@@ -172,9 +172,9 @@ const Parser = struct {
     }
 
     fn parseFuncSig(self: *Parser, module: *Mod.Module) ParseError!struct { params: []const types.ValType, results: []const types.ValType } {
-        var params: std.ArrayList(types.ValType) = .empty;
+        var params: std.ArrayListUnmanaged(types.ValType) = .{};
         errdefer params.deinit(self.allocator);
-        var results: std.ArrayList(types.ValType) = .empty;
+        var results: std.ArrayListUnmanaged(types.ValType) = .{};
         errdefer results.deinit(self.allocator);
 
         while (self.peek().kind == .l_paren) {
@@ -505,7 +505,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) _ = self.advance();
 
         // Skip offset expression and elem indices for now
-        seg.elem_var_indices = .empty;
+        seg.elem_var_indices = .{};
         while (self.peek().kind != .r_paren) {
             if (self.peek().kind == .l_paren) {
                 _ = self.advance();

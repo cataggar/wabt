@@ -9,7 +9,7 @@ const Mod = @import("../Module.zig");
 pub const WriteError = error{OutOfMemory};
 
 pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var w = WatWriter{ .allocator = allocator, .buf = .empty };
+    var w = WatWriter{ .allocator = allocator, .buf = .{} };
     errdefer w.buf.deinit(allocator);
     try w.write(module);
     return w.buf.toOwnedSlice(allocator);
@@ -17,7 +17,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) Writ
 
 const WatWriter = struct {
     allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8),
+    buf: std.ArrayListUnmanaged(u8),
     indent: u32 = 0,
 
     // ── Main entry ──────────────────────────────────────────────────────

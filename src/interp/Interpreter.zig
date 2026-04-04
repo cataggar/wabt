@@ -48,21 +48,21 @@ pub const Instance = struct {
     module: *const Mod.Module,
 
     /// Linear memory (one page = 65 536 bytes).
-    memory: std.ArrayList(u8),
+    memory: std.ArrayListUnmanaged(u8),
 
     /// Global variable values.
-    globals: std.ArrayList(Value),
+    globals: std.ArrayListUnmanaged(Value),
 
     /// Function table — `null` entries are uninitialised.
-    table: std.ArrayList(?u32),
+    table: std.ArrayListUnmanaged(?u32),
 
     pub fn init(allocator: std.mem.Allocator, module: *const Mod.Module) TrapError!Instance {
         var inst = Instance{
             .allocator = allocator,
             .module = module,
-            .memory = .empty,
-            .globals = .empty,
-            .table = .empty,
+            .memory = .{},
+            .globals = .{},
+            .table = .{},
         };
 
         // Allocate linear memory for first memory definition.
@@ -114,7 +114,7 @@ pub const Interpreter = struct {
     instance: *Instance,
 
     /// Operand stack.
-    stack: std.ArrayList(Value),
+    stack: std.ArrayListUnmanaged(Value),
 
     /// Current call nesting depth.
     call_depth: u32 = 0,
@@ -125,7 +125,7 @@ pub const Interpreter = struct {
         return .{
             .allocator = allocator,
             .instance = instance,
-            .stack = .empty,
+            .stack = .{},
         };
     }
 
@@ -1024,9 +1024,9 @@ fn testInterpreter() struct { interp: Interpreter, inst: *Instance, mod: *Mod.Mo
     inst.* = Instance{
         .allocator = alloc,
         .module = mod,
-        .memory = .empty,
-        .globals = .empty,
-        .table = .empty,
+        .memory = .{},
+        .globals = .{},
+        .table = .{},
     };
     return .{
         .interp = Interpreter.init(alloc, inst),
