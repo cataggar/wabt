@@ -9,23 +9,23 @@ const std = @import("std");
 /// Feature flag set. Each field corresponds to a WebAssembly proposal.
 /// Field order and defaults match wabt's feature.def.
 pub const Set = packed struct {
-    exceptions: bool = false,
+    exceptions: bool = true,
     mutable_globals: bool = true,
     sat_float_to_int: bool = true,
     sign_extension: bool = true,
     simd: bool = true,
-    threads: bool = false,
-    function_references: bool = false,
+    threads: bool = true,
+    function_references: bool = true,
     multi_value: bool = true,
-    tail_call: bool = false,
+    tail_call: bool = true,
     bulk_memory: bool = true,
     reference_types: bool = true,
-    annotations: bool = false,
+    annotations: bool = true,
     code_metadata: bool = false,
-    gc: bool = false,
-    memory64: bool = false,
-    multi_memory: bool = false,
-    extended_const: bool = false,
+    gc: bool = true,
+    memory64: bool = true,
+    multi_memory: bool = true,
+    extended_const: bool = true,
     relaxed_simd: bool = false,
     custom_page_sizes: bool = false,
     compact_imports: bool = false,
@@ -38,16 +38,7 @@ pub const Set = packed struct {
 
     /// All features enabled.
     pub const all = Set{
-        .exceptions = true,
-        .threads = true,
-        .function_references = true,
-        .tail_call = true,
-        .annotations = true,
         .code_metadata = true,
-        .gc = true,
-        .memory64 = true,
-        .multi_memory = true,
-        .extended_const = true,
         .relaxed_simd = true,
         .custom_page_sizes = true,
         .compact_imports = true,
@@ -115,16 +106,16 @@ test "default features" {
     try std.testing.expect(defaults.multi_value);
     try std.testing.expect(defaults.bulk_memory);
     try std.testing.expect(defaults.reference_types);
-    try std.testing.expect(!defaults.exceptions);
-    try std.testing.expect(!defaults.threads);
-    try std.testing.expect(!defaults.function_references);
-    try std.testing.expect(!defaults.tail_call);
-    try std.testing.expect(!defaults.annotations);
+    try std.testing.expect(defaults.exceptions);
+    try std.testing.expect(defaults.threads);
+    try std.testing.expect(defaults.function_references);
+    try std.testing.expect(defaults.tail_call);
+    try std.testing.expect(defaults.annotations);
     try std.testing.expect(!defaults.code_metadata);
-    try std.testing.expect(!defaults.gc);
-    try std.testing.expect(!defaults.memory64);
-    try std.testing.expect(!defaults.multi_memory);
-    try std.testing.expect(!defaults.extended_const);
+    try std.testing.expect(defaults.gc);
+    try std.testing.expect(defaults.memory64);
+    try std.testing.expect(defaults.multi_memory);
+    try std.testing.expect(defaults.extended_const);
     try std.testing.expect(!defaults.relaxed_simd);
     try std.testing.expect(!defaults.custom_page_sizes);
     try std.testing.expect(!defaults.compact_imports);
@@ -185,10 +176,10 @@ test "count returns number of non-default features" {
     try std.testing.expectEqual(@as(usize, 0), defaults.count());
 
     var s = Set{};
-    s.exceptions = true; // default false → changed
-    s.mutable_globals = false; // default true  → changed
+    s.exceptions = false; // default true → changed
+    s.mutable_globals = false; // default true → changed
     try std.testing.expectEqual(@as(usize, 2), s.count());
 
-    // all has 14 non-default features.
-    try std.testing.expectEqual(@as(usize, 14), Set.all.count());
+    // all has 5 non-default features (the 5 still false by default).
+    try std.testing.expectEqual(@as(usize, 5), Set.all.count());
 }

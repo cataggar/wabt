@@ -22,9 +22,14 @@ pub const AssertResult = enum {
 
 /// Run an assert_invalid test: the module bytes should fail validation.
 pub fn assertInvalid(allocator: std.mem.Allocator, wasm_bytes: []const u8) AssertResult {
+    return assertInvalidWithOptions(allocator, wasm_bytes, .{});
+}
+
+/// Run an assert_invalid test with explicit validator options.
+pub fn assertInvalidWithOptions(allocator: std.mem.Allocator, wasm_bytes: []const u8, options: Validator.Options) AssertResult {
     var module = binary_reader.readModule(allocator, wasm_bytes) catch return .pass;
     defer module.deinit();
-    Validator.validate(&module, .{}) catch return .pass;
+    Validator.validate(&module, options) catch return .pass;
     return .fail; // should have failed but didn't
 }
 
@@ -166,7 +171,7 @@ test "assert_invalid: duplicate exports" {
 }
 
 test "assert_invalid: too many memories" {
-    const result = assertInvalid(std.testing.allocator, &two_memories);
+    const result = assertInvalidWithOptions(std.testing.allocator, &two_memories, .{ .features = .{ .multi_memory = false } });
     try std.testing.expectEqual(AssertResult.pass, result);
 }
 
@@ -190,7 +195,7 @@ test "Suite runner tallies results" {
     suite.run("malformed truncated", assertMalformed(std.testing.allocator, &truncated));
     suite.run("invalid bad export", assertInvalid(std.testing.allocator, &bad_export_index));
     suite.run("invalid duplicate exports", assertInvalid(std.testing.allocator, &duplicate_exports));
-    suite.run("invalid too many memories", assertInvalid(std.testing.allocator, &two_memories));
+    suite.run("invalid too many memories", assertInvalidWithOptions(std.testing.allocator, &two_memories, .{ .features = .{ .multi_memory = false } }));
 
     // A valid module should *fail* the assertInvalid check
     suite.run("valid should fail assert_invalid", assertInvalid(std.testing.allocator, &valid_empty_module));
