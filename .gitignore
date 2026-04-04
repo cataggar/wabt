@@ -7,3 +7,5 @@
 .idea/
 .vscode/
 /cmake-build-debug/
+/.zig-cache/
+/zig-out/

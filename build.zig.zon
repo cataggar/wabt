@@ -1,0 +1,12 @@
+.{
+    .name = .wabt,
+    .version = "1.0.40",
+    .fingerprint = 0x9e1a5a2e6dd03d41,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
