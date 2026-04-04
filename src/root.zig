@@ -11,6 +11,7 @@ pub const Module = @import("Module.zig");
 pub const Validator = @import("Validator.zig");
 pub const CWriter = @import("CWriter.zig");
 pub const Decompiler = @import("Decompiler.zig");
+pub const wast_runner = @import("wast_runner.zig");
 
 pub const leb128 = @import("leb128.zig");
 
