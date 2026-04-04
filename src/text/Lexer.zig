@@ -10,26 +10,93 @@ pub const TokenKind = enum {
     l_paren,
     r_paren,
 
-    // Keywords
+    // Module-level keywords
     kw_module,
+    kw_type,
     kw_func,
+    kw_table,
+    kw_memory,
+    kw_global,
+    kw_import,
+    kw_export,
+    kw_start,
+    kw_elem,
+    kw_data,
+    kw_tag,
+
+    // Inline keywords
     kw_param,
     kw_result,
     kw_local,
-    kw_global,
-    kw_memory,
-    kw_table,
-    kw_type,
-    kw_import,
-    kw_export,
+    kw_mut,
+    kw_offset,
+    kw_align,
+    kw_declare,
+
+    // Value type keywords
+    kw_i32,
+    kw_i64,
+    kw_f32,
+    kw_f64,
+    kw_v128,
+    kw_funcref,
+    kw_externref,
+
+    // Reference keywords
+    kw_ref_null,
+    kw_ref_func,
+    kw_ref_extern,
+
+    // Control instructions
+    kw_block,
+    kw_loop,
+    kw_if,
+    kw_then,
+    kw_else,
+    kw_end,
+    kw_unreachable,
+    kw_nop,
+    kw_br,
+    kw_br_if,
+    kw_br_table,
+    kw_return,
+    kw_call,
+    kw_call_indirect,
+
+    // Parametric
+    kw_drop,
+    kw_select,
+
+    // Variable
+    kw_local_get,
+    kw_local_set,
+    kw_local_tee,
+    kw_global_get,
+    kw_global_set,
+
+    // Memory instructions
+    kw_memory_size,
+    kw_memory_grow,
+
+    // Numeric const
+    kw_i32_const,
+    kw_i64_const,
+    kw_f32_const,
+    kw_f64_const,
+
+    // Generic opcode (for instructions not explicitly listed)
+    opcode,
 
     // Literals
     integer,
     float,
     string,
 
-    // Identifiers
+    // Identifiers ($name)
     identifier,
+
+    // Nat after = (like offset=N, align=N)
+    nat_eq,
 
     // Special
     eof,
@@ -42,7 +109,7 @@ pub const Token = struct {
     offset: usize,
 };
 
-/// Lexer state.
+/// Lexer state — converts WAT source text into a stream of tokens.
 pub const Lexer = struct {
     source: []const u8,
     pos: usize = 0,
@@ -51,6 +118,7 @@ pub const Lexer = struct {
         return .{ .source = source };
     }
 
+    /// Returns the next token from the source.
     pub fn next(self: *Lexer) Token {
         self.skipWhitespaceAndComments();
 
@@ -63,6 +131,11 @@ pub const Lexer = struct {
 
         switch (c) {
             '(' => {
+                // Check for block comment start "(;"
+                if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
+                    self.skipBlockComment();
+                    return self.next();
+                }
                 self.pos += 1;
                 return .{ .kind = .l_paren, .text = "(", .offset = start };
             },
@@ -70,23 +143,87 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return .{ .kind = .r_paren, .text = ")", .offset = start };
             },
-            else => {
-                // consume until whitespace or paren
-                while (self.pos < self.source.len and
-                    self.source[self.pos] != ' ' and
-                    self.source[self.pos] != '\n' and
-                    self.source[self.pos] != '\r' and
-                    self.source[self.pos] != '\t' and
-                    self.source[self.pos] != '(' and
-                    self.source[self.pos] != ')')
-                {
-                    self.pos += 1;
-                }
-                const text = self.source[start..self.pos];
-                const kind = classifyKeyword(text);
-                return .{ .kind = kind, .text = text, .offset = start };
-            },
+            '"' => return self.lexString(start),
+            else => return self.lexWord(start),
         }
+    }
+
+    /// Lex a quoted string literal with escape sequences.
+    fn lexString(self: *Lexer, start: usize) Token {
+        // Skip opening quote
+        self.pos += 1;
+        while (self.pos < self.source.len) {
+            const ch = self.source[self.pos];
+            if (ch == '"') {
+                self.pos += 1;
+                return .{ .kind = .string, .text = self.source[start..self.pos], .offset = start };
+            }
+            if (ch == '\\') {
+                // Skip escape sequence
+                self.pos += 1;
+                if (self.pos < self.source.len) {
+                    self.pos += 1;
+                    // For \xx hex escapes the second hex digit is consumed by the next iteration
+                }
+                continue;
+            }
+            self.pos += 1;
+        }
+        // Unterminated string
+        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+    }
+
+    /// Lex a word token (keyword, number, identifier, or opcode).
+    fn lexWord(self: *Lexer, start: usize) Token {
+        // Identifiers start with '$'
+        if (self.source[start] == '$') {
+            self.pos += 1;
+            while (self.pos < self.source.len and isIdChar(self.source[self.pos])) {
+                self.pos += 1;
+            }
+            const text = self.source[start..self.pos];
+            return .{ .kind = .identifier, .text = text, .offset = start };
+        }
+
+        // Consume word chars (non-whitespace, non-paren, non-quote, non-semicolon-starting-comment)
+        while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
+            self.pos += 1;
+        }
+
+        const text = self.source[start..self.pos];
+        if (text.len == 0) {
+            self.pos += 1;
+            return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+        }
+
+        // Check for nat_eq pattern: word=number (e.g., offset=0, align=4)
+        if (self.pos < self.source.len and self.source[self.pos] == '=') {
+            const eq_pos = self.pos;
+            self.pos += 1; // skip '='
+            // Consume the number after '='
+            while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
+                self.pos += 1;
+            }
+            return .{ .kind = .nat_eq, .text = self.source[start..self.pos], .offset = eq_pos };
+        }
+
+        // Classify the word
+        const kind = classifyWord(text);
+        return .{ .kind = kind, .text = text, .offset = start };
+    }
+
+    fn isWordChar(c: u8) bool {
+        return switch (c) {
+            ' ', '\t', '\n', '\r', '(', ')', '"', ';', '=' => false,
+            else => c >= 0x21 and c <= 0x7e,
+        };
+    }
+
+    fn isIdChar(c: u8) bool {
+        return switch (c) {
+            ' ', '\t', '\n', '\r', '(', ')', '"', ';' => false,
+            else => c >= 0x21 and c <= 0x7e,
+        };
     }
 
     fn skipWhitespaceAndComments(self: *Lexer) void {
@@ -95,42 +232,426 @@ pub const Lexer = struct {
             if (c == ' ' or c == '\n' or c == '\r' or c == '\t') {
                 self.pos += 1;
             } else if (c == ';' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
-                // line comment
+                // Line comment: ;; to end of line
                 while (self.pos < self.source.len and self.source[self.pos] != '\n') {
                     self.pos += 1;
                 }
+            } else if (c == '(' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
+                self.skipBlockComment();
             } else {
                 break;
             }
         }
     }
 
-    fn classifyKeyword(text: []const u8) TokenKind {
-        const map = .{
-            .{ "module", TokenKind.kw_module },
-            .{ "func", TokenKind.kw_func },
-            .{ "param", TokenKind.kw_param },
-            .{ "result", TokenKind.kw_result },
-            .{ "local", TokenKind.kw_local },
-            .{ "global", TokenKind.kw_global },
-            .{ "memory", TokenKind.kw_memory },
-            .{ "table", TokenKind.kw_table },
-            .{ "type", TokenKind.kw_type },
-            .{ "import", TokenKind.kw_import },
-            .{ "export", TokenKind.kw_export },
-        };
-        inline for (map) |entry| {
-            if (std.mem.eql(u8, text, entry[0])) return entry[1];
+    /// Skip a block comment "(; ... ;)" with nesting support.
+    fn skipBlockComment(self: *Lexer) void {
+        // Skip opening "(;"
+        self.pos += 2;
+        var depth: usize = 1;
+        while (self.pos + 1 < self.source.len and depth > 0) {
+            if (self.source[self.pos] == '(' and self.source[self.pos + 1] == ';') {
+                depth += 1;
+                self.pos += 2;
+            } else if (self.source[self.pos] == ';' and self.source[self.pos + 1] == ')') {
+                depth -= 1;
+                self.pos += 2;
+            } else {
+                self.pos += 1;
+            }
         }
-        if (text.len > 0 and text[0] == '$') return .identifier;
-        return .invalid;
+        // If we ran out of input with depth > 0, we're at eof (malformed comment).
+        // If depth == 0 and only one byte left, check the last byte.
+        if (depth > 0 and self.pos < self.source.len) {
+            self.pos = self.source.len;
+        }
     }
 };
 
+/// Classify a word token into its specific TokenKind.
+pub fn classifyWord(text: []const u8) TokenKind {
+    if (text.len == 0) return .invalid;
+
+    // Check for numeric literal: starts with digit, or +/- followed by digit
+    if (isNumStart(text)) return classifyNumber(text);
+
+    // Bare "inf", "nan", "nan:0x..." are float literals
+    if (eql(text, "inf") or eql(text, "nan")) return .float;
+    if (text.len > 4 and std.mem.startsWith(u8, text, "nan:")) return .float;
+
+    // Exact keyword matching
+    const kind = matchKeyword(text);
+    if (kind != .invalid) return kind;
+
+    // If it contains a dot, treat as generic opcode
+    if (std.mem.indexOfScalar(u8, text, '.') != null) return .opcode;
+
+    return .invalid;
+}
+
+fn isNumStart(text: []const u8) bool {
+    if (text.len == 0) return false;
+    const first = text[0];
+    if (first >= '0' and first <= '9') return true;
+    if ((first == '+' or first == '-') and text.len > 1) {
+        const second = text[1];
+        if (second >= '0' and second <= '9') return true;
+        // +inf, -inf, +nan, -nan
+        if (text.len >= 4) {
+            const rest = text[1..];
+            if (std.mem.startsWith(u8, rest, "inf")) return true;
+            if (std.mem.startsWith(u8, rest, "nan")) return true;
+        }
+    }
+    return false;
+}
+
+fn classifyNumber(text: []const u8) TokenKind {
+    // Special float values
+    const base = if (text[0] == '+' or text[0] == '-') text[1..] else text;
+    if (std.mem.eql(u8, base, "inf")) return .float;
+    if (std.mem.startsWith(u8, base, "nan")) return .float;
+
+    // Check for float indicators: '.', 'e', 'E', 'p', 'P'
+    for (text) |ch| {
+        switch (ch) {
+            '.', 'e', 'E', 'p', 'P' => return .float,
+            else => {},
+        }
+    }
+    return .integer;
+}
+
+fn matchKeyword(text: []const u8) TokenKind {
+    // This uses a series of checks organized by first character for efficiency.
+    // Module-level keywords
+    if (eql(text, "module")) return .kw_module;
+    if (eql(text, "type")) return .kw_type;
+    if (eql(text, "func")) return .kw_func;
+    if (eql(text, "table")) return .kw_table;
+    if (eql(text, "memory")) return .kw_memory;
+    if (eql(text, "global")) return .kw_global;
+    if (eql(text, "import")) return .kw_import;
+    if (eql(text, "export")) return .kw_export;
+    if (eql(text, "start")) return .kw_start;
+    if (eql(text, "elem")) return .kw_elem;
+    if (eql(text, "data")) return .kw_data;
+    if (eql(text, "tag")) return .kw_tag;
+
+    // Inline keywords
+    if (eql(text, "param")) return .kw_param;
+    if (eql(text, "result")) return .kw_result;
+    if (eql(text, "local")) return .kw_local;
+    if (eql(text, "mut")) return .kw_mut;
+    if (eql(text, "offset")) return .kw_offset;
+    if (eql(text, "align")) return .kw_align;
+    if (eql(text, "declare")) return .kw_declare;
+
+    // Value type keywords
+    if (eql(text, "i32")) return .kw_i32;
+    if (eql(text, "i64")) return .kw_i64;
+    if (eql(text, "f32")) return .kw_f32;
+    if (eql(text, "f64")) return .kw_f64;
+    if (eql(text, "v128")) return .kw_v128;
+    if (eql(text, "funcref")) return .kw_funcref;
+    if (eql(text, "externref")) return .kw_externref;
+
+    // Reference keywords (dot-separated)
+    if (eql(text, "ref.null")) return .kw_ref_null;
+    if (eql(text, "ref.func")) return .kw_ref_func;
+    if (eql(text, "ref.extern")) return .kw_ref_extern;
+
+    // Control instructions
+    if (eql(text, "block")) return .kw_block;
+    if (eql(text, "loop")) return .kw_loop;
+    if (eql(text, "if")) return .kw_if;
+    if (eql(text, "then")) return .kw_then;
+    if (eql(text, "else")) return .kw_else;
+    if (eql(text, "end")) return .kw_end;
+    if (eql(text, "unreachable")) return .kw_unreachable;
+    if (eql(text, "nop")) return .kw_nop;
+    if (eql(text, "br")) return .kw_br;
+    if (eql(text, "br_if")) return .kw_br_if;
+    if (eql(text, "br_table")) return .kw_br_table;
+    if (eql(text, "return")) return .kw_return;
+    if (eql(text, "call")) return .kw_call;
+    if (eql(text, "call_indirect")) return .kw_call_indirect;
+
+    // Parametric
+    if (eql(text, "drop")) return .kw_drop;
+    if (eql(text, "select")) return .kw_select;
+
+    // Variable instructions (dot-separated)
+    if (eql(text, "local.get")) return .kw_local_get;
+    if (eql(text, "local.set")) return .kw_local_set;
+    if (eql(text, "local.tee")) return .kw_local_tee;
+    if (eql(text, "global.get")) return .kw_global_get;
+    if (eql(text, "global.set")) return .kw_global_set;
+
+    // Memory instructions (dot-separated)
+    if (eql(text, "memory.size")) return .kw_memory_size;
+    if (eql(text, "memory.grow")) return .kw_memory_grow;
+
+    // Numeric const instructions (dot-separated)
+    if (eql(text, "i32.const")) return .kw_i32_const;
+    if (eql(text, "i64.const")) return .kw_i64_const;
+    if (eql(text, "f32.const")) return .kw_f32_const;
+    if (eql(text, "f64.const")) return .kw_f64_const;
+
+    return .invalid;
+}
+
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+const testing = std.testing;
+
+fn collectTokenKinds(source: []const u8, buf: []TokenKind) []TokenKind {
+    var lexer = Lexer.init(source);
+    var i: usize = 0;
+    while (i < buf.len) {
+        const tok = lexer.next();
+        buf[i] = tok.kind;
+        i += 1;
+        if (tok.kind == .eof) break;
+    }
+    return buf[0..i];
+}
+
 test "lex module skeleton" {
-    var lexer = Lexer.init("(module)");
-    try std.testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
-    try std.testing.expectEqual(TokenKind.kw_module, lexer.next().kind);
-    try std.testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
-    try std.testing.expectEqual(TokenKind.eof, lexer.next().kind);
+    var buf: [8]TokenKind = undefined;
+    const kinds = collectTokenKinds("(module)", &buf);
+    try testing.expectEqual(@as(usize, 4), kinds.len);
+    try testing.expectEqual(TokenKind.l_paren, kinds[0]);
+    try testing.expectEqual(TokenKind.kw_module, kinds[1]);
+    try testing.expectEqual(TokenKind.r_paren, kinds[2]);
+    try testing.expectEqual(TokenKind.eof, kinds[3]);
+}
+
+test "lex line comments" {
+    var buf: [8]TokenKind = undefined;
+    const kinds = collectTokenKinds(";; this is a comment\n(module)", &buf);
+    try testing.expectEqual(@as(usize, 4), kinds.len);
+    try testing.expectEqual(TokenKind.l_paren, kinds[0]);
+    try testing.expectEqual(TokenKind.kw_module, kinds[1]);
+    try testing.expectEqual(TokenKind.r_paren, kinds[2]);
+    try testing.expectEqual(TokenKind.eof, kinds[3]);
+}
+
+test "lex block comments including nested" {
+    var buf: [8]TokenKind = undefined;
+    // Simple block comment
+    const kinds1 = collectTokenKinds("(; comment ;)(module)", &buf);
+    try testing.expectEqual(@as(usize, 4), kinds1.len);
+    try testing.expectEqual(TokenKind.l_paren, kinds1[0]);
+
+    // Nested block comment
+    var buf2: [8]TokenKind = undefined;
+    const kinds2 = collectTokenKinds("(; outer (; inner ;) still outer ;)(module)", &buf2);
+    try testing.expectEqual(@as(usize, 4), kinds2.len);
+    try testing.expectEqual(TokenKind.l_paren, kinds2[0]);
+    try testing.expectEqual(TokenKind.kw_module, kinds2[1]);
+}
+
+test "lex string literal" {
+    var lexer = Lexer.init("\"hello world\"");
+    const tok = lexer.next();
+    try testing.expectEqual(TokenKind.string, tok.kind);
+    try testing.expectEqualStrings("\"hello world\"", tok.text);
+
+    // String with escapes
+    var lexer2 = Lexer.init("\"line\\none\"");
+    const tok2 = lexer2.next();
+    try testing.expectEqual(TokenKind.string, tok2.kind);
+}
+
+test "lex integer and float literals" {
+    // Decimal integer
+    var lexer = Lexer.init("42");
+    try testing.expectEqual(TokenKind.integer, lexer.next().kind);
+
+    // Hex integer
+    var lexer2 = Lexer.init("0xFF");
+    try testing.expectEqual(TokenKind.integer, lexer2.next().kind);
+
+    // Signed integer
+    var lexer3 = Lexer.init("-7");
+    try testing.expectEqual(TokenKind.integer, lexer3.next().kind);
+
+    // Decimal float
+    var lexer4 = Lexer.init("3.14");
+    try testing.expectEqual(TokenKind.float, lexer4.next().kind);
+
+    // Hex float
+    var lexer5 = Lexer.init("0x1.5p10");
+    try testing.expectEqual(TokenKind.float, lexer5.next().kind);
+
+    // inf and nan
+    var lexer6 = Lexer.init("inf");
+    try testing.expectEqual(TokenKind.float, lexer6.next().kind);
+
+    var lexer7 = Lexer.init("nan");
+    try testing.expectEqual(TokenKind.float, lexer7.next().kind);
+
+    var lexer8 = Lexer.init("nan:0x7fc00000");
+    try testing.expectEqual(TokenKind.float, lexer8.next().kind);
+}
+
+test "lex identifiers" {
+    var lexer = Lexer.init("$foo $bar $my_func");
+    const t1 = lexer.next();
+    try testing.expectEqual(TokenKind.identifier, t1.kind);
+    try testing.expectEqualStrings("$foo", t1.text);
+
+    const t2 = lexer.next();
+    try testing.expectEqual(TokenKind.identifier, t2.kind);
+    try testing.expectEqualStrings("$bar", t2.text);
+
+    const t3 = lexer.next();
+    try testing.expectEqual(TokenKind.identifier, t3.kind);
+    try testing.expectEqualStrings("$my_func", t3.text);
+}
+
+test "lex value type keywords" {
+    var buf: [12]TokenKind = undefined;
+    const kinds = collectTokenKinds("i32 i64 f32 f64 v128 funcref externref", &buf);
+    try testing.expectEqual(TokenKind.kw_i32, kinds[0]);
+    try testing.expectEqual(TokenKind.kw_i64, kinds[1]);
+    try testing.expectEqual(TokenKind.kw_f32, kinds[2]);
+    try testing.expectEqual(TokenKind.kw_f64, kinds[3]);
+    try testing.expectEqual(TokenKind.kw_v128, kinds[4]);
+    try testing.expectEqual(TokenKind.kw_funcref, kinds[5]);
+    try testing.expectEqual(TokenKind.kw_externref, kinds[6]);
+}
+
+test "lex dot-separated instructions" {
+    var lexer = Lexer.init("i32.const local.get memory.grow i32.add f64.mul");
+
+    try testing.expectEqual(TokenKind.kw_i32_const, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_local_get, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_memory_grow, lexer.next().kind);
+    // Unknown dot-instructions → generic opcode
+    try testing.expectEqual(TokenKind.opcode, lexer.next().kind);
+    try testing.expectEqual(TokenKind.opcode, lexer.next().kind);
+}
+
+test "lex realistic WAT snippet" {
+    const source =
+        \\(module
+        \\  (type $sig (func (param i32 i32) (result i32)))
+        \\  (func $add (type $sig) (param $a i32) (param $b i32) (result i32)
+        \\    local.get $a
+        \\    local.get $b
+        \\    i32.add)
+        \\  (export "add" (func $add)))
+    ;
+
+    var lexer = Lexer.init(source);
+    // (module
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_module, lexer.next().kind);
+
+    // (type $sig (func (param i32 i32) (result i32)))
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_type, lexer.next().kind); // type
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $sig
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_func, lexer.next().kind); // func
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_param, lexer.next().kind); // param
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind); // i32
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind); // i32
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // )
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_result, lexer.next().kind); // result
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind); // i32
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // )
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // )
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // ) closes type
+
+    // (func $add (type $sig) ...
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_func, lexer.next().kind); // func
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $add
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind); // (
+    try testing.expectEqual(TokenKind.kw_type, lexer.next().kind); // type
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $sig
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // )
+
+    // (param $a i32) (param $b i32) (result i32)
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_param, lexer.next().kind);
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $a
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind);
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_param, lexer.next().kind);
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $b
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind);
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_result, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_i32, lexer.next().kind);
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+
+    // local.get $a  local.get $b  i32.add)
+    try testing.expectEqual(TokenKind.kw_local_get, lexer.next().kind);
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $a
+    try testing.expectEqual(TokenKind.kw_local_get, lexer.next().kind);
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $b
+    try testing.expectEqual(TokenKind.opcode, lexer.next().kind); // i32.add
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind); // )
+
+    // (export "add" (func $add))
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_export, lexer.next().kind);
+    try testing.expectEqual(TokenKind.string, lexer.next().kind); // "add"
+    try testing.expectEqual(TokenKind.l_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_func, lexer.next().kind);
+    try testing.expectEqual(TokenKind.identifier, lexer.next().kind); // $add
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+
+    // Closing )
+    try testing.expectEqual(TokenKind.r_paren, lexer.next().kind);
+    try testing.expectEqual(TokenKind.eof, lexer.next().kind);
+}
+
+test "lex nat_eq token" {
+    var lexer = Lexer.init("offset=0");
+    const tok = lexer.next();
+    try testing.expectEqual(TokenKind.nat_eq, tok.kind);
+    try testing.expectEqualStrings("offset=0", tok.text);
+}
+
+test "lex reference keywords" {
+    var lexer = Lexer.init("ref.null ref.func ref.extern");
+    try testing.expectEqual(TokenKind.kw_ref_null, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_ref_func, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_ref_extern, lexer.next().kind);
+}
+
+test "lex control and parametric keywords" {
+    var lexer = Lexer.init("block loop if then else end unreachable nop br br_if br_table return call call_indirect drop select");
+    try testing.expectEqual(TokenKind.kw_block, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_loop, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_if, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_then, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_else, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_end, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_unreachable, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_nop, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_br, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_br_if, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_br_table, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_return, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_call, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_call_indirect, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_drop, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_select, lexer.next().kind);
 }
