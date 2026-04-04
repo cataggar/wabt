@@ -31,4 +31,6 @@ pub const interp = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("integration_tests.zig");
+    _ = @import("spec_tests.zig");
 }

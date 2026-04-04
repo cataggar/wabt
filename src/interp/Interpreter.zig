@@ -176,7 +176,7 @@ pub const Interpreter = struct {
 
     pub fn popValue(self: *Interpreter) TrapError!Value {
         if (self.stack.items.len == 0) return error.StackOverflow;
-        return self.stack.pop();
+        return self.stack.pop() orelse error.StackOverflow;
     }
 
     pub fn peekValue(self: *Interpreter) TrapError!Value {
