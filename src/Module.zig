@@ -212,6 +212,9 @@ pub const Global = struct {
     @"type": types.GlobalType = .{},
     loc: Location = .{},
     is_import: bool = false,
+    /// Raw bytecode for the init expression (constant expr).
+    init_expr_bytes: []const u8 = &.{},
+    owns_init_expr_bytes: bool = false,
 };
 
 /// A defined or imported table.
@@ -247,6 +250,15 @@ pub const ElemSegment = struct {
     table_var: Var = .{ .index = 0 },
     elem_type: types.ValType = .funcref,
     elem_var_indices: std.ArrayListUnmanaged(Var) = .{},
+    /// Raw bytecode for the offset expression (constant expr).
+    offset_expr_bytes: []const u8 = &.{},
+    owns_offset_expr_bytes: bool = false,
+    /// Raw bytecode for elem expressions (used with funcref/externref elem exprs).
+    /// Each expression is terminated by 0x0b.
+    elem_expr_bytes: []const u8 = &.{},
+    owns_elem_expr_bytes: bool = false,
+    /// Number of individual elem expressions encoded in elem_expr_bytes.
+    elem_expr_count: u32 = 0,
 };
 
 /// Data segment.
@@ -255,6 +267,9 @@ pub const DataSegment = struct {
     kind: types.SegmentKind = .active,
     memory_var: Var = .{ .index = 0 },
     data: []const u8 = &.{},
+    /// Raw bytecode for the offset expression (constant expr).
+    offset_expr_bytes: []const u8 = &.{},
+    owns_offset_expr_bytes: bool = false,
 };
 
 /// Custom section.
@@ -320,14 +335,30 @@ pub const Module = struct {
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.memories.deinit(self.allocator);
+        for (self.globals.items) |*g| {
+            if (g.owns_init_expr_bytes and g.init_expr_bytes.len > 0) {
+                self.allocator.free(g.init_expr_bytes);
+            }
+        }
         self.globals.deinit(self.allocator);
         self.tags.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.exports.deinit(self.allocator);
         for (self.elem_segments.items) |*seg| {
             seg.elem_var_indices.deinit(self.allocator);
+            if (seg.owns_offset_expr_bytes and seg.offset_expr_bytes.len > 0) {
+                self.allocator.free(seg.offset_expr_bytes);
+            }
+            if (seg.owns_elem_expr_bytes and seg.elem_expr_bytes.len > 0) {
+                self.allocator.free(seg.elem_expr_bytes);
+            }
         }
         self.elem_segments.deinit(self.allocator);
+        for (self.data_segments.items) |*seg| {
+            if (seg.owns_offset_expr_bytes and seg.offset_expr_bytes.len > 0) {
+                self.allocator.free(seg.offset_expr_bytes);
+            }
+        }
         self.data_segments.deinit(self.allocator);
         self.customs.deinit(self.allocator);
     }

@@ -445,18 +445,44 @@ const Parser = struct {
             },
             else => {
                 // Generic folded instruction: (instr operands...)
-                // Parse sub-expressions first (operands), then the instruction
+                // Record the instruction, parse operands, then emit instruction after operands.
+                const instr_tok = self.peek();
+                const needs_reorder = switch (instr_tok.kind) {
+                    .kw_return, .kw_br, .kw_br_if, .kw_br_table => true,
+                    else => false,
+                };
+                const instr_start = code.items.len;
                 self.parsePlainInstr(code);
-                // Parse remaining operand sub-expressions
+                const instr_end = code.items.len;
+                const instr_len = instr_end - instr_start;
+
+                // Now parse operand sub-expressions (they emit AFTER the instruction in the buffer)
+                var has_operands = false;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.peek().kind == .l_paren) {
                         _ = self.advance();
                         self.parseFoldedInstr(code);
+                        has_operands = true;
                     } else {
                         // Could be additional immediates — skip them
                         _ = self.advance();
                     }
                 }
+
+                // For control-flow instructions that set unreachable, reorder so operands
+                // are validated before the instruction makes the stack unreachable.
+                if (needs_reorder and has_operands and instr_len > 0) {
+                    // Rotate: [instr][operands] → [operands][instr]
+                    var buf: [32]u8 = undefined;
+                    if (instr_len <= 32) {
+                        @memcpy(buf[0..instr_len], code.items[instr_start..instr_end]);
+                        const total = code.items.len;
+                        const operand_len = total - instr_end;
+                        std.mem.copyForwards(u8, code.items[instr_start .. instr_start + operand_len], code.items[instr_end..total]);
+                        @memcpy(code.items[instr_start + operand_len .. instr_start + operand_len + instr_len], buf[0..instr_len]);
+                    }
+                }
+
                 self.skipToRParen();
             },
         }
@@ -825,6 +851,69 @@ const Parser = struct {
         if (self.peek().kind == .r_paren) _ = self.advance();
     }
 
+    /// Parse a sequence of instructions in an init expression context and emit bytecode.
+    /// Handles both plain instructions and folded (parenthesized) instructions.
+    fn parseInitExpr(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+            if (self.peek().kind == .l_paren) {
+                _ = self.advance(); // consume '('
+                self.parseInitExprFolded(code);
+            } else {
+                self.parseInitExprPlain(code);
+            }
+        }
+    }
+
+    /// Parse a folded (parenthesized) init expression instruction.
+    fn parseInitExprFolded(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        const tok = self.peek();
+        switch (tok.kind) {
+            .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const,
+            .kw_ref_null, .kw_ref_func, .kw_global_get => {
+                // Parse nested args first, then the instruction
+                self.parseInitExprPlain(code);
+                // Skip to closing paren
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    if (self.peek().kind == .l_paren) {
+                        _ = self.advance();
+                        self.parseInitExprFolded(code);
+                    } else {
+                        self.parseInitExprPlain(code);
+                    }
+                }
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            },
+            else => {
+                // Non-constant instruction in folded form — still emit it for validation
+                self.parsePlainInstr(code);
+                // Parse sub-expressions
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    if (self.peek().kind == .l_paren) {
+                        _ = self.advance();
+                        self.parseInitExprFolded(code);
+                    } else {
+                        self.parseInitExprPlain(code);
+                    }
+                }
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            },
+        }
+    }
+
+    /// Parse a plain init expression instruction.
+    fn parseInitExprPlain(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.parsePlainInstr(code);
+    }
+
+    /// Parse an init expression that is wrapped in parens, e.g. (i32.const 0).
+    /// This handles a single folded instruction expression.
+    fn parseInitExprWrapped(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.peek().kind == .l_paren) {
+            _ = self.advance(); // consume '('
+            self.parseInitExprFolded(code);
+        }
+    }
+
     fn parseTable(self: *Parser, module: *Mod.Module) ParseError!void {
         if (self.peek().kind == .identifier) _ = self.advance();
         const initial = try self.parseU32();
@@ -878,21 +967,17 @@ const Parser = struct {
             val_type = try self.parseValType();
         }
 
-        // Skip init expression
-        while (self.peek().kind != .r_paren) {
-            if (self.peek().kind == .l_paren) {
-                _ = self.advance();
-                try self.skipSExpr();
-                try self.expect(.r_paren);
-            } else if (self.peek().kind == .eof) {
-                return error.InvalidModule;
-            } else {
-                _ = self.advance();
-            }
-        }
+        // Encode init expression into bytecode
+        var code: std.ArrayListUnmanaged(u8) = .{};
+        defer code.deinit(self.allocator);
+        self.parseInitExpr(&code);
+
+        const owned = code.toOwnedSlice(self.allocator) catch &.{};
 
         try module.globals.append(self.allocator, .{
             .type = .{ .val_type = val_type, .mutability = mutability },
+            .init_expr_bytes = owned,
+            .owns_init_expr_bytes = true,
         });
     }
 
@@ -1046,21 +1131,102 @@ const Parser = struct {
         var seg = Mod.ElemSegment{};
         if (self.peek().kind == .identifier) _ = self.advance();
 
-        // Skip offset expression and elem indices for now
+        // Parse offset expression and elem indices
         seg.elem_var_indices = .{};
+
+        // Check for declarative/passive keywords
+        if (self.peek().kind == .kw_declare) {
+            _ = self.advance();
+            seg.kind = .declared;
+        }
+
+        // Encode offset expression if present (active segment)
+        var offset_code: std.ArrayListUnmanaged(u8) = .{};
+        defer offset_code.deinit(self.allocator);
+        var has_offset = false;
+        // Track elem type keyword presence for validation
+        var has_elem_type = false;
+        var elem_type_is_externref = false;
+        // Encode elem expressions
+        var elem_expr_code: std.ArrayListUnmanaged(u8) = .{};
+        defer elem_expr_code.deinit(self.allocator);
+        var elem_expr_count: u32 = 0;
+
         while (self.peek().kind != .r_paren) {
             if (self.peek().kind == .l_paren) {
-                _ = self.advance();
-                try self.skipSExpr();
-                try self.expect(.r_paren);
+                const save_pos = self.lexer.pos;
+                const save_peeked = self.peeked;
+                _ = self.advance(); // consume '('
+
+                const inner_kind = self.peek().kind;
+                if (inner_kind == .kw_offset) {
+                    _ = self.advance(); // consume 'offset'
+                    self.parseInitExpr(&offset_code);
+                    try self.expect(.r_paren);
+                    has_offset = true;
+                } else if (inner_kind == .kw_table) {
+                    // (table $t) — skip
+                    try self.skipSExpr();
+                    try self.expect(.r_paren);
+                } else if (!has_offset) {
+                    // First folded expression is the offset expression
+                    self.lexer.pos = save_pos;
+                    self.peeked = save_peeked;
+                    self.parseInitExprWrapped(&offset_code);
+                    has_offset = true;
+                } else if (has_elem_type) {
+                    // Post-offset with explicit elem type: encode elem expressions
+                    if (inner_kind == .kw_item) {
+                        _ = self.advance(); // consume 'item'
+                    }
+                    self.parseInitExpr(&elem_expr_code);
+                    elem_expr_code.append(self.allocator, 0x0b) catch {}; // terminate expression
+                    elem_expr_count += 1;
+                    try self.expect(.r_paren);
+                } else {
+                    // Post-offset without explicit type: skip
+                    try self.skipSExpr();
+                    try self.expect(.r_paren);
+                }
             } else if (self.peek().kind == .integer) {
                 const idx = try self.parseU32();
                 try seg.elem_var_indices.append(self.allocator, .{ .index = idx });
+            } else if (self.peek().kind == .identifier) {
+                // Named reference like $f — skip for now
+                _ = self.advance();
+            } else if (self.peek().kind == .kw_funcref) {
+                _ = self.advance();
+                has_elem_type = true;
+            } else if (self.peek().kind == .kw_externref) {
+                _ = self.advance();
+                has_elem_type = true;
+                elem_type_is_externref = true;
+            } else if (self.peek().kind == .kw_func) {
+                _ = self.advance();
             } else if (self.peek().kind == .eof) {
                 return error.InvalidModule;
             } else {
                 _ = self.advance();
             }
+        }
+
+        if (has_offset) {
+            seg.kind = .active;
+            const owned = offset_code.toOwnedSlice(self.allocator) catch &.{};
+            seg.offset_expr_bytes = owned;
+            seg.owns_offset_expr_bytes = true;
+        }
+
+        if (has_elem_type) {
+            if (elem_type_is_externref) {
+                seg.elem_type = .externref;
+            }
+        }
+
+        if (elem_expr_count > 0) {
+            seg.elem_expr_bytes = elem_expr_code.toOwnedSlice(self.allocator) catch &.{};
+            seg.owns_elem_expr_bytes = true;
+            seg.elem_expr_count = elem_expr_count;
         }
 
         try module.elem_segments.append(self.allocator, seg);
@@ -1070,17 +1236,55 @@ const Parser = struct {
         var seg = Mod.DataSegment{};
         if (self.peek().kind == .identifier) _ = self.advance();
 
-        // Skip offset expression
+        // Parse offset expression
+        var offset_code: std.ArrayListUnmanaged(u8) = .{};
+        defer offset_code.deinit(self.allocator);
+        var has_offset = false;
+
         while (self.peek().kind == .l_paren) {
-            _ = self.advance();
-            try self.skipSExpr();
-            try self.expect(.r_paren);
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            _ = self.advance(); // consume '('
+
+            const inner_kind = self.peek().kind;
+            if (inner_kind == .kw_offset) {
+                _ = self.advance(); // consume 'offset'
+                self.parseInitExpr(&offset_code);
+                try self.expect(.r_paren);
+                has_offset = true;
+            } else if (inner_kind == .kw_memory) {
+                // (memory $m) — skip
+                try self.skipSExpr();
+                try self.expect(.r_paren);
+            } else if (!has_offset) {
+                // First non-offset/memory parenthesized expr is the offset expression
+                self.lexer.pos = save_pos;
+                self.peeked = save_peeked;
+                self.parseInitExprWrapped(&offset_code);
+                has_offset = true;
+            } else {
+                try self.skipSExpr();
+                try self.expect(.r_paren);
+            }
         }
 
-        // Read data string
-        if (self.peek().kind == .string) {
+        if (has_offset) {
+            seg.kind = .active;
+            const owned = offset_code.toOwnedSlice(self.allocator) catch &.{};
+            seg.offset_expr_bytes = owned;
+            seg.owns_offset_expr_bytes = true;
+        }
+
+        // Read data string(s)
+        var data_parts: std.ArrayListUnmanaged(u8) = .{};
+        defer data_parts.deinit(self.allocator);
+        while (self.peek().kind == .string) {
             const tok = self.advance();
-            seg.data = stripQuotes(tok.text);
+            const stripped = stripQuotes(tok.text);
+            data_parts.appendSlice(self.allocator, stripped) catch {};
+        }
+        if (data_parts.items.len > 0) {
+            seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
         }
 
         try module.data_segments.append(self.allocator, seg);
@@ -1093,6 +1297,15 @@ const Parser = struct {
         return text;
     }
 };
+
+/// Check if a token kind is a constant instruction (valid in init expressions).
+fn isConstInstrToken(kind: TokenKind) bool {
+    return switch (kind) {
+        .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const,
+        .kw_ref_null, .kw_ref_func, .kw_global_get => true,
+        else => false,
+    };
+}
 
 /// Map WAT instruction text (e.g. "i32.add") to binary opcode value.
 /// Returns null for unrecognized instructions.

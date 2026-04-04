@@ -24,7 +24,7 @@ pub const Set = packed struct {
     code_metadata: bool = false,
     gc: bool = true,
     memory64: bool = true,
-    multi_memory: bool = true,
+    multi_memory: bool = false,
     extended_const: bool = true,
     relaxed_simd: bool = false,
     custom_page_sizes: bool = false,
@@ -39,6 +39,7 @@ pub const Set = packed struct {
     /// All features enabled.
     pub const all = Set{
         .code_metadata = true,
+        .multi_memory = true,
         .relaxed_simd = true,
         .custom_page_sizes = true,
         .compact_imports = true,
@@ -114,7 +115,7 @@ test "default features" {
     try std.testing.expect(!defaults.code_metadata);
     try std.testing.expect(defaults.gc);
     try std.testing.expect(defaults.memory64);
-    try std.testing.expect(defaults.multi_memory);
+    try std.testing.expect(!defaults.multi_memory);
     try std.testing.expect(defaults.extended_const);
     try std.testing.expect(!defaults.relaxed_simd);
     try std.testing.expect(!defaults.custom_page_sizes);
@@ -180,6 +181,6 @@ test "count returns number of non-default features" {
     s.mutable_globals = false; // default true → changed
     try std.testing.expectEqual(@as(usize, 2), s.count());
 
-    // all has 5 non-default features (the 5 still false by default).
-    try std.testing.expectEqual(@as(usize, 5), Set.all.count());
+    // all has 6 non-default features (the 6 still false/off by default).
+    try std.testing.expectEqual(@as(usize, 6), Set.all.count());
 }

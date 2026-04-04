@@ -34,6 +34,7 @@ pub const TokenKind = enum {
     kw_offset,
     kw_align,
     kw_declare,
+    kw_item,
 
     // Value type keywords
     kw_i32,
@@ -364,6 +365,7 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "offset")) return .kw_offset;
     if (eql(text, "align")) return .kw_align;
     if (eql(text, "declare")) return .kw_declare;
+    if (eql(text, "item")) return .kw_item;
 
     // Value type keywords
     if (eql(text, "i32")) return .kw_i32;

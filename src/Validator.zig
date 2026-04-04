@@ -29,6 +29,8 @@ pub const Error = error{
     InvalidLabelIndex,
     ImmutableGlobal,
     TypeMismatch,
+    ConstantExprRequired,
+    InvalidAlignment,
     OutOfMemory,
 };
 
@@ -109,15 +111,20 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
         const max_pages: u64 = if (mem.type.limits.is_64)
             std.math.maxInt(u64)
         else
-            @as(u64, std.math.maxInt(u32));
+            65536; // 4GiB = 65536 pages of 64KiB
         try checkLimits(mem.type.limits, max_pages);
     }
 }
 
 fn checkGlobals(m: *const Mod.Module) Error!void {
-    for (m.globals.items) |global| {
+    for (m.globals.items, 0..) |global, i| {
         if (!global.type.val_type.isNumType() and !global.type.val_type.isRefType())
             return error.InvalidTypeIndex;
+        // Validate init expression for non-imported globals
+        if (!global.is_import) {
+            const expected = ValTypeOrUnknown.fromValType(global.type.val_type);
+            try checkConstExpr(m, global.init_expr_bytes, expected, @intCast(i));
+        }
     }
 }
 
@@ -167,11 +174,44 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
         if (seg.kind == .active) {
             if (m.tables.items.len == 0 or seg.table_var.index >= m.tables.items.len)
                 return error.InvalidTableIndex;
+            // Validate offset expression (even if empty — must produce i32)
+            try checkConstExpr(m, seg.offset_expr_bytes, .i32, null);
+            // Validate elem type matches table type
+            const table = m.tables.items[seg.table_var.index];
+            if (seg.elem_type != table.type.elem_type)
+                return error.TypeMismatch;
         }
+        // Validate elem expressions
+        if (seg.elem_expr_count > 0) {
+            const expected = ValTypeOrUnknown.fromValType(seg.elem_type);
+            try checkElemExprs(m, seg.elem_expr_bytes, expected, seg.elem_expr_count);
+        }
+        // Validate that func refs in funcref segments actually exist
         for (seg.elem_var_indices.items) |v| {
             if (v.index != 0 and v.index >= m.funcs.items.len)
                 return error.InvalidFuncIndex;
         }
+    }
+}
+
+/// Validate elem expressions encoded as consecutive constant expressions
+/// separated by 0x0b terminators.
+fn checkElemExprs(m: *const Mod.Module, bytes: []const u8, expected: ValTypeOrUnknown, count: u32) Error!void {
+    var pos: usize = 0;
+    var remaining = count;
+
+    while (remaining > 0 and pos < bytes.len) {
+        // Find the end of this expression (terminated by 0x0b)
+        var expr_end = pos;
+        while (expr_end < bytes.len and bytes[expr_end] != 0x0b) : (expr_end += 1) {}
+        const expr_bytes = bytes[pos..expr_end];
+
+        try checkConstExpr(m, expr_bytes, expected, null);
+
+        // Skip past the 0x0b terminator
+        if (expr_end < bytes.len) expr_end += 1;
+        pos = expr_end;
+        remaining -= 1;
     }
 }
 
@@ -180,6 +220,8 @@ fn checkDataSegments(m: *const Mod.Module) Error!void {
         if (seg.kind == .active) {
             if (m.memories.items.len == 0 or seg.memory_var.index >= m.memories.items.len)
                 return error.InvalidMemoryIndex;
+            // Validate offset expression (even if empty — must produce i32)
+            try checkConstExpr(m, seg.offset_expr_bytes, .i32, null);
         }
     }
 }
@@ -193,6 +235,128 @@ fn checkLimits(limits: types.Limits, absolute_max: u64) Error!void {
         if (limits.max < limits.initial)
             return error.InvalidLimits;
     }
+}
+
+// ── Constant expression validation ──────────────────────────────────────
+
+/// Validate a constant expression (used in global init, data/elem offsets).
+/// Only constant instructions are allowed: i32.const, i64.const, f32.const, f64.const,
+/// ref.null, ref.func, and global.get (of an immutable imported global).
+/// The expression must produce exactly one value of the expected type.
+/// `global_limit` restricts global.get to reference only imported globals with
+/// index < global_limit (for global init, this is the current global's index).
+fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: ValTypeOrUnknown, global_limit: ?u32) Error!void {
+    var pos: usize = 0;
+    var stack_depth: u32 = 0;
+    var result_type: ValTypeOrUnknown = .unknown;
+
+    while (pos < bytes.len) {
+        const opcode = bytes[pos];
+        pos += 1;
+
+        switch (opcode) {
+            0x41 => { // i32.const
+                _ = readS32(bytes, &pos);
+                stack_depth += 1;
+                result_type = .i32;
+            },
+            0x42 => { // i64.const
+                _ = readS64(bytes, &pos);
+                stack_depth += 1;
+                result_type = .i64;
+            },
+            0x43 => { // f32.const
+                pos += 4;
+                stack_depth += 1;
+                result_type = .f32;
+            },
+            0x44 => { // f64.const
+                pos += 8;
+                stack_depth += 1;
+                result_type = .f64;
+            },
+            0xd0 => { // ref.null
+                if (pos < bytes.len) {
+                    const reftype_byte = bytes[pos];
+                    pos += 1;
+                    result_type = if (reftype_byte == 0x6f) .externref else .funcref;
+                } else {
+                    result_type = .funcref;
+                }
+                stack_depth += 1;
+            },
+            0xd2 => { // ref.func
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                stack_depth += 1;
+                result_type = .funcref;
+            },
+            0x23 => { // global.get
+                const idx = readU32(bytes, &pos);
+                // In a global init, can only reference imported immutable globals
+                // with index < the current global being defined
+                if (global_limit) |limit| {
+                    // For global init: only imported immutable globals with index < current
+                    if (idx >= limit or idx >= m.globals.items.len)
+                        return error.InvalidGlobalIndex;
+                    if (!m.globals.items[idx].is_import)
+                        return error.InvalidGlobalIndex;
+                    if (m.globals.items[idx].type.mutability == .mutable)
+                        return error.ConstantExprRequired;
+                } else {
+                    // For data/elem offsets: only imported immutable globals
+                    if (idx >= m.globals.items.len)
+                        return error.InvalidGlobalIndex;
+                    if (!m.globals.items[idx].is_import)
+                        return error.InvalidGlobalIndex;
+                    if (m.globals.items[idx].type.mutability == .mutable)
+                        return error.ConstantExprRequired;
+                }
+                const gt = ValTypeOrUnknown.fromValType(m.globals.items[idx].type.val_type);
+                stack_depth += 1;
+                result_type = gt;
+            },
+            0x0b => break, // end
+            else => {
+                // Any other opcode is not allowed in constant expressions
+                return error.ConstantExprRequired;
+            },
+        }
+    }
+
+    // Must produce exactly one value
+    if (stack_depth == 0) return error.TypeMismatch;
+    if (stack_depth > 1) return error.TypeMismatch;
+
+    // Type must match expected
+    if (!result_type.matches(expected)) return error.TypeMismatch;
+}
+
+// ── Memory alignment validation ─────────────────────────────────────────
+
+/// Return the maximum allowed alignment (as log2) for a memory opcode.
+fn maxAlignmentForOpcode(opcode: u8) ?u32 {
+    return switch (opcode) {
+        0x28 => 2, // i32.load: 4 bytes
+        0x29 => 3, // i64.load: 8 bytes
+        0x2a => 2, // f32.load: 4 bytes
+        0x2b => 3, // f64.load: 8 bytes
+        0x2c, 0x2d => 0, // i32.load8_s/u: 1 byte
+        0x2e, 0x2f => 1, // i32.load16_s/u: 2 bytes
+        0x30, 0x31 => 0, // i64.load8_s/u: 1 byte
+        0x32, 0x33 => 1, // i64.load16_s/u: 2 bytes
+        0x34, 0x35 => 2, // i64.load32_s/u: 4 bytes
+        0x36 => 2, // i32.store
+        0x37 => 3, // i64.store
+        0x38 => 2, // f32.store
+        0x39 => 3, // f64.store
+        0x3a => 0, // i32.store8
+        0x3b => 1, // i32.store16
+        0x3c => 0, // i64.store8
+        0x3d => 1, // i64.store16
+        0x3e => 2, // i64.store32
+        else => null,
+    };
 }
 
 // ── Function body validation ────────────────────────────────────────────
@@ -576,15 +740,17 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                         try checkUnary(&val_stack, &ctrl_stack, input, output, gpa(m));
                     },
                     0x08 => { // memory.init
-                        _ = readU32(bytes, &pos); // data idx
+                        const data_idx = readU32(bytes, &pos);
                         _ = readU32(bytes, &pos); // mem idx
+                        if (data_idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                     },
                     0x09 => { // data.drop
-                        _ = readU32(bytes, &pos);
+                        const idx = readU32(bytes, &pos);
+                        if (idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                     },
                     0x0a => { // memory.copy
                         _ = readU32(bytes, &pos);
@@ -606,7 +772,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                         _ = readU32(bytes, &pos);
                     },
                     0x0d => { // elem.drop
-                        _ = readU32(bytes, &pos);
+                        const idx = readU32(bytes, &pos);
+                        if (idx >= m.elem_segments.items.len) return error.InvalidElemIndex;
                     },
                     0x0e => { // table.copy
                         _ = readU32(bytes, &pos);
@@ -680,9 +847,9 @@ fn readBlockType(m: *const Mod.Module, bytes: []const u8, pos: *usize) BlockType
         pos.* += 1;
         return .{ .params = &.{}, .results = &.{} };
     }
-    // Single value type
-    const as_signed: i8 = @bitCast(byte);
-    if (as_signed < 0) {
+    // Single value type (wasm type bytes: 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64,
+    // 0x70=funcref, 0x6F=externref). All are >= 0x60.
+    if (byte >= 0x60) {
         pos.* += 1;
         return .{ .params = &.{}, .results = valTypeSlice(byte) };
     }
@@ -866,10 +1033,10 @@ test "validate too many memories" {
     defer module.deinit();
     try module.memories.append(std.testing.allocator, .{});
     try module.memories.append(std.testing.allocator, .{});
-    // With multi_memory disabled, two memories should fail
-    try std.testing.expectError(error.TooManyMemories, validate(&module, .{ .features = .{ .multi_memory = false } }));
-    // With multi_memory enabled (now default), should pass
-    try validate(&module, .{});
+    // With multi_memory disabled (default), two memories should fail
+    try std.testing.expectError(error.TooManyMemories, validate(&module, .{}));
+    // With multi_memory enabled, should pass
+    try validate(&module, .{ .features = .{ .multi_memory = true } });
 }
 
 test "validate invalid limits (max < initial)" {
@@ -944,5 +1111,40 @@ test "validate type mismatch via text parser" {
     // (module (func (result i32))) — claims to return i32 but body is empty
     var module = try Parser.parseModule(alloc, "(module (func (result i32)))");
     defer module.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "return with empty operand in store should fail" {
+    const alloc = std.testing.allocator;
+    const TextParser = @import("text/Parser.zig");
+    // (return (i32.store)) — i32.store needs operands, inside return
+    var module = try TextParser.parseModule(alloc,
+        \\(module
+        \\  (memory 1)
+        \\  (func $type-address-empty-in-return
+        \\    (return (i32.store))
+        \\  )
+        \\)
+    );
+    defer module.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "br with empty stack in typed block should fail" {
+    const alloc = std.testing.allocator;
+    // block (result i32), br 0 with empty stack inside → TypeMismatch
+    const bytes = [_]u8{
+        0x02, 0x7f, // block (result i32)
+        0x0c, 0x00, // br 0 — needs i32 but stack is empty inside block
+        0x0b, // end (block)
+        0x0b, // end (function)
+    };
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = &bytes,
+    });
     try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
 }
