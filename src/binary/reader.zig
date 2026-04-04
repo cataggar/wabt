@@ -58,6 +58,14 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
     return module;
 }
 
+/// Safe enum cast: returns null if the integer doesn't match any tag.
+fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E {
+    inline for (@typeInfo(E).@"enum".fields) |field| {
+        if (value == field.value) return @enumFromInt(value);
+    }
+    return null;
+}
+
 // ── Internal reader ─────────────────────────────────────────────────────
 
 const Reader = struct {
@@ -127,7 +135,7 @@ const Reader = struct {
 
     fn readValType(self: *Reader) ReadError!types.ValType {
         const byte = try self.readByte();
-        return std.meta.intToEnum(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) catch
+        return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
     }
 
@@ -209,7 +217,7 @@ const Reader = struct {
 
     fn readTypeSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
-        try self.module.types.ensureTotalCapacity(self.allocator, count);
+        try self.module.module_types.ensureTotalCapacity(self.allocator, count);
         for (0..count) |_| {
             const form_byte = try self.readByte();
             if (form_byte != 0x60) return error.InvalidType; // only func form for now
@@ -223,7 +231,7 @@ const Reader = struct {
             errdefer self.allocator.free(results);
             for (0..num_results) |j| results[j] = try self.readValType();
 
-            self.module.types.appendAssumeCapacity(.{
+            self.module.module_types.appendAssumeCapacity(.{
                 .func_type = .{ .params = params, .results = results },
             });
         }
@@ -235,7 +243,7 @@ const Reader = struct {
             const module_name = try self.readName();
             const field_name = try self.readName();
             const kind_byte = try self.readByte();
-            const kind: types.ExternalKind = std.meta.intToEnum(types.ExternalKind, kind_byte) catch
+            const kind: types.ExternalKind = enumFromIntChecked(types.ExternalKind, kind_byte) orelse
                 return error.InvalidSection;
 
             var import = Mod.Import{
@@ -348,7 +356,7 @@ const Reader = struct {
             const index = try self.readU32();
             try self.module.exports.append(self.allocator, .{
                 .name = exp_name,
-                .kind = std.meta.intToEnum(types.ExternalKind, kind_byte) catch return error.InvalidSection,
+                .kind = enumFromIntChecked(types.ExternalKind, kind_byte) orelse return error.InvalidSection,
                 .var_ = .{ .index = index },
             });
         }
@@ -497,7 +505,7 @@ test "read type section" {
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
-    try std.testing.expectEqual(@as(usize, 1), module.types.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
 }
 
 test "read memory section" {

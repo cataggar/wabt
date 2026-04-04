@@ -13,8 +13,8 @@ pub const WriteError = error{OutOfMemory};
 // ── Public API ──────────────────────────────────────────────────────────
 
 pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var w = Writer{ .buf = std.ArrayList(u8).init(allocator) };
-    errdefer w.buf.deinit();
+    var w = Writer{ .allocator = allocator, .buf = .empty };
+    errdefer w.buf.deinit(allocator);
 
     try w.appendSlice(&reader.magic);
     try w.writeU32LE(reader.version);
@@ -32,22 +32,23 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) Writ
     try w.writeDataSection(module);
     try w.writeCustomSections(module);
 
-    return w.buf.toOwnedSlice();
+    return w.buf.toOwnedSlice(allocator);
 }
 
 // ── Internal writer ─────────────────────────────────────────────────────
 
 const Writer = struct {
+    allocator: std.mem.Allocator,
     buf: std.ArrayList(u8),
 
     // -- primitives --
 
     fn appendByte(self: *Writer, b: u8) WriteError!void {
-        try self.buf.append(self.buf.allocator, b);
+        try self.buf.append(self.allocator, b);
     }
 
     fn appendSlice(self: *Writer, s: []const u8) WriteError!void {
-        try self.buf.appendSlice(self.buf.allocator, s);
+        try self.buf.appendSlice(self.allocator, s);
     }
 
     fn writeU32LE(self: *Writer, v: u32) WriteError!void {
@@ -119,10 +120,10 @@ const Writer = struct {
     // -- sections --
 
     fn writeTypeSection(self: *Writer, module: *const Mod.Module) WriteError!void {
-        if (module.types.items.len == 0) return;
+        if (module.module_types.items.len == 0) return;
         const ph = try self.beginSection(1);
-        try self.writeU32Leb(@intCast(module.types.items.len));
-        for (module.types.items) |entry| {
+        try self.writeU32Leb(@intCast(module.module_types.items.len));
+        for (module.module_types.items) |entry| {
             switch (entry) {
                 .func_type => |ft| {
                     try self.appendByte(0x60);
@@ -371,7 +372,7 @@ test "round-trip type section" {
 
     // Should contain type section
     try std.testing.expect(output.len > 8);
-    try std.testing.expectEqual(@as(usize, 1), module.types.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
 }
 
 test "round-trip memory section" {

@@ -51,10 +51,10 @@ fn checkTypes(m: *const Mod.Module) Error!void {
     for (m.module_types.items) |entry| {
         switch (entry) {
             .func_type => |ft| {
-                for (ft.params.items) |p| {
+                for (ft.params) |p| {
                     if (!p.isNumType() and !p.isRefType()) return error.InvalidTypeIndex;
                 }
-                for (ft.results.items) |r| {
+                for (ft.results) |r| {
                     if (!r.isNumType() and !r.isRefType()) return error.InvalidTypeIndex;
                 }
             },
@@ -148,7 +148,7 @@ fn checkStart(m: *const Mod.Module) Error!void {
         const entry = m.module_types.items[func.decl.type_var.index];
         switch (entry) {
             .func_type => |ft| {
-                if (ft.params.items.len != 0 or ft.results.items.len != 0)
+                if (ft.params.len != 0 or ft.results.len != 0)
                     return error.InvalidStart;
             },
             else => {},
@@ -244,12 +244,9 @@ test "validate start function must be nullary" {
     var module = Mod.Module.init(alloc);
     defer module.deinit();
     // Add a type (i32) -> ()
-    var sig = Mod.FuncSignature.init(alloc);
-    try sig.params.append(alloc, .i32);
-    try module.module_types.append(alloc, .{ .func_type = sig });
-    // module.deinit frees module_types list but not inner FuncSignature,
-    // so we need to track it for cleanup
-    defer module.module_types.items[0].func_type.params.deinit(alloc);
+    const params = try alloc.alloc(types.ValType, 1);
+    params[0] = .i32;
+    try module.module_types.append(alloc, .{ .func_type = .{ .params = params } });
     try module.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
     module.start_var = .{ .index = 0 };
     try std.testing.expectError(error.InvalidStart, validate(&module, .{}));

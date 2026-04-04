@@ -127,28 +127,14 @@ pub const ExprType = enum {
 
 // ── FuncSignature ────────────────────────────────────────────────────────
 
-/// Owned function signature (parameter and result types with allocator).
+/// Owned function signature (parameter and result types).
 pub const FuncSignature = struct {
-    allocator: std.mem.Allocator,
-    params: std.ArrayList(types.ValType),
-    results: std.ArrayList(types.ValType),
-
-    pub fn init(allocator: std.mem.Allocator) FuncSignature {
-        return .{
-            .allocator = allocator,
-            .params = .empty,
-            .results = .empty,
-        };
-    }
-
-    pub fn deinit(self: *FuncSignature) void {
-        self.params.deinit(self.allocator);
-        self.results.deinit(self.allocator);
-    }
+    params: []const types.ValType = &.{},
+    results: []const types.ValType = &.{},
 
     pub fn eql(a: FuncSignature, b: FuncSignature) bool {
-        return std.mem.eql(types.ValType, a.params.items, b.params.items) and
-            std.mem.eql(types.ValType, a.results.items, b.results.items);
+        return std.mem.eql(types.ValType, a.params, b.params) and
+            std.mem.eql(types.ValType, a.results, b.results);
     }
 };
 
@@ -310,6 +296,15 @@ pub const Module = struct {
     }
 
     pub fn deinit(self: *Module) void {
+        for (self.module_types.items) |entry| {
+            switch (entry) {
+                .func_type => |ft| {
+                    if (ft.params.len > 0) self.allocator.free(ft.params);
+                    if (ft.results.len > 0) self.allocator.free(ft.results);
+                },
+                else => {},
+            }
+        }
         self.module_types.deinit(self.allocator);
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
@@ -415,17 +410,11 @@ test "Module getExport" {
 }
 
 test "FuncSignature eql" {
-    var a = FuncSignature.init(std.testing.allocator);
-    defer a.deinit();
-    var b = FuncSignature.init(std.testing.allocator);
-    defer b.deinit();
-    try std.testing.expect(a.eql(b));
-
-    try a.params.append(a.allocator, .i32);
+    const a = FuncSignature{ .params = &.{.i32}, .results = &.{} };
+    const b = FuncSignature{ .params = &.{}, .results = &.{} };
+    const c = FuncSignature{ .params = &.{.i32}, .results = &.{} };
     try std.testing.expect(!a.eql(b));
-
-    try b.params.append(b.allocator, .i32);
-    try std.testing.expect(a.eql(b));
+    try std.testing.expect(a.eql(c));
 }
 
 test "Module import helpers" {

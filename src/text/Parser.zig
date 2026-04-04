@@ -124,10 +124,10 @@ const Parser = struct {
     }
 
     fn parseFuncSig(self: *Parser, module: *Mod.Module) ParseError!struct { params: []const types.ValType, results: []const types.ValType } {
-        var params = std.ArrayList(types.ValType).init(self.allocator);
-        errdefer params.deinit();
-        var results = std.ArrayList(types.ValType).init(self.allocator);
-        errdefer results.deinit();
+        var params: std.ArrayList(types.ValType) = .empty;
+        errdefer params.deinit(self.allocator);
+        var results: std.ArrayList(types.ValType) = .empty;
+        errdefer results.deinit(self.allocator);
 
         while (self.peek().kind == .l_paren) {
             _ = self.advance();
@@ -154,8 +154,8 @@ const Parser = struct {
 
         _ = module;
         return .{
-            .params = try params.toOwnedSlice(),
-            .results = try results.toOwnedSlice(),
+            .params = try params.toOwnedSlice(self.allocator),
+            .results = try results.toOwnedSlice(self.allocator),
         };
     }
 
@@ -168,7 +168,7 @@ const Parser = struct {
         try self.expect(.kw_func);
         const sig = try self.parseFuncSig(module);
         try self.expect(.r_paren);
-        try module.types.append(self.allocator, .{
+        try module.module_types.append(self.allocator, .{
             .func_type = .{ .params = sig.params, .results = sig.results },
         });
     }
@@ -502,7 +502,7 @@ test "parse module with type" {
         \\)
     );
     defer module.deinit();
-    try std.testing.expectEqual(@as(usize, 1), module.types.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
 }
 
 test "parse module with import" {
