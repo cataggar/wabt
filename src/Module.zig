@@ -190,6 +190,227 @@ pub const Export = struct {
     var_: Var,
 };
 
+// ── Instruction ──────────────────────────────────────────────────────────
+
+/// A parsed WebAssembly instruction.
+pub const Instruction = union(enum) {
+    // Control
+    @"unreachable": void,
+    nop: void,
+    block: BlockType,
+    loop: BlockType,
+    @"if": BlockType,
+    @"else": void,
+    end: void,
+    br: u32,
+    br_if: u32,
+    br_table: BrTable,
+    @"return": void,
+    call: u32,
+    call_indirect: struct { type_index: u32, table_index: u32 },
+
+    // Parametric
+    drop: void,
+    select: void,
+
+    // Variable
+    local_get: u32,
+    local_set: u32,
+    local_tee: u32,
+    global_get: u32,
+    global_set: u32,
+
+    // Memory
+    i32_load: MemArg,
+    i64_load: MemArg,
+    f32_load: MemArg,
+    f64_load: MemArg,
+    i32_load8_s: MemArg,
+    i32_load8_u: MemArg,
+    i32_load16_s: MemArg,
+    i32_load16_u: MemArg,
+    i64_load8_s: MemArg,
+    i64_load8_u: MemArg,
+    i64_load16_s: MemArg,
+    i64_load16_u: MemArg,
+    i64_load32_s: MemArg,
+    i64_load32_u: MemArg,
+    i32_store: MemArg,
+    i64_store: MemArg,
+    f32_store: MemArg,
+    f64_store: MemArg,
+    i32_store8: MemArg,
+    i32_store16: MemArg,
+    i64_store8: MemArg,
+    i64_store16: MemArg,
+    i64_store32: MemArg,
+    memory_size: u32,
+    memory_grow: u32,
+
+    // Constants
+    i32_const: i32,
+    i64_const: i64,
+    f32_const: u32,
+    f64_const: u64,
+
+    // Comparison i32
+    i32_eqz: void,
+    i32_eq: void,
+    i32_ne: void,
+    i32_lt_s: void,
+    i32_lt_u: void,
+    i32_gt_s: void,
+    i32_gt_u: void,
+    i32_le_s: void,
+    i32_le_u: void,
+    i32_ge_s: void,
+    i32_ge_u: void,
+
+    // Comparison i64
+    i64_eqz: void,
+    i64_eq: void,
+    i64_ne: void,
+    i64_lt_s: void,
+    i64_lt_u: void,
+    i64_gt_s: void,
+    i64_gt_u: void,
+    i64_le_s: void,
+    i64_le_u: void,
+    i64_ge_s: void,
+    i64_ge_u: void,
+
+    // Arithmetic i32
+    i32_clz: void,
+    i32_ctz: void,
+    i32_popcnt: void,
+    i32_add: void,
+    i32_sub: void,
+    i32_mul: void,
+    i32_div_s: void,
+    i32_div_u: void,
+    i32_rem_s: void,
+    i32_rem_u: void,
+    i32_and: void,
+    i32_or: void,
+    i32_xor: void,
+    i32_shl: void,
+    i32_shr_s: void,
+    i32_shr_u: void,
+    i32_rotl: void,
+    i32_rotr: void,
+
+    // Arithmetic i64
+    i64_clz: void,
+    i64_ctz: void,
+    i64_popcnt: void,
+    i64_add: void,
+    i64_sub: void,
+    i64_mul: void,
+    i64_div_s: void,
+    i64_div_u: void,
+    i64_rem_s: void,
+    i64_rem_u: void,
+    i64_and: void,
+    i64_or: void,
+    i64_xor: void,
+    i64_shl: void,
+    i64_shr_s: void,
+    i64_shr_u: void,
+    i64_rotl: void,
+    i64_rotr: void,
+
+    // F32 arithmetic
+    f32_abs: void,
+    f32_neg: void,
+    f32_ceil: void,
+    f32_floor: void,
+    f32_trunc: void,
+    f32_nearest: void,
+    f32_sqrt: void,
+    f32_add: void,
+    f32_sub: void,
+    f32_mul: void,
+    f32_div: void,
+    f32_min: void,
+    f32_max: void,
+    f32_copysign: void,
+
+    // F64 arithmetic
+    f64_abs: void,
+    f64_neg: void,
+    f64_ceil: void,
+    f64_floor: void,
+    f64_trunc: void,
+    f64_nearest: void,
+    f64_sqrt: void,
+    f64_add: void,
+    f64_sub: void,
+    f64_mul: void,
+    f64_div: void,
+    f64_min: void,
+    f64_max: void,
+    f64_copysign: void,
+
+    // F32/F64 comparison
+    f32_eq: void, f32_ne: void, f32_lt: void, f32_gt: void, f32_le: void, f32_ge: void,
+    f64_eq: void, f64_ne: void, f64_lt: void, f64_gt: void, f64_le: void, f64_ge: void,
+
+    // Conversions
+    i32_wrap_i64: void,
+    i32_trunc_f32_s: void,
+    i32_trunc_f32_u: void,
+    i32_trunc_f64_s: void,
+    i32_trunc_f64_u: void,
+    i64_extend_i32_s: void,
+    i64_extend_i32_u: void,
+    i64_trunc_f32_s: void,
+    i64_trunc_f32_u: void,
+    i64_trunc_f64_s: void,
+    i64_trunc_f64_u: void,
+    f32_convert_i32_s: void,
+    f32_convert_i32_u: void,
+    f32_convert_i64_s: void,
+    f32_convert_i64_u: void,
+    f32_demote_f64: void,
+    f64_convert_i32_s: void,
+    f64_convert_i32_u: void,
+    f64_convert_i64_s: void,
+    f64_convert_i64_u: void,
+    f64_promote_f32: void,
+    i32_reinterpret_f32: void,
+    i64_reinterpret_f64: void,
+    f32_reinterpret_i32: void,
+    f64_reinterpret_i64: void,
+
+    // Sign extension
+    i32_extend8_s: void,
+    i32_extend16_s: void,
+    i64_extend8_s: void,
+    i64_extend16_s: void,
+    i64_extend32_s: void,
+
+    // Reference types
+    ref_null: types.ValType,
+    ref_is_null: void,
+    ref_func: u32,
+
+    pub const MemArg = struct {
+        align_: u32,
+        offset: u32,
+    };
+
+    pub const BlockType = union(enum) {
+        empty: void,
+        val_type: types.ValType,
+        type_index: u32,
+    };
+
+    pub const BrTable = struct {
+        targets: []const u32,
+        default_target: u32,
+    };
+};
+
 // ── Entities ─────────────────────────────────────────────────────────────
 
 /// A defined or imported function.
@@ -197,6 +418,7 @@ pub const Func = struct {
     name: ?[]const u8 = null,
     decl: FuncDeclaration = .{},
     local_types: std.ArrayList(types.ValType) = .empty,
+    instructions: std.ArrayList(Instruction) = .empty,
     loc: Location = .{},
     is_import: bool = false,
 };
@@ -306,6 +528,16 @@ pub const Module = struct {
             }
         }
         self.module_types.deinit(self.allocator);
+        for (self.funcs.items) |*func| {
+            func.local_types.deinit(self.allocator);
+            for (func.instructions.items) |instr| {
+                switch (instr) {
+                    .br_table => |bt| self.allocator.free(bt.targets),
+                    else => {},
+                }
+            }
+            func.instructions.deinit(self.allocator);
+        }
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.memories.deinit(self.allocator);

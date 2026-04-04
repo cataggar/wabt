@@ -202,23 +202,563 @@ const CW = struct {
         }
         try self.append("}\n\n");
 
-        // Functions (stubs for defined functions)
+        // Functions
         const fstart = module.num_func_imports;
         if (fstart < module.funcs.items.len) {
-            try self.append("/* Functions (stubs) */\n");
+            try self.append("/* Functions */\n");
             for (module.funcs.items[fstart..], 0..) |_, i| {
                 const idx = fstart + @as(u32, @intCast(i));
+                const func = &module.funcs.items[idx];
                 const sig = getFuncSig(module, idx);
-                try self.writeCReturnType(sig.results);
-                try self.appendByte(' ');
-                try self.append(name);
-                try self.append("_func_");
-                try self.writeU32(idx);
-                try self.appendByte('(');
-                try self.writeCParams(sig.params);
-                try self.append(") {\n  /* TODO: instruction translation */\n}\n\n");
+                try self.emitFuncBody(module, func, name, idx, sig);
             }
         }
+    }
+
+    fn emitFuncBody(
+        self: *CW,
+        module: *const Mod.Module,
+        func: *const Mod.Func,
+        mod_name: []const u8,
+        func_idx: u32,
+        sig: types.FuncType,
+    ) WriteError!void {
+        // Signature
+        try self.writeCReturnType(sig.results);
+        try self.appendByte(' ');
+        try self.append(mod_name);
+        try self.append("_func_");
+        try self.writeU32(func_idx);
+        try self.appendByte('(');
+        if (sig.params.len == 0) {
+            try self.append("void");
+        } else {
+            for (sig.params, 0..) |p, i| {
+                if (i > 0) try self.append(", ");
+                try self.append(valTypeToCType(p));
+                try self.append(" p");
+                try self.writeU32(@intCast(i));
+            }
+        }
+        try self.append(") {\n");
+
+        if (func.instructions.items.len == 0) {
+            if (sig.results.len > 0) {
+                try self.append("  return 0;\n");
+            }
+            try self.append("}\n\n");
+            return;
+        }
+
+        // Declare locals
+        for (func.local_types.items, 0..) |lt, i| {
+            try self.append("  ");
+            try self.append(valTypeToCType(lt));
+            try self.append(" l");
+            try self.writeU32(@intCast(sig.params.len + i));
+            try self.append(" = 0;\n");
+        }
+
+        // Stack
+        try self.append("  uint32_t sp = 0;\n");
+        try self.append("  uint64_t stack[1024];\n");
+
+        var label_count: u32 = 0;
+        for (func.instructions.items) |instr| {
+            switch (instr) {
+                // Control
+                .@"unreachable" => try self.append("  wasm_rt_trap(WASM_RT_TRAP_UNREACHABLE);\n"),
+                .nop => {},
+                .block => {
+                    label_count += 1;
+                    try self.append("  /* block */ {\n");
+                },
+                .loop => {
+                    label_count += 1;
+                    try self.append("  L");
+                    try self.writeU32(label_count);
+                    try self.append(": /* loop */ {\n");
+                },
+                .@"if" => {
+                    label_count += 1;
+                    try self.append("  if (stack[--sp]) {\n");
+                },
+                .@"else" => try self.append("  } else {\n"),
+                .end => try self.append("  }\n"),
+                .br => |depth| {
+                    if (depth < label_count) {
+                        try self.append("  goto L");
+                        try self.writeU32(label_count - depth);
+                        try self.append(";\n");
+                    }
+                },
+                .br_if => |depth| {
+                    if (depth < label_count) {
+                        try self.append("  if (stack[--sp]) goto L");
+                        try self.writeU32(label_count - depth);
+                        try self.append(";\n");
+                    } else {
+                        try self.append("  if (stack[--sp]) { /* br_if */ }\n");
+                    }
+                },
+                .br_table => try self.append("  /* br_table */ sp--;\n"),
+                .@"return" => {
+                    if (sig.results.len > 0) {
+                        try self.append("  return (");
+                        try self.append(valTypeToCType(sig.results[0]));
+                        try self.append(")stack[--sp];\n");
+                    } else {
+                        try self.append("  return;\n");
+                    }
+                },
+                .call => |idx| {
+                    const callee_sig = getFuncSig(module, idx);
+                    if (callee_sig.results.len > 0) {
+                        try self.append("  stack[sp++] = (uint64_t)");
+                    } else {
+                        try self.append("  ");
+                    }
+                    try self.append(mod_name);
+                    try self.append("_func_");
+                    try self.writeU32(idx);
+                    try self.appendByte('(');
+                    if (callee_sig.params.len > 0) {
+                        // Pop args in reverse
+                        try self.append("/* args from stack */ ");
+                        var pi: usize = callee_sig.params.len;
+                        while (pi > 0) {
+                            pi -= 1;
+                            if (pi < callee_sig.params.len - 1) try self.append(", ");
+                            try self.appendByte('(');
+                            try self.append(valTypeToCType(callee_sig.params[pi]));
+                            try self.append(")stack[--sp]");
+                        }
+                    }
+                    try self.append(");\n");
+                },
+                .call_indirect => try self.append("  /* call_indirect */ (void)0;\n"),
+
+                // Parametric
+                .drop => try self.append("  --sp;\n"),
+                .select => try self.append("  { uint32_t c = (uint32_t)stack[--sp]; uint64_t b = stack[--sp]; uint64_t a = stack[--sp]; stack[sp++] = c ? a : b; }\n"),
+
+                // Variable
+                .local_get => |idx| {
+                    try self.append("  stack[sp++] = (uint64_t)");
+                    try self.emitLocalRef(idx, sig.params.len);
+                    try self.append(";\n");
+                },
+                .local_set => |idx| {
+                    try self.append("  ");
+                    try self.emitLocalRef(idx, sig.params.len);
+                    try self.append(" = (");
+                    try self.append(self.localCType(func, idx, sig));
+                    try self.append(")stack[--sp];\n");
+                },
+                .local_tee => |idx| {
+                    try self.append("  ");
+                    try self.emitLocalRef(idx, sig.params.len);
+                    try self.append(" = (");
+                    try self.append(self.localCType(func, idx, sig));
+                    try self.append(")stack[sp - 1];\n");
+                },
+                .global_get => |idx| {
+                    try self.append("  stack[sp++] = (uint64_t)global_");
+                    try self.writeU32(idx);
+                    try self.append(";\n");
+                },
+                .global_set => |idx| {
+                    try self.append("  global_");
+                    try self.writeU32(idx);
+                    try self.append(" = stack[--sp];\n");
+                },
+
+                // Memory load
+                .i32_load => |ma| try self.emitLoad("uint32_t", "uint32_t", 4, ma),
+                .i64_load => |ma| try self.emitLoad("uint64_t", "uint64_t", 8, ma),
+                .f32_load => |ma| try self.emitLoad("float", "float", 4, ma),
+                .f64_load => |ma| try self.emitLoad("double", "double", 8, ma),
+                .i32_load8_s => |ma| try self.emitLoad("int8_t", "uint32_t", 1, ma),
+                .i32_load8_u => |ma| try self.emitLoad("uint8_t", "uint32_t", 1, ma),
+                .i32_load16_s => |ma| try self.emitLoad("int16_t", "uint32_t", 2, ma),
+                .i32_load16_u => |ma| try self.emitLoad("uint16_t", "uint32_t", 2, ma),
+                .i64_load8_s => |ma| try self.emitLoad("int8_t", "uint64_t", 1, ma),
+                .i64_load8_u => |ma| try self.emitLoad("uint8_t", "uint64_t", 1, ma),
+                .i64_load16_s => |ma| try self.emitLoad("int16_t", "uint64_t", 2, ma),
+                .i64_load16_u => |ma| try self.emitLoad("uint16_t", "uint64_t", 2, ma),
+                .i64_load32_s => |ma| try self.emitLoad("int32_t", "uint64_t", 4, ma),
+                .i64_load32_u => |ma| try self.emitLoad("uint32_t", "uint64_t", 4, ma),
+
+                // Memory store
+                .i32_store => |ma| try self.emitStore("uint32_t", 4, ma),
+                .i64_store => |ma| try self.emitStore("uint64_t", 8, ma),
+                .f32_store => |ma| try self.emitStore("float", 4, ma),
+                .f64_store => |ma| try self.emitStore("double", 8, ma),
+                .i32_store8 => |ma| try self.emitStore("uint8_t", 1, ma),
+                .i32_store16 => |ma| try self.emitStore("uint16_t", 2, ma),
+                .i64_store8 => |ma| try self.emitStore("uint8_t", 1, ma),
+                .i64_store16 => |ma| try self.emitStore("uint16_t", 2, ma),
+                .i64_store32 => |ma| try self.emitStore("uint32_t", 4, ma),
+
+                .memory_size => |idx| {
+                    try self.append("  stack[sp++] = (uint64_t)(memory_");
+                    try self.writeU32(idx);
+                    try self.append(".size / 65536);\n");
+                },
+                .memory_grow => |idx| {
+                    try self.append("  { uint32_t pages = (uint32_t)stack[--sp]; stack[sp++] = (uint64_t)wasm_rt_grow_memory(&memory_");
+                    try self.writeU32(idx);
+                    try self.append(", pages); }\n");
+                },
+
+                // Constants
+                .i32_const => |v| {
+                    try self.append("  stack[sp++] = (uint64_t)(uint32_t)");
+                    try self.writeS32(v);
+                    try self.append(";\n");
+                },
+                .i64_const => |v| {
+                    try self.append("  stack[sp++] = (uint64_t)");
+                    try self.writeS64(v);
+                    try self.append(";\n");
+                },
+                .f32_const => |v| {
+                    try self.append("  { union { uint32_t i; float f; } u; u.i = ");
+                    try self.writeU32(v);
+                    try self.append("u; memcpy(&stack[sp], &u.f, 4); sp++; }\n");
+                },
+                .f64_const => |v| {
+                    try self.append("  { union { uint64_t i; double f; } u; u.i = ");
+                    try self.writeU64(v);
+                    try self.append("ull; memcpy(&stack[sp], &u.f, 8); sp++; }\n");
+                },
+
+                // i32 comparison
+                .i32_eqz => try self.emitUnary32("stack[sp - 1] = ((uint32_t)stack[sp - 1] == 0)"),
+                .i32_eq => try self.emitBinop32("=="),
+                .i32_ne => try self.emitBinop32("!="),
+                .i32_lt_s => try self.emitBinopS32("<"),
+                .i32_lt_u => try self.emitBinop32("<"),
+                .i32_gt_s => try self.emitBinopS32(">"),
+                .i32_gt_u => try self.emitBinop32(">"),
+                .i32_le_s => try self.emitBinopS32("<="),
+                .i32_le_u => try self.emitBinop32("<="),
+                .i32_ge_s => try self.emitBinopS32(">="),
+                .i32_ge_u => try self.emitBinop32(">="),
+
+                // i64 comparison
+                .i64_eqz => try self.emitUnary64("stack[sp - 1] = (stack[sp - 1] == 0)"),
+                .i64_eq => try self.emitBinop64("=="),
+                .i64_ne => try self.emitBinop64("!="),
+                .i64_lt_s => try self.emitBinopS64("<"),
+                .i64_lt_u => try self.emitBinop64("<"),
+                .i64_gt_s => try self.emitBinopS64(">"),
+                .i64_gt_u => try self.emitBinop64(">"),
+                .i64_le_s => try self.emitBinopS64("<="),
+                .i64_le_u => try self.emitBinop64("<="),
+                .i64_ge_s => try self.emitBinopS64(">="),
+                .i64_ge_u => try self.emitBinop64(">="),
+
+                // i32 arithmetic
+                .i32_clz => try self.emitUnary32("stack[sp - 1] = (uint64_t)__builtin_clz((uint32_t)stack[sp - 1])"),
+                .i32_ctz => try self.emitUnary32("stack[sp - 1] = (uint64_t)__builtin_ctz((uint32_t)stack[sp - 1])"),
+                .i32_popcnt => try self.emitUnary32("stack[sp - 1] = (uint64_t)__builtin_popcount((uint32_t)stack[sp - 1])"),
+                .i32_add => try self.emitArith32("+"),
+                .i32_sub => try self.emitArith32("-"),
+                .i32_mul => try self.emitArith32("*"),
+                .i32_div_s => try self.emitArithS32("/"),
+                .i32_div_u => try self.emitArith32("/"),
+                .i32_rem_s => try self.emitArithS32("%"),
+                .i32_rem_u => try self.emitArith32("%"),
+                .i32_and => try self.emitArith32("&"),
+                .i32_or => try self.emitArith32("|"),
+                .i32_xor => try self.emitArith32("^"),
+                .i32_shl => try self.emitArith32("<<"),
+                .i32_shr_s => try self.emitArithS32(">>"),
+                .i32_shr_u => try self.emitArith32(">>"),
+                .i32_rotl => try self.append("  { uint32_t b = (uint32_t)stack[--sp] & 31; uint32_t a = (uint32_t)stack[--sp]; stack[sp++] = (uint64_t)((a << b) | (a >> (32 - b))); }\n"),
+                .i32_rotr => try self.append("  { uint32_t b = (uint32_t)stack[--sp] & 31; uint32_t a = (uint32_t)stack[--sp]; stack[sp++] = (uint64_t)((a >> b) | (a << (32 - b))); }\n"),
+
+                // i64 arithmetic
+                .i64_clz => try self.emitUnary64("stack[sp - 1] = (uint64_t)__builtin_clzll(stack[sp - 1])"),
+                .i64_ctz => try self.emitUnary64("stack[sp - 1] = (uint64_t)__builtin_ctzll(stack[sp - 1])"),
+                .i64_popcnt => try self.emitUnary64("stack[sp - 1] = (uint64_t)__builtin_popcountll(stack[sp - 1])"),
+                .i64_add => try self.emitArith64("+"),
+                .i64_sub => try self.emitArith64("-"),
+                .i64_mul => try self.emitArith64("*"),
+                .i64_div_s => try self.emitArithS64("/"),
+                .i64_div_u => try self.emitArith64("/"),
+                .i64_rem_s => try self.emitArithS64("%"),
+                .i64_rem_u => try self.emitArith64("%"),
+                .i64_and => try self.emitArith64("&"),
+                .i64_or => try self.emitArith64("|"),
+                .i64_xor => try self.emitArith64("^"),
+                .i64_shl => try self.emitArith64("<<"),
+                .i64_shr_s => try self.emitArithS64(">>"),
+                .i64_shr_u => try self.emitArith64(">>"),
+                .i64_rotl => try self.append("  { uint64_t b = stack[--sp] & 63; uint64_t a = stack[--sp]; stack[sp++] = (a << b) | (a >> (64 - b)); }\n"),
+                .i64_rotr => try self.append("  { uint64_t b = stack[--sp] & 63; uint64_t a = stack[--sp]; stack[sp++] = (a >> b) | (a << (64 - b)); }\n"),
+
+                // f32 arithmetic
+                .f32_abs => try self.emitFloatUnary("fabsf", "float"),
+                .f32_neg => try self.emitFloatUnary("-", "float"),
+                .f32_ceil => try self.emitFloatUnary("ceilf", "float"),
+                .f32_floor => try self.emitFloatUnary("floorf", "float"),
+                .f32_trunc => try self.emitFloatUnary("truncf", "float"),
+                .f32_nearest => try self.emitFloatUnary("nearbyintf", "float"),
+                .f32_sqrt => try self.emitFloatUnary("sqrtf", "float"),
+                .f32_add => try self.emitFloatBinop("+", "float"),
+                .f32_sub => try self.emitFloatBinop("-", "float"),
+                .f32_mul => try self.emitFloatBinop("*", "float"),
+                .f32_div => try self.emitFloatBinop("/", "float"),
+                .f32_min => try self.emitFloatBinop("fminf", "float"),
+                .f32_max => try self.emitFloatBinop("fmaxf", "float"),
+                .f32_copysign => try self.emitFloatBinop("copysignf", "float"),
+
+                // f64 arithmetic
+                .f64_abs => try self.emitFloatUnary("fabs", "double"),
+                .f64_neg => try self.emitFloatUnary("-", "double"),
+                .f64_ceil => try self.emitFloatUnary("ceil", "double"),
+                .f64_floor => try self.emitFloatUnary("floor", "double"),
+                .f64_trunc => try self.emitFloatUnary("trunc", "double"),
+                .f64_nearest => try self.emitFloatUnary("nearbyint", "double"),
+                .f64_sqrt => try self.emitFloatUnary("sqrt", "double"),
+                .f64_add => try self.emitFloatBinop("+", "double"),
+                .f64_sub => try self.emitFloatBinop("-", "double"),
+                .f64_mul => try self.emitFloatBinop("*", "double"),
+                .f64_div => try self.emitFloatBinop("/", "double"),
+                .f64_min => try self.emitFloatBinop("fmin", "double"),
+                .f64_max => try self.emitFloatBinop("fmax", "double"),
+                .f64_copysign => try self.emitFloatBinop("copysign", "double"),
+
+                // f32/f64 comparison
+                .f32_eq => try self.emitFloatCmp("==", "float"),
+                .f32_ne => try self.emitFloatCmp("!=", "float"),
+                .f32_lt => try self.emitFloatCmp("<", "float"),
+                .f32_gt => try self.emitFloatCmp(">", "float"),
+                .f32_le => try self.emitFloatCmp("<=", "float"),
+                .f32_ge => try self.emitFloatCmp(">=", "float"),
+                .f64_eq => try self.emitFloatCmp("==", "double"),
+                .f64_ne => try self.emitFloatCmp("!=", "double"),
+                .f64_lt => try self.emitFloatCmp("<", "double"),
+                .f64_gt => try self.emitFloatCmp(">", "double"),
+                .f64_le => try self.emitFloatCmp("<=", "double"),
+                .f64_ge => try self.emitFloatCmp(">=", "double"),
+
+                // Conversions
+                .i32_wrap_i64 => try self.emitUnary32("stack[sp - 1] = (uint64_t)(uint32_t)stack[sp - 1]"),
+                .i32_trunc_f32_s => try self.emitConvert("int32_t", "float"),
+                .i32_trunc_f32_u => try self.emitConvert("uint32_t", "float"),
+                .i32_trunc_f64_s => try self.emitConvert("int32_t", "double"),
+                .i32_trunc_f64_u => try self.emitConvert("uint32_t", "double"),
+                .i64_extend_i32_s => try self.emitUnary64("stack[sp - 1] = (uint64_t)(int64_t)(int32_t)(uint32_t)stack[sp - 1]"),
+                .i64_extend_i32_u => try self.emitUnary64("stack[sp - 1] = (uint64_t)(uint32_t)stack[sp - 1]"),
+                .i64_trunc_f32_s => try self.emitConvert("int64_t", "float"),
+                .i64_trunc_f32_u => try self.emitConvert("uint64_t", "float"),
+                .i64_trunc_f64_s => try self.emitConvert("int64_t", "double"),
+                .i64_trunc_f64_u => try self.emitConvert("uint64_t", "double"),
+                .f32_convert_i32_s => try self.emitConvert("float", "int32_t"),
+                .f32_convert_i32_u => try self.emitConvert("float", "uint32_t"),
+                .f32_convert_i64_s => try self.emitConvert("float", "int64_t"),
+                .f32_convert_i64_u => try self.emitConvert("float", "uint64_t"),
+                .f32_demote_f64 => try self.emitConvert("float", "double"),
+                .f64_convert_i32_s => try self.emitConvert("double", "int32_t"),
+                .f64_convert_i32_u => try self.emitConvert("double", "uint32_t"),
+                .f64_convert_i64_s => try self.emitConvert("double", "int64_t"),
+                .f64_convert_i64_u => try self.emitConvert("double", "uint64_t"),
+                .f64_promote_f32 => try self.emitConvert("double", "float"),
+                .i32_reinterpret_f32 => try self.append("  { float f; memcpy(&f, &stack[sp-1], 4); uint32_t i; memcpy(&i, &f, 4); stack[sp-1] = (uint64_t)i; }\n"),
+                .i64_reinterpret_f64 => try self.append("  /* i64.reinterpret_f64: no-op on stack */ (void)0;\n"),
+                .f32_reinterpret_i32 => try self.append("  { uint32_t i = (uint32_t)stack[sp-1]; float f; memcpy(&f, &i, 4); memcpy(&stack[sp-1], &f, 4); }\n"),
+                .f64_reinterpret_i64 => try self.append("  /* f64.reinterpret_i64: no-op on stack */ (void)0;\n"),
+
+                // Sign extension
+                .i32_extend8_s => try self.emitUnary32("stack[sp - 1] = (uint64_t)(uint32_t)(int32_t)(int8_t)(uint8_t)(uint32_t)stack[sp - 1]"),
+                .i32_extend16_s => try self.emitUnary32("stack[sp - 1] = (uint64_t)(uint32_t)(int32_t)(int16_t)(uint16_t)(uint32_t)stack[sp - 1]"),
+                .i64_extend8_s => try self.emitUnary64("stack[sp - 1] = (uint64_t)(int64_t)(int8_t)(uint8_t)stack[sp - 1]"),
+                .i64_extend16_s => try self.emitUnary64("stack[sp - 1] = (uint64_t)(int64_t)(int16_t)(uint16_t)stack[sp - 1]"),
+                .i64_extend32_s => try self.emitUnary64("stack[sp - 1] = (uint64_t)(int64_t)(int32_t)(uint32_t)stack[sp - 1]"),
+
+                // Reference types
+                .ref_null => try self.append("  stack[sp++] = 0; /* ref.null */\n"),
+                .ref_is_null => try self.emitUnary32("stack[sp - 1] = (stack[sp - 1] == 0)"),
+                .ref_func => |idx| {
+                    try self.append("  stack[sp++] = (uint64_t)");
+                    try self.writeU32(idx);
+                    try self.append("; /* ref.func */\n");
+                },
+            }
+        }
+
+        // Final return
+        if (sig.results.len > 0) {
+            try self.append("  return (");
+            try self.append(valTypeToCType(sig.results[0]));
+            try self.append(")stack[--sp];\n");
+        }
+        try self.append("}\n\n");
+    }
+
+    // ── Instruction emit helpers ────────────────────────────────────────
+
+    fn emitLocalRef(self: *CW, idx: u32, num_params: usize) WriteError!void {
+        if (idx < num_params) {
+            try self.appendByte('p');
+        } else {
+            try self.appendByte('l');
+        }
+        try self.writeU32(idx);
+    }
+
+    fn localCType(self: *CW, func: *const Mod.Func, idx: u32, sig: types.FuncType) []const u8 {
+        _ = self;
+        if (idx < sig.params.len) {
+            return valTypeToCType(sig.params[idx]);
+        }
+        const local_idx = idx - @as(u32, @intCast(sig.params.len));
+        if (local_idx < func.local_types.items.len) {
+            return valTypeToCType(func.local_types.items[local_idx]);
+        }
+        return "uint32_t";
+    }
+
+    fn emitUnary32(self: *CW, expr: []const u8) WriteError!void {
+        try self.append("  ");
+        try self.append(expr);
+        try self.append(";\n");
+    }
+
+    fn emitUnary64(self: *CW, expr: []const u8) WriteError!void {
+        try self.append("  ");
+        try self.append(expr);
+        try self.append(";\n");
+    }
+
+    fn emitBinop32(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { uint32_t b = (uint32_t)stack[--sp]; uint32_t a = (uint32_t)stack[--sp]; stack[sp++] = (uint64_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitBinopS32(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { int32_t b = (int32_t)(uint32_t)stack[--sp]; int32_t a = (int32_t)(uint32_t)stack[--sp]; stack[sp++] = (uint64_t)(uint32_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitBinop64(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { uint64_t b = stack[--sp]; uint64_t a = stack[--sp]; stack[sp++] = (uint64_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitBinopS64(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { int64_t b = (int64_t)stack[--sp]; int64_t a = (int64_t)stack[--sp]; stack[sp++] = (uint64_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitArith32(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { uint32_t b = (uint32_t)stack[--sp]; uint32_t a = (uint32_t)stack[--sp]; stack[sp++] = (uint64_t)(uint32_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitArithS32(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { int32_t b = (int32_t)(uint32_t)stack[--sp]; int32_t a = (int32_t)(uint32_t)stack[--sp]; stack[sp++] = (uint64_t)(uint32_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitArith64(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { uint64_t b = stack[--sp]; uint64_t a = stack[--sp]; stack[sp++] = (a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitArithS64(self: *CW, op: []const u8) WriteError!void {
+        try self.append("  { int64_t b = (int64_t)stack[--sp]; int64_t a = (int64_t)stack[--sp]; stack[sp++] = (uint64_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitLoad(self: *CW, mem_type: []const u8, result_type: []const u8, size: u32, ma: Mod.Instruction.MemArg) WriteError!void {
+        try self.append("  { uint32_t addr = (uint32_t)stack[--sp] + ");
+        try self.writeU32(ma.offset);
+        try self.append("u; ");
+        try self.append(mem_type);
+        try self.append(" val; memcpy(&val, memory_0.data + addr, ");
+        try self.writeU32(size);
+        try self.append("); stack[sp++] = (uint64_t)(");
+        try self.append(result_type);
+        try self.append(")val; }\n");
+    }
+
+    fn emitStore(self: *CW, mem_type: []const u8, size: u32, ma: Mod.Instruction.MemArg) WriteError!void {
+        try self.append("  { ");
+        try self.append(mem_type);
+        try self.append(" val = (");
+        try self.append(mem_type);
+        try self.append(")stack[--sp]; uint32_t addr = (uint32_t)stack[--sp] + ");
+        try self.writeU32(ma.offset);
+        try self.append("u; memcpy(memory_0.data + addr, &val, ");
+        try self.writeU32(size);
+        try self.append("); }\n");
+    }
+
+    fn emitFloatUnary(self: *CW, func_name: []const u8, ftype: []const u8) WriteError!void {
+        try self.append("  { ");
+        try self.append(ftype);
+        try self.append(" a; memcpy(&a, &stack[sp-1], sizeof(a)); a = ");
+        // Check if it's a prefix operator (like -)
+        if (func_name[0] == '-') {
+            try self.append("-a");
+        } else {
+            try self.append(func_name);
+            try self.append("(a)");
+        }
+        try self.append("; memcpy(&stack[sp-1], &a, sizeof(a)); }\n");
+    }
+
+    fn emitFloatBinop(self: *CW, op: []const u8, ftype: []const u8) WriteError!void {
+        try self.append("  { ");
+        try self.append(ftype);
+        try self.append(" b; memcpy(&b, &stack[--sp], sizeof(b)); ");
+        try self.append(ftype);
+        try self.append(" a; memcpy(&a, &stack[--sp], sizeof(a)); ");
+        // Check if it's a function call or operator
+        if (std.ascii.isAlphabetic(op[0])) {
+            try self.append(ftype);
+            try self.append(" r = ");
+            try self.append(op);
+            try self.append("(a, b)");
+        } else {
+            try self.append(ftype);
+            try self.append(" r = a ");
+            try self.append(op);
+            try self.append(" b");
+        }
+        try self.append("; memcpy(&stack[sp++], &r, sizeof(r)); }\n");
+    }
+
+    fn emitFloatCmp(self: *CW, op: []const u8, ftype: []const u8) WriteError!void {
+        try self.append("  { ");
+        try self.append(ftype);
+        try self.append(" b; memcpy(&b, &stack[--sp], sizeof(b)); ");
+        try self.append(ftype);
+        try self.append(" a; memcpy(&a, &stack[--sp], sizeof(a)); stack[sp++] = (uint64_t)(a ");
+        try self.append(op);
+        try self.append(" b); }\n");
+    }
+
+    fn emitConvert(self: *CW, to_type: []const u8, from_type: []const u8) WriteError!void {
+        try self.append("  { ");
+        try self.append(from_type);
+        try self.append(" v; memcpy(&v, &stack[sp-1], sizeof(v)); ");
+        try self.append(to_type);
+        try self.append(" r = (");
+        try self.append(to_type);
+        try self.append(")v; stack[sp-1] = 0; memcpy(&stack[sp-1], &r, sizeof(r)); }\n");
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -242,6 +782,18 @@ const CW = struct {
     }
 
     fn writeU64(self: *CW, v: u64) WriteError!void {
+        var tmp: [24]u8 = undefined;
+        const result = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+        try self.append(result);
+    }
+
+    fn writeS32(self: *CW, v: i32) WriteError!void {
+        var tmp: [16]u8 = undefined;
+        const result = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
+        try self.append(result);
+    }
+
+    fn writeS64(self: *CW, v: i64) WriteError!void {
         var tmp: [24]u8 = undefined;
         const result = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
         try self.append(result);
@@ -367,7 +919,7 @@ test "source with function stub" {
     const src = try writeSource(alloc, &module, "mod");
     defer alloc.free(src);
     try std.testing.expect(std.mem.indexOf(u8, src, "mod_func_0") != null);
-    try std.testing.expect(std.mem.indexOf(u8, src, "TODO: instruction translation") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "void mod_func_0(void)") != null);
 }
 
 test "valTypeToCType mapping" {
@@ -377,4 +929,122 @@ test "valTypeToCType mapping" {
     try std.testing.expectEqualStrings("double", valTypeToCType(.f64));
     try std.testing.expectEqualStrings("wasm_rt_funcref_t", valTypeToCType(.funcref));
     try std.testing.expectEqualStrings("wasm_rt_externref_t", valTypeToCType(.externref));
+}
+
+test "source with i32.add instructions" {
+    const alloc = std.testing.allocator;
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+
+    // Type: (i32, i32) -> i32
+    const params = try alloc.alloc(types.ValType, 2);
+    params[0] = .i32;
+    params[1] = .i32;
+    const results = try alloc.alloc(types.ValType, 1);
+    results[0] = .i32;
+    try module.module_types.append(alloc, .{ .func_type = .{ .params = params, .results = results } });
+
+    // Function with instructions
+    var func = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } } };
+    try func.instructions.append(alloc, .{ .local_get = 0 });
+    try func.instructions.append(alloc, .{ .local_get = 1 });
+    try func.instructions.append(alloc, .{ .i32_add = {} });
+    try func.instructions.append(alloc, .{ .end = {} });
+    try module.funcs.append(alloc, func);
+
+    const src = try writeSource(alloc, &module, "w2c");
+    defer alloc.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "uint32_t w2c_func_0(uint32_t p0, uint32_t p1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "stack[sp++] = (uint64_t)p0;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "stack[sp++] = (uint64_t)p1;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "a + b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "return (uint32_t)stack[--sp];") != null);
+}
+
+test "source with i32.const instruction" {
+    const alloc = std.testing.allocator;
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+
+    const params = try alloc.alloc(types.ValType, 0);
+    const results = try alloc.alloc(types.ValType, 1);
+    results[0] = .i32;
+    try module.module_types.append(alloc, .{ .func_type = .{ .params = params, .results = results } });
+
+    var func = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } } };
+    try func.instructions.append(alloc, .{ .i32_const = 42 });
+    try func.instructions.append(alloc, .{ .end = {} });
+    try module.funcs.append(alloc, func);
+
+    const src = try writeSource(alloc, &module, "w2c");
+    defer alloc.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "(uint32_t)42") != null);
+}
+
+test "binary read and CWriter for add function" {
+    const alloc = std.testing.allocator;
+    // (module (type (func (param i32 i32) (result i32)))
+    //  (func (type 0) local.get 0 local.get 1 i32.add)
+    //  (export "add" (func 0)))
+    const add_wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 1 type (i32,i32)->i32
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        // function section: 1 func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: "add" -> func 0
+        0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00,
+        // code section: 1 body
+        0x0a, 0x09, 0x01, // code section id=10, size=9, 1 body
+        0x07, // body size=7
+        0x00, // 0 locals
+        0x20, 0x00, // local.get 0
+        0x20, 0x01, // local.get 1
+        0x6a, // i32.add
+        0x0b, // end
+    };
+
+    var module = try @import("binary/reader.zig").readModule(alloc, &add_wasm);
+    defer module.deinit();
+
+    // Verify instructions parsed
+    try std.testing.expectEqual(@as(usize, 1), module.funcs.items.len);
+    const func = &module.funcs.items[0];
+    try std.testing.expect(func.instructions.items.len >= 3);
+
+    // Generate C source
+    const src = try writeSource(alloc, &module, "w2c");
+    defer alloc.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "#include") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "w2c_func_0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "uint32_t p0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "a + b") != null);
+}
+
+test "source with memory load/store" {
+    const alloc = std.testing.allocator;
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+
+    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 1 } } });
+
+    const params = try alloc.alloc(types.ValType, 0);
+    const results = try alloc.alloc(types.ValType, 0);
+    try module.module_types.append(alloc, .{ .func_type = .{ .params = params, .results = results } });
+
+    var func = Mod.Func{ .decl = .{ .type_var = .{ .index = 0 } } };
+    try func.instructions.append(alloc, .{ .i32_const = 0 });
+    try func.instructions.append(alloc, .{ .i32_const = 42 });
+    try func.instructions.append(alloc, .{ .i32_store = .{ .align_ = 2, .offset = 0 } });
+    try func.instructions.append(alloc, .{ .i32_const = 0 });
+    try func.instructions.append(alloc, .{ .i32_load = .{ .align_ = 2, .offset = 0 } });
+    try func.instructions.append(alloc, .{ .drop = {} });
+    try func.instructions.append(alloc, .{ .end = {} });
+    try module.funcs.append(alloc, func);
+
+    const src = try writeSource(alloc, &module, "w2c");
+    defer alloc.free(src);
+    try std.testing.expect(std.mem.indexOf(u8, src, "memcpy(memory_0.data + addr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "memcpy(&val, memory_0.data + addr") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "--sp") != null);
 }

@@ -420,22 +420,205 @@ const Reader = struct {
         const expected = self.module.funcs.items.len - self.module.num_func_imports;
         if (count != expected) return error.FunctionCodeMismatch;
 
-        for (0..count) |_| {
+        for (0..count) |i| {
             const body_size = try self.readU32();
             const body_end = self.pos + body_size;
             if (body_end > self.data.len) return error.SectionTooLarge;
 
+            const func_idx = self.module.num_func_imports + @as(u32, @intCast(i));
+            var func = &self.module.funcs.items[func_idx];
+
+            // Read locals
             const num_local_decls = try self.readU32();
             var total_locals: u64 = 0;
             for (0..num_local_decls) |_| {
                 const local_count = try self.readU32();
                 total_locals += local_count;
                 if (total_locals > 50000) return error.TooManyLocals;
-                _ = try self.readValType();
+                const local_type = try self.readValType();
+                for (0..local_count) |_| {
+                    try func.local_types.append(self.allocator, local_type);
+                }
             }
-            // Skip instruction bytes for now
-            self.pos = body_end;
+
+            // Read instructions until body_end
+            try self.readInstructions(func, body_end);
         }
+    }
+
+    fn readInstructions(self: *Reader, func: *Mod.Func, end: usize) ReadError!void {
+        while (self.pos < end) {
+            const opcode = try self.readByte();
+            const instr: Mod.Instruction = switch (opcode) {
+                0x00 => .{ .@"unreachable" = {} },
+                0x01 => .{ .nop = {} },
+                0x02 => .{ .block = try self.readBlockType() },
+                0x03 => .{ .loop = try self.readBlockType() },
+                0x04 => .{ .@"if" = try self.readBlockType() },
+                0x05 => .{ .@"else" = {} },
+                0x0b => .{ .end = {} },
+                0x0c => .{ .br = try self.readU32() },
+                0x0d => .{ .br_if = try self.readU32() },
+                0x0e => blk: {
+                    const cnt = try self.readU32();
+                    const targets = try self.allocator.alloc(u32, cnt);
+                    for (0..cnt) |j| targets[j] = try self.readU32();
+                    const default = try self.readU32();
+                    break :blk .{ .br_table = .{ .targets = targets, .default_target = default } };
+                },
+                0x0f => .{ .@"return" = {} },
+                0x10 => .{ .call = try self.readU32() },
+                0x11 => .{ .call_indirect = .{
+                    .type_index = try self.readU32(),
+                    .table_index = try self.readU32(),
+                } },
+                0x1a => .{ .drop = {} },
+                0x1b => .{ .select = {} },
+                0x20 => .{ .local_get = try self.readU32() },
+                0x21 => .{ .local_set = try self.readU32() },
+                0x22 => .{ .local_tee = try self.readU32() },
+                0x23 => .{ .global_get = try self.readU32() },
+                0x24 => .{ .global_set = try self.readU32() },
+                // Memory load/store
+                0x28 => .{ .i32_load = try self.readMemArg() },
+                0x29 => .{ .i64_load = try self.readMemArg() },
+                0x2a => .{ .f32_load = try self.readMemArg() },
+                0x2b => .{ .f64_load = try self.readMemArg() },
+                0x2c => .{ .i32_load8_s = try self.readMemArg() },
+                0x2d => .{ .i32_load8_u = try self.readMemArg() },
+                0x2e => .{ .i32_load16_s = try self.readMemArg() },
+                0x2f => .{ .i32_load16_u = try self.readMemArg() },
+                0x30 => .{ .i64_load8_s = try self.readMemArg() },
+                0x31 => .{ .i64_load8_u = try self.readMemArg() },
+                0x32 => .{ .i64_load16_s = try self.readMemArg() },
+                0x33 => .{ .i64_load16_u = try self.readMemArg() },
+                0x34 => .{ .i64_load32_s = try self.readMemArg() },
+                0x35 => .{ .i64_load32_u = try self.readMemArg() },
+                0x36 => .{ .i32_store = try self.readMemArg() },
+                0x37 => .{ .i64_store = try self.readMemArg() },
+                0x38 => .{ .f32_store = try self.readMemArg() },
+                0x39 => .{ .f64_store = try self.readMemArg() },
+                0x3a => .{ .i32_store8 = try self.readMemArg() },
+                0x3b => .{ .i32_store16 = try self.readMemArg() },
+                0x3c => .{ .i64_store8 = try self.readMemArg() },
+                0x3d => .{ .i64_store16 = try self.readMemArg() },
+                0x3e => .{ .i64_store32 = try self.readMemArg() },
+                0x3f => .{ .memory_size = try self.readU32() },
+                0x40 => .{ .memory_grow = try self.readU32() },
+                // Constants
+                0x41 => .{ .i32_const = try self.readS32() },
+                0x42 => .{ .i64_const = try self.readS64() },
+                0x43 => .{ .f32_const = try self.readFixedU32() },
+                0x44 => .{ .f64_const = try self.readFixedU64() },
+                // i32 comparison
+                0x45 => .{ .i32_eqz = {} },
+                0x46 => .{ .i32_eq = {} },
+                0x47 => .{ .i32_ne = {} },
+                0x48 => .{ .i32_lt_s = {} },
+                0x49 => .{ .i32_lt_u = {} },
+                0x4a => .{ .i32_gt_s = {} },
+                0x4b => .{ .i32_gt_u = {} },
+                0x4c => .{ .i32_le_s = {} },
+                0x4d => .{ .i32_le_u = {} },
+                0x4e => .{ .i32_ge_s = {} },
+                0x4f => .{ .i32_ge_u = {} },
+                // i64 comparison
+                0x50 => .{ .i64_eqz = {} },
+                0x51 => .{ .i64_eq = {} },
+                0x52 => .{ .i64_ne = {} },
+                0x53 => .{ .i64_lt_s = {} },
+                0x54 => .{ .i64_lt_u = {} },
+                0x55 => .{ .i64_gt_s = {} },
+                0x56 => .{ .i64_gt_u = {} },
+                0x57 => .{ .i64_le_s = {} },
+                0x58 => .{ .i64_le_u = {} },
+                0x59 => .{ .i64_ge_s = {} },
+                0x5a => .{ .i64_ge_u = {} },
+                // f32/f64 comparison
+                0x5b => .{ .f32_eq = {} }, 0x5c => .{ .f32_ne = {} },
+                0x5d => .{ .f32_lt = {} }, 0x5e => .{ .f32_gt = {} },
+                0x5f => .{ .f32_le = {} }, 0x60 => .{ .f32_ge = {} },
+                0x61 => .{ .f64_eq = {} }, 0x62 => .{ .f64_ne = {} },
+                0x63 => .{ .f64_lt = {} }, 0x64 => .{ .f64_gt = {} },
+                0x65 => .{ .f64_le = {} }, 0x66 => .{ .f64_ge = {} },
+                // i32 arithmetic
+                0x67 => .{ .i32_clz = {} }, 0x68 => .{ .i32_ctz = {} }, 0x69 => .{ .i32_popcnt = {} },
+                0x6a => .{ .i32_add = {} }, 0x6b => .{ .i32_sub = {} }, 0x6c => .{ .i32_mul = {} },
+                0x6d => .{ .i32_div_s = {} }, 0x6e => .{ .i32_div_u = {} },
+                0x6f => .{ .i32_rem_s = {} }, 0x70 => .{ .i32_rem_u = {} },
+                0x71 => .{ .i32_and = {} }, 0x72 => .{ .i32_or = {} }, 0x73 => .{ .i32_xor = {} },
+                0x74 => .{ .i32_shl = {} }, 0x75 => .{ .i32_shr_s = {} }, 0x76 => .{ .i32_shr_u = {} },
+                0x77 => .{ .i32_rotl = {} }, 0x78 => .{ .i32_rotr = {} },
+                // i64 arithmetic
+                0x79 => .{ .i64_clz = {} }, 0x7a => .{ .i64_ctz = {} }, 0x7b => .{ .i64_popcnt = {} },
+                0x7c => .{ .i64_add = {} }, 0x7d => .{ .i64_sub = {} }, 0x7e => .{ .i64_mul = {} },
+                0x7f => .{ .i64_div_s = {} }, 0x80 => .{ .i64_div_u = {} },
+                0x81 => .{ .i64_rem_s = {} }, 0x82 => .{ .i64_rem_u = {} },
+                0x83 => .{ .i64_and = {} }, 0x84 => .{ .i64_or = {} }, 0x85 => .{ .i64_xor = {} },
+                0x86 => .{ .i64_shl = {} }, 0x87 => .{ .i64_shr_s = {} }, 0x88 => .{ .i64_shr_u = {} },
+                0x89 => .{ .i64_rotl = {} }, 0x8a => .{ .i64_rotr = {} },
+                // f32 arithmetic
+                0x8b => .{ .f32_abs = {} }, 0x8c => .{ .f32_neg = {} },
+                0x8d => .{ .f32_ceil = {} }, 0x8e => .{ .f32_floor = {} },
+                0x8f => .{ .f32_trunc = {} }, 0x90 => .{ .f32_nearest = {} }, 0x91 => .{ .f32_sqrt = {} },
+                0x92 => .{ .f32_add = {} }, 0x93 => .{ .f32_sub = {} },
+                0x94 => .{ .f32_mul = {} }, 0x95 => .{ .f32_div = {} },
+                0x96 => .{ .f32_min = {} }, 0x97 => .{ .f32_max = {} }, 0x98 => .{ .f32_copysign = {} },
+                // f64 arithmetic
+                0x99 => .{ .f64_abs = {} }, 0x9a => .{ .f64_neg = {} },
+                0x9b => .{ .f64_ceil = {} }, 0x9c => .{ .f64_floor = {} },
+                0x9d => .{ .f64_trunc = {} }, 0x9e => .{ .f64_nearest = {} }, 0x9f => .{ .f64_sqrt = {} },
+                0xa0 => .{ .f64_add = {} }, 0xa1 => .{ .f64_sub = {} },
+                0xa2 => .{ .f64_mul = {} }, 0xa3 => .{ .f64_div = {} },
+                0xa4 => .{ .f64_min = {} }, 0xa5 => .{ .f64_max = {} }, 0xa6 => .{ .f64_copysign = {} },
+                // Conversions
+                0xa7 => .{ .i32_wrap_i64 = {} },
+                0xa8 => .{ .i32_trunc_f32_s = {} }, 0xa9 => .{ .i32_trunc_f32_u = {} },
+                0xaa => .{ .i32_trunc_f64_s = {} }, 0xab => .{ .i32_trunc_f64_u = {} },
+                0xac => .{ .i64_extend_i32_s = {} }, 0xad => .{ .i64_extend_i32_u = {} },
+                0xae => .{ .i64_trunc_f32_s = {} }, 0xaf => .{ .i64_trunc_f32_u = {} },
+                0xb0 => .{ .i64_trunc_f64_s = {} }, 0xb1 => .{ .i64_trunc_f64_u = {} },
+                0xb2 => .{ .f32_convert_i32_s = {} }, 0xb3 => .{ .f32_convert_i32_u = {} },
+                0xb4 => .{ .f32_convert_i64_s = {} }, 0xb5 => .{ .f32_convert_i64_u = {} },
+                0xb6 => .{ .f32_demote_f64 = {} },
+                0xb7 => .{ .f64_convert_i32_s = {} }, 0xb8 => .{ .f64_convert_i32_u = {} },
+                0xb9 => .{ .f64_convert_i64_s = {} }, 0xba => .{ .f64_convert_i64_u = {} },
+                0xbb => .{ .f64_promote_f32 = {} },
+                0xbc => .{ .i32_reinterpret_f32 = {} }, 0xbd => .{ .i64_reinterpret_f64 = {} },
+                0xbe => .{ .f32_reinterpret_i32 = {} }, 0xbf => .{ .f64_reinterpret_i64 = {} },
+                // Sign extension
+                0xc0 => .{ .i32_extend8_s = {} }, 0xc1 => .{ .i32_extend16_s = {} },
+                0xc2 => .{ .i64_extend8_s = {} }, 0xc3 => .{ .i64_extend16_s = {} },
+                0xc4 => .{ .i64_extend32_s = {} },
+                // Reference types
+                0xd0 => .{ .ref_null = try self.readValType() },
+                0xd1 => .{ .ref_is_null = {} },
+                0xd2 => .{ .ref_func = try self.readU32() },
+                // Prefixed opcodes — skip for now
+                0xfc, 0xfd, 0xfe => {
+                    _ = try self.readU32();
+                    continue;
+                },
+                else => continue,
+            };
+            try func.instructions.append(self.allocator, instr);
+        }
+    }
+
+    fn readBlockType(self: *Reader) ReadError!Mod.Instruction.BlockType {
+        const byte = try self.readByte();
+        if (byte == 0x40) return .{ .empty = {} };
+        const signed: i8 = @bitCast(byte);
+        if (signed < 0) {
+            return .{ .val_type = enumFromIntChecked(types.ValType, @as(i32, signed)) orelse return .{ .empty = {} } };
+        }
+        return .{ .type_index = byte };
+    }
+
+    fn readMemArg(self: *Reader) ReadError!Mod.Instruction.MemArg {
+        const align_ = try self.readU32();
+        const offset = try self.readU32();
+        return .{ .align_ = align_, .offset = offset };
     }
 
     fn readDataSection(self: *Reader, _: usize) ReadError!void {
@@ -605,4 +788,77 @@ test "read start section" {
     defer module.deinit();
     try std.testing.expect(module.start_var != null);
     try std.testing.expectEqual(@as(types.Index, 0), module.start_var.?.index);
+}
+
+test "read code section parses instructions" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: (i32, i32) -> i32
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f,
+        // function section: 1 func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // code section
+        0x0a, 0x09, 0x01, // section id=10, size=9, 1 body
+        0x07, // body size=7
+        0x00, // 0 locals
+        0x20, 0x00, // local.get 0
+        0x20, 0x01, // local.get 1
+        0x6a, // i32.add
+        0x0b, // end
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module.funcs.items.len);
+    const func = &module.funcs.items[0];
+    try std.testing.expectEqual(@as(usize, 4), func.instructions.items.len);
+    try std.testing.expectEqual(Mod.Instruction{ .local_get = 0 }, func.instructions.items[0]);
+    try std.testing.expectEqual(Mod.Instruction{ .local_get = 1 }, func.instructions.items[1]);
+    try std.testing.expect(func.instructions.items[2] == .i32_add);
+    try std.testing.expect(func.instructions.items[3] == .end);
+}
+
+test "read code section parses i32.const" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> i32
+        0x01, 0x05, 0x01, 0x60, 0x00, 0x01, 0x7f,
+        // function section
+        0x03, 0x02, 0x01, 0x00,
+        // code section
+        0x0a, 0x06, 0x01, // section, 1 body
+        0x04, // body size=4
+        0x00, // 0 locals
+        0x41, 0x2a, // i32.const 42
+        0x0b, // end
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+
+    const func = &module.funcs.items[0];
+    try std.testing.expectEqual(@as(usize, 2), func.instructions.items.len);
+    try std.testing.expectEqual(Mod.Instruction{ .i32_const = 42 }, func.instructions.items[0]);
+}
+
+test "read code section parses locals" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section
+        0x03, 0x02, 0x01, 0x00,
+        // code section
+        0x0a, 0x06, 0x01, // section, 1 body
+        0x04, // body size=4
+        0x01, // 1 local declaration
+        0x02, 0x7f, // 2 x i32
+        0x0b, // end
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+
+    const func = &module.funcs.items[0];
+    try std.testing.expectEqual(@as(usize, 2), func.local_types.items.len);
+    try std.testing.expectEqual(types.ValType.i32, func.local_types.items[0]);
+    try std.testing.expectEqual(types.ValType.i32, func.local_types.items[1]);
 }
