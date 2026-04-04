@@ -147,7 +147,7 @@ pub const TypeEntry = union(enum) {
     array_type: ArrayType,
 
     pub const StructType = struct {
-        fields: std.ArrayList(Field),
+        fields: std.ArrayListUnmanaged(Field),
 
         pub const Field = struct {
             name: ?[]const u8 = null,
@@ -196,7 +196,7 @@ pub const Export = struct {
 pub const Func = struct {
     name: ?[]const u8 = null,
     decl: FuncDeclaration = .{},
-    local_types: std.ArrayList(types.ValType) = .empty,
+    local_types: std.ArrayListUnmanaged(types.ValType) = .{},
     loc: Location = .{},
     is_import: bool = false,
 };
@@ -241,7 +241,7 @@ pub const ElemSegment = struct {
     kind: types.SegmentKind = .active,
     table_var: Var = .{ .index = 0 },
     elem_type: types.ValType = .funcref,
-    elem_var_indices: std.ArrayList(Var) = .empty,
+    elem_var_indices: std.ArrayListUnmanaged(Var) = .{},
 };
 
 /// Data segment.
@@ -267,19 +267,19 @@ pub const Module = struct {
     loc: Location = .{},
 
     // Type section
-    module_types: std.ArrayList(TypeEntry) = .empty,
+    module_types: std.ArrayListUnmanaged(TypeEntry) = .{},
 
     // Entity lists
-    funcs: std.ArrayList(Func) = .empty,
-    tables: std.ArrayList(Table) = .empty,
-    memories: std.ArrayList(Memory) = .empty,
-    globals: std.ArrayList(Global) = .empty,
-    tags: std.ArrayList(Tag) = .empty,
-    imports: std.ArrayList(Import) = .empty,
-    exports: std.ArrayList(Export) = .empty,
-    elem_segments: std.ArrayList(ElemSegment) = .empty,
-    data_segments: std.ArrayList(DataSegment) = .empty,
-    customs: std.ArrayList(Custom) = .empty,
+    funcs: std.ArrayListUnmanaged(Func) = .{},
+    tables: std.ArrayListUnmanaged(Table) = .{},
+    memories: std.ArrayListUnmanaged(Memory) = .{},
+    globals: std.ArrayListUnmanaged(Global) = .{},
+    tags: std.ArrayListUnmanaged(Tag) = .{},
+    imports: std.ArrayListUnmanaged(Import) = .{},
+    exports: std.ArrayListUnmanaged(Export) = .{},
+    elem_segments: std.ArrayListUnmanaged(ElemSegment) = .{},
+    data_segments: std.ArrayListUnmanaged(DataSegment) = .{},
+    customs: std.ArrayListUnmanaged(Custom) = .{},
 
     // Start function (optional)
     start_var: ?Var = null,

@@ -399,7 +399,7 @@ const Reader = struct {
             }
 
             const elem_count = try self.readU32();
-            seg.elem_var_indices = .empty;
+            seg.elem_var_indices = .{};
             try seg.elem_var_indices.ensureTotalCapacity(self.allocator, elem_count);
             for (0..elem_count) |_| {
                 if (use_elem_exprs) {

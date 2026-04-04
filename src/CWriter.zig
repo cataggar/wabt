@@ -11,7 +11,7 @@ pub const WriteError = error{OutOfMemory};
 
 /// Generate C header (.h) content for a wasm module.
 pub fn writeHeader(allocator: std.mem.Allocator, module: *const Mod.Module, module_name: []const u8) WriteError![]u8 {
-    var w = CW{ .allocator = allocator, .buf = .empty };
+    var w = CW{ .allocator = allocator, .buf = .{} };
     errdefer w.buf.deinit(allocator);
     try w.emitHeader(module, module_name);
     return w.buf.toOwnedSlice(allocator);
@@ -19,7 +19,7 @@ pub fn writeHeader(allocator: std.mem.Allocator, module: *const Mod.Module, modu
 
 /// Generate C implementation (.c) content for a wasm module.
 pub fn writeSource(allocator: std.mem.Allocator, module: *const Mod.Module, module_name: []const u8) WriteError![]u8 {
-    var w = CW{ .allocator = allocator, .buf = .empty };
+    var w = CW{ .allocator = allocator, .buf = .{} };
     errdefer w.buf.deinit(allocator);
     try w.emitSource(module, module_name);
     return w.buf.toOwnedSlice(allocator);
@@ -60,7 +60,7 @@ fn getFuncSig(module: *const Mod.Module, index: u32) types.FuncType {
 
 const CW = struct {
     allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8),
+    buf: std.ArrayListUnmanaged(u8),
 
     // ── Main emitters ───────────────────────────────────────────────────
 

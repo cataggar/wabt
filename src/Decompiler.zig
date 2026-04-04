@@ -11,7 +11,7 @@ pub const WriteError = error{OutOfMemory};
 
 /// Generate readable pseudo-code from a Module IR.
 pub fn decompile(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var d = Decomp{ .allocator = allocator, .buf = .empty };
+    var d = Decomp{ .allocator = allocator, .buf = .{} };
     errdefer d.buf.deinit(allocator);
     try d.emit(module);
     return d.buf.toOwnedSlice(allocator);
@@ -39,7 +39,7 @@ fn getFuncSig(module: *const Mod.Module, index: u32) types.FuncType {
 
 const Decomp = struct {
     allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8),
+    buf: std.ArrayListUnmanaged(u8),
 
     // ── Main emitter ────────────────────────────────────────────────────
 

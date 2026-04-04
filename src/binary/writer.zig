@@ -13,7 +13,7 @@ pub const WriteError = error{OutOfMemory};
 // ── Public API ──────────────────────────────────────────────────────────
 
 pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var w = Writer{ .allocator = allocator, .buf = .empty };
+    var w = Writer{ .allocator = allocator, .buf = .{} };
     errdefer w.buf.deinit(allocator);
 
     try w.appendSlice(&reader.magic);
@@ -39,7 +39,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) Writ
 
 const Writer = struct {
     allocator: std.mem.Allocator,
-    buf: std.ArrayList(u8),
+    buf: std.ArrayListUnmanaged(u8),
 
     // -- primitives --
 
