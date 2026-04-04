@@ -37,6 +37,7 @@ pub const ValType = enum(i32) {
     // Reference types
     funcref = 0x70,
     externref = 0x6f,
+    anyref = 0x6e,
     exnref = 0x69,
 
     // Typed references (GC proposal)
@@ -53,11 +54,11 @@ pub const ValType = enum(i32) {
     // Block void type
     void_ = 0x40,
 
-    /// Returns `true` for reference types (funcref, externref, exnref,
-    /// ref, ref_null).
+    /// Returns `true` for reference types (funcref, externref, anyref,
+    /// exnref, ref, ref_null).
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .exnref, .ref, .ref_null => true,
+            .funcref, .externref, .anyref, .exnref, .ref, .ref_null => true,
             else => false,
         };
     }
@@ -82,6 +83,7 @@ pub const ValType = enum(i32) {
             .i16 => "i16",
             .funcref => "funcref",
             .externref => "externref",
+            .anyref => "anyref",
             .exnref => "exnref",
             .ref => "ref",
             .ref_null => "ref_null",
@@ -207,6 +209,7 @@ test "ValType encoding" {
     try std.testing.expectEqual(@as(i32, 0x7b), @intFromEnum(ValType.v128));
     try std.testing.expectEqual(@as(i32, 0x70), @intFromEnum(ValType.funcref));
     try std.testing.expectEqual(@as(i32, 0x6f), @intFromEnum(ValType.externref));
+    try std.testing.expectEqual(@as(i32, 0x6e), @intFromEnum(ValType.anyref));
     try std.testing.expectEqual(@as(i32, 0x69), @intFromEnum(ValType.exnref));
     try std.testing.expectEqual(@as(i32, 0x60), @intFromEnum(ValType.func));
     try std.testing.expectEqual(@as(i32, 0x40), @intFromEnum(ValType.void_));
@@ -223,6 +226,7 @@ test "Limits.indexType" {
 test "ValType.isRefType" {
     try std.testing.expect(ValType.funcref.isRefType());
     try std.testing.expect(ValType.externref.isRefType());
+    try std.testing.expect(ValType.anyref.isRefType());
     try std.testing.expect(ValType.exnref.isRefType());
     try std.testing.expect(ValType.ref.isRefType());
     try std.testing.expect(ValType.ref_null.isRefType());
