@@ -14,55 +14,53 @@ pub fn runBinaryValidation(allocator: std.mem.Allocator, wasm_bytes: []const u8)
     return true;
 }
 
-pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
-    const io = init.io;
-    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
-    defer args_it.deinit();
+pub fn main() !void {
+    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa_state.deinit();
+    const alloc = gpa_state.allocator();
 
+    var args_it = try std.process.ArgIterator.initWithAllocator(alloc);
+    defer args_it.deinit();
     _ = args_it.next(); // skip program name
 
-    var input_file: ?[:0]const u8 = null;
+    var input_file: ?[]const u8 = null;
 
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            try std.Io.File.stdout().writeStreamingAll(io,
+            std.debug.print(
                 \\spectest-interp — run WebAssembly spec tests (.wast)
                 \\
                 \\Usage: spectest-interp [options] <file.wast>
                 \\
                 \\  -h, --help   Show this help message
                 \\
-            );
+            , .{});
             return;
         } else {
             input_file = arg;
         }
     }
 
-    const in_path = input_file orelse
-        std.process.fatal("no input file specified. Use --help for usage.", .{});
+    const in_path = input_file orelse {
+        std.debug.print("no input file specified. Use --help for usage.\n", .{});
+        return;
+    };
 
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        in_path,
-        gpa,
-        .limited(64 * 1024 * 1024),
-    ) catch |err|
-        std.process.fatal("cannot read '{s}': {t}", .{ in_path, err });
-    defer gpa.free(source);
+    const source = std.fs.cwd().readFileAlloc(alloc, in_path, 64 * 1024 * 1024) catch |err| {
+        std.debug.print("cannot read '{s}': {any}\n", .{ in_path, err });
+        return err;
+    };
+    defer alloc.free(source);
 
-    const result = wabt.wast_runner.run(gpa, source);
+    const result = wabt.wast_runner.run(alloc, source);
 
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "{s}: {d} passed, {d} failed, {d} skipped ({d} total)\n", .{
+    std.debug.print("{s}: {d} passed, {d} failed, {d} skipped ({d} total)\n", .{
         in_path,
         result.passed,
         result.failed,
         result.skipped,
         result.total(),
-    }) catch "result overflow\n";
-    try std.Io.File.stderr().writeStreamingAll(io, msg);
+    });
 }
 
 test "basic binary validation stub" {

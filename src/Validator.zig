@@ -7,6 +7,7 @@ const std = @import("std");
 const types = @import("types.zig");
 const Mod = @import("Module.zig");
 const Feature = @import("Feature.zig");
+const leb128 = @import("leb128.zig");
 
 pub const Error = error{
     InvalidTypeIndex,
@@ -24,6 +25,10 @@ pub const Error = error{
     TooManyMemories,
     TooManyTables,
     InvalidElemType,
+    InvalidLocalIndex,
+    InvalidLabelIndex,
+    ImmutableGlobal,
+    TypeMismatch,
     OutOfMemory,
 };
 
@@ -43,6 +48,7 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkStart(module);
     try checkElemSegments(module);
     try checkDataSegments(module);
+    try checkFunctionBodies(module);
 }
 
 // ── Validation passes ───────────────────────────────────────────────────
@@ -159,7 +165,7 @@ fn checkStart(m: *const Mod.Module) Error!void {
 fn checkElemSegments(m: *const Mod.Module) Error!void {
     for (m.elem_segments.items) |seg| {
         if (seg.kind == .active) {
-            if (seg.table_var.index >= m.tables.items.len and m.tables.items.len > 0)
+            if (m.tables.items.len == 0 or seg.table_var.index >= m.tables.items.len)
                 return error.InvalidTableIndex;
         }
         for (seg.elem_var_indices.items) |v| {
@@ -172,7 +178,7 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
 fn checkDataSegments(m: *const Mod.Module) Error!void {
     for (m.data_segments.items) |seg| {
         if (seg.kind == .active) {
-            if (seg.memory_var.index >= m.memories.items.len and m.memories.items.len > 0)
+            if (m.memories.items.len == 0 or seg.memory_var.index >= m.memories.items.len)
                 return error.InvalidMemoryIndex;
         }
     }
@@ -187,6 +193,641 @@ fn checkLimits(limits: types.Limits, absolute_max: u64) Error!void {
         if (limits.max < limits.initial)
             return error.InvalidLimits;
     }
+}
+
+// ── Function body validation ────────────────────────────────────────────
+
+fn checkFunctionBodies(m: *const Mod.Module) Error!void {
+    for (m.funcs.items) |func| {
+        if (func.is_import) continue;
+        if (func.code_bytes.len == 0) continue;
+        try checkOneBody(m, &func);
+    }
+}
+
+/// Resolve the signature (params, results) for a function.
+fn resolveSig(m: *const Mod.Module, decl: Mod.FuncDeclaration) struct { params: []const types.ValType, results: []const types.ValType } {
+    if (decl.type_var != .index) return .{ .params = &.{}, .results = &.{} };
+    const ti = decl.type_var.index;
+    if (ti == types.invalid_index or ti >= m.module_types.items.len) return .{ .params = &.{}, .results = &.{} };
+    return switch (m.module_types.items[ti]) {
+        .func_type => |ft| .{ .params = ft.params, .results = ft.results },
+        else => .{ .params = &.{}, .results = &.{} },
+    };
+}
+
+const ValStack = std.ArrayListUnmanaged(ValTypeOrUnknown);
+
+const ValTypeOrUnknown = enum(i32) {
+    i32 = @intFromEnum(types.ValType.i32),
+    i64 = @intFromEnum(types.ValType.i64),
+    f32 = @intFromEnum(types.ValType.f32),
+    f64 = @intFromEnum(types.ValType.f64),
+    v128 = @intFromEnum(types.ValType.v128),
+    funcref = @intFromEnum(types.ValType.funcref),
+    externref = @intFromEnum(types.ValType.externref),
+    unknown = 0,
+
+    fn fromValType(vt: types.ValType) ValTypeOrUnknown {
+        return switch (vt) {
+            .i32 => .i32,
+            .i64 => .i64,
+            .f32 => .f32,
+            .f64 => .f64,
+            .v128 => .v128,
+            .funcref => .funcref,
+            .externref => .externref,
+            else => .unknown,
+        };
+    }
+
+    fn matches(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
+        if (self == .unknown or other == .unknown) return true;
+        return self == other;
+    }
+};
+
+const CtrlFrame = struct {
+    opcode: u8, // 0x02=block, 0x03=loop, 0x04=if
+    start_types: []const types.ValType,
+    end_types: []const types.ValType,
+    height: usize,
+    unreachable_flag: bool,
+    else_seen: bool,
+};
+
+fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
+    const sig = resolveSig(m, func.decl);
+    const num_params: u32 = @intCast(sig.params.len);
+    const num_locals: u32 = num_params + @as(u32, @intCast(func.local_types.items.len));
+
+    // Build local types array: params ++ declared locals
+    var local_types_buf: [256]ValTypeOrUnknown = undefined;
+    var local_types: []ValTypeOrUnknown = &.{};
+    if (num_locals <= 256) {
+        for (sig.params, 0..) |p, i| local_types_buf[i] = ValTypeOrUnknown.fromValType(p);
+        for (func.local_types.items, 0..) |lt, i| local_types_buf[num_params + i] = ValTypeOrUnknown.fromValType(lt);
+        local_types = local_types_buf[0..num_locals];
+    }
+
+    var val_stack: ValStack = .{};
+    defer val_stack.deinit(gpa(m));
+    var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .{};
+    defer ctrl_stack.deinit(gpa(m));
+
+    // Push the function frame
+    ctrl_stack.append(gpa(m), .{
+        .opcode = 0x02,
+        .start_types = &.{},
+        .end_types = sig.results,
+        .height = 0,
+        .unreachable_flag = false,
+        .else_seen = false,
+    }) catch return error.OutOfMemory;
+
+    var pos: usize = 0;
+    const bytes = func.code_bytes;
+
+    while (pos < bytes.len) {
+        const opcode = bytes[pos];
+        pos += 1;
+
+        switch (opcode) {
+            0x00 => { // unreachable
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x01 => {}, // nop
+            0x02 => { // block
+                const bt = readBlockType(m, bytes, &pos);
+                pushCtrl(&ctrl_stack, &val_stack, 0x02, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x03 => { // loop
+                const bt = readBlockType(m, bytes, &pos);
+                pushCtrl(&ctrl_stack, &val_stack, 0x03, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x04 => { // if
+                const bt = readBlockType(m, bytes, &pos);
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                pushCtrl(&ctrl_stack, &val_stack, 0x04, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x05 => { // else
+                if (ctrl_stack.items.len == 0) return error.TypeMismatch;
+                const frame = &ctrl_stack.items[ctrl_stack.items.len - 1];
+                if (frame.opcode != 0x04) return error.TypeMismatch;
+                try popVals(&val_stack, frame, frame.end_types);
+                if (val_stack.items.len != frame.height) return error.TypeMismatch;
+                frame.unreachable_flag = false;
+                frame.else_seen = true;
+                pushVals(&val_stack, frame.start_types, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x0b => { // end
+                if (ctrl_stack.items.len == 0) break;
+                const frame = ctrl_stack.items[ctrl_stack.items.len - 1];
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], frame.end_types);
+                if (val_stack.items.len != frame.height) return error.TypeMismatch;
+                // If block was an if without else, and it has results, that's a type error
+                if (frame.opcode == 0x04 and !frame.else_seen and frame.end_types.len > 0) {
+                    // Check if start_types match end_types (if with no else must have matching in/out)
+                    if (!std.mem.eql(types.ValType, frame.start_types, frame.end_types))
+                        return error.TypeMismatch;
+                }
+                _ = ctrl_stack.pop();
+                pushVals(&val_stack, frame.end_types, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x0c => { // br
+                const depth = readU32(bytes, &pos);
+                if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - depth];
+                const label_types = labelTypes(&target);
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], label_types);
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x0d => { // br_if
+                const depth = readU32(bytes, &pos);
+                if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - depth];
+                const lt = labelTypes(&target);
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+                pushVals(&val_stack, lt, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x0e => { // br_table
+                const count = readU32(bytes, &pos);
+                var max_depth: u32 = 0;
+                for (0..count) |_| {
+                    const d = readU32(bytes, &pos);
+                    if (d > max_depth) max_depth = d;
+                }
+                const default = readU32(bytes, &pos);
+                if (default > max_depth) max_depth = default;
+                if (max_depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                if (default >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - default];
+                const lt = labelTypes(&target);
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x0f => { // return
+                if (ctrl_stack.items.len == 0) return error.TypeMismatch;
+                const lt = ctrl_stack.items[0].end_types;
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x10 => { // call
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                const callee_sig = resolveSig(m, m.funcs.items[idx].decl);
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], callee_sig.params);
+                pushVals(&val_stack, callee_sig.results, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x11 => { // call_indirect
+                const type_idx = readU32(bytes, &pos);
+                const table_idx = readU32(bytes, &pos);
+                if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+                if (m.tables.items.len == 0) return error.InvalidTableIndex;
+                if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                try popExpect(&val_stack, &ctrl_stack, .i32); // table index operand
+                const ft = switch (m.module_types.items[type_idx]) {
+                    .func_type => |ft| ft,
+                    else => Mod.FuncSignature{},
+                };
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], ft.params);
+                pushVals(&val_stack, ft.results, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x1a => { // drop
+                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+            },
+            0x1b => { // select
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                const t1 = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                const t2 = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                if (t1 != .unknown and t2 != .unknown and t1 != t2) return error.TypeMismatch;
+                const result = if (t1 != .unknown) t1 else t2;
+                val_stack.append(gpa(m), result) catch return error.OutOfMemory;
+            },
+            0x1c => { // select t
+                const count = readU32(bytes, &pos);
+                for (0..count) |_| _ = readU32(bytes, &pos); // skip types
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                val_stack.append(gpa(m), .unknown) catch return error.OutOfMemory;
+            },
+            0x20 => { // local.get
+                const idx = readU32(bytes, &pos);
+                if (idx >= num_locals) return error.InvalidLocalIndex;
+                const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
+                val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
+            },
+            0x21 => { // local.set
+                const idx = readU32(bytes, &pos);
+                if (idx >= num_locals) return error.InvalidLocalIndex;
+                const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
+                try popExpect(&val_stack, &ctrl_stack, lt);
+            },
+            0x22 => { // local.tee
+                const idx = readU32(bytes, &pos);
+                if (idx >= num_locals) return error.InvalidLocalIndex;
+                const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
+                try popExpect(&val_stack, &ctrl_stack, lt);
+                val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
+            },
+            0x23 => { // global.get
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.globals.items.len) return error.InvalidGlobalIndex;
+                const gt = ValTypeOrUnknown.fromValType(m.globals.items[idx].type.val_type);
+                val_stack.append(gpa(m), gt) catch return error.OutOfMemory;
+            },
+            0x24 => { // global.set
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.globals.items.len) return error.InvalidGlobalIndex;
+                if (m.globals.items[idx].type.mutability != .mutable) return error.ImmutableGlobal;
+                const gt = ValTypeOrUnknown.fromValType(m.globals.items[idx].type.val_type);
+                try popExpect(&val_stack, &ctrl_stack, gt);
+            },
+            0x25 => { // table.get
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.tables.items.len) return error.InvalidTableIndex;
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                val_stack.append(gpa(m), ValTypeOrUnknown.fromValType(m.tables.items[idx].type.elem_type)) catch return error.OutOfMemory;
+            },
+            0x26 => { // table.set
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.tables.items.len) return error.InvalidTableIndex;
+                const et = ValTypeOrUnknown.fromValType(m.tables.items[idx].type.elem_type);
+                try popExpect(&val_stack, &ctrl_stack, et);
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+            },
+            // Memory load instructions
+            0x28 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m)); },
+            0x29 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m)); },
+            0x2a => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m)); },
+            0x2b => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m)); },
+            0x2c...0x2f => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m)); },
+            0x30...0x35 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m)); },
+            // Memory store instructions
+            0x36 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m)); },
+            0x37 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m)); },
+            0x38 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m)); },
+            0x39 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m)); },
+            0x3a, 0x3b => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m)); },
+            0x3c...0x3e => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m)); },
+            0x3f => { // memory.size
+                const mem_idx = readU32(bytes, &pos);
+                if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+                val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+            },
+            0x40 => { // memory.grow
+                const mem_idx = readU32(bytes, &pos);
+                if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+                try popExpect(&val_stack, &ctrl_stack, .i32);
+                val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+            },
+            0x41 => { // i32.const
+                _ = readS32(bytes, &pos);
+                val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+            },
+            0x42 => { // i64.const
+                _ = readS64(bytes, &pos);
+                val_stack.append(gpa(m), .i64) catch return error.OutOfMemory;
+            },
+            0x43 => { // f32.const
+                pos += 4;
+                val_stack.append(gpa(m), .f32) catch return error.OutOfMemory;
+            },
+            0x44 => { // f64.const
+                pos += 8;
+                val_stack.append(gpa(m), .f64) catch return error.OutOfMemory;
+            },
+            // i32 comparison: unary
+            0x45 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            // i32 comparison: binary
+            0x46...0x4f => { try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            // i64 comparison: unary
+            0x50 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            // i64 comparison: binary
+            0x51...0x5a => { try checkBinary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            // f32 comparison
+            0x5b...0x60 => { try checkBinary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
+            // f64 comparison
+            0x61...0x66 => { try checkBinary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
+            // i32 unary
+            0x67...0x69 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            // i32 binary
+            0x6a...0x78 => { try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            // i64 unary
+            0x79...0x7b => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            // i64 binary
+            0x7c...0x8a => { try checkBinary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            // f32 unary
+            0x8b...0x91 => { try checkUnary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            // f32 binary
+            0x92...0x98 => { try checkBinary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            // f64 unary
+            0x99...0x9f => { try checkUnary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            // f64 binary
+            0xa0...0xa6 => { try checkBinary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            // Conversions
+            0xa7 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); }, // i32.wrap_i64
+            0xa8, 0xa9 => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
+            0xaa, 0xab => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
+            0xac, 0xad => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i64, gpa(m)); },
+            0xae, 0xaf => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i64, gpa(m)); },
+            0xb0, 0xb1 => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
+            0xb2, 0xb3 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
+            0xb4, 0xb5 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f32, gpa(m)); },
+            0xb6 => { try checkUnary(&val_stack, &ctrl_stack, .f64, .f32, gpa(m)); },
+            0xb7, 0xb8 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f64, gpa(m)); },
+            0xb9, 0xba => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
+            0xbb => { try checkUnary(&val_stack, &ctrl_stack, .f32, .f64, gpa(m)); },
+            0xbc => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
+            0xbd => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
+            0xbe => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
+            0xbf => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
+            // Sign extension
+            0xc0, 0xc1 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0xc2...0xc4 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            // Reference types
+            0xd0 => { // ref.null
+                if (pos < bytes.len) pos += 1; // skip reftype byte
+                val_stack.append(gpa(m), .funcref) catch return error.OutOfMemory;
+            },
+            0xd1 => { // ref.is_null
+                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+            },
+            0xd2 => { // ref.func
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                val_stack.append(gpa(m), .funcref) catch return error.OutOfMemory;
+            },
+            // Prefixed opcodes
+            0xfc => {
+                const sub = readU32(bytes, &pos);
+                switch (sub) {
+                    0x00...0x07 => {
+                        // Saturating float-to-int: 0-1 f32→i32, 2-3 f64→i32, 4-5 f32→i64, 6-7 f64→i64
+                        const input: ValTypeOrUnknown = if (sub & 2 == 0) .f32 else .f64;
+                        const output: ValTypeOrUnknown = if (sub < 4) .i32 else .i64;
+                        try checkUnary(&val_stack, &ctrl_stack, input, output, gpa(m));
+                    },
+                    0x08 => { // memory.init
+                        _ = readU32(bytes, &pos); // data idx
+                        _ = readU32(bytes, &pos); // mem idx
+                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                    },
+                    0x09 => { // data.drop
+                        _ = readU32(bytes, &pos);
+                    },
+                    0x0a => { // memory.copy
+                        _ = readU32(bytes, &pos);
+                        _ = readU32(bytes, &pos);
+                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                    },
+                    0x0b => { // memory.fill
+                        _ = readU32(bytes, &pos);
+                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                    },
+                    0x0c => { // table.init
+                        _ = readU32(bytes, &pos);
+                        _ = readU32(bytes, &pos);
+                    },
+                    0x0d => { // elem.drop
+                        _ = readU32(bytes, &pos);
+                    },
+                    0x0e => { // table.copy
+                        _ = readU32(bytes, &pos);
+                        _ = readU32(bytes, &pos);
+                    },
+                    0x0f => { // table.grow
+                        _ = readU32(bytes, &pos);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+                    },
+                    0x10 => { // table.size
+                        _ = readU32(bytes, &pos);
+                        val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
+                    },
+                    0x11 => { // table.fill
+                        _ = readU32(bytes, &pos);
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                    },
+                    else => {},
+                }
+            },
+            0xfe => {
+                // Atomic prefix — skip sub-opcode and memarg
+                const sub = readU32(bytes, &pos);
+                if (sub >= 0x10) {
+                    // Atomic load/store/rmw have memarg
+                    _ = readU32(bytes, &pos); // align
+                    _ = readU32(bytes, &pos); // offset
+                }
+                // Don't type-check atomics for now
+            },
+            0xfd => {
+                // SIMD prefix — skip
+                _ = readU32(bytes, &pos);
+                // SIMD ops have various immediates; skip conservatively
+                break;
+            },
+            else => {
+                // Unknown opcode — stop validation for this function to avoid misalignment
+                break;
+            },
+        }
+    }
+
+    // After processing all instructions, check the final stack matches the function's result types
+    if (ctrl_stack.items.len == 0) {
+        // All blocks have been closed — check results on val_stack
+        for (sig.results) |expected| {
+            const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+            if (!actual.matches(ValTypeOrUnknown.fromValType(expected))) return error.TypeMismatch;
+        }
+    }
+}
+
+fn gpa(m: *const Mod.Module) std.mem.Allocator {
+    return m.allocator;
+}
+
+const BlockType = struct {
+    params: []const types.ValType,
+    results: []const types.ValType,
+};
+
+fn readBlockType(m: *const Mod.Module, bytes: []const u8, pos: *usize) BlockType {
+    if (pos.* >= bytes.len) return .{ .params = &.{}, .results = &.{} };
+    const byte = bytes[pos.*];
+    if (byte == 0x40) {
+        pos.* += 1;
+        return .{ .params = &.{}, .results = &.{} };
+    }
+    // Single value type
+    const as_signed: i8 = @bitCast(byte);
+    if (as_signed < 0) {
+        pos.* += 1;
+        return .{ .params = &.{}, .results = valTypeSlice(byte) };
+    }
+    // Type index (s33 LEB128)
+    const result = leb128.readS32Leb128(bytes[pos.*..]) catch return .{ .params = &.{}, .results = &.{} };
+    pos.* += result.bytes_read;
+    const idx: u32 = @bitCast(result.value);
+    if (idx < m.module_types.items.len) {
+        return switch (m.module_types.items[idx]) {
+            .func_type => |ft| .{ .params = ft.params, .results = ft.results },
+            else => .{ .params = &.{}, .results = &.{} },
+        };
+    }
+    return .{ .params = &.{}, .results = &.{} };
+}
+
+// Reusable single-element type slices for block types
+const single_i32: [1]types.ValType = .{.i32};
+const single_i64: [1]types.ValType = .{.i64};
+const single_f32: [1]types.ValType = .{.f32};
+const single_f64: [1]types.ValType = .{.f64};
+const single_funcref: [1]types.ValType = .{.funcref};
+const single_externref: [1]types.ValType = .{.externref};
+
+fn valTypeSlice(byte: u8) []const types.ValType {
+    return switch (byte) {
+        0x7f => &single_i32,
+        0x7e => &single_i64,
+        0x7d => &single_f32,
+        0x7c => &single_f64,
+        0x70 => &single_funcref,
+        0x6f => &single_externref,
+        else => &.{},
+    };
+}
+
+fn readU32(bytes: []const u8, pos: *usize) u32 {
+    if (pos.* >= bytes.len) return 0;
+    const result = leb128.readU32Leb128(bytes[pos.*..]) catch return 0;
+    pos.* += result.bytes_read;
+    return result.value;
+}
+
+fn readS32(bytes: []const u8, pos: *usize) i32 {
+    if (pos.* >= bytes.len) return 0;
+    const result = leb128.readS32Leb128(bytes[pos.*..]) catch return 0;
+    pos.* += result.bytes_read;
+    return result.value;
+}
+
+fn readS64(bytes: []const u8, pos: *usize) i64 {
+    if (pos.* >= bytes.len) return 0;
+    const result = leb128.readS64Leb128(bytes[pos.*..]) catch return 0;
+    pos.* += result.bytes_read;
+    return result.value;
+}
+
+fn pushCtrl(ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), val_stack: *ValStack, opcode: u8, start: []const types.ValType, end: []const types.ValType, alloc: std.mem.Allocator) !void {
+    try ctrl_stack.append(alloc, .{
+        .opcode = opcode,
+        .start_types = start,
+        .end_types = end,
+        .height = val_stack.items.len,
+        .unreachable_flag = false,
+        .else_seen = false,
+    });
+}
+
+fn pushVals(val_stack: *ValStack, vts: []const types.ValType, alloc: std.mem.Allocator) !void {
+    for (vts) |vt| try val_stack.append(alloc, ValTypeOrUnknown.fromValType(vt));
+}
+
+fn popVal(val_stack: *ValStack, ctrl_stack: *const std.ArrayListUnmanaged(CtrlFrame)) error{TypeMismatch}!ValTypeOrUnknown {
+    if (ctrl_stack.items.len > 0) {
+        const frame = ctrl_stack.items[ctrl_stack.items.len - 1];
+        if (val_stack.items.len <= frame.height) {
+            if (frame.unreachable_flag) return .unknown;
+            return error.TypeMismatch;
+        }
+    } else if (val_stack.items.len == 0) {
+        return error.TypeMismatch;
+    }
+    return val_stack.pop() orelse return error.TypeMismatch;
+}
+
+fn popExpect(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), expected: ValTypeOrUnknown) Error!void {
+    const actual = popVal(val_stack, ctrl_stack) catch return error.TypeMismatch;
+    if (!actual.matches(expected)) return error.TypeMismatch;
+}
+
+fn popVals(val_stack: *ValStack, frame: *const CtrlFrame, expected: []const types.ValType) Error!void {
+    // Pop in reverse order
+    var i: usize = expected.len;
+    while (i > 0) {
+        i -= 1;
+        const actual = popValFromFrame(val_stack, frame) catch return error.TypeMismatch;
+        if (!actual.matches(ValTypeOrUnknown.fromValType(expected[i]))) return error.TypeMismatch;
+    }
+}
+
+fn popValFromFrame(val_stack: *ValStack, frame: *const CtrlFrame) error{TypeMismatch}!ValTypeOrUnknown {
+    if (val_stack.items.len <= frame.height) {
+        if (frame.unreachable_flag) return .unknown;
+        return error.TypeMismatch;
+    }
+    return val_stack.pop() orelse return error.TypeMismatch;
+}
+
+fn setUnreachable(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame)) void {
+    if (ctrl_stack.items.len == 0) return;
+    const frame = &ctrl_stack.items[ctrl_stack.items.len - 1];
+    val_stack.shrinkRetainingCapacity(frame.height);
+    frame.unreachable_flag = true;
+}
+
+fn labelTypes(frame: *const CtrlFrame) []const types.ValType {
+    // For loops, branch targets use start_types; for blocks/ifs, use end_types
+    return if (frame.opcode == 0x03) frame.start_types else frame.end_types;
+}
+
+fn checkUnary(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), input: ValTypeOrUnknown, output: ValTypeOrUnknown, alloc: std.mem.Allocator) Error!void {
+    try popExpect(val_stack, ctrl_stack, input);
+    val_stack.append(alloc, output) catch return error.OutOfMemory;
+}
+
+fn checkBinary(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), operand: ValTypeOrUnknown, result: ValTypeOrUnknown, alloc: std.mem.Allocator) Error!void {
+    try popExpect(val_stack, ctrl_stack, operand);
+    try popExpect(val_stack, ctrl_stack, operand);
+    val_stack.append(alloc, result) catch return error.OutOfMemory;
+}
+
+fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), result_type: ValTypeOrUnknown, alloc: std.mem.Allocator) Error!void {
+    _ = readU32(bytes, pos); // align
+    _ = readU32(bytes, pos); // offset
+    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    try popExpect(val_stack, ctrl_stack, .i32);
+    val_stack.append(alloc, result_type) catch return error.OutOfMemory;
+}
+
+fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), value_type: ValTypeOrUnknown, _: std.mem.Allocator) Error!void {
+    _ = readU32(bytes, pos); // align
+    _ = readU32(bytes, pos); // offset
+    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    try popExpect(val_stack, ctrl_stack, value_type);
+    try popExpect(val_stack, ctrl_stack, .i32);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -261,4 +902,47 @@ test "validate valid module with export" {
     });
     try module.exports.append(std.testing.allocator, .{ .name = "mem", .kind = .memory, .var_ = .{ .index = 0 } });
     try validate(&module, .{});
+}
+
+test "validate invalid local index via code_bytes" {
+    const alloc = std.testing.allocator;
+    const binary_reader = @import("binary/reader.zig");
+    // (module (type (func)) (func (type 0) (local.get 5)))
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
+        0x03, 0x02, 0x01, 0x00, // func section: type 0
+        0x0a, 0x06, 0x01, 0x04, 0x00, // code: 1 body, size 4, 0 locals
+        0x20, 0x05, // local.get 5 (invalid)
+        0x0b, // end
+    };
+    var module = try binary_reader.readModule(alloc, &wasm);
+    defer module.deinit();
+    try std.testing.expectError(error.InvalidLocalIndex, validate(&module, .{}));
+}
+
+test "validate unknown global via code_bytes" {
+    const alloc = std.testing.allocator;
+    const binary_reader = @import("binary/reader.zig");
+    // (module (type (func)) (func (type 0) (global.get 0))) — no globals
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type section: () -> ()
+        0x03, 0x02, 0x01, 0x00, // func section: type 0
+        0x0a, 0x06, 0x01, 0x04, 0x00, // code: 1 body, size 4, 0 locals
+        0x23, 0x00, // global.get 0 (invalid — no globals)
+        0x0b, // end
+    };
+    var module = try binary_reader.readModule(alloc, &wasm);
+    defer module.deinit();
+    try std.testing.expectError(error.InvalidGlobalIndex, validate(&module, .{}));
+}
+
+test "validate type mismatch via text parser" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    // (module (func (result i32))) — claims to return i32 but body is empty
+    var module = try Parser.parseModule(alloc, "(module (func (result i32)))");
+    defer module.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
 }
