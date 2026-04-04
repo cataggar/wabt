@@ -10,6 +10,8 @@ pub const Feature = @import("Feature.zig");
 pub const Module = @import("Module.zig");
 pub const Validator = @import("Validator.zig");
 
+pub const leb128 = @import("leb128.zig");
+
 pub const binary = struct {
     pub const reader = @import("binary/reader.zig");
     pub const writer = @import("binary/writer.zig");
