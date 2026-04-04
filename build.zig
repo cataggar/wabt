@@ -66,4 +66,22 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    // Tool tests
+    for (tool_names) |name| {
+        const tool_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(
+                    b.fmt("src/tools/{s}.zig", .{name}),
+                ),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "wabt", .module = wabt_mod },
+                },
+            }),
+        });
+        const run_tool_test = b.addRunArtifact(tool_test);
+        test_step.dependOn(&run_tool_test.step);
+    }
 }
