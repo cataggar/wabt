@@ -420,20 +420,26 @@ const Reader = struct {
         const expected = self.module.funcs.items.len - self.module.num_func_imports;
         if (count != expected) return error.FunctionCodeMismatch;
 
-        for (0..count) |_| {
+        for (0..count) |i| {
             const body_size = try self.readU32();
             const body_end = self.pos + body_size;
             if (body_end > self.data.len) return error.SectionTooLarge;
 
             const num_local_decls = try self.readU32();
             var total_locals: u64 = 0;
+            const func_idx = self.module.num_func_imports + @as(u32, @intCast(i));
             for (0..num_local_decls) |_| {
                 const local_count = try self.readU32();
                 total_locals += local_count;
                 if (total_locals > 50000) return error.TooManyLocals;
-                _ = try self.readValType();
+                const vt = try self.readValType();
+                // Populate local_types on the func
+                for (0..local_count) |_| {
+                    try self.module.funcs.items[func_idx].local_types.append(self.allocator, vt);
+                }
             }
-            // Skip instruction bytes for now
+            // Store the instruction bytes (slice into input data)
+            self.module.funcs.items[func_idx].code_bytes = self.data[self.pos..body_end];
             self.pos = body_end;
         }
     }

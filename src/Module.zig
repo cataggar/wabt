@@ -199,6 +199,11 @@ pub const Func = struct {
     local_types: std.ArrayListUnmanaged(types.ValType) = .{},
     loc: Location = .{},
     is_import: bool = false,
+    /// Raw instruction bytes (binary format) for validation.
+    /// Points into the original wasm bytes (binary path) or an owned buffer (text path).
+    code_bytes: []const u8 = &.{},
+    /// True when code_bytes is an owned allocation that must be freed.
+    owns_code_bytes: bool = false,
 };
 
 /// A defined or imported global.
@@ -306,6 +311,12 @@ pub const Module = struct {
             }
         }
         self.module_types.deinit(self.allocator);
+        for (self.funcs.items) |*func| {
+            func.local_types.deinit(self.allocator);
+            if (func.owns_code_bytes and func.code_bytes.len > 0) {
+                self.allocator.free(func.code_bytes);
+            }
+        }
         self.funcs.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.memories.deinit(self.allocator);
@@ -313,6 +324,9 @@ pub const Module = struct {
         self.tags.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.exports.deinit(self.allocator);
+        for (self.elem_segments.items) |*seg| {
+            seg.elem_var_indices.deinit(self.allocator);
+        }
         self.elem_segments.deinit(self.allocator);
         self.data_segments.deinit(self.allocator);
         self.customs.deinit(self.allocator);
