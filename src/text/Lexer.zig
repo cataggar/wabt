@@ -23,6 +23,8 @@ pub const TokenKind = enum {
     kw_elem,
     kw_data,
     kw_tag,
+    kw_rec,
+    kw_definition,
 
     // Inline keywords
     kw_param,
@@ -41,6 +43,11 @@ pub const TokenKind = enum {
     kw_v128,
     kw_funcref,
     kw_externref,
+    kw_anyref,
+
+    // Bare reference keywords (GC proposal)
+    kw_ref,
+    kw_null,
 
     // Reference keywords
     kw_ref_null,
@@ -101,6 +108,7 @@ pub const TokenKind = enum {
     // Special
     eof,
     invalid,
+    annotation,
 };
 
 pub const Token = struct {
@@ -135,6 +143,14 @@ pub const Lexer = struct {
                 if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
                     self.skipBlockComment();
                     return self.next();
+                }
+                // Check for annotation "(@id"
+                if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '@') {
+                    self.pos += 2; // skip '(' and '@'
+                    while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
+                        self.pos += 1;
+                    }
+                    return .{ .kind = .annotation, .text = self.source[start..self.pos], .offset = start };
                 }
                 self.pos += 1;
                 return .{ .kind = .l_paren, .text = "(", .offset = start };
@@ -337,6 +353,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "elem")) return .kw_elem;
     if (eql(text, "data")) return .kw_data;
     if (eql(text, "tag")) return .kw_tag;
+    if (eql(text, "rec")) return .kw_rec;
+    if (eql(text, "definition")) return .kw_definition;
 
     // Inline keywords
     if (eql(text, "param")) return .kw_param;
@@ -355,6 +373,11 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "v128")) return .kw_v128;
     if (eql(text, "funcref")) return .kw_funcref;
     if (eql(text, "externref")) return .kw_externref;
+    if (eql(text, "anyref")) return .kw_anyref;
+
+    // Bare reference keywords (GC proposal)
+    if (eql(text, "ref")) return .kw_ref;
+    if (eql(text, "null")) return .kw_null;
 
     // Reference keywords (dot-separated)
     if (eql(text, "ref.null")) return .kw_ref_null;
@@ -654,4 +677,41 @@ test "lex control and parametric keywords" {
     try testing.expectEqual(TokenKind.kw_call_indirect, lexer.next().kind);
     try testing.expectEqual(TokenKind.kw_drop, lexer.next().kind);
     try testing.expectEqual(TokenKind.kw_select, lexer.next().kind);
+}
+
+test "lex anyref keyword" {
+    var lexer = Lexer.init("anyref");
+    try testing.expectEqual(TokenKind.kw_anyref, lexer.next().kind);
+}
+
+test "lex rec keyword" {
+    var lexer = Lexer.init("rec");
+    try testing.expectEqual(TokenKind.kw_rec, lexer.next().kind);
+}
+
+test "lex definition keyword" {
+    var lexer = Lexer.init("definition");
+    try testing.expectEqual(TokenKind.kw_definition, lexer.next().kind);
+}
+
+test "lex bare ref and null keywords" {
+    var lexer = Lexer.init("ref null");
+    try testing.expectEqual(TokenKind.kw_ref, lexer.next().kind);
+    try testing.expectEqual(TokenKind.kw_null, lexer.next().kind);
+}
+
+test "lex annotation token" {
+    var buf: [8]TokenKind = undefined;
+    const kinds = collectTokenKinds("(@name foo)", &buf);
+    try testing.expectEqual(@as(usize, 4), kinds.len);
+    try testing.expectEqual(TokenKind.annotation, kinds[0]);
+    try testing.expectEqual(TokenKind.invalid, kinds[1]); // "foo" is not a keyword
+    try testing.expectEqual(TokenKind.r_paren, kinds[2]);
+    try testing.expectEqual(TokenKind.eof, kinds[3]);
+
+    // Verify annotation text includes (@
+    var lexer = Lexer.init("(@custom stuff)");
+    const tok = lexer.next();
+    try testing.expectEqual(TokenKind.annotation, tok.kind);
+    try testing.expectEqualStrings("(@custom", tok.text);
 }

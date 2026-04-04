@@ -1957,14 +1957,12 @@ test "isEnabled — MVP opcodes always enabled" {
 }
 
 test "isEnabled — feature-gated opcodes respect flags" {
-    const none = Feature.Set{
-        .mutable_globals = false,
-        .sat_float_to_int = false,
-        .sign_extension = false,
-        .simd = false,
-        .multi_value = false,
-        .bulk_memory = false,
-        .reference_types = false,
+    const none = comptime blk: {
+        var s: Feature.Set = undefined;
+        for (@typeInfo(Feature.Set).@"struct".fields) |f| {
+            @field(s, f.name) = false;
+        }
+        break :blk s;
     };
 
     // Exceptions
@@ -2051,10 +2049,11 @@ test "isEnabled — default features enable expected proposals" {
     try std.testing.expect(Code.memory_init.isEnabled(defaults));
     try std.testing.expect(Code.ref_null.isEnabled(defaults));
     try std.testing.expect(Code.select_t.isEnabled(defaults));
+    try std.testing.expect(Code.try_.isEnabled(defaults));
+    try std.testing.expect(Code.return_call.isEnabled(defaults));
+    try std.testing.expect(Code.memory_atomic_notify.isEnabled(defaults));
+    try std.testing.expect(Code.call_ref.isEnabled(defaults));
     // These should NOT be enabled by default
-    try std.testing.expect(!Code.try_.isEnabled(defaults));
-    try std.testing.expect(!Code.return_call.isEnabled(defaults));
-    try std.testing.expect(!Code.memory_atomic_notify.isEnabled(defaults));
     try std.testing.expect(!Code.i8x16_relaxed_swizzle.isEnabled(defaults));
     try std.testing.expect(!Code.i64_add128.isEnabled(defaults));
 }

@@ -225,9 +225,10 @@ test "validate too many memories" {
     defer module.deinit();
     try module.memories.append(std.testing.allocator, .{});
     try module.memories.append(std.testing.allocator, .{});
-    try std.testing.expectError(error.TooManyMemories, validate(&module, .{}));
-    // With multi_memory enabled, should pass
-    try validate(&module, .{ .features = .{ .multi_memory = true } });
+    // With multi_memory disabled, two memories should fail
+    try std.testing.expectError(error.TooManyMemories, validate(&module, .{ .features = .{ .multi_memory = false } }));
+    // With multi_memory enabled (now default), should pass
+    try validate(&module, .{});
 }
 
 test "validate invalid limits (max < initial)" {

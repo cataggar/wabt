@@ -34,7 +34,13 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     // Parse module fields
-    while (p.peek().kind == .l_paren) {
+    while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
+        // Skip annotations: (@id ...) — consume tokens until matching ')'
+        if (p.peek().kind == .annotation) {
+            _ = p.advance(); // consume annotation token
+            try p.skipAnnotation();
+            continue;
+        }
         _ = p.advance(); // consume '('
         const kw = p.advance();
         switch (kw.kind) {
@@ -48,6 +54,8 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_start => try p.parseStart(&module),
             .kw_elem => try p.parseElem(&module),
             .kw_data => try p.parseData(&module),
+            .kw_rec => try p.parseRec(&module),
+            .kw_definition => try p.skipSExpr(),
             else => try p.skipSExpr(),
         }
         try p.expect(.r_paren);
@@ -88,7 +96,7 @@ const Parser = struct {
         while (depth > 0) {
             const tok = self.advance();
             switch (tok.kind) {
-                .l_paren => depth += 1,
+                .l_paren, .annotation => depth += 1,
                 .r_paren => {
                     depth -= 1;
                     if (depth == 0) {
@@ -103,6 +111,21 @@ const Parser = struct {
         }
     }
 
+    fn skipAnnotation(self: *Parser) ParseError!void {
+        // The annotation token (@id has been consumed. Now skip until matching ')'.
+        // Annotations can contain nested s-expressions.
+        var depth: u32 = 1;
+        while (depth > 0) {
+            const tok = self.advance();
+            switch (tok.kind) {
+                .l_paren, .annotation => depth += 1,
+                .r_paren => depth -= 1,
+                .eof => return error.InvalidModule,
+                else => {},
+            }
+        }
+    }
+
     fn parseU32(self: *Parser) ParseError!u32 {
         const tok = self.advance();
         if (tok.kind != .integer) return error.InvalidNumber;
@@ -110,6 +133,30 @@ const Parser = struct {
     }
 
     fn parseValType(self: *Parser) ParseError!types.ValType {
+        // Handle parenthesized reference types: (ref null <heaptype>) / (ref <heaptype>)
+        if (self.peek().kind == .l_paren) {
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_ref) {
+                _ = self.advance(); // consume 'ref'
+                var nullable = false;
+                if (self.peek().kind == .kw_null) {
+                    _ = self.advance(); // consume 'null'
+                    nullable = true;
+                }
+                // Skip heap type (could be $id, keyword like func/extern/any, or index)
+                if (self.peek().kind != .r_paren) {
+                    _ = self.advance();
+                }
+                try self.expect(.r_paren);
+                return if (nullable) .ref_null else .ref;
+            }
+            // Not a ref type — restore state
+            self.lexer.pos = save_pos;
+            self.peeked = save_peeked;
+            return error.InvalidType;
+        }
         const tok = self.advance();
         return switch (tok.kind) {
             .kw_i32 => .i32,
@@ -119,6 +166,7 @@ const Parser = struct {
             .kw_v128 => .v128,
             .kw_funcref => .funcref,
             .kw_externref => .externref,
+            .kw_anyref => .anyref,
             else => error.InvalidType,
         };
     }
@@ -130,6 +178,8 @@ const Parser = struct {
         errdefer results.deinit(self.allocator);
 
         while (self.peek().kind == .l_paren) {
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
             _ = self.advance();
             const kw = self.peek();
             if (kw.kind == .kw_param) {
@@ -147,7 +197,8 @@ const Parser = struct {
                 }
                 try self.expect(.r_paren);
             } else {
-                self.peeked = Lex.Token{ .kind = .l_paren, .text = "(", .offset = 0 };
+                self.lexer.pos = save_pos;
+                self.peeked = save_peeked;
                 break;
             }
         }
@@ -165,12 +216,36 @@ const Parser = struct {
         // (type $name? (func (param ...) (result ...)))
         if (self.peek().kind == .identifier) _ = self.advance();
         try self.expect(.l_paren);
-        try self.expect(.kw_func);
-        const sig = try self.parseFuncSig(module);
-        try self.expect(.r_paren);
-        try module.module_types.append(self.allocator, .{
-            .func_type = .{ .params = sig.params, .results = sig.results },
-        });
+        // The inner form may be func, struct, or array (GC proposal) — skip non-func
+        if (self.peek().kind == .kw_func) {
+            _ = self.advance();
+            const sig = try self.parseFuncSig(module);
+            try self.expect(.r_paren);
+            try module.module_types.append(self.allocator, .{
+                .func_type = .{ .params = sig.params, .results = sig.results },
+            });
+        } else {
+            // GC composite type (struct, array, sub, etc.) — skip for now
+            try self.skipSExpr();
+            try self.expect(.r_paren);
+            try module.module_types.append(self.allocator, .{
+                .func_type = .{},
+            });
+        }
+    }
+
+    fn parseRec(self: *Parser, module: *Mod.Module) ParseError!void {
+        // (rec (type ...) (type ...) ...)
+        while (self.peek().kind == .l_paren) {
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_type) {
+                _ = self.advance(); // consume 'type'
+                try self.parseType(module);
+            } else {
+                try self.skipSExpr();
+            }
+            try self.expect(.r_paren);
+        }
     }
 
     fn parseFunc(self: *Parser, module: *Mod.Module) ParseError!void {
@@ -240,16 +315,21 @@ const Parser = struct {
         var mutability: types.Mutability = .immutable;
         var val_type: types.ValType = undefined;
 
+        // Check for (mut <valtype>) — requires two-token lookahead
         if (self.peek().kind == .l_paren) {
-            _ = self.advance();
+            // Save lexer state to allow backtracking
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_mut) {
                 _ = self.advance();
                 mutability = .mutable;
                 val_type = try self.parseValType();
                 try self.expect(.r_paren);
             } else {
-                // Might be init expr — skip
-                self.peeked = Lex.Token{ .kind = .l_paren, .text = "(", .offset = 0 };
+                // Not (mut ...) — restore and let parseValType handle it
+                self.lexer.pos = save_pos;
+                self.peeked = save_peeked;
                 val_type = try self.parseValType();
             }
         } else {
@@ -352,11 +432,19 @@ const Parser = struct {
                 var mutability: types.Mutability = .immutable;
                 var val_type: types.ValType = undefined;
                 if (self.peek().kind == .l_paren) {
+                    const save_pos = self.lexer.pos;
+                    const save_peeked = self.peeked;
                     _ = self.advance();
-                    try self.expect(.kw_mut);
-                    mutability = .mutable;
-                    val_type = try self.parseValType();
-                    try self.expect(.r_paren);
+                    if (self.peek().kind == .kw_mut) {
+                        _ = self.advance();
+                        mutability = .mutable;
+                        val_type = try self.parseValType();
+                        try self.expect(.r_paren);
+                    } else {
+                        self.lexer.pos = save_pos;
+                        self.peeked = save_peeked;
+                        val_type = try self.parseValType();
+                    }
                 } else {
                     val_type = try self.parseValType();
                 }
@@ -536,4 +624,44 @@ test "parse module with start" {
     );
     defer module.deinit();
     try std.testing.expect(module.start_var != null);
+}
+
+test "parse (ref null func) as value type" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (global (ref null func) (ref.null func))
+        \\)
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
+    try std.testing.expectEqual(types.ValType.ref_null, module.globals.items[0].type.val_type);
+}
+
+test "parse module with rec type group" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (rec (type (func)) (type (func (param i32))))
+        \\)
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.module_types.items.len);
+}
+
+test "parse module with anyref global" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (global anyref (ref.null any))
+        \\)
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
+    try std.testing.expectEqual(types.ValType.anyref, module.globals.items[0].type.val_type);
+}
+
+test "parse module with annotation" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module (@name "test") (memory 1))
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.memories.items.len);
 }
