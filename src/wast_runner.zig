@@ -607,10 +607,11 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                             result.skipped += 1;
                             continue;
                         };
-                        defer allocator.free(wasm_bytes);
                         if (state.setModuleBinary(wasm_bytes)) {
+                            // Module now owns the bytes (slices into them for names/code)
                             result.passed += 1;
                         } else {
+                            allocator.free(wasm_bytes);
                             result.skipped += 1;
                         }
                     } else {
