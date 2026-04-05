@@ -679,15 +679,15 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
     };
     const func_name = decodeStringEscapes(allocator, raw_func_name) orelse raw_func_name;
 
-    var args_buf: [16]Interp.Value = undefined;
+    var args_buf: [32]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
 
     // Parse expected results (after the invoke sexpr)
     const after_invoke = skipFirstSExpr(sexpr) orelse sexpr;
-    var expected_buf: [16]Interp.Value = undefined;
+    var expected_buf: [32]Interp.Value = undefined;
     const expected = parseExpectedResults(after_invoke, &expected_buf);
 
-    var results_buf: [16]Interp.Value = undefined;
+    var results_buf: [32]Interp.Value = undefined;
     const actuals = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
         result.failed += 1;
         if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });

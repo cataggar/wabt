@@ -342,6 +342,7 @@ const Parser = struct {
         errdefer params.deinit(self.allocator);
         var results: std.ArrayListUnmanaged(types.ValType) = .{};
         errdefer results.deinit(self.allocator);
+        var seen_result = false;
 
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
@@ -349,6 +350,7 @@ const Parser = struct {
             _ = self.advance();
             const kw = self.peek();
             if (kw.kind == .kw_param) {
+                if (seen_result) return error.UnexpectedToken; // param after result
                 _ = self.advance();
                 // Optional identifier
                 if (self.peek().kind == .identifier) _ = self.advance();
@@ -357,6 +359,7 @@ const Parser = struct {
                 }
                 try self.expect(.r_paren);
             } else if (kw.kind == .kw_result) {
+                seen_result = true;
                 _ = self.advance();
                 while (self.peek().kind != .r_paren) {
                     try results.append(self.allocator, try self.parseValType());
@@ -589,17 +592,40 @@ const Parser = struct {
                 @memcpy(p, params_list.items);
                 const r = self.allocator.alloc(types.ValType, results_list.items.len) catch return error.OutOfMemory;
                 @memcpy(r, results_list.items);
-                const type_idx = module.module_types.items.len;
-                module.module_types.append(self.allocator, .{
-                    .func_type = .{ .params = p, .results = r },
-                }) catch return error.OutOfMemory;
+                const new_sig = Mod.FuncSignature{ .params = p, .results = r };
+                // Deduplicate: reuse existing type if signature matches
+                const type_idx = blk: {
+                    for (module.module_types.items, 0..) |entry, idx| {
+                        switch (entry) {
+                            .func_type => |ft| if (ft.eql(new_sig)) {
+                                self.allocator.free(p);
+                                self.allocator.free(r);
+                                break :blk idx;
+                            },
+                            else => {},
+                        }
+                    }
+                    module.module_types.append(self.allocator, .{
+                        .func_type = new_sig,
+                    }) catch return error.OutOfMemory;
+                    break :blk module.module_types.items.len - 1;
+                };
                 func.decl.type_var = .{ .index = @intCast(type_idx) };
             } else {
-                // Empty func with no type — create void->void type
-                const type_idx = module.module_types.items.len;
-                module.module_types.append(self.allocator, .{
-                    .func_type = .{},
-                }) catch return error.OutOfMemory;
+                // Empty func with no type — deduplicate void->void type
+                const empty_sig = Mod.FuncSignature{};
+                const type_idx = blk: {
+                    for (module.module_types.items, 0..) |entry, idx| {
+                        switch (entry) {
+                            .func_type => |ft| if (ft.eql(empty_sig)) break :blk idx,
+                            else => {},
+                        }
+                    }
+                    module.module_types.append(self.allocator, .{
+                        .func_type = .{},
+                    }) catch return error.OutOfMemory;
+                    break :blk module.module_types.items.len - 1;
+                };
                 func.decl.type_var = .{ .index = @intCast(type_idx) };
             }
         }
@@ -1970,6 +1996,7 @@ const Parser = struct {
     }
 
     fn parseStart(self: *Parser, module: *Mod.Module) ParseError!void {
+        if (module.start_var != null) return error.InvalidModule;
         const index = try self.parseFuncIdx();
         module.start_var = .{ .index = index };
     }
