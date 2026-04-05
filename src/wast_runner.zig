@@ -22,30 +22,88 @@ pub const Result = struct {
     }
 };
 
-/// Mutable state for the runner: tracks the current module, instance, and interpreter.
+/// A module/instance/interpreter triple.
+const ModuleTriple = struct {
+    module: *Mod.Module,
+    instance: *Interp.Instance,
+    interpreter: *Interp.Interpreter,
+
+    fn destroy(self: ModuleTriple, allocator: std.mem.Allocator) void {
+        self.interpreter.deinit();
+        allocator.destroy(self.interpreter);
+        self.instance.deinit();
+        allocator.destroy(self.instance);
+        self.module.deinit();
+        allocator.destroy(self.module);
+    }
+};
+
+/// Mutable state for the runner: tracks the current module, instance, and interpreter,
+/// plus named (`$id`) and registered (`"name"`) module registries for multi-module tests.
 const RunState = struct {
     allocator: std.mem.Allocator,
     module: ?*Mod.Module = null,
     instance: ?*Interp.Instance = null,
     interpreter: ?*Interp.Interpreter = null,
 
+    /// Modules registered by $id (e.g. `(module $Func ...)` → "$Func").
+    named_modules: std.StringHashMapUnmanaged(ModuleTriple) = .{},
+    /// Modules registered by string name (e.g. `(register "Mf")` → "Mf").
+    registered_modules: std.StringHashMapUnmanaged(ModuleTriple) = .{},
+    /// Keys that are owned by this state and must be freed.
+    owned_keys: std.ArrayListUnmanaged([]const u8) = .{},
+
     fn deinit(self: *RunState) void {
-        if (self.interpreter) |interp| { interp.deinit(); self.allocator.destroy(interp); }
-        if (self.instance) |inst| { inst.deinit(); self.allocator.destroy(inst); }
-        if (self.module) |mod| { mod.deinit(); self.allocator.destroy(mod); }
+        self.destroyCurrent();
+        // Destroy all registered triples (named + registered may share entries,
+        // so collect unique pointers first).
+        var destroyed = std.AutoHashMapUnmanaged(*Mod.Module, void){};
+        defer destroyed.deinit(self.allocator);
+        var it = self.named_modules.valueIterator();
+        while (it.next()) |triple| {
+            destroyed.put(self.allocator, triple.module, {}) catch {};
+            triple.destroy(self.allocator);
+        }
+        var it2 = self.registered_modules.valueIterator();
+        while (it2.next()) |triple| {
+            if (!destroyed.contains(triple.module)) {
+                triple.destroy(self.allocator);
+                destroyed.put(self.allocator, triple.module, {}) catch {};
+            }
+        }
+        self.named_modules.deinit(self.allocator);
+        self.registered_modules.deinit(self.allocator);
+        for (self.owned_keys.items) |key| self.allocator.free(key);
+        self.owned_keys.deinit(self.allocator);
+    }
+
+    /// Destroy the current module/instance/interpreter if they are not held
+    /// in any registry.
+    fn destroyCurrent(self: *RunState) void {
+        if (self.module) |mod| {
+            // Check if this module is referenced in a registry
+            if (!self.isModuleRetained(mod)) {
+                if (self.interpreter) |interp| { interp.deinit(); self.allocator.destroy(interp); }
+                if (self.instance) |inst| { inst.deinit(); self.allocator.destroy(inst); }
+                mod.deinit();
+                self.allocator.destroy(mod);
+            }
+        }
         self.interpreter = null;
         self.instance = null;
         self.module = null;
     }
 
+    fn isModuleRetained(self: *RunState, mod: *Mod.Module) bool {
+        var it = self.named_modules.valueIterator();
+        while (it.next()) |triple| if (triple.module == mod) return true;
+        var it2 = self.registered_modules.valueIterator();
+        while (it2.next()) |triple| if (triple.module == mod) return true;
+        return false;
+    }
+
     fn setModule(self: *RunState, mod_text: []const u8) bool {
-        // Clean up previous state
-        if (self.interpreter) |interp| { interp.deinit(); self.allocator.destroy(interp); }
-        if (self.instance) |inst| { inst.deinit(); self.allocator.destroy(inst); }
-        if (self.module) |mod| { mod.deinit(); self.allocator.destroy(mod); }
-        self.interpreter = null;
-        self.instance = null;
-        self.module = null;
+        self.destroyCurrent();
 
         const mod = self.allocator.create(Mod.Module) catch return false;
         mod.* = Parser.parseModule(self.allocator, mod_text) catch {
@@ -85,7 +143,37 @@ const RunState = struct {
         self.module = mod;
         self.instance = inst;
         self.interpreter = interp;
+
+        // If the module text has a $name id, register it.
+        if (extractModuleId(mod_text)) |id| {
+            self.putNamed(id, .{ .module = mod, .instance = inst, .interpreter = interp });
+        }
+
         return true;
+    }
+
+    fn putNamed(self: *RunState, id: []const u8, triple: ModuleTriple) void {
+        const key = self.allocator.dupe(u8, id) catch return;
+        self.owned_keys.append(self.allocator, key) catch {
+            self.allocator.free(key);
+            return;
+        };
+        self.named_modules.put(self.allocator, key, triple) catch {};
+    }
+
+    fn putRegistered(self: *RunState, name: []const u8, triple: ModuleTriple) void {
+        const key = self.allocator.dupe(u8, name) catch return;
+        self.owned_keys.append(self.allocator, key) catch {
+            self.allocator.free(key);
+            return;
+        };
+        self.registered_modules.put(self.allocator, key, triple) catch {};
+    }
+
+    /// Look up an interpreter by $id name.
+    fn getNamedInterpreter(self: *RunState, id: []const u8) ?*Interp.Interpreter {
+        if (self.named_modules.get(id)) |triple| return triple.interpreter;
+        return null;
     }
 };
 
@@ -126,9 +214,10 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .assert_return => processAssertReturn(allocator, sexpr.text, &state, &result),
             .assert_trap => processAssertTrap(allocator, sexpr.text, &state, &result),
             .invoke => processInvoke(allocator, sexpr.text, &state, &result),
+            .register => processRegister(sexpr.text, &state, &result),
+            .get => processGet(sexpr.text, &state, &result),
             .assert_exhaustion,
             .assert_unlinkable,
-            .register,
             .unknown,
             => {
                 result.skipped += 1;
@@ -151,6 +240,7 @@ const Command = enum {
     assert_unlinkable,
     invoke,
     register,
+    get,
     unknown,
 };
 
@@ -171,6 +261,7 @@ fn classifyCommand(sexpr: []const u8) Command {
     if (std.mem.eql(u8, word, "assert_unlinkable")) return .assert_unlinkable;
     if (std.mem.eql(u8, word, "invoke")) return .invoke;
     if (std.mem.eql(u8, word, "register")) return .register;
+    if (std.mem.eql(u8, word, "get")) return .get;
     return .unknown;
 }
 
@@ -246,13 +337,20 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
 
 fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
     _ = allocator;
-    const interp = state.interpreter orelse {
+
+    // Check for (assert_return (get ...) ...) pattern
+    if (findGet(sexpr)) |get_expr| {
+        processAssertReturnGet(get_expr, sexpr, state, result);
+        return;
+    }
+
+    // Parse: (assert_return (invoke "name" args...) expected...)
+    // or:   (assert_return (invoke $Mod "name" args...) expected...)
+    const inv = findInvoke(sexpr) orelse {
         result.skipped += 1;
         return;
     };
-
-    // Parse: (assert_return (invoke "name" args...) expected...)
-    const inv = findInvoke(sexpr) orelse {
+    const interp = resolveInterpreter(inv, state) orelse {
         result.skipped += 1;
         return;
     };
@@ -301,13 +399,13 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
 fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
     _ = allocator;
-    const interp = state.interpreter orelse {
-        result.skipped += 1;
-        return;
-    };
 
     const inv = findInvoke(sexpr) orelse {
         // Could be (assert_trap (module ...) "msg") — skip these
+        result.skipped += 1;
+        return;
+    };
+    const interp = resolveInterpreter(inv, state) orelse {
         result.skipped += 1;
         return;
     };
@@ -330,7 +428,7 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
 
 fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
     _ = allocator;
-    const interp = state.interpreter orelse {
+    const interp = resolveInterpreter(sexpr, state) orelse {
         result.skipped += 1;
         return;
     };
@@ -342,6 +440,177 @@ fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunSta
     const args = parseInvokeArgs(sexpr, &args_buf);
     _ = interp.callExport(func_name, args) catch {};
     result.passed += 1;
+}
+
+/// Handle `(register "name")` or `(register "name" $id)`.
+fn processRegister(sexpr: []const u8, state: *RunState, result: *Result) void {
+    const name = extractStringLiteral(sexpr) orelse {
+        result.skipped += 1;
+        return;
+    };
+    // Determine which module to register: $id target or current.
+    const triple = blk: {
+        // Check for an optional $id after the string literal
+        if (extractDollarIdAfterString(sexpr)) |id| {
+            if (state.named_modules.get(id)) |t| break :blk t;
+        }
+        // Fall back to the current module.
+        const mod = state.module orelse {
+            result.skipped += 1;
+            return;
+        };
+        const inst = state.instance orelse {
+            result.skipped += 1;
+            return;
+        };
+        const interp = state.interpreter orelse {
+            result.skipped += 1;
+            return;
+        };
+        break :blk ModuleTriple{ .module = mod, .instance = inst, .interpreter = interp };
+    };
+    state.putRegistered(name, triple);
+    result.passed += 1;
+}
+
+/// Handle standalone `(get "global_name")` or `(get $Mod "global_name")`.
+fn processGet(sexpr: []const u8, state: *RunState, result: *Result) void {
+    _ = resolveGetValue(sexpr, state) orelse {
+        result.skipped += 1;
+        return;
+    };
+    result.passed += 1;
+}
+
+/// Handle `(assert_return (get ...) (expected))`.
+fn processAssertReturnGet(get_expr: []const u8, outer: []const u8, state: *RunState, result: *Result) void {
+    const actual = resolveGetValue(get_expr, state) orelse {
+        result.skipped += 1;
+        return;
+    };
+
+    // Parse expected results (after the get sexpr)
+    const after_get = skipFirstSExpr(outer) orelse outer;
+    var expected_buf: [16]Interp.Value = undefined;
+    const expected = parseExpectedResults(after_get, &expected_buf);
+
+    if (expected.len == 0) {
+        result.passed += 1;
+        return;
+    }
+
+    if (valuesEqual(actual, expected[0])) {
+        result.passed += 1;
+    } else {
+        result.failed += 1;
+        if (result.failed <= 20) {
+            const name = extractStringLiteral(get_expr) orelse "?";
+            std.debug.print("  FAIL assert_return(get \"{s}\"): got {any} expected {any}\n", .{ name, actual, expected[0] });
+        }
+    }
+}
+
+/// Resolve a global export value from a `(get ...)` expression.
+fn resolveGetValue(get_expr: []const u8, state: *RunState) ?Interp.Value {
+    // (get "name") or (get $Mod "name")
+    const interp = resolveInterpreter(get_expr, state) orelse return null;
+    const global_name = extractStringLiteral(get_expr) orelse return null;
+    const exp = interp.instance.module.getExport(global_name) orelse return null;
+    if (exp.kind != .global) return null;
+    const idx: u32 = switch (exp.var_) {
+        .index => |i| i,
+        .name => return null,
+    };
+    if (idx >= interp.instance.globals.items.len) return null;
+    return interp.instance.globals.items[idx];
+}
+
+/// Resolve the interpreter to use for an invoke/get expression.
+/// If the expression contains a `$name` identifier before the string literal,
+/// look it up in the named module registry; otherwise use the current interpreter.
+fn resolveInterpreter(expr: []const u8, state: *RunState) ?*Interp.Interpreter {
+    if (extractDollarId(expr)) |id| {
+        if (state.getNamedInterpreter(id)) |interp| return interp;
+    }
+    return state.interpreter;
+}
+
+/// Extract a `$identifier` from an invoke/get expression.
+/// Looks for `$` after the keyword and before the first `"`.
+fn extractDollarId(expr: []const u8) ?[]const u8 {
+    // Skip '(' and keyword
+    var i: usize = 1;
+    while (i < expr.len and isWhitespace(expr[i])) : (i += 1) {}
+    // Skip keyword
+    while (i < expr.len and !isWhitespace(expr[i]) and expr[i] != '(' and expr[i] != ')') : (i += 1) {}
+    // Skip whitespace after keyword
+    while (i < expr.len and isWhitespace(expr[i])) : (i += 1) {}
+    // Check for $ before "
+    if (i < expr.len and expr[i] == '$') {
+        const start = i;
+        i += 1;
+        while (i < expr.len and !isWhitespace(expr[i]) and expr[i] != '(' and expr[i] != ')' and expr[i] != '"') : (i += 1) {}
+        return expr[start..i];
+    }
+    return null;
+}
+
+/// Extract a `$identifier` that appears after a string literal in a sexpr.
+/// Used for `(register "name" $id)`.
+fn extractDollarIdAfterString(expr: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    // Find and skip first string literal
+    while (i < expr.len and expr[i] != '"') : (i += 1) {}
+    if (i >= expr.len) return null;
+    i += 1; // skip opening "
+    while (i < expr.len and expr[i] != '"') : (i += 1) {
+        if (expr[i] == '\\' and i + 1 < expr.len) { i += 1; continue; }
+    }
+    if (i >= expr.len) return null;
+    i += 1; // skip closing "
+    // Skip whitespace
+    while (i < expr.len and isWhitespace(expr[i])) : (i += 1) {}
+    // Check for $
+    if (i < expr.len and expr[i] == '$') {
+        const start = i;
+        i += 1;
+        while (i < expr.len and !isWhitespace(expr[i]) and expr[i] != '(' and expr[i] != ')') : (i += 1) {}
+        return expr[start..i];
+    }
+    return null;
+}
+
+/// Extract the `$name` identifier from a module s-expression, e.g. `(module $Func ...)`.
+fn extractModuleId(mod_text: []const u8) ?[]const u8 {
+    var i: usize = 1; // skip '('
+    while (i < mod_text.len and isWhitespace(mod_text[i])) : (i += 1) {}
+    // Skip "module"
+    const mod_kw = "module";
+    if (i + mod_kw.len > mod_text.len) return null;
+    if (!std.mem.eql(u8, mod_text[i .. i + mod_kw.len], mod_kw)) return null;
+    i += mod_kw.len;
+    // Skip whitespace
+    while (i < mod_text.len and isWhitespace(mod_text[i])) : (i += 1) {}
+    // Check for $identifier
+    if (i < mod_text.len and mod_text[i] == '$') {
+        const start = i;
+        i += 1;
+        while (i < mod_text.len and !isWhitespace(mod_text[i]) and mod_text[i] != '(' and mod_text[i] != ')') : (i += 1) {}
+        return mod_text[start..i];
+    }
+    return null;
+}
+
+/// Find the `(get ...)` sub-expression inside a sexpr.
+fn findGet(sexpr: []const u8) ?[]const u8 {
+    var i: usize = 1;
+    while (i < sexpr.len) : (i += 1) {
+        if (sexpr[i] == '(' and hasWordAt(sexpr, i + 1, "get")) {
+            const inner = extractSExpr(sexpr, i) orelse return null;
+            return inner.text;
+        }
+    }
+    return null;
 }
 
 // ── Invoke / value parsing helpers ──────────────────────────────────────
@@ -800,4 +1069,61 @@ test "run: assert_return with block and br" {
     const result = run(std.testing.allocator, wast);
     try std.testing.expectEqual(@as(u32, 2), result.passed);
     try std.testing.expectEqual(@as(u32, 0), result.failed);
+}
+
+test "run: register keeps module active" {
+    const wast =
+        \\(module
+        \\  (func (export "f") (result i32) (i32.const 42))
+        \\)
+        \\(register "M")
+        \\(assert_return (invoke "f") (i32.const 42))
+    ;
+    const result = run(std.testing.allocator, wast);
+    // module (passed) + register (passed) + assert_return (passed) = 3
+    try std.testing.expectEqual(@as(u32, 3), result.passed);
+    try std.testing.expectEqual(@as(u32, 0), result.failed);
+}
+
+test "run: named module survives replacement" {
+    const wast =
+        \\(module $Func
+        \\  (func (export "e") (param i32) (result i32)
+        \\    (i32.add (local.get 0) (i32.const 1))
+        \\  )
+        \\)
+        \\(assert_return (invoke "e" (i32.const 42)) (i32.const 43))
+        \\(module)
+        \\(assert_return (invoke $Func "e" (i32.const 42)) (i32.const 43))
+    ;
+    const result = run(std.testing.allocator, wast);
+    // module $Func (passed) + assert_return (passed) + module (passed) + assert_return (passed) = 4
+    try std.testing.expectEqual(@as(u32, 4), result.passed);
+    try std.testing.expectEqual(@as(u32, 0), result.failed);
+}
+
+test "run: get global export" {
+    const wast =
+        \\(module
+        \\  (global i32 (i32.const 99))
+        \\  (export "g" (global 0))
+        \\)
+        \\(assert_return (get "g") (i32.const 99))
+    ;
+    const result = run(std.testing.allocator, wast);
+    try std.testing.expectEqual(@as(u32, 2), result.passed);
+    try std.testing.expectEqual(@as(u32, 0), result.failed);
+}
+
+test "extractModuleId" {
+    try std.testing.expectEqualStrings("$Func", extractModuleId("(module $Func (func))").?);
+    try std.testing.expectEqualStrings("$M1", extractModuleId("(module $M1)").?);
+    try std.testing.expect(extractModuleId("(module (func))") == null);
+    try std.testing.expect(extractModuleId("(module)") == null);
+}
+
+test "extractDollarId" {
+    try std.testing.expectEqualStrings("$Func", extractDollarId("(invoke $Func \"e\")").?);
+    try std.testing.expect(extractDollarId("(invoke \"e\")") == null);
+    try std.testing.expectEqualStrings("$M", extractDollarId("(get $M \"g\")").?);
 }
