@@ -411,7 +411,11 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1; // parse failure = malformed = pass
             return;
         };
-        module.deinit();
+        defer module.deinit();
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1; // validation failure = malformed = pass
+            return;
+        };
         result.failed += 1; // parsed OK but should have been malformed
         return;
     }
