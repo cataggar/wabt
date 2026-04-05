@@ -167,8 +167,7 @@ const RunState = struct {
         self.destroyCurrent();
 
         const mod = self.allocator.create(Mod.Module) catch return false;
-        mod.* = Parser.parseModule(self.allocator, mod_text) catch |e| {
-            std.debug.print("  DBG setModule parse failed: {any} text[0..200]=\"{s}\"\n", .{ e, mod_text[0..@min(200, mod_text.len)] });
+        mod.* = Parser.parseModule(self.allocator, mod_text) catch {
             self.allocator.destroy(mod);
             return false;
         };
@@ -690,7 +689,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1; // validation failure = malformed = pass
             return;
         };
-        if (result.failed <= 40)
+        if (result.failed <= 20)
             std.debug.print("  FAIL assert_malformed(quote): should have been malformed: text[0..120]=\"{s}\"\n", .{wat_text[0..@min(120, wat_text.len)]});
         result.failed += 1; // parsed OK but should have been malformed
         return;
@@ -713,7 +712,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1;
             return;
         };
-        if (result.failed <= 30) {
+        if (result.failed <= 20) {
             std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes\n", .{wasm_bytes.len});
             var hex_buf: [60]u8 = undefined;
             var hi: usize = 0;
@@ -749,7 +748,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     };
 
-    if (result.failed <= 40)
+    if (result.failed <= 20)
         std.debug.print("  FAIL assert_malformed(text): should have been malformed: module[0..120]=\"{s}\"\n", .{inner[0..@min(120, inner.len)]});
     result.failed += 1;
 }

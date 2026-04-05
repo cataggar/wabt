@@ -71,6 +71,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     p.lexer.pos = saved_pos;
     p.peeked = saved_peeked;
     p.malformed = false; // Reset malformed flag for Pass 2
+    var seen_non_import_def = false; // Track if we've seen func/global/table/memory definitions
 
     while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
         // Skip annotations: (@id ...) — consume tokens until matching ')'
@@ -83,11 +84,32 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         const kw = p.advance();
         switch (kw.kind) {
             .kw_type, .kw_rec => try p.skipSExpr(), // already processed
-            .kw_func => try p.parseFunc(&module),
-            .kw_table => try p.parseTable(&module),
-            .kw_memory => try p.parseMemory(&module),
-            .kw_global => try p.parseGlobal(&module),
-            .kw_import => try p.parseImport(&module),
+            .kw_func => {
+                try p.parseFunc(&module);
+                // Check if this was an inline import (don't set seen_non_import_def)
+                // Inline imports have is_import set on the last func added
+                const last = module.funcs.items[module.funcs.items.len - 1];
+                if (!last.is_import) seen_non_import_def = true;
+            },
+            .kw_table => {
+                try p.parseTable(&module);
+                const last = module.tables.items[module.tables.items.len - 1];
+                if (!last.is_import) seen_non_import_def = true;
+            },
+            .kw_memory => {
+                try p.parseMemory(&module);
+                const last = module.memories.items[module.memories.items.len - 1];
+                if (!last.is_import) seen_non_import_def = true;
+            },
+            .kw_global => {
+                try p.parseGlobal(&module);
+                const last = module.globals.items[module.globals.items.len - 1];
+                if (!last.is_import) seen_non_import_def = true;
+            },
+            .kw_import => {
+                if (seen_non_import_def) p.malformed = true;
+                try p.parseImport(&module);
+            },
             .kw_export => try p.parseExport(&module),
             .kw_start => try p.parseStart(&module),
             .kw_elem => try p.parseElem(&module),
@@ -465,9 +487,10 @@ const Parser = struct {
             func.name = self.advance().text;
             // Register name → index for call resolution
             if (func.name) |n| {
-                if (self.func_names.getOrPut(self.allocator, n)) |gop| {
-                    gop.value_ptr.* = func_idx;
-                } else |_| {}
+                if (self.func_names.get(n)) |existing| {
+                    if (existing != func_idx and existing < func_idx) self.malformed = true;
+                }
+                self.func_names.put(self.allocator, n, func_idx) catch {};
             }
         }
 
@@ -590,16 +613,22 @@ const Parser = struct {
         var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
         defer results_list.deinit(self.allocator);
 
+        var seen_results = false;
+
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
             const inner = self.peek().kind;
             if (inner == .kw_param) {
+                if (seen_results) self.malformed = true;
                 _ = self.advance(); // consume 'param'
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
                     const idx: u32 = @intCast(params_list.items.len);
+                    if (self.local_names.get(name) != null) {
+                        self.malformed = true;
+                    }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
@@ -608,6 +637,7 @@ const Parser = struct {
                 }
                 try self.expect(.r_paren);
             } else if (inner == .kw_result) {
+                seen_results = true;
                 _ = self.advance(); // consume 'result'
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
@@ -693,6 +723,9 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
                     const idx: u32 = actual_param_count + @as(u32, @intCast(func.local_types.items.len));
+                    if (self.local_names.get(name) != null) {
+                        self.malformed = true;
+                    }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
@@ -1086,8 +1119,6 @@ const Parser = struct {
             },
             .opcode => self.emitGenericOpcode(tok.text, code),
             .invalid => {
-                // Unknown keyword in function body — flag as malformed
-                if (!self.malformed) std.debug.print("  MAL invalid tok \"{s}\"\n", .{tok.text});
                 self.malformed = true;
             },
             else => {},
@@ -1572,10 +1603,10 @@ const Parser = struct {
         const table_idx: u32 = @intCast(module.tables.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            if (self.table_names.getOrPut(self.allocator, name)) |gop| {
-                gop.value_ptr.* = table_idx;
-                gop.value_ptr.* = table_idx;
-            } else |_| {}
+            if (self.table_names.get(name)) |existing| {
+                if (existing != table_idx and existing < table_idx) self.malformed = true;
+            }
+            self.table_names.put(self.allocator, name, table_idx) catch {};
         }
 
         // Handle inline (export "name") and (import "mod" "name") on tables
@@ -1722,13 +1753,10 @@ const Parser = struct {
         const mem_idx: u32 = @intCast(module.memories.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            if (self.memory_names.getOrPut(self.allocator, name)) |gop| {
-                if (gop.found_existing and gop.value_ptr.* != mem_idx) {
-                    // Only flag if it's genuinely a different definition
-                }
-                gop.value_ptr.* = mem_idx;
-                gop.value_ptr.* = mem_idx;
-            } else |_| {}
+            if (self.memory_names.get(name)) |existing| {
+                if (existing != mem_idx and existing < mem_idx) self.malformed = true;
+            }
+            self.memory_names.put(self.allocator, name, mem_idx) catch {};
         }
 
         // Handle inline (export "name") declarations
@@ -1825,10 +1853,13 @@ const Parser = struct {
         const global_idx: u32 = @intCast(module.globals.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            if (self.global_names.getOrPut(self.allocator, name)) |gop| {
-                gop.value_ptr.* = global_idx;
-                gop.value_ptr.* = global_idx;
-            } else |_| {}
+            // Detect duplicate $name: prescan sets index on first occurrence,
+            // so if the existing index doesn't match ours AND it's a lower
+            // index (already processed), it's a genuine duplicate.
+            if (self.global_names.get(name)) |existing| {
+                if (existing != global_idx and existing < global_idx) self.malformed = true;
+            }
+            self.global_names.put(self.allocator, name, global_idx) catch {};
         }
 
         // Handle inline (export "name") and (import "mod" "name") declarations
