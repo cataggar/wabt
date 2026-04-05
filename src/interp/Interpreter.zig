@@ -1272,6 +1272,118 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .i64 = @as(i64, @as(i32, @truncate(a))) });
     }
 
+    // ── Saturating truncation (0xfc 0x00..0x07) ────────────────────────
+
+    pub fn i32TruncSatF32S(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a)) { try self.pushValue(.{ .i32 = 0 }); return; }
+        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1)))
+            { try self.pushValue(.{ .i32 = std.math.maxInt(i32) }); return; }
+        if (a < @as(f32, @floatFromInt(@as(i64, std.math.minInt(i32)))))
+            { try self.pushValue(.{ .i32 = std.math.minInt(i32) }); return; }
+        try self.pushValue(.{ .i32 = @intFromFloat(a) });
+    }
+
+    pub fn i32TruncSatF32U(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a) or a < 0.0) { try self.pushValue(.{ .i32 = 0 }); return; }
+        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)))
+            { try self.pushValue(.{ .i32 = @bitCast(@as(u32, std.math.maxInt(u32))) }); return; }
+        const u: u32 = @intFromFloat(a);
+        try self.pushValue(.{ .i32 = @bitCast(u) });
+    }
+
+    pub fn i32TruncSatF64S(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a)) { try self.pushValue(.{ .i32 = 0 }); return; }
+        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1)))
+            { try self.pushValue(.{ .i32 = std.math.maxInt(i32) }); return; }
+        if (a < @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32)))))
+            { try self.pushValue(.{ .i32 = std.math.minInt(i32) }); return; }
+        try self.pushValue(.{ .i32 = @intFromFloat(a) });
+    }
+
+    pub fn i32TruncSatF64U(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a) or a < 0.0) { try self.pushValue(.{ .i32 = 0 }); return; }
+        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)))
+            { try self.pushValue(.{ .i32 = @bitCast(@as(u32, std.math.maxInt(u32))) }); return; }
+        const u: u32 = @intFromFloat(a);
+        try self.pushValue(.{ .i32 = @bitCast(u) });
+    }
+
+    pub fn i64TruncSatF32S(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a)) { try self.pushValue(.{ .i64 = 0 }); return; }
+        const max_f: f32 = @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1);
+        const min_f: f32 = @floatFromInt(@as(i128, std.math.minInt(i64)));
+        if (a >= max_f) { try self.pushValue(.{ .i64 = std.math.maxInt(i64) }); return; }
+        if (a < min_f) { try self.pushValue(.{ .i64 = std.math.minInt(i64) }); return; }
+        try self.pushValue(.{ .i64 = @intFromFloat(a) });
+    }
+
+    pub fn i64TruncSatF32U(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a) or a < 0.0) { try self.pushValue(.{ .i64 = 0 }); return; }
+        const max_f: f32 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
+        if (a >= max_f) { try self.pushValue(.{ .i64 = @bitCast(@as(u64, std.math.maxInt(u64))) }); return; }
+        const u: u64 = @intFromFloat(a);
+        try self.pushValue(.{ .i64 = @bitCast(u) });
+    }
+
+    pub fn i64TruncSatF64S(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a)) { try self.pushValue(.{ .i64 = 0 }); return; }
+        const max_f: f64 = @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1);
+        const min_f: f64 = @floatFromInt(@as(i128, std.math.minInt(i64)));
+        if (a >= max_f) { try self.pushValue(.{ .i64 = std.math.maxInt(i64) }); return; }
+        if (a < min_f) { try self.pushValue(.{ .i64 = std.math.minInt(i64) }); return; }
+        try self.pushValue(.{ .i64 = @intFromFloat(a) });
+    }
+
+    pub fn i64TruncSatF64U(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a) or a < 0.0) { try self.pushValue(.{ .i64 = 0 }); return; }
+        const max_f: f64 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
+        if (a >= max_f) { try self.pushValue(.{ .i64 = @bitCast(@as(u64, std.math.maxInt(u64))) }); return; }
+        const u: u64 = @intFromFloat(a);
+        try self.pushValue(.{ .i64 = @bitCast(u) });
+    }
+
+    // ── Bulk memory ops (0xfc 0x0a, 0x0b) ──────────────────────────────
+
+    pub fn memoryCopy(self: *Interpreter) TrapError!void {
+        const n_val = try self.popI32();
+        const src_val = try self.popI32();
+        const dst_val = try self.popI32();
+        const n: u32 = @bitCast(n_val);
+        const src: u32 = @bitCast(src_val);
+        const dst: u32 = @bitCast(dst_val);
+        const mem = self.instance.memory.items;
+        if (@as(u64, src) + n > mem.len or @as(u64, dst) + n > mem.len)
+            return error.OutOfBoundsMemoryAccess;
+        if (n == 0) return;
+        const s: usize = @intCast(src);
+        const d: usize = @intCast(dst);
+        const len: usize = @intCast(n);
+        std.mem.copyBackwards(u8, mem[d .. d + len], mem[s .. s + len]);
+    }
+
+    pub fn memoryFill(self: *Interpreter) TrapError!void {
+        const n_val = try self.popI32();
+        const val = try self.popI32();
+        const dst_val = try self.popI32();
+        const n: u32 = @bitCast(n_val);
+        const dst: u32 = @bitCast(dst_val);
+        const mem = self.instance.memory.items;
+        if (@as(u64, dst) + n > mem.len)
+            return error.OutOfBoundsMemoryAccess;
+        if (n == 0) return;
+        const d: usize = @intCast(dst);
+        const len: usize = @intCast(n);
+        @memset(mem[d .. d + len], @truncate(@as(u32, @bitCast(val))));
+    }
+
     // ── Sub-word memory loads ───────────────────────────────────────────
 
     pub fn i32Load8S(self: *Interpreter, offset: u32) TrapError!void {
@@ -1749,6 +1861,32 @@ pub const Interpreter = struct {
                 0xd0 => { pc += 1; try self.pushValue(.{ .ref_null = {} }); },
                 0xd1 => { const v = try self.popValue(); try self.pushValue(.{ .i32 = @intFromBool(v == .ref_null) }); },
                 0xd2 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(.{ .ref_func = idx }); },
+                // 0xfc prefix: saturating truncation + bulk memory
+                0xfc => {
+                    var t = pc;
+                    const sub = readCodeU32(code, &t);
+                    pc = t;
+                    switch (sub) {
+                        0x00 => try self.i32TruncSatF32S(),
+                        0x01 => try self.i32TruncSatF32U(),
+                        0x02 => try self.i32TruncSatF64S(),
+                        0x03 => try self.i32TruncSatF64U(),
+                        0x04 => try self.i64TruncSatF32S(),
+                        0x05 => try self.i64TruncSatF32U(),
+                        0x06 => try self.i64TruncSatF64S(),
+                        0x07 => try self.i64TruncSatF64U(),
+                        0x0a => { // memory.copy
+                            _ = readCodeU32(code, &pc); // src mem
+                            _ = readCodeU32(code, &pc); // dst mem
+                            try self.memoryCopy();
+                        },
+                        0x0b => { // memory.fill
+                            _ = readCodeU32(code, &pc); // mem idx
+                            try self.memoryFill();
+                        },
+                        else => return error.Unimplemented,
+                    }
+                },
                 else => return error.Unimplemented,
             }
         }
