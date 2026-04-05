@@ -28,13 +28,14 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.local_names.deinit(allocator);
     defer p.global_names.deinit(allocator);
     defer p.table_names.deinit(allocator);
+    defer p.memory_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
 
-    // Pre-scan: collect function, type, global, and table names for forward references.
-    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, allocator);
+    // Pre-scan: collect function, type, global, table, and memory names for forward references.
+    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, &p.memory_names, allocator);
 
     try p.expect(.l_paren);
     try p.expect(.kw_module);
@@ -85,6 +86,7 @@ fn prescanNames(
     type_names: *std.StringArrayHashMapUnmanaged(u32),
     global_names: *std.StringArrayHashMapUnmanaged(u32),
     table_names: *std.StringArrayHashMapUnmanaged(u32),
+    memory_names: *std.StringArrayHashMapUnmanaged(u32),
     allocator: std.mem.Allocator,
 ) void {
     var lex = Lexer.init(source);
@@ -92,6 +94,7 @@ fn prescanNames(
     var type_idx: u32 = 0;
     var global_idx: u32 = 0;
     var table_idx: u32 = 0;
+    var memory_idx: u32 = 0;
 
     // Skip (module and optional name
     var tok = lex.next();
@@ -128,6 +131,12 @@ fn prescanNames(
                 table_names.put(allocator, tok.text, table_idx) catch {};
             }
             table_idx += 1;
+        } else if (tok.kind == .kw_memory) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                memory_names.put(allocator, tok.text, memory_idx) catch {};
+            }
+            memory_idx += 1;
         } else if (tok.kind == .kw_import) {
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
@@ -154,6 +163,12 @@ fn prescanNames(
                         table_names.put(allocator, tok.text, table_idx) catch {};
                     }
                     table_idx += 1;
+                } else if (tok.kind == .kw_memory) {
+                    tok = lex.next();
+                    if (tok.kind == .identifier) {
+                        memory_names.put(allocator, tok.text, memory_idx) catch {};
+                    }
+                    memory_idx += 1;
                 }
             }
         }
@@ -191,6 +206,8 @@ const Parser = struct {
     global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from table $name to index.
     table_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from memory $name to index.
+    memory_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
 
@@ -414,7 +431,7 @@ const Parser = struct {
             }
         }
 
-        // Handle inline (export "name") declarations
+        // Handle inline (export "name") and (import "mod" "name") declarations
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
@@ -429,6 +446,74 @@ const Parser = struct {
                     .kind = .func,
                     .var_ = .{ .index = func_idx },
                 }) catch return error.OutOfMemory;
+            } else if (self.peek().kind == .kw_import) {
+                _ = self.advance(); // consume 'import'
+                const mod_name = self.parseName(self.advance().text);
+                const field_name = self.parseName(self.advance().text);
+                try self.expect(.r_paren); // close (import ...)
+
+                // Parse optional (type $idx) and inline sig
+                var type_index: types.Index = 0;
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer params_list.deinit(self.allocator);
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer results_list.deinit(self.allocator);
+
+                while (self.peek().kind == .l_paren) {
+                    const sp2 = self.lexer.pos;
+                    const spk2 = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_type) {
+                        _ = self.advance();
+                        type_index = self.parseTypeIdx() catch 0;
+                        try self.expect(.r_paren);
+                    } else if (self.peek().kind == .kw_param) {
+                        _ = self.advance();
+                        if (self.peek().kind == .identifier) _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            params_list.append(self.allocator, vt) catch {};
+                        }
+                        try self.expect(.r_paren);
+                    } else if (self.peek().kind == .kw_result) {
+                        _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            results_list.append(self.allocator, vt) catch {};
+                        }
+                        try self.expect(.r_paren);
+                    } else {
+                        self.lexer.pos = sp2;
+                        self.peeked = spk2;
+                        break;
+                    }
+                }
+
+                // Register as import
+                func.is_import = true;
+                func.decl.type_var = .{ .index = type_index };
+
+                // Build func type if inline sig provided
+                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                    const params = params_list.toOwnedSlice(self.allocator) catch &.{};
+                    const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                    type_index = @intCast(module.module_types.items.len);
+                    module.module_types.append(self.allocator, .{
+                        .func_type = .{ .params = params, .results = results },
+                    }) catch {};
+                    func.decl.type_var = .{ .index = type_index };
+                }
+
+                try module.funcs.append(self.allocator, func);
+                module.num_func_imports += 1;
+                var import = Mod.Import{
+                    .module_name = mod_name,
+                    .field_name = field_name,
+                    .kind = .func,
+                };
+                import.func = .{ .type_var = .{ .index = type_index } };
+                try module.imports.append(self.allocator, import);
+                return;
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
@@ -1359,9 +1444,13 @@ const Parser = struct {
     }
 
     fn parseTable(self: *Parser, module: *Mod.Module) ParseError!void {
-        if (self.peek().kind == .identifier) _ = self.advance();
+        const table_idx: u32 = @intCast(module.tables.items.len);
+        if (self.peek().kind == .identifier) {
+            const name = self.advance().text;
+            self.table_names.put(self.allocator, name, table_idx) catch {};
+        }
 
-        // Handle inline (export "name") on tables
+        // Handle inline (export "name") and (import "mod" "name") on tables
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
@@ -1374,8 +1463,33 @@ const Parser = struct {
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
                     .kind = .table,
-                    .var_ = .{ .index = @intCast(module.tables.items.len) },
+                    .var_ = .{ .index = table_idx },
                 }) catch return error.OutOfMemory;
+            } else if (self.peek().kind == .kw_import) {
+                _ = self.advance(); // consume 'import'
+                const mod_name = self.parseName(self.advance().text);
+                const field_name = self.parseName(self.advance().text);
+                try self.expect(.r_paren); // close (import ...)
+                const initial = try self.parseU32();
+                var limits = types.Limits{ .initial = initial };
+                if (self.peek().kind == .integer) {
+                    limits.max = try self.parseU32();
+                    limits.has_max = true;
+                }
+                const elem_type = try self.parseValType();
+                try module.tables.append(self.allocator, .{
+                    .@"type" = .{ .elem_type = elem_type, .limits = limits },
+                    .is_import = true,
+                });
+                module.num_table_imports += 1;
+                var import = Mod.Import{
+                    .module_name = mod_name,
+                    .field_name = field_name,
+                    .kind = .table,
+                };
+                import.table = .{ .elem_type = elem_type, .limits = limits };
+                try module.imports.append(self.allocator, import);
+                return;
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
@@ -2020,6 +2134,8 @@ const Parser = struct {
             const owned = offset_code.toOwnedSlice(self.allocator) catch &.{};
             seg.offset_expr_bytes = owned;
             seg.owns_offset_expr_bytes = true;
+        } else {
+            seg.kind = .passive;
         }
 
         // Read data string(s), decoding WAT escape sequences
