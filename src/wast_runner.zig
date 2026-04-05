@@ -10,7 +10,7 @@ const Validator = @import("Validator.zig");
 const Mod = @import("Module.zig");
 const types = @import("types.zig");
 const Interp = @import("interp/Interpreter.zig");
-const BinaryReader = @import("binary/reader.zig");
+const binary_reader = @import("binary/reader.zig");
 
 /// Aggregate result of running a WAST file.
 pub const Result = struct {
@@ -313,7 +313,7 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
             return;
         };
         defer allocator.free(wasm_bytes);
-        var module = BinaryReader.readModule(allocator, wasm_bytes) catch {
+        var module = binary_reader.readModule(allocator, wasm_bytes) catch {
             result.passed += 1; // decode failure = invalid
             return;
         };
@@ -385,7 +385,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         };
         defer allocator.free(wasm_bytes);
-        var module = BinaryReader.readModule(allocator, wasm_bytes) catch {
+        var module = binary_reader.readModule(allocator, wasm_bytes) catch {
             result.passed += 1; // parse failure = malformed
             return;
         };
@@ -488,25 +488,21 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         };
 
         // Try binary module
-        if (isBinaryOrQuoteModule(inner)) {
-            // Binary/quote module trap — skip for now
-            result.skipped += 1;
-            return;
-        }
-
-        // Try text module
-        if (!isBinaryOrQuoteModule(inner)) {
-            var module = Parser.parseModule(allocator, inner) catch {
+        if (isBinaryModule(inner)) {
+            const wasm_bytes = decodeWastHexStrings(allocator, inner) catch {
+                result.passed += 1; // decode failure = trap
+                return;
+            };
+            defer allocator.free(wasm_bytes);
+            var module = binary_reader.readModule(allocator, wasm_bytes) catch {
                 result.passed += 1;
                 return;
             };
             defer module.deinit();
-
             Validator.validate(&module, .{}) catch {
                 result.passed += 1;
                 return;
             };
-
             var instance = Interp.Instance.init(allocator, &module) catch {
                 result.passed += 1;
                 return;
@@ -516,22 +512,49 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
                 result.passed += 1;
                 return;
             };
-            var interp2 = Interp.Interpreter.init(allocator, &instance);
-            defer interp2.deinit();
-
-            if (module.start_var) |sv| {
-                if (interp2.callFunc(sv.index, &.{})) |_| {
-                    result.failed += 1;
-                } else |_| {
-                    result.passed += 1;
-                }
-                return;
-            }
+            // Instantiation succeeded without trap — unexpected
             result.failed += 1;
             return;
         }
 
-        result.skipped += 1;
+        if (isQuoteModule(inner)) {
+            result.skipped += 1;
+            return;
+        }
+
+        // Text module
+        var module = Parser.parseModule(allocator, inner) catch {
+            result.passed += 1;
+            return;
+        };
+        defer module.deinit();
+
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1;
+            return;
+        };
+
+        var instance = Interp.Instance.init(allocator, &module) catch {
+            result.passed += 1;
+            return;
+        };
+        defer instance.deinit();
+        instance.instantiate() catch {
+            result.passed += 1;
+            return;
+        };
+        var interp2 = Interp.Interpreter.init(allocator, &instance);
+        defer interp2.deinit();
+
+        if (module.start_var) |sv| {
+            if (interp2.callFunc(sv.index, &.{})) |_| {
+                result.failed += 1;
+            } else |_| {
+                result.passed += 1;
+            }
+            return;
+        }
+        result.failed += 1;
         return;
     };
     const interp = resolveInterpreter(inv, state) orelse {

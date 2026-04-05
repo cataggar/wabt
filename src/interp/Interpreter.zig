@@ -876,7 +876,7 @@ pub const Interpreter = struct {
 
     pub fn f64Nearest(self: *Interpreter) TrapError!void {
         const a = try self.popF64();
-        try self.pushValue(.{ .f64 = @round(a) });
+        try self.pushValue(.{ .f64 = wasmNearestF64(a) });
     }
 
     // ── Conversions ─────────────────────────────────────────────────────
@@ -2095,6 +2095,30 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
         return if (std.math.signbit(a)) b else a;
     }
     return @max(a, b);
+}
+
+fn wasmNearestF32(a: f32) f32 {
+    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (a == 0.0) return a;
+    const rounded = @round(a);
+    const diff = a - rounded;
+    if (diff == 0.5 or diff == -0.5) {
+        const r_int: i64 = @intFromFloat(rounded);
+        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f32, 1.0), a);
+    }
+    return rounded;
+}
+
+fn wasmNearestF64(a: f64) f64 {
+    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (a == 0.0) return a;
+    const rounded = @round(a);
+    const diff = a - rounded;
+    if (diff == 0.5 or diff == -0.5) {
+        const r_int: i64 = @intFromFloat(rounded);
+        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f64, 1.0), a);
+    }
+    return rounded;
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────
