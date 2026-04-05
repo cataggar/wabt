@@ -286,6 +286,13 @@ pub const Interpreter = struct {
         const code = func.code_bytes;
         if (code.len == 0) return null;
 
+        // DBG: dump code bytes for all functions at depth 1
+        if (self.call_depth == 1 and code.len <= 20) {
+            std.debug.print("  DBG func[{d}] code({d}):", .{ func_idx, code.len });
+            for (code) |b| std.debug.print(" {x:0>2}", .{b});
+            std.debug.print("\n", .{});
+        }
+
         // Resolve function signature
         const sig = self.resolveSig(func.decl);
 
@@ -1248,15 +1255,17 @@ pub const Interpreter = struct {
     // ── Copysign ────────────────────────────────────────────────────────
 
     pub fn f32Copysign(self: *Interpreter) TrapError!void {
-        const b = try self.popF32();
-        const a = try self.popF32();
-        try self.pushValue(.{ .f32 = std.math.copysign(a, b) });
+        const b_bits: u32 = @bitCast(try self.popF32());
+        const a_bits: u32 = @bitCast(try self.popF32());
+        const result_bits = (a_bits & 0x7FFFFFFF) | (b_bits & 0x80000000);
+        try self.pushValue(.{ .f32 = @bitCast(result_bits) });
     }
 
     pub fn f64Copysign(self: *Interpreter) TrapError!void {
-        const b = try self.popF64();
-        const a = try self.popF64();
-        try self.pushValue(.{ .f64 = std.math.copysign(a, b) });
+        const b_bits: u64 = @bitCast(try self.popF64());
+        const a_bits: u64 = @bitCast(try self.popF64());
+        const result_bits = (a_bits & 0x7FFFFFFFFFFFFFFF) | (b_bits & 0x8000000000000000);
+        try self.pushValue(.{ .f64 = @bitCast(result_bits) });
     }
 
     // ── Additional truncation conversions ───────────────────────────────
