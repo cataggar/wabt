@@ -289,7 +289,9 @@ const Reader = struct {
         const count = try self.readU32();
         for (0..count) |_| {
             const module_name = try self.readName();
+            if (!std.unicode.utf8ValidateSlice(module_name)) return error.InvalidSection;
             const field_name = try self.readName();
+            if (!std.unicode.utf8ValidateSlice(field_name)) return error.InvalidSection;
             const kind_byte = try self.readByte();
             const kind: types.ExternalKind = enumFromIntChecked(types.ExternalKind, kind_byte) orelse
                 return error.InvalidSection;
@@ -332,6 +334,7 @@ const Reader = struct {
                 .global => {
                     const val_type = try self.readValType();
                     const mut_byte = try self.readByte();
+                    if (mut_byte > 1) return error.InvalidType;
                     const mutability: types.Mutability = if (mut_byte != 0) .mutable else .immutable;
                     import.global = .{ .val_type = val_type, .mutability = mutability };
                     try self.module.globals.append(self.allocator, .{
@@ -388,6 +391,7 @@ const Reader = struct {
         for (0..count) |_| {
             const val_type = try self.readValType();
             const mut_byte = try self.readByte();
+            if (mut_byte > 1) return error.InvalidType;
             const mutability: types.Mutability = if (mut_byte != 0) .mutable else .immutable;
             try self.skipInitExpr();
             try self.module.globals.append(self.allocator, .{
@@ -400,6 +404,7 @@ const Reader = struct {
         const count = try self.readU32();
         for (0..count) |_| {
             const exp_name = try self.readName();
+            if (!std.unicode.utf8ValidateSlice(exp_name)) return error.InvalidSection;
             const kind_byte = try self.readByte();
             const index = try self.readU32();
             try self.module.exports.append(self.allocator, .{
