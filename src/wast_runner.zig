@@ -12,6 +12,12 @@ const types = @import("types.zig");
 const Interp = @import("interp/Interpreter.zig");
 const binary_reader = @import("binary/reader.zig");
 
+// Sentinel bit patterns for WAST nan:canonical / nan:arithmetic matching.
+const nan_canonical_f32: u32 = 0x7FC00001;
+const nan_arithmetic_f32: u32 = 0x7FC00002;
+const nan_canonical_f64: u64 = 0x7FF8000000000001;
+const nan_arithmetic_f64: u64 = 0x7FF8000000000002;
+
 /// Aggregate result of running a WAST file.
 pub const Result = struct {
     passed: u32 = 0,
@@ -478,7 +484,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     const call_result = interp.callExport(func_name, args) catch |err| {
         result.failed += 1;
-        if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
     };
 
@@ -498,7 +504,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
+            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
         }
     } else {
         // Function returned no value
@@ -1029,27 +1035,32 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         };
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
-        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
-            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
+        // WAST-specific NaN categories
+        if (std.mem.eql(u8, val_text, "nan:canonical") or std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
         {
-            return .{ .f32 = std.math.nan(f32) };
+            return .{ .f32 = @bitCast(nan_canonical_f32) };
         }
-        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f32 = std.math.inf(f32) };
-        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f32 = -std.math.inf(f32) };
-        const v = std.fmt.parseFloat(f32, val_text) catch return .{ .f32 = 0.0 };
-        return .{ .f32 = v };
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+        {
+            return .{ .f32 = @bitCast(nan_arithmetic_f32) };
+        }
+        const bits = Parser.parseFloatBits(f32, val_text);
+        return .{ .f32 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
-        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
-            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
+        if (std.mem.eql(u8, val_text, "nan:canonical") or std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
         {
-            return .{ .f64 = std.math.nan(f64) };
+            return .{ .f64 = @bitCast(nan_canonical_f64) };
         }
-        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f64 = std.math.inf(f64) };
-        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f64 = -std.math.inf(f64) };
-        const v = std.fmt.parseFloat(f64, val_text) catch return .{ .f64 = 0.0 };
-        return .{ .f64 = v };
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+        {
+            return .{ .f64 = @bitCast(nan_arithmetic_f64) };
+        }
+        const bits = Parser.parseFloatBits(f64, val_text);
+        return .{ .f64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "ref.null")) {
         return .{ .ref_null = {} };
     } else if (std.mem.eql(u8, kw, "ref.func")) {
@@ -1089,6 +1100,8 @@ fn skipFirstSExpr(text: []const u8) ?[]const u8 {
 }
 
 /// Compare two Values for equality (used for assert_return).
+/// NaN values are compared by bit pattern. Sentinel patterns for nan:canonical
+/// and nan:arithmetic match any NaN in the corresponding category.
 fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
     return switch (a) {
         .i32 => |av| switch (b) {
@@ -1100,17 +1113,11 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             else => false,
         },
         .f32 => |av| switch (b) {
-            .f32 => |bv| {
-                if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                return av == bv;
-            },
+            .f32 => |bv| f32BitsMatch(@bitCast(av), @bitCast(bv)),
             else => false,
         },
         .f64 => |av| switch (b) {
-            .f64 => |bv| {
-                if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                return av == bv;
-            },
+            .f64 => |bv| f64BitsMatch(@bitCast(av), @bitCast(bv)),
             else => false,
         },
         .ref_null => b == .ref_null,
@@ -1119,6 +1126,26 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             else => false,
         },
     };
+}
+
+fn f32BitsMatch(got: u32, expected: u32) bool {
+    if (expected == nan_canonical_f32) {
+        return (got & 0x7fffffff) == 0x7fc00000;
+    }
+    if (expected == nan_arithmetic_f32) {
+        return (got & 0x7fc00000) == 0x7fc00000;
+    }
+    return got == expected;
+}
+
+fn f64BitsMatch(got: u64, expected: u64) bool {
+    if (expected == nan_canonical_f64) {
+        return (got & 0x7fffffffffffffff) == 0x7ff8000000000000;
+    }
+    if (expected == nan_arithmetic_f64) {
+        return (got & 0x7ff8000000000000) == 0x7ff8000000000000;
+    }
+    return got == expected;
 }
 
 const SExpr = struct {
