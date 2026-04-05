@@ -1067,7 +1067,7 @@ pub const Interpreter = struct {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
         if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1)) or
-            a < @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32)))))
+            a <= @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32)) - 1)))
             return error.IntegerOverflow;
         try self.pushValue(.{ .i32 = @intFromFloat(a) });
     }
@@ -1314,8 +1314,12 @@ pub const Interpreter = struct {
     pub fn i32TruncF32U(self: *Interpreter) TrapError!void {
         const a = try self.popF32();
         if (std.math.isNan(a)) return error.InvalidConversion;
-        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a <= -1.0)
             return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i32 = 0 });
+            return;
+        }
         const u: u32 = @intFromFloat(a);
         try self.pushValue(.{ .i32 = @bitCast(u) });
     }
@@ -1323,8 +1327,12 @@ pub const Interpreter = struct {
     pub fn i32TruncF64U(self: *Interpreter) TrapError!void {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
-        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a <= -1.0)
             return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i32 = 0 });
+            return;
+        }
         const u: u32 = @intFromFloat(a);
         try self.pushValue(.{ .i32 = @bitCast(u) });
     }
@@ -1342,7 +1350,11 @@ pub const Interpreter = struct {
         const a = try self.popF32();
         if (std.math.isNan(a)) return error.InvalidConversion;
         const max_f: f32 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
-        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        if (a >= max_f or a <= -1.0) return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i64 = 0 });
+            return;
+        }
         const u: u64 = @intFromFloat(a);
         try self.pushValue(.{ .i64 = @bitCast(u) });
     }
@@ -1360,7 +1372,11 @@ pub const Interpreter = struct {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
         const max_f: f64 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
-        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        if (a >= max_f or a <= -1.0) return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i64 = 0 });
+            return;
+        }
         const u: u64 = @intFromFloat(a);
         try self.pushValue(.{ .i64 = @bitCast(u) });
     }

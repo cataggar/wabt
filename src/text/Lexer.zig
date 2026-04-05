@@ -160,9 +160,28 @@ pub const Lexer = struct {
                 self.pos += 1;
                 return .{ .kind = .r_paren, .text = ")", .offset = start };
             },
-            '"' => return self.lexString(start),
-            else => return self.lexWord(start),
+            '"' => {
+                var tok = self.lexString(start);
+                // WAT requires separator after string tokens
+                if (!self.atSeparator()) tok.kind = .invalid;
+                return tok;
+            },
+            else => {
+                var tok = self.lexWord(start);
+                // WAT requires separator after word tokens
+                if (!self.atSeparator()) tok.kind = .invalid;
+                return tok;
+            },
         }
+    }
+
+    /// Check if current position is at a valid token separator.
+    fn atSeparator(self: *Lexer) bool {
+        if (self.pos >= self.source.len) return true;
+        return switch (self.source[self.pos]) {
+            ' ', '\t', '\n', '\r', '(', ')', ';' => true,
+            else => false,
+        };
     }
 
     /// Lex a quoted string literal with escape sequences.
