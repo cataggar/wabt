@@ -773,10 +773,12 @@ const Parser = struct {
 
         // Pre-scan: check for misplaced (param ...) or (result ...) in function body.
         // These must appear before any instructions, not after.
+        // Also check for (param ...) after (local ...).
         {
             var scan = Lexer.init(self.lexer.source);
             scan.pos = if (self.peeked) |pk| pk.offset else self.lexer.pos;
             var saw_instr = false;
+            var saw_local = func.local_types.items.len > 0;
             var depth: u32 = 0;
             scan_loop: while (true) {
                 const stok = scan.next();
@@ -785,9 +787,13 @@ const Parser = struct {
                     .l_paren => {
                         if (depth == 0) {
                             const inner = scan.next();
-                            if (inner.kind == .kw_param or inner.kind == .kw_result) {
+                            if (inner.kind == .kw_param) {
+                                if (saw_instr or saw_local) { self.malformed = true; break :scan_loop; }
+                            } else if (inner.kind == .kw_result) {
                                 if (saw_instr) { self.malformed = true; break :scan_loop; }
-                            } else if (inner.kind != .kw_local) {
+                            } else if (inner.kind == .kw_local) {
+                                saw_local = true;
+                            } else {
                                 saw_instr = true;
                             }
                         }
