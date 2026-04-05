@@ -1017,7 +1017,7 @@ pub const Interpreter = struct {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
         if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1)) or
-            a < @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32)))))
+            a <= @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32)) - 1)))
             return error.IntegerOverflow;
         try self.pushValue(.{ .i32 = @intFromFloat(a) });
     }
@@ -1248,15 +1248,17 @@ pub const Interpreter = struct {
     // ── Copysign ────────────────────────────────────────────────────────
 
     pub fn f32Copysign(self: *Interpreter) TrapError!void {
-        const b = try self.popF32();
-        const a = try self.popF32();
-        try self.pushValue(.{ .f32 = std.math.copysign(a, b) });
+        const b_bits: u32 = @bitCast(try self.popF32());
+        const a_bits: u32 = @bitCast(try self.popF32());
+        const result_bits = (a_bits & 0x7FFFFFFF) | (b_bits & 0x80000000);
+        try self.pushValue(.{ .f32 = @bitCast(result_bits) });
     }
 
     pub fn f64Copysign(self: *Interpreter) TrapError!void {
-        const b = try self.popF64();
-        const a = try self.popF64();
-        try self.pushValue(.{ .f64 = std.math.copysign(a, b) });
+        const b_bits: u64 = @bitCast(try self.popF64());
+        const a_bits: u64 = @bitCast(try self.popF64());
+        const result_bits = (a_bits & 0x7FFFFFFFFFFFFFFF) | (b_bits & 0x8000000000000000);
+        try self.pushValue(.{ .f64 = @bitCast(result_bits) });
     }
 
     // ── Additional truncation conversions ───────────────────────────────
@@ -1264,8 +1266,12 @@ pub const Interpreter = struct {
     pub fn i32TruncF32U(self: *Interpreter) TrapError!void {
         const a = try self.popF32();
         if (std.math.isNan(a)) return error.InvalidConversion;
-        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a <= -1.0)
             return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i32 = 0 });
+            return;
+        }
         const u: u32 = @intFromFloat(a);
         try self.pushValue(.{ .i32 = @bitCast(u) });
     }
@@ -1273,8 +1279,12 @@ pub const Interpreter = struct {
     pub fn i32TruncF64U(self: *Interpreter) TrapError!void {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
-        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a <= -1.0)
             return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i32 = 0 });
+            return;
+        }
         const u: u32 = @intFromFloat(a);
         try self.pushValue(.{ .i32 = @bitCast(u) });
     }
@@ -1292,7 +1302,11 @@ pub const Interpreter = struct {
         const a = try self.popF32();
         if (std.math.isNan(a)) return error.InvalidConversion;
         const max_f: f32 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
-        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        if (a >= max_f or a <= -1.0) return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i64 = 0 });
+            return;
+        }
         const u: u64 = @intFromFloat(a);
         try self.pushValue(.{ .i64 = @bitCast(u) });
     }
@@ -1310,7 +1324,11 @@ pub const Interpreter = struct {
         const a = try self.popF64();
         if (std.math.isNan(a)) return error.InvalidConversion;
         const max_f: f64 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
-        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        if (a >= max_f or a <= -1.0) return error.IntegerOverflow;
+        if (a < 0.0) {
+            try self.pushValue(.{ .i64 = 0 });
+            return;
+        }
         const u: u64 = @intFromFloat(a);
         try self.pushValue(.{ .i64 = @bitCast(u) });
     }
@@ -2362,24 +2380,30 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
 fn wasmNearestF32(a: f32) f32 {
     if (std.math.isNan(a) or std.math.isInf(a)) return a;
     if (a == 0.0) return a;
-    const rounded = @round(a);
+    var rounded = @round(a);
     const diff = a - rounded;
     if (diff == 0.5 or diff == -0.5) {
         const r_int: i64 = @intFromFloat(rounded);
-        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f32, 1.0), a);
+        if (@rem(r_int, 2) != 0) rounded = rounded - std.math.copysign(@as(f32, 1.0), a);
     }
+    // Preserve negative zero: if result rounds to 0 but input was negative
+    if (rounded == 0.0 and @as(u32, @bitCast(a)) & 0x80000000 != 0)
+        return @bitCast(@as(u32, 0x80000000));
     return rounded;
 }
 
 fn wasmNearestF64(a: f64) f64 {
     if (std.math.isNan(a) or std.math.isInf(a)) return a;
     if (a == 0.0) return a;
-    const rounded = @round(a);
+    var rounded = @round(a);
     const diff = a - rounded;
     if (diff == 0.5 or diff == -0.5) {
         const r_int: i64 = @intFromFloat(rounded);
-        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f64, 1.0), a);
+        if (@rem(r_int, 2) != 0) rounded = rounded - std.math.copysign(@as(f64, 1.0), a);
     }
+    // Preserve negative zero: if result rounds to 0 but input was negative
+    if (rounded == 0.0 and @as(u64, @bitCast(a)) & 0x8000000000000000 != 0)
+        return @bitCast(@as(u64, 0x8000000000000000));
     return rounded;
 }
 

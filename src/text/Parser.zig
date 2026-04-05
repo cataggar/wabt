@@ -766,7 +766,16 @@ const Parser = struct {
                     _ = self.advance(); // '('
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance(); // 'type'
-                        self.emitU32Imm(code); // type index
+                        // Resolve type name via type_names, not emitU32Imm
+                        // (emitU32Imm checks func_names first, which can
+                        // shadow type names when a function has the same $name)
+                        if (self.peek().kind == .identifier) {
+                            const type_tok = self.advance();
+                            const idx = self.type_names.get(type_tok.text) orelse 0;
+                            self.emitLeb128U32(code, idx);
+                        } else {
+                            self.emitU32Imm(code); // numeric type index
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance(); // ')'
                     } else {
                         self.lexer.pos = sp;
