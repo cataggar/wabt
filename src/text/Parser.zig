@@ -251,7 +251,8 @@ const Parser = struct {
     fn parseU32(self: *Parser) ParseError!u32 {
         const tok = self.advance();
         if (tok.kind != .integer) return error.InvalidNumber;
-        return std.fmt.parseInt(u32, tok.text, 0) catch return error.InvalidNumber;
+        const clean = stripUnderscores(tok.text);
+        return std.fmt.parseInt(u32, clean.slice(), 0) catch return error.InvalidNumber;
     }
 
     fn parseValType(self: *Parser) ParseError!types.ValType {
@@ -1022,9 +1023,11 @@ const Parser = struct {
             self.emitLeb128S32(code, 0);
             return;
         }
-        const val = std.fmt.parseInt(i32, tok.text, 0) catch blk: {
+        const clean = stripUnderscores(tok.text);
+        const text = clean.slice();
+        const val = std.fmt.parseInt(i32, text, 0) catch blk: {
             // Try parsing as unsigned and reinterpret
-            const uval = std.fmt.parseInt(u32, tok.text, 0) catch {
+            const uval = std.fmt.parseInt(u32, text, 0) catch {
                 break :blk 0;
             };
             break :blk @as(i32, @bitCast(uval));
@@ -1038,8 +1041,10 @@ const Parser = struct {
             self.emitLeb128S64(code, 0);
             return;
         }
-        const val = std.fmt.parseInt(i64, tok.text, 0) catch blk: {
-            const uval = std.fmt.parseInt(u64, tok.text, 0) catch {
+        const clean = stripUnderscores(tok.text);
+        const text = clean.slice();
+        const val = std.fmt.parseInt(i64, text, 0) catch blk: {
+            const uval = std.fmt.parseInt(u64, text, 0) catch {
                 break :blk 0;
             };
             break :blk @as(i64, @bitCast(uval));
@@ -1890,6 +1895,34 @@ fn isConstInstrToken(kind: TokenKind) bool {
     };
 }
 
+/// Strip WAT `_` digit separators from a number string.
+/// Uses a stack buffer to avoid allocation.
+const CleanNum = struct {
+    buf: [128]u8 = undefined,
+    len: usize = 0,
+    original: []const u8,
+
+    fn slice(self: *const CleanNum) []const u8 {
+        if (self.len == 0) return self.original;
+        return self.buf[0..self.len];
+    }
+};
+
+fn stripUnderscores(text: []const u8) CleanNum {
+    // Quick check: if no underscores, return as-is
+    if (std.mem.indexOfScalar(u8, text, '_') == null) {
+        return .{ .original = text };
+    }
+    var result = CleanNum{ .original = text };
+    for (text) |ch| {
+        if (ch != '_' and result.len < result.buf.len) {
+            result.buf[result.len] = ch;
+            result.len += 1;
+        }
+    }
+    return result;
+}
+
 /// Map WAT instruction text (e.g. "i32.add") to binary opcode value.
 /// Returns null for unrecognized instructions.
 fn parseF32Bits(text: []const u8) u32 {
@@ -1907,8 +1940,8 @@ fn parseF32Bits(text: []const u8) u32 {
     if (std.mem.eql(u8, text, "-nan")) return 0xffc00000;
     if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7f800000;
     if (std.mem.eql(u8, text, "-inf")) return 0xff800000;
-    // Try parsing as a float
-    const val = std.fmt.parseFloat(f32, text) catch 0.0;
+    const clean = stripUnderscores(text);
+    const val = std.fmt.parseFloat(f32, clean.slice()) catch 0.0;
     return @bitCast(val);
 }
 
@@ -1926,7 +1959,8 @@ fn parseF64Bits(text: []const u8) u64 {
     if (std.mem.eql(u8, text, "-nan")) return 0xfff8000000000000;
     if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7ff0000000000000;
     if (std.mem.eql(u8, text, "-inf")) return 0xfff0000000000000;
-    const val = std.fmt.parseFloat(f64, text) catch 0.0;
+    const clean = stripUnderscores(text);
+    const val = std.fmt.parseFloat(f64, clean.slice()) catch 0.0;
     return @bitCast(val);
 }
 

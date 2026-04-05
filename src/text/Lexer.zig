@@ -329,10 +329,17 @@ fn classifyNumber(text: []const u8) TokenKind {
     if (std.mem.eql(u8, base, "inf")) return .float;
     if (std.mem.startsWith(u8, base, "nan")) return .float;
 
-    // Check for float indicators: '.', 'e', 'E', 'p', 'P'
+    // Check if this is a hex number (0x prefix)
+    const is_hex = (base.len > 2 and base[0] == '0' and (base[1] == 'x' or base[1] == 'X'));
+
+    // Check for float indicators
+    // For hex: only '.' and 'p'/'P' indicate float (e/E are hex digits)
+    // For decimal: '.', 'e', 'E', 'p', 'P' indicate float
     for (text) |ch| {
         switch (ch) {
-            '.', 'e', 'E', 'p', 'P' => return .float,
+            '.' => return .float,
+            'p', 'P' => return .float,
+            'e', 'E' => if (!is_hex) return .float,
             else => {},
         }
     }
