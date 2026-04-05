@@ -195,11 +195,29 @@ const Reader = struct {
     // -- sections --
 
     fn readSections(self: *Reader) ReadError!void {
+        var last_non_custom_id: u8 = 0;
+        var seen_sections: u16 = 0; // bitmask for section IDs 0-15
+
         while (self.pos < self.data.len) {
             const id_byte = try self.readByte();
             const section_size = try self.readU32();
             const section_end = self.pos + section_size;
             if (section_end > self.data.len) return error.SectionTooLarge;
+
+            // Validate section ordering and duplicates (custom sections exempt)
+            if (id_byte != 0) {
+                if (id_byte > 13) return error.InvalidSection;
+                // Check ordering: each non-custom section must have a higher ID
+                // than the previous non-custom section (except data_count=12 before code=10)
+                const order_id: u8 = if (id_byte == 12) 9 else id_byte; // data_count sorts before code
+                const last_order: u8 = if (last_non_custom_id == 12) 9 else last_non_custom_id;
+                if (order_id <= last_order and last_non_custom_id != 0) return error.InvalidSection;
+                // Check for duplicate sections
+                const mask: u16 = @as(u16, 1) << @intCast(id_byte);
+                if (seen_sections & mask != 0) return error.InvalidSection;
+                seen_sections |= mask;
+                last_non_custom_id = id_byte;
+            }
 
             switch (id_byte) {
                 0 => try self.readCustomSection(section_end),
@@ -494,7 +512,9 @@ const Reader = struct {
     }
 
     fn readCustomSection(self: *Reader, end: usize) ReadError!void {
+        if (self.pos >= end) return; // empty custom section
         const sect_name = try self.readName();
+        if (self.pos > end) return error.UnexpectedEof;
         const payload = self.data[self.pos..end];
         try self.module.customs.append(self.allocator, .{
             .name = sect_name,

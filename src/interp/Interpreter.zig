@@ -1862,6 +1862,9 @@ pub const Interpreter = struct {
                             self.branch_depth = d - 1;
                             return pc;
                         }
+                    } else {
+                        // Normal block end — compact results
+                        self.compactBlockResults(block_stack_base, bsig.results);
                     }
                 },
                 0x03 => { // loop
@@ -1884,6 +1887,8 @@ pub const Interpreter = struct {
                                 return pc;
                             }
                         }
+                        // Normal loop end — compact to results
+                        self.compactBlockResults(loop_stack_base, lsig.results);
                         break;
                     }
                 },
@@ -1905,7 +1910,9 @@ pub const Interpreter = struct {
                                 return pc;
                             }
                         } else {
-                            // Normal end — check if we stopped at else (need to skip else body)
+                            // Normal end — compact results
+                            self.compactBlockResults(if_stack_base, isig.results);
+                            // Check if we stopped at else (need to skip else body)
                             if (pc > 0 and pc - 1 < code.len and code[pc - 1] == 0x05) {
                                 pc = scanToEnd(code, pc);
                             }
@@ -1926,6 +1933,9 @@ pub const Interpreter = struct {
                                     self.branch_depth = d - 1;
                                     return pc;
                                 }
+                            } else {
+                                // Normal else end — compact results
+                                self.compactBlockResults(if_stack_base, isig.results);
                             }
                         }
                     }
