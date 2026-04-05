@@ -776,13 +776,22 @@ const Parser = struct {
                 // In a stack machine, operands must be pushed before the
                 // instruction that consumes them.
                 if (has_operands and instr_len > 0) {
-                    var buf: [32]u8 = undefined;
                     if (instr_len <= 32) {
+                        var buf: [32]u8 = undefined;
                         @memcpy(buf[0..instr_len], code.items[instr_start..instr_end]);
                         const total = code.items.len;
                         const operand_len = total - instr_end;
                         std.mem.copyForwards(u8, code.items[instr_start .. instr_start + operand_len], code.items[instr_end..total]);
                         @memcpy(code.items[instr_start + operand_len .. instr_start + operand_len + instr_len], buf[0..instr_len]);
+                    } else {
+                        // Large instruction (e.g. br_table with many targets) — use heap
+                        const heap_buf = self.allocator.alloc(u8, instr_len) catch return;
+                        defer self.allocator.free(heap_buf);
+                        @memcpy(heap_buf, code.items[instr_start..instr_end]);
+                        const total = code.items.len;
+                        const operand_len = total - instr_end;
+                        std.mem.copyForwards(u8, code.items[instr_start .. instr_start + operand_len], code.items[instr_end..total]);
+                        @memcpy(code.items[instr_start + operand_len .. instr_start + operand_len + instr_len], heap_buf);
                     }
                 }
 
