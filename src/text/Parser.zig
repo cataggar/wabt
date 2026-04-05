@@ -913,12 +913,14 @@ const Parser = struct {
             if (self.peek().kind == .kw_param) {
                 _ = self.advance(); // consume 'param'
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const before_pos = self.lexer.pos;
                     if (self.parseValType()) |vt| {
                         if (param_count < 16) param_types_buf[param_count] = vt;
                         param_count += 1;
                     } else |_| {
-                        _ = self.advance();
-                        param_count += 1;
+                        // parseValType may have consumed a token; avoid infinite loop
+                        if (self.lexer.pos == before_pos) _ = self.advance();
+                        break;
                     }
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
@@ -937,12 +939,13 @@ const Parser = struct {
             if (self.peek().kind == .kw_result) {
                 _ = self.advance(); // consume 'result'
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const before_pos = self.lexer.pos;
                     if (self.parseValType()) |vt| {
                         if (result_count < 16) result_types_buf[result_count] = vt;
                         result_count += 1;
                     } else |_| {
-                        _ = self.advance();
-                        result_count += 1;
+                        if (self.lexer.pos == before_pos) _ = self.advance();
+                        break;
                     }
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
