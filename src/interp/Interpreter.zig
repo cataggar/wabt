@@ -155,7 +155,7 @@ pub const Instance = struct {
 
         // Copy active data segments into memory
         for (self.module.data_segments.items) |seg| {
-            if (seg.kind != .active or seg.data.len == 0) continue;
+            if (seg.kind != .active) continue;
             var offset: usize = 0;
             if (seg.offset_expr_bytes.len > 0) {
                 const off_val = evalConstExpr(self, seg.offset_expr_bytes);
@@ -167,7 +167,10 @@ pub const Instance = struct {
                     };
                 }
             }
-            if (offset + seg.data.len <= self.memory.items.len) {
+            if (offset + seg.data.len > self.memory.items.len) {
+                return error.OutOfBoundsMemoryAccess;
+            }
+            if (seg.data.len > 0) {
                 @memcpy(self.memory.items[offset .. offset + seg.data.len], seg.data);
             }
         }
@@ -190,13 +193,14 @@ pub const Instance = struct {
                     };
                 }
             }
+            if (offset + seg.elem_var_indices.items.len > tbl.items.len) {
+                return error.OutOfBoundsTableAccess;
+            }
             for (seg.elem_var_indices.items, 0..) |var_, j| {
                 const table_entry = offset + j;
-                if (table_entry < tbl.items.len) {
-                    switch (var_) {
-                        .index => |idx| tbl.items[table_entry] = idx,
-                        .name => {},
-                    }
+                switch (var_) {
+                    .index => |idx| tbl.items[table_entry] = idx,
+                    .name => {},
                 }
             }
         }

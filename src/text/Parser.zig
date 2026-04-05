@@ -1645,7 +1645,7 @@ const Parser = struct {
                 try self.expect(.r_paren); // close (data ...)
                 const data_len: u64 = @intCast(data_parts.items.len);
                 const page_size: u64 = 65536;
-                const pages: u64 = if (data_len == 0) 1 else (data_len + page_size - 1) / page_size;
+                const pages: u64 = if (data_len == 0) 0 else (data_len + page_size - 1) / page_size;
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true } },
                 });
