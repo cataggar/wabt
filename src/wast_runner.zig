@@ -142,6 +142,7 @@ const RunState = struct {
             return false;
         };
         interp.* = Interp.Interpreter.init(self.allocator, inst);
+        inst.interp_ref = interp;
         self.resolveImports(mod, interp);
         inst.instantiate() catch {
             interp.deinit();
@@ -196,6 +197,7 @@ const RunState = struct {
             return false;
         };
         interp.* = Interp.Interpreter.init(self.allocator, inst);
+        inst.interp_ref = interp;
 
         // Resolve function and global imports BEFORE instantiation so init
         // expressions like (global.get 0) can see imported global values.
@@ -326,6 +328,13 @@ const RunState = struct {
                 if (exp.kind != .memory) continue;
                 // Point to the exporter's memory for true sharing
                 interp.instance.shared_memory = triple.instance.getMemory();
+                // Store the exporter's actual max for grow limit checks
+                if (triple.module.memories.items.len > 0) {
+                    const exp_mem = triple.module.memories.items[0];
+                    if (exp_mem.@"type".limits.has_max) {
+                        interp.instance.shared_memory_max_pages = exp_mem.@"type".limits.max;
+                    }
+                }
             } else if (imp.kind == .table) {
                 // Share tables from exporting module via pointer
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
@@ -334,6 +343,8 @@ const RunState = struct {
                 // Point to the exporter's tables for true sharing
                 const src_tables = triple.instance.shared_tables orelse &triple.instance.tables;
                 interp.instance.shared_tables = src_tables;
+                // Share the table func refs map for cross-module call_indirect
+                interp.instance.shared_table_func_refs = triple.instance.getTableFuncRefs();
             }
         }
     }
@@ -383,7 +394,23 @@ const RunState = struct {
                     }
                 },
                 .memory => {
-                    // Memory import: check limits
+                    // Memory import: check limits compatibility
+                    if (imp.memory) |imp_m| {
+                        const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                        if (exp_idx >= triple.module.memories.items.len) return false;
+                        const exp_mem = triple.module.memories.items[exp_idx];
+                        // Actual size must be what's required
+                        const actual = if (triple.instance.shared_memory) |_|
+                            @as(u64, @intCast(triple.instance.getMemory().items.len / 65536))
+                        else
+                            @as(u64, @intCast(triple.instance.getMemory().items.len / 65536));
+                        if (actual < imp_m.limits.initial) return false;
+                        // If import has max, export must also have max and export.max ≤ import.max
+                        if (imp_m.limits.has_max) {
+                            if (!exp_mem.@"type".limits.has_max) return false;
+                            if (exp_mem.@"type".limits.max > imp_m.limits.max) return false;
+                        }
+                    }
                 },
                 .table => {
                     // Table import: check elem type and limits
@@ -391,7 +418,15 @@ const RunState = struct {
                         const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
                         if (exp_idx >= triple.module.tables.items.len) return false;
                         const exp_tbl = triple.module.tables.items[exp_idx];
-                        if (imp_t.elem_type != exp_tbl.type.elem_type) return false;
+                        if (imp_t.elem_type != exp_tbl.@"type".elem_type) return false;
+                        // Actual table size must be at least what's required
+                        const actual_size: u64 = @intCast(triple.instance.getTable(exp_idx).items.len);
+                        if (actual_size < imp_t.limits.initial) return false;
+                        // If import has max, export must also have max and export.max ≤ import.max
+                        if (imp_t.limits.has_max) {
+                            if (!exp_tbl.@"type".limits.has_max) return false;
+                            if (exp_tbl.@"type".limits.max > imp_t.limits.max) return false;
+                        }
                     }
                 },
                 else => {},
@@ -510,6 +545,7 @@ const RunState = struct {
             return;
         };
         interp.* = Interp.Interpreter.init(self.allocator, inst);
+        inst.interp_ref = interp;
 
         self.putRegistered("spectest", .{ .module = mod, .instance = inst, .interpreter = interp });
     }
@@ -1074,6 +1110,7 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, stat
 
     var interp = Interp.Interpreter.init(allocator, &instance);
     defer interp.deinit();
+    instance.interp_ref = &interp;
 
     // Check that all imports can be resolved
     if (state.checkImportsResolvable(&module)) {
@@ -1085,6 +1122,8 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, stat
         };
         // Everything succeeded — unexpected for assert_unlinkable.
         result.failed += 1;
+        const mod_text = findEmbeddedModule(sexpr) orelse sexpr;
+        std.debug.print("  FAIL assert_unlinkable: module linked OK: {s}\n", .{mod_text[0..@min(200, mod_text.len)]});
     } else {
         // Imports couldn't be resolved — this is the expected unlinkable behavior
         result.passed += 1;
