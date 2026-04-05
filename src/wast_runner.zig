@@ -59,6 +59,8 @@ const RunState = struct {
     registered_modules: std.StringHashMapUnmanaged(ModuleTriple) = .{},
     /// Keys that are owned by this state and must be freed.
     owned_keys: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Source texts from decoded quote modules (kept alive for name slices).
+    owned_sources: std.ArrayListUnmanaged([]const u8) = .{},
 
     fn deinit(self: *RunState) void {
         self.destroyCurrent();
@@ -82,6 +84,8 @@ const RunState = struct {
         self.registered_modules.deinit(self.allocator);
         for (self.owned_keys.items) |key| self.allocator.free(key);
         self.owned_keys.deinit(self.allocator);
+        for (self.owned_sources.items) |src| self.allocator.free(src);
+        self.owned_sources.deinit(self.allocator);
     }
 
     /// Destroy the current module/instance/interpreter if they are not held
@@ -479,21 +483,23 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                             result.skipped += 1;
                             continue;
                         };
-                        defer allocator.free(wat_text);
                         const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
                             wat_text
                         else blk: {
                             var buf2 = std.ArrayListUnmanaged(u8){};
-                            buf2.appendSlice(allocator, "(module ") catch { result.skipped += 1; continue; };
-                            buf2.appendSlice(allocator, wat_text) catch { result.skipped += 1; continue; };
-                            buf2.append(allocator, ')') catch { result.skipped += 1; continue; };
-                            break :blk buf2.toOwnedSlice(allocator) catch { result.skipped += 1; continue; };
+                            buf2.appendSlice(allocator, "(module ") catch { result.skipped += 1; allocator.free(wat_text); continue; };
+                            buf2.appendSlice(allocator, wat_text) catch { result.skipped += 1; allocator.free(wat_text); continue; };
+                            buf2.append(allocator, ')') catch { result.skipped += 1; allocator.free(wat_text); continue; };
+                            break :blk buf2.toOwnedSlice(allocator) catch { result.skipped += 1; allocator.free(wat_text); continue; };
                         };
-                        defer if (wrapped.ptr != wat_text.ptr) allocator.free(wrapped);
                         if (state.setModule(wrapped)) {
+                            // Keep source text alive - module names are slices into it
+                            state.owned_sources.append(allocator, wrapped) catch {};
+                            if (wrapped.ptr != wat_text.ptr) state.owned_sources.append(allocator, wat_text) catch {};
                             result.passed += 1;
                         } else {
-                            std.debug.print("  DEBUG quote module setModule failed, decoded text[0..120]=\"{s}\"\n", .{wrapped[0..@min(120, wrapped.len)]});
+                            if (wrapped.ptr != wat_text.ptr) allocator.free(wrapped);
+                            allocator.free(wat_text);
                             result.skipped += 1;
                         }
                     } else if (isBinaryModule(sexpr.text)) {
