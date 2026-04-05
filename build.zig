@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
             .root_module = tool_mod,
         });
         // Increase default stack size for deeply nested Wasm blocks
-        exe.stack_size = 16 * 1024 * 1024; // 16 MB
+        exe.stack_size = 128 * 1024 * 1024; // 128 MB
         b.installArtifact(exe);
     }
 
