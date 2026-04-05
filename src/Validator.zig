@@ -520,6 +520,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
             },
             0x0e => { // br_table
                 const count = readU32(bytes, &pos);
+                // Save position to re-read target depths for type checking
+                const targets_start = pos;
                 var max_depth: u32 = 0;
                 for (0..count) |_| {
                     const d = readU32(bytes, &pos);
@@ -530,9 +532,23 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                 if (max_depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
                 if (default >= ctrl_stack.items.len) return error.InvalidLabelIndex;
                 try popExpect(&val_stack, &ctrl_stack, .i32);
-                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - default];
-                const lt = labelTypes(&target);
-                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+
+                const default_target = ctrl_stack.items[ctrl_stack.items.len - 1 - default];
+                const default_lt = labelTypes(&default_target);
+
+                // Verify all targets have consistent label types with the default
+                var check_pos = targets_start;
+                for (0..count) |_| {
+                    const d = readU32(bytes, &check_pos);
+                    const target = ctrl_stack.items[ctrl_stack.items.len - 1 - d];
+                    const lt = labelTypes(&target);
+                    if (lt.len != default_lt.len) return error.TypeMismatch;
+                    for (lt, default_lt) |a, b| {
+                        if (a != b) return error.TypeMismatch;
+                    }
+                }
+
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], default_lt);
                 setUnreachable(&val_stack, &ctrl_stack);
             },
             0x0f => { // return

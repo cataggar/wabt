@@ -25,6 +25,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     var p = Parser{ .lexer = Lexer.init(source), .allocator = allocator };
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
+    p.module = &module;
 
     try p.expect(.l_paren);
     try p.expect(.kw_module);
@@ -72,6 +73,7 @@ const Parser = struct {
     lexer: Lexer,
     allocator: std.mem.Allocator,
     peeked: ?Lex.Token = null,
+    module: ?*Mod.Module = null,
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -677,40 +679,41 @@ const Parser = struct {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_result) {
                 _ = self.advance(); // consume 'result'
-                // Count result types
+                // Collect result types
                 var count: u32 = 0;
-                var first_type: ?types.ValType = null;
+                var result_types_buf: [16]types.ValType = undefined;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.parseValType()) |vt| {
-                        if (count == 0) first_type = vt;
+                        if (count < 16) result_types_buf[count] = vt;
                         count += 1;
                     } else |_| {
                         _ = self.advance(); // skip unrecognized token
-                        count += 1; // still counts as a type for validation
+                        count += 1;
                     }
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
 
                 if (count == 1) {
-                    if (first_type) |vt| {
-                        const raw: u32 = @bitCast(@intFromEnum(vt));
-                        buf[0] = @truncate(raw);
-                        return 1;
-                    }
-                }
-                if (count > 1) {
-                    // Multi-value result: create a type entry for multi-value block type.
-                    // Emit a type index that maps to a multi-result signature.
-                    // For validation, we create a synthetic type and emit its index.
-                    // Since we can't easily create types here, emit a special marker
-                    // that the validator will interpret as multi-value.
-                    // Use the convention: emit negative type index via LEB128.
-                    // For now, emit void (0x40) to skip — multi-value validation
-                    // requires the module to be available. Instead, we'll flag an error
-                    // by encoding as type index pointing to a non-existent type (0xFF),
-                    // which the validator will reject as a type mismatch.
-                    buf[0] = 0x40; // void — but the function expects 2 values
+                    const raw: u32 = @bitCast(@intFromEnum(result_types_buf[0]));
+                    buf[0] = @truncate(raw);
                     return 1;
+                }
+                if (count > 1 and count <= 16) {
+                    if (self.module) |mod| {
+                        const r = self.allocator.alloc(types.ValType, count) catch {
+                            buf[0] = 0x40;
+                            return 1;
+                        };
+                        @memcpy(r, result_types_buf[0..count]);
+                        const type_idx: u32 = @intCast(mod.module_types.items.len);
+                        mod.module_types.append(self.allocator, .{
+                            .func_type = .{ .params = &.{}, .results = r },
+                        }) catch {
+                            buf[0] = 0x40;
+                            return 1;
+                        };
+                        return leb128.writeS32Leb128(buf, @bitCast(type_idx));
+                    }
                 }
                 buf[0] = 0x40;
                 return 1;
