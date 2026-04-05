@@ -180,6 +180,10 @@ pub const Interpreter = struct {
     branch_depth: ?u32 = null,
     /// Set when a return instruction is executed.
     returning: bool = false,
+    /// Instruction counter to prevent infinite loops / runaway execution.
+    instr_count: u64 = 0,
+    /// Maximum instructions before we trap (100 million).
+    max_instrs: u64 = 100_000_000,
 
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
@@ -202,9 +206,16 @@ pub const Interpreter = struct {
             .name => return error.Unimplemented,
         };
         const stack_base = self.stack.items.len;
-        const result = try self.callFunc(idx, args);
+        self.instr_count = 0; // Reset for each top-level call
+        const result = self.callFunc(idx, args) catch |err| {
+            // On error, clean up stack to base
+            if (self.stack.items.len > stack_base)
+                self.stack.shrinkRetainingCapacity(stack_base);
+            return err;
+        };
         // Clean up any stale values left on the stack from multi-return or leaky calls
-        self.stack.shrinkRetainingCapacity(stack_base);
+        if (self.stack.items.len > stack_base)
+            self.stack.shrinkRetainingCapacity(stack_base);
         return result;
     }
 
@@ -797,7 +808,7 @@ pub const Interpreter = struct {
 
     pub fn f32Nearest(self: *Interpreter) TrapError!void {
         const a = try self.popF32();
-        try self.pushValue(.{ .f32 = @round(a) });
+        try self.pushValue(.{ .f32 = wasmNearestF32(a) });
     }
 
     // ── f64 arithmetic ──────────────────────────────────────────────────
@@ -870,7 +881,7 @@ pub const Interpreter = struct {
 
     pub fn f64Nearest(self: *Interpreter) TrapError!void {
         const a = try self.popF64();
-        try self.pushValue(.{ .f64 = @round(a) });
+        try self.pushValue(.{ .f64 = wasmNearestF64(a) });
     }
 
     // ── Conversions ─────────────────────────────────────────────────────
@@ -1272,6 +1283,56 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .i64 = @as(i64, @as(i32, @truncate(a))) });
     }
 
+    // ── Saturating truncation ───────────────────────────────────────────
+
+    pub fn i32TruncSatF32S(self: *Interpreter) TrapError!void {
+        const f = try self.popF32();
+        const v: i32 = if (std.math.isNan(f)) 0 else if (f >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1))) std.math.maxInt(i32) else if (f < @as(f32, @floatFromInt(@as(i64, std.math.minInt(i32))))) std.math.minInt(i32) else @intFromFloat(f);
+        try self.pushValue(.{ .i32 = v });
+    }
+
+    pub fn i32TruncSatF32U(self: *Interpreter) TrapError!void {
+        const f = try self.popF32();
+        const v: u32 = if (std.math.isNan(f) or f < 0.0) 0 else if (f >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1))) std.math.maxInt(u32) else @intFromFloat(f);
+        try self.pushValue(.{ .i32 = @bitCast(v) });
+    }
+
+    pub fn i32TruncSatF64S(self: *Interpreter) TrapError!void {
+        const f = try self.popF64();
+        const v: i32 = if (std.math.isNan(f)) 0 else if (f >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(i32)) + 1))) std.math.maxInt(i32) else if (f < @as(f64, @floatFromInt(@as(i64, std.math.minInt(i32))))) std.math.minInt(i32) else @intFromFloat(f);
+        try self.pushValue(.{ .i32 = v });
+    }
+
+    pub fn i32TruncSatF64U(self: *Interpreter) TrapError!void {
+        const f = try self.popF64();
+        const v: u32 = if (std.math.isNan(f) or f < 0.0) 0 else if (f >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1))) std.math.maxInt(u32) else @intFromFloat(f);
+        try self.pushValue(.{ .i32 = @bitCast(v) });
+    }
+
+    pub fn i64TruncSatF32S(self: *Interpreter) TrapError!void {
+        const f = try self.popF32();
+        const v: i64 = if (std.math.isNan(f)) 0 else if (f >= @as(f32, @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1))) std.math.maxInt(i64) else if (f < @as(f32, @floatFromInt(@as(i128, std.math.minInt(i64))))) std.math.minInt(i64) else @intFromFloat(f);
+        try self.pushValue(.{ .i64 = v });
+    }
+
+    pub fn i64TruncSatF32U(self: *Interpreter) TrapError!void {
+        const f = try self.popF32();
+        const v: u64 = if (std.math.isNan(f) or f < 0.0) 0 else if (f >= @as(f32, @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1))) std.math.maxInt(u64) else @intFromFloat(f);
+        try self.pushValue(.{ .i64 = @bitCast(v) });
+    }
+
+    pub fn i64TruncSatF64S(self: *Interpreter) TrapError!void {
+        const f = try self.popF64();
+        const v: i64 = if (std.math.isNan(f)) 0 else if (f >= @as(f64, @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1))) std.math.maxInt(i64) else if (f < @as(f64, @floatFromInt(@as(i128, std.math.minInt(i64))))) std.math.minInt(i64) else @intFromFloat(f);
+        try self.pushValue(.{ .i64 = v });
+    }
+
+    pub fn i64TruncSatF64U(self: *Interpreter) TrapError!void {
+        const f = try self.popF64();
+        const v: u64 = if (std.math.isNan(f) or f < 0.0) 0 else if (f >= @as(f64, @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1))) std.math.maxInt(u64) else @intFromFloat(f);
+        try self.pushValue(.{ .i64 = @bitCast(v) });
+    }
+
     // ── Sub-word memory loads ───────────────────────────────────────────
 
     pub fn i32Load8S(self: *Interpreter, offset: u32) TrapError!void {
@@ -1410,6 +1471,8 @@ pub const Interpreter = struct {
     fn dispatch(self: *Interpreter, code: []const u8, start_pc: usize, locals: []Value) TrapError!usize {
         var pc = start_pc;
         while (pc < code.len) {
+            self.instr_count += 1;
+            if (self.instr_count > self.max_instrs) return error.CallStackExhausted;
             const opcode = code[pc];
             pc += 1;
             switch (opcode) {
@@ -1749,6 +1812,266 @@ pub const Interpreter = struct {
                 0xd0 => { pc += 1; try self.pushValue(.{ .ref_null = {} }); },
                 0xd1 => { const v = try self.popValue(); try self.pushValue(.{ .i32 = @intFromBool(v == .ref_null) }); },
                 0xd2 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(.{ .ref_func = idx }); },
+                // table.get / table.set
+                0x25 => { // table.get
+                    var t = pc;
+                    const table_idx = readCodeU32(code, &t);
+                    pc = t;
+                    _ = table_idx;
+                    const elem_idx = @as(u32, @bitCast(try self.popI32()));
+                    if (elem_idx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
+                    if (self.instance.table.items[elem_idx]) |func_idx| {
+                        try self.pushValue(.{ .ref_func = func_idx });
+                    } else {
+                        try self.pushValue(.{ .ref_null = {} });
+                    }
+                },
+                0x26 => { // table.set
+                    var t = pc;
+                    const table_idx = readCodeU32(code, &t);
+                    pc = t;
+                    _ = table_idx;
+                    const val = try self.popValue();
+                    const elem_idx = @as(u32, @bitCast(try self.popI32()));
+                    if (elem_idx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
+                    self.instance.table.items[elem_idx] = switch (val) {
+                        .ref_func => |idx| idx,
+                        .ref_null => null,
+                        else => null,
+                    };
+                },
+                // 0xfc prefix: saturating truncation, bulk memory, table ops
+                0xfc => {
+                    var t = pc;
+                    const sub = readCodeU32(code, &t);
+                    pc = t;
+                    switch (sub) {
+                        // Saturating truncation operations
+                        0x00 => try self.i32TruncSatF32S(),
+                        0x01 => try self.i32TruncSatF32U(),
+                        0x02 => try self.i32TruncSatF64S(),
+                        0x03 => try self.i32TruncSatF64U(),
+                        0x04 => try self.i64TruncSatF32S(),
+                        0x05 => try self.i64TruncSatF32U(),
+                        0x06 => try self.i64TruncSatF64S(),
+                        0x07 => try self.i64TruncSatF64U(),
+                        // memory.init
+                        0x08 => {
+                            var t2 = pc;
+                            const data_idx = readCodeU32(code, &t2);
+                            _ = readCodeU32(code, &t2); // memory index
+                            pc = t2;
+                            const n_val = try self.popI32();
+                            const src_val = try self.popI32();
+                            const dst_val = try self.popI32();
+                            const n = @as(u32, @bitCast(n_val));
+                            const src = @as(u32, @bitCast(src_val));
+                            const dst = @as(u32, @bitCast(dst_val));
+                            // Check if data segment exists and is not dropped
+                            if (data_idx < self.instance.module.data_segments.items.len) {
+                                const seg = self.instance.module.data_segments.items[data_idx];
+                                if (seg.dropped) {
+                                    if (n != 0) return error.OutOfBoundsMemoryAccess;
+                                } else {
+                                    if (@as(u64, src) + n > seg.data.len or @as(u64, dst) + n > self.instance.memory.items.len)
+                                        return error.OutOfBoundsMemoryAccess;
+                                    if (n > 0) {
+                                        const s = @as(usize, src);
+                                        const d = @as(usize, dst);
+                                        const nn = @as(usize, n);
+                                        @memcpy(self.instance.memory.items[d .. d + nn], seg.data[s .. s + nn]);
+                                    }
+                                }
+                            } else {
+                                if (n != 0) return error.OutOfBoundsMemoryAccess;
+                            }
+                        },
+                        // data.drop
+                        0x09 => {
+                            var t2 = pc;
+                            const data_idx = readCodeU32(code, &t2);
+                            pc = t2;
+                            if (data_idx < self.instance.module.data_segments.items.len) {
+                                self.instance.module.data_segments.items[data_idx].dropped = true;
+                            }
+                        },
+                        // memory.copy
+                        0x0a => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // dst memory
+                            _ = readCodeU32(code, &t2); // src memory
+                            pc = t2;
+                            const n = @as(u32, @bitCast(try self.popI32()));
+                            const src = @as(u32, @bitCast(try self.popI32()));
+                            const dst = @as(u32, @bitCast(try self.popI32()));
+                            const mem = &self.instance.memory;
+                            if (@as(u64, dst) + n > mem.items.len or @as(u64, src) + n > mem.items.len)
+                                return error.OutOfBoundsMemoryAccess;
+                            if (n > 0) {
+                                const d = @as(usize, dst);
+                                const s = @as(usize, src);
+                                const nn = @as(usize, n);
+                                // memmove semantics (overlapping ok)
+                                if (d <= s) {
+                                    var i: usize = 0;
+                                    while (i < nn) : (i += 1) mem.items[d + i] = mem.items[s + i];
+                                } else {
+                                    var i: usize = nn;
+                                    while (i > 0) {
+                                        i -= 1;
+                                        mem.items[d + i] = mem.items[s + i];
+                                    }
+                                }
+                            }
+                        },
+                        // memory.fill
+                        0x0b => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // memory index
+                            pc = t2;
+                            const n = @as(u32, @bitCast(try self.popI32()));
+                            const val = @as(u8, @truncate(@as(u32, @bitCast(try self.popI32()))));
+                            const dst = @as(u32, @bitCast(try self.popI32()));
+                            if (@as(u64, dst) + n > self.instance.memory.items.len)
+                                return error.OutOfBoundsMemoryAccess;
+                            if (n > 0) {
+                                @memset(self.instance.memory.items[@as(usize, dst)..@as(usize, dst) + @as(usize, n)], val);
+                            }
+                        },
+                        // table.init
+                        0x0c => {
+                            var t2 = pc;
+                            const elem_idx = readCodeU32(code, &t2);
+                            _ = readCodeU32(code, &t2); // table index
+                            pc = t2;
+                            const n_val = try self.popI32();
+                            const src_val = try self.popI32();
+                            const dst_val = try self.popI32();
+                            const n = @as(u32, @bitCast(n_val));
+                            const src = @as(u32, @bitCast(src_val));
+                            const dst = @as(u32, @bitCast(dst_val));
+                            if (elem_idx < self.instance.module.elem_segments.items.len) {
+                                const seg = &self.instance.module.elem_segments.items[elem_idx];
+                                if (seg.dropped) {
+                                    if (n != 0) return error.OutOfBoundsTableAccess;
+                                } else {
+                                    if (@as(u64, src) + n > seg.elem_var_indices.items.len or @as(u64, dst) + n > self.instance.table.items.len)
+                                        return error.OutOfBoundsTableAccess;
+                                    var i: u32 = 0;
+                                    while (i < n) : (i += 1) {
+                                        const var_ = seg.elem_var_indices.items[@as(usize, src + i)];
+                                        self.instance.table.items[@as(usize, dst + i)] = switch (var_) {
+                                            .index => |idx| idx,
+                                            .name => null,
+                                        };
+                                    }
+                                }
+                            } else {
+                                if (n != 0) return error.OutOfBoundsTableAccess;
+                            }
+                        },
+                        // elem.drop
+                        0x0d => {
+                            var t2 = pc;
+                            const elem_idx = readCodeU32(code, &t2);
+                            pc = t2;
+                            if (elem_idx < self.instance.module.elem_segments.items.len) {
+                                self.instance.module.elem_segments.items[elem_idx].dropped = true;
+                            }
+                        },
+                        // table.copy
+                        0x0e => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // dst table
+                            _ = readCodeU32(code, &t2); // src table
+                            pc = t2;
+                            const n = @as(u32, @bitCast(try self.popI32()));
+                            const src = @as(u32, @bitCast(try self.popI32()));
+                            const dst = @as(u32, @bitCast(try self.popI32()));
+                            const tbl = &self.instance.table;
+                            if (@as(u64, dst) + n > tbl.items.len or @as(u64, src) + n > tbl.items.len)
+                                return error.OutOfBoundsTableAccess;
+                            if (n > 0) {
+                                const d = @as(usize, dst);
+                                const s = @as(usize, src);
+                                const nn = @as(usize, n);
+                                if (d <= s) {
+                                    var i: usize = 0;
+                                    while (i < nn) : (i += 1) tbl.items[d + i] = tbl.items[s + i];
+                                } else {
+                                    var i: usize = nn;
+                                    while (i > 0) {
+                                        i -= 1;
+                                        tbl.items[d + i] = tbl.items[s + i];
+                                    }
+                                }
+                            }
+                        },
+                        // table.grow
+                        0x0f => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // table index
+                            pc = t2;
+                            const n = @as(u32, @bitCast(try self.popI32()));
+                            const init_val = try self.popValue();
+                            const tbl = &self.instance.table;
+                            const old_size: i32 = @intCast(tbl.items.len);
+                            // Check table max limit
+                            var max_exceeded = false;
+                            if (self.instance.module.tables.items.len > 0) {
+                                const tab = self.instance.module.tables.items[0];
+                                if (tab.@"type".limits.has_max) {
+                                    if (@as(u64, tbl.items.len) + n > tab.@"type".limits.max) {
+                                        max_exceeded = true;
+                                    }
+                                }
+                            }
+                            if (max_exceeded) {
+                                try self.pushValue(.{ .i32 = -1 });
+                            } else {
+                                const entry: ?u32 = switch (init_val) {
+                                    .ref_func => |idx| idx,
+                                    .ref_null => null,
+                                    else => null,
+                                };
+                                tbl.appendNTimes(self.allocator, entry, n) catch {
+                                    try self.pushValue(.{ .i32 = -1 });
+                                    continue;
+                                };
+                                try self.pushValue(.{ .i32 = old_size });
+                            }
+                        },
+                        // table.size
+                        0x10 => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // table index
+                            pc = t2;
+                            const size: i32 = @intCast(self.instance.table.items.len);
+                            try self.pushValue(.{ .i32 = size });
+                        },
+                        // table.fill
+                        0x11 => {
+                            var t2 = pc;
+                            _ = readCodeU32(code, &t2); // table index
+                            pc = t2;
+                            const n = @as(u32, @bitCast(try self.popI32()));
+                            const fill_val = try self.popValue();
+                            const dst = @as(u32, @bitCast(try self.popI32()));
+                            if (@as(u64, dst) + n > self.instance.table.items.len)
+                                return error.OutOfBoundsTableAccess;
+                            const entry: ?u32 = switch (fill_val) {
+                                .ref_func => |idx| idx,
+                                .ref_null => null,
+                                else => null,
+                            };
+                            var i: u32 = 0;
+                            while (i < n) : (i += 1) {
+                                self.instance.table.items[@as(usize, dst + i)] = entry;
+                            }
+                        },
+                        else => return error.Unimplemented,
+                    }
+                },
                 else => return error.Unimplemented,
             }
         }
@@ -1949,6 +2272,37 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
         return if (std.math.signbit(a)) b else a;
     }
     return @max(a, b);
+}
+
+/// WebAssembly nearest: rounds to nearest even (banker's rounding).
+fn wasmNearestF32(a: f32) f32 {
+    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (a == 0.0) return a; // preserve sign of zero
+    const rounded = @round(a);
+    const diff = a - rounded;
+    // If exactly halfway, round to even
+    if (diff == 0.5 or diff == -0.5) {
+        const r_int: i64 = @intFromFloat(rounded);
+        if (@rem(r_int, 2) != 0) {
+            return rounded - std.math.copysign(@as(f32, 1.0), a);
+        }
+    }
+    return rounded;
+}
+
+/// WebAssembly nearest: rounds to nearest even (banker's rounding).
+fn wasmNearestF64(a: f64) f64 {
+    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (a == 0.0) return a; // preserve sign of zero
+    const rounded = @round(a);
+    const diff = a - rounded;
+    if (diff == 0.5 or diff == -0.5) {
+        const r_int: i64 = @intFromFloat(rounded);
+        if (@rem(r_int, 2) != 0) {
+            return rounded - std.math.copysign(@as(f64, 1.0), a);
+        }
+    }
+    return rounded;
 }
 
 // ── Test helpers ─────────────────────────────────────────────────────────
