@@ -36,6 +36,14 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     // Pre-scan: collect function, type, global, and table names for forward references.
     prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, allocator);
 
+    // DBG: dump prescan type_names
+    {
+        var it = p.type_names.iterator();
+        while (it.next()) |entry| {
+            std.debug.print("  DBG prescan type: {s} -> {d}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+    }
+
     try p.expect(.l_paren);
     try p.expect(.kw_module);
 
@@ -776,6 +784,7 @@ const Parser = struct {
                         if (self.peek().kind == .identifier) {
                             const type_tok = self.advance();
                             const idx = self.type_names.get(type_tok.text) orelse 0;
+                            std.debug.print("  DBG ci_parse: type {s} -> {d}\n", .{ type_tok.text, idx });
                             self.emitLeb128U32(code, idx);
                         } else {
                             self.emitU32Imm(code); // numeric type index
