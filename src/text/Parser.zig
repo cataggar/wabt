@@ -27,13 +27,14 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.type_names.deinit(allocator);
     defer p.local_names.deinit(allocator);
     defer p.global_names.deinit(allocator);
+    defer p.table_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
 
-    // Pre-scan: collect function, type, and global names for forward references.
-    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, allocator);
+    // Pre-scan: collect function, type, global, and table names for forward references.
+    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, allocator);
 
     try p.expect(.l_paren);
     try p.expect(.kw_module);
@@ -83,12 +84,14 @@ fn prescanNames(
     func_names: *std.StringArrayHashMapUnmanaged(u32),
     type_names: *std.StringArrayHashMapUnmanaged(u32),
     global_names: *std.StringArrayHashMapUnmanaged(u32),
+    table_names: *std.StringArrayHashMapUnmanaged(u32),
     allocator: std.mem.Allocator,
 ) void {
     var lex = Lexer.init(source);
     var func_idx: u32 = 0;
     var type_idx: u32 = 0;
     var global_idx: u32 = 0;
+    var table_idx: u32 = 0;
 
     // Skip (module and optional name
     var tok = lex.next();
@@ -119,6 +122,12 @@ fn prescanNames(
                 global_names.put(allocator, tok.text, global_idx) catch {};
             }
             global_idx += 1;
+        } else if (tok.kind == .kw_table) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                table_names.put(allocator, tok.text, table_idx) catch {};
+            }
+            table_idx += 1;
         } else if (tok.kind == .kw_import) {
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
@@ -139,11 +148,20 @@ fn prescanNames(
                         global_names.put(allocator, tok.text, global_idx) catch {};
                     }
                     global_idx += 1;
+                } else if (tok.kind == .kw_table) {
+                    tok = lex.next();
+                    if (tok.kind == .identifier) {
+                        table_names.put(allocator, tok.text, table_idx) catch {};
+                    }
+                    table_idx += 1;
                 }
             }
         }
         // Skip to matching ')'
+        // If a branch consumed a '(' (e.g. kw_func read past $name into '(export'),
+        // account for the extra nesting level.
         var depth: u32 = 1;
+        if (tok.kind == .l_paren) depth += 1;
         while (depth > 0) {
             tok = lex.next();
             if (tok.kind == .l_paren) depth += 1;
@@ -171,6 +189,8 @@ const Parser = struct {
     local_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from global $name to index.
     global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from table $name to index.
+    table_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
 
@@ -705,7 +725,40 @@ const Parser = struct {
             },
             .kw_call_indirect => {
                 code.append(self.allocator, 0x11) catch return;
-                // call_indirect can have (type $idx) or inline type use, then optional table index
+                // WAT: call_indirect $tableidx? typeuse
+                // Binary: 0x11 typeidx tableidx
+                var ci_table_idx: u32 = 0;
+                // Check for $table identifier before the type use
+                if (self.peek().kind == .identifier) {
+                    const ci_tok = self.advance();
+                    ci_table_idx = self.table_names.get(ci_tok.text) orelse 0;
+                } else if (self.peek().kind == .integer) {
+                    // Lookahead: if integer followed by (type ...), it's a table index
+                    const sp_ci = self.lexer.pos;
+                    const spk_ci = self.peeked;
+                    const maybe_tbl = self.parseU32() catch 0;
+                    if (self.peek().kind == .l_paren) {
+                        const sp2 = self.lexer.pos;
+                        const spk2 = self.peeked;
+                        _ = self.advance(); // skip '('
+                        if (self.peek().kind == .kw_type) {
+                            // It was a table index followed by (type ...)
+                            ci_table_idx = maybe_tbl;
+                            // Restore to just before '(' so the type parsing below handles it
+                            self.lexer.pos = sp2;
+                            self.peeked = spk2;
+                        } else {
+                            // Not (type ...), restore and treat as type index
+                            self.lexer.pos = sp_ci;
+                            self.peeked = spk_ci;
+                        }
+                    } else {
+                        // No '(' follows, restore and treat as type index
+                        self.lexer.pos = sp_ci;
+                        self.peeked = spk_ci;
+                    }
+                }
+                // Parse type use: (type $idx) or inline
                 if (self.peek().kind == .l_paren) {
                     const sp = self.lexer.pos;
                     const spk = self.peeked;
@@ -717,19 +770,15 @@ const Parser = struct {
                     } else {
                         self.lexer.pos = sp;
                         self.peeked = spk;
-                        self.emitLeb128U32(code, 0); // type index 0
+                        self.emitLeb128U32(code, 0); // default type 0
                     }
                 } else if (self.peek().kind == .integer) {
-                    self.emitU32Imm(code);
+                    self.emitU32Imm(code); // numeric type index
                 } else {
-                    self.emitLeb128U32(code, 0);
+                    self.emitLeb128U32(code, 0); // default type 0
                 }
-                // Table index (default 0)
-                if (self.peek().kind == .integer) {
-                    self.emitU32Imm(code);
-                } else {
-                    self.emitLeb128U32(code, 0);
-                }
+                // Emit table index
+                self.emitLeb128U32(code, ci_table_idx);
             },
             .kw_drop => code.append(self.allocator, 0x1a) catch return,
             .kw_select => code.append(self.allocator, 0x1b) catch return,
@@ -930,6 +979,10 @@ const Parser = struct {
                 self.emitLeb128U32(code, idx);
                 return;
             }
+            if (self.table_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
             self.emitLeb128U32(code, 0);
             return;
         }
@@ -1044,6 +1097,10 @@ const Parser = struct {
                 // Memory load/store instructions have memarg (align, offset)
                 if (op >= 0x28 and op <= 0x3e) {
                     self.emitMemarg(code, @truncate(op));
+                }
+                // table.get / table.set need a table index immediate
+                if (op == 0x25 or op == 0x26) {
+                    self.emitU32Imm(code);
                 }
             } else {
                 // Prefixed opcode
@@ -1571,8 +1628,23 @@ const Parser = struct {
                     try self.expect(.r_paren);
                     has_offset = true;
                 } else if (inner_kind == .kw_table) {
-                    // (table $t) — skip
-                    try self.skipSExpr();
+                    // (table $t) — record target table index
+                    _ = self.advance(); // consume 'table'
+                    if (self.peek().kind == .identifier) {
+                        const ttok = self.advance();
+                        seg.table_var = .{ .index = self.table_names.get(ttok.text) orelse 0 };
+                    } else if (self.peek().kind == .integer) {
+                        seg.table_var = .{ .index = self.parseU32() catch 0 };
+                    }
+                    if (self.peek().kind == .r_paren) _ = self.advance();
+                } else if (has_elem_type) {
+                    // Post-type elem expressions (passive/declarative segment)
+                    if (inner_kind == .kw_item) {
+                        _ = self.advance(); // consume 'item'
+                    }
+                    self.parseInitExpr(&elem_expr_code);
+                    elem_expr_code.append(self.allocator, 0x0b) catch {}; // terminate expression
+                    elem_expr_count += 1;
                     try self.expect(.r_paren);
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
@@ -1621,6 +1693,9 @@ const Parser = struct {
             const owned = offset_code.toOwnedSlice(self.allocator) catch &.{};
             seg.offset_expr_bytes = owned;
             seg.owns_offset_expr_bytes = true;
+        } else if (has_elem_type and seg.kind != .declared) {
+            // funcref/externref without an offset → passive segment
+            seg.kind = .passive;
         }
 
         if (has_elem_type) {
