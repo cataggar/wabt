@@ -45,7 +45,32 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         module.name = p.advance().text;
     }
 
-    // Parse module fields
+    // Parse module fields — two passes:
+    // Pass 1: process only (type ...) declarations to build the type section first.
+    // This ensures explicit type indices are assigned before implicit function types.
+    const saved_pos = p.lexer.pos;
+    const saved_peeked = p.peeked;
+
+    while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
+        if (p.peek().kind == .annotation) {
+            _ = p.advance();
+            try p.skipAnnotation();
+            continue;
+        }
+        _ = p.advance(); // consume '('
+        const kw = p.advance();
+        switch (kw.kind) {
+            .kw_type => try p.parseType(&module),
+            .kw_rec => try p.parseRec(&module),
+            else => try p.skipSExpr(),
+        }
+        try p.expect(.r_paren);
+    }
+
+    // Pass 2: process all other declarations (skip type/rec which were already handled).
+    p.lexer.pos = saved_pos;
+    p.peeked = saved_peeked;
+
     while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
         // Skip annotations: (@id ...) — consume tokens until matching ')'
         if (p.peek().kind == .annotation) {
@@ -56,7 +81,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         _ = p.advance(); // consume '('
         const kw = p.advance();
         switch (kw.kind) {
-            .kw_type => try p.parseType(&module),
+            .kw_type, .kw_rec => try p.skipSExpr(), // already processed
             .kw_func => try p.parseFunc(&module),
             .kw_table => try p.parseTable(&module),
             .kw_memory => try p.parseMemory(&module),
@@ -66,7 +91,6 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_start => try p.parseStart(&module),
             .kw_elem => try p.parseElem(&module),
             .kw_data => try p.parseData(&module),
-            .kw_rec => try p.parseRec(&module),
             .kw_definition => try p.skipSExpr(),
             else => try p.skipSExpr(),
         }
