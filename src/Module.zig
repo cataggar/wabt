@@ -259,8 +259,6 @@ pub const ElemSegment = struct {
     owns_elem_expr_bytes: bool = false,
     /// Number of individual elem expressions encoded in elem_expr_bytes.
     elem_expr_count: u32 = 0,
-    /// Set by elem.drop instruction at runtime.
-    dropped: bool = false,
 };
 
 /// Data segment.
@@ -272,8 +270,6 @@ pub const DataSegment = struct {
     /// Raw bytecode for the offset expression (constant expr).
     offset_expr_bytes: []const u8 = &.{},
     owns_offset_expr_bytes: bool = false,
-    /// Set by data.drop instruction at runtime.
-    dropped: bool = false,
 };
 
 /// Custom section.

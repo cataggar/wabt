@@ -27,7 +27,6 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.type_names.deinit(allocator);
     defer p.local_names.deinit(allocator);
     defer p.global_names.deinit(allocator);
-    defer p.label_stack.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
@@ -168,9 +167,6 @@ const Parser = struct {
     local_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from global $name to index.
     global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
-    /// Stack of label $names for block/loop/if — most recent label at the end.
-    /// Index into the stack from the end gives the branch depth.
-    label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -525,28 +521,21 @@ const Parser = struct {
             .kw_block => {
                 _ = self.advance();
                 code.append(self.allocator, 0x02) catch return;
-                const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
                 self.parseFuncBodyInstrs(code);
                 code.append(self.allocator, 0x0b) catch return; // end
-                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen();
             },
             .kw_loop => {
                 _ = self.advance();
                 code.append(self.allocator, 0x03) catch return;
-                const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
                 self.parseFuncBodyInstrs(code);
                 code.append(self.allocator, 0x0b) catch return; // end
-                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen();
             },
             .kw_if => {
                 _ = self.advance();
-                const label = self.consumeOptionalLabel();
                 // Parse block type
                 var block_type_buf: [6]u8 = undefined;
                 const bt_len = self.readBlockType(&block_type_buf);
@@ -573,7 +562,6 @@ const Parser = struct {
                 // Now emit the if opcode
                 code.append(self.allocator, 0x04) catch return;
                 code.appendSlice(self.allocator, block_type_buf[0..bt_len]) catch return;
-                self.label_stack.append(self.allocator, label) catch {};
 
                 if (has_then) {
                     _ = self.advance(); // consume 'then'
@@ -596,7 +584,6 @@ const Parser = struct {
                     }
                 }
                 code.append(self.allocator, 0x0b) catch return; // end
-                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen(); // close (if ...)
             },
             else => {
@@ -647,27 +634,18 @@ const Parser = struct {
             .kw_nop => code.append(self.allocator, 0x01) catch return,
             .kw_block => {
                 code.append(self.allocator, 0x02) catch return;
-                const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_loop => {
                 code.append(self.allocator, 0x03) catch return;
-                const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_if => {
                 code.append(self.allocator, 0x04) catch return;
-                const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_else => code.append(self.allocator, 0x05) catch return,
-            .kw_end => {
-                code.append(self.allocator, 0x0b) catch return;
-                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
-            },
+            .kw_end => code.append(self.allocator, 0x0b) catch return,
             .kw_br => {
                 code.append(self.allocator, 0x0c) catch return;
                 self.emitU32Imm(code);

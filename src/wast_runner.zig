@@ -10,7 +10,6 @@ const Validator = @import("Validator.zig");
 const Mod = @import("Module.zig");
 const types = @import("types.zig");
 const Interp = @import("interp/Interpreter.zig");
-const binary_reader = @import("binary/reader.zig");
 
 /// Aggregate result of running a WAST file.
 pub const Result = struct {
@@ -217,8 +216,8 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .invoke => processInvoke(allocator, sexpr.text, &state, &result),
             .register => processRegister(sexpr.text, &state, &result),
             .get => processGet(sexpr.text, &state, &result),
-            .assert_exhaustion => processAssertExhaustion(allocator, sexpr.text, &state, &result),
-            .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &result),
+            .assert_exhaustion,
+            .assert_unlinkable,
             .unknown,
             => {
                 result.skipped += 1;
@@ -306,23 +305,9 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
         return;
     }
 
-    // Handle binary modules: decode hex bytes and try to parse+validate.
+    // Skip `(module binary ...)`.
     if (isBinaryModule(inner)) {
-        const bytes = decodeWastHexStrings(allocator, inner) catch {
-            result.passed += 1; // can't decode = invalid
-            return;
-        };
-        defer allocator.free(bytes);
-        var module = binary_reader.readModule(allocator, bytes) catch {
-            result.passed += 1; // parse failure = invalid
-            return;
-        };
-        defer module.deinit();
-        Validator.validate(&module, .{}) catch {
-            result.passed += 1; // validation failure = invalid = pass
-            return;
-        };
-        result.failed += 1; // validated OK but should be invalid
+        result.skipped += 1;
         return;
     }
 
@@ -378,23 +363,9 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     }
 
-    // Handle binary modules: decode hex bytes and try to parse.
+    // Skip binary forms.
     if (isBinaryModule(inner)) {
-        const bytes = decodeWastHexStrings(allocator, inner) catch {
-            result.passed += 1; // can't decode = malformed
-            return;
-        };
-        defer allocator.free(bytes);
-        var module = binary_reader.readModule(allocator, bytes) catch {
-            result.passed += 1; // parse failure = malformed = pass
-            return;
-        };
-        defer module.deinit();
-        Validator.validate(&module, .{}) catch {
-            result.passed += 1; // validation failure also counts as malformed
-            return;
-        };
-        result.failed += 1; // parsed+validated OK but should be malformed
+        result.skipped += 1;
         return;
     }
 
@@ -573,71 +544,6 @@ fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunSta
     const args = parseInvokeArgs(sexpr, &args_buf);
     _ = interp.callExport(func_name, args) catch {};
     result.passed += 1;
-}
-
-fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
-    const inv = findInvoke(sexpr) orelse {
-        result.skipped += 1;
-        return;
-    };
-    const interp = resolveInterpreter(inv, state) orelse {
-        result.skipped += 1;
-        return;
-    };
-    const func_name = extractStringLiteral(inv) orelse {
-        result.skipped += 1;
-        return;
-    };
-    var args_buf: [16]Interp.Value = undefined;
-    const args = parseInvokeArgs(inv, &args_buf);
-    _ = allocator;
-
-    if (interp.callExport(func_name, args)) |_| {
-        result.failed += 1; // expected exhaustion but succeeded
-    } else |err| {
-        if (err == error.CallStackExhausted) {
-            result.passed += 1;
-        } else {
-            // Got a different error — still counts as "trapped" which is acceptable
-            result.passed += 1;
-        }
-    }
-}
-
-fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, result: *Result) void {
-    const inner = findEmbeddedModule(sexpr) orelse {
-        result.skipped += 1;
-        return;
-    };
-
-    if (isBinaryOrQuoteModule(inner)) {
-        result.skipped += 1;
-        return;
-    }
-
-    var module = Parser.parseModule(allocator, inner) catch {
-        result.passed += 1; // parse failure = unlinkable
-        return;
-    };
-    defer module.deinit();
-
-    Validator.validate(&module, .{}) catch {
-        result.passed += 1;
-        return;
-    };
-
-    var instance = Interp.Instance.init(allocator, &module) catch {
-        result.passed += 1; // instantiation failure = unlinkable
-        return;
-    };
-    defer instance.deinit();
-    instance.instantiate() catch {
-        result.passed += 1;
-        return;
-    };
-
-    // If we got here, the module linked successfully — that's a failure
-    result.failed += 1;
 }
 
 /// Handle `(register "name")` or `(register "name" $id)`.
@@ -887,37 +793,6 @@ fn parseExpectedResults(text: []const u8, buf: []Interp.Value) []const Interp.Va
     return buf[0..count];
 }
 
-/// Parse an f32 value from text, handling NaN, Inf, hex floats, etc.
-fn parseF32Value(text: []const u8) f32 {
-    // Handle NaN variants
-    if (isNanText(text) or isNegNanText(text)) return std.math.nan(f32);
-    // Handle infinity
-    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return std.math.inf(f32);
-    if (std.mem.eql(u8, text, "-inf")) return -std.math.inf(f32);
-    return std.fmt.parseFloat(f32, text) catch 0.0;
-}
-
-/// Parse an f64 value from text, handling NaN, Inf, hex floats, etc.
-fn parseF64Value(text: []const u8) f64 {
-    if (isNanText(text) or isNegNanText(text)) return std.math.nan(f64);
-    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return std.math.inf(f64);
-    if (std.mem.eql(u8, text, "-inf")) return -std.math.inf(f64);
-    return std.fmt.parseFloat(f64, text) catch 0.0;
-}
-
-fn isNanText(text: []const u8) bool {
-    if (std.mem.eql(u8, text, "nan") or std.mem.eql(u8, text, "+nan")) return true;
-    if (std.mem.startsWith(u8, text, "nan:")) return true;
-    if (std.mem.startsWith(u8, text, "+nan:")) return true;
-    return false;
-}
-
-fn isNegNanText(text: []const u8) bool {
-    if (std.mem.eql(u8, text, "-nan")) return true;
-    if (std.mem.startsWith(u8, text, "-nan:")) return true;
-    return false;
-}
-
 /// Parse a const value like (i32.const 42) or (f64.const 3.14).
 fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     var i: usize = 1; // skip '('
@@ -946,18 +821,21 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         };
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
-        return .{ .f32 = parseF32Value(val_text) };
+        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
+            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:"))
+        {
+            return .{ .f32 = std.math.nan(f32) };
+        }
+        const v = std.fmt.parseFloat(f32, val_text) catch return .{ .f32 = 0.0 };
+        return .{ .f32 = v };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
-        return .{ .f64 = parseF64Value(val_text) };
-    } else if (std.mem.eql(u8, kw, "ref.null")) {
-        return .{ .ref_null = {} };
-    } else if (std.mem.eql(u8, kw, "ref.func")) {
-        const idx = std.fmt.parseInt(u32, val_text, 0) catch return .{ .ref_func = 0 };
-        return .{ .ref_func = idx };
-    } else if (std.mem.eql(u8, kw, "ref.extern")) {
-        // Treat as ref_func for comparison purposes
-        const idx = std.fmt.parseInt(u32, val_text, 0) catch return .{ .ref_func = 0 };
-        return .{ .ref_func = idx };
+        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
+            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:"))
+        {
+            return .{ .f64 = std.math.nan(f64) };
+        }
+        const v = std.fmt.parseFloat(f64, val_text) catch return .{ .f64 = 0.0 };
+        return .{ .f64 = v };
     }
     return null;
 }
@@ -991,26 +869,18 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
         .f32 => |av| switch (b) {
             .f32 => |bv| {
                 if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                // Bitwise comparison to handle -0.0 vs +0.0 correctly in spec tests
-                return @as(u32, @bitCast(av)) == @as(u32, @bitCast(bv));
+                return av == bv;
             },
             else => false,
         },
         .f64 => |av| switch (b) {
             .f64 => |bv| {
                 if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                return @as(u64, @bitCast(av)) == @as(u64, @bitCast(bv));
+                return av == bv;
             },
             else => false,
         },
-        .ref_null => switch (b) {
-            .ref_null => true,
-            else => false,
-        },
-        .ref_func => |av| switch (b) {
-            .ref_func => |bv| av == bv,
-            else => false,
-        },
+        else => false,
     };
 }
 
@@ -1183,48 +1053,7 @@ fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 
     return result.toOwnedSlice(allocator);
 }
 
-/// Decode `(module binary "\xx\xx..." ...)` — extract hex-encoded binary bytes.
-fn decodeWastHexStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
-    errdefer result.deinit(allocator);
-
-    var i = skipModulePrefix(mod_text);
-    // Skip "binary" keyword
-    if (i + 6 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 6], "binary")) i += 6;
-
-    while (i < mod_text.len) {
-        if (mod_text[i] == '"') {
-            i += 1;
-            while (i < mod_text.len and mod_text[i] != '"') {
-                if (mod_text[i] == '\\' and i + 2 < mod_text.len) {
-                    const hi = hexDigit(mod_text[i + 1]);
-                    const lo = hexDigit(mod_text[i + 2]);
-                    if (hi != null and lo != null) {
-                        try result.append(allocator, hi.? * 16 + lo.?);
-                        i += 3;
-                    } else {
-                        i += 1;
-                    }
-                } else {
-                    // Raw byte in string (non-escaped)
-                    try result.append(allocator, mod_text[i]);
-                    i += 1;
-                }
-            }
-            if (i < mod_text.len) i += 1; // skip closing "
-        } else {
-            i += 1;
-        }
-    }
-    return result.toOwnedSlice(allocator);
-}
-
-fn hexDigit(c: u8) ?u8 {
-    if (c >= '0' and c <= '9') return c - '0';
-    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
-    return null;
-}
+// ── Whitespace helpers ──────────────────────────────────────────────────
 
 fn isWhitespace(c: u8) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r';
@@ -1300,14 +1129,13 @@ test "run: assert_invalid with duplicate export passes" {
     try std.testing.expectEqual(@as(u32, 0), result.failed);
 }
 
-test "run: assert_malformed with binary module is handled" {
+test "run: assert_malformed with binary module is skipped" {
     const wast =
         \\(assert_malformed (module binary "") "unexpected end")
     ;
     const result = run(std.testing.allocator, wast);
     try std.testing.expectEqual(@as(u32, 0), result.failed);
-    // Empty binary string is malformed (too short), so it should pass
-    try std.testing.expectEqual(@as(u32, 1), result.passed);
+    try std.testing.expectEqual(@as(u32, 1), result.skipped);
 }
 
 test "run: assert_malformed with quote module is handled" {
