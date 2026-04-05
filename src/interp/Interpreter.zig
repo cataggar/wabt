@@ -81,6 +81,10 @@ pub const Instance = struct {
     /// Back-reference to the owning interpreter (set after creation).
     interp_ref: ?*Interpreter = null,
 
+    /// Interpreter refs for imported funcref globals.
+    /// Maps global index to the interpreter that owns the referenced function.
+    global_func_interps: std.ArrayListUnmanaged(?*Interpreter) = .{},
+
     /// Get the active memory (shared or local).
     pub fn getMemory(self: *Instance) *std.ArrayListUnmanaged(u8) {
         return self.shared_memory orelse &self.memory;
@@ -173,6 +177,7 @@ pub const Instance = struct {
         for (self.tables.items) |*t| t.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.table_func_refs.deinit(self.allocator);
+        self.global_func_interps.deinit(self.allocator);
         self.dropped_data.deinit(self.allocator);
         self.dropped_elems.deinit(self.allocator);
     }
@@ -230,17 +235,34 @@ pub const Instance = struct {
                 }
             }
 
+            // Bounds check for empty elem segments (offset must be ≤ table.size)
+            const elem_count = @max(seg.elem_var_indices.items.len, @as(usize, seg.elem_expr_count));
+            if (offset + elem_count > tbl.items.len) {
+                return error.OutOfBoundsTableAccess;
+            }
+            if (offset > tbl.items.len) {
+                return error.OutOfBoundsTableAccess;
+            }
+
             // Try elem expressions first (funcref expressions like ref.func, global.get)
             if (seg.elem_expr_count > 0 and seg.elem_expr_bytes.len > 0) {
-                if (offset + seg.elem_expr_count > tbl.items.len) {
-                    return error.OutOfBoundsTableAccess;
-                }
                 var expr_pc: usize = 0;
                 var expr_i: u32 = 0;
                 while (expr_i < seg.elem_expr_count) : (expr_i += 1) {
                     const entry_idx: u32 = @intCast(offset + expr_i);
-                    // Evaluate one const expression (terminated by 0x0b)
                     const expr_start = expr_pc;
+                    // Detect if expression is global.get (0x23) for funcref source tracking
+                    var source_interp: ?*Interpreter = self.interp_ref;
+                    if (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] == 0x23) {
+                        // global.get — check if it references an imported funcref global
+                        var tmp = expr_pc + 1;
+                        const gidx = readCodeU32(seg.elem_expr_bytes, &tmp);
+                        if (gidx < self.global_func_interps.items.len) {
+                            if (self.global_func_interps.items[gidx]) |gi| {
+                                source_interp = gi;
+                            }
+                        }
+                    }
                     // Find the end of this expression
                     while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) {
                         expr_pc += 1;
@@ -250,7 +272,7 @@ pub const Instance = struct {
                     if (val) |v| switch (v) {
                         .ref_func => |func_idx| {
                             tbl.items[entry_idx] = func_idx;
-                            if (self.interp_ref) |interp| {
+                            if (source_interp) |interp| {
                                 const refs = self.getTableFuncRefs();
                                 refs.put(self.allocator, makeTableKey(tbl_idx, entry_idx), interp) catch {};
                             }
@@ -262,9 +284,6 @@ pub const Instance = struct {
                     };
                 }
             } else if (seg.elem_var_indices.items.len > 0) {
-                if (offset + seg.elem_var_indices.items.len > tbl.items.len) {
-                    return error.OutOfBoundsTableAccess;
-                }
                 for (seg.elem_var_indices.items, 0..) |var_, j| {
                     const table_entry = offset + j;
                     switch (var_) {
@@ -277,6 +296,15 @@ pub const Instance = struct {
                         },
                         .name => {},
                     }
+                }
+            }
+        }
+
+        // Implicitly drop active and declarative elem segments (per spec)
+        for (self.module.elem_segments.items, 0..) |seg, seg_i| {
+            if (seg.kind == .active or seg.kind == .declared) {
+                if (seg_i < self.dropped_elems.capacity()) {
+                    self.dropped_elems.set(seg_i);
                 }
             }
         }
@@ -1698,13 +1726,50 @@ pub const Interpreter = struct {
         const dropped = elem_idx < self.instance.dropped_elems.capacity() and
             self.instance.dropped_elems.isSet(elem_idx);
         const seg = &self.instance.module.elem_segments.items[elem_idx];
-        const seg_len: u32 = if (dropped) 0 else @intCast(seg.elem_var_indices.items.len);
+        // Use the larger of var_indices count and expr count for segment length
+        const var_len: u32 = @intCast(seg.elem_var_indices.items.len);
+        const expr_len: u32 = seg.elem_expr_count;
+        const seg_len: u32 = if (dropped) 0 else @max(var_len, expr_len);
         const tbl = self.instance.getTable(tbl_idx);
         if (@as(u64, src) + n > seg_len or
             @as(u64, dst) + n > tbl.items.len)
             return error.OutOfBoundsTableAccess;
         if (n == 0) return;
         const refs = self.instance.getTableFuncRefs();
+
+        // If elem segment uses expressions (funcref/externref), evaluate them
+        if (var_len == 0 and expr_len > 0 and seg.elem_expr_bytes.len > 0) {
+            // Navigate to the src-th expression
+            var expr_pc: usize = 0;
+            var skip: u32 = 0;
+            while (skip < src and expr_pc < seg.elem_expr_bytes.len) : (skip += 1) {
+                while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) {
+                    expr_pc += 1;
+                }
+                if (expr_pc < seg.elem_expr_bytes.len) expr_pc += 1;
+            }
+            var i: u32 = 0;
+            while (i < n) : (i += 1) {
+                const expr_start = expr_pc;
+                while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) {
+                    expr_pc += 1;
+                }
+                if (expr_pc < seg.elem_expr_bytes.len) expr_pc += 1;
+                const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start..expr_pc]);
+                if (val) |v| switch (v) {
+                    .ref_func => |func_idx| {
+                        tbl.items[dst + i] = func_idx;
+                        refs.put(self.allocator, Instance.makeTableKey(tbl_idx, dst + i), self) catch {};
+                    },
+                    .ref_null => {
+                        tbl.items[dst + i] = null;
+                    },
+                    else => {},
+                };
+            }
+            return;
+        }
+
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const var_entry = seg.elem_var_indices.items[src + i];
