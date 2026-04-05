@@ -1107,7 +1107,7 @@ const Parser = struct {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_type) {
                 _ = self.advance();
-                if (self.parseU32()) |idx| {
+                if (self.parseTypeIdx()) |idx| {
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     const n = leb128.writeS32Leb128(buf, @bitCast(idx));
                     return n;
@@ -1147,6 +1147,10 @@ const Parser = struct {
                 return;
             }
             if (self.table_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            if (self.memory_names.get(tok.text)) |idx| {
                 self.emitLeb128U32(code, idx);
                 return;
             }
@@ -1591,10 +1595,13 @@ const Parser = struct {
     }
 
     fn parseMemory(self: *Parser, module: *Mod.Module) ParseError!void {
-        if (self.peek().kind == .identifier) _ = self.advance();
+        const mem_idx: u32 = @intCast(module.memories.items.len);
+        if (self.peek().kind == .identifier) {
+            const name = self.advance().text;
+            self.memory_names.put(self.allocator, name, mem_idx) catch {};
+        }
 
         // Handle inline (export "name") declarations
-        const mem_idx: u32 = @intCast(module.memories.items.len);
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;

@@ -151,6 +151,22 @@ const RunState = struct {
         // Resolve function imports against registered modules.
         self.resolveImports(mod, interp);
 
+        // Execute the start function if present.
+        if (mod.start_var) |sv| {
+            const start_idx: u32 = switch (sv) {
+                .index => |i| i,
+                .name => blk: {
+                    for (mod.funcs.items, 0..) |f, i| {
+                        if (f.name) |n| {
+                            if (std.mem.eql(u8, n, sv.name)) break :blk @as(u32, @intCast(i));
+                        }
+                    }
+                    break :blk 0;
+                },
+            };
+            interp.callFunc(start_idx, &.{}) catch {};
+        }
+
         self.module = mod;
         self.instance = inst;
         self.interpreter = interp;
