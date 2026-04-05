@@ -329,9 +329,6 @@ fn classifyNumber(text: []const u8) TokenKind {
     if (std.mem.eql(u8, base, "inf")) return .float;
     if (std.mem.startsWith(u8, base, "nan")) return .float;
 
-    // Validate WAT number format (reject 0x, 1x, 0e, 0e+, 0x0pA, etc.)
-    if (!validateWatNumber(text)) return .invalid;
-
     // Check if this is a hex number (0x prefix)
     const is_hex = (base.len > 2 and base[0] == '0' and (base[1] == 'x' or base[1] == 'X'));
 
@@ -347,118 +344,6 @@ fn classifyNumber(text: []const u8) TokenKind {
         }
     }
     return .integer;
-}
-
-/// Validate WAT number literal format per the spec grammar.
-/// Rejects malformed patterns: 0x, 1x, 0e, 0e+, 0x0pA, trailing _, etc.
-fn validateWatNumber(text: []const u8) bool {
-    var pos: usize = 0;
-
-    // Skip sign
-    if (pos < text.len and (text[pos] == '+' or text[pos] == '-')) pos += 1;
-    if (pos >= text.len) return false;
-
-    // Must start with a decimal digit
-    if (!isDecDigit(text[pos])) return false;
-
-    // Hex path: 0x...
-    if (pos + 1 < text.len and text[pos] == '0' and (text[pos + 1] == 'x' or text[pos + 1] == 'X')) {
-        pos += 2;
-        var has_int = false;
-        var has_frac = false;
-
-        // Integer hex digits
-        const int_r = skipWatDigitSeq(text, pos, true);
-        if (int_r.err) return false;
-        has_int = int_r.pos > pos;
-        pos = int_r.pos;
-
-        // Optional fractional part
-        if (pos < text.len and text[pos] == '.') {
-            pos += 1;
-            const frac_r = skipWatDigitSeq(text, pos, true);
-            if (frac_r.err) return false;
-            has_frac = frac_r.pos > pos;
-            pos = frac_r.pos;
-        }
-
-        if (!has_int and !has_frac) return false;
-
-        // Optional p-exponent (must use decimal digits)
-        if (pos < text.len and (text[pos] == 'p' or text[pos] == 'P')) {
-            pos += 1;
-            if (pos < text.len and (text[pos] == '+' or text[pos] == '-')) pos += 1;
-            const exp_start = pos;
-            const exp_r = skipWatDigitSeq(text, pos, false);
-            if (exp_r.err) return false;
-            if (exp_r.pos == exp_start) return false; // empty exponent
-            pos = exp_r.pos;
-        }
-
-        return pos == text.len;
-    }
-
-    // Decimal path
-    const int_r = skipWatDigitSeq(text, pos, false);
-    if (int_r.err) return false;
-    pos = int_r.pos;
-
-    // Optional fractional part
-    if (pos < text.len and text[pos] == '.') {
-        pos += 1;
-        const frac_r = skipWatDigitSeq(text, pos, false);
-        if (frac_r.err) return false;
-        pos = frac_r.pos;
-    }
-
-    // Optional e-exponent
-    if (pos < text.len and (text[pos] == 'e' or text[pos] == 'E')) {
-        pos += 1;
-        if (pos < text.len and (text[pos] == '+' or text[pos] == '-')) pos += 1;
-        const exp_start = pos;
-        const exp_r = skipWatDigitSeq(text, pos, false);
-        if (exp_r.err) return false;
-        if (exp_r.pos == exp_start) return false; // empty exponent
-        pos = exp_r.pos;
-    }
-
-    return pos == text.len;
-}
-
-const SkipResult = struct { pos: usize, err: bool };
-
-/// Skip a WAT digit sequence: digit ('_'? digit)*
-/// Returns the position after the sequence and whether an underscore error was found.
-fn skipWatDigitSeq(text: []const u8, start: usize, hex: bool) SkipResult {
-    var pos = start;
-    if (pos >= text.len) return .{ .pos = pos, .err = false };
-
-    // Must start with a digit
-    if (!(if (hex) isHexDigit(text[pos]) else isDecDigit(text[pos])))
-        return .{ .pos = pos, .err = false };
-    pos += 1;
-
-    while (pos < text.len) {
-        if (text[pos] == '_') {
-            if (pos + 1 >= text.len) return .{ .pos = pos, .err = true };
-            if (!(if (hex) isHexDigit(text[pos + 1]) else isDecDigit(text[pos + 1])))
-                return .{ .pos = pos, .err = true };
-            pos += 2;
-        } else if (if (hex) isHexDigit(text[pos]) else isDecDigit(text[pos])) {
-            pos += 1;
-        } else {
-            break;
-        }
-    }
-    return .{ .pos = pos, .err = false };
-}
-
-fn isDecDigit(c: u8) bool {
-    return c >= '0' and c <= '9';
-}
-
-fn isHexDigit(c: u8) bool {
-    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
 }
 
 fn matchKeyword(text: []const u8) TokenKind {
