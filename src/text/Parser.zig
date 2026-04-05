@@ -702,12 +702,18 @@ const Parser = struct {
             },
             .kw_br_table => {
                 code.append(self.allocator, 0x0e) catch return;
-                // Collect all integer targets
+                // Collect all targets (integer depths or $label identifiers)
                 var targets: std.ArrayListUnmanaged(u32) = .{};
                 defer targets.deinit(self.allocator);
-                while (self.peek().kind == .integer) {
-                    const idx = self.parseU32() catch break;
-                    targets.append(self.allocator, idx) catch return;
+                while (self.peek().kind == .integer or self.peek().kind == .identifier) {
+                    if (self.peek().kind == .integer) {
+                        const idx = self.parseU32() catch break;
+                        targets.append(self.allocator, idx) catch return;
+                    } else {
+                        const label_tok = self.advance();
+                        const depth = self.resolveLabelDepth(label_tok.text) orelse 0;
+                        targets.append(self.allocator, depth) catch return;
+                    }
                 }
                 if (targets.items.len == 0) {
                     // Malformed, emit 0 targets with default 0
@@ -893,55 +899,92 @@ const Parser = struct {
     }
 
     fn readBlockType(self: *Parser, buf: *[6]u8) usize {
-        // Check for (result <valtype>+) or (param ...) (result ...)
-        if (self.peek().kind == .l_paren) {
+        // Check for (param ...) (result ...), (result <valtype>+), or bare (param ...)
+        var param_count: u32 = 0;
+        var param_types_buf: [16]types.ValType = undefined;
+        var result_count: u32 = 0;
+        var result_types_buf: [16]types.ValType = undefined;
+
+        // Consume all (param ...) blocks
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_param) {
+                _ = self.advance(); // consume 'param'
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    if (self.parseValType()) |vt| {
+                        if (param_count < 16) param_types_buf[param_count] = vt;
+                        param_count += 1;
+                    } else |_| {
+                        _ = self.advance();
+                        param_count += 1;
+                    }
+                }
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+
+        // Consume all (result ...) blocks
+        while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_result) {
                 _ = self.advance(); // consume 'result'
-                // Collect result types
-                var count: u32 = 0;
-                var result_types_buf: [16]types.ValType = undefined;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.parseValType()) |vt| {
-                        if (count < 16) result_types_buf[count] = vt;
-                        count += 1;
+                        if (result_count < 16) result_types_buf[result_count] = vt;
+                        result_count += 1;
                     } else |_| {
-                        _ = self.advance(); // skip unrecognized token
-                        count += 1;
+                        _ = self.advance();
+                        result_count += 1;
                     }
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
-
-                if (count == 1) {
-                    const raw: u32 = @bitCast(@intFromEnum(result_types_buf[0]));
-                    buf[0] = @truncate(raw);
-                    return 1;
-                }
-                if (count > 1 and count <= 16) {
-                    if (self.module) |mod| {
-                        const r = self.allocator.alloc(types.ValType, count) catch {
-                            buf[0] = 0x40;
-                            return 1;
-                        };
-                        @memcpy(r, result_types_buf[0..count]);
-                        const type_idx: u32 = @intCast(mod.module_types.items.len);
-                        mod.module_types.append(self.allocator, .{
-                            .func_type = .{ .params = &.{}, .results = r },
-                        }) catch {
-                            buf[0] = 0x40;
-                            return 1;
-                        };
-                        return leb128.writeS32Leb128(buf, @bitCast(type_idx));
-                    }
-                }
-                buf[0] = 0x40;
-                return 1;
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
+                break;
             }
+        }
+
+        // No block type annotations found
+        if (param_count == 0 and result_count == 0) {
+            // Fall through to check for (type N) below
+        } else if (param_count == 0 and result_count == 1) {
+            // Simple single-result block type: emit valtype byte
+            const raw: u32 = @bitCast(@intFromEnum(result_types_buf[0]));
+            buf[0] = @truncate(raw);
+            return 1;
+        } else {
+            // Multi-value: create a func type entry and emit type index
+            if (self.module) |mod| {
+                const p = self.allocator.alloc(types.ValType, param_count) catch {
+                    buf[0] = 0x40;
+                    return 1;
+                };
+                @memcpy(p, param_types_buf[0..param_count]);
+                const r = self.allocator.alloc(types.ValType, result_count) catch {
+                    buf[0] = 0x40;
+                    return 1;
+                };
+                @memcpy(r, result_types_buf[0..result_count]);
+                const type_idx: u32 = @intCast(mod.module_types.items.len);
+                mod.module_types.append(self.allocator, .{
+                    .func_type = .{ .params = p, .results = r },
+                }) catch {
+                    buf[0] = 0x40;
+                    return 1;
+                };
+                return leb128.writeS32Leb128(buf, @bitCast(type_idx));
+            }
+            buf[0] = 0x40;
+            return 1;
         }
         // Check for bare type use: (type N)
         if (self.peek().kind == .l_paren) {
@@ -1324,7 +1367,28 @@ const Parser = struct {
                 if (self.peek().kind == .kw_elem) {
                     _ = self.advance();
                     while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                        if (self.peek().kind == .identifier) {
+                        if (self.peek().kind == .l_paren) {
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_ref_func) {
+                                _ = self.advance();
+                                if (self.peek().kind == .identifier) {
+                                    const tok = self.advance();
+                                    const idx = self.func_names.get(tok.text) orelse 0;
+                                    elem_indices.append(self.allocator, .{ .index = idx }) catch {};
+                                } else if (self.peek().kind == .integer) {
+                                    const idx = self.parseU32() catch 0;
+                                    elem_indices.append(self.allocator, .{ .index = idx }) catch {};
+                                }
+                            } else if (self.peek().kind == .kw_ref_null) {
+                                _ = self.advance();
+                                if (self.peek().kind != .r_paren and self.peek().kind != .eof)
+                                    _ = self.advance();
+                                elem_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                            } else {
+                                try self.skipSExpr();
+                            }
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                        } else if (self.peek().kind == .identifier) {
                             const tok = self.advance();
                             if (self.func_names.get(tok.text)) |idx| {
                                 elem_indices.append(self.allocator, .{ .index = idx }) catch {};
@@ -1719,9 +1783,23 @@ const Parser = struct {
                     if (inner_kind == .kw_item) {
                         _ = self.advance(); // consume 'item'
                     }
+                    const expr_start = elem_expr_code.items.len;
                     self.parseInitExpr(&elem_expr_code);
-                    elem_expr_code.append(self.allocator, 0x0b) catch {}; // terminate expression
+                    elem_expr_code.append(self.allocator, 0x0b) catch {};
                     elem_expr_count += 1;
+                    // Extract func index from emitted bytecode for elem_var_indices
+                    const expr_bytes = elem_expr_code.items[expr_start .. elem_expr_code.items.len - 1];
+                    if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
+                        if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                        } else |_| {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                        }
+                    } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
+                        seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                    } else {
+                        seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                    }
                     try self.expect(.r_paren);
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
@@ -1734,9 +1812,22 @@ const Parser = struct {
                     if (inner_kind == .kw_item) {
                         _ = self.advance(); // consume 'item'
                     }
+                    const expr_start2 = elem_expr_code.items.len;
                     self.parseInitExpr(&elem_expr_code);
-                    elem_expr_code.append(self.allocator, 0x0b) catch {}; // terminate expression
+                    elem_expr_code.append(self.allocator, 0x0b) catch {};
                     elem_expr_count += 1;
+                    const expr_bytes2 = elem_expr_code.items[expr_start2 .. elem_expr_code.items.len - 1];
+                    if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd2) {
+                        if (leb128.readU32Leb128(expr_bytes2[1..])) |r| {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                        } else |_| {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                        }
+                    } else if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd0) {
+                        seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                    } else {
+                        seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                    }
                     try self.expect(.r_paren);
                 } else {
                     // Post-offset without explicit type: skip
