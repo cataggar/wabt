@@ -287,6 +287,9 @@ const RunState = struct {
         if (mod.num_global_imports > 0) {
             interp.global_links.resize(self.allocator, mod.globals.items.len) catch return;
             @memset(interp.global_links.items, null);
+            // Allocate global_func_interps for funcref global tracking
+            interp.instance.global_func_interps.resize(self.allocator, mod.globals.items.len) catch {};
+            @memset(interp.instance.global_func_interps.items, null);
         }
 
         var func_import_idx: u32 = 0;
@@ -328,6 +331,13 @@ const RunState = struct {
                             .instance = triple.instance,
                             .global_idx = src_idx,
                         };
+                    }
+                    // Track funcref source interpreter for cross-module elem init
+                    const val = triple.instance.globals.items[src_idx];
+                    if (val == .ref_func) {
+                        if (global_import_idx < interp.instance.global_func_interps.items.len) {
+                            interp.instance.global_func_interps.items[global_import_idx] = triple.interpreter;
+                        }
                     }
                 }
             } else if (imp.kind == .memory) {
@@ -1169,8 +1179,6 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, stat
         };
         // Everything succeeded — unexpected for assert_unlinkable.
         result.failed += 1;
-        const mod_text = findEmbeddedModule(sexpr) orelse sexpr;
-        std.debug.print("  FAIL assert_unlinkable: module linked OK: {s}\n", .{mod_text[0..@min(200, mod_text.len)]});
     } else {
         // Imports couldn't be resolved — this is the expected unlinkable behavior
         result.passed += 1;
