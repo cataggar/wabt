@@ -1029,9 +1029,30 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         };
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
+        // WAST-specific NaN categories
+        if (std.mem.eql(u8, val_text, "nan:canonical") or std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
+        {
+            return .{ .f32 = @bitCast(nan_canonical_f32) };
+        }
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+        {
+            return .{ .f32 = @bitCast(nan_arithmetic_f32) };
+        }
         const bits = Parser.parseFloatBits(f32, val_text);
         return .{ .f32 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
+        if (std.mem.eql(u8, val_text, "nan:canonical") or std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
+        {
+            return .{ .f64 = @bitCast(nan_canonical_f64) };
+        }
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+        {
+            return .{ .f64 = @bitCast(nan_arithmetic_f64) };
+        }
         const bits = Parser.parseFloatBits(f64, val_text);
         return .{ .f64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "ref.null")) {
