@@ -1687,11 +1687,11 @@ const Parser = struct {
         while (self.peek().kind == .string) {
             const tok = self.advance();
             const stripped = stripQuotes(tok.text);
-            const decoded = decodeWatString(self.allocator, stripped);
-            data_parts.appendSlice(self.allocator, decoded) catch {};
+            decodeWatStringInto(stripped, &data_parts, self.allocator);
         }
         if (data_parts.items.len > 0) {
             seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
+            seg.owns_data = true;
         }
 
         try module.data_segments.append(self.allocator, seg);

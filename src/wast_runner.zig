@@ -142,6 +142,9 @@ const RunState = struct {
         };
         interp.* = Interp.Interpreter.init(self.allocator, inst);
 
+        // Resolve function imports against registered modules.
+        self.resolveImports(mod, interp);
+
         self.module = mod;
         self.instance = inst;
         self.interpreter = interp;
@@ -176,6 +179,34 @@ const RunState = struct {
     fn getNamedInterpreter(self: *RunState, id: []const u8) ?*Interp.Interpreter {
         if (self.named_modules.get(id)) |triple| return triple.interpreter;
         return null;
+    }
+
+    /// Resolve function imports by linking them to exports in registered modules.
+    fn resolveImports(self: *RunState, mod: *Mod.Module, interp: *Interp.Interpreter) void {
+        if (mod.num_func_imports == 0) return;
+        interp.import_links.resize(self.allocator, mod.num_func_imports) catch return;
+        @memset(interp.import_links.items, null);
+
+        var func_import_idx: u32 = 0;
+        for (mod.imports.items) |imp| {
+            if (imp.kind != .func) continue;
+            if (func_import_idx >= mod.num_func_imports) break;
+            defer func_import_idx += 1;
+
+            // Look up the source module by module_name in registered modules.
+            const triple = self.registered_modules.get(imp.module_name) orelse continue;
+            // Find the export by field_name in the source module.
+            const exp = triple.module.getExport(imp.field_name) orelse continue;
+            if (exp.kind != .func) continue;
+            const src_idx: u32 = switch (exp.var_) {
+                .index => |i| i,
+                .name => continue,
+            };
+            interp.import_links.items[func_import_idx] = .{
+                .interpreter = triple.interpreter,
+                .func_idx = src_idx,
+            };
+        }
     }
 };
 
