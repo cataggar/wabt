@@ -260,9 +260,9 @@ const RunState = struct {
         return null;
     }
 
-    /// Resolve function and global imports by linking them to exports in registered modules.
+    /// Resolve function, global, memory, and table imports by linking to registered modules.
     fn resolveImports(self: *RunState, mod: *Mod.Module, interp: *Interp.Interpreter) void {
-        if (mod.num_func_imports == 0 and mod.num_global_imports == 0) return;
+        if (mod.imports.items.len == 0) return;
 
         if (mod.num_func_imports > 0) {
             interp.import_links.resize(self.allocator, mod.num_func_imports) catch return;
@@ -301,6 +301,34 @@ const RunState = struct {
                     global_import_idx < interp.instance.globals.items.len)
                 {
                     interp.instance.globals.items[global_import_idx] = triple.instance.globals.items[src_idx];
+                }
+            } else if (imp.kind == .memory) {
+                // Share memory from exporting module
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .memory) continue;
+                // Copy the exporter's memory data into this instance
+                if (triple.instance.memory.items.len > 0) {
+                    interp.instance.memory.resize(self.allocator, triple.instance.memory.items.len) catch continue;
+                    @memcpy(interp.instance.memory.items, triple.instance.memory.items);
+                }
+            } else if (imp.kind == .table) {
+                // Share table from exporting module
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .table) continue;
+                const src_tbl_idx: u32 = switch (exp.var_) {
+                    .index => |i| i,
+                    .name => continue,
+                };
+                if (src_tbl_idx < triple.instance.tables.items.len) {
+                    const src_tbl = &triple.instance.tables.items[src_tbl_idx];
+                    // Copy table entries
+                    if (interp.instance.tables.items.len > 0) {
+                        const dst_tbl = &interp.instance.tables.items[0];
+                        dst_tbl.resize(self.allocator, src_tbl.items.len) catch continue;
+                        @memcpy(dst_tbl.items, src_tbl.items);
+                    }
                 }
             }
         }
