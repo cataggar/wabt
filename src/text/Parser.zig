@@ -1191,6 +1191,10 @@ const Parser = struct {
             .invalid => {
                 self.malformed = true;
             },
+            .kw_param, .kw_result, .kw_local => {
+                // param/result/local in function body means ordering error
+                self.malformed = true;
+            },
             else => {},
         }
     }
@@ -2050,7 +2054,14 @@ const Parser = struct {
         switch (kind_tok.kind) {
             .kw_func => {
                 import.kind = .func;
-                if (self.peek().kind == .identifier) _ = self.advance();
+                const import_func_idx: u32 = @intCast(module.funcs.items.len);
+                if (self.peek().kind == .identifier) {
+                    const fname = self.advance().text;
+                    if (self.func_names.getOrPut(self.allocator, fname)) |gop| {
+                        if (gop.found_existing and gop.value_ptr.* != import_func_idx) self.malformed = true;
+                        gop.value_ptr.* = import_func_idx;
+                    } else |_| {}
+                }
                 var type_index: types.Index = 0;
                 if (self.peek().kind == .l_paren) {
                     _ = self.advance();
