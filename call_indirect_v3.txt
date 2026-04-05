@@ -1,0 +1,7 @@
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32)   (call_indirect (type $sig) (result i3"
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32)   (call_indirect (param i32) (type $sig"
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32)   (call_indirect (param i32) (result i3"
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32)   (call_indirect (result i32) (type $si"
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type $sig (func (param i32) (result i32))) (table 0 funcref) (func (result i32)   (call_indirect (result i32) (param i3"
+  FAIL assert_invalid: validation should have failed: module[0..120]="(module (table funcref (elem 0 0)))"
+third_party\testsuite\call_indirect.wast: 166 passed, 6 failed, 0 skipped (172 total)

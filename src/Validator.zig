@@ -362,10 +362,42 @@ fn maxAlignmentForOpcode(opcode: u8) ?u32 {
 // ── Function body validation ────────────────────────────────────────────
 
 fn checkFunctionBodies(m: *const Mod.Module) Error!void {
+    // Build set of "declared" function indices for ref.func validation.
+    // A function is declared if it appears in an element segment or is exported.
+    var declared = std.AutoHashMapUnmanaged(u32, void){};
+    defer declared.deinit(gpa(m));
+    for (m.elem_segments.items) |seg| {
+        for (seg.elem_var_indices.items) |v| {
+            declared.put(gpa(m), v.index, {}) catch {};
+        }
+        // Also scan elem_expr_bytes for ref.func instructions
+        if (seg.elem_expr_count > 0) {
+            var epos: usize = 0;
+            while (epos < seg.elem_expr_bytes.len) {
+                const op = seg.elem_expr_bytes[epos];
+                epos += 1;
+                if (op == 0xd2) { // ref.func
+                    const r = leb128.readU32Leb128(seg.elem_expr_bytes[epos..]) catch break;
+                    epos += r.bytes_read;
+                    declared.put(gpa(m), r.value, {}) catch {};
+                } else if (op == 0xd0) { // ref.null
+                    if (epos < seg.elem_expr_bytes.len) epos += 1;
+                } else if (op == 0x0b) { // end
+                    continue;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    for (m.exports.items) |exp| {
+        if (exp.kind == .func) declared.put(gpa(m), exp.var_.index, {}) catch {};
+    }
+
     for (m.funcs.items) |func| {
         if (func.is_import) continue;
         if (func.code_bytes.len == 0) continue;
-        try checkOneBody(m, &func);
+        try checkOneBody(m, &func, &declared);
     }
 }
 
@@ -420,7 +452,7 @@ const CtrlFrame = struct {
     else_seen: bool,
 };
 
-fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
+fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const std.AutoHashMapUnmanaged(u32, void)) Error!void {
     const sig = resolveSig(m, func.decl);
     const num_params: u32 = @intCast(sig.params.len);
     const num_locals: u32 = num_params + @as(u32, @intCast(func.local_types.items.len));
@@ -576,6 +608,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                 if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
                 if (m.tables.items.len == 0) return error.InvalidTableIndex;
                 if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                // call_indirect requires a funcref table
+                if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
                 try popExpect(&val_stack, &ctrl_stack, .i32); // table index operand
                 const ft = switch (m.module_types.items[type_idx]) {
                     .func_type => |ft| ft,
@@ -593,6 +627,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                 const t2 = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
                 if (t1 != .unknown and t2 != .unknown and t1 != t2) return error.TypeMismatch;
                 const result = if (t1 != .unknown) t1 else t2;
+                // Untyped select only works with numeric types, not ref types
+                if (result == .funcref or result == .externref) return error.TypeMismatch;
                 val_stack.append(gpa(m), result) catch return error.OutOfMemory;
             },
             0x1c => { // select t
@@ -760,6 +796,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
             0xd2 => { // ref.func
                 const idx = readU32(bytes, &pos);
                 if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                if (!declared_funcs.contains(idx)) return error.InvalidFuncIndex;
                 val_stack.append(gpa(m), .funcref) catch return error.OutOfMemory;
             },
             // Prefixed opcodes
@@ -813,9 +850,14 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                         _ = readU32(bytes, &pos);
                     },
                     0x0f => { // table.grow
-                        _ = readU32(bytes, &pos);
+                        const tbl_idx = readU32(bytes, &pos);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
-                        _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        if (tbl_idx < m.tables.items.len) {
+                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].@"type".elem_type);
+                            try popExpect(&val_stack, &ctrl_stack, elem_t);
+                        } else {
+                            _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        }
                         val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
                     },
                     0x10 => { // table.size
@@ -823,9 +865,14 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
                         val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
                     },
                     0x11 => { // table.fill
-                        _ = readU32(bytes, &pos);
+                        const tbl_idx = readU32(bytes, &pos);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
-                        _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        if (tbl_idx < m.tables.items.len) {
+                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].@"type".elem_type);
+                            try popExpect(&val_stack, &ctrl_stack, elem_t);
+                        } else {
+                            _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                        }
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                     },
                     else => {},

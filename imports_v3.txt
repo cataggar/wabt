@@ -1,0 +1,8 @@
+  DBG setModule parse failed: error.InvalidNumber text[0..200]="(module
+  (type $func_i32 (func (param i32)))
+  (type $func_i64 (func (param i64)))
+  (type $func_f32 (func (param f32)))
+  (type $func_f64 (func (param f64)))
+
+  (import "spectest" "print_i32" "
+third_party\testsuite\imports.wast: 113 passed, 62 failed, 3 skipped (178 total)
