@@ -1076,7 +1076,8 @@ const Parser = struct {
             },
             .opcode => self.emitGenericOpcode(tok.text, code),
             else => {
-                // Unknown token in function body — ignore for bytecode purposes
+                // Unknown token in function body — flag as malformed
+                self.malformed = true;
             },
         }
     }
@@ -1381,8 +1382,10 @@ const Parser = struct {
                     self.emitBulkMemImm(sub, code);
                 }
             }
+        } else {
+            // Unrecognized opcode text — flag as malformed
+            self.malformed = true;
         }
-        // If opcode not recognized, just skip (don't emit anything)
     }
 
     fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
@@ -1396,9 +1399,15 @@ const Parser = struct {
                 const tok = self.advance();
                 // Format: "offset=N" or "align=N"
                 if (std.mem.startsWith(u8, tok.text, "offset=")) {
-                    offset = std.fmt.parseInt(u32, tok.text[7..], 0) catch 0;
+                    offset = std.fmt.parseInt(u32, tok.text[7..], 0) catch {
+                        self.malformed = true;
+                        continue;
+                    };
                 } else if (std.mem.startsWith(u8, tok.text, "align=")) {
-                    alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch 0;
+                    alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch {
+                        self.malformed = true;
+                        continue;
+                    };
                     has_align = true;
                 }
             }
@@ -1930,7 +1939,7 @@ const Parser = struct {
                     _ = self.advance();
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
-                        type_index = try self.parseU32();
+                        type_index = try self.parseTypeIdx();
                         try self.expect(.r_paren);
                     } else {
                         try self.skipSExpr();
