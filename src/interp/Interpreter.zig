@@ -2371,24 +2371,30 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
 fn wasmNearestF32(a: f32) f32 {
     if (std.math.isNan(a) or std.math.isInf(a)) return a;
     if (a == 0.0) return a;
-    const rounded = @round(a);
+    var rounded = @round(a);
     const diff = a - rounded;
     if (diff == 0.5 or diff == -0.5) {
         const r_int: i64 = @intFromFloat(rounded);
-        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f32, 1.0), a);
+        if (@rem(r_int, 2) != 0) rounded = rounded - std.math.copysign(@as(f32, 1.0), a);
     }
+    // Preserve negative zero: if result rounds to 0 but input was negative
+    if (rounded == 0.0 and @as(u32, @bitCast(a)) & 0x80000000 != 0)
+        return @bitCast(@as(u32, 0x80000000));
     return rounded;
 }
 
 fn wasmNearestF64(a: f64) f64 {
     if (std.math.isNan(a) or std.math.isInf(a)) return a;
     if (a == 0.0) return a;
-    const rounded = @round(a);
+    var rounded = @round(a);
     const diff = a - rounded;
     if (diff == 0.5 or diff == -0.5) {
         const r_int: i64 = @intFromFloat(rounded);
-        if (@rem(r_int, 2) != 0) return rounded - std.math.copysign(@as(f64, 1.0), a);
+        if (@rem(r_int, 2) != 0) rounded = rounded - std.math.copysign(@as(f64, 1.0), a);
     }
+    // Preserve negative zero: if result rounds to 0 but input was negative
+    if (rounded == 0.0 and @as(u64, @bitCast(a)) & 0x8000000000000000 != 0)
+        return @bitCast(@as(u64, 0x8000000000000000));
     return rounded;
 }
 
