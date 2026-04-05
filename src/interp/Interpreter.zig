@@ -256,12 +256,62 @@ pub const Interpreter = struct {
             .index => |i| i,
             .name => return error.Unimplemented,
         };
+        const func = self.instance.module.funcs.items[idx];
+        const sig = self.resolveSig(func.decl);
         self.instruction_count = 0;
         const stack_base = self.stack.items.len;
         const result = try self.callFunc(idx, args);
-        // Clean up any stale values left on the stack from multi-return or leaky calls
+        // For multi-value returns, the first result is at stack_base
+        if (sig.results.len > 1 and self.stack.items.len > stack_base) {
+            const first = self.stack.items[stack_base];
+            self.stack.shrinkRetainingCapacity(stack_base);
+            return first;
+        }
         self.stack.shrinkRetainingCapacity(stack_base);
         return result;
+    }
+
+    /// Call an exported function and return all result values.
+    pub fn callExportMulti(self: *Interpreter, name: []const u8, args: []const Value, result_buf: []Value) TrapError!usize {
+        const exp = self.instance.module.getExport(name) orelse return error.UndefinedElement;
+        if (exp.kind != .func) return error.UndefinedElement;
+        const idx: u32 = switch (exp.var_) {
+            .index => |i| i,
+            .name => return error.Unimplemented,
+        };
+        const func = self.instance.module.funcs.items[idx];
+        const sig = self.resolveSig(func.decl);
+        self.instruction_count = 0;
+        const stack_base = self.stack.items.len;
+        const last_result = try self.callFunc(idx, args);
+        var count: usize = 0;
+        if (sig.results.len <= 1) {
+            // Single or void: use callFunc's return value only
+            if (last_result) |v| {
+                if (count < result_buf.len) {
+                    result_buf[count] = v;
+                    count += 1;
+                }
+            }
+        } else {
+            // Multi-value: first (N-1) results on stack, last was popped by callFunc
+            const remaining = self.stack.items.len - stack_base;
+            const to_copy = @min(remaining, sig.results.len - 1);
+            for (0..to_copy) |i| {
+                if (count < result_buf.len) {
+                    result_buf[count] = self.stack.items[stack_base + i];
+                    count += 1;
+                }
+            }
+            if (last_result) |v| {
+                if (count < result_buf.len) {
+                    result_buf[count] = v;
+                    count += 1;
+                }
+            }
+        }
+        self.stack.shrinkRetainingCapacity(stack_base);
+        return count;
     }
 
     /// Call a function by index.

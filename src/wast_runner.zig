@@ -482,16 +482,18 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
 
-    const call_result = interp.callExport(func_name, args) catch |err| {
-        result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
-        return;
-    };
-
     // Parse expected results (after the invoke sexpr)
     const after_invoke = skipFirstSExpr(sexpr) orelse sexpr;
     var expected_buf: [16]Interp.Value = undefined;
     const expected = parseExpectedResults(after_invoke, &expected_buf);
+
+    // Use multi-value call to get all results
+    var results_buf: [16]Interp.Value = undefined;
+    const result_count = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
+        result.failed += 1;
+        if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        return;
+    };
 
     if (expected.len == 0) {
         // No expected result — just check it didn't trap
@@ -499,20 +501,29 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
         return;
     }
 
-    if (call_result) |actual| {
-        if (expected.len > 0 and valuesEqual(actual, expected[0])) {
-            result.passed += 1;
-        } else {
-            result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
-        }
+    // Compare all expected values against actual results
+    var all_match = true;
+    if (result_count < expected.len) {
+        all_match = false;
     } else {
-        // Function returned no value
-        if (expected.len == 0) {
-            result.passed += 1;
-        } else {
-            result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got null expected {any}\n", .{ func_name, expected[0] });
+        for (0..expected.len) |i| {
+            if (!valuesEqual(results_buf[i], expected[i])) {
+                all_match = false;
+                break;
+            }
+        }
+    }
+
+    if (all_match) {
+        result.passed += 1;
+    } else {
+        result.failed += 1;
+        if (result.failed <= 500) {
+            if (result_count > 0) {
+                std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, results_buf[0], expected[0] });
+            } else {
+                std.debug.print("  FAIL assert_return(invoke \"{s}\"): got null expected {any}\n", .{ func_name, expected[0] });
+            }
         }
     }
 }
