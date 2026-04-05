@@ -1589,8 +1589,16 @@ pub const Interpreter = struct {
         if (n == 0) return;
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            const func_idx = seg.elem_var_indices.items[src + i].index;
-            tbl.items[dst + i] = func_idx;
+            const var_entry = seg.elem_var_indices.items[src + i];
+            const func_idx = switch (var_entry) {
+                .index => |idx| idx,
+                .name => 0,
+            };
+            if (func_idx == std.math.maxInt(u32)) {
+                tbl.items[dst + i] = null;
+            } else {
+                tbl.items[dst + i] = func_idx;
+            }
         }
     }
 
@@ -1612,6 +1620,11 @@ pub const Interpreter = struct {
         }
         // Check table maximum
         const new_size: u64 = @as(u64, old_size) + delta;
+        // Reject growing beyond the implementation limit
+        if (new_size > 10_000_000) {
+            try self.pushValue(.{ .i32 = -1 });
+            return;
+        }
         if (tbl_idx < self.instance.module.tables.items.len) {
             const tbl_type = self.instance.module.tables.items[tbl_idx];
             if (tbl_type.@"type".limits.has_max and new_size > tbl_type.@"type".limits.max) {

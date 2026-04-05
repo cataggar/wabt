@@ -410,8 +410,14 @@ const Reader = struct {
             try seg.elem_var_indices.ensureTotalCapacity(self.allocator, elem_count);
             for (0..elem_count) |_| {
                 if (use_elem_exprs) {
-                    try self.skipInitExpr();
-                    seg.elem_var_indices.appendAssumeCapacity(.{ .index = 0 });
+                    const expr = try self.readInitExprBytes();
+                    if (expr.len >= 2 and expr[0] == 0xd2) {
+                        const r = leb128.readU32Leb128(expr[1..]) catch
+                            return error.InvalidSection;
+                        seg.elem_var_indices.appendAssumeCapacity(.{ .index = r.value });
+                    } else {
+                        seg.elem_var_indices.appendAssumeCapacity(.{ .index = std.math.maxInt(u32) });
+                    }
                 } else {
                     seg.elem_var_indices.appendAssumeCapacity(.{ .index = try self.readU32() });
                 }

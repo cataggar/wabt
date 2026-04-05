@@ -187,32 +187,164 @@ const RunState = struct {
         return null;
     }
 
-    /// Resolve function imports by linking them to exports in registered modules.
+    /// Resolve function and global imports by linking them to exports in registered modules.
     fn resolveImports(self: *RunState, mod: *Mod.Module, interp: *Interp.Interpreter) void {
-        if (mod.num_func_imports == 0) return;
-        interp.import_links.resize(self.allocator, mod.num_func_imports) catch return;
-        @memset(interp.import_links.items, null);
+        if (mod.num_func_imports == 0 and mod.num_global_imports == 0) return;
+
+        if (mod.num_func_imports > 0) {
+            interp.import_links.resize(self.allocator, mod.num_func_imports) catch return;
+            @memset(interp.import_links.items, null);
+        }
 
         var func_import_idx: u32 = 0;
+        var global_import_idx: u32 = 0;
         for (mod.imports.items) |imp| {
-            if (imp.kind != .func) continue;
-            if (func_import_idx >= mod.num_func_imports) break;
-            defer func_import_idx += 1;
+            if (imp.kind == .func) {
+                if (func_import_idx >= mod.num_func_imports) continue;
+                defer func_import_idx += 1;
 
-            // Look up the source module by module_name in registered modules.
-            const triple = self.registered_modules.get(imp.module_name) orelse continue;
-            // Find the export by field_name in the source module.
-            const exp = triple.module.getExport(imp.field_name) orelse continue;
-            if (exp.kind != .func) continue;
-            const src_idx: u32 = switch (exp.var_) {
-                .index => |i| i,
-                .name => continue,
-            };
-            interp.import_links.items[func_import_idx] = .{
-                .interpreter = triple.interpreter,
-                .func_idx = src_idx,
-            };
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .func) continue;
+                const src_idx: u32 = switch (exp.var_) {
+                    .index => |i| i,
+                    .name => continue,
+                };
+                interp.import_links.items[func_import_idx] = .{
+                    .interpreter = triple.interpreter,
+                    .func_idx = src_idx,
+                };
+            } else if (imp.kind == .global) {
+                defer global_import_idx += 1;
+
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .global) continue;
+                const src_idx: u32 = switch (exp.var_) {
+                    .index => |i| i,
+                    .name => continue,
+                };
+                if (src_idx < triple.instance.globals.items.len and
+                    global_import_idx < interp.instance.globals.items.len)
+                {
+                    interp.instance.globals.items[global_import_idx] = triple.instance.globals.items[src_idx];
+                }
+            }
         }
+    }
+
+    /// Register the "spectest" host module with standard globals and functions.
+    fn registerSpectest(self: *RunState) void {
+        const mod = self.allocator.create(Mod.Module) catch return;
+        mod.* = Mod.Module.init(self.allocator);
+
+        const noop_code = &[_]u8{0x0b};
+
+        const Fd = struct { name: []const u8, n_params: u8 };
+        const func_defs = [_]Fd{
+            .{ .name = "print", .n_params = 0 },
+            .{ .name = "print_i32", .n_params = 1 },
+            .{ .name = "print_i64", .n_params = 1 },
+            .{ .name = "print_f32", .n_params = 1 },
+            .{ .name = "print_f64", .n_params = 1 },
+            .{ .name = "print_i32_f32", .n_params = 2 },
+            .{ .name = "print_f64_f64", .n_params = 2 },
+        };
+        const param_types = [7][2]types.ValType{
+            .{ .i32, .i32 },
+            .{ .i32, .i32 },
+            .{ .i64, .i64 },
+            .{ .f32, .f32 },
+            .{ .f64, .f64 },
+            .{ .i32, .f32 },
+            .{ .f64, .f64 },
+        };
+        for (func_defs, 0..) |fd, i| {
+            const n = fd.n_params;
+            const owned_params: []const types.ValType = if (n > 0)
+                (self.allocator.dupe(types.ValType, param_types[i][0..n]) catch return)
+            else
+                &.{};
+            mod.module_types.append(self.allocator, .{ .func_type = .{
+                .params = owned_params,
+                .results = &.{},
+            } }) catch return;
+            mod.funcs.append(self.allocator, .{
+                .decl = .{ .type_var = .{ .index = @intCast(i) }, .sig = .{ .params = owned_params, .results = &.{} } },
+                .code_bytes = noop_code,
+            }) catch return;
+            mod.exports.append(self.allocator, .{
+                .name = fd.name,
+                .kind = .func,
+                .var_ = .{ .index = @intCast(i) },
+            }) catch return;
+        }
+
+        const global_defs = [_]struct { name: []const u8, vt: types.ValType }{
+            .{ .name = "global_i32", .vt = .i32 },
+            .{ .name = "global_i64", .vt = .i64 },
+            .{ .name = "global_f32", .vt = .f32 },
+            .{ .name = "global_f64", .vt = .f64 },
+        };
+        for (global_defs, 0..) |gd, i| {
+            mod.globals.append(self.allocator, .{
+                .@"type" = .{ .val_type = gd.vt, .mutability = .immutable },
+            }) catch return;
+            mod.exports.append(self.allocator, .{
+                .name = gd.name,
+                .kind = .global,
+                .var_ = .{ .index = @intCast(i) },
+            }) catch return;
+        }
+
+        mod.tables.append(self.allocator, .{
+            .@"type" = .{ .elem_type = .funcref, .limits = .{ .initial = 10, .max = 20, .has_max = true } },
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "table",
+            .kind = .table,
+            .var_ = .{ .index = 0 },
+        }) catch return;
+
+        mod.memories.append(self.allocator, .{
+            .@"type" = .{ .limits = .{ .initial = 1, .max = 2, .has_max = true } },
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "memory",
+            .kind = .memory,
+            .var_ = .{ .index = 0 },
+        }) catch return;
+
+        const inst = self.allocator.create(Interp.Instance) catch {
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return;
+        };
+        inst.* = Interp.Instance.init(self.allocator, mod) catch {
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return;
+        };
+        inst.instantiate() catch {};
+
+        if (inst.globals.items.len >= 4) {
+            inst.globals.items[0] = .{ .i32 = 666 };
+            inst.globals.items[1] = .{ .i64 = 666 };
+            inst.globals.items[2] = .{ .f32 = @as(f32, 666.6) };
+            inst.globals.items[3] = .{ .f64 = @as(f64, 666.6) };
+        }
+
+        const interp = self.allocator.create(Interp.Interpreter) catch {
+            inst.deinit();
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return;
+        };
+        interp.* = Interp.Interpreter.init(self.allocator, inst);
+
+        self.putRegistered("spectest", .{ .module = mod, .instance = inst, .interpreter = interp });
     }
 };
 
@@ -222,6 +354,8 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
     var pos: usize = 0;
     var state = RunState{ .allocator = allocator };
     defer state.deinit();
+
+    state.registerSpectest();
 
     while (pos < source.len) {
         pos = skipWhitespaceAndComments(source, pos);
