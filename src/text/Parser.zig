@@ -652,8 +652,31 @@ const Parser = struct {
             }
         }
 
+        // If (type $sig) is given with inline params/results, validate they match exactly
+        const has_type_ref = func.decl.type_var == .index and func.decl.type_var.index != types.invalid_index;
+        if (has_type_ref and (params_list.items.len > 0 or results_list.items.len > 0)) {
+            const tidx = func.decl.type_var.index;
+            if (tidx < module.module_types.items.len) {
+                switch (module.module_types.items[tidx]) {
+                    .func_type => |ft| {
+                        if (ft.params.len != params_list.items.len or ft.results.len != results_list.items.len) {
+                            self.malformed = true;
+                        } else {
+                            for (ft.params, params_list.items) |a, b| {
+                                if (a != b) self.malformed = true;
+                            }
+                            for (ft.results, results_list.items) |a, b| {
+                                if (a != b) self.malformed = true;
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            }
+        }
+
         // If we found inline params/results and no (type $idx), create a type entry
-        if (func.decl.type_var == .index and func.decl.type_var.index == types.invalid_index) {
+        if (!has_type_ref) {
             if (params_list.items.len > 0 or results_list.items.len > 0) {
                 const p = self.allocator.alloc(types.ValType, params_list.items.len) catch return error.OutOfMemory;
                 @memcpy(p, params_list.items);
@@ -2049,7 +2072,14 @@ const Parser = struct {
             },
             .kw_memory => {
                 import.kind = .memory;
-                if (self.peek().kind == .identifier) _ = self.advance();
+                const import_mem_idx: u32 = @intCast(module.memories.items.len);
+                if (self.peek().kind == .identifier) {
+                    const mname = self.advance().text;
+                    if (self.memory_names.get(mname)) |existing| {
+                        if (existing != import_mem_idx and existing < import_mem_idx) self.malformed = true;
+                    }
+                    self.memory_names.put(self.allocator, mname, import_mem_idx) catch {};
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
@@ -2065,7 +2095,14 @@ const Parser = struct {
             },
             .kw_table => {
                 import.kind = .table;
-                if (self.peek().kind == .identifier) _ = self.advance();
+                const import_table_idx: u32 = @intCast(module.tables.items.len);
+                if (self.peek().kind == .identifier) {
+                    const tname = self.advance().text;
+                    if (self.table_names.get(tname)) |existing| {
+                        if (existing != import_table_idx and existing < import_table_idx) self.malformed = true;
+                    }
+                    self.table_names.put(self.allocator, tname, import_table_idx) catch {};
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
@@ -2082,7 +2119,14 @@ const Parser = struct {
             },
             .kw_global => {
                 import.kind = .global;
-                if (self.peek().kind == .identifier) _ = self.advance();
+                const import_global_idx: u32 = @intCast(module.globals.items.len);
+                if (self.peek().kind == .identifier) {
+                    const gname = self.advance().text;
+                    if (self.global_names.get(gname)) |existing| {
+                        if (existing != import_global_idx and existing < import_global_idx) self.malformed = true;
+                    }
+                    self.global_names.put(self.allocator, gname, import_global_idx) catch {};
+                }
                 var mutability: types.Mutability = .immutable;
                 var val_type: types.ValType = undefined;
                 if (self.peek().kind == .l_paren) {
