@@ -1768,6 +1768,45 @@ pub const Interpreter = struct {
         std.mem.writeInt(u32, self.instance.memory.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
+    // ── Block stack helpers ──────────────────────────────────────────────
+
+    const BlockSig = struct { params: usize, results: usize };
+
+    /// Return how many param and result values a block type declares.
+    fn getBlockSig(self: *Interpreter, code: []const u8, block_type_pc: usize) BlockSig {
+        if (block_type_pc >= code.len) return .{ .params = 0, .results = 0 };
+        const byte = code[block_type_pc];
+        if (byte == 0x40) return .{ .params = 0, .results = 0 }; // void
+        if ((byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f) return .{ .params = 0, .results = 1 };
+        // Type index (signed LEB128)
+        var tmp = block_type_pc;
+        const idx_s32 = readCodeS32(code, &tmp);
+        if (idx_s32 < 0) return .{ .params = 0, .results = 0 };
+        const idx: u32 = @intCast(idx_s32);
+        if (idx < self.instance.module.module_types.items.len) {
+            switch (self.instance.module.module_types.items[idx]) {
+                .func_type => |ft| return .{ .params = ft.params.len, .results = ft.results.len },
+                else => return .{ .params = 0, .results = 0 },
+            }
+        }
+        return .{ .params = 0, .results = 0 };
+    }
+
+    /// Compact the stack after a block finishes: keep only the top
+    /// `result_count` values above `block_stack_base`.
+    fn compactBlockResults(self: *Interpreter, block_stack_base: usize, result_count: usize) void {
+        if (self.stack.items.len <= block_stack_base + result_count) return;
+        if (result_count == 0) {
+            self.stack.shrinkRetainingCapacity(block_stack_base);
+            return;
+        }
+        const src = self.stack.items.len - result_count;
+        for (0..result_count) |i| {
+            self.stack.items[block_stack_base + i] = self.stack.items[src + i];
+        }
+        self.stack.shrinkRetainingCapacity(block_stack_base + result_count);
+    }
+
     // ── Bytecode dispatch ───────────────────────────────────────────────
 
     fn dispatch(self: *Interpreter, code: []const u8, start_pc: usize, locals: []Value) TrapError!usize {
@@ -1781,13 +1820,15 @@ pub const Interpreter = struct {
                 0x00 => return error.Unreachable,
                 0x01 => {},
                 0x02 => { // block
+                    const bsig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
+                    const block_stack_base = self.stack.items.len -| bsig.params;
                     pc = try self.dispatch(code, body_start, locals);
                     if (self.returning) return pc;
                     if (self.branch_depth) |d| {
                         if (d == 0) {
                             self.branch_depth = null;
-                            // Scan from body start to correctly skip nested structures
+                            self.compactBlockResults(block_stack_base, bsig.results);
                             pc = scanToEnd(code, body_start);
                         } else {
                             self.branch_depth = d - 1;
@@ -1796,7 +1837,9 @@ pub const Interpreter = struct {
                     }
                 },
                 0x03 => { // loop
+                    const lsig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
+                    const loop_stack_base = self.stack.items.len -| lsig.params;
                     pc = body_start;
                     while (true) {
                         pc = try self.dispatch(code, body_start, locals);
@@ -1804,10 +1847,11 @@ pub const Interpreter = struct {
                         if (self.branch_depth) |d| {
                             if (d == 0) {
                                 self.branch_depth = null;
+                                // For loop restart, compact to params
+                                self.compactBlockResults(loop_stack_base, lsig.params);
                                 continue; // restart loop
                             } else {
                                 self.branch_depth = d - 1;
-                                // Scan from body start to find loop's end
                                 pc = scanToEnd(code, body_start);
                                 return pc;
                             }
@@ -1816,14 +1860,17 @@ pub const Interpreter = struct {
                     }
                 },
                 0x04 => { // if
+                    const isig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
                     const cond = try self.popI32();
+                    const if_stack_base = self.stack.items.len -| isig.params;
                     if (cond != 0) {
                         pc = try self.dispatch(code, body_start, locals);
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
                                 self.branch_depth = null;
+                                self.compactBlockResults(if_stack_base, isig.results);
                                 pc = scanToEnd(code, body_start);
                             } else {
                                 self.branch_depth = d - 1;
@@ -1845,6 +1892,7 @@ pub const Interpreter = struct {
                             if (self.branch_depth) |d| {
                                 if (d == 0) {
                                     self.branch_depth = null;
+                                    self.compactBlockResults(if_stack_base, isig.results);
                                     pc = scanToEnd(code, else_start);
                                 } else {
                                     self.branch_depth = d - 1;
