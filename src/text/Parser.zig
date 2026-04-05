@@ -702,12 +702,18 @@ const Parser = struct {
             },
             .kw_br_table => {
                 code.append(self.allocator, 0x0e) catch return;
-                // Collect all integer targets
+                // Collect all integer/label targets
                 var targets: std.ArrayListUnmanaged(u32) = .{};
                 defer targets.deinit(self.allocator);
-                while (self.peek().kind == .integer) {
-                    const idx = self.parseU32() catch break;
-                    targets.append(self.allocator, idx) catch return;
+                while (self.peek().kind == .integer or self.peek().kind == .identifier) {
+                    if (self.peek().kind == .identifier) {
+                        const label_tok = self.advance();
+                        const depth = self.resolveLabelDepth(label_tok.text) orelse 0;
+                        targets.append(self.allocator, depth) catch return;
+                    } else {
+                        const idx = self.parseU32() catch break;
+                        targets.append(self.allocator, idx) catch return;
+                    }
                 }
                 if (targets.items.len == 0) {
                     // Malformed, emit 0 targets with default 0
