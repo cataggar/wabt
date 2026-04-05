@@ -919,9 +919,39 @@ const Parser = struct {
                 self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
-            .kw_else => code.append(self.allocator, 0x05) catch return,
+            .kw_else => {
+                code.append(self.allocator, 0x05) catch return;
+                // Validate optional else label matches the opening if label
+                if (self.peek().kind == .identifier) {
+                    const el_label = self.advance().text;
+                    if (self.label_stack.items.len > 0) {
+                        const opening = self.label_stack.items[self.label_stack.items.len - 1];
+                        if (opening == null or !std.mem.eql(u8, opening.?, el_label)) {
+                            self.malformed = true;
+                            return;
+                        }
+                    } else {
+                        self.malformed = true;
+                        return;
+                    }
+                }
+            },
             .kw_end => {
                 code.append(self.allocator, 0x0b) catch return;
+                // Validate optional end label matches the opening block/loop/if label
+                if (self.peek().kind == .identifier) {
+                    const en_label = self.advance().text;
+                    if (self.label_stack.items.len > 0) {
+                        const opening = self.label_stack.items[self.label_stack.items.len - 1];
+                        if (opening == null or !std.mem.eql(u8, opening.?, en_label)) {
+                            self.malformed = true;
+                            return;
+                        }
+                    } else {
+                        self.malformed = true;
+                        return;
+                    }
+                }
                 if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
             },
             .kw_br => {
