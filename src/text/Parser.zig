@@ -1020,14 +1020,17 @@ const Parser = struct {
     fn emitS32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind != .integer) {
+            self.malformed = true;
             self.emitLeb128S32(code, 0);
             return;
         }
+        if (!isValidNumLiteral(tok.text)) self.malformed = true;
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i32, text, 0) catch blk: {
             // Try parsing as unsigned and reinterpret
             const uval = std.fmt.parseInt(u32, text, 0) catch {
+                self.malformed = true;
                 break :blk 0;
             };
             break :blk @as(i32, @bitCast(uval));
@@ -1038,13 +1041,16 @@ const Parser = struct {
     fn emitS64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind != .integer) {
+            self.malformed = true;
             self.emitLeb128S64(code, 0);
             return;
         }
+        if (!isValidNumLiteral(tok.text)) self.malformed = true;
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i64, text, 0) catch blk: {
             const uval = std.fmt.parseInt(u64, text, 0) catch {
+                self.malformed = true;
                 break :blk 0;
             };
             break :blk @as(i64, @bitCast(uval));
@@ -1055,11 +1061,13 @@ const Parser = struct {
     fn emitF32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
-            // Handle special nan/inf patterns and hex floats
+            if (!isValidNumLiteral(tok.text)) self.malformed = true;
+            if (!isValidFloatLiteral(f32, tok.text)) self.malformed = true;
             const bits = parseF32Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
+            self.malformed = true;
             code.appendSlice(self.allocator, &[4]u8{ 0, 0, 0, 0 }) catch {};
         }
     }
@@ -1067,10 +1075,13 @@ const Parser = struct {
     fn emitF64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
+            if (!isValidNumLiteral(tok.text)) self.malformed = true;
+            if (!isValidFloatLiteral(f64, tok.text)) self.malformed = true;
             const bits = parseF64Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
+            self.malformed = true;
             code.appendSlice(self.allocator, &[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }) catch {};
         }
     }
@@ -1923,45 +1934,290 @@ fn stripUnderscores(text: []const u8) CleanNum {
     return result;
 }
 
-/// Map WAT instruction text (e.g. "i32.add") to binary opcode value.
-/// Returns null for unrecognized instructions.
-fn parseF32Bits(text: []const u8) u32 {
-    // Handle nan:0xNNNNNN patterns
-    if (std.mem.startsWith(u8, text, "nan:0x") or std.mem.startsWith(u8, text, "+nan:0x")) {
-        const hex_start = if (text[0] == '+') @as(usize, 6) else @as(usize, 6);
-        const payload = std.fmt.parseInt(u32, text[hex_start..], 16) catch 0;
-        return 0x7fc00000 | (payload & 0x7fffff);
+/// Validate WAT number literal underscore placement.
+/// Underscores are only valid between two hex/decimal digits.
+/// Also rejects bare `0x`, truncated exponents (`0e`, `0e+`), etc.
+fn isValidNumLiteral(text: []const u8) bool {
+    if (text.len == 0) return false;
+    var i: usize = 0;
+
+    // Skip optional sign
+    if (text[i] == '+' or text[i] == '-') {
+        i += 1;
+        if (i >= text.len) return false;
     }
-    if (std.mem.startsWith(u8, text, "-nan:0x")) {
-        const payload = std.fmt.parseInt(u32, text[7..], 16) catch 0;
-        return 0xffc00000 | (payload & 0x7fffff);
+
+    // Handle nan/inf (always valid if we got here)
+    const rest = text[i..];
+    if (std.mem.startsWith(u8, rest, "nan") or std.mem.startsWith(u8, rest, "inf"))
+        return true;
+
+    // Check for hex prefix
+    const is_hex = rest.len > 2 and rest[0] == '0' and (rest[1] == 'x' or rest[1] == 'X');
+    if (is_hex) {
+        i += 2; // skip "0x"
+        if (i >= text.len or (!isHexChar(text[i]) and text[i] != '.'))
+            return false; // bare "0x" or "0x_..."
     }
-    if (std.mem.eql(u8, text, "nan") or std.mem.eql(u8, text, "+nan")) return 0x7fc00000;
-    if (std.mem.eql(u8, text, "-nan")) return 0xffc00000;
-    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7f800000;
-    if (std.mem.eql(u8, text, "-inf")) return 0xff800000;
+
+    // Walk remaining characters, check underscore rules and exponent completeness
+    var prev_was_digit = false;
+    var seen_digit_part = false;
+    while (i < text.len) : (i += 1) {
+        const ch = text[i];
+        if (ch == '_') {
+            if (!prev_was_digit) return false;
+            if (i + 1 >= text.len) return false;
+            const next = text[i + 1];
+            const next_is_digit = if (is_hex) isHexChar(next) else (next >= '0' and next <= '9');
+            if (!next_is_digit) return false;
+            prev_was_digit = false;
+        } else if ((is_hex and isHexChar(ch)) or (ch >= '0' and ch <= '9')) {
+            prev_was_digit = true;
+            seen_digit_part = true;
+        } else if (ch == '.') {
+            prev_was_digit = false;
+        } else if (ch == 'e' or ch == 'E' or ch == 'p' or ch == 'P') {
+            // Exponent marker: must be followed by optional sign then ≥1 digit
+            i += 1;
+            if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+            if (i >= text.len or (text[i] != '_' and text[i] < '0') or text[i] > '9')
+                return false; // no digits after exponent
+            prev_was_digit = true;
+            seen_digit_part = true;
+        } else {
+            return false;
+        }
+    }
+    return seen_digit_part;
+}
+
+fn isHexChar(c: u8) bool {
+    return (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+}
+
+/// Validate float-type-specific rules: overflow to infinity, NaN payload constraints.
+fn isValidFloatLiteral(comptime F: type, text: []const u8) bool {
+    const mantissa_bits: comptime_int = if (F == f32) 23 else 52;
+    const UInt = if (F == f32) u32 else u64;
+
+    var i: usize = 0;
+    if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+    const after_sign = text[i..];
+
+    // NaN payload validation
+    if (std.mem.startsWith(u8, after_sign, "nan:")) {
+        const payload_text = after_sign[4..];
+        // Must be 0xN format
+        if (!std.mem.startsWith(u8, payload_text, "0x")) return false;
+        // Strip underscores and parse
+        const clean = stripUnderscores(payload_text[2..]);
+        const payload = std.fmt.parseInt(UInt, clean.slice(), 16) catch return false;
+        // Payload must be non-zero and fit in mantissa
+        if (payload == 0) return false;
+        if (payload >= (@as(UInt, 1) << mantissa_bits)) return false;
+        return true;
+    }
+    if (std.mem.eql(u8, after_sign, "nan") or std.mem.eql(u8, after_sign, "inf"))
+        return true;
+
+    // Check for overflow: parsed bits form infinity but input isn't inf
     const clean = stripUnderscores(text);
-    const val = std.fmt.parseFloat(f32, clean.slice()) catch 0.0;
+    const bits = parseFloatBits(F, clean.slice());
+    const inf_bits: UInt = if (F == f32) 0x7f800000 else 0x7ff0000000000000;
+    const mantissa_mask: UInt = (@as(UInt, 1) << mantissa_bits) - 1;
+    // If exponent is all-1s and mantissa is 0, that's infinity
+    if ((bits & ~(@as(UInt, 1) << @intCast(mantissa_bits + (if (F == f32) @as(comptime_int, 8) else 11)))) == inf_bits) {
+        if ((bits & mantissa_mask) == 0) return false; // overflow to infinity
+    }
+    return true;
+}
+
+/// Parse a float literal and return its IEEE 754 bit pattern as u32.
+fn parseF32Bits(text: []const u8) u32 {
+    return parseFloatBits(f32, text);
+}
+
+/// Parse a float literal and return its IEEE 754 bit pattern as u64.
+fn parseF64Bits(text: []const u8) u64 {
+    return parseFloatBits(f64, text);
+}
+
+/// Generic float-literal-to-bits parser for f32 or f64.
+pub fn parseFloatBits(comptime F: type, text: []const u8) if (F == f32) u32 else u64 {
+    const UInt = if (F == f32) u32 else u64;
+    const mantissa_bits: comptime_int = if (F == f32) 23 else 52;
+
+    // Determine sign prefix length
+    const sign_len: usize = if (text.len > 0 and (text[0] == '+' or text[0] == '-')) 1 else 0;
+    const negative = sign_len == 1 and text[0] == '-';
+    const sign_bit: UInt = if (negative) @as(UInt, 1) << @intCast(mantissa_bits + (if (F == f32) @as(comptime_int, 8) else 11)) else 0;
+    const after_sign = text[sign_len..];
+
+    // NaN with payload: nan:0xN — exponent all-1s, mantissa = payload
+    if (std.mem.startsWith(u8, after_sign, "nan:0x")) {
+        const payload = std.fmt.parseInt(UInt, after_sign[6..], 16) catch 0;
+        const nan_exp: UInt = if (F == f32) 0x7f800000 else 0x7ff0000000000000;
+        const mantissa_mask: UInt = (@as(UInt, 1) << mantissa_bits) - 1;
+        return sign_bit | nan_exp | (payload & mantissa_mask);
+    }
+    // Canonical NaN
+    if (std.mem.eql(u8, after_sign, "nan")) {
+        const canon: UInt = if (F == f32) 0x7fc00000 else 0x7ff8000000000000;
+        return sign_bit | canon;
+    }
+    // Infinity
+    if (std.mem.eql(u8, after_sign, "inf")) {
+        const inf_bits: UInt = if (F == f32) 0x7f800000 else 0x7ff0000000000000;
+        return sign_bit | inf_bits;
+    }
+    const clean = stripUnderscores(text);
+    // Hex float/integer: use custom parser with correct round-to-nearest-even
+    if (parseHexFloatBits(F, clean.slice())) |bits| return bits;
+    // Decimal: std.fmt.parseFloat is correct for decimal literals
+    const val = std.fmt.parseFloat(F, clean.slice()) catch 0.0;
     return @bitCast(val);
 }
 
-fn parseF64Bits(text: []const u8) u64 {
-    if (std.mem.startsWith(u8, text, "nan:0x") or std.mem.startsWith(u8, text, "+nan:0x")) {
-        const hex_start = if (text[0] == '+') @as(usize, 6) else @as(usize, 6);
-        const payload = std.fmt.parseInt(u64, text[hex_start..], 16) catch 0;
-        return 0x7ff8000000000000 | (payload & 0xfffffffffffff);
+/// Parse a hex float literal (0x...) with correct round-to-nearest-even.
+/// Returns null if text is not a hex float.
+fn parseHexFloatBits(comptime F: type, text: []const u8) ?if (F == f32) u32 else u64 {
+    const UInt = if (F == f32) u32 else u64;
+    const mantissa_bits: comptime_int = if (F == f32) 23 else 52;
+    const exp_bias: comptime_int = if (F == f32) 127 else 1023;
+    const max_biased_exp: comptime_int = if (F == f32) 254 else 2046;
+    const exp_field_bits: comptime_int = if (F == f32) 8 else 11;
+
+    var pos: usize = 0;
+    var negative = false;
+    if (pos < text.len and (text[pos] == '+' or text[pos] == '-')) {
+        negative = text[pos] == '-';
+        pos += 1;
     }
-    if (std.mem.startsWith(u8, text, "-nan:0x")) {
-        const payload = std.fmt.parseInt(u64, text[7..], 16) catch 0;
-        return 0xfff8000000000000 | (payload & 0xfffffffffffff);
+    if (pos + 1 >= text.len or text[pos] != '0') return null;
+    if (text[pos + 1] != 'x' and text[pos + 1] != 'X') return null;
+    pos += 2;
+
+    var sig: u128 = 0;
+    var sig_overflow_sticky: bool = false;
+    var frac_hex_digits: i32 = 0;
+    var in_frac = false;
+    var saw_digit = false;
+
+    while (pos < text.len) : (pos += 1) {
+        if (text[pos] == '.') { in_frac = true; continue; }
+        const d: u128 = hexDigitVal(text[pos]) orelse break;
+        saw_digit = true;
+        if (in_frac) frac_hex_digits += 1;
+        if ((sig >> 124) != 0) {
+            sig_overflow_sticky = sig_overflow_sticky or (d != 0);
+        } else {
+            sig = sig * 16 + d;
+        }
     }
-    if (std.mem.eql(u8, text, "nan") or std.mem.eql(u8, text, "+nan")) return 0x7ff8000000000000;
-    if (std.mem.eql(u8, text, "-nan")) return 0xfff8000000000000;
-    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7ff0000000000000;
-    if (std.mem.eql(u8, text, "-inf")) return 0xfff0000000000000;
-    const clean = stripUnderscores(text);
-    const val = std.fmt.parseFloat(f64, clean.slice()) catch 0.0;
-    return @bitCast(val);
+    if (!saw_digit) return null;
+
+    // Parse binary exponent (p/P followed by decimal integer)
+    var p_exp: i32 = 0;
+    if (pos < text.len and (text[pos] == 'p' or text[pos] == 'P')) {
+        pos += 1;
+        var exp_neg = false;
+        if (pos < text.len and (text[pos] == '+' or text[pos] == '-')) {
+            exp_neg = text[pos] == '-';
+            pos += 1;
+        }
+        while (pos < text.len and text[pos] >= '0' and text[pos] <= '9') : (pos += 1) {
+            p_exp = p_exp *| 10 +| @as(i32, @intCast(text[pos] - '0'));
+        }
+        if (exp_neg) p_exp = -p_exp;
+    }
+
+    const sign_bit: UInt = if (negative) @as(UInt, 1) << @intCast(mantissa_bits + exp_field_bits) else 0;
+    if (sig == 0) return sign_bit;
+
+    // Find MSB position
+    var msb: u32 = 0;
+    {
+        var tmp = sig;
+        while (tmp > 1) {
+            tmp >>= 1;
+            msb += 1;
+        }
+    }
+
+    // Unbiased exponent: value = sig * 2^(p_exp - 4*frac_hex_digits)
+    //                         = 1.xxx * 2^(msb + p_exp - 4*frac_hex_digits)
+    const true_exp: i32 = @as(i32, @intCast(msb)) + p_exp - 4 * frac_hex_digits;
+
+    // Overflow → infinity
+    if (true_exp > max_biased_exp - exp_bias + 1) {
+        return sign_bit | (@as(UInt, max_biased_exp + 1) << mantissa_bits);
+    }
+    // Extreme underflow → zero
+    if (true_exp < 1 - exp_bias - mantissa_bits - 1) {
+        return sign_bit;
+    }
+
+    var biased_exp: i32 = true_exp + exp_bias;
+    var target_msb_pos: i32 = mantissa_bits;
+    if (biased_exp <= 0) {
+        // Subnormal range: reduce target position
+        target_msb_pos += biased_exp - 1;
+        biased_exp = 0;
+    }
+
+    const shift: i32 = @as(i32, @intCast(msb)) - target_msb_pos;
+    var mantissa: UInt = undefined;
+    var guard: bool = false;
+    var sticky: bool = sig_overflow_sticky;
+
+    if (shift > 0) {
+        if (shift > @as(i32, @intCast(msb)) + 1) {
+            // Guard bit is above all sig bits — value is too small to round up
+            return sign_bit;
+        }
+        const s: u7 = @intCast(@as(u32, @intCast(shift)));
+        mantissa = @truncate(sig >> @as(u7, s));
+        guard = ((sig >> @as(u7, s - 1)) & 1) != 0;
+        if (s >= 2) {
+            const mask: u128 = (@as(u128, 1) << @as(u7, s - 1)) - 1;
+            sticky = sticky or ((sig & mask) != 0);
+        }
+    } else if (shift == 0) {
+        mantissa = @truncate(sig);
+    } else {
+        mantissa = @as(UInt, @truncate(sig)) << @intCast(@as(u32, @intCast(-shift)));
+    }
+
+    const mantissa_mask: UInt = (@as(UInt, 1) << mantissa_bits) - 1;
+    var m: UInt = mantissa & mantissa_mask;
+
+    // Round to nearest, ties to even
+    if (guard) {
+        if (sticky) {
+            m += 1; // above midpoint
+        } else if ((m & 1) != 0) {
+            m += 1; // tie, round to even
+        }
+        if (m > mantissa_mask) {
+            m = 0;
+            biased_exp += 1;
+            if (biased_exp > max_biased_exp) {
+                return sign_bit | (@as(UInt, @intCast(max_biased_exp + 1)) << mantissa_bits);
+            }
+        }
+    }
+
+    return sign_bit | (@as(UInt, @intCast(biased_exp)) << mantissa_bits) | m;
+}
+
+fn hexDigitVal(c: u8) ?u128 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
 }
 
 fn opcodeFromText(text: []const u8) ?u32 {
