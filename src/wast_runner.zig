@@ -956,18 +956,24 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
         if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:"))
+            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
+            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
         {
             return .{ .f32 = std.math.nan(f32) };
         }
+        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f32 = std.math.inf(f32) };
+        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f32 = -std.math.inf(f32) };
         const v = std.fmt.parseFloat(f32, val_text) catch return .{ .f32 = 0.0 };
         return .{ .f32 = v };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
         if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:"))
+            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
+            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
         {
             return .{ .f64 = std.math.nan(f64) };
         }
+        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f64 = std.math.inf(f64) };
+        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f64 = -std.math.inf(f64) };
         const v = std.fmt.parseFloat(f64, val_text) catch return .{ .f64 = 0.0 };
         return .{ .f64 = v };
     } else if (std.mem.eql(u8, kw, "ref.null")) {
