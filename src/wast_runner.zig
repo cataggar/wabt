@@ -993,12 +993,17 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
             return;
         };
         defer instance.deinit();
+
+        var interp2 = Interp.Interpreter.init(allocator, &instance);
+        defer interp2.deinit();
+
+        // Resolve imports so shared memory/tables work during instantiation
+        state.resolveImports(&module, &interp2);
+
         instance.instantiate() catch {
             result.passed += 1;
             return;
         };
-        var interp2 = Interp.Interpreter.init(allocator, &instance);
-        defer interp2.deinit();
 
         if (module.start_var) |sv| {
             interp2.callFunc(sv.index, &.{}) catch {
