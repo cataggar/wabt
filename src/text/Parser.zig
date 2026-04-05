@@ -454,7 +454,10 @@ const Parser = struct {
             func.name = self.advance().text;
             // Register name → index for call resolution
             if (func.name) |n| {
-                self.func_names.put(self.allocator, n, func_idx) catch {};
+                if (self.func_names.getOrPut(self.allocator, n)) |gop| {
+                    if (gop.found_existing and gop.value_ptr.* != func_idx) self.malformed = true;
+                    gop.value_ptr.* = func_idx;
+                } else |_| {}
             }
         }
 
@@ -1526,7 +1529,10 @@ const Parser = struct {
         const table_idx: u32 = @intCast(module.tables.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            self.table_names.put(self.allocator, name, table_idx) catch {};
+            if (self.table_names.getOrPut(self.allocator, name)) |gop| {
+                if (gop.found_existing and gop.value_ptr.* != table_idx) self.malformed = true;
+                gop.value_ptr.* = table_idx;
+            } else |_| {}
         }
 
         // Handle inline (export "name") and (import "mod" "name") on tables
@@ -1673,7 +1679,10 @@ const Parser = struct {
         const mem_idx: u32 = @intCast(module.memories.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            self.memory_names.put(self.allocator, name, mem_idx) catch {};
+            if (self.memory_names.getOrPut(self.allocator, name)) |gop| {
+                if (gop.found_existing and gop.value_ptr.* != mem_idx) self.malformed = true;
+                gop.value_ptr.* = mem_idx;
+            } else |_| {}
         }
 
         // Handle inline (export "name") declarations
@@ -1770,7 +1779,10 @@ const Parser = struct {
         const global_idx: u32 = @intCast(module.globals.items.len);
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
-            self.global_names.put(self.allocator, name, global_idx) catch {};
+            if (self.global_names.getOrPut(self.allocator, name)) |gop| {
+                if (gop.found_existing and gop.value_ptr.* != global_idx) self.malformed = true;
+                gop.value_ptr.* = global_idx;
+            } else |_| {}
         }
 
         // Handle inline (export "name") and (import "mod" "name") declarations

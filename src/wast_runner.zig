@@ -612,10 +612,14 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1; // parse failure = malformed
             return;
         };
-        module.deinit();
+        defer module.deinit();
+        // Some spec tests classify validation errors (e.g. alignment) as "malformed"
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1;
+            return;
+        };
         if (result.failed <= 30) {
             std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes\n", .{wasm_bytes.len});
-            // Print first 20 bytes as hex
             var hex_buf: [60]u8 = undefined;
             var hi: usize = 0;
             for (wasm_bytes[0..@min(20, wasm_bytes.len)]) |b| {

@@ -1,0 +1,27 @@
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 35 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 36 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 37 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 38 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 33 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 34 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 35 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 36 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 44 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 37 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 05 03 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 44 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 04 01 60 00 00 03 02 01 00 04 04 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 17 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 07 02 60 00 00 60 00 00 
+  FAIL assert_malformed(binary): parsed OK, expected malformed, 72 bytes
+    bytes: 00 61 73 6d 01 00 00 00 01 25 0c 60 00 00 60 00 00 60 00 00 
+third_party\testsuite\binary.wast: 103 passed, 13 failed, 20 skipped (136 total)

@@ -1,0 +1,1 @@
+third_party\testsuite\align.wast: 162 passed, 0 failed, 0 skipped (162 total)
