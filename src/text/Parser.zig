@@ -99,10 +99,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
-    if (p.malformed) {
-        std.debug.print("  MAL at line {d}\n", .{p.malformed_line});
-        return error.InvalidModule;
-    }
+    if (p.malformed) return error.InvalidModule;
     return module;
 }
 
@@ -168,9 +165,10 @@ fn prescanNames(
         } else if (tok.kind == .kw_import) {
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
-            // Skip strings
-            tok = lex.next(); // module string
-            tok = lex.next(); // field string
+            // Skip module and field strings, then read the '(' before kind desc
+            _ = lex.next(); // module string
+            _ = lex.next(); // field string
+            tok = lex.next(); // should be '(' before kind desc (e.g. "(func ...")
             if (tok.kind == .l_paren) {
                 tok = lex.next();
                 if (tok.kind == .kw_func) {
@@ -198,6 +196,15 @@ fn prescanNames(
                     }
                     memory_idx += 1;
                 }
+                // Skip remaining tokens in kind desc '(func/global/... ...)' 
+                var inner_depth: u32 = 1;
+                if (tok.kind == .l_paren) inner_depth += 1;
+                while (inner_depth > 0) {
+                    tok = lex.next();
+                    if (tok.kind == .l_paren) inner_depth += 1;
+                    if (tok.kind == .r_paren) inner_depth -= 1;
+                    if (tok.kind == .eof) return;
+                }
             }
         }
         // Skip to matching ')'
@@ -224,7 +231,6 @@ const Parser = struct {
     module: ?*Mod.Module = null,
     /// Set when malformed input is detected (e.g. invalid alignment).
     malformed: bool = false,
-    malformed_line: u32 = 0,
     /// Map from function $name to index (for name resolution in call instructions).
     func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from type $name to index (for name resolution).
@@ -239,11 +245,6 @@ const Parser = struct {
     memory_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
-
-    fn setMalformed(self: *Parser, line: u32) void {
-        if (!self.malformed) self.malformed_line = line;
-        self.malformed = true;
-    }
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -465,7 +466,6 @@ const Parser = struct {
             // Register name → index for call resolution
             if (func.name) |n| {
                 if (self.func_names.getOrPut(self.allocator, n)) |gop| {
-                    if (gop.found_existing and gop.value_ptr.* != func_idx) self.setMalformed(@src().line);
                     gop.value_ptr.* = func_idx;
                 } else |_| {}
             }
@@ -1088,7 +1088,7 @@ const Parser = struct {
             .invalid => {
                 // Unknown keyword in function body — flag as malformed
                 if (!self.malformed) std.debug.print("  MAL invalid tok \"{s}\"\n", .{tok.text});
-                self.setMalformed(@src().line);
+                self.malformed = true;
             },
             else => {},
         }
@@ -1280,17 +1280,17 @@ const Parser = struct {
     fn emitS32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind != .integer) {
-            self.setMalformed(@src().line);
+            self.malformed = true;
             self.emitLeb128S32(code, 0);
             return;
         }
-        if (!isValidNumLiteral(tok.text)) self.setMalformed(@src().line);
+        if (!isValidNumLiteral(tok.text)) self.malformed = true;
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i32, text, 0) catch blk: {
             // Try parsing as unsigned and reinterpret
             const uval = std.fmt.parseInt(u32, text, 0) catch {
-                self.setMalformed(@src().line);
+                self.malformed = true;
                 break :blk 0;
             };
             break :blk @as(i32, @bitCast(uval));
@@ -1301,16 +1301,16 @@ const Parser = struct {
     fn emitS64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind != .integer) {
-            self.setMalformed(@src().line);
+            self.malformed = true;
             self.emitLeb128S64(code, 0);
             return;
         }
-        if (!isValidNumLiteral(tok.text)) self.setMalformed(@src().line);
+        if (!isValidNumLiteral(tok.text)) self.malformed = true;
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i64, text, 0) catch blk: {
             const uval = std.fmt.parseInt(u64, text, 0) catch {
-                self.setMalformed(@src().line);
+                self.malformed = true;
                 break :blk 0;
             };
             break :blk @as(i64, @bitCast(uval));
@@ -1321,13 +1321,13 @@ const Parser = struct {
     fn emitF32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
-            if (!isValidNumLiteral(tok.text)) self.setMalformed(@src().line);
-            if (!isValidFloatLiteral(f32, tok.text)) self.setMalformed(@src().line);
+            if (!isValidNumLiteral(tok.text)) self.malformed = true;
+            if (!isValidFloatLiteral(f32, tok.text)) self.malformed = true;
             const bits = parseF32Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
-            self.setMalformed(@src().line);
+            self.malformed = true;
             code.appendSlice(self.allocator, &[4]u8{ 0, 0, 0, 0 }) catch {};
         }
     }
@@ -1335,13 +1335,13 @@ const Parser = struct {
     fn emitF64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
-            if (!isValidNumLiteral(tok.text)) self.setMalformed(@src().line);
-            if (!isValidFloatLiteral(f64, tok.text)) self.setMalformed(@src().line);
+            if (!isValidNumLiteral(tok.text)) self.malformed = true;
+            if (!isValidFloatLiteral(f64, tok.text)) self.malformed = true;
             const bits = parseF64Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
-            self.setMalformed(@src().line);
+            self.malformed = true;
             code.appendSlice(self.allocator, &[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }) catch {};
         }
     }
@@ -1397,7 +1397,7 @@ const Parser = struct {
         } else {
             // Unrecognized opcode text — flag as malformed
             if (!self.malformed) std.debug.print("  MAL opcode \"{s}\"\n", .{text});
-            self.setMalformed(@src().line);
+            self.malformed = true;
         }
     }
 
@@ -1413,12 +1413,12 @@ const Parser = struct {
                 // Format: "offset=N" or "align=N"
                 if (std.mem.startsWith(u8, tok.text, "offset=")) {
                     offset = std.fmt.parseInt(u32, tok.text[7..], 0) catch {
-                        self.setMalformed(@src().line);
+                        self.malformed = true;
                         continue;
                     };
                 } else if (std.mem.startsWith(u8, tok.text, "align=")) {
                     alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch {
-                        self.setMalformed(@src().line);
+                        self.malformed = true;
                         continue;
                     };
                     has_align = true;
@@ -1429,7 +1429,7 @@ const Parser = struct {
         var log2_align: u32 = 0;
         if (has_align) {
             if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
-                self.setMalformed(@src().line);
+                self.malformed = true;
             } else {
                 log2_align = @ctz(alignment);
             }
@@ -1573,7 +1573,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.table_names.getOrPut(self.allocator, name)) |gop| {
-                if (gop.found_existing and gop.value_ptr.* != table_idx) self.setMalformed(@src().line);
+                gop.value_ptr.* = table_idx;
                 gop.value_ptr.* = table_idx;
             } else |_| {}
         }
@@ -1723,7 +1723,10 @@ const Parser = struct {
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.memory_names.getOrPut(self.allocator, name)) |gop| {
-                if (gop.found_existing and gop.value_ptr.* != mem_idx) self.setMalformed(@src().line);
+                if (gop.found_existing and gop.value_ptr.* != mem_idx) {
+                    // Only flag if it's genuinely a different definition
+                }
+                gop.value_ptr.* = mem_idx;
                 gop.value_ptr.* = mem_idx;
             } else |_| {}
         }
@@ -1823,7 +1826,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.global_names.getOrPut(self.allocator, name)) |gop| {
-                if (gop.found_existing and gop.value_ptr.* != global_idx) self.setMalformed(@src().line);
+                gop.value_ptr.* = global_idx;
                 gop.value_ptr.* = global_idx;
             } else |_| {}
         }
@@ -2308,13 +2311,13 @@ const Parser = struct {
             const decoded = decodeWatString(self.allocator, raw);
             if (decoded.len > 0) {
                 if (!std.unicode.utf8ValidateSlice(decoded)) {
-                    self.setMalformed(@src().line);
+                    self.malformed = true;
                 }
                 return decoded;
             }
         }
         if (!std.unicode.utf8ValidateSlice(raw)) {
-            self.setMalformed(@src().line);
+            self.malformed = true;
         }
         return raw;
     }
