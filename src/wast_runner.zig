@@ -1368,7 +1368,8 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.func")) {
         return .{ .ref_null = {} }; // treat as non-null ref for comparison
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
-        return .{ .ref_null = {} }; // treat extern refs as ref_null for now
+        const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
+        return .{ .ref_func = idx }; // non-null externref represented as ref_func
     }
     return null;
 }
