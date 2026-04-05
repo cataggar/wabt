@@ -12,6 +12,12 @@ const types = @import("types.zig");
 const Interp = @import("interp/Interpreter.zig");
 const binary_reader = @import("binary/reader.zig");
 
+// Sentinel bit patterns for NaN category matching in assert_return comparisons.
+const nan_canonical_f32: u32 = 0x7FC00001;
+const nan_arithmetic_f32: u32 = 0x7FC00002;
+const nan_canonical_f64: u64 = 0x7FF8000000000001;
+const nan_arithmetic_f64: u64 = 0x7FF8000000000002;
+
 /// Aggregate result of running a WAST file.
 pub const Result = struct {
     passed: u32 = 0,
@@ -1029,9 +1035,25 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         };
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
+        if (std.mem.eql(u8, val_text, "nan:canonical") or
+            std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
+            return .{ .f32 = @bitCast(nan_canonical_f32) };
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or
+            std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+            return .{ .f32 = @bitCast(nan_arithmetic_f32) };
         const bits = Parser.parseFloatBits(f32, val_text);
         return .{ .f32 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
+        if (std.mem.eql(u8, val_text, "nan:canonical") or
+            std.mem.eql(u8, val_text, "+nan:canonical") or
+            std.mem.eql(u8, val_text, "-nan:canonical"))
+            return .{ .f64 = @bitCast(nan_canonical_f64) };
+        if (std.mem.eql(u8, val_text, "nan:arithmetic") or
+            std.mem.eql(u8, val_text, "+nan:arithmetic") or
+            std.mem.eql(u8, val_text, "-nan:arithmetic"))
+            return .{ .f64 = @bitCast(nan_arithmetic_f64) };
         const bits = Parser.parseFloatBits(f64, val_text);
         return .{ .f64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "ref.null")) {
@@ -1088,6 +1110,12 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             .f32 => |bv| {
                 const ab: u32 = @bitCast(av);
                 const bb: u32 = @bitCast(bv);
+                // nan:canonical sentinel — any canonical NaN matches
+                if (bb == nan_canonical_f32)
+                    return (ab & 0x7fffffff) == 0x7fc00000;
+                // nan:arithmetic sentinel — any arithmetic NaN matches
+                if (bb == nan_arithmetic_f32)
+                    return (ab & 0x7fc00000) == 0x7fc00000;
                 return ab == bb;
             },
             else => false,
@@ -1096,6 +1124,10 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             .f64 => |bv| {
                 const ab: u64 = @bitCast(av);
                 const bb: u64 = @bitCast(bv);
+                if (bb == nan_canonical_f64)
+                    return (ab & 0x7fffffffffffffff) == 0x7ff8000000000000;
+                if (bb == nan_arithmetic_f64)
+                    return (ab & 0x7ff8000000000000) == 0x7ff8000000000000;
                 return ab == bb;
             },
             else => false,
