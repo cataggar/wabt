@@ -605,6 +605,22 @@ const Parser = struct {
         }
 
         // Parse (local ...) declarations
+        // When computing local indices, use the actual param count from the type
+        // (params_list may be empty if the function uses (type $sig) instead of inline params)
+        const actual_param_count: u32 = blk: {
+            if (params_list.items.len > 0) break :blk @intCast(params_list.items.len);
+            // Look up param count from referenced type
+            if (func.decl.type_var == .index and func.decl.type_var.index != types.invalid_index) {
+                const tidx = func.decl.type_var.index;
+                if (tidx < module.module_types.items.len) {
+                    switch (module.module_types.items[tidx]) {
+                        .func_type => |ft| break :blk @intCast(ft.params.len),
+                        else => {},
+                    }
+                }
+            }
+            break :blk 0;
+        };
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
@@ -613,7 +629,7 @@ const Parser = struct {
                 _ = self.advance(); // consume 'local'
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
-                    const idx: u32 = @intCast(params_list.items.len + func.local_types.items.len);
+                    const idx: u32 = actual_param_count + @as(u32, @intCast(func.local_types.items.len));
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {

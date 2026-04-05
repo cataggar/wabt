@@ -236,6 +236,8 @@ const Reader = struct {
                 13 => try self.readTagSection(section_end),
                 else => {},
             }
+            // Verify section was fully consumed (detect section size mismatch)
+            if (self.pos != section_end) return error.InvalidSection;
             self.pos = section_end;
         }
     }
@@ -446,7 +448,7 @@ const Reader = struct {
         _ = end;
     }
 
-    fn readCodeSection(self: *Reader, _: usize) ReadError!void {
+    fn readCodeSection(self: *Reader, section_end: usize) ReadError!void {
         const count = try self.readU32();
         const expected = self.module.funcs.items.len - self.module.num_func_imports;
         if (count != expected) return error.FunctionCodeMismatch;
@@ -454,7 +456,7 @@ const Reader = struct {
         for (0..count) |i| {
             const body_size = try self.readU32();
             const body_end = self.pos + body_size;
-            if (body_end > self.data.len) return error.SectionTooLarge;
+            if (body_end > self.data.len or body_end > section_end) return error.SectionTooLarge;
 
             const num_local_decls = try self.readU32();
             var total_locals: u64 = 0;
