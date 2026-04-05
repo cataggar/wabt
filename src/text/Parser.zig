@@ -1403,10 +1403,62 @@ const Parser = struct {
                     .var_ = .{ .index = mem_idx },
                 }) catch return error.OutOfMemory;
             } else if (self.peek().kind == .kw_data) {
-                // Inline (data "...") — skip for now
-                self.lexer.pos = sp;
-                self.peeked = spk;
-                break;
+                // Inline (data "...") abbreviation
+                _ = self.advance(); // consume 'data'
+                var data_parts: std.ArrayListUnmanaged(u8) = .{};
+                defer data_parts.deinit(self.allocator);
+                while (self.peek().kind == .string) {
+                    const tok = self.advance();
+                    const stripped = stripQuotes(tok.text);
+                    decodeWatStringInto(stripped, &data_parts, self.allocator);
+                }
+                try self.expect(.r_paren); // close (data ...)
+                const data_len: u64 = @intCast(data_parts.items.len);
+                const page_size: u64 = 65536;
+                const pages: u64 = if (data_len == 0) 1 else (data_len + page_size - 1) / page_size;
+                try module.memories.append(self.allocator, .{
+                    .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true } },
+                });
+                // Create active data segment at offset 0
+                var seg = Mod.DataSegment{};
+                seg.kind = .active;
+                seg.memory_var = .{ .index = mem_idx };
+                const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
+                ob[0] = 0x41; // i32.const
+                ob[1] = 0x00; // 0
+                seg.offset_expr_bytes = ob;
+                seg.owns_offset_expr_bytes = true;
+                if (data_parts.items.len > 0) {
+                    seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
+                    seg.owns_data = true;
+                }
+                try module.data_segments.append(self.allocator, seg);
+                return;
+            } else if (self.peek().kind == .kw_import) {
+                // Inline (import "mod" "name") abbreviation for memory
+                _ = self.advance(); // consume 'import'
+                const mod_name = self.parseName(self.advance().text);
+                const field_name = self.parseName(self.advance().text);
+                try self.expect(.r_paren); // close (import ...)
+                const initial = try self.parseU32();
+                var limits = types.Limits{ .initial = initial };
+                if (self.peek().kind == .integer) {
+                    limits.max = try self.parseU32();
+                    limits.has_max = true;
+                }
+                try module.memories.append(self.allocator, .{
+                    .type = .{ .limits = limits },
+                    .is_import = true,
+                });
+                module.num_memory_imports += 1;
+                var import = Mod.Import{
+                    .module_name = mod_name,
+                    .field_name = field_name,
+                    .kind = .memory,
+                };
+                import.memory = .{ .limits = limits };
+                try module.imports.append(self.allocator, import);
+                return;
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;

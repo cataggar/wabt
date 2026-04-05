@@ -297,7 +297,13 @@ pub const Interpreter = struct {
             // Resolve via import links
             if (func_idx < self.import_links.items.len) {
                 if (self.import_links.items[func_idx]) |link| {
-                    return link.interpreter.callFunc(link.func_idx, args);
+                    const link_base = link.interpreter.stack.items.len;
+                    try link.interpreter.callFunc(link.func_idx, args);
+                    // Copy results from linked interpreter's stack to our stack
+                    const link_results = link.interpreter.stack.items[link_base..];
+                    for (link_results) |v| try self.pushValue(v);
+                    link.interpreter.stack.shrinkRetainingCapacity(link_base);
+                    return;
                 }
             }
             return error.Unimplemented;
@@ -1604,6 +1610,15 @@ pub const Interpreter = struct {
             try self.pushValue(.{ .i32 = @bitCast(old_size) });
             return;
         }
+        // Check table maximum
+        const new_size: u64 = @as(u64, old_size) + delta;
+        if (tbl_idx < self.instance.module.tables.items.len) {
+            const tbl_type = self.instance.module.tables.items[tbl_idx];
+            if (tbl_type.@"type".limits.has_max and new_size > tbl_type.@"type".limits.max) {
+                try self.pushValue(.{ .i32 = -1 });
+                return;
+            }
+        }
         tbl.appendNTimes(self.allocator, func_ref, delta) catch {
             try self.pushValue(.{ .i32 = -1 });
             return;
@@ -1768,6 +1783,45 @@ pub const Interpreter = struct {
         std.mem.writeInt(u32, self.instance.memory.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
+    // ── Block stack helpers ──────────────────────────────────────────────
+
+    const BlockSig = struct { params: usize, results: usize };
+
+    /// Return how many param and result values a block type declares.
+    fn getBlockSig(self: *Interpreter, code: []const u8, block_type_pc: usize) BlockSig {
+        if (block_type_pc >= code.len) return .{ .params = 0, .results = 0 };
+        const byte = code[block_type_pc];
+        if (byte == 0x40) return .{ .params = 0, .results = 0 }; // void
+        if ((byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f) return .{ .params = 0, .results = 1 };
+        // Type index (signed LEB128)
+        var tmp = block_type_pc;
+        const idx_s32 = readCodeS32(code, &tmp);
+        if (idx_s32 < 0) return .{ .params = 0, .results = 0 };
+        const idx: u32 = @intCast(idx_s32);
+        if (idx < self.instance.module.module_types.items.len) {
+            switch (self.instance.module.module_types.items[idx]) {
+                .func_type => |ft| return .{ .params = ft.params.len, .results = ft.results.len },
+                else => return .{ .params = 0, .results = 0 },
+            }
+        }
+        return .{ .params = 0, .results = 0 };
+    }
+
+    /// Compact the stack after a block finishes: keep only the top
+    /// `result_count` values above `block_stack_base`.
+    fn compactBlockResults(self: *Interpreter, block_stack_base: usize, result_count: usize) void {
+        if (self.stack.items.len <= block_stack_base + result_count) return;
+        if (result_count == 0) {
+            self.stack.shrinkRetainingCapacity(block_stack_base);
+            return;
+        }
+        const src = self.stack.items.len - result_count;
+        for (0..result_count) |i| {
+            self.stack.items[block_stack_base + i] = self.stack.items[src + i];
+        }
+        self.stack.shrinkRetainingCapacity(block_stack_base + result_count);
+    }
+
     // ── Bytecode dispatch ───────────────────────────────────────────────
 
     fn dispatch(self: *Interpreter, code: []const u8, start_pc: usize, locals: []Value) TrapError!usize {
@@ -1781,13 +1835,15 @@ pub const Interpreter = struct {
                 0x00 => return error.Unreachable,
                 0x01 => {},
                 0x02 => { // block
+                    const bsig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
+                    const block_stack_base = self.stack.items.len -| bsig.params;
                     pc = try self.dispatch(code, body_start, locals);
                     if (self.returning) return pc;
                     if (self.branch_depth) |d| {
                         if (d == 0) {
                             self.branch_depth = null;
-                            // Scan from body start to correctly skip nested structures
+                            self.compactBlockResults(block_stack_base, bsig.results);
                             pc = scanToEnd(code, body_start);
                         } else {
                             self.branch_depth = d - 1;
@@ -1796,7 +1852,9 @@ pub const Interpreter = struct {
                     }
                 },
                 0x03 => { // loop
+                    const lsig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
+                    const loop_stack_base = self.stack.items.len -| lsig.params;
                     pc = body_start;
                     while (true) {
                         pc = try self.dispatch(code, body_start, locals);
@@ -1804,10 +1862,11 @@ pub const Interpreter = struct {
                         if (self.branch_depth) |d| {
                             if (d == 0) {
                                 self.branch_depth = null;
+                                // For loop restart, compact to params
+                                self.compactBlockResults(loop_stack_base, lsig.params);
                                 continue; // restart loop
                             } else {
                                 self.branch_depth = d - 1;
-                                // Scan from body start to find loop's end
                                 pc = scanToEnd(code, body_start);
                                 return pc;
                             }
@@ -1816,14 +1875,17 @@ pub const Interpreter = struct {
                     }
                 },
                 0x04 => { // if
+                    const isig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
                     const cond = try self.popI32();
+                    const if_stack_base = self.stack.items.len -| isig.params;
                     if (cond != 0) {
                         pc = try self.dispatch(code, body_start, locals);
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
                                 self.branch_depth = null;
+                                self.compactBlockResults(if_stack_base, isig.results);
                                 pc = scanToEnd(code, body_start);
                             } else {
                                 self.branch_depth = d - 1;
@@ -1845,6 +1907,7 @@ pub const Interpreter = struct {
                             if (self.branch_depth) |d| {
                                 if (d == 0) {
                                     self.branch_depth = null;
+                                    self.compactBlockResults(if_stack_base, isig.results);
                                     pc = scanToEnd(code, else_start);
                                 } else {
                                     self.branch_depth = d - 1;
@@ -1944,6 +2007,14 @@ pub const Interpreter = struct {
                 },
                 0x1a => _ = try self.popValue(), // drop
                 0x1b => try self.selectOp(), // select
+                0x1c => { // select t*
+                    var t = pc;
+                    const vec_len = readCodeU32(code, &t);
+                    var ti: u32 = 0;
+                    while (ti < vec_len) : (ti += 1) _ = readCodeU32(code, &t);
+                    pc = t;
+                    try self.selectOp();
+                },
                 0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(locals[idx]); },
                 0x21 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; locals[idx] = try self.popValue(); },
                 0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
@@ -2315,6 +2386,11 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         },
         0x10 => _ = readCodeU32(code, &p), // call
         0x11 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect
+        0x1c => { // select t*
+            const vec_len = readCodeU32(code, &p);
+            var ti: u32 = 0;
+            while (ti < vec_len) : (ti += 1) _ = readCodeU32(code, &p);
+        },
         0x20, 0x21, 0x22, 0x23, 0x24 => _ = readCodeU32(code, &p),
         0x25, 0x26 => _ = readCodeU32(code, &p), // table.get/set
         0x28...0x3e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
