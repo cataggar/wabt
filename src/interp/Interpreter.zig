@@ -1129,29 +1129,35 @@ pub const Interpreter = struct {
             try self.pushValue(.{ .i32 = -1 });
             return;
         }
-        const old_pages: i32 = @intCast(self.instance.memory.items.len / page_size);
-        const new_len = self.instance.memory.items.len + @as(usize, @intCast(delta)) * page_size;
+        const old_pages: u32 = @intCast(self.instance.memory.items.len / page_size);
+        const new_pages: u64 = @as(u64, old_pages) + @as(u64, @as(u32, @bitCast(delta)));
+
+        // Wasm spec: max 65536 pages (4GB)
+        if (new_pages > 65536) {
+            try self.pushValue(.{ .i32 = -1 });
+            return;
+        }
 
         // Apply max limit from the module definition if present.
         if (self.instance.module.memories.items.len > 0) {
             const mem = self.instance.module.memories.items[0];
             if (mem.@"type".limits.has_max) {
-                const max_bytes = @as(usize, @intCast(mem.@"type".limits.max)) * page_size;
-                if (new_len > max_bytes) {
+                if (new_pages > mem.@"type".limits.max) {
                     try self.pushValue(.{ .i32 = -1 });
                     return;
                 }
             }
         }
 
+        const new_len = @as(usize, @intCast(new_pages)) * page_size;
         self.instance.memory.resize(self.allocator, new_len) catch {
             try self.pushValue(.{ .i32 = -1 });
             return;
         };
         // Zero-initialise newly grown pages.
-        const old_len = @as(usize, @intCast(old_pages)) * page_size;
+        const old_len = @as(usize, old_pages) * page_size;
         @memset(self.instance.memory.items[old_len..], 0);
-        try self.pushValue(.{ .i32 = old_pages });
+        try self.pushValue(.{ .i32 = @bitCast(old_pages) });
     }
 
     // ── Select ──────────────────────────────────────────────────────────
