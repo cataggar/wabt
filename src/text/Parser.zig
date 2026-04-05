@@ -115,6 +115,10 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_elem => try p.parseElem(&module),
             .kw_data => try p.parseData(&module),
             .kw_definition => try p.skipSExpr(),
+            .invalid => {
+                p.malformed = true;
+                try p.skipSExpr();
+            },
             else => try p.skipSExpr(),
         }
         try p.expect(.r_paren);
@@ -936,6 +940,7 @@ const Parser = struct {
                         has_operands = true;
                     } else {
                         // Could be additional immediates — skip them
+                        if (self.peek().kind == .invalid) self.malformed = true;
                         _ = self.advance();
                     }
                 }
@@ -1045,7 +1050,10 @@ const Parser = struct {
                         targets.append(self.allocator, idx) catch return;
                     } else {
                         const label_tok = self.advance();
-                        const depth = self.resolveLabelDepth(label_tok.text) orelse 0;
+                        const depth = self.resolveLabelDepth(label_tok.text) orelse blk: {
+                            self.malformed = true;
+                            break :blk 0;
+                        };
                         targets.append(self.allocator, depth) catch return;
                     }
                 }
@@ -1097,6 +1105,35 @@ const Parser = struct {
                         // No '(' follows, restore and treat as type index
                         self.lexer.pos = sp_ci;
                         self.peeked = spk_ci;
+                    }
+                }
+                // Pre-scan: check type/param/result ordering
+                // Valid order is: (type ...)? (param ...)* (result ...)*
+                {
+                    var scan = Lexer.init(self.lexer.source);
+                    scan.pos = if (self.peeked) |pk| pk.offset else self.lexer.pos;
+                    var saw_type = false;
+                    var saw_param = false;
+                    var saw_result = false;
+                    while (true) {
+                        const stok = scan.next();
+                        if (stok.kind != .l_paren) break;
+                        const inner = scan.next();
+                        if (inner.kind == .kw_type) {
+                            if (saw_param or saw_result) self.malformed = true;
+                            saw_type = true;
+                        } else if (inner.kind == .kw_param) {
+                            if (saw_result) self.malformed = true;
+                            saw_param = true;
+                        } else if (inner.kind == .kw_result) {
+                            saw_result = true;
+                        } else break;
+                        // Skip to matching ')'
+                        var sdepth: u32 = 1;
+                        while (sdepth > 0) {
+                            const s2 = scan.next();
+                            if (s2.kind == .l_paren) sdepth += 1 else if (s2.kind == .r_paren) sdepth -= 1 else if (s2.kind == .eof) break;
+                        }
                     }
                 }
                 // Parse type use: (type $idx) or inline
