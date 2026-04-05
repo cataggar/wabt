@@ -771,6 +771,39 @@ const Parser = struct {
             }
         }
 
+        // Pre-scan: check for misplaced (param ...) or (result ...) in function body.
+        // These must appear before any instructions, not after.
+        {
+            var scan = Lexer.init(self.lexer.source);
+            scan.pos = if (self.peeked) |pk| pk.offset else self.lexer.pos;
+            var saw_instr = false;
+            var depth: u32 = 0;
+            scan_loop: while (true) {
+                const stok = scan.next();
+                switch (stok.kind) {
+                    .eof => break,
+                    .l_paren => {
+                        if (depth == 0) {
+                            const inner = scan.next();
+                            if (inner.kind == .kw_param or inner.kind == .kw_result) {
+                                if (saw_instr) { self.malformed = true; break :scan_loop; }
+                            } else if (inner.kind != .kw_local) {
+                                saw_instr = true;
+                            }
+                        }
+                        depth += 1;
+                    },
+                    .r_paren => {
+                        if (depth == 0) break;
+                        depth -= 1;
+                    },
+                    else => {
+                        if (depth == 0) saw_instr = true;
+                    },
+                }
+            }
+        }
+
         // Parse function body instructions → emit bytecode
         var code: std.ArrayListUnmanaged(u8) = .{};
         defer code.deinit(self.allocator);
