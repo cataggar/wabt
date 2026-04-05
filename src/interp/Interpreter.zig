@@ -1612,6 +1612,11 @@ pub const Interpreter = struct {
         }
         // Check table maximum
         const new_size: u64 = @as(u64, old_size) + delta;
+        // Reject growing beyond the implementation limit
+        if (new_size > 10_000_000) {
+            try self.pushValue(.{ .i32 = -1 });
+            return;
+        }
         if (tbl_idx < self.instance.module.tables.items.len) {
             const tbl_type = self.instance.module.tables.items[tbl_idx];
             if (tbl_type.@"type".limits.has_max and new_size > tbl_type.@"type".limits.max) {
