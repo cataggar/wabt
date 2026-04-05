@@ -201,7 +201,11 @@ pub const Interpreter = struct {
             .index => |i| i,
             .name => return error.Unimplemented,
         };
-        return self.callFunc(idx, args);
+        const stack_base = self.stack.items.len;
+        const result = try self.callFunc(idx, args);
+        // Clean up any stale values left on the stack from multi-return or leaky calls
+        self.stack.shrinkRetainingCapacity(stack_base);
+        return result;
     }
 
     /// Call a function by index.
@@ -1412,13 +1416,14 @@ pub const Interpreter = struct {
                 0x00 => return error.Unreachable,
                 0x01 => {},
                 0x02 => { // block
-                    pc = skipBlockType(code, pc);
-                    pc = try self.dispatch(code, pc, locals);
+                    const body_start = skipBlockType(code, pc);
+                    pc = try self.dispatch(code, body_start, locals);
                     if (self.returning) return pc;
                     if (self.branch_depth) |d| {
                         if (d == 0) {
                             self.branch_depth = null;
-                            pc = scanToEnd(code, pc);
+                            // Scan from body start to correctly skip nested structures
+                            pc = scanToEnd(code, body_start);
                         } else {
                             self.branch_depth = d - 1;
                             return pc;
@@ -1426,10 +1431,10 @@ pub const Interpreter = struct {
                     }
                 },
                 0x03 => { // loop
-                    pc = skipBlockType(code, pc);
-                    const loop_start = pc;
+                    const body_start = skipBlockType(code, pc);
+                    pc = body_start;
                     while (true) {
-                        pc = try self.dispatch(code, loop_start, locals);
+                        pc = try self.dispatch(code, body_start, locals);
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
@@ -1437,6 +1442,8 @@ pub const Interpreter = struct {
                                 continue; // restart loop
                             } else {
                                 self.branch_depth = d - 1;
+                                // Scan from body start to find loop's end
+                                pc = scanToEnd(code, body_start);
                                 return pc;
                             }
                         }
@@ -1444,15 +1451,15 @@ pub const Interpreter = struct {
                     }
                 },
                 0x04 => { // if
-                    pc = skipBlockType(code, pc);
+                    const body_start = skipBlockType(code, pc);
                     const cond = try self.popI32();
                     if (cond != 0) {
-                        pc = try self.dispatch(code, pc, locals);
+                        pc = try self.dispatch(code, body_start, locals);
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
                                 self.branch_depth = null;
-                                pc = scanToEnd(code, pc);
+                                pc = scanToEnd(code, body_start);
                             } else {
                                 self.branch_depth = d - 1;
                                 return pc;
@@ -1464,15 +1471,16 @@ pub const Interpreter = struct {
                             }
                         }
                     } else {
-                        pc = scanToElseOrEnd(code, pc);
+                        pc = scanToElseOrEnd(code, body_start);
                         if (pc > 0 and pc - 1 < code.len and code[pc - 1] == 0x05) {
+                            const else_start = pc;
                             // Execute else branch
                             pc = try self.dispatch(code, pc, locals);
                             if (self.returning) return pc;
                             if (self.branch_depth) |d| {
                                 if (d == 0) {
                                     self.branch_depth = null;
-                                    pc = scanToEnd(code, pc);
+                                    pc = scanToEnd(code, else_start);
                                 } else {
                                     self.branch_depth = d - 1;
                                     return pc;
