@@ -478,7 +478,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     const call_result = interp.callExport(func_name, args) catch |err| {
         result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
     };
 
@@ -498,7 +498,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
+            if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
         }
     } else {
         // Function returned no value
