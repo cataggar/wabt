@@ -1,2 +1,0 @@
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(type (func (result i32) (param i32))) "
-third_party\testsuite\type.wast: 2 passed, 1 failed, 0 skipped (3 total)

@@ -1,9 +1,0 @@
-  FAIL assert_invalid: validation should have failed: module[0..120]="(module
-    (table $t 0 funcref)
-    (func $type-value-vs-funcref (param $r externref)
-      (table.fill $t (i32.cons"
-  FAIL assert_invalid: validation should have failed: module[0..120]="(module
-    (table $t1 1 externref)
-    (table $t2 1 funcref)
-    (func $type-value-externref-vs-funcref-multi (param"
-third_party\testsuite\table_fill.wast: 43 passed, 2 failed, 0 skipped (45 total)

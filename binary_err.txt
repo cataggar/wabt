@@ -1,1 +1,0 @@
-third_party\testsuite\binary.wast: 91 passed, 25 failed, 20 skipped (136 total)

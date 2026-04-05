@@ -1,7 +1,0 @@
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load32 (local.get 0))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load32_u (local.get 0))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load32_s (local.get 0))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load64 (local.get 0))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load64_u (local.get 0))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (param i32) (result i32) (i32.load64_s (local.get 0))) "
-third_party\testsuite\load.wast: 91 passed, 6 failed, 0 skipped (97 total)

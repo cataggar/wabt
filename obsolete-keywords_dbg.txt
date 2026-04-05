@@ -1,5 +1,0 @@
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (drop (grow_memory (i32.const 0)))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func (local $i i32) (drop (tee_local $i (i32.const 0)))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func (drop (i32.wrap/i64 (i64.const 0)))) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func (drop (i32.trunc_s:sat/f32 (f32.const 0)))) "
-third_party\testsuite\obsolete-keywords.wast: 7 passed, 4 failed, 0 skipped (11 total)

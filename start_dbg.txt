@@ -1,2 +1,0 @@
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(module (func $a (unreachable)) (func $b (unreachable)) (start $a) (start $b)) "
-third_party\testsuite\start.wast: 19 passed, 1 failed, 0 skipped (20 total)
