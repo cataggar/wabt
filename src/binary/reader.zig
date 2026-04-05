@@ -164,12 +164,19 @@ const Reader = struct {
     }
 
     fn skipInitExpr(self: *Reader) ReadError!void {
+        _ = try self.readInitExprBytes();
+    }
+
+    /// Read an init expression and return a slice of the underlying data
+    /// that contains the expression bytecode (including the 0x0b terminator).
+    fn readInitExprBytes(self: *Reader) ReadError![]const u8 {
+        const start = self.pos;
         var depth: u32 = 0;
         while (true) {
             const byte = try self.readByte();
             switch (byte) {
                 0x0b => {
-                    if (depth == 0) return;
+                    if (depth == 0) return self.data[start..self.pos];
                     depth -= 1;
                 },
                 0x02, 0x03, 0x04 => depth += 1,
@@ -387,7 +394,7 @@ const Reader = struct {
 
             if (!is_passive) {
                 if (has_explicit_index) seg.table_var = .{ .index = try self.readU32() };
-                try self.skipInitExpr();
+                seg.offset_expr_bytes = try self.readInitExprBytes();
             }
 
             if (is_passive or has_explicit_index) {
@@ -455,7 +462,7 @@ const Reader = struct {
             } else {
                 seg.kind = .active;
                 if (flags & 2 != 0) seg.memory_var = .{ .index = try self.readU32() };
-                try self.skipInitExpr();
+                seg.offset_expr_bytes = try self.readInitExprBytes();
             }
 
             const data_len = try self.readU32();
