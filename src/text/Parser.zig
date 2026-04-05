@@ -121,10 +121,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
-    if (p.malformed) {
-        std.debug.print("  DEBUG: malformed detected in parseModule\n", .{});
-        return error.InvalidModule;
-    }
+    if (p.malformed) return error.InvalidModule;
     return module;
 }
 
@@ -278,11 +275,12 @@ const Parser = struct {
     }
 
     fn advance(self: *Parser) Lex.Token {
-        if (self.peeked) |t| {
+        const tok = if (self.peeked) |t| blk: {
             self.peeked = null;
-            return t;
-        }
-        return self.lexer.next();
+            break :blk t;
+        } else self.lexer.next();
+        if (tok.kind == .invalid) self.malformed = true;
+        return tok;
     }
 
     fn expect(self: *Parser, kind: TokenKind) ParseError!void {
@@ -1045,7 +1043,10 @@ const Parser = struct {
                         targets.append(self.allocator, idx) catch return;
                     } else {
                         const label_tok = self.advance();
-                        const depth = self.resolveLabelDepth(label_tok.text) orelse 0;
+                        const depth = self.resolveLabelDepth(label_tok.text) orelse blk: {
+                            self.malformed = true;
+                            break :blk 0;
+                        };
                         targets.append(self.allocator, depth) catch return;
                     }
                 }
