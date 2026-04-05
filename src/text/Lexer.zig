@@ -173,6 +173,14 @@ pub const Lexer = struct {
             const ch = self.source[self.pos];
             if (ch == '"') {
                 self.pos += 1;
+                // Reject glued tokens: string immediately followed by word/string/id
+                if (self.pos < self.source.len) {
+                    const nc = self.source[self.pos];
+                    if (isWordChar(nc) or nc == '$' or nc == '"') {
+                        self.consumeGluedContent();
+                        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+                    }
+                }
                 return .{ .kind = .string, .text = self.source[start..self.pos], .offset = start };
             }
             if (ch == '\\') {
@@ -198,6 +206,11 @@ pub const Lexer = struct {
             while (self.pos < self.source.len and isIdChar(self.source[self.pos])) {
                 self.pos += 1;
             }
+            // Reject identifier glued to string
+            if (self.pos < self.source.len and self.source[self.pos] == '"') {
+                self.consumeGluedContent();
+                return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+            }
             const text = self.source[start..self.pos];
             return .{ .kind = .identifier, .text = text, .offset = start };
         }
@@ -210,6 +223,12 @@ pub const Lexer = struct {
         const text = self.source[start..self.pos];
         if (text.len == 0) {
             self.pos += 1;
+            return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+        }
+
+        // Reject word glued to string (e.g. data"a", 0"a")
+        if (self.pos < self.source.len and self.source[self.pos] == '"') {
+            self.consumeGluedContent();
             return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
         }
 
@@ -241,6 +260,23 @@ pub const Lexer = struct {
             ' ', '\t', '\n', '\r', '(', ')', '"', ';' => false,
             else => c >= 0x21 and c <= 0x7e,
         };
+    }
+
+    /// Consume remaining glued content (strings, words, identifiers) without separators.
+    fn consumeGluedContent(self: *Lexer) void {
+        while (self.pos < self.source.len) {
+            const gc = self.source[self.pos];
+            if (gc == '"') {
+                self.pos += 1;
+                while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                    if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) self.pos += 1;
+                    self.pos += 1;
+                }
+                if (self.pos < self.source.len) self.pos += 1;
+            } else if (isWordChar(gc) or gc == '$') {
+                self.pos += 1;
+            } else break;
+        }
     }
 
     fn skipWhitespaceAndComments(self: *Lexer) void {
