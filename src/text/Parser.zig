@@ -1107,7 +1107,6 @@ const Parser = struct {
                         if (param_count < 16) param_types_buf[param_count] = vt;
                         param_count += 1;
                     } else |_| {
-                        // parseValType may have consumed a token; avoid infinite loop
                         if (self.lexer.pos == before_pos) _ = self.advance();
                         break;
                     }

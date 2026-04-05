@@ -131,18 +131,6 @@ const RunState = struct {
             return false;
         };
 
-        // Resolve global imports BEFORE instantiation so init expressions
-        // like (global.get 0) can see imported global values.
-        self.resolveGlobalImports(mod, inst);
-
-        inst.instantiate() catch {
-            inst.deinit();
-            self.allocator.destroy(inst);
-            mod.deinit();
-            self.allocator.destroy(mod);
-            return false;
-        };
-
         const interp = self.allocator.create(Interp.Interpreter) catch {
             inst.deinit();
             self.allocator.destroy(inst);
@@ -152,8 +140,19 @@ const RunState = struct {
         };
         interp.* = Interp.Interpreter.init(self.allocator, inst);
 
-        // Resolve function imports against registered modules.
+        // Resolve function and global imports BEFORE instantiation so init
+        // expressions like (global.get 0) can see imported global values.
         self.resolveImports(mod, interp);
+
+        inst.instantiate() catch {
+            interp.deinit();
+            self.allocator.destroy(interp);
+            inst.deinit();
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return false;
+        };
 
         // Execute the start function if present.
         if (mod.start_var) |sv| {
@@ -205,28 +204,6 @@ const RunState = struct {
     fn getNamedInterpreter(self: *RunState, id: []const u8) ?*Interp.Interpreter {
         if (self.named_modules.get(id)) |triple| return triple.interpreter;
         return null;
-    }
-
-    /// Resolve global imports on an instance before instantiation.
-    fn resolveGlobalImports(self: *RunState, mod: *Mod.Module, inst: *Interp.Instance) void {
-        if (mod.num_global_imports == 0) return;
-        var global_import_idx: u32 = 0;
-        for (mod.imports.items) |imp| {
-            if (imp.kind != .global) continue;
-            defer global_import_idx += 1;
-            const triple = self.registered_modules.get(imp.module_name) orelse continue;
-            const exp = triple.module.getExport(imp.field_name) orelse continue;
-            if (exp.kind != .global) continue;
-            const src_idx: u32 = switch (exp.var_) {
-                .index => |i| i,
-                .name => continue,
-            };
-            if (src_idx < triple.instance.globals.items.len and
-                global_import_idx < inst.globals.items.len)
-            {
-                inst.globals.items[global_import_idx] = triple.instance.globals.items[src_idx];
-            }
-        }
     }
 
     /// Resolve function and global imports by linking them to exports in registered modules.
