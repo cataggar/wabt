@@ -217,8 +217,8 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .invoke => processInvoke(allocator, sexpr.text, &state, &result),
             .register => processRegister(sexpr.text, &state, &result),
             .get => processGet(sexpr.text, &state, &result),
-            .assert_exhaustion,
-            .assert_unlinkable,
+            .assert_exhaustion => processAssertExhaustion(allocator, sexpr.text, &state, &result),
+            .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &result),
             .unknown,
             => {
                 result.skipped += 1;
@@ -576,6 +576,92 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         // Got an error (trap) — this is expected
         result.passed += 1;
     }
+}
+
+fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
+    _ = allocator;
+    // (assert_exhaustion (invoke "f" ...) "msg")
+    // Same as assert_trap — call a function and expect it to error (stack overflow).
+    const inv = findInvoke(sexpr) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const interp = resolveInterpreter(inv, state) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const func_name = extractStringLiteral(inv) orelse {
+        result.skipped += 1;
+        return;
+    };
+
+    var args_buf: [16]Interp.Value = undefined;
+    const args = parseInvokeArgs(inv, &args_buf);
+
+    if (interp.callExport(func_name, args)) |_| {
+        result.failed += 1;
+    } else |_| {
+        result.passed += 1;
+    }
+}
+
+fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, result: *Result) void {
+    // (assert_unlinkable (module ...) "msg")
+    const inner = findEmbeddedModule(sexpr) orelse {
+        result.skipped += 1;
+        return;
+    };
+
+    if (isBinaryModule(inner)) {
+        const wasm_bytes = decodeWastHexStrings(allocator, inner) catch {
+            result.passed += 1;
+            return;
+        };
+        defer allocator.free(wasm_bytes);
+        var module = binary_reader.readModule(allocator, wasm_bytes) catch {
+            result.passed += 1;
+            return;
+        };
+        defer module.deinit();
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1;
+            return;
+        };
+        // Module validated OK — linking should still fail for unlinkable
+        result.failed += 1;
+        return;
+    }
+
+    if (isQuoteModule(inner)) {
+        result.skipped += 1;
+        return;
+    }
+
+    var module = Parser.parseModule(allocator, inner) catch {
+        result.passed += 1;
+        return;
+    };
+    defer module.deinit();
+
+    Validator.validate(&module, .{}) catch {
+        result.passed += 1;
+        return;
+    };
+
+    // For assert_unlinkable, the module should fail at instantiation/linking.
+    // If validation passes, try instantiation.
+    var instance = Interp.Instance.init(allocator, &module) catch {
+        result.passed += 1;
+        return;
+    };
+    defer instance.deinit();
+    instance.instantiate() catch {
+        result.passed += 1;
+        return;
+    };
+
+    // Everything succeeded — unexpected for assert_unlinkable.
+    result.failed += 1;
 }
 
 fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
