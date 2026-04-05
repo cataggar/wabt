@@ -7,6 +7,7 @@
 const std = @import("std");
 const Mod = @import("../Module.zig");
 const types = @import("../types.zig");
+const leb128 = @import("../leb128.zig");
 
 const page_size: u32 = types.default_page_size; // 65 536
 
@@ -104,6 +105,61 @@ pub const Instance = struct {
         self.globals.deinit(self.allocator);
         self.table.deinit(self.allocator);
     }
+
+    /// Run module instantiation: evaluate global init exprs, copy data segments,
+    /// populate table from element segments.
+    pub fn instantiate(self: *Instance) TrapError!void {
+        // Evaluate global init expressions
+        for (self.module.globals.items, 0..) |g, i| {
+            if (g.init_expr_bytes.len > 0) {
+                const val = evalConstExpr(self, g.init_expr_bytes) orelse continue;
+                if (i < self.globals.items.len) self.globals.items[i] = val;
+            }
+        }
+
+        // Copy active data segments into memory
+        for (self.module.data_segments.items) |seg| {
+            if (seg.kind != .active or seg.data.len == 0) continue;
+            var offset: usize = 0;
+            if (seg.offset_expr_bytes.len > 0) {
+                const off_val = evalConstExpr(self, seg.offset_expr_bytes);
+                if (off_val) |v| {
+                    offset = switch (v) {
+                        .i32 => |x| @intCast(@as(u32, @bitCast(x))),
+                        .i64 => |x| @intCast(@as(u64, @bitCast(x))),
+                        else => 0,
+                    };
+                }
+            }
+            if (offset + seg.data.len <= self.memory.items.len) {
+                @memcpy(self.memory.items[offset .. offset + seg.data.len], seg.data);
+            }
+        }
+
+        // Populate table from active element segments
+        for (self.module.elem_segments.items) |seg| {
+            if (seg.kind != .active) continue;
+            var offset: usize = 0;
+            if (seg.offset_expr_bytes.len > 0) {
+                const off_val = evalConstExpr(self, seg.offset_expr_bytes);
+                if (off_val) |v| {
+                    offset = switch (v) {
+                        .i32 => |x| @intCast(@as(u32, @bitCast(x))),
+                        else => 0,
+                    };
+                }
+            }
+            for (seg.elem_var_indices.items, 0..) |var_, j| {
+                const table_idx = offset + j;
+                if (table_idx < self.table.items.len) {
+                    switch (var_) {
+                        .index => |idx| self.table.items[table_idx] = idx,
+                        .name => {},
+                    }
+                }
+            }
+        }
+    }
 };
 
 // ── Interpreter ──────────────────────────────────────────────────────────
@@ -120,6 +176,10 @@ pub const Interpreter = struct {
     call_depth: u32 = 0,
     /// Maximum allowed call nesting depth.
     max_call_depth: u32 = 1000,
+    /// Remaining branch depth (set by br/br_if instructions).
+    branch_depth: ?u32 = null,
+    /// Set when a return instruction is executed.
+    returning: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
@@ -152,20 +212,72 @@ pub const Interpreter = struct {
         self.call_depth += 1;
         defer self.call_depth -= 1;
 
-        // Push arguments onto the stack.
-        for (args) |a| try self.pushValue(a);
-
-        // Instruction dispatch from bytecode is not yet implemented;
-        // return a result value from the stack if one is present.
         const func = self.instance.module.funcs.items[func_idx];
-        const sig = func.decl.sig;
-        if (sig.results.len > 0) {
-            if (self.stack.items.len > 0) {
-                return self.popValue();
+        if (func.is_import) return error.Unimplemented;
+
+        const code = func.code_bytes;
+        if (code.len == 0) return null;
+
+        // Resolve function signature
+        const sig = self.resolveSig(func.decl);
+
+        // Initialize locals: params + declared locals
+        const num_locals = sig.params.len + func.local_types.items.len;
+        var locals = self.allocator.alloc(Value, num_locals) catch return error.OutOfMemory;
+        defer self.allocator.free(locals);
+        // Copy arguments into parameter slots
+        for (args, 0..) |arg, i| {
+            if (i < locals.len) locals[i] = arg;
+        }
+        // Zero-initialize declared locals
+        for (sig.params.len..num_locals) |i| {
+            if (i < func.local_types.items.len + sig.params.len) {
+                const lt = func.local_types.items[i - sig.params.len];
+                locals[i] = switch (lt) {
+                    .i64 => .{ .i64 = 0 },
+                    .f32 => .{ .f32 = 0.0 },
+                    .f64 => .{ .f64 = 0.0 },
+                    else => .{ .i32 = 0 },
+                };
             }
-            return null;
+        }
+
+        // Save and restore control flow state across calls
+        const saved_branch = self.branch_depth;
+        const saved_returning = self.returning;
+        self.branch_depth = null;
+        self.returning = false;
+        defer {
+            self.branch_depth = saved_branch;
+            self.returning = saved_returning;
+        }
+
+        // Record stack depth before execution
+        const stack_base = self.stack.items.len;
+
+        // Execute bytecode
+        _ = try self.dispatch(code, 0, locals);
+
+        // Return value
+        if (sig.results.len > 0 and self.stack.items.len > stack_base) {
+            return self.popValue() catch null;
         }
         return null;
+    }
+
+    /// Resolve function signature from a FuncDeclaration.
+    fn resolveSig(self: *Interpreter, decl: Mod.FuncDeclaration) types.FuncType {
+        if (decl.type_var == .index) {
+            const idx = decl.type_var.index;
+            if (idx < self.instance.module.module_types.items.len) {
+                const te = self.instance.module.module_types.items[idx];
+                switch (te) {
+                    .func_type => |ft| return .{ .params = ft.params, .results = ft.results },
+                    else => {},
+                }
+            }
+        }
+        return decl.sig;
     }
 
     // ── Stack helpers ────────────────────────────────────────────────────
@@ -973,7 +1085,824 @@ pub const Interpreter = struct {
         @memset(self.instance.memory.items[old_len..], 0);
         try self.pushValue(.{ .i32 = old_pages });
     }
+
+    // ── Select ──────────────────────────────────────────────────────────
+
+    pub fn selectOp(self: *Interpreter) TrapError!void {
+        const cond = try self.popI32();
+        const val2 = try self.popValue();
+        const val1 = try self.popValue();
+        try self.pushValue(if (cond != 0) val1 else val2);
+    }
+
+    // ── f32 comparison ──────────────────────────────────────────────────
+
+    pub fn f32Eq(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a == b) });
+    }
+
+    pub fn f32Ne(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a != b) });
+    }
+
+    pub fn f32Lt(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a < b) });
+    }
+
+    pub fn f32Gt(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a > b) });
+    }
+
+    pub fn f32Le(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a <= b) });
+    }
+
+    pub fn f32Ge(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .i32 = @intFromBool(a >= b) });
+    }
+
+    // ── f64 comparison ──────────────────────────────────────────────────
+
+    pub fn f64Eq(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a == b) });
+    }
+
+    pub fn f64Ne(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a != b) });
+    }
+
+    pub fn f64Lt(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a < b) });
+    }
+
+    pub fn f64Gt(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a > b) });
+    }
+
+    pub fn f64Le(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a <= b) });
+    }
+
+    pub fn f64Ge(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .i32 = @intFromBool(a >= b) });
+    }
+
+    // ── Copysign ────────────────────────────────────────────────────────
+
+    pub fn f32Copysign(self: *Interpreter) TrapError!void {
+        const b = try self.popF32();
+        const a = try self.popF32();
+        try self.pushValue(.{ .f32 = std.math.copysign(a, b) });
+    }
+
+    pub fn f64Copysign(self: *Interpreter) TrapError!void {
+        const b = try self.popF64();
+        const a = try self.popF64();
+        try self.pushValue(.{ .f64 = std.math.copysign(a, b) });
+    }
+
+    // ── Additional truncation conversions ───────────────────────────────
+
+    pub fn i32TruncF32U(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        if (a >= @as(f32, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+            return error.IntegerOverflow;
+        const u: u32 = @intFromFloat(a);
+        try self.pushValue(.{ .i32 = @bitCast(u) });
+    }
+
+    pub fn i32TruncF64U(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        if (a >= @as(f64, @floatFromInt(@as(i64, std.math.maxInt(u32)) + 1)) or a < 0.0)
+            return error.IntegerOverflow;
+        const u: u32 = @intFromFloat(a);
+        try self.pushValue(.{ .i32 = @bitCast(u) });
+    }
+
+    pub fn i64TruncF32S(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        const max_f: f32 = @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1);
+        const min_f: f32 = @floatFromInt(@as(i128, std.math.minInt(i64)));
+        if (a >= max_f or a < min_f) return error.IntegerOverflow;
+        try self.pushValue(.{ .i64 = @intFromFloat(a) });
+    }
+
+    pub fn i64TruncF32U(self: *Interpreter) TrapError!void {
+        const a = try self.popF32();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        const max_f: f32 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
+        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        const u: u64 = @intFromFloat(a);
+        try self.pushValue(.{ .i64 = @bitCast(u) });
+    }
+
+    pub fn i64TruncF64S(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        const max_f: f64 = @floatFromInt(@as(i128, std.math.maxInt(i64)) + 1);
+        const min_f: f64 = @floatFromInt(@as(i128, std.math.minInt(i64)));
+        if (a >= max_f or a < min_f) return error.IntegerOverflow;
+        try self.pushValue(.{ .i64 = @intFromFloat(a) });
+    }
+
+    pub fn i64TruncF64U(self: *Interpreter) TrapError!void {
+        const a = try self.popF64();
+        if (std.math.isNan(a)) return error.InvalidConversion;
+        const max_f: f64 = @floatFromInt(@as(u128, std.math.maxInt(u64)) + 1);
+        if (a >= max_f or a < 0.0) return error.IntegerOverflow;
+        const u: u64 = @intFromFloat(a);
+        try self.pushValue(.{ .i64 = @bitCast(u) });
+    }
+
+    // ── Sign extension ──────────────────────────────────────────────────
+
+    pub fn i32Extend8S(self: *Interpreter) TrapError!void {
+        const a = try self.popI32();
+        try self.pushValue(.{ .i32 = @as(i32, @as(i8, @truncate(a))) });
+    }
+
+    pub fn i32Extend16S(self: *Interpreter) TrapError!void {
+        const a = try self.popI32();
+        try self.pushValue(.{ .i32 = @as(i32, @as(i16, @truncate(a))) });
+    }
+
+    pub fn i64Extend8S(self: *Interpreter) TrapError!void {
+        const a = try self.popI64();
+        try self.pushValue(.{ .i64 = @as(i64, @as(i8, @truncate(a))) });
+    }
+
+    pub fn i64Extend16S(self: *Interpreter) TrapError!void {
+        const a = try self.popI64();
+        try self.pushValue(.{ .i64 = @as(i64, @as(i16, @truncate(a))) });
+    }
+
+    pub fn i64Extend32S(self: *Interpreter) TrapError!void {
+        const a = try self.popI64();
+        try self.pushValue(.{ .i64 = @as(i64, @as(i32, @truncate(a))) });
+    }
+
+    // ── Sub-word memory loads ───────────────────────────────────────────
+
+    pub fn i32Load8S(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const val: i8 = @bitCast(self.instance.memory.items[@intCast(addr)]);
+        try self.pushValue(.{ .i32 = @as(i32, val) });
+    }
+
+    pub fn i32Load8U(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const val = self.instance.memory.items[@intCast(addr)];
+        try self.pushValue(.{ .i32 = @as(i32, val) });
+    }
+
+    pub fn i32Load16S(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(i16, self.instance.memory.items[idx..][0..2], .little);
+        try self.pushValue(.{ .i32 = @as(i32, val) });
+    }
+
+    pub fn i32Load16U(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(u16, self.instance.memory.items[idx..][0..2], .little);
+        try self.pushValue(.{ .i32 = @as(i32, val) });
+    }
+
+    pub fn i64Load8S(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const val: i8 = @bitCast(self.instance.memory.items[@intCast(addr)]);
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    pub fn i64Load8U(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const val = self.instance.memory.items[@intCast(addr)];
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    pub fn i64Load16S(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(i16, self.instance.memory.items[idx..][0..2], .little);
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    pub fn i64Load16U(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(u16, self.instance.memory.items[idx..][0..2], .little);
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    pub fn i64Load32S(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(i32, self.instance.memory.items[idx..][0..4], .little);
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    pub fn i64Load32U(self: *Interpreter, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const val = std.mem.readInt(u32, self.instance.memory.items[idx..][0..4], .little);
+        try self.pushValue(.{ .i64 = @as(i64, val) });
+    }
+
+    // ── Sub-word memory stores ──────────────────────────────────────────
+
+    pub fn i32Store8(self: *Interpreter, offset: u32) TrapError!void {
+        const val = try self.popI32();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        self.instance.memory.items[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
+    }
+
+    pub fn i32Store16(self: *Interpreter, offset: u32) TrapError!void {
+        const val = try self.popI32();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        std.mem.writeInt(u16, self.instance.memory.items[idx..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
+    }
+
+    pub fn i64Store8(self: *Interpreter, offset: u32) TrapError!void {
+        const val = try self.popI64();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        self.instance.memory.items[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
+    }
+
+    pub fn i64Store16(self: *Interpreter, offset: u32) TrapError!void {
+        const val = try self.popI64();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        std.mem.writeInt(u16, self.instance.memory.items[idx..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
+    }
+
+    pub fn i64Store32(self: *Interpreter, offset: u32) TrapError!void {
+        const val = try self.popI64();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        std.mem.writeInt(u32, self.instance.memory.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
+    }
+
+    // ── Bytecode dispatch ───────────────────────────────────────────────
+
+    fn dispatch(self: *Interpreter, code: []const u8, start_pc: usize, locals: []Value) TrapError!usize {
+        var pc = start_pc;
+        while (pc < code.len) {
+            const opcode = code[pc];
+            pc += 1;
+            switch (opcode) {
+                0x00 => return error.Unreachable,
+                0x01 => {},
+                0x02 => { // block
+                    pc = skipBlockType(code, pc);
+                    pc = try self.dispatch(code, pc, locals);
+                    if (self.returning) return pc;
+                    if (self.branch_depth) |d| {
+                        if (d == 0) {
+                            self.branch_depth = null;
+                            pc = scanToEnd(code, pc);
+                        } else {
+                            self.branch_depth = d - 1;
+                            return pc;
+                        }
+                    }
+                },
+                0x03 => { // loop
+                    pc = skipBlockType(code, pc);
+                    const loop_start = pc;
+                    while (true) {
+                        pc = try self.dispatch(code, loop_start, locals);
+                        if (self.returning) return pc;
+                        if (self.branch_depth) |d| {
+                            if (d == 0) {
+                                self.branch_depth = null;
+                                continue; // restart loop
+                            } else {
+                                self.branch_depth = d - 1;
+                                return pc;
+                            }
+                        }
+                        break;
+                    }
+                },
+                0x04 => { // if
+                    pc = skipBlockType(code, pc);
+                    const cond = try self.popI32();
+                    if (cond != 0) {
+                        pc = try self.dispatch(code, pc, locals);
+                        if (self.returning) return pc;
+                        if (self.branch_depth) |d| {
+                            if (d == 0) {
+                                self.branch_depth = null;
+                                pc = scanToEnd(code, pc);
+                            } else {
+                                self.branch_depth = d - 1;
+                                return pc;
+                            }
+                        } else {
+                            // Normal end — check if we stopped at else (need to skip else body)
+                            if (pc > 0 and pc - 1 < code.len and code[pc - 1] == 0x05) {
+                                pc = scanToEnd(code, pc);
+                            }
+                        }
+                    } else {
+                        pc = scanToElseOrEnd(code, pc);
+                        if (pc > 0 and pc - 1 < code.len and code[pc - 1] == 0x05) {
+                            // Execute else branch
+                            pc = try self.dispatch(code, pc, locals);
+                            if (self.returning) return pc;
+                            if (self.branch_depth) |d| {
+                                if (d == 0) {
+                                    self.branch_depth = null;
+                                    pc = scanToEnd(code, pc);
+                                } else {
+                                    self.branch_depth = d - 1;
+                                    return pc;
+                                }
+                            }
+                        }
+                    }
+                },
+                0x05 => return pc, // else — end of true branch
+                0x0b => return pc, // end
+                0x0c => { // br
+                    var tmp_pc = pc;
+                    const depth = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    self.branch_depth = depth;
+                    return pc;
+                },
+                0x0d => { // br_if
+                    var tmp_pc = pc;
+                    const depth = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    const cond = try self.popI32();
+                    if (cond != 0) {
+                        self.branch_depth = depth;
+                        return pc;
+                    }
+                },
+                0x0e => { // br_table
+                    var tmp_pc = pc;
+                    const count = readCodeU32(code, &tmp_pc);
+                    const idx: u32 = @bitCast(try self.popI32());
+                    var target: u32 = 0;
+                    for (0..count) |i| {
+                        const t = readCodeU32(code, &tmp_pc);
+                        if (i == idx) target = t;
+                    }
+                    const default = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    if (idx >= count) target = default;
+                    self.branch_depth = target;
+                    return pc;
+                },
+                0x0f => { // return
+                    self.returning = true;
+                    return pc;
+                },
+                0x10 => { // call
+                    var tmp_pc = pc;
+                    const idx = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    const target = self.instance.module.funcs.items[idx];
+                    const sig = self.resolveSig(target.decl);
+                    var call_args = self.allocator.alloc(Value, sig.params.len) catch return error.OutOfMemory;
+                    defer self.allocator.free(call_args);
+                    var i = sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        call_args[i] = try self.popValue();
+                    }
+                    const result = try self.callFunc(idx, call_args);
+                    if (result) |v| try self.pushValue(v);
+                },
+                0x11 => { // call_indirect
+                    var tmp_pc = pc;
+                    const type_idx = readCodeU32(code, &tmp_pc);
+                    _ = readCodeU32(code, &tmp_pc); // table index (0)
+                    pc = tmp_pc;
+                    const elem_idx = try self.popI32();
+                    const uidx: u32 = @bitCast(elem_idx);
+                    if (uidx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
+                    const func_idx = self.instance.table.items[uidx] orelse return error.UninitializedElement;
+                    // Optionally check type matches
+                    _ = type_idx;
+                    const target = self.instance.module.funcs.items[func_idx];
+                    const sig = self.resolveSig(target.decl);
+                    var call_args = self.allocator.alloc(Value, sig.params.len) catch return error.OutOfMemory;
+                    defer self.allocator.free(call_args);
+                    var i = sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        call_args[i] = try self.popValue();
+                    }
+                    const result = try self.callFunc(func_idx, call_args);
+                    if (result) |v| try self.pushValue(v);
+                },
+                0x1a => _ = try self.popValue(), // drop
+                0x1b => try self.selectOp(), // select
+                0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(locals[idx]); },
+                0x21 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; locals[idx] = try self.popValue(); },
+                0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
+                0x23 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(self.instance.globals.items[idx]); },
+                0x24 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; self.instance.globals.items[idx] = try self.popValue(); },
+                // Memory load
+                0x28 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load(o); },
+                0x29 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load(o); },
+                0x2a => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.f32Load(o); },
+                0x2b => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.f64Load(o); },
+                0x2c => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load8S(o); },
+                0x2d => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load8U(o); },
+                0x2e => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load16S(o); },
+                0x2f => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load16U(o); },
+                0x30 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load8S(o); },
+                0x31 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load8U(o); },
+                0x32 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load16S(o); },
+                0x33 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load16U(o); },
+                0x34 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load32S(o); },
+                0x35 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load32U(o); },
+                // Memory store
+                0x36 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Store(o); },
+                0x37 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Store(o); },
+                0x38 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.f32Store(o); },
+                0x39 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.f64Store(o); },
+                0x3a => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Store8(o); },
+                0x3b => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Store16(o); },
+                0x3c => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Store8(o); },
+                0x3d => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Store16(o); },
+                0x3e => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Store32(o); },
+                0x3f => { var t = pc; _ = readCodeU32(code, &t); pc = t; try self.memorySize(); },
+                0x40 => { var t = pc; _ = readCodeU32(code, &t); pc = t; try self.memoryGrow(); },
+                // Constants
+                0x41 => { var t = pc; const v = readCodeS32(code, &t); pc = t; try self.pushValue(.{ .i32 = v }); },
+                0x42 => { var t = pc; const v = readCodeS64(code, &t); pc = t; try self.pushValue(.{ .i64 = v }); },
+                0x43 => { const bits = readCodeFixedU32(code, pc); pc += 4; try self.pushValue(.{ .f32 = @bitCast(bits) }); },
+                0x44 => { const bits = readCodeFixedU64(code, pc); pc += 8; try self.pushValue(.{ .f64 = @bitCast(bits) }); },
+                // i32 comparison
+                0x45 => try self.i32Eqz(),
+                0x46 => try self.i32Eq(),
+                0x47 => try self.i32Ne(),
+                0x48 => try self.i32LtS(),
+                0x49 => try self.i32LtU(),
+                0x4a => try self.i32GtS(),
+                0x4b => try self.i32GtU(),
+                0x4c => try self.i32LeS(),
+                0x4d => try self.i32LeU(),
+                0x4e => try self.i32GeS(),
+                0x4f => try self.i32GeU(),
+                // i64 comparison
+                0x50 => try self.i64Eqz(),
+                0x51 => try self.i64Eq(),
+                0x52 => try self.i64Ne(),
+                0x53 => try self.i64LtS(),
+                0x54 => try self.i64LtU(),
+                0x55 => try self.i64GtS(),
+                0x56 => try self.i64GtU(),
+                0x57 => try self.i64LeS(),
+                0x58 => try self.i64LeU(),
+                0x59 => try self.i64GeS(),
+                0x5a => try self.i64GeU(),
+                // f32 comparison
+                0x5b => try self.f32Eq(),
+                0x5c => try self.f32Ne(),
+                0x5d => try self.f32Lt(),
+                0x5e => try self.f32Gt(),
+                0x5f => try self.f32Le(),
+                0x60 => try self.f32Ge(),
+                // f64 comparison
+                0x61 => try self.f64Eq(),
+                0x62 => try self.f64Ne(),
+                0x63 => try self.f64Lt(),
+                0x64 => try self.f64Gt(),
+                0x65 => try self.f64Le(),
+                0x66 => try self.f64Ge(),
+                // i32 unary
+                0x67 => try self.i32Clz(),
+                0x68 => try self.i32Ctz(),
+                0x69 => try self.i32Popcnt(),
+                // i32 binary
+                0x6a => try self.i32Add(),
+                0x6b => try self.i32Sub(),
+                0x6c => try self.i32Mul(),
+                0x6d => try self.i32DivS(),
+                0x6e => try self.i32DivU(),
+                0x6f => try self.i32RemS(),
+                0x70 => try self.i32RemU(),
+                0x71 => try self.i32And(),
+                0x72 => try self.i32Or(),
+                0x73 => try self.i32Xor(),
+                0x74 => try self.i32Shl(),
+                0x75 => try self.i32ShrS(),
+                0x76 => try self.i32ShrU(),
+                0x77 => try self.i32Rotl(),
+                0x78 => try self.i32Rotr(),
+                // i64 unary
+                0x79 => try self.i64Clz(),
+                0x7a => try self.i64Ctz(),
+                0x7b => try self.i64Popcnt(),
+                // i64 binary
+                0x7c => try self.i64Add(),
+                0x7d => try self.i64Sub(),
+                0x7e => try self.i64Mul(),
+                0x7f => try self.i64DivS(),
+                0x80 => try self.i64DivU(),
+                0x81 => try self.i64RemS(),
+                0x82 => try self.i64RemU(),
+                0x83 => try self.i64And(),
+                0x84 => try self.i64Or(),
+                0x85 => try self.i64Xor(),
+                0x86 => try self.i64Shl(),
+                0x87 => try self.i64ShrS(),
+                0x88 => try self.i64ShrU(),
+                0x89 => try self.i64Rotl(),
+                0x8a => try self.i64Rotr(),
+                // f32 unary + binary
+                0x8b => try self.f32Abs(),
+                0x8c => try self.f32Neg(),
+                0x8d => try self.f32Ceil(),
+                0x8e => try self.f32Floor(),
+                0x8f => try self.f32Trunc(),
+                0x90 => try self.f32Nearest(),
+                0x91 => try self.f32Sqrt(),
+                0x92 => try self.f32Add(),
+                0x93 => try self.f32Sub(),
+                0x94 => try self.f32Mul(),
+                0x95 => try self.f32Div(),
+                0x96 => try self.f32Min(),
+                0x97 => try self.f32Max(),
+                0x98 => try self.f32Copysign(),
+                // f64 unary + binary
+                0x99 => try self.f64Abs(),
+                0x9a => try self.f64Neg(),
+                0x9b => try self.f64Ceil(),
+                0x9c => try self.f64Floor(),
+                0x9d => try self.f64Trunc(),
+                0x9e => try self.f64Nearest(),
+                0x9f => try self.f64Sqrt(),
+                0xa0 => try self.f64Add(),
+                0xa1 => try self.f64Sub(),
+                0xa2 => try self.f64Mul(),
+                0xa3 => try self.f64Div(),
+                0xa4 => try self.f64Min(),
+                0xa5 => try self.f64Max(),
+                0xa6 => try self.f64Copysign(),
+                // Conversions
+                0xa7 => try self.i32WrapI64(),
+                0xa8 => try self.i32TruncF32S(),
+                0xa9 => try self.i32TruncF32U(),
+                0xaa => try self.i32TruncF64S(),
+                0xab => try self.i32TruncF64U(),
+                0xac => try self.i64ExtendI32S(),
+                0xad => try self.i64ExtendI32U(),
+                0xae => try self.i64TruncF32S(),
+                0xaf => try self.i64TruncF32U(),
+                0xb0 => try self.i64TruncF64S(),
+                0xb1 => try self.i64TruncF64U(),
+                0xb2 => try self.f32ConvertI32S(),
+                0xb3 => try self.f32ConvertI32U(),
+                0xb4 => try self.f32ConvertI64S(),
+                0xb5 => try self.f32ConvertI64U(),
+                0xb6 => try self.f32DemoteF64(),
+                0xb7 => try self.f64ConvertI32S(),
+                0xb8 => try self.f64ConvertI32U(),
+                0xb9 => try self.f64ConvertI64S(),
+                0xba => try self.f64ConvertI64U(),
+                0xbb => try self.f64PromoteF32(),
+                0xbc => try self.i32ReinterpretF32(),
+                0xbd => try self.i64ReinterpretF64(),
+                0xbe => try self.f32ReinterpretI32(),
+                0xbf => try self.f64ReinterpretI64(),
+                // Sign extension
+                0xc0 => try self.i32Extend8S(),
+                0xc1 => try self.i32Extend16S(),
+                0xc2 => try self.i64Extend8S(),
+                0xc3 => try self.i64Extend16S(),
+                0xc4 => try self.i64Extend32S(),
+                // ref.null / ref.is_null / ref.func
+                0xd0 => { pc += 1; try self.pushValue(.{ .ref_null = {} }); },
+                0xd1 => { const v = try self.popValue(); try self.pushValue(.{ .i32 = @intFromBool(v == .ref_null) }); },
+                0xd2 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(.{ .ref_func = idx }); },
+                else => return error.Unimplemented,
+            }
+        }
+        return pc;
+    }
 };
+
+// ── Bytecode reading helpers ─────────────────────────────────────────────
+
+fn readCodeU32(code: []const u8, pc: *usize) u32 {
+    const result = leb128.readU32Leb128(code[pc.*..]) catch return 0;
+    pc.* += result.bytes_read;
+    return result.value;
+}
+
+fn readCodeS32(code: []const u8, pc: *usize) i32 {
+    const result = leb128.readS32Leb128(code[pc.*..]) catch return 0;
+    pc.* += result.bytes_read;
+    return result.value;
+}
+
+fn readCodeS64(code: []const u8, pc: *usize) i64 {
+    const result = leb128.readS64Leb128(code[pc.*..]) catch return 0;
+    pc.* += result.bytes_read;
+    return result.value;
+}
+
+fn readCodeFixedU32(code: []const u8, pc: usize) u32 {
+    if (pc + 4 > code.len) return 0;
+    return std.mem.readInt(u32, code[pc..][0..4], .little);
+}
+
+fn readCodeFixedU64(code: []const u8, pc: usize) u64 {
+    if (pc + 8 > code.len) return 0;
+    return std.mem.readInt(u64, code[pc..][0..8], .little);
+}
+
+fn skipBlockType(code: []const u8, pc: usize) usize {
+    if (pc >= code.len) return pc;
+    const byte = code[pc];
+    // 0x40 = void, or a valtype byte (single-byte block type)
+    if (byte == 0x40 or (byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f) {
+        return pc + 1;
+    }
+    // Otherwise it's a signed LEB128 type index
+    var tmp = pc;
+    _ = readCodeS32(code, &tmp);
+    return tmp;
+}
+
+/// Scan forward from `start` to find matching else (0x05) or end (0x0b).
+/// Returns pc just after the terminator byte.
+fn scanToElseOrEnd(code: []const u8, start: usize) usize {
+    var pc = start;
+    var depth: u32 = 0;
+    while (pc < code.len) {
+        const op = code[pc];
+        pc += 1;
+        switch (op) {
+            0x02, 0x03, 0x04 => {
+                pc = skipBlockType(code, pc);
+                depth += 1;
+            },
+            0x05 => {
+                if (depth == 0) return pc;
+            },
+            0x0b => {
+                if (depth == 0) return pc;
+                depth -= 1;
+            },
+            else => pc = skipImmediates(code, pc, op),
+        }
+    }
+    return pc;
+}
+
+/// Scan forward from `start` to find matching end (0x0b), ignoring else.
+fn scanToEnd(code: []const u8, start: usize) usize {
+    var pc = start;
+    var depth: u32 = 0;
+    while (pc < code.len) {
+        const op = code[pc];
+        pc += 1;
+        switch (op) {
+            0x02, 0x03, 0x04 => {
+                pc = skipBlockType(code, pc);
+                depth += 1;
+            },
+            0x0b => {
+                if (depth == 0) return pc;
+                depth -= 1;
+            },
+            else => pc = skipImmediates(code, pc, op),
+        }
+    }
+    return pc;
+}
+
+/// Skip past the immediate operands for a given opcode.
+fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
+    var p = pc;
+    switch (op) {
+        0x0c, 0x0d => _ = readCodeU32(code, &p), // br, br_if
+        0x0e => { // br_table
+            const count = readCodeU32(code, &p);
+            for (0..count + 1) |_| _ = readCodeU32(code, &p);
+        },
+        0x10 => _ = readCodeU32(code, &p), // call
+        0x11 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect
+        0x20, 0x21, 0x22, 0x23, 0x24 => _ = readCodeU32(code, &p),
+        0x25, 0x26 => _ = readCodeU32(code, &p), // table.get/set
+        0x28...0x3e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
+        0x3f, 0x40 => _ = readCodeU32(code, &p),
+        0x41 => _ = readCodeS32(code, &p),
+        0x42 => _ = readCodeS64(code, &p),
+        0x43 => p += 4,
+        0x44 => p += 8,
+        0xd0 => p += 1,
+        0xd2 => _ = readCodeU32(code, &p),
+        0xfc => {
+            const sub = readCodeU32(code, &p);
+            switch (sub) {
+                0x08, 0x0a, 0x0c, 0x0e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
+                0x09, 0x0b, 0x0d, 0x0f, 0x10, 0x11 => _ = readCodeU32(code, &p),
+                else => {},
+            }
+        },
+        else => {},
+    }
+    return p;
+}
+
+/// Evaluate a simple constant expression (used for global init and segment offsets).
+fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
+    var pc: usize = 0;
+    while (pc < expr.len) {
+        const op = expr[pc];
+        pc += 1;
+        switch (op) {
+            0x41 => return .{ .i32 = readCodeS32(expr, &pc) },
+            0x42 => return .{ .i64 = readCodeS64(expr, &pc) },
+            0x43 => {
+                const bits = readCodeFixedU32(expr, pc);
+                return .{ .f32 = @bitCast(bits) };
+            },
+            0x44 => {
+                const bits = readCodeFixedU64(expr, pc);
+                return .{ .f64 = @bitCast(bits) };
+            },
+            0x23 => { // global.get
+                const idx = readCodeU32(expr, &pc);
+                if (idx < instance.globals.items.len) return instance.globals.items[idx];
+                return null;
+            },
+            0xd0 => { pc += 1; return .{ .ref_null = {} }; },
+            0xd2 => return .{ .ref_func = readCodeU32(expr, &pc) },
+            0x0b => return null,
+            else => return null,
+        }
+    }
+    return null;
+}
 
 // ── Wasm-spec min/max helpers (NaN propagation) ─────────────────────────
 
@@ -1498,4 +2427,60 @@ test "Instance init with globals" {
     try std.testing.expectEqual(@as(usize, 2), inst.globals.items.len);
     try std.testing.expectEqual(@as(i32, 0), inst.globals.items[0].i32);
     try std.testing.expectEqual(@as(f64, 0.0), inst.globals.items[1].f64);
+}
+
+test "dispatch: i32.const + i32.add via callFunc" {
+    const alloc = std.testing.allocator;
+    const mod = alloc.create(Mod.Module) catch @panic("OOM");
+    mod.* = Mod.Module.init(alloc);
+    defer {
+        mod.deinit();
+        alloc.destroy(mod);
+    }
+    // Type: (func (param i32 i32) (result i32))
+    const params = alloc.alloc(types.ValType, 2) catch @panic("OOM");
+    params[0] = .i32;
+    params[1] = .i32;
+    const results = alloc.alloc(types.ValType, 1) catch @panic("OOM");
+    results[0] = .i32;
+    try mod.module_types.append(alloc, .{ .func_type = .{ .params = params, .results = results } });
+    // Bytecode: local.get 0, local.get 1, i32.add, end
+    const code = &[_]u8{ 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b };
+    try mod.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = code,
+    });
+    var inst = Instance.init(alloc, mod) catch @panic("trap");
+    defer inst.deinit();
+    var interp = Interpreter.init(alloc, &inst);
+    defer interp.deinit();
+    const result = try interp.callFunc(0, &[_]Value{ .{ .i32 = 3 }, .{ .i32 = 4 } });
+    try std.testing.expectEqual(@as(i32, 7), result.?.i32);
+}
+
+test "dispatch: block with br" {
+    const alloc = std.testing.allocator;
+    const mod = alloc.create(Mod.Module) catch @panic("OOM");
+    mod.* = Mod.Module.init(alloc);
+    defer {
+        mod.deinit();
+        alloc.destroy(mod);
+    }
+    const results = alloc.alloc(types.ValType, 1) catch @panic("OOM");
+    results[0] = .i32;
+    const params = alloc.alloc(types.ValType, 1) catch @panic("OOM");
+    params[0] = .i32;
+    try mod.module_types.append(alloc, .{ .func_type = .{ .params = params, .results = results } });
+    // Bytecode: block (result i32) local.get 0 br 0 end end
+    const code = &[_]u8{ 0x02, 0x7f, 0x20, 0x00, 0x0c, 0x00, 0x0b, 0x0b };
+    try mod.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = code,
+    });
+    var inst = Instance.init(alloc, mod) catch @panic("trap");
+    defer inst.deinit();
+    var interp = Interpreter.init(alloc, &inst);
+    defer interp.deinit();
+    const result = try interp.callFunc(0, &[_]Value{.{ .i32 = 99 }});
+    try std.testing.expectEqual(@as(i32, 99), result.?.i32);
 }

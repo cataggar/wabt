@@ -23,6 +23,8 @@ pub const ParseError = error{
 /// Parse a WebAssembly text format source into a Module.
 pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!Mod.Module {
     var p = Parser{ .lexer = Lexer.init(source), .allocator = allocator };
+    defer p.func_names.deinit(allocator);
+    defer p.type_names.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
@@ -74,6 +76,10 @@ const Parser = struct {
     allocator: std.mem.Allocator,
     peeked: ?Lex.Token = null,
     module: ?*Mod.Module = null,
+    /// Map from function $name to index (for name resolution in call instructions).
+    func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from type $name to index (for name resolution).
+    type_names: std.StringArrayHashMapUnmanaged(u32) = .{},
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -217,7 +223,10 @@ const Parser = struct {
 
     fn parseType(self: *Parser, module: *Mod.Module) ParseError!void {
         // (type $name? (func (param ...) (result ...)))
-        if (self.peek().kind == .identifier) _ = self.advance();
+        if (self.peek().kind == .identifier) {
+            const name = self.advance().text;
+            self.type_names.put(self.allocator, name, @intCast(module.module_types.items.len)) catch {};
+        }
         try self.expect(.l_paren);
         // The inner form may be func, struct, or array (GC proposal) — skip non-func
         if (self.peek().kind == .kw_func) {
@@ -253,7 +262,36 @@ const Parser = struct {
 
     fn parseFunc(self: *Parser, module: *Mod.Module) ParseError!void {
         var func = Mod.Func{};
-        if (self.peek().kind == .identifier) func.name = self.advance().text;
+        const func_idx: u32 = @intCast(module.funcs.items.len);
+        if (self.peek().kind == .identifier) {
+            func.name = self.advance().text;
+            // Register name → index for call resolution
+            if (func.name) |n| {
+                self.func_names.put(self.allocator, n, func_idx) catch {};
+            }
+        }
+
+        // Handle inline (export "name") declarations
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_export) {
+                _ = self.advance(); // consume 'export'
+                const name_tok = self.advance();
+                const exp_name = stripQuotes(name_tok.text);
+                if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
+                module.exports.append(self.allocator, .{
+                    .name = exp_name,
+                    .kind = .func,
+                    .var_ = .{ .index = func_idx },
+                }) catch return error.OutOfMemory;
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
 
         // Check for (type $idx)
         if (self.peek().kind == .l_paren) {
@@ -262,8 +300,14 @@ const Parser = struct {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_type) {
                 _ = self.advance();
-                const idx = try self.parseU32();
-                func.decl.type_var = .{ .index = idx };
+                if (self.peek().kind == .identifier) {
+                    const name = self.advance().text;
+                    const idx = self.type_names.get(name) orelse 0;
+                    func.decl.type_var = .{ .index = idx };
+                } else {
+                    const idx = try self.parseU32();
+                    func.decl.type_var = .{ .index = idx };
+                }
                 try self.expect(.r_paren);
             } else {
                 // Not (type ...) — restore
@@ -745,6 +789,19 @@ const Parser = struct {
     }
 
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            if (self.func_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            if (self.type_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            self.emitLeb128U32(code, 0);
+            return;
+        }
         const val = self.parseU32() catch 0;
         self.emitLeb128U32(code, val);
     }
@@ -782,16 +839,25 @@ const Parser = struct {
 
     fn emitF32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
-        _ = tok;
-        // Emit 4 zero bytes as placeholder (exact value doesn't matter for validation)
-        code.appendSlice(self.allocator, &[4]u8{ 0, 0, 0, 0 }) catch {};
+        if (tok.kind == .integer or tok.kind == .float) {
+            // Handle special nan/inf patterns and hex floats
+            const bits = parseF32Bits(tok.text);
+            const le = std.mem.toBytes(bits);
+            code.appendSlice(self.allocator, &le) catch {};
+        } else {
+            code.appendSlice(self.allocator, &[4]u8{ 0, 0, 0, 0 }) catch {};
+        }
     }
 
     fn emitF64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const tok = self.advance();
-        _ = tok;
-        // Emit 8 zero bytes as placeholder
-        code.appendSlice(self.allocator, &[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }) catch {};
+        if (tok.kind == .integer or tok.kind == .float) {
+            const bits = parseF64Bits(tok.text);
+            const le = std.mem.toBytes(bits);
+            code.appendSlice(self.allocator, &le) catch {};
+        } else {
+            code.appendSlice(self.allocator, &[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }) catch {};
+        }
     }
 
     fn emitLeb128U32(self: *Parser, code: *std.ArrayListUnmanaged(u8), val: u32) void {
@@ -971,6 +1037,89 @@ const Parser = struct {
 
     fn parseTable(self: *Parser, module: *Mod.Module) ParseError!void {
         if (self.peek().kind == .identifier) _ = self.advance();
+
+        // Handle inline (export "name") on tables
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance();
+            if (self.peek().kind == .kw_export) {
+                _ = self.advance();
+                const name_tok = self.advance();
+                const exp_name = stripQuotes(name_tok.text);
+                if (self.peek().kind == .r_paren) _ = self.advance();
+                module.exports.append(self.allocator, .{
+                    .name = exp_name,
+                    .kind = .table,
+                    .var_ = .{ .index = @intCast(module.tables.items.len) },
+                }) catch return error.OutOfMemory;
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+
+        // Check for inline element syntax: (table elemtype (elem ...))
+        if (self.peek().kind != .integer) {
+            // elemtype first — inline elem syntax
+            const elem_type = self.parseValType() catch .funcref;
+            // Parse (elem func_refs...)
+            var elem_indices: std.ArrayListUnmanaged(Mod.Var) = .{};
+            if (self.peek().kind == .l_paren) {
+                const sp2 = self.lexer.pos;
+                const spk2 = self.peeked;
+                _ = self.advance();
+                if (self.peek().kind == .kw_elem) {
+                    _ = self.advance();
+                    while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                        if (self.peek().kind == .identifier) {
+                            const tok = self.advance();
+                            if (self.func_names.get(tok.text)) |idx| {
+                                elem_indices.append(self.allocator, .{ .index = idx }) catch {};
+                            } else {
+                                elem_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                            }
+                        } else if (self.peek().kind == .integer) {
+                            const idx = self.parseU32() catch 0;
+                            elem_indices.append(self.allocator, .{ .index = idx }) catch {};
+                        } else {
+                            _ = self.advance();
+                        }
+                    }
+                    if (self.peek().kind == .r_paren) _ = self.advance();
+                } else {
+                    self.lexer.pos = sp2;
+                    self.peeked = spk2;
+                }
+            }
+            const initial: u64 = @intCast(elem_indices.items.len);
+            try module.tables.append(self.allocator, .{
+                .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial } },
+            });
+            // Create active element segment for the inline elements
+            if (elem_indices.items.len > 0) {
+                // Build offset expr: i32.const 0
+                const ob = self.allocator.alloc(u8, 2) catch {
+                    elem_indices.deinit(self.allocator);
+                    return error.OutOfMemory;
+                };
+                ob[0] = 0x41; // i32.const
+                ob[1] = 0x00; // 0
+                try module.elem_segments.append(self.allocator, .{
+                    .kind = .active,
+                    .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
+                    .elem_type = elem_type,
+                    .elem_var_indices = elem_indices,
+                    .offset_expr_bytes = ob,
+                    .owns_offset_expr_bytes = true,
+                });
+            } else {
+                elem_indices.deinit(self.allocator);
+            }
+            return;
+        }
+
         const initial = try self.parseU32();
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
@@ -979,7 +1128,7 @@ const Parser = struct {
         }
         const elem_type = try self.parseValType();
         try module.tables.append(self.allocator, .{
-            .type = .{ .elem_type = elem_type, .limits = limits },
+            .@"type" = .{ .elem_type = elem_type, .limits = limits },
         });
     }
 
@@ -1364,6 +1513,44 @@ fn isConstInstrToken(kind: TokenKind) bool {
 
 /// Map WAT instruction text (e.g. "i32.add") to binary opcode value.
 /// Returns null for unrecognized instructions.
+fn parseF32Bits(text: []const u8) u32 {
+    // Handle nan:0xNNNNNN patterns
+    if (std.mem.startsWith(u8, text, "nan:0x") or std.mem.startsWith(u8, text, "+nan:0x")) {
+        const hex_start = if (text[0] == '+') @as(usize, 6) else @as(usize, 6);
+        const payload = std.fmt.parseInt(u32, text[hex_start..], 16) catch 0;
+        return 0x7fc00000 | (payload & 0x7fffff);
+    }
+    if (std.mem.startsWith(u8, text, "-nan:0x")) {
+        const payload = std.fmt.parseInt(u32, text[7..], 16) catch 0;
+        return 0xffc00000 | (payload & 0x7fffff);
+    }
+    if (std.mem.eql(u8, text, "nan") or std.mem.eql(u8, text, "+nan")) return 0x7fc00000;
+    if (std.mem.eql(u8, text, "-nan")) return 0xffc00000;
+    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7f800000;
+    if (std.mem.eql(u8, text, "-inf")) return 0xff800000;
+    // Try parsing as a float
+    const val = std.fmt.parseFloat(f32, text) catch 0.0;
+    return @bitCast(val);
+}
+
+fn parseF64Bits(text: []const u8) u64 {
+    if (std.mem.startsWith(u8, text, "nan:0x") or std.mem.startsWith(u8, text, "+nan:0x")) {
+        const hex_start = if (text[0] == '+') @as(usize, 6) else @as(usize, 6);
+        const payload = std.fmt.parseInt(u64, text[hex_start..], 16) catch 0;
+        return 0x7ff8000000000000 | (payload & 0xfffffffffffff);
+    }
+    if (std.mem.startsWith(u8, text, "-nan:0x")) {
+        const payload = std.fmt.parseInt(u64, text[7..], 16) catch 0;
+        return 0xfff8000000000000 | (payload & 0xfffffffffffff);
+    }
+    if (std.mem.eql(u8, text, "nan") or std.mem.eql(u8, text, "+nan")) return 0x7ff8000000000000;
+    if (std.mem.eql(u8, text, "-nan")) return 0xfff8000000000000;
+    if (std.mem.eql(u8, text, "inf") or std.mem.eql(u8, text, "+inf")) return 0x7ff0000000000000;
+    if (std.mem.eql(u8, text, "-inf")) return 0xfff0000000000000;
+    const val = std.fmt.parseFloat(f64, text) catch 0.0;
+    return @bitCast(val);
+}
+
 fn opcodeFromText(text: []const u8) ?u32 {
     const map = std.StaticStringMap(u32).initComptime(.{
         // Reference
