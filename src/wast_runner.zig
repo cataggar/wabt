@@ -595,6 +595,8 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1; // validation failure = malformed = pass
             return;
         };
+        if (result.failed <= 40)
+            std.debug.print("  FAIL assert_malformed(quote): should have been malformed: text[0..120]=\"{s}\"\n", .{wat_text[0..@min(120, wat_text.len)]});
         result.failed += 1; // parsed OK but should have been malformed
         return;
     }
@@ -611,6 +613,19 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         };
         module.deinit();
+        if (result.failed <= 30) {
+            std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes\n", .{wasm_bytes.len});
+            // Print first 20 bytes as hex
+            var hex_buf: [60]u8 = undefined;
+            var hi: usize = 0;
+            for (wasm_bytes[0..@min(20, wasm_bytes.len)]) |b| {
+                hex_buf[hi] = "0123456789abcdef"[b >> 4];
+                hex_buf[hi + 1] = "0123456789abcdef"[b & 0x0f];
+                hex_buf[hi + 2] = ' ';
+                hi += 3;
+            }
+            std.debug.print("    bytes: {s}\n", .{hex_buf[0..hi]});
+        }
         result.failed += 1; // parsed OK but should have been malformed
         return;
     }
@@ -635,6 +650,8 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     };
 
+    if (result.failed <= 40)
+        std.debug.print("  FAIL assert_malformed(text): should have been malformed: module[0..120]=\"{s}\"\n", .{inner[0..@min(120, inner.len)]});
     result.failed += 1;
 }
 

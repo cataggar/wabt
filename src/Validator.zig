@@ -463,17 +463,23 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func) Error!void {
             0x01 => {}, // nop
             0x02 => { // block
                 const bt = readBlockType(m, bytes, &pos);
+                if (bt.params.len > 0)
+                    try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x02, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x03 => { // loop
                 const bt = readBlockType(m, bytes, &pos);
+                if (bt.params.len > 0)
+                    try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x03, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x04 => { // if
                 const bt = readBlockType(m, bytes, &pos);
                 try popExpect(&val_stack, &ctrl_stack, .i32);
+                if (bt.params.len > 0)
+                    try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x04, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },

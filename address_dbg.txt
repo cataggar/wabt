@@ -1,0 +1,2 @@
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(memory 1) (func (drop (i32.load offset=4294967296 (i32.const 0)))) "
+third_party\testsuite\address.wast: 259 passed, 1 failed, 0 skipped (260 total)

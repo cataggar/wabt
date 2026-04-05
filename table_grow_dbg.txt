@@ -1,0 +1,5 @@
+  FAIL assert_invalid: validation should have failed: module[0..120]="(module
+    (table $t 0 funcref)
+    (func $type-init-externref-vs-funcref (param $r externref) (result i32)
+      (t"
+third_party\testsuite\table_grow.wast: 57 passed, 1 failed, 0 skipped (58 total)

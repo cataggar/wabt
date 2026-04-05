@@ -1,0 +1,1 @@
+third_party\testsuite\loop.wast: 118 passed, 2 failed, 0 skipped (120 total)

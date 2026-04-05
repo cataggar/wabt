@@ -1,0 +1,2 @@
+  FAIL assert_return(invoke "4294967249"): trap error.UndefinedElement
+third_party\testsuite\float_literals.wast: 177 passed, 1 failed, 1 skipped (179 total)

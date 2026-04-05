@@ -55,6 +55,11 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
     var r = Reader{ .data = bytes, .pos = 8, .allocator = allocator, .module = &module };
     try r.readSections();
 
+    // Validate data count matches data section
+    if (module.has_data_count) {
+        if (module.data_count != module.data_segments.items.len) return error.InvalidSection;
+    }
+
     return module;
 }
 
@@ -141,6 +146,10 @@ const Reader = struct {
 
     fn readLimits(self: *Reader) ReadError!types.Limits {
         const flags = try self.readByte();
+        // Valid flags: 0x00 (min only), 0x01 (min+max), 0x03 (shared+max), 0x04 (memory64)
+        // Reject unknown flag combinations
+        if (flags & 0xF8 != 0) return error.InvalidLimits;
+        if (flags & 0x02 != 0 and flags & 0x01 == 0) return error.InvalidLimits; // shared requires max
         var limits = types.Limits{};
         limits.has_max = (flags & 0x01) != 0;
         limits.is_shared = (flags & 0x02) != 0;
@@ -240,6 +249,18 @@ const Reader = struct {
             if (self.pos != section_end) return error.InvalidSection;
             self.pos = section_end;
         }
+
+        // Cross-section validation
+        // Data count must match actual data section count
+        if (self.module.has_data_count and self.module.data_count != @as(u32, @intCast(self.module.data_segments.items.len))) {
+            return error.InvalidSection;
+        }
+        // Function section requires code section and vice versa
+        const num_defined_funcs = self.module.funcs.items.len - self.module.num_func_imports;
+        const has_func_section = (seen_sections & (1 << 3)) != 0;
+        const has_code_section = (seen_sections & (1 << 10)) != 0;
+        if (has_func_section and !has_code_section and num_defined_funcs > 0) return error.FunctionCodeMismatch;
+        if (!has_func_section and has_code_section) return error.FunctionCodeMismatch;
     }
 
     fn readTypeSection(self: *Reader, _: usize) ReadError!void {
@@ -466,11 +487,12 @@ const Reader = struct {
                 total_locals += local_count;
                 if (total_locals > 50000) return error.TooManyLocals;
                 const vt = try self.readValType();
-                // Populate local_types on the func
                 for (0..local_count) |_| {
                     try self.module.funcs.items[func_idx].local_types.append(self.allocator, vt);
                 }
             }
+            // Validate function body ends with 0x0b (end opcode)
+            if (body_end > 0 and self.data[body_end - 1] != 0x0b) return error.InvalidSection;
             // Store the instruction bytes (slice into input data)
             self.module.funcs.items[func_idx].code_bytes = self.data[self.pos..body_end];
             self.pos = body_end;
@@ -501,7 +523,8 @@ const Reader = struct {
     }
 
     fn readDataCountSection(self: *Reader, _: usize) ReadError!void {
-        _ = try self.readU32();
+        self.module.data_count = try self.readU32();
+        self.module.has_data_count = true;
     }
 
     fn readTagSection(self: *Reader, _: usize) ReadError!void {

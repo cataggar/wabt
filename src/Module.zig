@@ -312,6 +312,10 @@ pub const Module = struct {
     num_global_imports: types.Index = 0,
     num_tag_imports: types.Index = 0,
 
+    // Data count section
+    has_data_count: bool = false,
+    data_count: u32 = 0,
+
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{ .allocator = allocator };
     }
