@@ -61,6 +61,8 @@ const RunState = struct {
     owned_keys: std.ArrayListUnmanaged([]const u8) = .{},
     /// Source texts from decoded quote modules (kept alive for name slices).
     owned_sources: std.ArrayListUnmanaged([]const u8) = .{},
+    /// Triples kept alive because they wrote to shared tables (prevent dangling refs).
+    zombie_triples: std.ArrayListUnmanaged(ModuleTriple) = .{},
 
     fn deinit(self: *RunState) void {
         self.destroyCurrent();
@@ -80,6 +82,13 @@ const RunState = struct {
                 destroyed.put(self.allocator, triple.module, {}) catch {};
             }
         }
+        for (self.zombie_triples.items) |triple| {
+            if (!destroyed.contains(triple.module)) {
+                triple.destroy(self.allocator);
+                destroyed.put(self.allocator, triple.module, {}) catch {};
+            }
+        }
+        self.zombie_triples.deinit(self.allocator);
         self.named_modules.deinit(self.allocator);
         self.registered_modules.deinit(self.allocator);
         for (self.owned_keys.items) |key| self.allocator.free(key);
@@ -975,38 +984,76 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
             return;
         }
 
-        // Text module
-        var module = Parser.parseModule(allocator, inner) catch {
-            result.passed += 1;
-            return;
-        };
-        defer module.deinit();
-
-        Validator.validate(&module, .{}) catch {
+        // Text module — heap-allocate so resources survive if the module
+        // writes to shared tables/memory before trapping.
+        const mod = allocator.create(Mod.Module) catch { result.skipped += 1; return; };
+        mod.* = Parser.parseModule(allocator, inner) catch {
+            allocator.destroy(mod);
             result.passed += 1;
             return;
         };
 
-        var instance = Interp.Instance.init(allocator, &module) catch {
+        Validator.validate(mod, .{}) catch {
+            mod.deinit();
+            allocator.destroy(mod);
             result.passed += 1;
             return;
         };
-        defer instance.deinit();
-        instance.instantiate() catch {
-            result.passed += 1;
-            return;
-        };
-        var interp2 = Interp.Interpreter.init(allocator, &instance);
-        defer interp2.deinit();
 
-        if (module.start_var) |sv| {
+        const inst = allocator.create(Interp.Instance) catch {
+            mod.deinit();
+            allocator.destroy(mod);
+            result.skipped += 1;
+            return;
+        };
+        inst.* = Interp.Instance.init(allocator, mod) catch {
+            allocator.destroy(inst);
+            mod.deinit();
+            allocator.destroy(mod);
+            result.passed += 1;
+            return;
+        };
+
+        const interp2 = allocator.create(Interp.Interpreter) catch {
+            inst.deinit();
+            allocator.destroy(inst);
+            mod.deinit();
+            allocator.destroy(mod);
+            result.skipped += 1;
+            return;
+        };
+        interp2.* = Interp.Interpreter.init(allocator, inst);
+        inst.interp_ref = interp2;
+        state.resolveImports(mod, interp2);
+
+        const has_shared = inst.shared_memory != null or inst.shared_tables != null;
+        const triple = ModuleTriple{ .module = mod, .instance = inst, .interpreter = interp2 };
+
+        inst.instantiate() catch {
+            if (has_shared) {
+                state.zombie_triples.append(allocator, triple) catch {};
+            } else {
+                triple.destroy(allocator);
+            }
+            result.passed += 1;
+            return;
+        };
+
+        if (mod.start_var) |sv| {
             interp2.callFunc(sv.index, &.{}) catch {
+                if (has_shared) {
+                    state.zombie_triples.append(allocator, triple) catch {};
+                } else {
+                    triple.destroy(allocator);
+                }
                 result.passed += 1;
                 return;
             };
+            triple.destroy(allocator);
             result.failed += 1;
             return;
         }
+        triple.destroy(allocator);
         result.failed += 1;
         return;
     };
