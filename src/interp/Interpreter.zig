@@ -58,6 +58,11 @@ pub const Instance = struct {
     /// Function table — `null` entries are uninitialised.
     table: std.ArrayListUnmanaged(?u32),
 
+    /// Tracks which data segments have been dropped via data.drop.
+    dropped_data: std.DynamicBitSetUnmanaged = .{},
+    /// Tracks which element segments have been dropped via elem.drop.
+    dropped_elems: std.DynamicBitSetUnmanaged = .{},
+
     pub fn init(allocator: std.mem.Allocator, module: *const Mod.Module) TrapError!Instance {
         var inst = Instance{
             .allocator = allocator,
@@ -66,6 +71,14 @@ pub const Instance = struct {
             .globals = .{},
             .table = .{},
         };
+
+        // Allocate drop tracking bitsets.
+        if (module.data_segments.items.len > 0) {
+            inst.dropped_data = std.DynamicBitSetUnmanaged.initEmpty(allocator, module.data_segments.items.len) catch return error.OutOfMemory;
+        }
+        if (module.elem_segments.items.len > 0) {
+            inst.dropped_elems = std.DynamicBitSetUnmanaged.initEmpty(allocator, module.elem_segments.items.len) catch return error.OutOfMemory;
+        }
 
         // Allocate linear memory for first memory definition.
         if (module.memories.items.len > 0) {
@@ -105,6 +118,8 @@ pub const Instance = struct {
         self.memory.deinit(self.allocator);
         self.globals.deinit(self.allocator);
         self.table.deinit(self.allocator);
+        self.dropped_data.deinit(self.allocator);
+        self.dropped_elems.deinit(self.allocator);
     }
 
     /// Run module instantiation: evaluate global init exprs, copy data segments,
@@ -1390,6 +1405,123 @@ pub const Interpreter = struct {
         @memset(mem[d .. d + len], @truncate(@as(u32, @bitCast(val))));
     }
 
+    pub fn memoryInit(self: *Interpreter, data_idx: u32) TrapError!void {
+        const n_val = try self.popI32();
+        const src_val = try self.popI32();
+        const dst_val = try self.popI32();
+        const n: u32 = @bitCast(n_val);
+        const src: u32 = @bitCast(src_val);
+        const dst: u32 = @bitCast(dst_val);
+        if (data_idx >= self.instance.module.data_segments.items.len)
+            return error.OutOfBoundsMemoryAccess;
+        const dropped = data_idx < self.instance.dropped_data.capacity() and
+            self.instance.dropped_data.isSet(data_idx);
+        const seg = self.instance.module.data_segments.items[data_idx];
+        const seg_len: u32 = if (dropped) 0 else @intCast(seg.data.len);
+        if (@as(u64, src) + n > seg_len or
+            @as(u64, dst) + n > self.instance.memory.items.len)
+            return error.OutOfBoundsMemoryAccess;
+        if (n == 0) return;
+        const s: usize = @intCast(src);
+        const d: usize = @intCast(dst);
+        const len: usize = @intCast(n);
+        @memcpy(self.instance.memory.items[d .. d + len], seg.data[s .. s + len]);
+    }
+
+    pub fn tableCopy(self: *Interpreter) TrapError!void {
+        const n_val = try self.popI32();
+        const src_val = try self.popI32();
+        const dst_val = try self.popI32();
+        const n: u32 = @bitCast(n_val);
+        const src: u32 = @bitCast(src_val);
+        const dst: u32 = @bitCast(dst_val);
+        const tbl = self.instance.table.items;
+        if (@as(u64, dst) + n > tbl.len or @as(u64, src) + n > tbl.len)
+            return error.OutOfBoundsTableAccess;
+        if (n == 0) return;
+        const d: usize = @intCast(dst);
+        const s: usize = @intCast(src);
+        const len: usize = @intCast(n);
+        if (d <= s) {
+            var i: usize = 0;
+            while (i < len) : (i += 1) tbl[d + i] = tbl[s + i];
+        } else {
+            var i: usize = len;
+            while (i > 0) {
+                i -= 1;
+                tbl[d + i] = tbl[s + i];
+            }
+        }
+    }
+
+    pub fn tableInit(self: *Interpreter, elem_idx: u32) TrapError!void {
+        const n_val = try self.popI32();
+        const src_val = try self.popI32();
+        const dst_val = try self.popI32();
+        const n: u32 = @bitCast(n_val);
+        const src: u32 = @bitCast(src_val);
+        const dst: u32 = @bitCast(dst_val);
+        if (elem_idx >= self.instance.module.elem_segments.items.len)
+            return error.OutOfBoundsTableAccess;
+        const dropped = elem_idx < self.instance.dropped_elems.capacity() and
+            self.instance.dropped_elems.isSet(elem_idx);
+        const seg = &self.instance.module.elem_segments.items[elem_idx];
+        const seg_len: u32 = if (dropped) 0 else @intCast(seg.elem_var_indices.items.len);
+        if (@as(u64, src) + n > seg_len or
+            @as(u64, dst) + n > self.instance.table.items.len)
+            return error.OutOfBoundsTableAccess;
+        if (n == 0) return;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const func_idx = seg.elem_var_indices.items[src + i].index;
+            self.instance.table.items[dst + i] = func_idx;
+        }
+    }
+
+    pub fn tableGrow(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
+        _ = readCodeU32(code, pc); // table idx
+        const delta = @as(u32, @bitCast(try self.popI32()));
+        const init_val = try self.popValue();
+        const old_size: u32 = @intCast(self.instance.table.items.len);
+        const func_ref: ?u32 = switch (init_val) {
+            .ref_func => |idx| idx,
+            .ref_null => null,
+            .i32 => |v| @bitCast(v),
+            else => null,
+        };
+        if (delta == 0) {
+            try self.pushValue(.{ .i32 = @bitCast(old_size) });
+            return;
+        }
+        self.instance.table.appendNTimes(self.allocator, func_ref, delta) catch {
+            try self.pushValue(.{ .i32 = -1 });
+            return;
+        };
+        try self.pushValue(.{ .i32 = @bitCast(old_size) });
+    }
+
+    pub fn tableSize(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
+        _ = readCodeU32(code, pc); // table idx
+        try self.pushValue(.{ .i32 = @intCast(self.instance.table.items.len) });
+    }
+
+    pub fn tableFill(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
+        _ = readCodeU32(code, pc); // table idx
+        const n = @as(u32, @bitCast(try self.popI32()));
+        const val = try self.popValue();
+        const dst = @as(u32, @bitCast(try self.popI32()));
+        if (@as(u64, dst) + n > self.instance.table.items.len)
+            return error.OutOfBoundsTableAccess;
+        const func_ref: ?u32 = switch (val) {
+            .ref_func => |idx| idx,
+            .ref_null => null,
+            .i32 => |v| @bitCast(v),
+            else => null,
+        };
+        var i: u32 = 0;
+        while (i < n) : (i += 1) self.instance.table.items[dst + i] = func_ref;
+    }
+
     // ── Sub-word memory loads ───────────────────────────────────────────
 
     pub fn i32Load8S(self: *Interpreter, offset: u32) TrapError!void {
@@ -1666,19 +1798,31 @@ pub const Interpreter = struct {
                 0x11 => { // call_indirect
                     var tmp_pc = pc;
                     const type_idx = readCodeU32(code, &tmp_pc);
-                    _ = readCodeU32(code, &tmp_pc); // table index (0)
+                    _ = readCodeU32(code, &tmp_pc); // table index
                     pc = tmp_pc;
                     const elem_idx = try self.popI32();
                     const uidx: u32 = @bitCast(elem_idx);
                     if (uidx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
                     const func_idx = self.instance.table.items[uidx] orelse return error.UninitializedElement;
-                    // Optionally check type matches
-                    _ = type_idx;
+                    if (func_idx >= self.instance.module.funcs.items.len) return error.UndefinedElement;
                     const target = self.instance.module.funcs.items[func_idx];
-                    const sig = self.resolveSig(target.decl);
-                    var call_args = self.allocator.alloc(Value, sig.params.len) catch return error.OutOfMemory;
+                    const func_sig = self.resolveSig(target.decl);
+                    // Verify type matches the expected signature (structural)
+                    if (type_idx < self.instance.module.module_types.items.len) {
+                        switch (self.instance.module.module_types.items[type_idx]) {
+                            .func_type => |expected| {
+                                const params_match = std.mem.eql(types.ValType, func_sig.params, expected.params);
+                                const results_match = std.mem.eql(types.ValType, func_sig.results, expected.results);
+                                if (!params_match or !results_match) {
+                                    return error.IndirectCallTypeMismatch;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    var call_args = self.allocator.alloc(Value, func_sig.params.len) catch return error.OutOfMemory;
                     defer self.allocator.free(call_args);
-                    var i = sig.params.len;
+                    var i = func_sig.params.len;
                     while (i > 0) {
                         i -= 1;
                         call_args[i] = try self.popValue();
@@ -1693,6 +1837,31 @@ pub const Interpreter = struct {
                 0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
                 0x23 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(self.instance.globals.items[idx]); },
                 0x24 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; self.instance.globals.items[idx] = try self.popValue(); },
+                0x25 => { // table.get
+                    var t = pc;
+                    _ = readCodeU32(code, &t); // table idx
+                    pc = t;
+                    const idx = @as(u32, @bitCast(try self.popI32()));
+                    if (idx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
+                    if (self.instance.table.items[idx]) |func_idx|
+                        try self.pushValue(.{ .ref_func = func_idx })
+                    else
+                        try self.pushValue(.{ .ref_null = {} });
+                },
+                0x26 => { // table.set
+                    var t = pc;
+                    _ = readCodeU32(code, &t); // table idx
+                    pc = t;
+                    const val = try self.popValue();
+                    const idx = @as(u32, @bitCast(try self.popI32()));
+                    if (idx >= self.instance.table.items.len) return error.OutOfBoundsTableAccess;
+                    self.instance.table.items[idx] = switch (val) {
+                        .ref_func => |fi| fi,
+                        .ref_null => null,
+                        .i32 => |v| @bitCast(v),
+                        else => null,
+                    };
+                },
                 // Memory load
                 0x28 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i32Load(o); },
                 0x29 => { var t = pc; _ = readCodeU32(code, &t); const o = readCodeU32(code, &t); pc = t; try self.i64Load(o); },
@@ -1883,15 +2052,43 @@ pub const Interpreter = struct {
                         0x05 => try self.i64TruncSatF32U(),
                         0x06 => try self.i64TruncSatF64S(),
                         0x07 => try self.i64TruncSatF64U(),
+                        0x08 => { // memory.init
+                            const data_idx = readCodeU32(code, &pc);
+                            _ = readCodeU32(code, &pc); // mem idx
+                            try self.memoryInit(data_idx);
+                        },
+                        0x09 => { // data.drop
+                            const data_idx = readCodeU32(code, &pc);
+                            if (data_idx < self.instance.dropped_data.capacity())
+                                self.instance.dropped_data.set(data_idx);
+                        },
                         0x0a => { // memory.copy
-                            _ = readCodeU32(code, &pc); // src mem
                             _ = readCodeU32(code, &pc); // dst mem
+                            _ = readCodeU32(code, &pc); // src mem
                             try self.memoryCopy();
                         },
                         0x0b => { // memory.fill
                             _ = readCodeU32(code, &pc); // mem idx
                             try self.memoryFill();
                         },
+                        0x0c => { // table.init
+                            const elem_idx = readCodeU32(code, &pc);
+                            _ = readCodeU32(code, &pc); // table idx
+                            try self.tableInit(elem_idx);
+                        },
+                        0x0d => { // elem.drop
+                            const elem_idx = readCodeU32(code, &pc);
+                            if (elem_idx < self.instance.dropped_elems.capacity())
+                                self.instance.dropped_elems.set(elem_idx);
+                        },
+                        0x0e => { // table.copy
+                            _ = readCodeU32(code, &pc); // dst table
+                            _ = readCodeU32(code, &pc); // src table
+                            try self.tableCopy();
+                        },
+                        0x0f => try self.tableGrow(code, &pc), // table.grow
+                        0x10 => try self.tableSize(code, &pc), // table.size
+                        0x11 => try self.tableFill(code, &pc), // table.fill
                         else => return error.Unimplemented,
                     }
                 },

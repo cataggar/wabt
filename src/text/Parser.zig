@@ -72,6 +72,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
+    if (p.malformed) return error.InvalidModule;
     return module;
 }
 
@@ -160,6 +161,8 @@ const Parser = struct {
     allocator: std.mem.Allocator,
     peeked: ?Lex.Token = null,
     module: ?*Mod.Module = null,
+    /// Set when malformed input is detected (e.g. invalid alignment).
+    malformed: bool = false,
     /// Map from function $name to index (for name resolution in call instructions).
     func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from type $name to index (for name resolution).
@@ -1040,7 +1043,7 @@ const Parser = struct {
                 code.append(self.allocator, @truncate(op)) catch return;
                 // Memory load/store instructions have memarg (align, offset)
                 if (op >= 0x28 and op <= 0x3e) {
-                    self.emitMemarg(code);
+                    self.emitMemarg(code, @truncate(op));
                 }
             } else {
                 // Prefixed opcode
@@ -1052,8 +1055,8 @@ const Parser = struct {
                 code.appendSlice(self.allocator, buf[0..n]) catch return;
                 // Atomic/bulk memory instructions may have memarg or other immediates
                 if (prefix == 0xfe and sub >= 0x10) {
-                    // Atomic load/store/rmw/cmpxchg have memarg
-                    self.emitMemarg(code);
+                    // Atomic load/store/rmw/cmpxchg have memarg (no alignment check for now)
+                    self.emitMemarg(code, 0);
                 } else if (prefix == 0xfc) {
                     self.emitBulkMemImm(sub, code);
                 }
