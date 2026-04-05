@@ -297,7 +297,13 @@ pub const Interpreter = struct {
             // Resolve via import links
             if (func_idx < self.import_links.items.len) {
                 if (self.import_links.items[func_idx]) |link| {
-                    return link.interpreter.callFunc(link.func_idx, args);
+                    const link_base = link.interpreter.stack.items.len;
+                    try link.interpreter.callFunc(link.func_idx, args);
+                    // Copy results from linked interpreter's stack to our stack
+                    const link_results = link.interpreter.stack.items[link_base..];
+                    for (link_results) |v| try self.pushValue(v);
+                    link.interpreter.stack.shrinkRetainingCapacity(link_base);
+                    return;
                 }
             }
             return error.Unimplemented;
