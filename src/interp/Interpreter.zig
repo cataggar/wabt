@@ -27,6 +27,7 @@ pub const TrapError = error{
     CallStackExhausted,
     OutOfMemory,
     Unimplemented,
+    InstructionLimitExceeded,
 };
 
 // ── Value ────────────────────────────────────────────────────────────────
@@ -180,6 +181,10 @@ pub const Interpreter = struct {
     branch_depth: ?u32 = null,
     /// Set when a return instruction is executed.
     returning: bool = false,
+    /// Instruction counter for execution limit.
+    instruction_count: u64 = 0,
+    /// Maximum instructions before trap (prevents infinite loops).
+    max_instructions: u64 = 10_000_000,
 
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
@@ -201,6 +206,7 @@ pub const Interpreter = struct {
             .index => |i| i,
             .name => return error.Unimplemented,
         };
+        self.instruction_count = 0;
         const stack_base = self.stack.items.len;
         const result = try self.callFunc(idx, args);
         // Clean up any stale values left on the stack from multi-return or leaky calls
@@ -797,7 +803,7 @@ pub const Interpreter = struct {
 
     pub fn f32Nearest(self: *Interpreter) TrapError!void {
         const a = try self.popF32();
-        try self.pushValue(.{ .f32 = @round(a) });
+        try self.pushValue(.{ .f32 = wasmNearestF32(a) });
     }
 
     // ── f64 arithmetic ──────────────────────────────────────────────────
@@ -1522,6 +1528,8 @@ pub const Interpreter = struct {
     fn dispatch(self: *Interpreter, code: []const u8, start_pc: usize, locals: []Value) TrapError!usize {
         var pc = start_pc;
         while (pc < code.len) {
+            self.instruction_count += 1;
+            if (self.instruction_count > self.max_instructions) return error.InstructionLimitExceeded;
             const opcode = code[pc];
             pc += 1;
             switch (opcode) {
