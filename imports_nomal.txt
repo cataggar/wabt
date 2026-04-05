@@ -1,2 +1,0 @@
-  FAIL assert_return(invoke "print64"): trap error.StackOverflow
-third_party\testsuite\imports.wast: 115 passed, 63 failed, 0 skipped (178 total)
