@@ -441,6 +441,8 @@ const Reader = struct {
             if (is_passive or has_explicit_index) {
                 if (use_elem_exprs) {
                     seg.elem_type = try self.readValType();
+                    // Element segment type must be a reference type
+                    if (!seg.elem_type.isRefType()) return error.InvalidType;
                 } else {
                     _ = try self.readByte(); // external kind (0=func)
                 }
