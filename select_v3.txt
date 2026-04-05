@@ -1,1 +1,0 @@
-third_party\testsuite\select.wast: 148 passed, 0 failed, 0 skipped (148 total)
