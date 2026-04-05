@@ -368,29 +368,18 @@ fn classifyNumber(text: []const u8) TokenKind {
     // Check if this is a hex number (0x prefix)
     const is_hex = (base.len > 2 and base[0] == '0' and (base[1] == 'x' or base[1] == 'X'));
 
-    // Validate all characters and detect float indicators
-    const digits_start: usize = if (is_hex) 2 + @as(usize, @intFromBool(text[0] == '+' or text[0] == '-')) else @as(usize, @intFromBool(text[0] == '+' or text[0] == '-'));
-    var is_float = false;
-    var i: usize = digits_start;
-    while (i < text.len) : (i += 1) {
-        const ch = text[i];
+    // Check for float indicators
+    // For hex: only '.' and 'p'/'P' indicate float (e/E are hex digits)
+    // For decimal: '.', 'e', 'E', 'p', 'P' indicate float
+    for (text) |ch| {
         switch (ch) {
-            '0'...'9', '_' => {},
-            'a'...'d', 'f' => if (!is_hex) return .invalid,
-            'A'...'D', 'F' => if (!is_hex) return .invalid,
-            '.' => is_float = true,
-            'p', 'P' => is_float = true,
-            'e', 'E' => if (!is_hex) { is_float = true; },
-            '+', '-' => {
-                if (i > 0) {
-                    const prev = text[i - 1];
-                    if (prev != 'e' and prev != 'E' and prev != 'p' and prev != 'P') return .invalid;
-                }
-            },
-            else => return .invalid,
+            '.' => return .float,
+            'p', 'P' => return .float,
+            'e', 'E' => if (!is_hex) return .float,
+            else => {},
         }
     }
-    return if (is_float) .float else .integer;
+    return .integer;
 }
 
 fn matchKeyword(text: []const u8) TokenKind {

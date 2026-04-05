@@ -278,12 +278,11 @@ const Parser = struct {
     }
 
     fn advance(self: *Parser) Lex.Token {
-        const tok = if (self.peeked) |t| blk: {
+        if (self.peeked) |t| {
             self.peeked = null;
-            break :blk t;
-        } else self.lexer.next();
-        if (tok.kind == .invalid) self.malformed = true;
-        return tok;
+            return t;
+        }
+        return self.lexer.next();
     }
 
     fn expect(self: *Parser, kind: TokenKind) ParseError!void {
@@ -1046,10 +1045,7 @@ const Parser = struct {
                         targets.append(self.allocator, idx) catch return;
                     } else {
                         const label_tok = self.advance();
-                        const depth = self.resolveLabelDepth(label_tok.text) orelse blk: {
-                            self.malformed = true;
-                            break :blk 0;
-                        };
+                        const depth = self.resolveLabelDepth(label_tok.text) orelse 0;
                         targets.append(self.allocator, depth) catch return;
                     }
                 }
