@@ -537,9 +537,11 @@ const Reader = struct {
     }
 
     fn readCustomSection(self: *Reader, end: usize) ReadError!void {
-        if (self.pos >= end) return; // empty custom section
+        if (self.pos >= end) return error.InvalidSection; // custom section must have a name
         const sect_name = try self.readName();
         if (self.pos > end) return error.UnexpectedEof;
+        // Validate UTF-8 name
+        if (!std.unicode.utf8ValidateSlice(sect_name)) return error.InvalidSection;
         const payload = self.data[self.pos..end];
         try self.module.customs.append(self.allocator, .{
             .name = sect_name,

@@ -710,11 +710,13 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             0x3d => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d); },
             0x3e => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e); },
             0x3f => { // memory.size
+                if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
                 val_stack.append(gpa(m), .i32) catch return error.OutOfMemory;
             },
             0x40 => { // memory.grow
+                if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
                 try popExpect(&val_stack, &ctrl_stack, .i32);
