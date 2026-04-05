@@ -248,7 +248,7 @@ pub const Interpreter = struct {
         self.import_links.deinit(self.allocator);
     }
 
-    /// Call an exported function by name.
+    /// Call an exported function by name (single return value).
     pub fn callExport(self: *Interpreter, name: []const u8, args: []const Value) TrapError!?Value {
         const exp = self.instance.module.getExport(name) orelse return error.UndefinedElement;
         if (exp.kind != .func) return error.UndefinedElement;
@@ -258,14 +258,34 @@ pub const Interpreter = struct {
         };
         self.instruction_count = 0;
         const stack_base = self.stack.items.len;
-        const result = try self.callFunc(idx, args);
-        // Clean up any stale values left on the stack from multi-return or leaky calls
+        try self.callFunc(idx, args);
+        const result: ?Value = if (self.stack.items.len > stack_base) self.stack.items[stack_base] else null;
         self.stack.shrinkRetainingCapacity(stack_base);
         return result;
     }
 
-    /// Call a function by index.
-    pub fn callFunc(self: *Interpreter, func_idx: u32, args: []const Value) TrapError!?Value {
+    /// Call an exported function by name, returning all result values.
+    pub fn callExportMulti(self: *Interpreter, name: []const u8, args: []const Value, results_buf: []Value) TrapError![]Value {
+        const exp = self.instance.module.getExport(name) orelse return error.UndefinedElement;
+        if (exp.kind != .func) return error.UndefinedElement;
+        const idx: u32 = switch (exp.var_) {
+            .index => |i| i,
+            .name => return error.Unimplemented,
+        };
+        self.instruction_count = 0;
+        const stack_base = self.stack.items.len;
+        try self.callFunc(idx, args);
+        const num_results = self.stack.items.len - stack_base;
+        const n = @min(num_results, results_buf.len);
+        for (0..n) |i| {
+            results_buf[i] = self.stack.items[stack_base + i];
+        }
+        self.stack.shrinkRetainingCapacity(stack_base);
+        return results_buf[0..n];
+    }
+
+    /// Call a function by index. Results are left on the operand stack.
+    pub fn callFunc(self: *Interpreter, func_idx: u32, args: []const Value) TrapError!void {
         if (self.call_depth >= self.max_call_depth) return error.CallStackExhausted;
         if (func_idx >= self.instance.module.funcs.items.len) return error.UndefinedElement;
 
@@ -284,7 +304,7 @@ pub const Interpreter = struct {
         }
 
         const code = func.code_bytes;
-        if (code.len == 0) return null;
+        if (code.len == 0) return;
 
         // Resolve function signature
         const sig = self.resolveSig(func.decl);
@@ -305,6 +325,8 @@ pub const Interpreter = struct {
                     .i64 => .{ .i64 = 0 },
                     .f32 => .{ .f32 = 0.0 },
                     .f64 => .{ .f64 = 0.0 },
+                    .funcref => .{ .ref_null = {} },
+                    .externref => .{ .ref_null = {} },
                     else => .{ .i32 = 0 },
                 };
             }
@@ -326,11 +348,18 @@ pub const Interpreter = struct {
         // Execute bytecode
         _ = try self.dispatch(code, 0, locals);
 
-        // Return value
-        if (sig.results.len > 0 and self.stack.items.len > stack_base) {
-            return self.popValue() catch null;
+        // Compact: keep only the last sig.results.len values above stack_base
+        const num_on_stack = self.stack.items.len -| stack_base;
+        const expected = sig.results.len;
+        if (expected > 0 and num_on_stack > expected) {
+            const src_start = self.stack.items.len - expected;
+            for (0..expected) |i| {
+                self.stack.items[stack_base + i] = self.stack.items[src_start + i];
+            }
+            self.stack.shrinkRetainingCapacity(stack_base + expected);
+        } else if (expected == 0) {
+            self.stack.shrinkRetainingCapacity(stack_base);
         }
-        return null;
     }
 
     /// Resolve function signature from a FuncDeclaration.
@@ -1876,8 +1905,7 @@ pub const Interpreter = struct {
                         i -= 1;
                         call_args[i] = try self.popValue();
                     }
-                    const result = try self.callFunc(idx, call_args);
-                    if (result) |v| try self.pushValue(v);
+                    try self.callFunc(idx, call_args);
                 },
                 0x11 => { // call_indirect
                     var tmp_pc = pc;
@@ -1912,8 +1940,7 @@ pub const Interpreter = struct {
                         i -= 1;
                         call_args[i] = try self.popValue();
                     }
-                    const result = try self.callFunc(func_idx, call_args);
-                    if (result) |v| try self.pushValue(v);
+                    try self.callFunc(func_idx, call_args);
                 },
                 0x1a => _ = try self.popValue(), // drop
                 0x1b => try self.selectOp(), // select
@@ -2378,7 +2405,8 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
 }
 
 fn wasmNearestF32(a: f32) f32 {
-    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (std.math.isNan(a)) return std.math.nan(f32);
+    if (std.math.isInf(a)) return a;
     if (a == 0.0) return a;
     var rounded = @round(a);
     const diff = a - rounded;
@@ -2393,7 +2421,8 @@ fn wasmNearestF32(a: f32) f32 {
 }
 
 fn wasmNearestF64(a: f64) f64 {
-    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (std.math.isNan(a)) return std.math.nan(f64);
+    if (std.math.isInf(a)) return a;
     if (a == 0.0) return a;
     var rounded = @round(a);
     const diff = a - rounded;
@@ -2921,8 +2950,8 @@ test "dispatch: i32.const + i32.add via callFunc" {
     defer inst.deinit();
     var interp = Interpreter.init(alloc, &inst);
     defer interp.deinit();
-    const result = try interp.callFunc(0, &[_]Value{ .{ .i32 = 3 }, .{ .i32 = 4 } });
-    try std.testing.expectEqual(@as(i32, 7), result.?.i32);
+    try interp.callFunc(0, &[_]Value{ .{ .i32 = 3 }, .{ .i32 = 4 } });
+    try std.testing.expectEqual(@as(i32, 7), interp.stack.items[interp.stack.items.len - 1].i32);
 }
 
 test "dispatch: block with br" {
@@ -2948,6 +2977,6 @@ test "dispatch: block with br" {
     defer inst.deinit();
     var interp = Interpreter.init(alloc, &inst);
     defer interp.deinit();
-    const result = try interp.callFunc(0, &[_]Value{.{ .i32 = 99 }});
-    try std.testing.expectEqual(@as(i32, 99), result.?.i32);
+    try interp.callFunc(0, &[_]Value{.{ .i32 = 99 }});
+    try std.testing.expectEqual(@as(i32, 99), interp.stack.items[interp.stack.items.len - 1].i32);
 }
