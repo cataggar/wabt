@@ -107,7 +107,8 @@ const RunState = struct {
         self.destroyCurrent();
 
         const mod = self.allocator.create(Mod.Module) catch return false;
-        mod.* = Parser.parseModule(self.allocator, mod_text) catch {
+        mod.* = Parser.parseModule(self.allocator, mod_text) catch |e| {
+            std.debug.print("  DBG setModule parse failed: {any} text[0..@min(80,mod_text.len)]=\"{s}\"\n", .{ e, mod_text[0..@min(80, mod_text.len)] });
             self.allocator.destroy(mod);
             return false;
         };
@@ -1183,7 +1184,17 @@ fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 
                         '"' => { try result.append(allocator, '"'); i += 1; },
                         '\'' => { try result.append(allocator, '\''); i += 1; },
                         else => {
-                            // \xx hex or \u{xxxx} — just pass through as-is for WAT parser
+                            // \xx hex escape — decode to actual byte
+                            if (i + 1 < mod_text.len) {
+                                const hi = hexDigit(mod_text[i]);
+                                const lo = hexDigit(mod_text[i + 1]);
+                                if (hi != null and lo != null) {
+                                    try result.append(allocator, hi.? * 16 + lo.?);
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                            // Not a valid hex escape — pass through as-is
                             try result.append(allocator, '\\');
                             try result.append(allocator, mod_text[i]);
                             i += 1;

@@ -375,7 +375,7 @@ const Parser = struct {
             if (self.peek().kind == .kw_export) {
                 _ = self.advance(); // consume 'export'
                 const name_tok = self.advance();
-                const exp_name = stripQuotes(name_tok.text);
+                const exp_name = self.parseName(name_tok.text);
                 if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
@@ -1065,10 +1065,12 @@ const Parser = struct {
         // If opcode not recognized, just skip (don't emit anything)
     }
 
-    fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+    fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
+        _ = opcode;
         // Parse optional offset=N and align=N
         var alignment: u32 = 0;
         var offset: u32 = 0;
+        var has_align = false;
         for (0..2) |_| {
             if (self.peek().kind == .nat_eq) {
                 const tok = self.advance();
@@ -1077,10 +1079,20 @@ const Parser = struct {
                     offset = std.fmt.parseInt(u32, tok.text[7..], 0) catch 0;
                 } else if (std.mem.startsWith(u8, tok.text, "align=")) {
                     alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch 0;
+                    has_align = true;
                 }
             }
         }
-        self.emitLeb128U32(code, alignment);
+        // Convert alignment to log2 and validate
+        var log2_align: u32 = 0;
+        if (has_align) {
+            if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
+                self.malformed = true;
+            } else {
+                log2_align = @ctz(alignment);
+            }
+        }
+        self.emitLeb128U32(code, log2_align);
         self.emitLeb128U32(code, offset);
     }
 
@@ -1203,7 +1215,7 @@ const Parser = struct {
             if (self.peek().kind == .kw_export) {
                 _ = self.advance();
                 const name_tok = self.advance();
-                const exp_name = stripQuotes(name_tok.text);
+                const exp_name = self.parseName(name_tok.text);
                 if (self.peek().kind == .r_paren) _ = self.advance();
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
@@ -1350,8 +1362,8 @@ const Parser = struct {
         const module_name = self.advance().text; // string literal
         const field_name = self.advance().text;
         // Strip quotes
-        const mod_str = stripQuotes(module_name);
-        const field_str = stripQuotes(field_name);
+        const mod_str = self.parseName(module_name);
+        const field_str = self.parseName(field_name);
 
         try self.expect(.l_paren);
         const kind_tok = self.advance();
@@ -1468,7 +1480,7 @@ const Parser = struct {
 
     fn parseExport(self: *Parser, module: *Mod.Module) ParseError!void {
         const name_tok = self.advance();
-        const exp_name = stripQuotes(name_tok.text);
+        const exp_name = self.parseName(name_tok.text);
         try self.expect(.l_paren);
         const kind_tok = self.advance();
         const kind: types.ExternalKind = switch (kind_tok.kind) {
@@ -1640,13 +1652,14 @@ const Parser = struct {
             seg.owns_offset_expr_bytes = true;
         }
 
-        // Read data string(s)
+        // Read data string(s), decoding WAT escape sequences
         var data_parts: std.ArrayListUnmanaged(u8) = .{};
         defer data_parts.deinit(self.allocator);
         while (self.peek().kind == .string) {
             const tok = self.advance();
             const stripped = stripQuotes(tok.text);
-            data_parts.appendSlice(self.allocator, stripped) catch {};
+            const decoded = decodeWatString(self.allocator, stripped);
+            data_parts.appendSlice(self.allocator, decoded) catch {};
         }
         if (data_parts.items.len > 0) {
             seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
@@ -1661,7 +1674,72 @@ const Parser = struct {
         }
         return text;
     }
+
+    /// Strip quotes and validate UTF-8 for names (exports, imports).
+    fn parseName(self: *Parser, text: []const u8) []const u8 {
+        const raw = stripQuotes(text);
+        // Check if string contains escape sequences
+        if (std.mem.indexOfScalar(u8, raw, '\\')) |_| {
+            // Decode escape sequences and validate UTF-8
+            const decoded = decodeWatString(self.allocator, raw);
+            if (decoded.len > 0) {
+                if (!std.unicode.utf8ValidateSlice(decoded)) {
+                    self.malformed = true;
+                }
+                return decoded;
+            }
+        }
+        if (!std.unicode.utf8ValidateSlice(raw)) {
+            self.malformed = true;
+        }
+        return raw;
+    }
 };
+
+/// Decode WAT string escape sequences (\nn hex, \t, \n, \r, \\, \").
+fn decodeWatString(allocator: std.mem.Allocator, raw: []const u8) []const u8 {
+    var buf = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '\\' and i + 1 < raw.len) {
+            i += 1;
+            switch (raw[i]) {
+                'n' => { buf.append(allocator, '\n') catch return &.{}; i += 1; },
+                't' => { buf.append(allocator, '\t') catch return &.{}; i += 1; },
+                'r' => { buf.append(allocator, '\r') catch return &.{}; i += 1; },
+                '\\' => { buf.append(allocator, '\\') catch return &.{}; i += 1; },
+                '"' => { buf.append(allocator, '"') catch return &.{}; i += 1; },
+                '\'' => { buf.append(allocator, '\'') catch return &.{}; i += 1; },
+                else => {
+                    // Try \xx hex escape
+                    if (i + 1 < raw.len) {
+                        const hi = hexVal(raw[i]);
+                        const lo = hexVal(raw[i + 1]);
+                        if (hi != null and lo != null) {
+                            buf.append(allocator, hi.? * 16 + lo.?) catch return &.{};
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    buf.append(allocator, '\\') catch return &.{};
+                    buf.append(allocator, raw[i]) catch return &.{};
+                    i += 1;
+                },
+            }
+        } else {
+            buf.append(allocator, raw[i]) catch return &.{};
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(allocator) catch return &.{};
+}
+
+fn hexVal(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
 
 /// Check if a token kind is a constant instruction (valid in init expressions).
 fn isConstInstrToken(kind: TokenKind) bool {
