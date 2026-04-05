@@ -1670,8 +1670,9 @@ const Parser = struct {
                 const idx = try self.parseU32();
                 try seg.elem_var_indices.append(self.allocator, .{ .index = idx });
             } else if (self.peek().kind == .identifier) {
-                // Named reference like $f — skip for now
-                _ = self.advance();
+                const id_tok = self.advance();
+                const func_idx = self.func_names.get(id_tok.text) orelse 0;
+                try seg.elem_var_indices.append(self.allocator, .{ .index = func_idx });
             } else if (self.peek().kind == .kw_funcref) {
                 _ = self.advance();
                 has_elem_type = true;
