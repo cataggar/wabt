@@ -1,0 +1,20 @@
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): got .{ .i32 = 1 } expected .{ .i32 = 9 }
+  FAIL assert_return(invoke "check"): got .{ .i32 = 4 } expected .{ .i32 = 2 }
+  FAIL assert_return(invoke "check"): got .{ .i32 = 1 } expected .{ .i32 = 7 }
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): got .{ .i32 = 1 } expected .{ .i32 = 7 }
+  FAIL assert_return(invoke "check"): got .{ .i32 = 1 } expected .{ .i32 = 9 }
+  FAIL assert_return(invoke "check"): got .{ .i32 = 1 } expected .{ .i32 = 7 }
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+  FAIL assert_return(invoke "check"): got .{ .i32 = 3 } expected .{ .i32 = 9 }
+  FAIL assert_return(invoke "check"): got .{ .i32 = 6 } expected .{ .i32 = 2 }
+  FAIL assert_return(invoke "check"): trap error.UninitializedElement
+third_party\testsuite\table_init.wast: 751 passed, 29 failed, 0 skipped (780 total)

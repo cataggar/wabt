@@ -1,0 +1,1 @@
+third_party\testsuite\table_grow.wast: 58 passed, 0 failed, 0 skipped (58 total)
