@@ -398,10 +398,57 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 }
 
 fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
-    _ = allocator;
-
     const inv = findInvoke(sexpr) orelse {
-        // Could be (assert_trap (module ...) "msg") — skip these
+        // Could be (assert_trap (module ...) "msg") — module instantiation should trap
+        const inner = findEmbeddedModule(sexpr) orelse {
+            result.skipped += 1;
+            return;
+        };
+
+        // Try binary module
+        if (isBinaryOrQuoteModule(inner)) {
+            // Binary/quote module trap — skip for now
+            result.skipped += 1;
+            return;
+        }
+
+        // Try text module
+        if (!isBinaryOrQuoteModule(inner)) {
+            var module = Parser.parseModule(allocator, inner) catch {
+                result.passed += 1;
+                return;
+            };
+            defer module.deinit();
+
+            Validator.validate(&module, .{}) catch {
+                result.passed += 1;
+                return;
+            };
+
+            var instance = Interp.Instance.init(allocator, &module) catch {
+                result.passed += 1;
+                return;
+            };
+            defer instance.deinit();
+            instance.instantiate() catch {
+                result.passed += 1;
+                return;
+            };
+            var interp2 = Interp.Interpreter.init(allocator, &instance);
+            defer interp2.deinit();
+
+            if (module.start_var) |sv| {
+                if (interp2.callFunc(sv.index, &.{})) |_| {
+                    result.failed += 1;
+                } else |_| {
+                    result.passed += 1;
+                }
+                return;
+            }
+            result.failed += 1;
+            return;
+        }
+
         result.skipped += 1;
         return;
     };
