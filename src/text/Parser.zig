@@ -644,36 +644,11 @@ const Parser = struct {
                     results_list.append(self.allocator, vt) catch return error.OutOfMemory;
                 }
                 try self.expect(.r_paren);
-            } else if (inner == .kw_type) {
-                // (type ...) after (param/result ...) is malformed
-                if (params_list.items.len > 0 or results_list.items.len > 0) {
-                    self.malformed = true;
-                }
-                try self.skipSExpr();
-                try self.expect(.r_paren);
             } else {
                 // Not param/result — restore and stop parsing sig
                 self.lexer.pos = save_pos;
                 self.peeked = save_peeked;
                 break;
-            }
-        }
-
-        // Validate inline params/results match type annotation if both present
-        if (func.decl.type_var == .index and func.decl.type_var.index != types.invalid_index) {
-            const tidx = func.decl.type_var.index;
-            if (tidx < module.module_types.items.len) {
-                switch (module.module_types.items[tidx]) {
-                    .func_type => |ft| {
-                        if (params_list.items.len > 0 and params_list.items.len != ft.params.len) {
-                            self.malformed = true;
-                        }
-                        if (results_list.items.len > 0 and results_list.items.len != ft.results.len) {
-                            self.malformed = true;
-                        }
-                    },
-                    else => {},
-                }
             }
         }
 
@@ -1191,10 +1166,6 @@ const Parser = struct {
             },
             .opcode => self.emitGenericOpcode(tok.text, code),
             .invalid => {
-                self.malformed = true;
-            },
-            .kw_param, .kw_result, .kw_local => {
-                // param/result/local in function body means ordering error
                 self.malformed = true;
             },
             else => {},
@@ -2056,14 +2027,7 @@ const Parser = struct {
         switch (kind_tok.kind) {
             .kw_func => {
                 import.kind = .func;
-                const import_func_idx: u32 = @intCast(module.funcs.items.len);
-                if (self.peek().kind == .identifier) {
-                    const fname = self.advance().text;
-                    if (self.func_names.getOrPut(self.allocator, fname)) |gop| {
-                        if (gop.found_existing and gop.value_ptr.* != import_func_idx) self.malformed = true;
-                        gop.value_ptr.* = import_func_idx;
-                    } else |_| {}
-                }
+                if (self.peek().kind == .identifier) _ = self.advance();
                 var type_index: types.Index = 0;
                 if (self.peek().kind == .l_paren) {
                     _ = self.advance();
