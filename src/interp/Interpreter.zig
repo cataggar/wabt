@@ -64,15 +64,27 @@ pub const Instance = struct {
     /// Tracks which element segments have been dropped via elem.drop.
     dropped_elems: std.DynamicBitSetUnmanaged = .{},
 
+    /// Shared memory pointer — when set, memory operations use this instead of local memory.
+    shared_memory: ?*std.ArrayListUnmanaged(u8) = null,
+    /// Shared table pointers — when set, table operations use this instead of local tables.
+    shared_tables: ?*std.ArrayListUnmanaged(std.ArrayListUnmanaged(?u32)) = null,
+
+    /// Get the active memory (shared or local).
+    pub fn getMemory(self: *Instance) *std.ArrayListUnmanaged(u8) {
+        return self.shared_memory orelse &self.memory;
+    }
+
     /// Shorthand to access the default (index 0) table.
     pub fn table(self: *Instance) *std.ArrayListUnmanaged(?u32) {
-        return &self.tables.items[0];
+        const tbls = self.shared_tables orelse &self.tables;
+        return &tbls.items[0];
     }
 
     /// Access a table by index, falling back to index 0.
     pub fn getTable(self: *Instance, idx: u32) *std.ArrayListUnmanaged(?u32) {
-        if (idx < self.tables.items.len) return &self.tables.items[idx];
-        return &self.tables.items[0];
+        const tbls = self.shared_tables orelse &self.tables;
+        if (idx < tbls.items.len) return &tbls.items[idx];
+        return &tbls.items[0];
     }
 
     pub fn init(allocator: std.mem.Allocator, module: *const Mod.Module) TrapError!Instance {
@@ -92,8 +104,8 @@ pub const Instance = struct {
             inst.dropped_elems = std.DynamicBitSetUnmanaged.initEmpty(allocator, module.elem_segments.items.len) catch return error.OutOfMemory;
         }
 
-        // Allocate linear memory for first memory definition.
-        if (module.memories.items.len > 0) {
+        // Allocate linear memory for first memory definition (skip if imported).
+        if (module.memories.items.len > 0 and !module.memories.items[0].is_import) {
             const mem = module.memories.items[0];
             const initial_pages: usize = @intCast(mem.@"type".limits.initial);
             const byte_count = initial_pages * @as(usize, page_size);
@@ -115,11 +127,12 @@ pub const Instance = struct {
             inst.globals.append(allocator, val) catch return error.OutOfMemory;
         }
 
-        // Initialise all tables.
+        // Initialise all tables (skip imported ones, they'll be set via shared_tables).
         if (module.tables.items.len > 0) {
             inst.tables.resize(allocator, module.tables.items.len) catch return error.OutOfMemory;
             for (module.tables.items, 0..) |tbl, i| {
                 inst.tables.items[i] = .{};
+                if (tbl.is_import) continue; // will be shared via pointer
                 const initial: usize = @intCast(tbl.@"type".limits.initial);
                 inst.tables.items[i].resize(allocator, initial) catch return error.OutOfMemory;
                 @memset(inst.tables.items[i].items, null);
@@ -167,11 +180,12 @@ pub const Instance = struct {
                     };
                 }
             }
-            if (offset + seg.data.len > self.memory.items.len) {
+            const mem = self.getMemory();
+            if (offset + seg.data.len > mem.items.len) {
                 return error.OutOfBoundsMemoryAccess;
             }
             if (seg.data.len > 0) {
-                @memcpy(self.memory.items[offset .. offset + seg.data.len], seg.data);
+                @memcpy(mem.items[offset .. offset + seg.data.len], seg.data);
             }
         }
 
@@ -1116,9 +1130,9 @@ pub const Interpreter = struct {
     pub fn i32Load(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(i32, self.instance.memory.items[idx..][0..4], .little);
+        const val = std.mem.readInt(i32, self.instance.getMemory().items[idx..][0..4], .little);
         try self.pushValue(.{ .i32 = val });
     }
 
@@ -1126,17 +1140,17 @@ pub const Interpreter = struct {
         const val = try self.popI32();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        std.mem.writeInt(i32, self.instance.memory.items[idx..][0..4], val, .little);
+        std.mem.writeInt(i32, self.instance.getMemory().items[idx..][0..4], val, .little);
     }
 
     pub fn i64Load(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 8 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 8 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(i64, self.instance.memory.items[idx..][0..8], .little);
+        const val = std.mem.readInt(i64, self.instance.getMemory().items[idx..][0..8], .little);
         try self.pushValue(.{ .i64 = val });
     }
 
@@ -1144,17 +1158,17 @@ pub const Interpreter = struct {
         const val = try self.popI64();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 8 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 8 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        std.mem.writeInt(i64, self.instance.memory.items[idx..][0..8], val, .little);
+        std.mem.writeInt(i64, self.instance.getMemory().items[idx..][0..8], val, .little);
     }
 
     pub fn f32Load(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const bits = std.mem.readInt(u32, self.instance.memory.items[idx..][0..4], .little);
+        const bits = std.mem.readInt(u32, self.instance.getMemory().items[idx..][0..4], .little);
         try self.pushValue(.{ .f32 = @bitCast(bits) });
     }
 
@@ -1162,18 +1176,18 @@ pub const Interpreter = struct {
         const val = try self.popF32();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits: u32 = @bitCast(val);
-        std.mem.writeInt(u32, self.instance.memory.items[idx..][0..4], bits, .little);
+        std.mem.writeInt(u32, self.instance.getMemory().items[idx..][0..4], bits, .little);
     }
 
     pub fn f64Load(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 8 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 8 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const bits = std.mem.readInt(u64, self.instance.memory.items[idx..][0..8], .little);
+        const bits = std.mem.readInt(u64, self.instance.getMemory().items[idx..][0..8], .little);
         try self.pushValue(.{ .f64 = @bitCast(bits) });
     }
 
@@ -1181,14 +1195,14 @@ pub const Interpreter = struct {
         const val = try self.popF64();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 8 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 8 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits: u64 = @bitCast(val);
-        std.mem.writeInt(u64, self.instance.memory.items[idx..][0..8], bits, .little);
+        std.mem.writeInt(u64, self.instance.getMemory().items[idx..][0..8], bits, .little);
     }
 
     pub fn memorySize(self: *Interpreter) TrapError!void {
-        const pages: i32 = @intCast(self.instance.memory.items.len / page_size);
+        const pages: i32 = @intCast(self.instance.getMemory().items.len / page_size);
         try self.pushValue(.{ .i32 = pages });
     }
 
@@ -1198,7 +1212,7 @@ pub const Interpreter = struct {
             try self.pushValue(.{ .i32 = -1 });
             return;
         }
-        const old_pages: u32 = @intCast(self.instance.memory.items.len / page_size);
+        const old_pages: u32 = @intCast(self.instance.getMemory().items.len / page_size);
         const new_pages: u64 = @as(u64, old_pages) + @as(u64, @as(u32, @bitCast(delta)));
 
         // Wasm spec: max 65536 pages (4GB)
@@ -1219,13 +1233,13 @@ pub const Interpreter = struct {
         }
 
         const new_len = @as(usize, @intCast(new_pages)) * page_size;
-        self.instance.memory.resize(self.allocator, new_len) catch {
+        self.instance.getMemory().resize(self.allocator, new_len) catch {
             try self.pushValue(.{ .i32 = -1 });
             return;
         };
         // Zero-initialise newly grown pages.
         const old_len = @as(usize, old_pages) * page_size;
-        @memset(self.instance.memory.items[old_len..], 0);
+        @memset(self.instance.getMemory().items[old_len..], 0);
         try self.pushValue(.{ .i32 = @bitCast(old_pages) });
     }
 
@@ -1516,7 +1530,7 @@ pub const Interpreter = struct {
         const n: u32 = @bitCast(n_val);
         const src: u32 = @bitCast(src_val);
         const dst: u32 = @bitCast(dst_val);
-        const mem = self.instance.memory.items;
+        const mem = self.instance.getMemory().items;
         if (@as(u64, src) + n > mem.len or @as(u64, dst) + n > mem.len)
             return error.OutOfBoundsMemoryAccess;
         if (n == 0) return;
@@ -1536,7 +1550,7 @@ pub const Interpreter = struct {
         const dst_val = try self.popI32();
         const n: u32 = @bitCast(n_val);
         const dst: u32 = @bitCast(dst_val);
-        const mem = self.instance.memory.items;
+        const mem = self.instance.getMemory().items;
         if (@as(u64, dst) + n > mem.len)
             return error.OutOfBoundsMemoryAccess;
         if (n == 0) return;
@@ -1559,13 +1573,13 @@ pub const Interpreter = struct {
         const seg = self.instance.module.data_segments.items[data_idx];
         const seg_len: u32 = if (dropped) 0 else @intCast(seg.data.len);
         if (@as(u64, src) + n > seg_len or
-            @as(u64, dst) + n > self.instance.memory.items.len)
+            @as(u64, dst) + n > self.instance.getMemory().items.len)
             return error.OutOfBoundsMemoryAccess;
         if (n == 0) return;
         const s: usize = @intCast(src);
         const d: usize = @intCast(dst);
         const len: usize = @intCast(n);
-        @memcpy(self.instance.memory.items[d .. d + len], seg.data[s .. s + len]);
+        @memcpy(self.instance.getMemory().items[d .. d + len], seg.data[s .. s + len]);
     }
 
     pub fn tableCopy(self: *Interpreter, dst_tbl_idx: u32, src_tbl_idx: u32) TrapError!void {
@@ -1702,86 +1716,86 @@ pub const Interpreter = struct {
     pub fn i32Load8S(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        const val: i8 = @bitCast(self.instance.memory.items[@intCast(addr)]);
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        const val: i8 = @bitCast(self.instance.getMemory().items[@intCast(addr)]);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
     pub fn i32Load8U(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        const val = self.instance.memory.items[@intCast(addr)];
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        const val = self.instance.getMemory().items[@intCast(addr)];
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
     pub fn i32Load16S(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(i16, self.instance.memory.items[idx..][0..2], .little);
+        const val = std.mem.readInt(i16, self.instance.getMemory().items[idx..][0..2], .little);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
     pub fn i32Load16U(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(u16, self.instance.memory.items[idx..][0..2], .little);
+        const val = std.mem.readInt(u16, self.instance.getMemory().items[idx..][0..2], .little);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
     pub fn i64Load8S(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        const val: i8 = @bitCast(self.instance.memory.items[@intCast(addr)]);
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        const val: i8 = @bitCast(self.instance.getMemory().items[@intCast(addr)]);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
     pub fn i64Load8U(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        const val = self.instance.memory.items[@intCast(addr)];
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        const val = self.instance.getMemory().items[@intCast(addr)];
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
     pub fn i64Load16S(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(i16, self.instance.memory.items[idx..][0..2], .little);
+        const val = std.mem.readInt(i16, self.instance.getMemory().items[idx..][0..2], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
     pub fn i64Load16U(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(u16, self.instance.memory.items[idx..][0..2], .little);
+        const val = std.mem.readInt(u16, self.instance.getMemory().items[idx..][0..2], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
     pub fn i64Load32S(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(i32, self.instance.memory.items[idx..][0..4], .little);
+        const val = std.mem.readInt(i32, self.instance.getMemory().items[idx..][0..4], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
     pub fn i64Load32U(self: *Interpreter, offset: u32) TrapError!void {
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        const val = std.mem.readInt(u32, self.instance.memory.items[idx..][0..4], .little);
+        const val = std.mem.readInt(u32, self.instance.getMemory().items[idx..][0..4], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
@@ -1791,43 +1805,43 @@ pub const Interpreter = struct {
         const val = try self.popI32();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        self.instance.memory.items[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        self.instance.getMemory().items[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
     }
 
     pub fn i32Store16(self: *Interpreter, offset: u32) TrapError!void {
         const val = try self.popI32();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        std.mem.writeInt(u16, self.instance.memory.items[idx..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
+        std.mem.writeInt(u16, self.instance.getMemory().items[idx..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
     }
 
     pub fn i64Store8(self: *Interpreter, offset: u32) TrapError!void {
         const val = try self.popI64();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 1 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
-        self.instance.memory.items[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
+        if (addr + 1 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
+        self.instance.getMemory().items[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
     }
 
     pub fn i64Store16(self: *Interpreter, offset: u32) TrapError!void {
         const val = try self.popI64();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 2 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 2 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        std.mem.writeInt(u16, self.instance.memory.items[idx..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
+        std.mem.writeInt(u16, self.instance.getMemory().items[idx..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
     pub fn i64Store32(self: *Interpreter, offset: u32) TrapError!void {
         const val = try self.popI64();
         const base = try self.popI32();
         const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
-        if (addr + 4 > self.instance.memory.items.len) return error.OutOfBoundsMemoryAccess;
+        if (addr + 4 > self.instance.getMemory().items.len) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        std.mem.writeInt(u32, self.instance.memory.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
+        std.mem.writeInt(u32, self.instance.getMemory().items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
     // ── Block stack helpers ──────────────────────────────────────────────
@@ -3113,3 +3127,4 @@ test "dispatch: block with br" {
     try interp.callFunc(0, &[_]Value{.{ .i32 = 99 }});
     try std.testing.expectEqual(@as(i32, 99), interp.stack.items[interp.stack.items.len - 1].i32);
 }
+

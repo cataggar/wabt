@@ -320,33 +320,20 @@ const RunState = struct {
                     }
                 }
             } else if (imp.kind == .memory) {
-                // Share memory from exporting module
+                // Share memory from exporting module via pointer
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
                 const exp = triple.module.getExport(imp.field_name) orelse continue;
                 if (exp.kind != .memory) continue;
-                // Copy the exporter's memory data into this instance
-                if (triple.instance.memory.items.len > 0) {
-                    interp.instance.memory.resize(self.allocator, triple.instance.memory.items.len) catch continue;
-                    @memcpy(interp.instance.memory.items, triple.instance.memory.items);
-                }
+                // Point to the exporter's memory for true sharing
+                interp.instance.shared_memory = triple.instance.getMemory();
             } else if (imp.kind == .table) {
-                // Share table from exporting module
+                // Share tables from exporting module via pointer
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
                 const exp = triple.module.getExport(imp.field_name) orelse continue;
                 if (exp.kind != .table) continue;
-                const src_tbl_idx: u32 = switch (exp.var_) {
-                    .index => |i| i,
-                    .name => continue,
-                };
-                if (src_tbl_idx < triple.instance.tables.items.len) {
-                    const src_tbl = &triple.instance.tables.items[src_tbl_idx];
-                    // Copy table entries
-                    if (interp.instance.tables.items.len > 0) {
-                        const dst_tbl = &interp.instance.tables.items[0];
-                        dst_tbl.resize(self.allocator, src_tbl.items.len) catch continue;
-                        @memcpy(dst_tbl.items, src_tbl.items);
-                    }
-                }
+                // Point to the exporter's tables for true sharing
+                const src_tables = triple.instance.shared_tables orelse &triple.instance.tables;
+                interp.instance.shared_tables = src_tables;
             }
         }
     }
