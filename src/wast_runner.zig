@@ -478,7 +478,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     const call_result = interp.callExport(func_name, args) catch |err| {
         result.failed += 1;
-        if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
     };
 
@@ -498,7 +498,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
+            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
         }
     } else {
         // Function returned no value
@@ -1029,27 +1029,11 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         };
         return .{ .i64 = v };
     } else if (std.mem.eql(u8, kw, "f32.const")) {
-        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
-            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
-        {
-            return .{ .f32 = std.math.nan(f32) };
-        }
-        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f32 = std.math.inf(f32) };
-        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f32 = -std.math.inf(f32) };
-        const v = std.fmt.parseFloat(f32, val_text) catch return .{ .f32 = 0.0 };
-        return .{ .f32 = v };
+        const bits = Parser.parseFloatBits(f32, val_text);
+        return .{ .f32 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "f64.const")) {
-        if (std.mem.eql(u8, val_text, "nan") or std.mem.eql(u8, val_text, "+nan") or
-            std.mem.eql(u8, val_text, "-nan") or std.mem.startsWith(u8, val_text, "nan:") or
-            std.mem.startsWith(u8, val_text, "+nan:") or std.mem.startsWith(u8, val_text, "-nan:"))
-        {
-            return .{ .f64 = std.math.nan(f64) };
-        }
-        if (std.mem.eql(u8, val_text, "inf") or std.mem.eql(u8, val_text, "+inf")) return .{ .f64 = std.math.inf(f64) };
-        if (std.mem.eql(u8, val_text, "-inf")) return .{ .f64 = -std.math.inf(f64) };
-        const v = std.fmt.parseFloat(f64, val_text) catch return .{ .f64 = 0.0 };
-        return .{ .f64 = v };
+        const bits = Parser.parseFloatBits(f64, val_text);
+        return .{ .f64 = @bitCast(bits) };
     } else if (std.mem.eql(u8, kw, "ref.null")) {
         return .{ .ref_null = {} };
     } else if (std.mem.eql(u8, kw, "ref.func")) {
@@ -1089,6 +1073,7 @@ fn skipFirstSExpr(text: []const u8) ?[]const u8 {
 }
 
 /// Compare two Values for equality (used for assert_return).
+/// NaN values are compared by bit pattern so that specific NaN payloads match.
 fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
     return switch (a) {
         .i32 => |av| switch (b) {
@@ -1101,15 +1086,17 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
         },
         .f32 => |av| switch (b) {
             .f32 => |bv| {
-                if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                return av == bv;
+                const ab: u32 = @bitCast(av);
+                const bb: u32 = @bitCast(bv);
+                return ab == bb;
             },
             else => false,
         },
         .f64 => |av| switch (b) {
             .f64 => |bv| {
-                if (std.math.isNan(av) and std.math.isNan(bv)) return true;
-                return av == bv;
+                const ab: u64 = @bitCast(av);
+                const bb: u64 = @bitCast(bv);
+                return ab == bb;
             },
             else => false,
         },
