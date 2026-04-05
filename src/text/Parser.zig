@@ -1432,9 +1432,31 @@ const Parser = struct {
             },
             0x0b => self.emitU32Imm(code), // memory.fill
             0x0c => {
-                // table.init: elem_idx, table_idx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                // table.init: WAT syntax is `table.init $table $elem` or `table.init $elem`
+                // Binary format expects: elem_idx, table_idx
+                const first_kind = self.peek().kind;
+                if (first_kind == .identifier or first_kind == .integer) {
+                    var first_code = std.ArrayListUnmanaged(u8){};
+                    self.emitU32Imm(&first_code);
+                    const second_kind = self.peek().kind;
+                    if (second_kind == .identifier or second_kind == .integer) {
+                        // Two immediates: first is table_idx, second is elem_idx
+                        // Binary order: elem_idx, table_idx
+                        var second_code = std.ArrayListUnmanaged(u8){};
+                        self.emitU32Imm(&second_code);
+                        code.appendSlice(self.allocator, second_code.items) catch {};
+                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        second_code.deinit(self.allocator);
+                    } else {
+                        // One immediate: it's elem_idx, table defaults to 0
+                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        self.emitLeb128U32(code, 0); // table_idx = 0
+                    }
+                    first_code.deinit(self.allocator);
+                } else {
+                    self.emitLeb128U32(code, 0); // elem_idx = 0
+                    self.emitLeb128U32(code, 0); // table_idx = 0
+                }
             },
             0x0d => self.emitU32Imm(code), // elem.drop
             0x0e => {
