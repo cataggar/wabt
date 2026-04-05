@@ -644,6 +644,13 @@ const Parser = struct {
                     results_list.append(self.allocator, vt) catch return error.OutOfMemory;
                 }
                 try self.expect(.r_paren);
+            } else if (inner == .kw_type) {
+                // (type ...) after (param/result ...) is malformed
+                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                    self.malformed = true;
+                }
+                try self.skipSExpr();
+                try self.expect(.r_paren);
             } else {
                 // Not param/result — restore and stop parsing sig
                 self.lexer.pos = save_pos;
@@ -1191,8 +1198,8 @@ const Parser = struct {
             .invalid => {
                 self.malformed = true;
             },
-            .kw_param, .kw_result, .kw_local => {
-                // param/result/local in function body means ordering error
+            .kw_local => {
+                // local in function body (after instructions) is an ordering error
                 self.malformed = true;
             },
             else => {},
