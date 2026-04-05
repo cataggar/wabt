@@ -478,7 +478,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     const call_result = interp.callExport(func_name, args) catch |err| {
         result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
     };
 
@@ -498,7 +498,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
+            if (result.failed <= 500) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
         }
     } else {
         // Function returned no value
@@ -1010,7 +1010,11 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     while (i < sexpr.len and isWhitespace(sexpr[i])) : (i += 1) {}
     const val_start = i;
     while (i < sexpr.len and sexpr[i] != ')' and !isWhitespace(sexpr[i])) : (i += 1) {}
-    const val_text = sexpr[val_start..i];
+    const raw_val_text = sexpr[val_start..i];
+
+    // Strip WAT underscore digit separators
+    var clean_buf: [128]u8 = undefined;
+    const val_text = stripWatUnderscores(raw_val_text, &clean_buf);
 
     if (std.mem.eql(u8, kw, "i32.const")) {
         const v = std.fmt.parseInt(i32, val_text, 0) catch blk: {
@@ -1054,6 +1058,19 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         return .{ .ref_null = {} }; // treat extern refs as ref_null for now
     }
     return null;
+}
+
+/// Strip WAT `_` digit separators from a number string.
+fn stripWatUnderscores(text: []const u8, buf: []u8) []const u8 {
+    if (std.mem.indexOfScalar(u8, text, '_') == null) return text;
+    var len: usize = 0;
+    for (text) |ch| {
+        if (ch != '_' and len < buf.len) {
+            buf[len] = ch;
+            len += 1;
+        }
+    }
+    return buf[0..len];
 }
 
 /// Skip past the first nested s-expression in text and return the remainder.
