@@ -10,6 +10,7 @@ const Validator = @import("Validator.zig");
 const Mod = @import("Module.zig");
 const types = @import("types.zig");
 const Interp = @import("interp/Interpreter.zig");
+const BinaryReader = @import("binary/reader.zig");
 
 /// Aggregate result of running a WAST file.
 pub const Result = struct {
@@ -305,9 +306,23 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
         return;
     }
 
-    // Skip `(module binary ...)`.
+    // Handle `(module binary ...)` — decode binary and validate.
     if (isBinaryModule(inner)) {
-        result.skipped += 1;
+        const wasm_bytes = decodeWastHexStrings(allocator, inner) catch {
+            result.skipped += 1;
+            return;
+        };
+        defer allocator.free(wasm_bytes);
+        var module = BinaryReader.readModule(allocator, wasm_bytes) catch {
+            result.passed += 1; // decode failure = invalid
+            return;
+        };
+        defer module.deinit();
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1;
+            return;
+        };
+        result.failed += 1;
         return;
     }
 
@@ -363,9 +378,19 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     }
 
-    // Skip binary forms.
+    // Handle `(module binary ...)` — decode binary and try to parse.
     if (isBinaryModule(inner)) {
-        result.skipped += 1;
+        const wasm_bytes = decodeWastHexStrings(allocator, inner) catch {
+            result.passed += 1; // decode failure = malformed
+            return;
+        };
+        defer allocator.free(wasm_bytes);
+        var module = BinaryReader.readModule(allocator, wasm_bytes) catch {
+            result.passed += 1; // parse failure = malformed
+            return;
+        };
+        module.deinit();
+        result.failed += 1; // parsed OK but should have been malformed
         return;
     }
 
@@ -1053,6 +1078,45 @@ fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 
     return result.toOwnedSlice(allocator);
 }
 
+/// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.
+fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+    var res = std.ArrayListUnmanaged(u8){};
+    errdefer res.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '"') {
+            i += 1;
+            while (i < text.len and text[i] != '"') {
+                if (text[i] == '\\' and i + 2 < text.len) {
+                    const hi = hexDigit(text[i + 1]);
+                    const lo = hexDigit(text[i + 2]);
+                    if (hi != null and lo != null) {
+                        try res.append(allocator, hi.? * 16 + lo.?);
+                        i += 3;
+                    } else {
+                        try res.append(allocator, text[i]);
+                        i += 1;
+                    }
+                } else {
+                    try res.append(allocator, text[i]);
+                    i += 1;
+                }
+            }
+            if (i < text.len) i += 1; // skip closing "
+        } else {
+            i += 1;
+        }
+    }
+    return res.toOwnedSlice(allocator);
+}
+
+fn hexDigit(c: u8) ?u8 {
+    if (c >= '0' and c <= '9') return c - '0';
+    if (c >= 'a' and c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' and c <= 'F') return c - 'A' + 10;
+    return null;
+}
+
 // ── Whitespace helpers ──────────────────────────────────────────────────
 
 fn isWhitespace(c: u8) bool {
@@ -1129,13 +1193,13 @@ test "run: assert_invalid with duplicate export passes" {
     try std.testing.expectEqual(@as(u32, 0), result.failed);
 }
 
-test "run: assert_malformed with binary module is skipped" {
+test "run: assert_malformed with binary module is processed" {
     const wast =
         \\(assert_malformed (module binary "") "unexpected end")
     ;
     const result = run(std.testing.allocator, wast);
     try std.testing.expectEqual(@as(u32, 0), result.failed);
-    try std.testing.expectEqual(@as(u32, 1), result.skipped);
+    try std.testing.expectEqual(@as(u32, 1), result.passed);
 }
 
 test "run: assert_malformed with quote module is handled" {
