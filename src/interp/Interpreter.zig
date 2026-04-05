@@ -69,6 +69,18 @@ pub const Instance = struct {
     /// Shared table pointers — when set, table operations use this instead of local tables.
     shared_tables: ?*std.ArrayListUnmanaged(std.ArrayListUnmanaged(?u32)) = null,
 
+    /// Max pages for shared (imported) memory — from the exporter's definition.
+    shared_memory_max_pages: ?u64 = null,
+
+    /// Per-table-entry interpreter refs for cross-module function references.
+    /// Key = (tbl_idx << 32) | entry_idx. Only used when tables are shared.
+    table_func_refs: std.AutoHashMapUnmanaged(u64, *Interpreter) = .{},
+    /// Points to the table owner's table_func_refs when tables are shared.
+    shared_table_func_refs: ?*std.AutoHashMapUnmanaged(u64, *Interpreter) = null,
+
+    /// Back-reference to the owning interpreter (set after creation).
+    interp_ref: ?*Interpreter = null,
+
     /// Get the active memory (shared or local).
     pub fn getMemory(self: *Instance) *std.ArrayListUnmanaged(u8) {
         return self.shared_memory orelse &self.memory;
@@ -85,6 +97,15 @@ pub const Instance = struct {
         const tbls = self.shared_tables orelse &self.tables;
         if (idx < tbls.items.len) return &tbls.items[idx];
         return &tbls.items[0];
+    }
+
+    /// Get the table func refs map (shared or local).
+    pub fn getTableFuncRefs(self: *Instance) *std.AutoHashMapUnmanaged(u64, *Interpreter) {
+        return self.shared_table_func_refs orelse &self.table_func_refs;
+    }
+
+    fn makeTableKey(tbl_idx: u32, entry_idx: u32) u64 {
+        return (@as(u64, tbl_idx) << 32) | entry_idx;
     }
 
     pub fn init(allocator: std.mem.Allocator, module: *const Mod.Module) TrapError!Instance {
@@ -151,6 +172,7 @@ pub const Instance = struct {
         self.globals.deinit(self.allocator);
         for (self.tables.items) |*t| t.deinit(self.allocator);
         self.tables.deinit(self.allocator);
+        self.table_func_refs.deinit(self.allocator);
         self.dropped_data.deinit(self.allocator);
         self.dropped_elems.deinit(self.allocator);
     }
@@ -207,14 +229,54 @@ pub const Instance = struct {
                     };
                 }
             }
-            if (offset + seg.elem_var_indices.items.len > tbl.items.len) {
-                return error.OutOfBoundsTableAccess;
-            }
-            for (seg.elem_var_indices.items, 0..) |var_, j| {
-                const table_entry = offset + j;
-                switch (var_) {
-                    .index => |idx| tbl.items[table_entry] = idx,
-                    .name => {},
+
+            // Try elem expressions first (funcref expressions like ref.func, global.get)
+            if (seg.elem_expr_count > 0 and seg.elem_expr_bytes.len > 0) {
+                if (offset + seg.elem_expr_count > tbl.items.len) {
+                    return error.OutOfBoundsTableAccess;
+                }
+                var expr_pc: usize = 0;
+                var expr_i: u32 = 0;
+                while (expr_i < seg.elem_expr_count) : (expr_i += 1) {
+                    const entry_idx: u32 = @intCast(offset + expr_i);
+                    // Evaluate one const expression (terminated by 0x0b)
+                    const expr_start = expr_pc;
+                    // Find the end of this expression
+                    while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) {
+                        expr_pc += 1;
+                    }
+                    if (expr_pc < seg.elem_expr_bytes.len) expr_pc += 1; // skip 0x0b
+                    const val = evalConstExpr(self, seg.elem_expr_bytes[expr_start..expr_pc]);
+                    if (val) |v| switch (v) {
+                        .ref_func => |func_idx| {
+                            tbl.items[entry_idx] = func_idx;
+                            if (self.interp_ref) |interp| {
+                                const refs = self.getTableFuncRefs();
+                                refs.put(self.allocator, makeTableKey(tbl_idx, entry_idx), interp) catch {};
+                            }
+                        },
+                        .ref_null => {
+                            tbl.items[entry_idx] = null;
+                        },
+                        else => {},
+                    };
+                }
+            } else if (seg.elem_var_indices.items.len > 0) {
+                if (offset + seg.elem_var_indices.items.len > tbl.items.len) {
+                    return error.OutOfBoundsTableAccess;
+                }
+                for (seg.elem_var_indices.items, 0..) |var_, j| {
+                    const table_entry = offset + j;
+                    switch (var_) {
+                        .index => |idx| {
+                            tbl.items[table_entry] = idx;
+                            if (self.interp_ref) |interp| {
+                                const refs = self.getTableFuncRefs();
+                                refs.put(self.allocator, makeTableKey(tbl_idx, @intCast(table_entry)), interp) catch {};
+                            }
+                        },
+                        .name => {},
+                    }
                 }
             }
         }
@@ -1221,8 +1283,15 @@ pub const Interpreter = struct {
             return;
         }
 
-        // Apply max limit from the module definition if present.
-        if (self.instance.module.memories.items.len > 0) {
+        // For imported (shared) memory, respect the exporter's actual max.
+        if (self.instance.shared_memory != null) {
+            if (self.instance.shared_memory_max_pages) |max| {
+                if (new_pages > max) {
+                    try self.pushValue(.{ .i32 = -1 });
+                    return;
+                }
+            }
+        } else if (self.instance.module.memories.items.len > 0) {
             const mem = self.instance.module.memories.items[0];
             if (mem.@"type".limits.has_max) {
                 if (new_pages > mem.@"type".limits.max) {
@@ -1635,6 +1704,7 @@ pub const Interpreter = struct {
             @as(u64, dst) + n > tbl.items.len)
             return error.OutOfBoundsTableAccess;
         if (n == 0) return;
+        const refs = self.instance.getTableFuncRefs();
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const var_entry = seg.elem_var_indices.items[src + i];
@@ -1646,6 +1716,7 @@ pub const Interpreter = struct {
                 tbl.items[dst + i] = null;
             } else {
                 tbl.items[dst + i] = func_idx;
+                refs.put(self.allocator, Instance.makeTableKey(tbl_idx, dst + i), self) catch {};
             }
         }
     }
@@ -2051,9 +2122,15 @@ pub const Interpreter = struct {
                     const ci_tbl = self.instance.getTable(ci_tbl_idx);
                     if (uidx >= ci_tbl.items.len) return error.OutOfBoundsTableAccess;
                     const func_idx = ci_tbl.items[uidx] orelse return error.UninitializedElement;
-                    if (func_idx >= self.instance.module.funcs.items.len) return error.UndefinedElement;
-                    const target = self.instance.module.funcs.items[func_idx];
-                    const func_sig = self.resolveSig(target.decl);
+
+                    // Check for cross-module function reference
+                    const key = Instance.makeTableKey(ci_tbl_idx, uidx);
+                    const refs = self.instance.getTableFuncRefs();
+                    const target_interp = refs.get(key) orelse self;
+
+                    if (func_idx >= target_interp.instance.module.funcs.items.len) return error.UndefinedElement;
+                    const target = target_interp.instance.module.funcs.items[func_idx];
+                    const func_sig = target_interp.resolveSig(target.decl);
                     // Verify type matches the expected signature (structural)
                     if (type_idx < self.instance.module.module_types.items.len) {
                         switch (self.instance.module.module_types.items[type_idx]) {
@@ -2074,7 +2151,16 @@ pub const Interpreter = struct {
                         i -= 1;
                         call_args[i] = try self.popValue();
                     }
-                    try self.callFunc(func_idx, call_args);
+                    if (target_interp != self) {
+                        // Cross-module call: call through target interpreter and copy results
+                        const link_base = target_interp.stack.items.len;
+                        try target_interp.callFunc(func_idx, call_args);
+                        const link_results = target_interp.stack.items[link_base..];
+                        for (link_results) |v| try self.pushValue(v);
+                        target_interp.stack.shrinkRetainingCapacity(link_base);
+                    } else {
+                        try self.callFunc(func_idx, call_args);
+                    }
                 },
                 0x1a => _ = try self.popValue(), // drop
                 0x1b => try self.selectOp(), // select

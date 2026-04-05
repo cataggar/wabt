@@ -2148,16 +2148,46 @@ const Parser = struct {
                     } else |_| {}
                 }
                 var type_index: types.Index = 0;
-                if (self.peek().kind == .l_paren) {
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer params_list.deinit(self.allocator);
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer results_list.deinit(self.allocator);
+                while (self.peek().kind == .l_paren) {
+                    const sp2 = self.lexer.pos;
+                    const spk2 = self.peeked;
                     _ = self.advance();
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = try self.parseTypeIdx();
                         try self.expect(.r_paren);
-                    } else {
-                        try self.skipSExpr();
+                    } else if (self.peek().kind == .kw_param) {
+                        _ = self.advance();
+                        if (self.peek().kind == .identifier) _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            params_list.append(self.allocator, vt) catch {};
+                        }
                         try self.expect(.r_paren);
+                    } else if (self.peek().kind == .kw_result) {
+                        _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            results_list.append(self.allocator, vt) catch {};
+                        }
+                        try self.expect(.r_paren);
+                    } else {
+                        self.lexer.pos = sp2;
+                        self.peeked = spk2;
+                        break;
                     }
+                }
+                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                    const params = params_list.toOwnedSlice(self.allocator) catch &.{};
+                    const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                    type_index = @intCast(module.module_types.items.len);
+                    module.module_types.append(self.allocator, .{
+                        .func_type = .{ .params = params, .results = results },
+                    }) catch {};
                 }
                 import.func = .{ .type_var = .{ .index = type_index } };
                 try module.funcs.append(self.allocator, .{
