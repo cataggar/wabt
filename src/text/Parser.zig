@@ -25,9 +25,14 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     var p = Parser{ .lexer = Lexer.init(source), .allocator = allocator };
     defer p.func_names.deinit(allocator);
     defer p.type_names.deinit(allocator);
+    defer p.local_names.deinit(allocator);
+    defer p.global_names.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
+
+    // Pre-scan: collect function, type, and global names for forward references.
+    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, allocator);
 
     try p.expect(.l_paren);
     try p.expect(.kw_module);
@@ -69,6 +74,84 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     return module;
 }
 
+/// Fast pre-scan of source text to collect function, type, and global names
+/// for forward reference resolution. Uses a separate lexer pass.
+fn prescanNames(
+    source: []const u8,
+    func_names: *std.StringArrayHashMapUnmanaged(u32),
+    type_names: *std.StringArrayHashMapUnmanaged(u32),
+    global_names: *std.StringArrayHashMapUnmanaged(u32),
+    allocator: std.mem.Allocator,
+) void {
+    var lex = Lexer.init(source);
+    var func_idx: u32 = 0;
+    var type_idx: u32 = 0;
+    var global_idx: u32 = 0;
+
+    // Skip (module and optional name
+    var tok = lex.next();
+    if (tok.kind != .l_paren) return;
+    tok = lex.next();
+    if (tok.kind != .kw_module) return;
+    tok = lex.next();
+    if (tok.kind == .identifier) tok = lex.next();
+
+    // Scan top-level fields
+    while (tok.kind == .l_paren) {
+        tok = lex.next();
+        if (tok.kind == .kw_func) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                func_names.put(allocator, tok.text, func_idx) catch {};
+            }
+            func_idx += 1;
+        } else if (tok.kind == .kw_type) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                type_names.put(allocator, tok.text, type_idx) catch {};
+            }
+            type_idx += 1;
+        } else if (tok.kind == .kw_global) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                global_names.put(allocator, tok.text, global_idx) catch {};
+            }
+            global_idx += 1;
+        } else if (tok.kind == .kw_import) {
+            // Imports define indices for their kind. We need to find
+            // (import "mod" "name" (func $name ...)) to count import funcs.
+            // Skip strings
+            tok = lex.next(); // module string
+            tok = lex.next(); // field string
+            if (tok.kind == .l_paren) {
+                tok = lex.next();
+                if (tok.kind == .kw_func) {
+                    tok = lex.next();
+                    if (tok.kind == .identifier) {
+                        func_names.put(allocator, tok.text, func_idx) catch {};
+                    }
+                    func_idx += 1;
+                } else if (tok.kind == .kw_global) {
+                    tok = lex.next();
+                    if (tok.kind == .identifier) {
+                        global_names.put(allocator, tok.text, global_idx) catch {};
+                    }
+                    global_idx += 1;
+                }
+            }
+        }
+        // Skip to matching ')'
+        var depth: u32 = 1;
+        while (depth > 0) {
+            tok = lex.next();
+            if (tok.kind == .l_paren) depth += 1;
+            if (tok.kind == .r_paren) depth -= 1;
+            if (tok.kind == .eof) return;
+        }
+        tok = lex.next(); // next top-level field
+    }
+}
+
 // ── Internal parser ─────────────────────────────────────────────────────
 
 const Parser = struct {
@@ -80,6 +163,10 @@ const Parser = struct {
     func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from type $name to index (for name resolution).
     type_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from local/param $name to index (per-function, cleared for each func).
+    local_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from global $name to index.
+    global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -263,6 +350,8 @@ const Parser = struct {
     fn parseFunc(self: *Parser, module: *Mod.Module) ParseError!void {
         var func = Mod.Func{};
         const func_idx: u32 = @intCast(module.funcs.items.len);
+        // Clear per-function local name map
+        self.local_names.clearRetainingCapacity();
         if (self.peek().kind == .identifier) {
             func.name = self.advance().text;
             // Register name → index for call resolution
@@ -329,7 +418,11 @@ const Parser = struct {
             const inner = self.peek().kind;
             if (inner == .kw_param) {
                 _ = self.advance(); // consume 'param'
-                if (self.peek().kind == .identifier) _ = self.advance(); // skip $name
+                if (self.peek().kind == .identifier) {
+                    const name = self.advance().text;
+                    const idx: u32 = @intCast(params_list.items.len);
+                    self.local_names.put(self.allocator, name, idx) catch {};
+                }
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
                     params_list.append(self.allocator, vt) catch return error.OutOfMemory;
@@ -379,7 +472,11 @@ const Parser = struct {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_local) {
                 _ = self.advance(); // consume 'local'
-                if (self.peek().kind == .identifier) _ = self.advance(); // skip $name
+                if (self.peek().kind == .identifier) {
+                    const name = self.advance().text;
+                    const idx: u32 = @intCast(params_list.items.len + func.local_types.items.len);
+                    self.local_names.put(self.allocator, name, idx) catch {};
+                }
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
                     func.local_types.append(self.allocator, vt) catch return error.OutOfMemory;
@@ -491,12 +588,8 @@ const Parser = struct {
             },
             else => {
                 // Generic folded instruction: (instr operands...)
-                // Record the instruction, parse operands, then emit instruction after operands.
-                const instr_tok = self.peek();
-                const needs_reorder = switch (instr_tok.kind) {
-                    .kw_return, .kw_br, .kw_br_if, .kw_br_table => true,
-                    else => false,
-                };
+                // Emit instruction bytes first, then operands, then rotate so
+                // operands precede the instruction in the final bytecode.
                 const instr_start = code.items.len;
                 self.parsePlainInstr(code);
                 const instr_end = code.items.len;
@@ -515,10 +608,10 @@ const Parser = struct {
                     }
                 }
 
-                // For control-flow instructions that set unreachable, reorder so operands
-                // are validated before the instruction makes the stack unreachable.
-                if (needs_reorder and has_operands and instr_len > 0) {
-                    // Rotate: [instr][operands] → [operands][instr]
+                // Reorder: [instr][operands] → [operands][instr]
+                // In a stack machine, operands must be pushed before the
+                // instruction that consumes them.
+                if (has_operands and instr_len > 0) {
                     var buf: [32]u8 = undefined;
                     if (instr_len <= 32) {
                         @memcpy(buf[0..instr_len], code.items[instr_start..instr_end]);
@@ -791,11 +884,19 @@ const Parser = struct {
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         if (self.peek().kind == .identifier) {
             const tok = self.advance();
+            if (self.local_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
             if (self.func_names.get(tok.text)) |idx| {
                 self.emitLeb128U32(code, idx);
                 return;
             }
             if (self.type_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            if (self.global_names.get(tok.text)) |idx| {
                 self.emitLeb128U32(code, idx);
                 return;
             }
@@ -1146,7 +1247,11 @@ const Parser = struct {
     }
 
     fn parseGlobal(self: *Parser, module: *Mod.Module) ParseError!void {
-        if (self.peek().kind == .identifier) _ = self.advance();
+        const global_idx: u32 = @intCast(module.globals.items.len);
+        if (self.peek().kind == .identifier) {
+            const name = self.advance().text;
+            self.global_names.put(self.allocator, name, global_idx) catch {};
+        }
         var mutability: types.Mutability = .immutable;
         var val_type: types.ValType = undefined;
 
