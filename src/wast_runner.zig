@@ -275,8 +275,38 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
         return;
     };
 
-    // Skip `(module binary ...)` and `(module quote ...)` — we can't handle those.
-    if (isBinaryOrQuoteModule(inner)) {
+    // Handle `(module quote ...)` — decode and try to parse+validate.
+    if (isQuoteModule(inner)) {
+        const wat_text = decodeQuoteStrings(allocator, inner) catch {
+            result.skipped += 1;
+            return;
+        };
+        defer allocator.free(wat_text);
+        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+            wat_text
+        else blk: {
+            var buf = std.ArrayListUnmanaged(u8){};
+            buf.appendSlice(allocator, "(module ") catch { result.skipped += 1; return; };
+            buf.appendSlice(allocator, wat_text) catch { result.skipped += 1; return; };
+            buf.append(allocator, ')') catch { result.skipped += 1; return; };
+            break :blk buf.toOwnedSlice(allocator) catch { result.skipped += 1; return; };
+        };
+        defer if (wrapped.ptr != wat_text.ptr) allocator.free(wrapped);
+        var module = Parser.parseModule(allocator, wrapped) catch {
+            result.passed += 1; // parse failure counts as invalid
+            return;
+        };
+        defer module.deinit();
+        Validator.validate(&module, .{}) catch {
+            result.passed += 1;
+            return;
+        };
+        result.failed += 1;
+        return;
+    }
+
+    // Skip `(module binary ...)`.
+    if (isBinaryModule(inner)) {
         result.skipped += 1;
         return;
     }
@@ -306,8 +336,35 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     };
 
-    // Skip binary/quote forms.
-    if (isBinaryOrQuoteModule(inner)) {
+    // Handle `(module quote ...)` — decode quoted WAT text and parse.
+    if (isQuoteModule(inner)) {
+        const wat_text = decodeQuoteStrings(allocator, inner) catch {
+            result.passed += 1; // decode failure = malformed
+            return;
+        };
+        defer allocator.free(wat_text);
+        // Wrap in (module ...) if not already
+        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+            wat_text
+        else blk: {
+            var buf = std.ArrayListUnmanaged(u8){};
+            buf.appendSlice(allocator, "(module ") catch { result.passed += 1; return; };
+            buf.appendSlice(allocator, wat_text) catch { result.passed += 1; return; };
+            buf.append(allocator, ')') catch { result.passed += 1; return; };
+            break :blk buf.toOwnedSlice(allocator) catch { result.passed += 1; return; };
+        };
+        defer if (wrapped.ptr != wat_text.ptr) allocator.free(wrapped);
+        var module = Parser.parseModule(allocator, wrapped) catch {
+            result.passed += 1; // parse failure = malformed = pass
+            return;
+        };
+        module.deinit();
+        result.failed += 1; // parsed OK but should have been malformed
+        return;
+    }
+
+    // Skip binary forms.
+    if (isBinaryModule(inner)) {
         result.skipped += 1;
         return;
     }
@@ -925,24 +982,75 @@ fn hasWordAt(source: []const u8, pos: usize, word: []const u8) bool {
 
 /// Check whether a module s-expression is `(module binary ...)` or `(module quote ...)`.
 fn isBinaryOrQuoteModule(mod_text: []const u8) bool {
-    // Skip "(module" then whitespace, then check for "binary" or "quote".
+    return isBinaryModule(mod_text) or isQuoteModule(mod_text);
+}
+
+fn isBinaryModule(mod_text: []const u8) bool {
+    const i = skipModulePrefix(mod_text);
+    return i + 6 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 6], "binary");
+}
+
+fn isQuoteModule(mod_text: []const u8) bool {
+    const i = skipModulePrefix(mod_text);
+    return i + 5 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 5], "quote");
+}
+
+/// Skip past "(module" + optional whitespace + optional $name + whitespace.
+fn skipModulePrefix(mod_text: []const u8) usize {
     var i: usize = 1; // skip '('
     while (i < mod_text.len and isWhitespace(mod_text[i])) : (i += 1) {}
-    // Skip "module"
     const mod_kw = "module";
-    if (i + mod_kw.len > mod_text.len) return false;
+    if (i + mod_kw.len > mod_text.len) return i;
     i += mod_kw.len;
-    // Skip whitespace
     while (i < mod_text.len and isWhitespace(mod_text[i])) : (i += 1) {}
-    // Optional $name identifier
     if (i < mod_text.len and mod_text[i] == '$') {
         while (i < mod_text.len and !isWhitespace(mod_text[i]) and mod_text[i] != '(' and mod_text[i] != ')') : (i += 1) {}
         while (i < mod_text.len and isWhitespace(mod_text[i])) : (i += 1) {}
     }
-    // Now check for "binary" or "quote"
-    if (i + 6 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 6], "binary")) return true;
-    if (i + 5 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 5], "quote")) return true;
-    return false;
+    return i;
+}
+
+/// Decode `(module quote "..." "..." ...)` — extract and concatenate quoted WAT strings.
+fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 {
+    var result = std.ArrayListUnmanaged(u8){};
+    errdefer result.deinit(allocator);
+
+    var i = skipModulePrefix(mod_text);
+    // Skip "quote" keyword
+    if (i + 5 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 5], "quote")) i += 5;
+
+    while (i < mod_text.len) {
+        if (mod_text[i] == '"') {
+            i += 1;
+            while (i < mod_text.len and mod_text[i] != '"') {
+                if (mod_text[i] == '\\' and i + 1 < mod_text.len) {
+                    i += 1;
+                    switch (mod_text[i]) {
+                        'n' => { try result.append(allocator, '\n'); i += 1; },
+                        't' => { try result.append(allocator, '\t'); i += 1; },
+                        'r' => { try result.append(allocator, '\r'); i += 1; },
+                        '\\' => { try result.append(allocator, '\\'); i += 1; },
+                        '"' => { try result.append(allocator, '"'); i += 1; },
+                        '\'' => { try result.append(allocator, '\''); i += 1; },
+                        else => {
+                            // \xx hex or \u{xxxx} — just pass through as-is for WAT parser
+                            try result.append(allocator, '\\');
+                            try result.append(allocator, mod_text[i]);
+                            i += 1;
+                        },
+                    }
+                } else {
+                    try result.append(allocator, mod_text[i]);
+                    i += 1;
+                }
+            }
+            if (i < mod_text.len) i += 1; // skip closing "
+            try result.append(allocator, ' '); // space between segments
+        } else {
+            i += 1;
+        }
+    }
+    return result.toOwnedSlice(allocator);
 }
 
 // ── Whitespace helpers ──────────────────────────────────────────────────
@@ -1030,13 +1138,14 @@ test "run: assert_malformed with binary module is skipped" {
     try std.testing.expectEqual(@as(u32, 1), result.skipped);
 }
 
-test "run: assert_malformed with quote module is skipped" {
+test "run: assert_malformed with quote module is handled" {
+    // Verify quote modules are processed (not skipped)
     const wast =
-        \\(assert_malformed (module quote "(func)") "unknown operator")
+        \\(assert_malformed (module quote "(module (func (result i32)))") "")
     ;
     const result = run(std.testing.allocator, wast);
-    try std.testing.expectEqual(@as(u32, 0), result.failed);
-    try std.testing.expectEqual(@as(u32, 1), result.skipped);
+    // Should be processed, not skipped
+    try std.testing.expectEqual(@as(u32, 0), result.skipped);
 }
 
 test "run: assert_return without module is skipped" {
