@@ -482,38 +482,47 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
 
-    const call_result = interp.callExport(func_name, args) catch |err| {
-        result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
-        return;
-    };
-
     // Parse expected results (after the invoke sexpr)
     const after_invoke = skipFirstSExpr(sexpr) orelse sexpr;
     var expected_buf: [16]Interp.Value = undefined;
     const expected = parseExpectedResults(after_invoke, &expected_buf);
 
+    var results_buf: [16]Interp.Value = undefined;
+    const actuals = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
+        result.failed += 1;
+        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        return;
+    };
+
     if (expected.len == 0) {
-        // No expected result — just check it didn't trap
         result.passed += 1;
         return;
     }
 
-    if (call_result) |actual| {
-        if (expected.len > 0 and valuesEqual(actual, expected[0])) {
+    if (actuals.len >= expected.len) {
+        var all_match = true;
+        for (0..expected.len) |i| {
+            if (!valuesEqual(actuals[i], expected[i])) {
+                all_match = false;
+                break;
+            }
+        }
+        if (all_match) {
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual, expected[0] });
+            if (result.failed <= 20) {
+                if (expected.len == 1) {
+                    const actual_v = if (actuals.len > 0) actuals[0] else Interp.Value{ .i32 = 0 };
+                    std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual_v, expected[0] });
+                } else {
+                    std.debug.print("  FAIL assert_return(invoke \"{s}\"): multi-value mismatch ({d} results)\n", .{ func_name, expected.len });
+                }
+            }
         }
     } else {
-        // Function returned no value
-        if (expected.len == 0) {
-            result.passed += 1;
-        } else {
-            result.failed += 1;
-            if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got null expected {any}\n", .{ func_name, expected[0] });
-        }
+        result.failed += 1;
+        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {d} results expected {d}\n", .{ func_name, actuals.len, expected.len });
     }
 }
 
@@ -585,11 +594,11 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         defer interp2.deinit();
 
         if (module.start_var) |sv| {
-            if (interp2.callFunc(sv.index, &.{})) |_| {
-                result.failed += 1;
-            } else |_| {
+            interp2.callFunc(sv.index, &.{}) catch {
                 result.passed += 1;
-            }
+                return;
+            };
+            result.failed += 1;
             return;
         }
         result.failed += 1;
