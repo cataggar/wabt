@@ -337,6 +337,68 @@ const RunState = struct {
         }
     }
 
+    /// Check whether all imports in a module can be resolved against registered modules.
+    /// Returns false if any import module or export is missing.
+    fn checkImportsResolvable(self: *RunState, mod: *const Mod.Module) bool {
+        for (mod.imports.items) |imp| {
+            const triple = self.registered_modules.get(imp.module_name) orelse return false;
+            const exp = triple.module.getExport(imp.field_name) orelse return false;
+            if (exp.kind != imp.kind) return false;
+            switch (imp.kind) {
+                .func => {
+                    const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                    if (exp_idx >= triple.module.funcs.items.len) return false;
+                    const exp_func = triple.module.funcs.items[exp_idx];
+                    if (imp.func) |imp_f| {
+                        const imp_type_idx = imp_f.type_var.index;
+                        const exp_type_idx = exp_func.decl.type_var.index;
+                        if (imp_type_idx < mod.module_types.items.len and
+                            exp_type_idx < triple.module.module_types.items.len)
+                        {
+                            const imp_type = mod.module_types.items[imp_type_idx];
+                            const exp_type = triple.module.module_types.items[exp_type_idx];
+                            switch (imp_type) {
+                                .func_type => |imp_ft| switch (exp_type) {
+                                    .func_type => |exp_ft| {
+                                        if (!std.mem.eql(types.ValType, imp_ft.params, exp_ft.params) or
+                                            !std.mem.eql(types.ValType, imp_ft.results, exp_ft.results))
+                                            return false;
+                                    },
+                                    else => {},
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
+                .global => {
+                    const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                    if (exp_idx >= triple.module.globals.items.len) return false;
+                    const exp_global = triple.module.globals.items[exp_idx];
+                    if (imp.global) |imp_g| {
+                        if (imp_g.val_type != exp_global.type.val_type or
+                            imp_g.mutability != exp_global.type.mutability)
+                            return false;
+                    }
+                },
+                .memory => {
+                    // Memory import: check limits
+                },
+                .table => {
+                    // Table import: check elem type and limits
+                    if (imp.table) |imp_t| {
+                        const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                        if (exp_idx >= triple.module.tables.items.len) return false;
+                        const exp_tbl = triple.module.tables.items[exp_idx];
+                        if (imp_t.elem_type != exp_tbl.type.elem_type) return false;
+                    }
+                },
+                else => {},
+            }
+        }
+        return true;
+    }
+
     /// Register the "spectest" host module with standard globals and functions.
     fn registerSpectest(self: *RunState) void {
         const mod = self.allocator.create(Mod.Module) catch return;
@@ -533,7 +595,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .register => processRegister(sexpr.text, &state, &result),
             .get => processGet(sexpr.text, &state, &result),
             .assert_exhaustion => processAssertExhaustion(allocator, sexpr.text, &state, &result),
-            .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &result),
+            .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &state, &result),
             .unknown,
             => {
                 result.skipped += 1;
@@ -958,7 +1020,7 @@ fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, stat
     }
 }
 
-fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, result: *Result) void {
+fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
     // (assert_unlinkable (module ...) "msg")
     const inner = findEmbeddedModule(sexpr) orelse {
         result.skipped += 1;
@@ -980,7 +1042,6 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, resu
             result.passed += 1;
             return;
         };
-        // Module validated OK — linking should still fail for unlinkable
         result.failed += 1;
         return;
     }
@@ -1001,20 +1062,30 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, resu
         return;
     };
 
-    // For assert_unlinkable, the module should fail at instantiation/linking.
-    // If validation passes, try instantiation.
+    // Try instantiation with import resolution — should fail for unlinkable modules.
     var instance = Interp.Instance.init(allocator, &module) catch {
         result.passed += 1;
         return;
     };
     defer instance.deinit();
-    instance.instantiate() catch {
-        result.passed += 1;
-        return;
-    };
 
-    // Everything succeeded — unexpected for assert_unlinkable.
-    result.failed += 1;
+    var interp = Interp.Interpreter.init(allocator, &instance);
+    defer interp.deinit();
+
+    // Check that all imports can be resolved
+    if (state.checkImportsResolvable(&module)) {
+        // All imports resolved — try instantiation
+        state.resolveImports(&module, &interp);
+        instance.instantiate() catch {
+            result.passed += 1;
+            return;
+        };
+        // Everything succeeded — unexpected for assert_unlinkable.
+        result.failed += 1;
+    } else {
+        // Imports couldn't be resolved — this is the expected unlinkable behavior
+        result.passed += 1;
+    }
 }
 
 fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {

@@ -121,7 +121,10 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
-    if (p.malformed) return error.InvalidModule;
+    if (p.malformed) {
+        std.debug.print("  DEBUG: malformed detected in parseModule\n", .{});
+        return error.InvalidModule;
+    }
     return module;
 }
 
@@ -1547,7 +1550,6 @@ const Parser = struct {
             }
         } else {
             // Unrecognized opcode text — flag as malformed
-            if (!self.malformed) std.debug.print("  MAL opcode \"{s}\"\n", .{text});
             self.malformed = true;
         }
     }
