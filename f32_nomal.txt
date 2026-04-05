@@ -1,0 +1,3 @@
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func (result f32) (f32.const nan:arithmetic)) "
+  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func (result f32) (f32.const nan:canonical)) "
+third_party\testsuite\f32.wast: 2512 passed, 2 failed, 0 skipped (2514 total)

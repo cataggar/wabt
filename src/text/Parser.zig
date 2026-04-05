@@ -99,10 +99,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
-    if (p.malformed) {
-        std.debug.print("  DBG malformed flag set during parsing\n", .{});
-        return error.InvalidModule;
-    }
+    if (p.malformed) return error.InvalidModule;
     return module;
 }
 
@@ -1081,6 +1078,7 @@ const Parser = struct {
             .opcode => self.emitGenericOpcode(tok.text, code),
             .invalid => {
                 // Unknown keyword in function body — flag as malformed
+                if (!self.malformed) std.debug.print("  MAL invalid tok \"{s}\"\n", .{tok.text});
                 self.malformed = true;
             },
             else => {},
@@ -1389,6 +1387,7 @@ const Parser = struct {
             }
         } else {
             // Unrecognized opcode text — flag as malformed
+            if (!self.malformed) std.debug.print("  MAL opcode \"{s}\"\n", .{text});
             self.malformed = true;
         }
     }

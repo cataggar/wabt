@@ -109,6 +109,60 @@ const RunState = struct {
         return false;
     }
 
+    fn setModuleBinary(self: *RunState, wasm_bytes: []const u8) bool {
+        self.destroyCurrent();
+
+        const mod = self.allocator.create(Mod.Module) catch return false;
+        mod.* = binary_reader.readModule(self.allocator, wasm_bytes) catch {
+            self.allocator.destroy(mod);
+            return false;
+        };
+
+        const inst = self.allocator.create(Interp.Instance) catch {
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return false;
+        };
+        inst.* = Interp.Instance.init(self.allocator, mod) catch {
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return false;
+        };
+
+        const interp = self.allocator.create(Interp.Interpreter) catch {
+            inst.deinit();
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return false;
+        };
+        interp.* = Interp.Interpreter.init(self.allocator, inst);
+        self.resolveImports(mod, interp);
+        inst.instantiate() catch {
+            interp.deinit();
+            self.allocator.destroy(interp);
+            inst.deinit();
+            self.allocator.destroy(inst);
+            mod.deinit();
+            self.allocator.destroy(mod);
+            return false;
+        };
+
+        if (mod.start_var) |sv| {
+            const start_idx: u32 = switch (sv) {
+                .index => |i| i,
+                else => 0,
+            };
+            interp.callFunc(start_idx, &.{}) catch {};
+        }
+
+        self.module = mod;
+        self.instance = inst;
+        self.interpreter = interp;
+        return true;
+    }
+
     fn setModule(self: *RunState, mod_text: []const u8) bool {
         self.destroyCurrent();
 
@@ -392,7 +446,43 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
         switch (cmd) {
             .module => {
                 if (isBinaryOrQuoteModule(sexpr.text)) {
-                    result.skipped += 1;
+                    if (isQuoteModule(sexpr.text)) {
+                        // Decode quoted WAT and parse as module
+                        const wat_text = decodeQuoteStrings(allocator, sexpr.text) catch {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        defer allocator.free(wat_text);
+                        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+                            wat_text
+                        else blk: {
+                            var buf2 = std.ArrayListUnmanaged(u8){};
+                            buf2.appendSlice(allocator, "(module ") catch { result.skipped += 1; continue; };
+                            buf2.appendSlice(allocator, wat_text) catch { result.skipped += 1; continue; };
+                            buf2.append(allocator, ')') catch { result.skipped += 1; continue; };
+                            break :blk buf2.toOwnedSlice(allocator) catch { result.skipped += 1; continue; };
+                        };
+                        defer if (wrapped.ptr != wat_text.ptr) allocator.free(wrapped);
+                        if (state.setModule(wrapped)) {
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else if (isBinaryModule(sexpr.text)) {
+                        // Decode binary module
+                        const wasm_bytes = decodeWastHexStrings(allocator, sexpr.text) catch {
+                            result.skipped += 1;
+                            continue;
+                        };
+                        defer allocator.free(wasm_bytes);
+                        if (state.setModuleBinary(wasm_bytes)) {
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else {
+                        result.skipped += 1;
+                    }
                 } else {
                     if (state.setModule(sexpr.text)) {
                         result.passed += 1;

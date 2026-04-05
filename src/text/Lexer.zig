@@ -250,7 +250,7 @@ pub const Lexer = struct {
                 self.pos += 1;
             } else if (c == ';' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
                 // Line comment: ;; to end of line
-                while (self.pos < self.source.len and self.source[self.pos] != '\n') {
+                while (self.pos < self.source.len and self.source[self.pos] != '\n' and self.source[self.pos] != '\r') {
                     self.pos += 1;
                 }
             } else if (c == '(' and self.pos + 1 < self.source.len and self.source[self.pos + 1] == ';') {
