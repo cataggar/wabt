@@ -27,6 +27,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.type_names.deinit(allocator);
     defer p.local_names.deinit(allocator);
     defer p.global_names.deinit(allocator);
+    defer p.label_stack.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
@@ -167,6 +168,8 @@ const Parser = struct {
     local_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from global $name to index.
     global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Stack of label $names for block/loop/if — most recent label at the end.
+    label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -352,6 +355,7 @@ const Parser = struct {
         const func_idx: u32 = @intCast(module.funcs.items.len);
         // Clear per-function local name map
         self.local_names.clearRetainingCapacity();
+        self.label_stack.clearRetainingCapacity();
         if (self.peek().kind == .identifier) {
             func.name = self.advance().text;
             // Register name → index for call resolution
@@ -521,21 +525,28 @@ const Parser = struct {
             .kw_block => {
                 _ = self.advance();
                 code.append(self.allocator, 0x02) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
                 self.parseFuncBodyInstrs(code);
                 code.append(self.allocator, 0x0b) catch return; // end
+                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen();
             },
             .kw_loop => {
                 _ = self.advance();
                 code.append(self.allocator, 0x03) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
                 self.parseFuncBodyInstrs(code);
                 code.append(self.allocator, 0x0b) catch return; // end
+                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen();
             },
             .kw_if => {
                 _ = self.advance();
+                const label = self.consumeOptionalLabel();
                 // Parse block type
                 var block_type_buf: [6]u8 = undefined;
                 const bt_len = self.readBlockType(&block_type_buf);
@@ -562,6 +573,7 @@ const Parser = struct {
                 // Now emit the if opcode
                 code.append(self.allocator, 0x04) catch return;
                 code.appendSlice(self.allocator, block_type_buf[0..bt_len]) catch return;
+                self.label_stack.append(self.allocator, label) catch {};
 
                 if (has_then) {
                     _ = self.advance(); // consume 'then'
@@ -584,6 +596,7 @@ const Parser = struct {
                     }
                 }
                 code.append(self.allocator, 0x0b) catch return; // end
+                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen(); // close (if ...)
             },
             else => {
@@ -634,18 +647,27 @@ const Parser = struct {
             .kw_nop => code.append(self.allocator, 0x01) catch return,
             .kw_block => {
                 code.append(self.allocator, 0x02) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_loop => {
                 code.append(self.allocator, 0x03) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_if => {
                 code.append(self.allocator, 0x04) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
             },
             .kw_else => code.append(self.allocator, 0x05) catch return,
-            .kw_end => code.append(self.allocator, 0x0b) catch return,
+            .kw_end => {
+                code.append(self.allocator, 0x0b) catch return;
+                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
+            },
             .kw_br => {
                 code.append(self.allocator, 0x0c) catch return;
                 self.emitU32Imm(code);
@@ -884,6 +906,11 @@ const Parser = struct {
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         if (self.peek().kind == .identifier) {
             const tok = self.advance();
+            // Check label stack first (for br/br_if $label)
+            if (self.resolveLabelDepth(tok.text)) |depth| {
+                self.emitLeb128U32(code, depth);
+                return;
+            }
             if (self.local_names.get(tok.text)) |idx| {
                 self.emitLeb128U32(code, idx);
                 return;
@@ -903,8 +930,34 @@ const Parser = struct {
             self.emitLeb128U32(code, 0);
             return;
         }
-        const val = self.parseU32() catch 0;
-        self.emitLeb128U32(code, val);
+        if (self.peek().kind == .integer) {
+            const val = self.parseU32() catch 0;
+            self.emitLeb128U32(code, val);
+        } else {
+            self.emitLeb128U32(code, 0);
+        }
+    }
+
+    /// Consume an optional $label identifier (used after block/loop/if keywords).
+    fn consumeOptionalLabel(self: *Parser) ?[]const u8 {
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            return tok.text;
+        }
+        return null;
+    }
+
+    /// Resolve a label name to its branch depth (0 = innermost).
+    fn resolveLabelDepth(self: *Parser, name: []const u8) ?u32 {
+        if (self.label_stack.items.len == 0) return null;
+        var i: u32 = 0;
+        while (i < self.label_stack.items.len) : (i += 1) {
+            const idx = self.label_stack.items.len - 1 - i;
+            if (self.label_stack.items[idx]) |label| {
+                if (std.mem.eql(u8, label, name)) return i;
+            }
+        }
+        return null;
     }
 
     fn emitS32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
