@@ -812,6 +812,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         try checkUnary(&val_stack, &ctrl_stack, input, output, gpa(m));
                     },
                     0x08 => { // memory.init
+                        if (!m.has_data_count) return error.InvalidDataIndex;
                         const data_idx = readU32(bytes, &pos);
                         _ = readU32(bytes, &pos); // mem idx
                         if (data_idx >= m.data_segments.items.len) return error.InvalidDataIndex;
@@ -821,6 +822,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                     },
                     0x09 => { // data.drop
+                        if (!m.has_data_count) return error.InvalidDataIndex;
                         const idx = readU32(bytes, &pos);
                         if (idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                     },
@@ -910,6 +912,9 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
             if (!actual.matches(ValTypeOrUnknown.fromValType(expected))) return error.TypeMismatch;
         }
+    } else {
+        // Function body ended with unclosed blocks — unexpected end
+        return error.TypeMismatch;
     }
 }
 

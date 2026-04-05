@@ -1736,6 +1736,28 @@ fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     errdefer res.deinit(allocator);
     var i: usize = 0;
     while (i < text.len) {
+        // Skip line comments: ;; ... \n
+        if (text[i] == ';' and i + 1 < text.len and text[i + 1] == ';') {
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        // Skip block comments: (; ... ;)
+        if (text[i] == '(' and i + 1 < text.len and text[i + 1] == ';') {
+            i += 2;
+            var depth: usize = 1;
+            while (i + 1 < text.len and depth > 0) {
+                if (text[i] == '(' and text[i + 1] == ';') {
+                    depth += 1;
+                    i += 2;
+                } else if (text[i] == ';' and text[i + 1] == ')') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
         if (text[i] == '"') {
             i += 1;
             while (i < text.len and text[i] != '"') {
