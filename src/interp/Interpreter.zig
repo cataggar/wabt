@@ -2378,7 +2378,8 @@ fn wasmMaxF64(a: f64, b: f64) f64 {
 }
 
 fn wasmNearestF32(a: f32) f32 {
-    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (std.math.isNan(a)) return std.math.nan(f32);
+    if (std.math.isInf(a)) return a;
     if (a == 0.0) return a;
     var rounded = @round(a);
     const diff = a - rounded;
@@ -2393,7 +2394,8 @@ fn wasmNearestF32(a: f32) f32 {
 }
 
 fn wasmNearestF64(a: f64) f64 {
-    if (std.math.isNan(a) or std.math.isInf(a)) return a;
+    if (std.math.isNan(a)) return std.math.nan(f64);
+    if (std.math.isInf(a)) return a;
     if (a == 0.0) return a;
     var rounded = @round(a);
     const diff = a - rounded;
