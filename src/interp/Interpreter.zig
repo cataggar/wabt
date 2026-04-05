@@ -1610,6 +1610,15 @@ pub const Interpreter = struct {
             try self.pushValue(.{ .i32 = @bitCast(old_size) });
             return;
         }
+        // Check table maximum
+        const new_size: u64 = @as(u64, old_size) + delta;
+        if (tbl_idx < self.instance.module.tables.items.len) {
+            const tbl_type = self.instance.module.tables.items[tbl_idx];
+            if (tbl_type.@"type".limits.has_max and new_size > tbl_type.@"type".limits.max) {
+                try self.pushValue(.{ .i32 = -1 });
+                return;
+            }
+        }
         tbl.appendNTimes(self.allocator, func_ref, delta) catch {
             try self.pushValue(.{ .i32 = -1 });
             return;
@@ -1998,6 +2007,14 @@ pub const Interpreter = struct {
                 },
                 0x1a => _ = try self.popValue(), // drop
                 0x1b => try self.selectOp(), // select
+                0x1c => { // select t*
+                    var t = pc;
+                    const vec_len = readCodeU32(code, &t);
+                    var ti: u32 = 0;
+                    while (ti < vec_len) : (ti += 1) _ = readCodeU32(code, &t);
+                    pc = t;
+                    try self.selectOp();
+                },
                 0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(locals[idx]); },
                 0x21 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; locals[idx] = try self.popValue(); },
                 0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
@@ -2369,6 +2386,11 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         },
         0x10 => _ = readCodeU32(code, &p), // call
         0x11 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect
+        0x1c => { // select t*
+            const vec_len = readCodeU32(code, &p);
+            var ti: u32 = 0;
+            while (ti < vec_len) : (ti += 1) _ = readCodeU32(code, &p);
+        },
         0x20, 0x21, 0x22, 0x23, 0x24 => _ = readCodeU32(code, &p),
         0x25, 0x26 => _ = readCodeU32(code, &p), // table.get/set
         0x28...0x3e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
