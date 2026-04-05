@@ -1,3 +1,4 @@
+  DBG malformed flag set during parsing
   DBG setModule parse failed: error.InvalidModule text[0..200]="(module
   (type $func_i32 (func (param i32)))
   (type $func_i64 (func (param i64)))
@@ -5,6 +6,7 @@
   (type $func_f64 (func (param f64)))
 
   (import "spectest" "print_i32" "
+  DBG malformed flag set during parsing
   DBG setModule parse failed: error.InvalidModule text[0..200]="(module
   (import "spectest" "global_i32" (global i32))
   (global (import "spectest" "global_i32") i32)
