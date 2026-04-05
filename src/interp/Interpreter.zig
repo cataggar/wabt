@@ -215,6 +215,11 @@ pub const ImportLink = struct {
     func_idx: u32,
 };
 
+pub const GlobalLink = struct {
+    instance: *Instance,
+    global_idx: u32,
+};
+
 /// Stack-based WebAssembly interpreter.
 pub const Interpreter = struct {
     allocator: std.mem.Allocator,
@@ -239,6 +244,9 @@ pub const Interpreter = struct {
     /// Resolved function import links (indexed by func_idx for imported funcs).
     import_links: std.ArrayListUnmanaged(?ImportLink) = .{},
 
+    /// Links imported globals to exporting instance's globals for shared mutation.
+    global_links: std.ArrayListUnmanaged(?GlobalLink) = .{},
+
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
             .allocator = allocator,
@@ -250,6 +258,28 @@ pub const Interpreter = struct {
     pub fn deinit(self: *Interpreter) void {
         self.stack.deinit(self.allocator);
         self.import_links.deinit(self.allocator);
+        self.global_links.deinit(self.allocator);
+    }
+
+    /// Read a global value, following links for imported globals.
+    pub fn getGlobal(self: *Interpreter, idx: u32) Value {
+        if (idx < self.global_links.items.len) {
+            if (self.global_links.items[idx]) |link| {
+                return link.instance.globals.items[link.global_idx];
+            }
+        }
+        return self.instance.globals.items[idx];
+    }
+
+    /// Write a global value, following links for imported globals.
+    fn setGlobal(self: *Interpreter, idx: u32, val: Value) void {
+        if (idx < self.global_links.items.len) {
+            if (self.global_links.items[idx]) |link| {
+                link.instance.globals.items[link.global_idx] = val;
+                return;
+            }
+        }
+        self.instance.globals.items[idx] = val;
     }
 
     /// Call an exported function by name (single return value).
@@ -2045,8 +2075,8 @@ pub const Interpreter = struct {
                 0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(locals[idx]); },
                 0x21 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; locals[idx] = try self.popValue(); },
                 0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
-                0x23 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(self.instance.globals.items[idx]); },
-                0x24 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; self.instance.globals.items[idx] = try self.popValue(); },
+                0x23 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(self.getGlobal(idx)); },
+                0x24 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; self.setGlobal(idx, try self.popValue()); },
                 0x25 => { // table.get
                     var t = pc;
                     const tg_idx = readCodeU32(code, &t);

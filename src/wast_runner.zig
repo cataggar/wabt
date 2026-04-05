@@ -272,6 +272,12 @@ const RunState = struct {
             @memset(interp.import_links.items, null);
         }
 
+        // Set up global links for shared mutable globals
+        if (mod.num_global_imports > 0) {
+            interp.global_links.resize(self.allocator, mod.globals.items.len) catch return;
+            @memset(interp.global_links.items, null);
+        }
+
         var func_import_idx: u32 = 0;
         var global_import_idx: u32 = 0;
         for (mod.imports.items) |imp| {
@@ -300,10 +306,18 @@ const RunState = struct {
                     .index => |i| i,
                     .name => continue,
                 };
+                // Copy initial value AND set up link for shared mutation
                 if (src_idx < triple.instance.globals.items.len and
                     global_import_idx < interp.instance.globals.items.len)
                 {
                     interp.instance.globals.items[global_import_idx] = triple.instance.globals.items[src_idx];
+                    // Link for shared mutable globals
+                    if (global_import_idx < interp.global_links.items.len) {
+                        interp.global_links.items[global_import_idx] = .{
+                            .instance = triple.instance,
+                            .global_idx = src_idx,
+                        };
+                    }
                 }
             } else if (imp.kind == .memory) {
                 // Share memory from exporting module
@@ -782,7 +796,9 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         };
         if (result.failed <= 20) {
-            std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes\n", .{wasm_bytes.len});
+            // Extract expected error message from sexpr
+            const expected_msg = extractExpectedMessage(sexpr) orelse "?";
+            std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes, expected=\"{s}\"\n", .{ wasm_bytes.len, expected_msg });
             var hex_buf: [60]u8 = undefined;
             var hi: usize = 0;
             for (wasm_bytes[0..@min(20, wasm_bytes.len)]) |b| {
@@ -1184,7 +1200,7 @@ fn resolveGetValue(get_expr: []const u8, state: *RunState) ?Interp.Value {
         .name => return null,
     };
     if (idx >= interp.instance.globals.items.len) return null;
-    return interp.instance.globals.items[idx];
+    return interp.getGlobal(idx);
 }
 
 /// Resolve the interpreter to use for an invoke/get expression.
@@ -1604,6 +1620,28 @@ fn findEmbeddedModule(sexpr: []const u8) ?[]const u8 {
         if (sexpr[i] == '(' and hasWordAt(sexpr, i + 1, "module")) {
             const inner = extractSExpr(sexpr, i) orelse return null;
             return inner.text;
+        }
+    }
+    return null;
+}
+
+/// Extract the expected error message string from an assert_malformed/assert_invalid sexpr.
+/// The message is the last quoted string in the outer sexpr, after the module.
+fn extractExpectedMessage(sexpr: []const u8) ?[]const u8 {
+    // Search backward for the last quoted string
+    var end = sexpr.len;
+    while (end > 0) {
+        end -= 1;
+        if (sexpr[end] == '"') {
+            // Found end quote, search backward for start quote
+            var start = end;
+            while (start > 0) {
+                start -= 1;
+                if (sexpr[start] == '"' and (start == 0 or sexpr[start - 1] != '\\')) {
+                    return sexpr[start + 1 .. end];
+                }
+            }
+            return null;
         }
     }
     return null;
