@@ -255,6 +255,32 @@ const Parser = struct {
         return std.fmt.parseInt(u32, clean.slice(), 0) catch return error.InvalidNumber;
     }
 
+    /// Parse an index that may be either a numeric u32 or a $name identifier.
+    /// Resolves $name against the given name map.
+    fn parseIndexWithMap(self: *Parser, names: *const std.StringArrayHashMapUnmanaged(u32)) ParseError!u32 {
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            return names.get(tok.text) orelse return error.InvalidNumber;
+        }
+        return self.parseU32();
+    }
+
+    fn parseFuncIdx(self: *Parser) ParseError!u32 {
+        return self.parseIndexWithMap(&self.func_names);
+    }
+
+    fn parseGlobalIdx(self: *Parser) ParseError!u32 {
+        return self.parseIndexWithMap(&self.global_names);
+    }
+
+    fn parseTableIdx(self: *Parser) ParseError!u32 {
+        return self.parseIndexWithMap(&self.table_names);
+    }
+
+    fn parseTypeIdx(self: *Parser) ParseError!u32 {
+        return self.parseIndexWithMap(&self.type_names);
+    }
+
     fn parseValType(self: *Parser) ParseError!types.ValType {
         // Handle parenthesized reference types: (ref null <heaptype>) / (ref <heaptype>)
         if (self.peek().kind == .l_paren) {
@@ -1550,6 +1576,68 @@ const Parser = struct {
             const name = self.advance().text;
             self.global_names.put(self.allocator, name, global_idx) catch {};
         }
+
+        // Handle inline (export "name") and (import "mod" "name") declarations
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_export) {
+                _ = self.advance(); // consume 'export'
+                const name_tok = self.advance();
+                const exp_name = self.parseName(name_tok.text);
+                if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
+                module.exports.append(self.allocator, .{
+                    .name = exp_name,
+                    .kind = .global,
+                    .var_ = .{ .index = global_idx },
+                }) catch return error.OutOfMemory;
+            } else if (self.peek().kind == .kw_import) {
+                _ = self.advance(); // consume 'import'
+                const mod_name = self.parseName(self.advance().text);
+                const field_name = self.parseName(self.advance().text);
+                try self.expect(.r_paren); // close (import ...)
+
+                // Parse type after import
+                var mutability: types.Mutability = .immutable;
+                var val_type: types.ValType = undefined;
+                if (self.peek().kind == .l_paren) {
+                    const sp2 = self.lexer.pos;
+                    const spk2 = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_mut) {
+                        _ = self.advance();
+                        mutability = .mutable;
+                        val_type = try self.parseValType();
+                        try self.expect(.r_paren);
+                    } else {
+                        self.lexer.pos = sp2;
+                        self.peeked = spk2;
+                        val_type = try self.parseValType();
+                    }
+                } else {
+                    val_type = try self.parseValType();
+                }
+                try module.globals.append(self.allocator, .{
+                    .type = .{ .val_type = val_type, .mutability = mutability },
+                    .is_import = true,
+                });
+                module.num_global_imports += 1;
+                var import = Mod.Import{
+                    .module_name = mod_name,
+                    .field_name = field_name,
+                    .kind = .global,
+                };
+                import.global = .{ .val_type = val_type, .mutability = mutability };
+                try module.imports.append(self.allocator, import);
+                return;
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+
         var mutability: types.Mutability = .immutable;
         var val_type: types.ValType = undefined;
 
@@ -1720,7 +1808,13 @@ const Parser = struct {
             .kw_global => .global,
             else => return error.UnexpectedToken,
         };
-        const index = try self.parseU32();
+        const index = switch (kind) {
+            .func => try self.parseFuncIdx(),
+            .global => try self.parseGlobalIdx(),
+            .table => try self.parseTableIdx(),
+            .memory => self.parseU32() catch 0,
+            else => try self.parseU32(),
+        };
         try self.expect(.r_paren);
         try module.exports.append(self.allocator, .{
             .name = exp_name,
@@ -1730,7 +1824,7 @@ const Parser = struct {
     }
 
     fn parseStart(self: *Parser, module: *Mod.Module) ParseError!void {
-        const index = try self.parseU32();
+        const index = try self.parseFuncIdx();
         module.start_var = .{ .index = index };
     }
 
