@@ -1,1 +1,0 @@
-third_party\testsuite\ref_func.wast: 17 passed, 0 failed, 0 skipped (17 total)

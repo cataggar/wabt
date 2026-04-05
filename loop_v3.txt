@@ -1,3 +1,0 @@
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func loop end $l) "
-  FAIL assert_malformed(quote): should have been malformed: text[0..120]="(func loop $a end $l) "
-third_party\testsuite\loop.wast: 118 passed, 2 failed, 0 skipped (120 total)
