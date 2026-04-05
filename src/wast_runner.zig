@@ -970,6 +970,12 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
         }
         const v = std.fmt.parseFloat(f64, val_text) catch return .{ .f64 = 0.0 };
         return .{ .f64 = v };
+    } else if (std.mem.eql(u8, kw, "ref.null")) {
+        return .{ .ref_null = {} };
+    } else if (std.mem.eql(u8, kw, "ref.func")) {
+        return .{ .ref_null = {} }; // treat as non-null ref for comparison
+    } else if (std.mem.eql(u8, kw, "ref.extern")) {
+        return .{ .ref_null = {} }; // treat extern refs as ref_null for now
     }
     return null;
 }
@@ -1014,7 +1020,11 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             },
             else => false,
         },
-        else => false,
+        .ref_null => b == .ref_null,
+        .ref_func => |av| switch (b) {
+            .ref_func => |bv| av == bv,
+            else => false,
+        },
     };
 }
 
