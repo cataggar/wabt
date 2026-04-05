@@ -108,7 +108,7 @@ const RunState = struct {
 
         const mod = self.allocator.create(Mod.Module) catch return false;
         mod.* = Parser.parseModule(self.allocator, mod_text) catch |e| {
-            std.debug.print("  DBG setModule parse failed: {any} text[0..@min(80,mod_text.len)]=\"{s}\"\n", .{ e, mod_text[0..@min(80, mod_text.len)] });
+            std.debug.print("  DBG setModule parse failed: {any} text[0..200]=\"{s}\"\n", .{ e, mod_text[0..@min(200, mod_text.len)] });
             self.allocator.destroy(mod);
             return false;
         };
@@ -419,7 +419,6 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
 }
 
 fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
-    _ = allocator;
 
     // Check for (assert_return (get ...) ...) pattern
     if (findGet(sexpr)) |get_expr| {
@@ -437,10 +436,11 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
         result.skipped += 1;
         return;
     };
-    const func_name = extractStringLiteral(inv) orelse {
+    const raw_func_name = extractStringLiteral(inv) orelse {
         result.skipped += 1;
         return;
     };
+    const func_name = decodeStringEscapes(allocator, raw_func_name) orelse raw_func_name;
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -562,10 +562,11 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         result.skipped += 1;
         return;
     };
-    const func_name = extractStringLiteral(inv) orelse {
+    const raw_name_trap = extractStringLiteral(inv) orelse {
         result.skipped += 1;
         return;
     };
+    const func_name = decodeStringEscapes(allocator, raw_name_trap) orelse raw_name_trap;
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -580,7 +581,6 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
 }
 
 fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
-    _ = allocator;
     // (assert_exhaustion (invoke "f" ...) "msg")
     // Same as assert_trap — call a function and expect it to error (stack overflow).
     const inv = findInvoke(sexpr) orelse {
@@ -591,10 +591,11 @@ fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, stat
         result.skipped += 1;
         return;
     };
-    const func_name = extractStringLiteral(inv) orelse {
+    const raw_exh_name = extractStringLiteral(inv) orelse {
         result.skipped += 1;
         return;
     };
+    const func_name = decodeStringEscapes(allocator, raw_exh_name) orelse raw_exh_name;
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -666,15 +667,15 @@ fn processAssertUnlinkable(allocator: std.mem.Allocator, sexpr: []const u8, resu
 }
 
 fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
-    _ = allocator;
     const interp = resolveInterpreter(sexpr, state) orelse {
         result.skipped += 1;
         return;
     };
-    const func_name = extractStringLiteral(sexpr) orelse {
+    const raw_inv_name = extractStringLiteral(sexpr) orelse {
         result.skipped += 1;
         return;
     };
+    const func_name = decodeStringEscapes(allocator, raw_inv_name) orelse raw_inv_name;
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(sexpr, &args_buf);
     _ = interp.callExport(func_name, args) catch {};
@@ -879,6 +880,43 @@ fn extractStringLiteral(sexpr: []const u8) ?[]const u8 {
     }
     if (i > sexpr.len) return null;
     return sexpr[start..i];
+}
+
+/// Decode WAT string escape sequences in-place (\nn hex, \t, \n, \\, \").
+fn decodeStringEscapes(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
+    // Quick check: if no escapes, return as-is
+    if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
+    var buf = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '\\' and i + 1 < raw.len) {
+            i += 1;
+            switch (raw[i]) {
+                'n' => { buf.append(allocator, '\n') catch return null; i += 1; },
+                't' => { buf.append(allocator, '\t') catch return null; i += 1; },
+                'r' => { buf.append(allocator, '\r') catch return null; i += 1; },
+                '\\' => { buf.append(allocator, '\\') catch return null; i += 1; },
+                '"' => { buf.append(allocator, '"') catch return null; i += 1; },
+                else => {
+                    if (i + 1 < raw.len) {
+                        const hi = hexDigit(raw[i]);
+                        const lo = hexDigit(raw[i + 1]);
+                        if (hi != null and lo != null) {
+                            buf.append(allocator, hi.? * 16 + lo.?) catch return null;
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    buf.append(allocator, raw[i]) catch return null;
+                    i += 1;
+                },
+            }
+        } else {
+            buf.append(allocator, raw[i]) catch return null;
+            i += 1;
+        }
+    }
+    return buf.toOwnedSlice(allocator) catch null;
 }
 
 /// Parse const value arguments from an invoke expression.

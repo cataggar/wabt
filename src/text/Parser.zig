@@ -1303,6 +1303,35 @@ const Parser = struct {
 
     fn parseMemory(self: *Parser, module: *Mod.Module) ParseError!void {
         if (self.peek().kind == .identifier) _ = self.advance();
+
+        // Handle inline (export "name") declarations
+        const mem_idx: u32 = @intCast(module.memories.items.len);
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance(); // consume '('
+            if (self.peek().kind == .kw_export) {
+                _ = self.advance(); // consume 'export'
+                const name_tok = self.advance();
+                const exp_name = self.parseName(name_tok.text);
+                if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
+                module.exports.append(self.allocator, .{
+                    .name = exp_name,
+                    .kind = .memory,
+                    .var_ = .{ .index = mem_idx },
+                }) catch return error.OutOfMemory;
+            } else if (self.peek().kind == .kw_data) {
+                // Inline (data "...") — skip for now
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+
         const initial = try self.parseU32();
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
@@ -1739,6 +1768,41 @@ fn hexVal(c: u8) ?u8 {
     if (c >= 'a' and c <= 'f') return c - 'a' + 10;
     if (c >= 'A' and c <= 'F') return c - 'A' + 10;
     return null;
+}
+
+/// Decode WAT string escape sequences into an existing buffer (no allocation returned).
+fn decodeWatStringInto(raw: []const u8, out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) void {
+    var i: usize = 0;
+    while (i < raw.len) {
+        if (raw[i] == '\\' and i + 1 < raw.len) {
+            i += 1;
+            switch (raw[i]) {
+                'n' => { out.append(allocator, '\n') catch {}; i += 1; },
+                't' => { out.append(allocator, '\t') catch {}; i += 1; },
+                'r' => { out.append(allocator, '\r') catch {}; i += 1; },
+                '\\' => { out.append(allocator, '\\') catch {}; i += 1; },
+                '"' => { out.append(allocator, '"') catch {}; i += 1; },
+                '\'' => { out.append(allocator, '\'') catch {}; i += 1; },
+                else => {
+                    if (i + 1 < raw.len) {
+                        const hi = hexVal(raw[i]);
+                        const lo = hexVal(raw[i + 1]);
+                        if (hi != null and lo != null) {
+                            out.append(allocator, hi.? * 16 + lo.?) catch {};
+                            i += 2;
+                            continue;
+                        }
+                    }
+                    out.append(allocator, '\\') catch {};
+                    out.append(allocator, raw[i]) catch {};
+                    i += 1;
+                },
+            }
+        } else {
+            out.append(allocator, raw[i]) catch {};
+            i += 1;
+        }
+    }
 }
 
 /// Check if a token kind is a constant instruction (valid in init expressions).
