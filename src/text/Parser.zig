@@ -70,6 +70,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     // Pass 2: process all other declarations (skip type/rec which were already handled).
     p.lexer.pos = saved_pos;
     p.peeked = saved_peeked;
+    p.malformed = false; // Reset malformed flag for Pass 2
 
     while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
         // Skip annotations: (@id ...) — consume tokens until matching ')'
