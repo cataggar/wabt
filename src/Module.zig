@@ -267,6 +267,7 @@ pub const DataSegment = struct {
     kind: types.SegmentKind = .active,
     memory_var: Var = .{ .index = 0 },
     data: []const u8 = &.{},
+    owns_data: bool = false,
     /// Raw bytecode for the offset expression (constant expr).
     offset_expr_bytes: []const u8 = &.{},
     owns_offset_expr_bytes: bool = false,
@@ -355,6 +356,9 @@ pub const Module = struct {
         }
         self.elem_segments.deinit(self.allocator);
         for (self.data_segments.items) |*seg| {
+            if (seg.owns_data and seg.data.len > 0) {
+                self.allocator.free(seg.data);
+            }
             if (seg.owns_offset_expr_bytes and seg.offset_expr_bytes.len > 0) {
                 self.allocator.free(seg.offset_expr_bytes);
             }
