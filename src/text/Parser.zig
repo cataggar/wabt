@@ -1045,6 +1045,23 @@ const Parser = struct {
                             self.emitU32Imm(code); // numeric type index
                         }
                         if (self.peek().kind == .r_paren) _ = self.advance(); // ')'
+                        // Consume optional inline (param ...) and (result ...) after type
+                        while (self.peek().kind == .l_paren) {
+                            const sp2 = self.lexer.pos;
+                            const spk2 = self.peeked;
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_param or self.peek().kind == .kw_result) {
+                                _ = self.advance();
+                                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                                    _ = self.advance();
+                                }
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                            } else {
+                                self.lexer.pos = sp2;
+                                self.peeked = spk2;
+                                break;
+                            }
+                        }
                     } else {
                         self.lexer.pos = sp;
                         self.peeked = spk;

@@ -493,6 +493,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                         if (state.setModule(wrapped)) {
                             result.passed += 1;
                         } else {
+                            std.debug.print("  DEBUG quote module setModule failed, decoded text[0..120]=\"{s}\"\n", .{wrapped[0..@min(120, wrapped.len)]});
                             result.skipped += 1;
                         }
                     } else if (isBinaryModule(sexpr.text)) {
