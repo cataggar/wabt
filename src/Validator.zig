@@ -188,7 +188,7 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
         }
         // Validate that func refs in funcref segments actually exist
         for (seg.elem_var_indices.items) |v| {
-            if (v.index != 0 and v.index >= m.funcs.items.len)
+            if (v.index >= m.funcs.items.len)
                 return error.InvalidFuncIndex;
         }
     }

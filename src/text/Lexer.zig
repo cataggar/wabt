@@ -326,7 +326,10 @@ pub fn classifyWord(text: []const u8) TokenKind {
     if (text.len == 0) return .invalid;
 
     // Check for numeric literal: starts with digit, or +/- followed by digit
-    if (isNumStart(text)) return classifyNumber(text);
+    if (isNumStart(text)) {
+        if (!hasValidNumberChars(text)) return .invalid;
+        return classifyNumber(text);
+    }
 
     // Bare "inf", "nan", "nan:0x..." are float literals
     if (eql(text, "inf") or eql(text, "nan")) return .float;
@@ -380,6 +383,33 @@ fn classifyNumber(text: []const u8) TokenKind {
         }
     }
     return .integer;
+}
+
+/// Check that a number-starting word only contains valid number characters.
+/// Rejects glued tokens like `0drop`, `0$l` where a number runs into a keyword/identifier.
+fn hasValidNumberChars(text: []const u8) bool {
+    var i: usize = 0;
+    // Skip optional sign
+    if (i < text.len and (text[i] == '+' or text[i] == '-')) i += 1;
+    // Handle special values: inf, nan, nan:0x...
+    if (i < text.len) {
+        const rest = text[i..];
+        if (std.mem.startsWith(u8, rest, "inf") and rest.len == 3) return true;
+        if (std.mem.startsWith(u8, rest, "nan")) return true;
+    }
+    // Check hex prefix
+    const is_hex = (i + 2 <= text.len and text[i] == '0' and
+        (text[i + 1] == 'x' or text[i + 1] == 'X'));
+    if (is_hex) i += 2;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c >= '0' and c <= '9') continue;
+        if (c == '_' or c == '.' or c == '+' or c == '-') continue;
+        if (c == 'e' or c == 'E' or c == 'p' or c == 'P') continue;
+        if (is_hex and ((c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F'))) continue;
+        return false;
+    }
+    return true;
 }
 
 fn matchKeyword(text: []const u8) TokenKind {
