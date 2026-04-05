@@ -2393,8 +2393,7 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
 // ── Wasm-spec min/max helpers (NaN propagation) ─────────────────────────
 
 fn wasmMinF32(a: f32, b: f32) f32 {
-    if (std.math.isNan(a)) return a;
-    if (std.math.isNan(b)) return b;
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(f32);
     if (a == 0.0 and b == 0.0) {
         // -0 < +0 in wasm
         return if (std.math.signbit(a)) a else b;
@@ -2403,8 +2402,7 @@ fn wasmMinF32(a: f32, b: f32) f32 {
 }
 
 fn wasmMaxF32(a: f32, b: f32) f32 {
-    if (std.math.isNan(a)) return a;
-    if (std.math.isNan(b)) return b;
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(f32);
     if (a == 0.0 and b == 0.0) {
         return if (std.math.signbit(a)) b else a;
     }
@@ -2412,8 +2410,7 @@ fn wasmMaxF32(a: f32, b: f32) f32 {
 }
 
 fn wasmMinF64(a: f64, b: f64) f64 {
-    if (std.math.isNan(a)) return a;
-    if (std.math.isNan(b)) return b;
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(f64);
     if (a == 0.0 and b == 0.0) {
         return if (std.math.signbit(a)) a else b;
     }
@@ -2421,8 +2418,7 @@ fn wasmMinF64(a: f64, b: f64) f64 {
 }
 
 fn wasmMaxF64(a: f64, b: f64) f64 {
-    if (std.math.isNan(a)) return a;
-    if (std.math.isNan(b)) return b;
+    if (std.math.isNan(a) or std.math.isNan(b)) return std.math.nan(f64);
     if (a == 0.0 and b == 0.0) {
         return if (std.math.signbit(a)) b else a;
     }
