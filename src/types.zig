@@ -56,6 +56,14 @@ pub const ValType = enum(i32) {
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
     nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
 
+    // Non-nullable abstract heap types (internal-only, not binary encoded)
+    ref_func = -1,     // (ref func) — non-nullable func
+    ref_extern = -2,   // (ref extern) — non-nullable extern
+    ref_any = -3,      // (ref any) — non-nullable any
+    ref_none = -4,     // (ref none) — non-nullable none (bottom)
+    ref_nofunc = -5,   // (ref nofunc) — non-nullable nofunc (bottom)
+    ref_noextern = -6, // (ref noextern) — non-nullable noextern (bottom)
+
     // Block void type
     void_ = 0x40,
 
@@ -65,6 +73,7 @@ pub const ValType = enum(i32) {
         return switch (self) {
             .funcref, .externref, .anyref, .exnref, .ref, .ref_null,
             .nullfuncref, .nullexternref, .nullref,
+            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
             => true,
             else => false,
         };

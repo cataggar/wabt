@@ -492,8 +492,12 @@ pub const Interpreter = struct {
                     .f32 => .{ .f32 = 0.0 },
                     .f64 => .{ .f64 = 0.0 },
                     .v128 => .{ .v128 = 0 },
-                    .funcref => .{ .ref_null = {} },
-                    .externref => .{ .ref_null = {} },
+                    .funcref, .externref, .anyref,
+                    .nullfuncref, .nullexternref, .nullref,
+                    .ref, .ref_null,
+                    .ref_func, .ref_extern, .ref_any,
+                    .ref_none, .ref_nofunc, .ref_noextern,
+                    => .{ .ref_null = {} },
                     else => .{ .i32 = 0 },
                 };
             }

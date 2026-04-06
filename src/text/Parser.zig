@@ -452,6 +452,15 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "noextern")) return .nullexternref;
                     if (std.mem.eql(u8, heap_text, "none")) return .nullref;
                 }
+                // Canonicalize non-nullable abstract heap types
+                if (!nullable and heap_text.len > 0) {
+                    if (std.mem.eql(u8, heap_text, "func")) return .ref_func;
+                    if (std.mem.eql(u8, heap_text, "extern")) return .ref_extern;
+                    if (std.mem.eql(u8, heap_text, "any")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
+                    if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
+                    if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
+                }
                 return if (nullable) .ref_null else .ref;
             }
             // Not a ref type — restore state

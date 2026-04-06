@@ -188,8 +188,9 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
     for (m.tables.items) |table| {
         if (!table.type.elem_type.isRefType())
             return error.InvalidElemType;
-        // Non-nullable ref types (ref func, ref extern, ref $t) require init expr
-        if (table.type.elem_type == .ref)
+        // Non-nullable ref types require init expr (tables without init are invalid)
+        const vt = ValTypeOrUnknown.fromValType(table.type.elem_type);
+        if (vt.isNonNullableRef())
             return error.TypeMismatch;
         try checkLimits(table.type.limits, std.math.maxInt(u32));
     }
@@ -543,6 +544,12 @@ const ValTypeOrUnknown = enum(i32) {
     nullfuncref = @intFromEnum(types.ValType.nullfuncref),
     nullexternref = @intFromEnum(types.ValType.nullexternref),
     nullref = @intFromEnum(types.ValType.nullref),
+    ref_func = @intFromEnum(types.ValType.ref_func),
+    ref_extern = @intFromEnum(types.ValType.ref_extern),
+    ref_any = @intFromEnum(types.ValType.ref_any),
+    ref_none = @intFromEnum(types.ValType.ref_none),
+    ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
+    ref_noextern = @intFromEnum(types.ValType.ref_noextern),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -560,6 +567,12 @@ const ValTypeOrUnknown = enum(i32) {
             .nullfuncref => .nullfuncref,
             .nullexternref => .nullexternref,
             .nullref => .nullref,
+            .ref_func => .ref_func,
+            .ref_extern => .ref_extern,
+            .ref_any => .ref_any,
+            .ref_none => .ref_none,
+            .ref_nofunc => .ref_nofunc,
+            .ref_noextern => .ref_noextern,
             else => .unknown,
         };
     }
@@ -568,25 +581,35 @@ const ValTypeOrUnknown = enum(i32) {
         return switch (self) {
             .funcref, .externref, .anyref, .ref, .ref_null,
             .nullfuncref, .nullexternref, .nullref,
+            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
             => true,
             else => false,
         };
     }
 
     fn isNonNullableRef(self: ValTypeOrUnknown) bool {
-        return self == .ref;
+        return switch (self) {
+            .ref, .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern => true,
+            else => false,
+        };
     }
 
     /// Check if self is a subtype of other (for validation).
     fn isSubtypeOf(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == other) return true;
         if (self == .unknown or other == .unknown) return true;
-        // Bottom types are subtypes of their respective top types
+        // Nullable bottom types are subtypes of their top types
+        // Non-nullable bottom types are subtypes of their top types
         return switch (self) {
-            .nullfuncref => other == .funcref,
+            .nullfuncref => other == .funcref or other == .anyref,
             .nullexternref => other == .externref,
             .nullref => other == .anyref,
-            .funcref => other == .anyref, // funcref <: anyref in GC
+            .funcref => other == .anyref,
+            .ref_nofunc => other == .ref_func or other == .ref_any or other == .funcref or other == .anyref,
+            .ref_noextern => other == .ref_extern or other == .externref,
+            .ref_none => other == .ref_any or other == .anyref,
+            .ref_func => other == .ref_any or other == .anyref or other == .funcref,
+            .ref_extern => other == .externref,
             else => false,
         };
     }
