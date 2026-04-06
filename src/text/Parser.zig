@@ -1854,7 +1854,13 @@ const Parser = struct {
                     }
                 }
             },
-            .opcode => self.emitGenericOpcode(tok.text, code),
+            .opcode => {
+                if (std.mem.eql(u8, tok.text, "v128.const")) {
+                    self.emitSimdV128Const(code);
+                } else {
+                    self.emitGenericOpcode(tok.text, code);
+                }
+            },
             .invalid => {
                 self.malformed = true;
             },
@@ -2169,12 +2175,135 @@ const Parser = struct {
                     self.emitMemarg(code, 0);
                 } else if (prefix == 0xfc) {
                     self.emitBulkMemImm(sub, code);
+                } else if (prefix == 0xfd) {
+                    self.emitSimdImm(sub, code);
                 }
             }
         } else {
             // Unrecognized opcode text — flag as malformed
             self.malformed = true;
         }
+    }
+
+    /// Emit immediates for SIMD (0xfd prefix) instructions.
+    fn emitSimdImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
+        if (sub <= 0x0b or (sub >= 0x5c and sub <= 0x5d)) {
+            // v128.load/store variants + load_zero: memarg
+            self.emitMemIdx(code);
+            self.emitMemarg(code, 0);
+        } else if (sub == 0x0d) {
+            // i8x16.shuffle: 16 lane index bytes
+            for (0..16) |_| {
+                const lane_val = self.parseU32() catch 0;
+                code.append(self.allocator, @truncate(lane_val)) catch {};
+            }
+        } else if (sub >= 0x15 and sub <= 0x22) {
+            // extract_lane / replace_lane: 1 byte lane index
+            const lane_val = self.parseU32() catch 0;
+            code.append(self.allocator, @truncate(lane_val)) catch {};
+        } else if (sub >= 0x54 and sub <= 0x5b) {
+            // v128.load*_lane / v128.store*_lane: memarg + 1 byte lane
+            self.emitMemIdx(code);
+            self.emitMemarg(code, 0);
+            const lane_val = self.parseU32() catch 0;
+            code.append(self.allocator, @truncate(lane_val)) catch {};
+        }
+        // All other SIMD ops (arithmetic, comparison, etc.) have no immediates
+    }
+
+    /// Emit a v128.const instruction with 16 bytes of literal data.
+    fn emitSimdV128Const(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        // Emit 0xfd prefix + 0x0c sub-opcode
+        code.append(self.allocator, 0xfd) catch return;
+        var buf: [5]u8 = undefined;
+        const n = leb128.writeU32Leb128(&buf, 0x0c);
+        code.appendSlice(self.allocator, buf[0..n]) catch return;
+
+        // Parse lane format: i8x16, i16x8, i32x4, i64x2, f32x4, f64x2
+        const fmt_tok = self.advance();
+        const fmt = fmt_tok.text;
+        if (std.mem.eql(u8, fmt, "i8x16")) {
+            for (0..16) |_| {
+                const v = self.parseU32() catch 0;
+                code.append(self.allocator, @truncate(v)) catch {};
+            }
+        } else if (std.mem.eql(u8, fmt, "i16x8")) {
+            for (0..8) |_| {
+                const v = self.parseU32() catch 0;
+                const val: u16 = @truncate(v);
+                code.appendSlice(self.allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, val))) catch {};
+            }
+        } else if (std.mem.eql(u8, fmt, "i32x4")) {
+            for (0..4) |_| {
+                const v = self.parseI32() catch 0;
+                code.appendSlice(self.allocator, std.mem.asBytes(&std.mem.nativeToLittle(i32, v))) catch {};
+            }
+        } else if (std.mem.eql(u8, fmt, "i64x2")) {
+            for (0..2) |_| {
+                const v = self.parseI64() catch 0;
+                code.appendSlice(self.allocator, std.mem.asBytes(&std.mem.nativeToLittle(i64, v))) catch {};
+            }
+        } else if (std.mem.eql(u8, fmt, "f32x4")) {
+            for (0..4) |_| {
+                const v = self.parseF32Bytes();
+                code.appendSlice(self.allocator, &v) catch {};
+            }
+        } else if (std.mem.eql(u8, fmt, "f64x2")) {
+            for (0..2) |_| {
+                const v = self.parseF64Bytes();
+                code.appendSlice(self.allocator, &v) catch {};
+            }
+        } else {
+            // Unknown lane format — emit 16 zero bytes
+            code.appendNTimes(self.allocator, 0, 16) catch {};
+        }
+    }
+
+    fn parseI32(self: *Parser) ParseError!i32 {
+        const tok = self.advance();
+        if (tok.kind == .integer) {
+            // Handle both positive and negative, and hex
+            return std.fmt.parseInt(i32, tok.text, 0) catch {
+                // Try unsigned parsing for large values
+                const u = std.fmt.parseInt(u32, tok.text, 0) catch return 0;
+                return @bitCast(u);
+            };
+        }
+        return 0;
+    }
+
+    fn parseI64(self: *Parser) ParseError!i64 {
+        const tok = self.advance();
+        if (tok.kind == .integer) {
+            return std.fmt.parseInt(i64, tok.text, 0) catch {
+                const u = std.fmt.parseInt(u64, tok.text, 0) catch return 0;
+                return @bitCast(u);
+            };
+        }
+        return 0;
+    }
+
+    fn parseF32Bytes(self: *Parser) [4]u8 {
+        const tok = self.advance();
+        if (std.mem.startsWith(u8, tok.text, "nan:")) {
+            // NaN with payload
+            const payload = std.fmt.parseInt(u32, tok.text[4..], 0) catch 0;
+            const val: u32 = 0x7f800000 | payload;
+            return std.mem.toBytes(std.mem.nativeToLittle(u32, val));
+        }
+        const f = std.fmt.parseFloat(f32, tok.text) catch 0.0;
+        return std.mem.toBytes(std.mem.nativeToLittle(f32, f));
+    }
+
+    fn parseF64Bytes(self: *Parser) [8]u8 {
+        const tok = self.advance();
+        if (std.mem.startsWith(u8, tok.text, "nan:")) {
+            const payload = std.fmt.parseInt(u64, tok.text[4..], 0) catch 0;
+            const val: u64 = 0x7ff0000000000000 | payload;
+            return std.mem.toBytes(std.mem.nativeToLittle(u64, val));
+        }
+        const f = std.fmt.parseFloat(f64, tok.text) catch 0.0;
+        return std.mem.toBytes(std.mem.nativeToLittle(f64, f));
     }
 
     /// Emit an optional memory index for load/store instructions.
@@ -3937,6 +4066,259 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "table.grow", 0xfc0f },
         .{ "table.size", 0xfc10 },
         .{ "table.fill", 0xfc11 },
+        // SIMD (0xfd prefix)
+        .{ "v128.load", 0xfd00 },
+        .{ "v128.load8x8_s", 0xfd01 },
+        .{ "v128.load8x8_u", 0xfd02 },
+        .{ "v128.load16x4_s", 0xfd03 },
+        .{ "v128.load16x4_u", 0xfd04 },
+        .{ "v128.load32x2_s", 0xfd05 },
+        .{ "v128.load32x2_u", 0xfd06 },
+        .{ "v128.load8_splat", 0xfd07 },
+        .{ "v128.load16_splat", 0xfd08 },
+        .{ "v128.load32_splat", 0xfd09 },
+        .{ "v128.load64_splat", 0xfd0a },
+        .{ "v128.store", 0xfd0b },
+        // 0xfd0c = v128.const (handled separately)
+        .{ "i8x16.shuffle", 0xfd0d },
+        .{ "i8x16.swizzle", 0xfd0e },
+        .{ "i8x16.splat", 0xfd0f },
+        .{ "i16x8.splat", 0xfd10 },
+        .{ "i32x4.splat", 0xfd11 },
+        .{ "i64x2.splat", 0xfd12 },
+        .{ "f32x4.splat", 0xfd13 },
+        .{ "f64x2.splat", 0xfd14 },
+        .{ "i8x16.extract_lane_s", 0xfd15 },
+        .{ "i8x16.extract_lane_u", 0xfd16 },
+        .{ "i8x16.replace_lane", 0xfd17 },
+        .{ "i16x8.extract_lane_s", 0xfd18 },
+        .{ "i16x8.extract_lane_u", 0xfd19 },
+        .{ "i16x8.replace_lane", 0xfd1a },
+        .{ "i32x4.extract_lane", 0xfd1b },
+        .{ "i32x4.replace_lane", 0xfd1c },
+        .{ "i64x2.extract_lane", 0xfd1d },
+        .{ "i64x2.replace_lane", 0xfd1e },
+        .{ "f32x4.extract_lane", 0xfd1f },
+        .{ "f32x4.replace_lane", 0xfd20 },
+        .{ "f64x2.extract_lane", 0xfd21 },
+        .{ "f64x2.replace_lane", 0xfd22 },
+        // i8x16 comparison
+        .{ "i8x16.eq", 0xfd23 },
+        .{ "i8x16.ne", 0xfd24 },
+        .{ "i8x16.lt_s", 0xfd25 },
+        .{ "i8x16.lt_u", 0xfd26 },
+        .{ "i8x16.gt_s", 0xfd27 },
+        .{ "i8x16.gt_u", 0xfd28 },
+        .{ "i8x16.le_s", 0xfd29 },
+        .{ "i8x16.le_u", 0xfd2a },
+        .{ "i8x16.ge_s", 0xfd2b },
+        .{ "i8x16.ge_u", 0xfd2c },
+        // i16x8 comparison
+        .{ "i16x8.eq", 0xfd2d },
+        .{ "i16x8.ne", 0xfd2e },
+        .{ "i16x8.lt_s", 0xfd2f },
+        .{ "i16x8.lt_u", 0xfd30 },
+        .{ "i16x8.gt_s", 0xfd31 },
+        .{ "i16x8.gt_u", 0xfd32 },
+        .{ "i16x8.le_s", 0xfd33 },
+        .{ "i16x8.le_u", 0xfd34 },
+        .{ "i16x8.ge_s", 0xfd35 },
+        .{ "i16x8.ge_u", 0xfd36 },
+        // i32x4 comparison
+        .{ "i32x4.eq", 0xfd37 },
+        .{ "i32x4.ne", 0xfd38 },
+        .{ "i32x4.lt_s", 0xfd39 },
+        .{ "i32x4.lt_u", 0xfd3a },
+        .{ "i32x4.gt_s", 0xfd3b },
+        .{ "i32x4.gt_u", 0xfd3c },
+        .{ "i32x4.le_s", 0xfd3d },
+        .{ "i32x4.le_u", 0xfd3e },
+        .{ "i32x4.ge_s", 0xfd3f },
+        .{ "i32x4.ge_u", 0xfd40 },
+        // f32x4 comparison
+        .{ "f32x4.eq", 0xfd41 },
+        .{ "f32x4.ne", 0xfd42 },
+        .{ "f32x4.lt", 0xfd43 },
+        .{ "f32x4.gt", 0xfd44 },
+        .{ "f32x4.le", 0xfd45 },
+        .{ "f32x4.ge", 0xfd46 },
+        // f64x2 comparison
+        .{ "f64x2.eq", 0xfd47 },
+        .{ "f64x2.ne", 0xfd48 },
+        .{ "f64x2.lt", 0xfd49 },
+        .{ "f64x2.gt", 0xfd4a },
+        .{ "f64x2.le", 0xfd4b },
+        .{ "f64x2.ge", 0xfd4c },
+        // v128 bitwise
+        .{ "v128.not", 0xfd4d },
+        .{ "v128.and", 0xfd4e },
+        .{ "v128.andnot", 0xfd4f },
+        .{ "v128.or", 0xfd50 },
+        .{ "v128.xor", 0xfd51 },
+        .{ "v128.bitselect", 0xfd52 },
+        .{ "v128.any_true", 0xfd53 },
+        // v128.load*_lane / v128.store*_lane
+        .{ "v128.load8_lane", 0xfd54 },
+        .{ "v128.load16_lane", 0xfd55 },
+        .{ "v128.load32_lane", 0xfd56 },
+        .{ "v128.load64_lane", 0xfd57 },
+        .{ "v128.store8_lane", 0xfd58 },
+        .{ "v128.store16_lane", 0xfd59 },
+        .{ "v128.store32_lane", 0xfd5a },
+        .{ "v128.store64_lane", 0xfd5b },
+        .{ "v128.load32_zero", 0xfd5c },
+        .{ "v128.load64_zero", 0xfd5d },
+        // f32x4 arithmetic
+        .{ "f32x4.demote_f64x2_zero", 0xfd5e },
+        .{ "f64x2.promote_low_f32x4", 0xfd5f },
+        // i8x16 arithmetic
+        .{ "i8x16.abs", 0xfd60 },
+        .{ "i8x16.neg", 0xfd61 },
+        .{ "i8x16.popcnt", 0xfd62 },
+        .{ "i8x16.all_true", 0xfd63 },
+        .{ "i8x16.bitmask", 0xfd64 },
+        .{ "i8x16.narrow_i16x8_s", 0xfd65 },
+        .{ "i8x16.narrow_i16x8_u", 0xfd66 },
+        .{ "f32x4.ceil", 0xfd67 },
+        .{ "f32x4.floor", 0xfd68 },
+        .{ "f32x4.trunc", 0xfd69 },
+        .{ "f32x4.nearest", 0xfd6a },
+        .{ "f64x2.ceil", 0xfd74 },
+        .{ "f64x2.floor", 0xfd75 },
+        .{ "f64x2.trunc", 0xfd7a },
+        .{ "f64x2.nearest", 0xfd94 },
+        .{ "i8x16.shl", 0xfd6b },
+        .{ "i8x16.shr_s", 0xfd6c },
+        .{ "i8x16.shr_u", 0xfd6d },
+        .{ "i8x16.add", 0xfd6e },
+        .{ "i8x16.add_sat_s", 0xfd6f },
+        .{ "i8x16.add_sat_u", 0xfd70 },
+        .{ "i8x16.sub", 0xfd71 },
+        .{ "i8x16.sub_sat_s", 0xfd72 },
+        .{ "i8x16.sub_sat_u", 0xfd73 },
+        .{ "i8x16.min_s", 0xfd76 },
+        .{ "i8x16.min_u", 0xfd77 },
+        .{ "i8x16.max_s", 0xfd78 },
+        .{ "i8x16.max_u", 0xfd79 },
+        .{ "i8x16.avgr_u", 0xfd7b },
+        // i16x8 arithmetic
+        .{ "i16x8.extadd_pairwise_i8x16_s", 0xfd7c },
+        .{ "i16x8.extadd_pairwise_i8x16_u", 0xfd7d },
+        .{ "i32x4.extadd_pairwise_i16x8_s", 0xfd7e },
+        .{ "i32x4.extadd_pairwise_i16x8_u", 0xfd7f },
+        .{ "i16x8.abs", 0xfd80 },
+        .{ "i16x8.neg", 0xfd81 },
+        .{ "i16x8.q15mulr_sat_s", 0xfd82 },
+        .{ "i16x8.all_true", 0xfd83 },
+        .{ "i16x8.bitmask", 0xfd84 },
+        .{ "i16x8.narrow_i32x4_s", 0xfd85 },
+        .{ "i16x8.narrow_i32x4_u", 0xfd86 },
+        .{ "i16x8.extend_low_i8x16_s", 0xfd87 },
+        .{ "i16x8.extend_high_i8x16_s", 0xfd88 },
+        .{ "i16x8.extend_low_i8x16_u", 0xfd89 },
+        .{ "i16x8.extend_high_i8x16_u", 0xfd8a },
+        .{ "i16x8.shl", 0xfd8b },
+        .{ "i16x8.shr_s", 0xfd8c },
+        .{ "i16x8.shr_u", 0xfd8d },
+        .{ "i16x8.add", 0xfd8e },
+        .{ "i16x8.add_sat_s", 0xfd8f },
+        .{ "i16x8.add_sat_u", 0xfd90 },
+        .{ "i16x8.sub", 0xfd91 },
+        .{ "i16x8.sub_sat_s", 0xfd92 },
+        .{ "i16x8.sub_sat_u", 0xfd93 },
+        .{ "i16x8.mul", 0xfd95 },
+        .{ "i16x8.min_s", 0xfd96 },
+        .{ "i16x8.min_u", 0xfd97 },
+        .{ "i16x8.max_s", 0xfd98 },
+        .{ "i16x8.max_u", 0xfd99 },
+        .{ "i16x8.avgr_u", 0xfd9b },
+        // i32x4 arithmetic
+        .{ "i32x4.abs", 0xfda0 },
+        .{ "i32x4.neg", 0xfda1 },
+        .{ "i32x4.all_true", 0xfda3 },
+        .{ "i32x4.bitmask", 0xfda4 },
+        .{ "i32x4.extend_low_i16x8_s", 0xfda7 },
+        .{ "i32x4.extend_high_i16x8_s", 0xfda8 },
+        .{ "i32x4.extend_low_i16x8_u", 0xfda9 },
+        .{ "i32x4.extend_high_i16x8_u", 0xfdaa },
+        .{ "i32x4.shl", 0xfdab },
+        .{ "i32x4.shr_s", 0xfdac },
+        .{ "i32x4.shr_u", 0xfdad },
+        .{ "i32x4.add", 0xfdae },
+        .{ "i32x4.sub", 0xfdb1 },
+        .{ "i32x4.mul", 0xfdb5 },
+        .{ "i32x4.min_s", 0xfdb6 },
+        .{ "i32x4.min_u", 0xfdb7 },
+        .{ "i32x4.max_s", 0xfdb8 },
+        .{ "i32x4.max_u", 0xfdb9 },
+        .{ "i32x4.dot_i16x8_s", 0xfdba },
+        // i64x2 arithmetic
+        .{ "i64x2.abs", 0xfdc0 },
+        .{ "i64x2.neg", 0xfdc1 },
+        .{ "i64x2.all_true", 0xfdc3 },
+        .{ "i64x2.bitmask", 0xfdc4 },
+        .{ "i64x2.extend_low_i32x4_s", 0xfdc7 },
+        .{ "i64x2.extend_high_i32x4_s", 0xfdc8 },
+        .{ "i64x2.extend_low_i32x4_u", 0xfdc9 },
+        .{ "i64x2.extend_high_i32x4_u", 0xfdca },
+        .{ "i64x2.shl", 0xfdcb },
+        .{ "i64x2.shr_s", 0xfdcc },
+        .{ "i64x2.shr_u", 0xfdcd },
+        .{ "i64x2.add", 0xfdce },
+        .{ "i64x2.sub", 0xfdd1 },
+        .{ "i64x2.mul", 0xfdd5 },
+        .{ "i64x2.eq", 0xfdd6 },
+        .{ "i64x2.ne", 0xfdd7 },
+        .{ "i64x2.lt_s", 0xfdd8 },
+        .{ "i64x2.gt_s", 0xfdd9 },
+        .{ "i64x2.le_s", 0xfdda },
+        .{ "i64x2.ge_s", 0xfddb },
+        // f32x4 arithmetic
+        .{ "f32x4.abs", 0xfde0 },
+        .{ "f32x4.neg", 0xfde1 },
+        .{ "f32x4.sqrt", 0xfde3 },
+        .{ "f32x4.add", 0xfde4 },
+        .{ "f32x4.sub", 0xfde5 },
+        .{ "f32x4.mul", 0xfde6 },
+        .{ "f32x4.div", 0xfde7 },
+        .{ "f32x4.min", 0xfde8 },
+        .{ "f32x4.max", 0xfde9 },
+        .{ "f32x4.pmin", 0xfdea },
+        .{ "f32x4.pmax", 0xfdeb },
+        // f64x2 arithmetic
+        .{ "f64x2.abs", 0xfdec },
+        .{ "f64x2.neg", 0xfded },
+        .{ "f64x2.sqrt", 0xfdef },
+        .{ "f64x2.add", 0xfdf0 },
+        .{ "f64x2.sub", 0xfdf1 },
+        .{ "f64x2.mul", 0xfdf2 },
+        .{ "f64x2.div", 0xfdf3 },
+        .{ "f64x2.min", 0xfdf4 },
+        .{ "f64x2.max", 0xfdf5 },
+        .{ "f64x2.pmin", 0xfdf6 },
+        .{ "f64x2.pmax", 0xfdf7 },
+        // Conversions
+        .{ "i32x4.trunc_sat_f32x4_s", 0xfdf8 },
+        .{ "i32x4.trunc_sat_f32x4_u", 0xfdf9 },
+        .{ "f32x4.convert_i32x4_s", 0xfdfa },
+        .{ "f32x4.convert_i32x4_u", 0xfdfb },
+        .{ "i32x4.trunc_sat_f64x2_s_zero", 0xfdfc },
+        .{ "i32x4.trunc_sat_f64x2_u_zero", 0xfdfd },
+        .{ "f64x2.convert_low_i32x4_s", 0xfdfe },
+        .{ "f64x2.convert_low_i32x4_u", 0xfdff },
+        // Extended multiply
+        .{ "i16x8.extmul_low_i8x16_s", 0xfd9c },
+        .{ "i16x8.extmul_high_i8x16_s", 0xfd9d },
+        .{ "i16x8.extmul_low_i8x16_u", 0xfd9e },
+        .{ "i16x8.extmul_high_i8x16_u", 0xfd9f },
+        .{ "i32x4.extmul_low_i16x8_s", 0xfdbc },
+        .{ "i32x4.extmul_high_i16x8_s", 0xfdbd },
+        .{ "i32x4.extmul_low_i16x8_u", 0xfdbe },
+        .{ "i32x4.extmul_high_i16x8_u", 0xfdbf },
+        .{ "i64x2.extmul_low_i32x4_s", 0xfddc },
+        .{ "i64x2.extmul_high_i32x4_s", 0xfddd },
+        .{ "i64x2.extmul_low_i32x4_u", 0xfdde },
+        .{ "i64x2.extmul_high_i32x4_u", 0xfddf },
     });
     return map.get(text);
 }

@@ -2626,7 +2626,86 @@ pub const Interpreter = struct {
                     const simd_sub = readCodeU32(code, &t);
                     pc = t;
                     switch (simd_sub) {
+                        // v128.load (memarg)
+                        0x00 => {
+                            const m = readCodeU32(code, &pc);
+                            _ = readCodeU32(code, &pc); // align
+                            const o = readCodeU32(code, &pc);
+                            try self.v128Load(m, o);
+                        },
+                        // v128.load8x8_s / u
+                        0x01 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load8x8(m, o, true); },
+                        0x02 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load8x8(m, o, false); },
+                        // v128.load16x4_s / u
+                        0x03 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load16x4(m, o, true); },
+                        0x04 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load16x4(m, o, false); },
+                        // v128.load32x2_s / u
+                        0x05 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load32x2(m, o, true); },
+                        0x06 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load32x2(m, o, false); },
+                        // v128.load8_splat / load16_splat / load32_splat / load64_splat
+                        0x07 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 1); },
+                        0x08 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 2); },
+                        0x09 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 4); },
+                        0x0a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 8); },
+                        // v128.store (memarg)
+                        0x0b => {
+                            const m = readCodeU32(code, &pc);
+                            _ = readCodeU32(code, &pc); // align
+                            const o = readCodeU32(code, &pc);
+                            try self.v128Store(m, o);
+                        },
                         0x0c => try self.simdConst(code, &pc), // v128.const
+                        // i8x16.shuffle
+                        0x0d => {
+                            var imm: [16]u8 = undefined;
+                            if (pc + 16 <= code.len) {
+                                @memcpy(&imm, code[pc..][0..16]);
+                                pc += 16;
+                            } else return error.Unimplemented;
+                            try self.i8x16Shuffle(imm);
+                        },
+                        // i8x16.swizzle
+                        0x0e => try self.i8x16Swizzle(),
+                        // i8x16.splat .. f64x2.splat
+                        0x0f => try self.splatOp(u8),
+                        0x10 => try self.splatOp(u16),
+                        0x11 => try self.splatOp(u32),
+                        0x12 => try self.splatOp(u64),
+                        0x13 => try self.f32Splat(),
+                        0x14 => try self.f64Splat(),
+                        // i8x16.extract_lane_s/u, i8x16.replace_lane
+                        0x15 => { const lane = code[pc]; pc += 1; try self.extractLane(i8, lane, true); },
+                        0x16 => { const lane = code[pc]; pc += 1; try self.extractLane(u8, lane, false); },
+                        0x17 => { const lane = code[pc]; pc += 1; try self.replaceLane(u8, lane); },
+                        // i16x8.extract_lane_s/u, i16x8.replace_lane
+                        0x18 => { const lane = code[pc]; pc += 1; try self.extractLane(i16, lane, true); },
+                        0x19 => { const lane = code[pc]; pc += 1; try self.extractLane(u16, lane, false); },
+                        0x1a => { const lane = code[pc]; pc += 1; try self.replaceLane(u16, lane); },
+                        // i32x4.extract_lane, i32x4.replace_lane
+                        0x1b => { const lane = code[pc]; pc += 1; try self.extractLane(u32, lane, false); },
+                        0x1c => { const lane = code[pc]; pc += 1; try self.replaceLane(u32, lane); },
+                        // i64x2.extract_lane, i64x2.replace_lane
+                        0x1d => { const lane = code[pc]; pc += 1; try self.extractLane(u64, lane, false); },
+                        0x1e => { const lane = code[pc]; pc += 1; try self.replaceLane(u64, lane); },
+                        // f32x4.extract_lane, f32x4.replace_lane
+                        0x1f => { const lane = code[pc]; pc += 1; try self.extractLaneF32(lane); },
+                        0x20 => { const lane = code[pc]; pc += 1; try self.replaceLaneF32(lane); },
+                        // f64x2.extract_lane, f64x2.replace_lane
+                        0x21 => { const lane = code[pc]; pc += 1; try self.extractLaneF64(lane); },
+                        0x22 => { const lane = code[pc]; pc += 1; try self.replaceLaneF64(lane); },
+                        // v128.load8_lane .. v128.load64_lane (0x54-0x57)
+                        0x54 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 1, lane); },
+                        0x55 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 2, lane); },
+                        0x56 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 4, lane); },
+                        0x57 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 8, lane); },
+                        // v128.store8_lane .. v128.store64_lane (0x58-0x5b)
+                        0x58 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 1, lane); },
+                        0x59 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 2, lane); },
+                        0x5a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 4, lane); },
+                        0x5b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 8, lane); },
+                        // v128.load32_zero / v128.load64_zero (0x5c-0x5d)
+                        0x5c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 4); },
+                        0x5d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 8); },
                         else => return error.Unimplemented,
                     }
                 },
@@ -2643,6 +2722,260 @@ pub const Interpreter = struct {
             pc.* += 16;
             try self.pushValue(.{ .v128 = @bitCast(bytes) });
         } else return error.Unimplemented;
+    }
+
+    // ── SIMD v128 memory operations ─────────────────────────────────────
+
+    fn v128Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + 16 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var bytes: [16]u8 = undefined;
+        @memcpy(&bytes, mem.items[idx..][0..16]);
+        try self.pushValue(.{ .v128 = @bitCast(bytes) });
+    }
+
+    fn v128Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+        const val = try self.popValue();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + 16 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const bytes: [16]u8 = @bitCast(val.v128);
+        @memcpy(mem.items[idx..][0..16], &bytes);
+    }
+
+    fn v128Load8x8(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var result: [8]i16 = undefined;
+        for (0..8) |i| {
+            if (signed) {
+                result[i] = @as(i16, @as(i8, @bitCast(mem.items[idx + i])));
+            } else {
+                result[i] = @as(i16, mem.items[idx + i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn v128Load16x4(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var result: [4]i32 = undefined;
+        for (0..4) |i| {
+            const v = std.mem.readInt(i16, mem.items[idx + i * 2 ..][0..2], .little);
+            if (signed) {
+                result[i] = @as(i32, v);
+            } else {
+                result[i] = @as(i32, @as(u16, @bitCast(v)));
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn v128Load32x2(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var result: [2]i64 = undefined;
+        for (0..2) |i| {
+            const v = std.mem.readInt(i32, mem.items[idx + i * 4 ..][0..4], .little);
+            if (signed) {
+                result[i] = @as(i64, v);
+            } else {
+                result[i] = @as(i64, @as(u32, @bitCast(v)));
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn v128LoadSplat(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var result: [16]u8 = undefined;
+        const count = 16 / size;
+        for (0..count) |i| {
+            @memcpy(result[i * size ..][0..size], mem.items[idx..][0..size]);
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn v128LoadZero(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int) TrapError!void {
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var result: [16]u8 = [_]u8{0} ** 16;
+        @memcpy(result[0..size], mem.items[idx..][0..size]);
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn v128LoadLane(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int, lane: u8) TrapError!void {
+        const v = try self.popValue();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        var bytes: [16]u8 = @bitCast(v.v128);
+        const lane_offset = @as(usize, lane) * size;
+        if (lane_offset + size > 16) return error.Unimplemented;
+        @memcpy(bytes[lane_offset..][0..size], mem.items[idx..][0..size]);
+        try self.pushValue(.{ .v128 = @bitCast(bytes) });
+    }
+
+    fn v128StoreLane(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int, lane: u8) TrapError!void {
+        const v = try self.popValue();
+        const base = try self.popI32();
+        const addr = @as(u64, @as(u32, @bitCast(base))) + offset;
+        const mem = self.instance.getMemory(mem_idx);
+        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        const idx: usize = @intCast(addr);
+        const bytes: [16]u8 = @bitCast(v.v128);
+        const lane_offset = @as(usize, lane) * size;
+        if (lane_offset + size > 16) return error.Unimplemented;
+        @memcpy(mem.items[idx..][0..size], bytes[lane_offset..][0..size]);
+    }
+
+    // ── SIMD lane/splat operations ──────────────────────────────────────
+
+    fn i8x16Shuffle(self: *Interpreter, imm: [16]u8) TrapError!void {
+        const b = try self.popValue();
+        const a = try self.popValue();
+        const ab: [16]u8 = @bitCast(a.v128);
+        const bb: [16]u8 = @bitCast(b.v128);
+        var result: [16]u8 = undefined;
+        for (0..16) |i| {
+            const idx = imm[i];
+            result[i] = if (idx < 16) ab[idx] else if (idx < 32) bb[idx - 16] else 0;
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn i8x16Swizzle(self: *Interpreter) TrapError!void {
+        const s = try self.popValue();
+        const v = try self.popValue();
+        const vb: [16]u8 = @bitCast(v.v128);
+        const sb: [16]u8 = @bitCast(s.v128);
+        var result: [16]u8 = undefined;
+        for (0..16) |i| {
+            result[i] = if (sb[i] < 16) vb[sb[i]] else 0;
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn splatOp(self: *Interpreter, comptime T: type) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        if (@sizeOf(T) <= 4) {
+            const val = try self.popI32();
+            const truncated: T = @truncate(@as(u32, @bitCast(val)));
+            var lanes: [count]T = undefined;
+            for (&lanes) |*l| l.* = truncated;
+            try self.pushValue(.{ .v128 = @bitCast(lanes) });
+        } else {
+            const val = try self.popValue();
+            const lanes = [2]u64{ @bitCast(val.i64), @bitCast(val.i64) };
+            try self.pushValue(.{ .v128 = @bitCast(lanes) });
+        }
+    }
+
+    fn f32Splat(self: *Interpreter) TrapError!void {
+        const val = try self.popValue();
+        const fval: f32 = @bitCast(val.i32);
+        const lanes = [4]f32{ fval, fval, fval, fval };
+        try self.pushValue(.{ .v128 = @bitCast(lanes) });
+    }
+
+    fn f64Splat(self: *Interpreter) TrapError!void {
+        const val = try self.popValue();
+        const fval: f64 = @bitCast(val.i64);
+        const lanes = [2]f64{ fval, fval };
+        try self.pushValue(.{ .v128 = @bitCast(lanes) });
+    }
+
+    fn extractLane(self: *Interpreter, comptime T: type, lane: u8, comptime signed: bool) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        const v = try self.popValue();
+        if (lane >= count) return error.Unimplemented;
+        const lanes: [count]T = @bitCast(v.v128);
+        if (@sizeOf(T) <= 4) {
+            if (signed) {
+                const s: i32 = @as(i32, @as(std.meta.Int(.signed, @bitSizeOf(T)), @bitCast(lanes[lane])));
+                try self.pushValue(.{ .i32 = s });
+            } else {
+                const u_val: u32 = @as(u32, lanes[lane]);
+                try self.pushValue(.{ .i32 = @bitCast(u_val) });
+            }
+        } else {
+            try self.pushValue(.{ .i64 = @bitCast(lanes[lane]) });
+        }
+    }
+
+    fn replaceLane(self: *Interpreter, comptime T: type, lane: u8) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        if (@sizeOf(T) <= 4) {
+            const val = try self.popI32();
+            const v = try self.popValue();
+            if (lane >= count) return error.Unimplemented;
+            var lanes: [count]T = @bitCast(v.v128);
+            lanes[lane] = @truncate(@as(u32, @bitCast(val)));
+            try self.pushValue(.{ .v128 = @bitCast(lanes) });
+        } else {
+            const val = try self.popValue();
+            const v = try self.popValue();
+            if (lane >= count) return error.Unimplemented;
+            var lanes: [count]T = @bitCast(v.v128);
+            lanes[lane] = @bitCast(val.i64);
+            try self.pushValue(.{ .v128 = @bitCast(lanes) });
+        }
+    }
+
+    fn extractLaneF32(self: *Interpreter, lane: u8) TrapError!void {
+        const v = try self.popValue();
+        if (lane >= 4) return error.Unimplemented;
+        const lanes: [4]u32 = @bitCast(v.v128);
+        try self.pushValue(.{ .i32 = @bitCast(lanes[lane]) });
+    }
+
+    fn replaceLaneF32(self: *Interpreter, lane: u8) TrapError!void {
+        const val = try self.popValue();
+        const v = try self.popValue();
+        if (lane >= 4) return error.Unimplemented;
+        var lanes: [4]u32 = @bitCast(v.v128);
+        lanes[lane] = @bitCast(val.i32);
+        try self.pushValue(.{ .v128 = @bitCast(lanes) });
+    }
+
+    fn extractLaneF64(self: *Interpreter, lane: u8) TrapError!void {
+        const v = try self.popValue();
+        if (lane >= 2) return error.Unimplemented;
+        const lanes: [2]u64 = @bitCast(v.v128);
+        try self.pushValue(.{ .i64 = @bitCast(lanes[lane]) });
+    }
+
+    fn replaceLaneF64(self: *Interpreter, lane: u8) TrapError!void {
+        const val = try self.popValue();
+        const v = try self.popValue();
+        if (lane >= 2) return error.Unimplemented;
+        var lanes: [2]u64 = @bitCast(v.v128);
+        lanes[lane] = @bitCast(val.i64);
+        try self.pushValue(.{ .v128 = @bitCast(lanes) });
     }
 
     /// Check if a type index has GC sub-type metadata.
