@@ -961,6 +961,9 @@ const single_f64: [1]types.ValType = .{.f64};
 const single_funcref: [1]types.ValType = .{.funcref};
 const single_externref: [1]types.ValType = .{.externref};
 
+const single_ref_null: [1]types.ValType = .{.ref_null};
+const single_ref: [1]types.ValType = .{.ref};
+
 fn valTypeSlice(byte: u8) []const types.ValType {
     return switch (byte) {
         0x7f => &single_i32,
@@ -969,6 +972,8 @@ fn valTypeSlice(byte: u8) []const types.ValType {
         0x7c => &single_f64,
         0x70 => &single_funcref,
         0x6f => &single_externref,
+        0x63 => &single_ref_null,
+        0x64 => &single_ref,
         else => &.{},
     };
 }

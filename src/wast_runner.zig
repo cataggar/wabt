@@ -1545,7 +1545,7 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.null")) {
         return .{ .ref_null = {} };
     } else if (std.mem.eql(u8, kw, "ref.func")) {
-        return .{ .ref_null = {} }; // treat as non-null ref for comparison
+        return .{ .ref_func = std.math.maxInt(u32) }; // sentinel: match any non-null funcref
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
         return .{ .ref_func = idx }; // non-null externref represented as ref_func
@@ -1621,7 +1621,11 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
         },
         .ref_null => b == .ref_null,
         .ref_func => |av| switch (b) {
-            .ref_func => |bv| av == bv,
+            .ref_func => |bv| {
+                // sentinel maxInt means "any non-null funcref"
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
             else => false,
         },
     };
