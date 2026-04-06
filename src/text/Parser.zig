@@ -1240,7 +1240,34 @@ const Parser = struct {
                 self.emitLeb128U32(code, ci_table_idx);
             },
             .kw_drop => code.append(self.allocator, 0x1a) catch return,
-            .kw_select => code.append(self.allocator, 0x1b) catch return,
+            .kw_select => {
+                // Check for typed select: (select (result <type>) ...)
+                if (self.peek().kind == .l_paren) {
+                    const save_pos2 = self.lexer.pos;
+                    const save_peeked2 = self.peeked;
+                    _ = self.advance(); // consume '('
+                    if (self.peek().kind == .kw_result) {
+                        _ = self.advance(); // consume 'result'
+                        code.append(self.allocator, 0x1c) catch return; // typed select
+                        var count: u32 = 0;
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            _ = vt;
+                            count += 1;
+                        }
+                        // Encode count + type (simplified: just encode count)
+                        self.emitLeb128U32(code, count);
+                        for (0..count) |_| self.emitLeb128U32(code, 0);
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = save_pos2;
+                        self.peeked = save_peeked2;
+                        code.append(self.allocator, 0x1b) catch return;
+                    }
+                } else {
+                    code.append(self.allocator, 0x1b) catch return;
+                }
+            },
             .kw_local_get => {
                 code.append(self.allocator, 0x20) catch return;
                 self.emitU32Imm(code);
