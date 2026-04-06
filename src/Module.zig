@@ -291,6 +291,11 @@ pub const TypeMeta = struct {
     rec_group_size: u32 = 1,
     /// Position within the rec group.
     rec_position: u32 = 0,
+    /// Type indices referenced by this type's structural content (params/results/fields),
+    /// in order of appearance. Used for iso-recursive type canonicalization.
+    type_refs: []const u32 = &.{},
+    /// Canonical rec group ID — types in iso-recursively equivalent rec groups share this.
+    canonical_group: u32 = std.math.maxInt(u32),
     pub const Kind = enum { func, struct_, array };
 };
 
@@ -355,6 +360,9 @@ pub const Module = struct {
             }
         }
         self.module_types.deinit(self.allocator);
+        for (self.type_meta.items) |tm| {
+            if (tm.type_refs.len > 0) self.allocator.free(tm.type_refs);
+        }
         self.type_meta.deinit(self.allocator);
         for (self.funcs.items) |*func| {
             func.local_types.deinit(self.allocator);

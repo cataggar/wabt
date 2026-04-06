@@ -2273,7 +2273,7 @@ pub const Interpreter = struct {
                                     if (!params_match or !results_match) {
                                         return error.IndirectCallTypeMismatch;
                                     }
-                                    if (!self.recGroupsMatch(type_idx, actual_type_idx, target_interp)) {
+                                    if (!typesEquivalent(self.instance.module, type_idx, target_interp.instance.module, actual_type_idx)) {
                                         return error.IndirectCallTypeMismatch;
                                     }
                                 },
@@ -2653,29 +2653,17 @@ pub const Interpreter = struct {
     }
 
     /// Check if actual_type is a subtype of (or equal to) expected_type.
-    /// Walks the actual type's parent chain looking for the expected type.
-    /// Both types must be in the same module (or structurally compared for cross-module).
+    /// Walks the actual type's parent chain, checking iso-recursive equivalence at each step.
     fn isSubtypeOf(self: *const Interpreter, actual_idx: u32, expected_idx: u32, target: *const Interpreter) bool {
         const exp_mod = self.instance.module;
         const act_mod = target.instance.module;
-        // Same module — compare by index and walk parent chain
-        if (exp_mod == act_mod) {
-            var current = actual_idx;
-            var depth: u32 = 0;
-            while (depth < 32) : (depth += 1) {
-                if (current == expected_idx) return true;
-                if (current >= exp_mod.type_meta.items.len) break;
-                const parent = exp_mod.type_meta.items[current].parent;
-                if (parent == std.math.maxInt(u32)) break;
-                current = parent;
-            }
-            return false;
-        }
-        // Cross-module — need structural + rec group comparison at each step
+
         var current = actual_idx;
         var depth: u32 = 0;
         while (depth < 32) : (depth += 1) {
-            if (self.recGroupsMatch(expected_idx, current, target)) return true;
+            // Check equivalence: same index (same module) or same canonical group + position
+            if (exp_mod == act_mod and current == expected_idx) return true;
+            if (typesEquivalent(exp_mod, expected_idx, act_mod, current)) return true;
             if (current >= act_mod.type_meta.items.len) break;
             const parent = act_mod.type_meta.items[current].parent;
             if (parent == std.math.maxInt(u32)) break;
@@ -2684,24 +2672,32 @@ pub const Interpreter = struct {
         return false;
     }
 
-    /// Check if two type indices have compatible rec group structures.
-    /// Returns true if the rec groups match structurally (same size, same kinds at each position).
-    fn recGroupsMatch(self: *const Interpreter, expected_idx: u32, actual_idx: u32, target: *const Interpreter) bool {
-        const exp_mod = self.instance.module;
-        const act_mod = target.instance.module;
-        // If no metadata, assume match (backward compatibility)
+    /// Check if two types are iso-recursively equivalent using canonical group IDs.
+    fn typesEquivalent(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.Module, idx_b: u32) bool {
+        if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len) return false;
+        const meta_a = mod_a.type_meta.items[idx_a];
+        const meta_b = mod_b.type_meta.items[idx_b];
+        // Both must have valid canonical groups
+        if (meta_a.canonical_group == std.math.maxInt(u32) or meta_b.canonical_group == std.math.maxInt(u32)) {
+            // Fallback: structural comparison for cross-module types without canonicalization
+            return recGroupsMatchStatic(mod_a, idx_a, mod_b, idx_b);
+        }
+        // Same module: canonical groups are directly comparable
+        if (mod_a == mod_b) {
+            return meta_a.canonical_group == meta_b.canonical_group and meta_a.rec_position == meta_b.rec_position;
+        }
+        // Cross-module: use structural comparison (canonical IDs are per-module)
+        return recGroupsMatchStatic(mod_a, idx_a, mod_b, idx_b);
+    }
+
+    /// Structural rec group comparison for cross-module matching.
+    fn recGroupsMatchStatic(exp_mod: *const Mod.Module, expected_idx: u32, act_mod: *const Mod.Module, actual_idx: u32) bool {
         if (expected_idx >= exp_mod.type_meta.items.len or actual_idx >= act_mod.type_meta.items.len)
             return true;
         const exp_meta = exp_mod.type_meta.items[expected_idx];
         const act_meta = act_mod.type_meta.items[actual_idx];
-        // Singleton groups (no rec) always match on signature alone
-        if (exp_meta.rec_group == std.math.maxInt(u32) and act_meta.rec_group == std.math.maxInt(u32))
-            return true;
-        // If one is in a rec group and the other isn't, check sizes
-        // Rec groups must have the same size and position
         if (exp_meta.rec_group_size != act_meta.rec_group_size) return false;
         if (exp_meta.rec_position != act_meta.rec_position) return false;
-        // Check all types in both rec groups have matching kinds
         const exp_start = exp_meta.rec_group;
         const act_start = act_meta.rec_group;
         for (0..exp_meta.rec_group_size) |i| {
@@ -2709,7 +2705,6 @@ pub const Interpreter = struct {
             const ai = act_start + @as(u32, @intCast(i));
             if (ei >= exp_mod.type_meta.items.len or ai >= act_mod.type_meta.items.len) return false;
             if (exp_mod.type_meta.items[ei].kind != act_mod.type_meta.items[ai].kind) return false;
-            // Also check structural content matches for each type in the group
             if (ei < exp_mod.module_types.items.len and ai < act_mod.module_types.items.len) {
                 const exp_entry = exp_mod.module_types.items[ei];
                 const act_entry = act_mod.module_types.items[ai];

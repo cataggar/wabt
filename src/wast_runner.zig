@@ -1987,38 +1987,152 @@ fn recGroupsCompatible(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.M
         return true; // No metadata, assume compatible
     const meta_a = mod_a.type_meta.items[idx_a];
     const meta_b = mod_b.type_meta.items[idx_b];
-    // Singleton groups (not in rec) always match on signature alone
-    if (meta_a.rec_group == std.math.maxInt(u32) and meta_b.rec_group == std.math.maxInt(u32))
-        return true;
     if (meta_a.rec_group_size != meta_b.rec_group_size) return false;
     if (meta_a.rec_position != meta_b.rec_position) return false;
-    // Check all types in both rec groups have matching kinds and content
     const start_a = meta_a.rec_group;
     const start_b = meta_b.rec_group;
     for (0..meta_a.rec_group_size) |i| {
         const ai = start_a + @as(u32, @intCast(i));
         const bi = start_b + @as(u32, @intCast(i));
         if (ai >= mod_a.type_meta.items.len or bi >= mod_b.type_meta.items.len) return false;
-        if (mod_a.type_meta.items[ai].kind != mod_b.type_meta.items[bi].kind) return false;
+        const ma = mod_a.type_meta.items[ai];
+        const mb = mod_b.type_meta.items[bi];
+        if (ma.kind != mb.kind) return false;
+        if (ma.is_final != mb.is_final) return false;
+
+        // Parent references must be compatible
+        const pa = ma.parent;
+        const pb = mb.parent;
+        if ((pa == std.math.maxInt(u32)) != (pb == std.math.maxInt(u32))) return false;
+        if (pa != std.math.maxInt(u32) and pb != std.math.maxInt(u32)) {
+            // Both have parents — check if both internal or both external, and compatible
+            const pa_internal = pa >= start_a and pa < start_a + meta_a.rec_group_size;
+            const pb_internal = pb >= start_b and pb < start_b + meta_b.rec_group_size;
+            if (pa_internal != pb_internal) return false;
+            if (pa_internal) {
+                // Internal parents must be at the same position
+                if (pa - start_a != pb - start_b) return false;
+            } else {
+                // External parents must be in equivalent rec groups
+                if (!recGroupsCompatible(mod_a, pa, mod_b, pb)) return false;
+            }
+        }
+
+        // Structural content
         if (ai < mod_a.module_types.items.len and bi < mod_b.module_types.items.len) {
-            switch (mod_a.module_types.items[ai]) {
-                .func_type => |fa| switch (mod_b.module_types.items[bi]) {
+            const ea = mod_a.module_types.items[ai];
+            const eb = mod_b.module_types.items[bi];
+            switch (ea) {
+                .func_type => |fa| switch (eb) {
                     .func_type => |fb| {
-                        if (!std.mem.eql(types.ValType, fa.params, fb.params)) return false;
-                        if (!std.mem.eql(types.ValType, fa.results, fb.results)) return false;
+                        // Compare params/results with canonicalized type refs
+                        if (fa.params.len != fb.params.len or fa.results.len != fb.results.len) return false;
+                        if (!compareValTypesWithRefs(fa.params, fa.results, ma.type_refs, mod_a, start_a, meta_a.rec_group_size,
+                            fb.params, fb.results, mb.type_refs, mod_b, start_b, meta_b.rec_group_size)) return false;
                     },
                     else => return false,
                 },
-                .struct_type => |sa| switch (mod_b.module_types.items[bi]) {
+                .struct_type => |sa| switch (eb) {
                     .struct_type => |sb| {
                         if (sa.fields.items.len != sb.fields.items.len) return false;
+                        if (!compareStructFieldsWithRefs(sa, ma.type_refs, mod_a, start_a, meta_a.rec_group_size,
+                            sb, mb.type_refs, mod_b, start_b, meta_b.rec_group_size)) return false;
                     },
                     else => return false,
                 },
-                .array_type => switch (mod_b.module_types.items[bi]) {
+                .array_type => switch (eb) {
                     .array_type => {},
                     else => return false,
                 },
+            }
+        }
+    }
+    return true;
+}
+
+/// Compare func type params/results with canonicalized type references.
+fn compareValTypesWithRefs(
+    params_a: []const types.ValType,
+    results_a: []const types.ValType,
+    refs_a: []const u32,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    params_b: []const types.ValType,
+    results_b: []const types.ValType,
+    refs_b: []const u32,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    var ri_a: usize = 0;
+    var ri_b: usize = 0;
+    for (params_a, params_b) |pa, pb| {
+        if (!compareOneValType(pa, refs_a, &ri_a, mod_a, start_a, size_a, pb, refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    for (results_a, results_b) |ra, rb| {
+        if (!compareOneValType(ra, refs_a, &ri_a, mod_a, start_a, size_a, rb, refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    return true;
+}
+
+/// Compare struct fields with canonicalized type references.
+fn compareStructFieldsWithRefs(
+    sa: Mod.TypeEntry.StructType,
+    refs_a: []const u32,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    sb: Mod.TypeEntry.StructType,
+    refs_b: []const u32,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    var ri_a: usize = 0;
+    var ri_b: usize = 0;
+    for (sa.fields.items, sb.fields.items) |fa, fb| {
+        if (fa.mutable != fb.mutable) return false;
+        if (!compareOneValType(fa.@"type", refs_a, &ri_a, mod_a, start_a, size_a,
+            fb.@"type", refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    return true;
+}
+
+/// Compare a single ValType with canonicalized type reference resolution.
+fn compareOneValType(
+    vt_a: types.ValType,
+    refs_a: []const u32,
+    ri_a: *usize,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    vt_b: types.ValType,
+    refs_b: []const u32,
+    ri_b: *usize,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    if (vt_a != vt_b) return false;
+    if (vt_a == .ref or vt_a == .ref_null) {
+        // Both are typed references — compare the referenced types
+        const has_a = ri_a.* < refs_a.len;
+        const has_b = ri_b.* < refs_b.len;
+        if (has_a) ri_a.* += 1;
+        if (has_b) ri_b.* += 1;
+        if (has_a and has_b) {
+            const target_a = refs_a[ri_a.* - 1];
+            const target_b = refs_b[ri_b.* - 1];
+            const a_internal = target_a >= start_a and target_a < start_a + size_a;
+            const b_internal = target_b >= start_b and target_b < start_b + size_b;
+            if (a_internal != b_internal) return false;
+            if (a_internal) {
+                // Internal: compare by position
+                if (target_a - start_a != target_b - start_b) return false;
+            } else {
+                // External: recursively check equivalence
+                if (!recGroupsCompatible(mod_a, target_a, mod_b, target_b)) return false;
             }
         }
     }

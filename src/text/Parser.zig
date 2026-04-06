@@ -31,6 +31,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.memory_names.deinit(allocator);
     defer p.data_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
+    defer p.collected_type_refs.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
@@ -72,6 +73,9 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         }
         try p.expect(.r_paren);
     }
+
+    // Canonicalize rec groups for iso-recursive type equivalence
+    p.canonicalizeTypes(&module);
 
     // Pass 2: process all other declarations (skip type/rec which were already handled).
     p.lexer.pos = saved_pos;
@@ -302,6 +306,10 @@ const Parser = struct {
     data_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
+    /// Type indices referenced during current type parsing (for iso-recursive canonicalization).
+    collected_type_refs: std.ArrayListUnmanaged(u32) = .{},
+    /// True when parsing a type section entry (controls type ref collection).
+    in_type_parse: bool = false,
 
     fn peek(self: *Parser) Lex.Token {
         if (self.peeked) |t| return t;
@@ -411,6 +419,7 @@ const Parser = struct {
                 }
                 // Parse heap type (could be $id, keyword like func/extern/any, or index)
                 var heap_text: []const u8 = "";
+                var resolved_type_idx: u32 = std.math.maxInt(u32);
                 if (self.peek().kind != .r_paren) {
                     const ht = self.advance();
                     heap_text = ht.text;
@@ -421,6 +430,7 @@ const Parser = struct {
                             try self.expect(.r_paren);
                             return if (nullable) .ref_null else .ref;
                         };
+                        resolved_type_idx = idx;
                         if (self.in_rec) {
                             // Within rec group, allow refs within the group but not beyond
                             if (idx >= self.rec_end) self.malformed = true;
@@ -432,6 +442,7 @@ const Parser = struct {
                     } else if (ht.kind == .identifier) {
                         // Validate named type references
                         if (self.type_names.get(ht.text)) |idx| {
+                            resolved_type_idx = idx;
                             if (self.in_rec) {
                                 if (idx >= self.rec_end) self.malformed = true;
                             } else {
@@ -460,6 +471,10 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
+                }
+                // Record type index for concrete type references (only during type section parsing)
+                if (self.in_type_parse and resolved_type_idx != std.math.maxInt(u32)) {
+                    self.collected_type_refs.append(self.allocator, resolved_type_idx) catch {};
                 }
                 return if (nullable) .ref_null else .ref;
             }
@@ -527,6 +542,10 @@ const Parser = struct {
     // -- module fields --
 
     fn parseType(self: *Parser, module: *Mod.Module) ParseError!void {
+        // Clear type ref collection for this type
+        self.collected_type_refs.clearRetainingCapacity();
+        self.in_type_parse = true;
+        defer self.in_type_parse = false;
         // (type $name? (func (param ...) (result ...)))
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
@@ -614,6 +633,11 @@ const Parser = struct {
                             const ftype = self.parseValType() catch .ref_null;
                             fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
                         }
+                        // Handle multiple anonymous fields: (field type type type ...)
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const extra_type = self.parseValType() catch break;
+                            fields.append(self.allocator, .{ .@"type" = extra_type }) catch {};
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else {
                         self.lexer.pos = sp;
@@ -682,6 +706,8 @@ const Parser = struct {
                 });
             }
         }
+        // Save collected type refs into the meta
+        meta.type_refs = self.collected_type_refs.toOwnedSlice(self.allocator) catch &.{};
         try module.type_meta.append(self.allocator, meta);
     }
 
@@ -797,6 +823,171 @@ const Parser = struct {
             }
             try self.expect(.r_paren);
         }
+    }
+
+    /// Assign canonical rec group IDs using iso-recursive structural comparison.
+    /// Types in structurally identical rec groups get the same canonical_group.
+    fn canonicalizeTypes(self: *Parser, module: *Mod.Module) void {
+        const meta_items = module.type_meta.items;
+        // Ensure all types have a rec group assignment (singletons get their own index)
+        for (meta_items, 0..) |*meta, i| {
+            if (meta.rec_group == std.math.maxInt(u32)) {
+                meta.rec_group = @intCast(i);
+                meta.rec_group_size = 1;
+                meta.rec_position = 0;
+            }
+        }
+
+        var next_canonical: u32 = 0;
+        // Map from canonical key bytes → canonical group ID
+        var group_map = std.StringHashMapUnmanaged(u32){};
+        defer {
+            // Free all stored keys
+            var it = group_map.iterator();
+            while (it.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+            }
+            group_map.deinit(self.allocator);
+        }
+
+        var i: u32 = 0;
+        while (i < meta_items.len) {
+            const group_start = meta_items[i].rec_group;
+            const group_size = meta_items[i].rec_group_size;
+
+            // Build canonical key for this rec group
+            var key: std.ArrayListUnmanaged(u8) = .{};
+            defer key.deinit(self.allocator);
+            self.buildRecGroupKey(&key, module, group_start, group_size);
+
+            // Look up or assign canonical ID
+            if (group_map.get(key.items)) |existing_id| {
+                for (0..group_size) |pos| {
+                    meta_items[group_start + @as(u32, @intCast(pos))].canonical_group = existing_id;
+                }
+            } else {
+                const id = next_canonical;
+                next_canonical += 1;
+                for (0..group_size) |pos| {
+                    meta_items[group_start + @as(u32, @intCast(pos))].canonical_group = id;
+                }
+                // Store owned copy of key
+                const owned_key = self.allocator.alloc(u8, key.items.len) catch {
+                    i = group_start + group_size;
+                    continue;
+                };
+                @memcpy(owned_key, key.items);
+                group_map.put(self.allocator, owned_key, id) catch {};
+            }
+
+            i = group_start + group_size;
+        }
+    }
+
+    /// Build a canonical byte key for a rec group that captures its full structure.
+    fn buildRecGroupKey(self: *Parser, key: *std.ArrayListUnmanaged(u8), module: *Mod.Module, group_start: u32, group_size: u32) void {
+        const alloc = self.allocator;
+        const meta_items = module.type_meta.items;
+        const types_items = module.module_types.items;
+
+        for (0..group_size) |pos| {
+            const type_idx = group_start + @as(u32, @intCast(pos));
+            if (type_idx >= meta_items.len) break;
+            const tmeta = meta_items[type_idx];
+
+            // Kind byte
+            key.append(alloc, @intFromEnum(tmeta.kind)) catch {};
+
+            // Finality (part of type identity in the GC spec)
+            key.append(alloc, if (tmeta.is_final) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
+
+            // Parent reference (canonicalized)
+            if (tmeta.parent == std.math.maxInt(u32)) {
+                // No parent
+                key.appendSlice(alloc, &[_]u8{ 0xFF, 0xFF, 0xFF, 0xFF }) catch {};
+            } else if (tmeta.parent >= group_start and tmeta.parent < group_start + group_size) {
+                // Internal parent reference — encode by position within rec group
+                key.append(alloc, 0x01) catch {};
+                const parent_pos: u32 = tmeta.parent - group_start;
+                key.appendSlice(alloc, std.mem.asBytes(&parent_pos)) catch {};
+            } else if (tmeta.parent < meta_items.len) {
+                // External parent reference — encode by canonical group + position
+                key.append(alloc, 0x02) catch {};
+                const parent_meta = meta_items[tmeta.parent];
+                key.appendSlice(alloc, std.mem.asBytes(&parent_meta.canonical_group)) catch {};
+                key.appendSlice(alloc, std.mem.asBytes(&parent_meta.rec_position)) catch {};
+            }
+
+            // Structural content
+            if (type_idx >= types_items.len) continue;
+            switch (types_items[type_idx]) {
+                .func_type => |ft| {
+                    key.append(alloc, 0x10) catch {};
+                    const plen: u32 = @intCast(ft.params.len);
+                    key.appendSlice(alloc, std.mem.asBytes(&plen)) catch {};
+                    const rlen: u32 = @intCast(ft.results.len);
+                    key.appendSlice(alloc, std.mem.asBytes(&rlen)) catch {};
+                    // Encode each param/result type with canonicalized type refs
+                    var ref_idx: usize = 0;
+                    for (ft.params) |p| {
+                        ref_idx = appendCanonicalValType(alloc, key, p, tmeta.type_refs, ref_idx, meta_items, group_start, group_size);
+                    }
+                    for (ft.results) |r| {
+                        ref_idx = appendCanonicalValType(alloc, key, r, tmeta.type_refs, ref_idx, meta_items, group_start, group_size);
+                    }
+                },
+                .struct_type => |st| {
+                    key.append(alloc, 0x20) catch {};
+                    const flen: u32 = @intCast(st.fields.items.len);
+                    key.appendSlice(alloc, std.mem.asBytes(&flen)) catch {};
+                    var ref_idx: usize = 0;
+                    for (st.fields.items) |field| {
+                        key.append(alloc, if (field.mutable) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
+                        ref_idx = appendCanonicalValType(alloc, key, field.@"type", tmeta.type_refs, ref_idx, meta_items, group_start, group_size);
+                    }
+                },
+                .array_type => |at| {
+                    key.append(alloc, 0x30) catch {};
+                    key.append(alloc, if (at.field.mutable) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
+                    _ = appendCanonicalValType(alloc, key, at.field.@"type", tmeta.type_refs, 0, meta_items, group_start, group_size);
+                },
+            }
+        }
+    }
+
+    /// Append a canonicalized ValType to the key buffer. For concrete type refs (.ref/.ref_null),
+    /// uses the type_refs to resolve the index and canonicalize as internal/external reference.
+    fn appendCanonicalValType(
+        alloc: std.mem.Allocator,
+        key: *std.ArrayListUnmanaged(u8),
+        vt: types.ValType,
+        type_refs: []const u32,
+        ref_idx: usize,
+        meta_items: []const Mod.TypeMeta,
+        group_start: u32,
+        group_size: u32,
+    ) usize {
+        if ((vt == .ref or vt == .ref_null) and ref_idx < type_refs.len) {
+            const target_idx = type_refs[ref_idx];
+            key.append(alloc, if (vt == .ref) @as(u8, 0xA0) else @as(u8, 0xA1)) catch {};
+            if (target_idx >= group_start and target_idx < group_start + group_size) {
+                // Internal reference — encode by position within rec group
+                key.append(alloc, 0x01) catch {};
+                const target_pos: u32 = target_idx - group_start;
+                key.appendSlice(alloc, std.mem.asBytes(&target_pos)) catch {};
+            } else if (target_idx < meta_items.len) {
+                // External reference — encode by canonical group + position
+                key.append(alloc, 0x02) catch {};
+                const target_meta = meta_items[target_idx];
+                key.appendSlice(alloc, std.mem.asBytes(&target_meta.canonical_group)) catch {};
+                key.appendSlice(alloc, std.mem.asBytes(&target_meta.rec_position)) catch {};
+            }
+            return ref_idx + 1;
+        }
+        // Non-reference type — encode the ValType directly
+        const val: i32 = @intFromEnum(vt);
+        key.appendSlice(alloc, std.mem.asBytes(&val)) catch {};
+        return ref_idx;
     }
 
     fn parseFunc(self: *Parser, module: *Mod.Module) ParseError!void {
