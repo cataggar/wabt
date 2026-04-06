@@ -2224,13 +2224,13 @@ const Parser = struct {
         const fmt = fmt_tok.text;
         if (std.mem.eql(u8, fmt, "i8x16")) {
             for (0..16) |_| {
-                const v = self.parseU32() catch 0;
-                code.append(self.allocator, @truncate(v)) catch {};
+                const v = self.parseI32() catch 0;
+                code.append(self.allocator, @truncate(@as(u32, @bitCast(v)))) catch {};
             }
         } else if (std.mem.eql(u8, fmt, "i16x8")) {
             for (0..8) |_| {
-                const v = self.parseU32() catch 0;
-                const val: u16 = @truncate(v);
+                const v = self.parseI32() catch 0;
+                const val: u16 = @truncate(@as(u32, @bitCast(v)));
                 code.appendSlice(self.allocator, std.mem.asBytes(&std.mem.nativeToLittle(u16, val))) catch {};
             }
         } else if (std.mem.eql(u8, fmt, "i32x4")) {
