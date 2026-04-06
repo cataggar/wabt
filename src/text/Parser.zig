@@ -1208,11 +1208,11 @@ const Parser = struct {
             },
             .kw_memory_size => {
                 code.append(self.allocator, 0x3f) catch return;
-                code.append(self.allocator, 0x00) catch return;
+                self.emitMemIdxImm(code);
             },
             .kw_memory_grow => {
                 code.append(self.allocator, 0x40) catch return;
-                code.append(self.allocator, 0x00) catch return;
+                self.emitMemIdxImm(code);
             },
             .kw_i32_const => {
                 code.append(self.allocator, 0x41) catch return;
@@ -1561,8 +1561,9 @@ const Parser = struct {
         if (opcode) |op| {
             if (op <= 0xff) {
                 code.append(self.allocator, @truncate(op)) catch return;
-                // Memory load/store instructions have memarg (align, offset)
+                // Memory load/store instructions: emit mem_idx + memarg
                 if (op >= 0x28 and op <= 0x3e) {
+                    self.emitMemIdx(code);
                     self.emitMemarg(code, @truncate(op));
                 }
                 // table.get / table.set need a table index immediate
@@ -1589,6 +1590,25 @@ const Parser = struct {
             // Unrecognized opcode text — flag as malformed
             self.malformed = true;
         }
+    }
+
+    /// Emit an optional memory index for load/store instructions.
+    /// Checks if the next token is a $name matching a known memory.
+    fn emitMemIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.peek().kind == .identifier) {
+            if (self.memory_names.get(self.peek().text)) |idx| {
+                _ = self.advance();
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+        }
+        self.emitLeb128U32(code, 0);
+    }
+
+    /// Emit memory index immediate for memory.size/memory.grow.
+    /// Same as emitMemIdx — resolves $name or emits 0.
+    fn emitMemIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitMemIdx(code);
     }
 
     fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
@@ -2503,8 +2523,18 @@ const Parser = struct {
                 try self.expect(.r_paren);
                 has_offset = true;
             } else if (inner_kind == .kw_memory) {
-                // (memory $m) — skip
-                try self.skipSExpr();
+                // (memory $m) — resolve memory index
+                _ = self.advance(); // consume 'memory'
+                if (self.peek().kind == .identifier) {
+                    const mtok = self.advance();
+                    if (self.memory_names.get(mtok.text)) |idx| {
+                        seg.memory_var = .{ .index = idx };
+                    }
+                } else if (self.peek().kind == .integer) {
+                    const mtok = self.advance();
+                    const idx = std.fmt.parseInt(u32, mtok.text, 0) catch 0;
+                    seg.memory_var = .{ .index = idx };
+                }
                 try self.expect(.r_paren);
             } else if (!has_offset) {
                 // First non-offset/memory parenthesized expr is the offset expression

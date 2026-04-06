@@ -303,7 +303,7 @@ test "interpreter memory store and load" {
     defer instance.deinit();
 
     // Verify memory was allocated (1 page = 65536 bytes)
-    try std.testing.expectEqual(@as(usize, 65536), instance.memory.items.len);
+    try std.testing.expectEqual(@as(usize, 65536), instance.memories.items[0].items.len);
 
     var interp = Interp.Interpreter.init(allocator, &instance);
     defer interp.deinit();
@@ -311,11 +311,11 @@ test "interpreter memory store and load" {
     // Store 0xDEADBEEF at address 0, offset 100
     try interp.i32Const(0); // base address
     try interp.i32Const(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))));
-    try interp.i32Store(100); // offset=100
+    try interp.i32Store(0, 100); // mem_idx=0, offset=100
 
     // Load it back
     try interp.i32Const(0); // base address
-    try interp.i32Load(100); // offset=100
+    try interp.i32Load(0, 100); // mem_idx=0, offset=100
     const loaded = try interp.popI32();
     try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))), loaded);
 }
