@@ -621,7 +621,15 @@ const Parser = struct {
                         break;
                     }
                 }
-                self.skipToRParen(); // skip remaining struct content
+                // Skip any remaining unparsed struct content
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    if (self.peek().kind == .l_paren) {
+                        _ = self.advance();
+                        self.skipToRParen();
+                    } else {
+                        _ = self.advance();
+                    }
+                }
                 try self.expect(.r_paren); // close struct
                 if (meta.is_sub) try self.expect(.r_paren);
                 try module.module_types.append(self.allocator, .{
