@@ -279,6 +279,15 @@ pub const Custom = struct {
     data: []const u8 = &.{},
 };
 
+/// Per-type metadata for GC subtyping validation.
+pub const TypeMeta = struct {
+    kind: Kind = .func,
+    is_sub: bool = false,
+    is_final: bool = true,
+    parent: u32 = std.math.maxInt(u32),
+    pub const Kind = enum { func, struct_, array };
+};
+
 // ── Module ───────────────────────────────────────────────────────────────
 
 /// A parsed WebAssembly module — the main IR container.
@@ -289,6 +298,8 @@ pub const Module = struct {
 
     // Type section
     module_types: std.ArrayListUnmanaged(TypeEntry) = .{},
+    /// Per-type metadata for GC subtyping validation.
+    type_meta: std.ArrayListUnmanaged(TypeMeta) = .{},
 
     // Entity lists
     funcs: std.ArrayListUnmanaged(Func) = .{},
@@ -334,6 +345,7 @@ pub const Module = struct {
             }
         }
         self.module_types.deinit(self.allocator);
+        self.type_meta.deinit(self.allocator);
         for (self.funcs.items) |*func| {
             func.local_types.deinit(self.allocator);
             if (func.owns_code_bytes and func.code_bytes.len > 0) {

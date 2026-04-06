@@ -524,22 +524,54 @@ const Parser = struct {
             self.type_names.put(self.allocator, name, @intCast(module.module_types.items.len)) catch {};
         }
         try self.expect(.l_paren);
-        // The inner form may be func, struct, or array (GC proposal) — skip non-func
+
+        // Check for (sub ...) wrapper
+        var meta = Mod.TypeMeta{};
+        if (std.mem.eql(u8, self.peek().text, "sub")) {
+            _ = self.advance(); // consume 'sub'
+            meta.is_sub = true;
+            meta.is_final = false; // sub types are non-final by default
+            // Check for 'final' modifier
+            if (std.mem.eql(u8, self.peek().text, "final")) {
+                _ = self.advance();
+                meta.is_final = true;
+            }
+            // Check for parent type reference ($name or index)
+            if (self.peek().kind == .identifier) {
+                const parent_name = self.advance().text;
+                if (self.type_names.get(parent_name)) |idx| {
+                    meta.parent = idx;
+                }
+            } else if (self.peek().kind == .integer) {
+                meta.parent = self.parseU32() catch std.math.maxInt(u32);
+            }
+            // Next should be '(' for the actual type definition
+            try self.expect(.l_paren);
+        }
+
+        // Parse the inner type: func, struct, or array
+        const inner_text = self.peek().text;
         if (self.peek().kind == .kw_func) {
+            meta.kind = .func;
             _ = self.advance();
             const sig = try self.parseFuncSig(module);
             try self.expect(.r_paren);
+            if (meta.is_sub) try self.expect(.r_paren); // close (sub ...)
             try module.module_types.append(self.allocator, .{
                 .func_type = .{ .params = sig.params, .results = sig.results },
             });
         } else {
-            // GC composite type (struct, array, sub, etc.) — scan for type references
+            if (std.mem.eql(u8, inner_text, "struct")) meta.kind = .struct_
+            else if (std.mem.eql(u8, inner_text, "array")) meta.kind = .array;
+            // GC composite type — scan for type references
             self.scanGcTypeRefs();
             try self.expect(.r_paren);
+            if (meta.is_sub) try self.expect(.r_paren); // close (sub ...)
             try module.module_types.append(self.allocator, .{
                 .func_type = .{},
             });
         }
+        try module.type_meta.append(self.allocator, meta);
     }
 
     /// Scan a GC composite type body for type reference validation and duplicate field names.

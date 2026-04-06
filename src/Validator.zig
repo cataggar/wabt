@@ -70,6 +70,18 @@ fn checkTypes(m: *const Mod.Module) Error!void {
             else => {},
         }
     }
+    // Validate GC subtype declarations
+    for (m.type_meta.items) |meta| {
+        if (meta.parent != std.math.maxInt(u32)) {
+            // Has a parent — validate subtyping
+            if (meta.parent >= m.type_meta.items.len) return error.InvalidTypeIndex;
+            const parent = m.type_meta.items[meta.parent];
+            // Parent must be non-final (declared with 'sub' and not 'final')
+            if (parent.is_final) return error.TypeMismatch;
+            // Kind must match
+            if (meta.kind != parent.kind) return error.TypeMismatch;
+        }
+    }
 }
 
 fn checkImports(m: *const Mod.Module) Error!void {

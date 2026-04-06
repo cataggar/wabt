@@ -1615,8 +1615,7 @@ fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Inter
             const tok = nextToken(sexpr, &i) orelse return null;
             var clean_buf: [64]u8 = undefined;
             const clean = stripWatUnderscores(tok, &clean_buf);
-            // Try integer first (some tests use integer representation for f32)
-            const bits: u32 = if (std.fmt.parseInt(u32, clean, 0)) |u| u else |_| Parser.parseFloatBits(f32, clean);
+            const bits = Parser.parseFloatBits(f32, clean);
             const b: [4]u8 = @bitCast(bits);
             @memcpy(bytes[idx * 4 ..][0..4], &b);
         }
