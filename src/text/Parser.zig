@@ -284,6 +284,8 @@ const Parser = struct {
     malformed: bool = false,
     /// True when parsing inside a (rec ...) group (forward type refs allowed).
     in_rec: bool = false,
+    /// Upper bound type index for the current rec group.
+    rec_end: u32 = 0,
     /// Map from function $name to index (for name resolution in call instructions).
     func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from type $name to index (for name resolution).
@@ -417,16 +419,23 @@ const Parser = struct {
                             try self.expect(.r_paren);
                             return if (nullable) .ref_null else .ref;
                         };
-                        if (!self.in_rec) {
+                        if (self.in_rec) {
+                            // Within rec group, allow refs within the group but not beyond
+                            if (idx >= self.rec_end) self.malformed = true;
+                        } else {
                             if (self.module) |mod| {
                                 if (idx >= mod.module_types.items.len) self.malformed = true;
                             }
                         }
-                    } else if (ht.kind == .identifier and !self.in_rec) {
-                        // Validate named type references are defined (forward refs only allowed in rec)
+                    } else if (ht.kind == .identifier) {
+                        // Validate named type references
                         if (self.type_names.get(ht.text)) |idx| {
-                            if (self.module) |mod| {
-                                if (idx >= mod.module_types.items.len) self.malformed = true;
+                            if (self.in_rec) {
+                                if (idx >= self.rec_end) self.malformed = true;
+                            } else {
+                                if (self.module) |mod| {
+                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                }
                             }
                         }
                     }
@@ -547,15 +556,21 @@ const Parser = struct {
                                 self.malformed = true;
                                 continue;
                             };
-                            if (!self.in_rec) {
+                            if (self.in_rec) {
+                                if (idx >= self.rec_end) self.malformed = true;
+                            } else {
                                 if (self.module) |mod| {
                                     if (idx >= mod.module_types.items.len) self.malformed = true;
                                 }
                             }
-                        } else if (ht.kind == .identifier and !self.in_rec) {
+                        } else if (ht.kind == .identifier) {
                             if (self.type_names.get(ht.text)) |idx| {
-                                if (self.module) |mod| {
-                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                if (self.in_rec) {
+                                    if (idx >= self.rec_end) self.malformed = true;
+                                } else {
+                                    if (self.module) |mod| {
+                                        if (idx >= mod.module_types.items.len) self.malformed = true;
+                                    }
                                 }
                             }
                         }
@@ -589,8 +604,26 @@ const Parser = struct {
 
     fn parseRec(self: *Parser, module: *Mod.Module) ParseError!void {
         // (rec (type ...) (type ...) ...)
+        // Pre-count types to determine the rec group boundary.
+        const save_pos = self.lexer.pos;
+        const save_peeked = self.peeked;
+        var rec_count: u32 = 0;
+        while (self.peek().kind == .l_paren) {
+            _ = self.advance();
+            if (self.peek().kind == .kw_type) rec_count += 1;
+            self.skipSExpr() catch {};
+            if (self.peek().kind == .r_paren) _ = self.advance();
+        }
+        self.lexer.pos = save_pos;
+        self.peeked = save_peeked;
+
+        const rec_start: u32 = @intCast(module.module_types.items.len);
         self.in_rec = true;
-        defer self.in_rec = false;
+        self.rec_end = rec_start + rec_count;
+        defer {
+            self.in_rec = false;
+            self.rec_end = 0;
+        }
         while (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_type) {
