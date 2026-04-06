@@ -410,8 +410,10 @@ const Parser = struct {
                     nullable = true;
                 }
                 // Parse heap type (could be $id, keyword like func/extern/any, or index)
+                var heap_text: []const u8 = "";
                 if (self.peek().kind != .r_paren) {
                     const ht = self.advance();
+                    heap_text = ht.text;
                     // Validate type index if it's a number
                     if (ht.kind == .integer) {
                         const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
@@ -441,6 +443,12 @@ const Parser = struct {
                     }
                 }
                 try self.expect(.r_paren);
+                // Canonicalize: (ref null func) → funcref, (ref null extern) → externref
+                if (nullable and heap_text.len > 0) {
+                    if (std.mem.eql(u8, heap_text, "func")) return .funcref;
+                    if (std.mem.eql(u8, heap_text, "extern")) return .externref;
+                    if (std.mem.eql(u8, heap_text, "any")) return .anyref;
+                }
                 return if (nullable) .ref_null else .ref;
             }
             // Not a ref type — restore state
