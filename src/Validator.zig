@@ -425,6 +425,22 @@ fn resolveSig(m: *const Mod.Module, decl: Mod.FuncDeclaration) struct { params: 
 
 const ValStack = std.ArrayListUnmanaged(ValTypeOrUnknown);
 
+/// Pack local initialization state into a compact bitset (up to 256 locals).
+fn packInitState(local_inited: []const bool) [4]u64 {
+    var bits: [4]u64 = .{ 0, 0, 0, 0 };
+    for (local_inited, 0..) |v, i| {
+        if (v) bits[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+    }
+    return bits;
+}
+
+/// Restore local initialization state from a packed bitset.
+fn unpackInitState(bits: [4]u64, local_inited: []bool) void {
+    for (local_inited, 0..) |*v, i| {
+        v.* = (bits[i / 64] >> @intCast(i % 64)) & 1 != 0;
+    }
+}
+
 const ValTypeOrUnknown = enum(i32) {
     i32 = @intFromEnum(types.ValType.i32),
     i64 = @intFromEnum(types.ValType.i64),
@@ -461,6 +477,10 @@ const ValTypeOrUnknown = enum(i32) {
         };
     }
 
+    fn isNonNullableRef(self: ValTypeOrUnknown) bool {
+        return self == .ref;
+    }
+
     fn matches(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == .unknown or other == .unknown) return true;
         return self == other;
@@ -474,6 +494,8 @@ const CtrlFrame = struct {
     height: usize,
     unreachable_flag: bool,
     else_seen: bool,
+    // Local initialization state at frame entry (for conservative merge at join points)
+    saved_init: [4]u64 = .{ 0, 0, 0, 0 },
 };
 
 fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const std.AutoHashMapUnmanaged(u32, void)) Error!void {
@@ -489,6 +511,13 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
         for (func.local_types.items, 0..) |lt, i| local_types_buf[num_params + i] = ValTypeOrUnknown.fromValType(lt);
         local_types = local_types_buf[0..num_locals];
     }
+
+    // Track initialization of non-nullable ref locals (params are always initialized)
+    var local_inited_buf: [256]bool = undefined;
+    for (0..@min(num_locals, 256)) |i| {
+        local_inited_buf[i] = if (i < num_params) true else !local_types_buf[i].isNonNullableRef();
+    }
+    const local_inited: []bool = if (num_locals <= 256) local_inited_buf[0..num_locals] else &.{};
 
     var val_stack: ValStack = .{};
     defer val_stack.deinit(gpa(m));
@@ -537,6 +566,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (bt.params.len > 0)
                     try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x04, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                // Save init state at if entry for conservative merge
+                ctrl_stack.items[ctrl_stack.items.len - 1].saved_init = packInitState(local_inited);
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x05 => { // else
@@ -547,6 +578,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (val_stack.items.len != frame.height) return error.TypeMismatch;
                 frame.unreachable_flag = false;
                 frame.else_seen = true;
+                // Restore init state from if entry (else branch didn't execute then)
+                unpackInitState(frame.saved_init, local_inited);
                 pushVals(&val_stack, frame.start_types, gpa(m)) catch return error.OutOfMemory;
             },
             0x0b => { // end
@@ -559,6 +592,10 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     // Check if start_types match end_types (if with no else must have matching in/out)
                     if (!std.mem.eql(types.ValType, frame.start_types, frame.end_types))
                         return error.TypeMismatch;
+                }
+                // Restore init state from frame entry (conservative merge)
+                if (frame.opcode == 0x04 or frame.opcode == 0x02) {
+                    unpackInitState(frame.saved_init, local_inited);
                 }
                 _ = ctrl_stack.pop();
                 pushVals(&val_stack, frame.end_types, gpa(m)) catch return error.OutOfMemory;
@@ -667,6 +704,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const idx = readU32(bytes, &pos);
                 if (idx >= num_locals) return error.InvalidLocalIndex;
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
+                // Non-nullable ref locals must be initialized before use
+                if (idx < local_inited.len and !local_inited[idx]) return error.TypeMismatch;
                 val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
             },
             0x21 => { // local.set
@@ -674,6 +713,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (idx >= num_locals) return error.InvalidLocalIndex;
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
                 try popExpect(&val_stack, &ctrl_stack, lt);
+                if (idx < local_inited.len) local_inited[idx] = true;
             },
             0x22 => { // local.tee
                 const idx = readU32(bytes, &pos);
@@ -681,6 +721,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
                 try popExpect(&val_stack, &ctrl_stack, lt);
                 val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
+                if (idx < local_inited.len) local_inited[idx] = true;
             },
             0x23 => { // global.get
                 const idx = readU32(bytes, &pos);

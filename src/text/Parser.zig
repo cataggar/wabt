@@ -513,12 +513,77 @@ const Parser = struct {
                 .func_type = .{ .params = sig.params, .results = sig.results },
             });
         } else {
-            // GC composite type (struct, array, sub, etc.) — skip for now
-            try self.skipSExpr();
+            // GC composite type (struct, array, sub, etc.) — scan for type references
+            self.scanGcTypeRefs();
             try self.expect(.r_paren);
             try module.module_types.append(self.allocator, .{
                 .func_type = .{},
             });
+        }
+    }
+
+    /// Scan a GC composite type body for type reference validation and duplicate field names.
+    /// Consumes tokens up to (but not including) the closing ')' of the type form.
+    fn scanGcTypeRefs(self: *Parser) void {
+        const first = self.advance(); // consume struct/array/sub keyword
+        const is_struct = std.mem.eql(u8, first.text, "struct");
+        var field_names: [64][]const u8 = undefined;
+        var field_count: usize = 0;
+        // Scan nested s-expressions for (ref N) patterns
+        var depth: u32 = 0;
+        while (self.peek().kind != .eof) {
+            const tok = self.peek();
+            if (tok.kind == .l_paren) {
+                _ = self.advance();
+                depth += 1;
+                // Check for (ref ...) or (ref null ...)
+                if (self.peek().kind == .kw_ref or self.peek().kind == .kw_ref_null) {
+                    _ = self.advance(); // consume ref/ref_null
+                    if (self.peek().kind == .kw_null) _ = self.advance(); // consume null
+                    if (self.peek().kind != .r_paren) {
+                        const ht = self.advance();
+                        if (ht.kind == .integer) {
+                            const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
+                                self.malformed = true;
+                                continue;
+                            };
+                            if (!self.in_rec) {
+                                if (self.module) |mod| {
+                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                }
+                            }
+                        } else if (ht.kind == .identifier and !self.in_rec) {
+                            if (self.type_names.get(ht.text)) |idx| {
+                                if (self.module) |mod| {
+                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                }
+                            }
+                        }
+                    }
+                } else if (is_struct and std.mem.eql(u8, self.peek().text, "field")) {
+                    _ = self.advance(); // consume 'field'
+                    // Check for named field: (field $name ...)
+                    if (self.peek().kind == .identifier) {
+                        const fname = self.advance().text;
+                        if (field_count < field_names.len) {
+                            for (field_names[0..field_count]) |existing| {
+                                if (std.mem.eql(u8, fname, existing)) {
+                                    self.malformed = true;
+                                    break;
+                                }
+                            }
+                            field_names[field_count] = fname;
+                            field_count += 1;
+                        }
+                    }
+                }
+            } else if (tok.kind == .r_paren) {
+                if (depth == 0) break;
+                _ = self.advance();
+                depth -= 1;
+            } else {
+                _ = self.advance();
+            }
         }
     }
 
