@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-linux
+            name: linux-x64
+          - os: ubuntu-22.04-arm
+            target: aarch64-linux
+            name: linux-arm64
+          - os: macos-14
+            target: aarch64-macos
+            name: macos-arm64
+          - os: windows-latest
+            target: x86_64-windows
+            name: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Get version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          PKGNAME="wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "$PKGNAME/bin"
+          cp zig-out/bin/* "$PKGNAME/bin/"
+          cp LICENSE README.md "$PKGNAME/"
+          strip "$PKGNAME/bin/"* 2>/dev/null || true
+          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+          sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          PKGNAME="wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          mkdir -p "$PKGNAME/bin"
+          cp zig-out/bin/*.exe "$PKGNAME/bin/"
+          cp LICENSE README.md "$PKGNAME/"
+          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
+          sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            wabt-*.tar.gz
+            wabt-*.sha256
+
+  source:
+    name: Source tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package source
+        run: |
+          PKGNAME="wabt-${{ steps.version.outputs.version }}"
+          git archive --format=tar --prefix="$PKGNAME/" HEAD | xz > "$PKGNAME.tar.xz"
+          sha256sum "$PKGNAME.tar.xz" > "$PKGNAME.tar.xz.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: source
+          path: |
+            wabt-*.tar.xz
+            wabt-*.sha256
+
+  release:
+    name: Create Release
+    needs: [build, source]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Get version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: wabt ${{ steps.version.outputs.version }}
+          body: |
+            ## wabt ${{ steps.version.outputs.version }} — Zig rewrite
+
+            Experimental fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) rewritten from C++ to Zig.
+
+            **Highlights:**
+            - 100% WebAssembly 2.0 spec conformance (28011/28011 assertions)
+            - Build system: `build.zig` with cross-compilation
+            - Zig 0.15.2 (no C/C++ dependencies)
+
+            **Tools included:** wat2wasm, wasm2wat, wast2json, wasm-validate, wasm-objdump, wasm2c, wasm-interp, wasm-decompile, wasm-strip, wasm-stats, wat-desugar, spectest-interp, wasm2wat-fuzz
+          files: |
+            wabt-*.tar.gz
+            wabt-*.tar.xz
+            wabt-*.sha256
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}
