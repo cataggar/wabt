@@ -99,6 +99,9 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
     for (m.tables.items) |table| {
         if (!table.type.elem_type.isRefType())
             return error.InvalidElemType;
+        // Non-nullable ref types (ref func, ref extern, ref $t) require init expr
+        if (table.type.elem_type == .ref)
+            return error.TypeMismatch;
         try checkLimits(table.type.limits, std.math.maxInt(u32));
     }
 }
