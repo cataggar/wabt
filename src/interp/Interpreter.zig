@@ -2254,21 +2254,30 @@ pub const Interpreter = struct {
                     if (func_idx >= target_interp.instance.module.funcs.items.len) return error.UndefinedElement;
                     const target = target_interp.instance.module.funcs.items[func_idx];
                     const func_sig = target_interp.resolveSig(target.decl);
-                    // Verify type matches: structural signature + rec group compatibility
+                    // Verify type matches: nominal matching with subtype chain for GC types
                     if (type_idx < self.instance.module.module_types.items.len) {
-                        switch (self.instance.module.module_types.items[type_idx]) {
-                            .func_type => |expected| {
-                                const params_match = std.mem.eql(types.ValType, func_sig.params, expected.params);
-                                const results_match = std.mem.eql(types.ValType, func_sig.results, expected.results);
-                                if (!params_match or !results_match) {
-                                    return error.IndirectCallTypeMismatch;
-                                }
-                                // Check rec group compatibility (GC proposal)
-                                if (!self.recGroupsMatch(type_idx, target.decl.type_var.index, target_interp)) {
-                                    return error.IndirectCallTypeMismatch;
-                                }
-                            },
-                            else => {},
+                        const actual_type_idx = target.decl.type_var.index;
+                        // Check if types use GC sub declarations (nominal matching needed)
+                        if (self.hasSubTypeInfo(type_idx) or target_interp.hasSubTypeInfo(actual_type_idx)) {
+                            // Nominal matching: walk the actual type's parent chain
+                            if (!self.isSubtypeOf(actual_type_idx, type_idx, target_interp)) {
+                                return error.IndirectCallTypeMismatch;
+                            }
+                        } else {
+                            // Structural matching (legacy/non-GC)
+                            switch (self.instance.module.module_types.items[type_idx]) {
+                                .func_type => |expected| {
+                                    const params_match = std.mem.eql(types.ValType, func_sig.params, expected.params);
+                                    const results_match = std.mem.eql(types.ValType, func_sig.results, expected.results);
+                                    if (!params_match or !results_match) {
+                                        return error.IndirectCallTypeMismatch;
+                                    }
+                                    if (!self.recGroupsMatch(type_idx, actual_type_idx, target_interp)) {
+                                        return error.IndirectCallTypeMismatch;
+                                    }
+                                },
+                                else => {},
+                            }
                         }
                     }
                     var call_args = self.allocator.alloc(Value, func_sig.params.len) catch return error.OutOfMemory;
@@ -2583,6 +2592,45 @@ pub const Interpreter = struct {
             pc.* += 16;
             try self.pushValue(.{ .v128 = @bitCast(bytes) });
         } else return error.Unimplemented;
+    }
+
+    /// Check if a type index has GC sub-type metadata.
+    fn hasSubTypeInfo(self: *const Interpreter, type_idx: u32) bool {
+        if (type_idx >= self.instance.module.type_meta.items.len) return false;
+        return self.instance.module.type_meta.items[type_idx].is_sub or
+            self.instance.module.type_meta.items[type_idx].parent != std.math.maxInt(u32);
+    }
+
+    /// Check if actual_type is a subtype of (or equal to) expected_type.
+    /// Walks the actual type's parent chain looking for the expected type.
+    /// Both types must be in the same module (or structurally compared for cross-module).
+    fn isSubtypeOf(self: *const Interpreter, actual_idx: u32, expected_idx: u32, target: *const Interpreter) bool {
+        const exp_mod = self.instance.module;
+        const act_mod = target.instance.module;
+        // Same module — compare by index and walk parent chain
+        if (exp_mod == act_mod) {
+            var current = actual_idx;
+            var depth: u32 = 0;
+            while (depth < 32) : (depth += 1) {
+                if (current == expected_idx) return true;
+                if (current >= exp_mod.type_meta.items.len) break;
+                const parent = exp_mod.type_meta.items[current].parent;
+                if (parent == std.math.maxInt(u32)) break;
+                current = parent;
+            }
+            return false;
+        }
+        // Cross-module — need structural + rec group comparison at each step
+        var current = actual_idx;
+        var depth: u32 = 0;
+        while (depth < 32) : (depth += 1) {
+            if (self.recGroupsMatch(expected_idx, current, target)) return true;
+            if (current >= act_mod.type_meta.items.len) break;
+            const parent = act_mod.type_meta.items[current].parent;
+            if (parent == std.math.maxInt(u32)) break;
+            current = parent;
+        }
+        return false;
     }
 
     /// Check if two type indices have compatible rec group structures.
