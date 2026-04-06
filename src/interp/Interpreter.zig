@@ -2674,7 +2674,8 @@ pub const Interpreter = struct {
 
     /// Check if two types are iso-recursively equivalent using canonical group IDs.
     fn typesEquivalent(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.Module, idx_b: u32) bool {
-        if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len) return false;
+        // Types without metadata (e.g., inline func types) match by signature alone
+        if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len) return true;
         const meta_a = mod_a.type_meta.items[idx_a];
         const meta_b = mod_b.type_meta.items[idx_b];
         // Both must have valid canonical groups
