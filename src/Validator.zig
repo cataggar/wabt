@@ -598,18 +598,17 @@ const ValTypeOrUnknown = enum(i32) {
     fn isSubtypeOf(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == other) return true;
         if (self == .unknown or other == .unknown) return true;
-        // Nullable bottom types are subtypes of their top types
-        // Non-nullable bottom types are subtypes of their top types
+        // GC type hierarchy (three SEPARATE hierarchies):
+        // Internal: any > eq > struct/array/i31 > none
+        // Function: func > nofunc (NOT under any)
+        // External: extern > noextern (NOT under any)
         return switch (self) {
-            .nullfuncref => other == .funcref or other == .anyref,
+            .nullfuncref => other == .funcref,
             .nullexternref => other == .externref,
             .nullref => other == .anyref,
-            .funcref => other == .anyref,
-            .ref_nofunc => other == .ref_func or other == .ref_any or other == .funcref or other == .anyref,
-            .ref_noextern => other == .ref_extern or other == .externref,
-            .ref_none => other == .ref_any or other == .anyref,
-            .ref_func => other == .ref_any or other == .anyref or other == .funcref,
-            .ref_extern => other == .externref,
+            .ref_nofunc => other == .ref_func,
+            .ref_noextern => other == .ref_extern,
+            .ref_none => other == .ref_any,
             else => false,
         };
     }
