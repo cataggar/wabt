@@ -96,6 +96,66 @@ fn checkTypes(m: *const Mod.Module) Error!void {
                     else => {},
                 }
             }
+            // Structural check for array types: element types must be compatible
+            if (meta.kind == .array and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .array_type => |child_at| switch (m.module_types.items[meta.parent]) {
+                        .array_type => |parent_at| {
+                            // Mutable fields must have exact same type; immutable: child <: parent
+                            if (child_at.field.mutable != parent_at.field.mutable)
+                                return error.TypeMismatch;
+                            if (child_at.field.mutable) {
+                                // Mutable: types must be exactly equal
+                                if (child_at.field.@"type" != parent_at.field.@"type")
+                                    return error.TypeMismatch;
+                            } else {
+                                // Immutable: child element type must be subtype of parent
+                                if (child_at.field.@"type" != parent_at.field.@"type") {
+                                    // Check basic subtyping
+                                    const cv = ValTypeOrUnknown.fromValType(child_at.field.@"type");
+                                    const pv = ValTypeOrUnknown.fromValType(parent_at.field.@"type");
+                                    if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
+                                }
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+            // Structural check for struct types: fields must be compatible
+            if (meta.kind == .struct_ and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .struct_type => |child_st| switch (m.module_types.items[meta.parent]) {
+                        .struct_type => |parent_st| {
+                            // Child must have at least as many fields as parent
+                            if (child_st.fields.items.len < parent_st.fields.items.len)
+                                return error.TypeMismatch;
+                            // Each parent field must be compatible with corresponding child field
+                            for (parent_st.fields.items, 0..) |pf, fi| {
+                                if (fi >= child_st.fields.items.len) break;
+                                const cf = child_st.fields.items[fi];
+                                if (cf.mutable != pf.mutable) return error.TypeMismatch;
+                                if (cf.mutable) {
+                                    if (cf.@"type" != pf.@"type") return error.TypeMismatch;
+                                } else {
+                                    if (cf.@"type" != pf.@"type") {
+                                        const cv = ValTypeOrUnknown.fromValType(cf.@"type");
+                                        const pv = ValTypeOrUnknown.fromValType(pf.@"type");
+                                        if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
         }
     }
 }

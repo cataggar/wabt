@@ -561,15 +561,109 @@ const Parser = struct {
                 .func_type = .{ .params = sig.params, .results = sig.results },
             });
         } else {
-            if (std.mem.eql(u8, inner_text, "struct")) meta.kind = .struct_
-            else if (std.mem.eql(u8, inner_text, "array")) meta.kind = .array;
-            // GC composite type — scan for type references
-            self.scanGcTypeRefs();
-            try self.expect(.r_paren);
-            if (meta.is_sub) try self.expect(.r_paren); // close (sub ...)
-            try module.module_types.append(self.allocator, .{
-                .func_type = .{},
-            });
+            if (std.mem.eql(u8, inner_text, "struct")) {
+                meta.kind = .struct_;
+                _ = self.advance(); // consume 'struct'
+                // Parse struct fields: (field [$name] [mut] <valtype>) ...
+                var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .{};
+                while (self.peek().kind == .l_paren) {
+                    const sp = self.lexer.pos;
+                    const spk = self.peeked;
+                    _ = self.advance(); // consume '('
+                    if (std.mem.eql(u8, self.peek().text, "field")) {
+                        _ = self.advance(); // consume 'field'
+                        var fname: ?[]const u8 = null;
+                        if (self.peek().kind == .identifier) {
+                            fname = self.advance().text;
+                            // Duplicate field check
+                            for (fields.items) |existing| {
+                                if (existing.name) |en| {
+                                    if (fname) |fn2| {
+                                        if (std.mem.eql(u8, en, fn2)) self.malformed = true;
+                                    }
+                                }
+                            }
+                        }
+                        var fmut = false;
+                        if (self.peek().kind == .l_paren) {
+                            const sp2 = self.lexer.pos;
+                            const spk2 = self.peeked;
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_mut) {
+                                _ = self.advance();
+                                fmut = true;
+                                const ftype = self.parseValType() catch .ref_null;
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut }) catch {};
+                            } else {
+                                self.lexer.pos = sp2;
+                                self.peeked = spk2;
+                                const ftype = self.parseValType() catch .ref_null;
+                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                            }
+                        } else {
+                            const ftype = self.parseValType() catch .ref_null;
+                            fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        break;
+                    }
+                }
+                self.skipToRParen(); // skip remaining struct content
+                try self.expect(.r_paren); // close struct
+                if (meta.is_sub) try self.expect(.r_paren);
+                try module.module_types.append(self.allocator, .{
+                    .struct_type = .{ .fields = fields },
+                });
+            } else if (std.mem.eql(u8, inner_text, "array")) {
+                meta.kind = .array;
+                _ = self.advance(); // consume 'array'
+                // Parse element type: [mut] <valtype>
+                var elem_mut = false;
+                if (self.peek().kind == .l_paren) {
+                    const sp = self.lexer.pos;
+                    const spk = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_mut) {
+                        _ = self.advance();
+                        elem_mut = true;
+                        const elem_type = self.parseValType() catch .ref_null;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        try self.expect(.r_paren); // close array
+                        if (meta.is_sub) try self.expect(.r_paren);
+                        try module.module_types.append(self.allocator, .{
+                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = elem_mut } },
+                        });
+                    } else {
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        const elem_type = self.parseValType() catch .ref_null;
+                        try self.expect(.r_paren); // close array
+                        if (meta.is_sub) try self.expect(.r_paren);
+                        try module.module_types.append(self.allocator, .{
+                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false } },
+                        });
+                    }
+                } else {
+                    const elem_type = self.parseValType() catch .ref_null;
+                    try self.expect(.r_paren); // close array
+                    if (meta.is_sub) try self.expect(.r_paren);
+                    try module.module_types.append(self.allocator, .{
+                        .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false } },
+                    });
+                }
+            } else {
+                // Other GC types (sub without inner type, etc.)
+                self.scanGcTypeRefs();
+                try self.expect(.r_paren);
+                if (meta.is_sub) try self.expect(.r_paren);
+                try module.module_types.append(self.allocator, .{
+                    .func_type = .{},
+                });
+            }
         }
         try module.type_meta.append(self.allocator, meta);
     }

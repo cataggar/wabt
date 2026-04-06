@@ -341,6 +341,10 @@ pub const Module = struct {
                     if (ft.params.len > 0) self.allocator.free(ft.params);
                     if (ft.results.len > 0) self.allocator.free(ft.results);
                 },
+                .struct_type => |st| {
+                    var fields = st.fields;
+                    fields.deinit(self.allocator);
+                },
                 else => {},
             }
         }
