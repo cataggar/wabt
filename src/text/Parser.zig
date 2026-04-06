@@ -52,10 +52,15 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     const saved_pos = p.lexer.pos;
     const saved_peeked = p.peeked;
 
-    while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
+    while (p.peek().kind == .l_paren or p.peek().kind == .annotation or p.peek().kind == .invalid) {
         if (p.peek().kind == .annotation) {
             _ = p.advance();
             try p.skipAnnotation();
+            continue;
+        }
+        if (p.peek().kind == .invalid) {
+            _ = p.advance();
+            p.malformed = true;
             continue;
         }
         _ = p.advance(); // consume '('
@@ -75,11 +80,16 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     p.malformed = false; // Reset malformed flag for Pass 2
     var seen_non_import_def = false; // Track if we've seen func/global/table/memory definitions
 
-    while (p.peek().kind == .l_paren or p.peek().kind == .annotation) {
+    while (p.peek().kind == .l_paren or p.peek().kind == .annotation or p.peek().kind == .invalid) {
         // Skip annotations: (@id ...) — consume tokens until matching ')'
         if (p.peek().kind == .annotation) {
             _ = p.advance(); // consume annotation token
             try p.skipAnnotation();
+            continue;
+        }
+        if (p.peek().kind == .invalid) {
+            _ = p.advance();
+            p.malformed = true;
             continue;
         }
         _ = p.advance(); // consume '('
@@ -128,6 +138,8 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
+    // Check for unexpected trailing tokens
+    if (p.peek().kind != .eof) p.malformed = true;
     if (p.malformed or pass1_malformed) {
         return error.InvalidModule;
     }
@@ -338,6 +350,7 @@ const Parser = struct {
                 .l_paren, .annotation => depth += 1,
                 .r_paren => depth -= 1,
                 .eof => return error.InvalidModule,
+                .invalid => self.malformed = true,
                 else => {},
             }
         }

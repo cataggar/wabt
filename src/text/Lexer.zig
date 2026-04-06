@@ -148,8 +148,13 @@ pub const Lexer = struct {
                 // Check for annotation "(@id"
                 if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '@') {
                     self.pos += 2; // skip '(' and '@'
+                    const id_start = self.pos;
                     while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
                         self.pos += 1;
+                    }
+                    // Empty annotation id: (@) or (@ x) — return invalid
+                    if (self.pos == id_start) {
+                        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
                     }
                     return .{ .kind = .annotation, .text = self.source[start..self.pos], .offset = start };
                 }
