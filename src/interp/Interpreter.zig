@@ -209,34 +209,7 @@ pub const Instance = struct {
             }
         }
 
-        // Copy active data segments into memory
-        for (self.module.data_segments.items) |seg| {
-            if (seg.kind != .active) continue;
-            var offset: usize = 0;
-            if (seg.offset_expr_bytes.len > 0) {
-                const off_val = evalConstExpr(self, seg.offset_expr_bytes);
-                if (off_val) |v| {
-                    offset = switch (v) {
-                        .i32 => |x| @intCast(@as(u32, @bitCast(x))),
-                        .i64 => |x| @intCast(@as(u64, @bitCast(x))),
-                        else => 0,
-                    };
-                }
-            }
-            const mem_idx: u32 = switch (seg.memory_var) {
-                .index => |idx| idx,
-                .name => 0,
-            };
-            const mem = self.getMemory(mem_idx);
-            if (offset + seg.data.len > mem.items.len) {
-                return error.OutOfBoundsMemoryAccess;
-            }
-            if (seg.data.len > 0) {
-                @memcpy(mem.items[offset .. offset + seg.data.len], seg.data);
-            }
-        }
-
-        // Populate tables from active element segments
+        // Populate tables from active element segments (before data segments per spec)
         for (self.module.elem_segments.items) |seg| {
             if (seg.kind != .active) continue;
             const tbl_idx: u32 = switch (seg.table_var) {
@@ -326,6 +299,34 @@ pub const Instance = struct {
                 if (seg_i < self.dropped_elems.capacity()) {
                     self.dropped_elems.set(seg_i);
                 }
+            }
+        }
+
+        // Copy active data segments into memory (after elem segments per spec,
+        // so table entries persist even if data segment init traps)
+        for (self.module.data_segments.items) |seg| {
+            if (seg.kind != .active) continue;
+            var offset: usize = 0;
+            if (seg.offset_expr_bytes.len > 0) {
+                const off_val = evalConstExpr(self, seg.offset_expr_bytes);
+                if (off_val) |v| {
+                    offset = switch (v) {
+                        .i32 => |x| @intCast(@as(u32, @bitCast(x))),
+                        .i64 => |x| @intCast(@as(u64, @bitCast(x))),
+                        else => 0,
+                    };
+                }
+            }
+            const mem_idx: u32 = switch (seg.memory_var) {
+                .index => |idx| idx,
+                .name => 0,
+            };
+            const mem = self.getMemory(mem_idx);
+            if (offset + seg.data.len > mem.items.len) {
+                return error.OutOfBoundsMemoryAccess;
+            }
+            if (seg.data.len > 0) {
+                @memcpy(mem.items[offset .. offset + seg.data.len], seg.data);
             }
         }
     }
