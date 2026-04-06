@@ -1677,8 +1677,8 @@ const Parser = struct {
         // No block type annotations found
         if (param_count == 0 and result_count == 0) {
             // Fall through to check for (type N) below
-        } else if (param_count == 0 and result_count == 1) {
-            // Simple single-result block type: emit valtype byte
+        } else if (param_count == 0 and result_count == 1 and @intFromEnum(result_types_buf[0]) > 0) {
+            // Simple single-result block type: emit valtype byte (only for standard types)
             const raw: u32 = @bitCast(@intFromEnum(result_types_buf[0]));
             buf[0] = @truncate(raw);
             return 1;
