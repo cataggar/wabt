@@ -2706,6 +2706,227 @@ pub const Interpreter = struct {
                         // v128.load32_zero / v128.load64_zero (0x5c-0x5d)
                         0x5c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 4); },
                         0x5d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 8); },
+                        // f32x4.demote_f64x2_zero / f64x2.promote_low_f32x4
+                        0x5e => try self.f32x4DemoteF64x2Zero(),
+                        0x5f => try self.f64x2PromoteLowF32x4(),
+
+                        // ── i8x16 comparison (0x23-0x2c) ──
+                        0x23 => try self.simdCmpOp(u8, cmpEq(u8)),
+                        0x24 => try self.simdCmpOp(u8, cmpNe(u8)),
+                        0x25 => try self.simdCmpOp(u8, cmpLtS(u8)),
+                        0x26 => try self.simdCmpOp(u8, cmpLtU(u8)),
+                        0x27 => try self.simdCmpOp(u8, cmpGtS(u8)),
+                        0x28 => try self.simdCmpOp(u8, cmpGtU(u8)),
+                        0x29 => try self.simdCmpOp(u8, cmpLeS(u8)),
+                        0x2a => try self.simdCmpOp(u8, cmpLeU(u8)),
+                        0x2b => try self.simdCmpOp(u8, cmpGeS(u8)),
+                        0x2c => try self.simdCmpOp(u8, cmpGeU(u8)),
+                        // ── i16x8 comparison (0x2d-0x36) ──
+                        0x2d => try self.simdCmpOp(u16, cmpEq(u16)),
+                        0x2e => try self.simdCmpOp(u16, cmpNe(u16)),
+                        0x2f => try self.simdCmpOp(u16, cmpLtS(u16)),
+                        0x30 => try self.simdCmpOp(u16, cmpLtU(u16)),
+                        0x31 => try self.simdCmpOp(u16, cmpGtS(u16)),
+                        0x32 => try self.simdCmpOp(u16, cmpGtU(u16)),
+                        0x33 => try self.simdCmpOp(u16, cmpLeS(u16)),
+                        0x34 => try self.simdCmpOp(u16, cmpLeU(u16)),
+                        0x35 => try self.simdCmpOp(u16, cmpGeS(u16)),
+                        0x36 => try self.simdCmpOp(u16, cmpGeU(u16)),
+                        // ── i32x4 comparison (0x37-0x40) ──
+                        0x37 => try self.simdCmpOp(u32, cmpEq(u32)),
+                        0x38 => try self.simdCmpOp(u32, cmpNe(u32)),
+                        0x39 => try self.simdCmpOp(u32, cmpLtS(u32)),
+                        0x3a => try self.simdCmpOp(u32, cmpLtU(u32)),
+                        0x3b => try self.simdCmpOp(u32, cmpGtS(u32)),
+                        0x3c => try self.simdCmpOp(u32, cmpGtU(u32)),
+                        0x3d => try self.simdCmpOp(u32, cmpLeS(u32)),
+                        0x3e => try self.simdCmpOp(u32, cmpLeU(u32)),
+                        0x3f => try self.simdCmpOp(u32, cmpGeS(u32)),
+                        0x40 => try self.simdCmpOp(u32, cmpGeU(u32)),
+                        // ── f32x4 comparison (0x41-0x46) ──
+                        0x41 => try self.simdFloatCmpOp(f32, floatEq(f32)),
+                        0x42 => try self.simdFloatCmpOp(f32, floatNe(f32)),
+                        0x43 => try self.simdFloatCmpOp(f32, floatLt(f32)),
+                        0x44 => try self.simdFloatCmpOp(f32, floatGt(f32)),
+                        0x45 => try self.simdFloatCmpOp(f32, floatLe(f32)),
+                        0x46 => try self.simdFloatCmpOp(f32, floatGe(f32)),
+                        // ── f64x2 comparison (0x47-0x4c) ──
+                        0x47 => try self.simdFloatCmpOp(f64, floatEq(f64)),
+                        0x48 => try self.simdFloatCmpOp(f64, floatNe(f64)),
+                        0x49 => try self.simdFloatCmpOp(f64, floatLt(f64)),
+                        0x4a => try self.simdFloatCmpOp(f64, floatGt(f64)),
+                        0x4b => try self.simdFloatCmpOp(f64, floatLe(f64)),
+                        0x4c => try self.simdFloatCmpOp(f64, floatGe(f64)),
+
+                        // ── Bitwise ops (0x4d-0x53) ──
+                        0x4d => try self.simdNot(),
+                        0x4e => try self.simdAnd(),
+                        0x4f => try self.simdAndNot(),
+                        0x50 => try self.simdOr(),
+                        0x51 => try self.simdXor(),
+                        0x52 => try self.simdBitselect(),
+                        0x53 => try self.simdAnyTrue(),
+
+                        // ── i8x16 ops (0x60-0x7b) ──
+                        0x60 => try self.simdUnaryOp(u8, intAbs(u8)),
+                        0x61 => try self.simdUnaryOp(u8, intNeg(u8)),
+                        0x62 => try self.i8x16Popcnt(),
+                        0x63 => try self.simdAllTrue(u8),
+                        0x64 => try self.simdBitmask(u8),
+                        0x65 => try self.simdNarrowS(u16, u8),
+                        0x66 => try self.simdNarrowU(u16, u8),
+                        0x6b => try self.simdShiftOp(u8, .left),
+                        0x6c => try self.simdShiftOp(u8, .right_s),
+                        0x6d => try self.simdShiftOp(u8, .right_u),
+                        0x6e => try self.simdBinOp(u8, intAdd(u8)),
+                        0x6f => try self.simdBinOp(u8, intAddSatS(u8)),
+                        0x70 => try self.simdBinOp(u8, intAddSatU(u8)),
+                        0x71 => try self.simdBinOp(u8, intSub(u8)),
+                        0x72 => try self.simdBinOp(u8, intSubSatS(u8)),
+                        0x73 => try self.simdBinOp(u8, intSubSatU(u8)),
+                        0x76 => try self.simdBinOp(u8, intMinS(u8)),
+                        0x77 => try self.simdBinOp(u8, intMinU(u8)),
+                        0x78 => try self.simdBinOp(u8, intMaxS(u8)),
+                        0x79 => try self.simdBinOp(u8, intMaxU(u8)),
+                        0x7b => try self.simdBinOp(u8, intAvgrU(u8)),
+
+                        // ── f32x4 rounding (interleaved with i8x16) ──
+                        0x67 => try self.simdUnaryOp(f32, floatCeil(f32)),
+                        0x68 => try self.simdUnaryOp(f32, floatFloor(f32)),
+                        0x69 => try self.simdUnaryOp(f32, floatTrunc(f32)),
+                        0x6a => try self.simdUnaryOp(f32, floatNearest(f32)),
+
+                        // ── f64x2 rounding (interleaved) ──
+                        0x74 => try self.simdUnaryOp(f64, floatCeil(f64)),
+                        0x75 => try self.simdUnaryOp(f64, floatFloor(f64)),
+                        0x7a => try self.simdUnaryOp(f64, floatTrunc(f64)),
+                        0x94 => try self.simdUnaryOp(f64, floatNearest(f64)),
+
+                        // ── extadd_pairwise (0x7c-0x7f) ──
+                        0x7c => try self.simdExtaddPairwise(u8, u16, true),
+                        0x7d => try self.simdExtaddPairwise(u8, u16, false),
+                        0x7e => try self.simdExtaddPairwise(u16, u32, true),
+                        0x7f => try self.simdExtaddPairwise(u16, u32, false),
+
+                        // ── i16x8 ops (0x80-0x9f) ──
+                        0x80 => try self.simdUnaryOp(u16, intAbs(u16)),
+                        0x81 => try self.simdUnaryOp(u16, intNeg(u16)),
+                        0x82 => try self.i16x8Q15mulrSatS(),
+                        0x83 => try self.simdAllTrue(u16),
+                        0x84 => try self.simdBitmask(u16),
+                        0x85 => try self.simdNarrowS(u32, u16),
+                        0x86 => try self.simdNarrowU(u32, u16),
+                        0x87 => try self.simdExtendLow(u8, u16, true),
+                        0x88 => try self.simdExtendHigh(u8, u16, true),
+                        0x89 => try self.simdExtendLow(u8, u16, false),
+                        0x8a => try self.simdExtendHigh(u8, u16, false),
+                        0x8b => try self.simdShiftOp(u16, .left),
+                        0x8c => try self.simdShiftOp(u16, .right_s),
+                        0x8d => try self.simdShiftOp(u16, .right_u),
+                        0x8e => try self.simdBinOp(u16, intAdd(u16)),
+                        0x8f => try self.simdBinOp(u16, intAddSatS(u16)),
+                        0x90 => try self.simdBinOp(u16, intAddSatU(u16)),
+                        0x91 => try self.simdBinOp(u16, intSub(u16)),
+                        0x92 => try self.simdBinOp(u16, intSubSatS(u16)),
+                        0x93 => try self.simdBinOp(u16, intSubSatU(u16)),
+                        0x95 => try self.simdBinOp(u16, intMul(u16)),
+                        0x96 => try self.simdBinOp(u16, intMinS(u16)),
+                        0x97 => try self.simdBinOp(u16, intMinU(u16)),
+                        0x98 => try self.simdBinOp(u16, intMaxS(u16)),
+                        0x99 => try self.simdBinOp(u16, intMaxU(u16)),
+                        0x9b => try self.simdBinOp(u16, intAvgrU(u16)),
+                        0x9c => try self.simdExtmulLow(u8, u16, true),
+                        0x9d => try self.simdExtmulHigh(u8, u16, true),
+                        0x9e => try self.simdExtmulLow(u8, u16, false),
+                        0x9f => try self.simdExtmulHigh(u8, u16, false),
+
+                        // ── i32x4 ops (0xa0-0xbf) ──
+                        0xa0 => try self.simdUnaryOp(u32, intAbs(u32)),
+                        0xa1 => try self.simdUnaryOp(u32, intNeg(u32)),
+                        0xa3 => try self.simdAllTrue(u32),
+                        0xa4 => try self.simdBitmask(u32),
+                        0xa7 => try self.simdExtendLow(u16, u32, true),
+                        0xa8 => try self.simdExtendHigh(u16, u32, true),
+                        0xa9 => try self.simdExtendLow(u16, u32, false),
+                        0xaa => try self.simdExtendHigh(u16, u32, false),
+                        0xab => try self.simdShiftOp(u32, .left),
+                        0xac => try self.simdShiftOp(u32, .right_s),
+                        0xad => try self.simdShiftOp(u32, .right_u),
+                        0xae => try self.simdBinOp(u32, intAdd(u32)),
+                        0xb1 => try self.simdBinOp(u32, intSub(u32)),
+                        0xb5 => try self.simdBinOp(u32, intMul(u32)),
+                        0xb6 => try self.simdBinOp(u32, intMinS(u32)),
+                        0xb7 => try self.simdBinOp(u32, intMinU(u32)),
+                        0xb8 => try self.simdBinOp(u32, intMaxS(u32)),
+                        0xb9 => try self.simdBinOp(u32, intMaxU(u32)),
+                        0xba => try self.i32x4DotI16x8S(),
+                        0xbc => try self.simdExtmulLow(u16, u32, true),
+                        0xbd => try self.simdExtmulHigh(u16, u32, true),
+                        0xbe => try self.simdExtmulLow(u16, u32, false),
+                        0xbf => try self.simdExtmulHigh(u16, u32, false),
+
+                        // ── i64x2 ops (0xc0-0xdf) ──
+                        0xc0 => try self.simdUnaryOp(u64, intAbs(u64)),
+                        0xc1 => try self.simdUnaryOp(u64, intNeg(u64)),
+                        0xc3 => try self.simdAllTrue(u64),
+                        0xc4 => try self.simdBitmask(u64),
+                        0xc7 => try self.simdExtendLow(u32, u64, true),
+                        0xc8 => try self.simdExtendHigh(u32, u64, true),
+                        0xc9 => try self.simdExtendLow(u32, u64, false),
+                        0xca => try self.simdExtendHigh(u32, u64, false),
+                        0xcb => try self.simdShiftOp(u64, .left),
+                        0xcc => try self.simdShiftOp(u64, .right_s),
+                        0xcd => try self.simdShiftOp(u64, .right_u),
+                        0xce => try self.simdBinOp(u64, intAdd(u64)),
+                        0xd1 => try self.simdBinOp(u64, intSub(u64)),
+                        0xd5 => try self.simdBinOp(u64, intMul(u64)),
+                        0xd6 => try self.simdCmpOp(u64, cmpEq(u64)),
+                        0xd7 => try self.simdCmpOp(u64, cmpNe(u64)),
+                        0xd8 => try self.simdCmpOp(u64, cmpLtS(u64)),
+                        0xd9 => try self.simdCmpOp(u64, cmpGtS(u64)),
+                        0xda => try self.simdCmpOp(u64, cmpLeS(u64)),
+                        0xdb => try self.simdCmpOp(u64, cmpGeS(u64)),
+                        0xdc => try self.simdExtmulLow(u32, u64, true),
+                        0xdd => try self.simdExtmulHigh(u32, u64, true),
+                        0xde => try self.simdExtmulLow(u32, u64, false),
+                        0xdf => try self.simdExtmulHigh(u32, u64, false),
+
+                        // ── f32x4 ops (0xe0-0xeb) ──
+                        0xe0 => try self.simdUnaryOp(f32, floatAbs(f32)),
+                        0xe1 => try self.simdUnaryOp(f32, floatNeg(f32)),
+                        0xe3 => try self.simdUnaryOp(f32, floatSqrt(f32)),
+                        0xe4 => try self.simdBinOp(f32, floatAdd(f32)),
+                        0xe5 => try self.simdBinOp(f32, floatSub(f32)),
+                        0xe6 => try self.simdBinOp(f32, floatMul(f32)),
+                        0xe7 => try self.simdBinOp(f32, floatDiv(f32)),
+                        0xe8 => try self.simdBinOp(f32, floatMin(f32)),
+                        0xe9 => try self.simdBinOp(f32, floatMax(f32)),
+                        0xea => try self.simdBinOp(f32, floatPmin(f32)),
+                        0xeb => try self.simdBinOp(f32, floatPmax(f32)),
+
+                        // ── f64x2 ops (0xec-0xf7) ──
+                        0xec => try self.simdUnaryOp(f64, floatAbs(f64)),
+                        0xed => try self.simdUnaryOp(f64, floatNeg(f64)),
+                        0xef => try self.simdUnaryOp(f64, floatSqrt(f64)),
+                        0xf0 => try self.simdBinOp(f64, floatAdd(f64)),
+                        0xf1 => try self.simdBinOp(f64, floatSub(f64)),
+                        0xf2 => try self.simdBinOp(f64, floatMul(f64)),
+                        0xf3 => try self.simdBinOp(f64, floatDiv(f64)),
+                        0xf4 => try self.simdBinOp(f64, floatMin(f64)),
+                        0xf5 => try self.simdBinOp(f64, floatMax(f64)),
+                        0xf6 => try self.simdBinOp(f64, floatPmin(f64)),
+                        0xf7 => try self.simdBinOp(f64, floatPmax(f64)),
+
+                        // ── Conversion ops (0xf8-0xff) ──
+                        0xf8 => try self.i32x4TruncSatF32x4(true),
+                        0xf9 => try self.i32x4TruncSatF32x4(false),
+                        0xfa => try self.f32x4ConvertI32x4(true),
+                        0xfb => try self.f32x4ConvertI32x4(false),
+                        0xfc => try self.i32x4TruncSatF64x2Zero(true),
+                        0xfd => try self.i32x4TruncSatF64x2Zero(false),
+                        0xfe => try self.f64x2ConvertLowI32x4(true),
+                        0xff => try self.f64x2ConvertLowI32x4(false),
+
                         else => return error.Unimplemented,
                     }
                 },
@@ -2976,6 +3197,734 @@ pub const Interpreter = struct {
         var lanes: [2]u64 = @bitCast(v.v128);
         lanes[lane] = @bitCast(val.i64);
         try self.pushValue(.{ .v128 = @bitCast(lanes) });
+    }
+
+    // ── SIMD generic helper functions ───────────────────────────────────
+
+    /// Binary v128 op: pop two v128 values, apply `op` per lane, push result.
+    fn simdBinOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) T) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        const b: [count]T = @bitCast((try self.popValue()).v128);
+        const a: [count]T = @bitCast((try self.popValue()).v128);
+        var result: [count]T = undefined;
+        for (0..count) |i| result[i] = op(a[i], b[i]);
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    /// Unary v128 op: pop one v128, apply `op` per lane, push result.
+    fn simdUnaryOp(self: *Interpreter, comptime T: type, comptime op: fn (T) T) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        const a: [count]T = @bitCast((try self.popValue()).v128);
+        var result: [count]T = undefined;
+        for (0..count) |i| result[i] = op(a[i]);
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    /// Compare op: pop two v128, compare per lane, push v128 with all-1s or all-0s per lane.
+    fn simdCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
+        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const count = 16 / @sizeOf(T);
+        const b: [count]T = @bitCast((try self.popValue()).v128);
+        const a: [count]T = @bitCast((try self.popValue()).v128);
+        var result: [count]Unsigned = undefined;
+        for (0..count) |i| result[i] = if (op(a[i], b[i])) @as(Unsigned, @bitCast(@as(std.meta.Int(.signed, @bitSizeOf(T)), -1))) else 0;
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    /// Float compare op: pop two v128 of float type, compare per lane.
+    fn simdFloatCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
+        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const count = 16 / @sizeOf(T);
+        const b: [count]T = @bitCast((try self.popValue()).v128);
+        const a: [count]T = @bitCast((try self.popValue()).v128);
+        var result: [count]Unsigned = undefined;
+        for (0..count) |i| result[i] = if (op(a[i], b[i])) std.math.maxInt(Unsigned) else 0;
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    /// Shift op: pop i32 shift amount, pop v128, shift each lane, push result.
+    fn simdShiftOp(self: *Interpreter, comptime T: type, comptime dir: enum { left, right_s, right_u }) TrapError!void {
+        const bits = @bitSizeOf(T);
+        const Unsigned = std.meta.Int(.unsigned, bits);
+        const Signed = std.meta.Int(.signed, bits);
+        const ShiftT = std.math.Log2Int(Unsigned);
+        const count = 16 / @sizeOf(T);
+        const shift_raw: i32 = try self.popI32();
+        const shift: ShiftT = @intCast(@as(u32, @bitCast(shift_raw)) % bits);
+        const a: [count]T = @bitCast((try self.popValue()).v128);
+        var result: [count]T = undefined;
+        for (0..count) |i| {
+            switch (dir) {
+                .left => result[i] = @bitCast(@as(Unsigned, @bitCast(a[i])) << shift),
+                .right_s => result[i] = @bitCast(@as(Unsigned, @bitCast(@as(Signed, @bitCast(a[i])) >> shift))),
+                .right_u => result[i] = @bitCast(@as(Unsigned, @bitCast(a[i])) >> shift),
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    /// all_true: pop v128, push i32 (1 if all lanes non-zero).
+    fn simdAllTrue(self: *Interpreter, comptime T: type) TrapError!void {
+        const count = 16 / @sizeOf(T);
+        const lanes: [count]T = @bitCast((try self.popValue()).v128);
+        var all: bool = true;
+        for (0..count) |i| {
+            if (lanes[i] == 0) { all = false; break; }
+        }
+        try self.pushValue(.{ .i32 = @intFromBool(all) });
+    }
+
+    /// bitmask: extract high bit of each lane, pack into i32.
+    fn simdBitmask(self: *Interpreter, comptime T: type) TrapError!void {
+        const bits = @bitSizeOf(T);
+        const Unsigned = std.meta.Int(.unsigned, bits);
+        const count = 16 / @sizeOf(T);
+        const lanes: [count]T = @bitCast((try self.popValue()).v128);
+        var mask: u32 = 0;
+        for (0..count) |i| {
+            const val: Unsigned = @bitCast(lanes[i]);
+            mask |= @as(u32, @intCast((val >> (bits - 1)) & 1)) << @intCast(i);
+        }
+        try self.pushValue(.{ .i32 = @bitCast(mask) });
+    }
+
+    // ── SIMD integer arithmetic lane ops ────────────────────────────────
+
+    fn intAdd(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return a +% b; }
+        }.f;
+    }
+
+    fn intSub(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return a -% b; }
+        }.f;
+    }
+
+    fn intMul(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return a *% b; }
+        }.f;
+    }
+
+    fn intNeg(comptime T: type) fn (T) T {
+        return struct {
+            fn f(a: T) T { return 0 -% a; }
+        }.f;
+    }
+
+    fn intAbs(comptime T: type) fn (T) T {
+        return struct {
+            fn f(a: T) T {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const s: Signed = @bitCast(a);
+                if (s == std.math.minInt(Signed)) return a; // min value stays
+                return @bitCast(if (s < 0) -s else s);
+            }
+        }.f;
+    }
+
+    // Saturating add/sub for signed
+    fn intAddSatS(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const sa: Signed = @bitCast(a);
+                const sb: Signed = @bitCast(b);
+                return @bitCast(sa +| sb);
+            }
+        }.f;
+    }
+
+    fn intSubSatS(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const sa: Signed = @bitCast(a);
+                const sb: Signed = @bitCast(b);
+                return @bitCast(sa -| sb);
+            }
+        }.f;
+    }
+
+    // Saturating add/sub for unsigned
+    fn intAddSatU(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return a +| b; }
+        }.f;
+    }
+
+    fn intSubSatU(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return a -| b; }
+        }.f;
+    }
+
+    fn intMinS(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const sa: Signed = @bitCast(a);
+                const sb: Signed = @bitCast(b);
+                return @bitCast(@min(sa, sb));
+            }
+        }.f;
+    }
+
+    fn intMinU(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return @min(a, b); }
+        }.f;
+    }
+
+    fn intMaxS(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const sa: Signed = @bitCast(a);
+                const sb: Signed = @bitCast(b);
+                return @bitCast(@max(sa, sb));
+            }
+        }.f;
+    }
+
+    fn intMaxU(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return @max(a, b); }
+        }.f;
+    }
+
+    fn intAvgrU(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                const Wide = std.meta.Int(.unsigned, @bitSizeOf(T) * 2);
+                return @intCast((@as(Wide, a) + @as(Wide, b) + 1) / 2);
+            }
+        }.f;
+    }
+
+    // ── SIMD comparison helpers ─────────────────────────────────────────
+
+    fn cmpEq(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a == b; } }.f;
+    }
+    fn cmpNe(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a != b; } }.f;
+    }
+    fn cmpLtS(comptime T: type) fn (T, T) bool {
+        return struct {
+            fn f(a: T, b: T) bool {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                return @as(Signed, @bitCast(a)) < @as(Signed, @bitCast(b));
+            }
+        }.f;
+    }
+    fn cmpLtU(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a < b; } }.f;
+    }
+    fn cmpGtS(comptime T: type) fn (T, T) bool {
+        return struct {
+            fn f(a: T, b: T) bool {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                return @as(Signed, @bitCast(a)) > @as(Signed, @bitCast(b));
+            }
+        }.f;
+    }
+    fn cmpGtU(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a > b; } }.f;
+    }
+    fn cmpLeS(comptime T: type) fn (T, T) bool {
+        return struct {
+            fn f(a: T, b: T) bool {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                return @as(Signed, @bitCast(a)) <= @as(Signed, @bitCast(b));
+            }
+        }.f;
+    }
+    fn cmpLeU(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a <= b; } }.f;
+    }
+    fn cmpGeS(comptime T: type) fn (T, T) bool {
+        return struct {
+            fn f(a: T, b: T) bool {
+                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                return @as(Signed, @bitCast(a)) >= @as(Signed, @bitCast(b));
+            }
+        }.f;
+    }
+    fn cmpGeU(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a >= b; } }.f;
+    }
+
+    // Float comparisons
+    fn floatEq(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a == b; } }.f;
+    }
+    fn floatNe(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a != b; } }.f;
+    }
+    fn floatLt(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a < b; } }.f;
+    }
+    fn floatGt(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a > b; } }.f;
+    }
+    fn floatLe(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a <= b; } }.f;
+    }
+    fn floatGe(comptime T: type) fn (T, T) bool {
+        return struct { fn f(a: T, b: T) bool { return a >= b; } }.f;
+    }
+
+    // ── SIMD float arithmetic helpers ───────────────────────────────────
+
+    fn floatAdd(comptime T: type) fn (T, T) T {
+        return struct { fn f(a: T, b: T) T { return a + b; } }.f;
+    }
+    fn floatSub(comptime T: type) fn (T, T) T {
+        return struct { fn f(a: T, b: T) T { return a - b; } }.f;
+    }
+    fn floatMul(comptime T: type) fn (T, T) T {
+        return struct { fn f(a: T, b: T) T { return a * b; } }.f;
+    }
+    fn floatDiv(comptime T: type) fn (T, T) T {
+        return struct { fn f(a: T, b: T) T { return a / b; } }.f;
+    }
+    fn floatAbs(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return @abs(a); } }.f;
+    }
+    fn floatNeg(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return -a; } }.f;
+    }
+    fn floatSqrt(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return @sqrt(a); } }.f;
+    }
+    fn floatCeil(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return @ceil(a); } }.f;
+    }
+    fn floatFloor(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return @floor(a); } }.f;
+    }
+    fn floatTrunc(comptime T: type) fn (T) T {
+        return struct { fn f(a: T) T { return @trunc(a); } }.f;
+    }
+    fn floatNearest(comptime T: type) fn (T) T {
+        return struct {
+            fn f(a: T) T {
+                if (std.math.isNan(a)) return a;
+                if (std.math.isInf(a)) return a;
+                if (a == 0.0) return a; // preserve sign of zero
+                const rounded = @round(a);
+                // Banker's rounding: if exactly halfway, round to even
+                const diff = a - rounded;
+                if (diff == 0.5 or diff == -0.5) {
+                    const half_rounded = rounded / 2.0;
+                    if (half_rounded != @round(half_rounded)) {
+                        // rounded is odd, adjust
+                        return if (diff > 0) rounded - 1.0 else rounded + 1.0;
+                    }
+                }
+                return rounded;
+            }
+        }.f;
+    }
+
+    /// IEEE 754 min: propagates NaN, -0 < +0
+    fn floatMin(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                if (std.math.isNan(a)) return canonicalNan(T);
+                if (std.math.isNan(b)) return canonicalNan(T);
+                // -0 < +0
+                if (a == b) {
+                    const Uint = std.meta.Int(.unsigned, @bitSizeOf(T));
+                    const ab: Uint = @bitCast(a);
+                    const bb: Uint = @bitCast(b);
+                    return @bitCast(ab | bb); // -0 wins over +0
+                }
+                return if (a < b) a else b;
+            }
+        }.f;
+    }
+
+    /// IEEE 754 max: propagates NaN, +0 > -0
+    fn floatMax(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T {
+                if (std.math.isNan(a)) return canonicalNan(T);
+                if (std.math.isNan(b)) return canonicalNan(T);
+                if (a == b) {
+                    const Uint = std.meta.Int(.unsigned, @bitSizeOf(T));
+                    const ab: Uint = @bitCast(a);
+                    const bb: Uint = @bitCast(b);
+                    return @bitCast(ab & bb); // +0 wins over -0
+                }
+                return if (a > b) a else b;
+            }
+        }.f;
+    }
+
+    fn canonicalNan(comptime T: type) T {
+        return @bitCast(if (T == f32) @as(u32, 0x7fc00000) else @as(u64, 0x7ff8000000000000));
+    }
+
+    /// pmin: return b if b < a, else a (C-style, no NaN canonicalization)
+    fn floatPmin(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return if (b < a) b else a; }
+        }.f;
+    }
+
+    /// pmax: return b if a < b, else a
+    fn floatPmax(comptime T: type) fn (T, T) T {
+        return struct {
+            fn f(a: T, b: T) T { return if (a < b) b else a; }
+        }.f;
+    }
+
+    // ── SIMD bitwise operations ─────────────────────────────────────────
+
+    fn simdNot(self: *Interpreter) TrapError!void {
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = ~a });
+    }
+
+    fn simdAnd(self: *Interpreter) TrapError!void {
+        const b = (try self.popValue()).v128;
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = a & b });
+    }
+
+    fn simdAndNot(self: *Interpreter) TrapError!void {
+        const b = (try self.popValue()).v128;
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = a & ~b });
+    }
+
+    fn simdOr(self: *Interpreter) TrapError!void {
+        const b = (try self.popValue()).v128;
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = a | b });
+    }
+
+    fn simdXor(self: *Interpreter) TrapError!void {
+        const b = (try self.popValue()).v128;
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = a ^ b });
+    }
+
+    fn simdBitselect(self: *Interpreter) TrapError!void {
+        const c = (try self.popValue()).v128;
+        const v2 = (try self.popValue()).v128;
+        const v1 = (try self.popValue()).v128;
+        try self.pushValue(.{ .v128 = (v1 & c) | (v2 & ~c) });
+    }
+
+    fn simdAnyTrue(self: *Interpreter) TrapError!void {
+        const a = (try self.popValue()).v128;
+        try self.pushValue(.{ .i32 = @intFromBool(a != 0) });
+    }
+
+    // ── SIMD narrow operations ──────────────────────────────────────────
+
+    fn simdNarrowS(self: *Interpreter, comptime Src: type, comptime Dst: type) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+        const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+        const b: [src_count]Src = @bitCast((try self.popValue()).v128);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..src_count) |i| {
+            const sv: SrcSigned = @bitCast(a[i]);
+            const clamped: DstSigned = @intCast(@max(@as(SrcSigned, std.math.minInt(DstSigned)), @min(@as(SrcSigned, std.math.maxInt(DstSigned)), sv)));
+            result[i] = @bitCast(clamped);
+        }
+        for (0..src_count) |i| {
+            const sv: SrcSigned = @bitCast(b[i]);
+            const clamped: DstSigned = @intCast(@max(@as(SrcSigned, std.math.minInt(DstSigned)), @min(@as(SrcSigned, std.math.maxInt(DstSigned)), sv)));
+            result[src_count + i] = @bitCast(clamped);
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn simdNarrowU(self: *Interpreter, comptime Src: type, comptime Dst: type) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+        const b: [src_count]Src = @bitCast((try self.popValue()).v128);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..src_count) |i| {
+            const sv: SrcSigned = @bitCast(a[i]);
+            if (sv < 0) {
+                result[i] = 0;
+            } else if (sv > @as(SrcSigned, std.math.maxInt(Dst))) {
+                result[i] = std.math.maxInt(Dst);
+            } else {
+                result[i] = @intCast(@as(Src, @bitCast(sv)));
+            }
+        }
+        for (0..src_count) |i| {
+            const sv: SrcSigned = @bitCast(b[i]);
+            if (sv < 0) {
+                result[src_count + i] = 0;
+            } else if (sv > @as(SrcSigned, std.math.maxInt(Dst))) {
+                result[src_count + i] = std.math.maxInt(Dst);
+            } else {
+                result[src_count + i] = @intCast(@as(Src, @bitCast(sv)));
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // ── SIMD extend operations ──────────────────────────────────────────
+
+    fn simdExtendLow(self: *Interpreter, comptime Src: type, comptime Dst: type, comptime signed: bool) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..dst_count) |i| {
+            if (signed) {
+                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const sv: SrcSigned = @bitCast(a[i]);
+                const extended: DstSigned = sv;
+                result[i] = @bitCast(extended);
+            } else {
+                result[i] = @as(Dst, a[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn simdExtendHigh(self: *Interpreter, comptime Src: type, comptime Dst: type, comptime signed: bool) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..dst_count) |i| {
+            if (signed) {
+                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const sv: SrcSigned = @bitCast(a[dst_count + i]);
+                const extended: DstSigned = sv;
+                result[i] = @bitCast(extended);
+            } else {
+                result[i] = @as(Dst, a[dst_count + i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // ── SIMD extmul operations ──────────────────────────────────────────
+
+    fn simdExtmulLow(self: *Interpreter, comptime Src: type, comptime Dst: type, comptime signed: bool) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const b: [src_count]Src = @bitCast((try self.popValue()).v128);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..dst_count) |i| {
+            if (signed) {
+                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const sa: DstSigned = @as(SrcSigned, @bitCast(a[i]));
+                const sb: DstSigned = @as(SrcSigned, @bitCast(b[i]));
+                result[i] = @bitCast(sa *% sb);
+            } else {
+                const wa: Dst = a[i];
+                const wb: Dst = b[i];
+                result[i] = wa *% wb;
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn simdExtmulHigh(self: *Interpreter, comptime Src: type, comptime Dst: type, comptime signed: bool) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const b: [src_count]Src = @bitCast((try self.popValue()).v128);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..dst_count) |i| {
+            if (signed) {
+                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const sa: DstSigned = @as(SrcSigned, @bitCast(a[dst_count + i]));
+                const sb: DstSigned = @as(SrcSigned, @bitCast(b[dst_count + i]));
+                result[i] = @bitCast(sa *% sb);
+            } else {
+                const wa: Dst = a[dst_count + i];
+                const wb: Dst = b[dst_count + i];
+                result[i] = wa *% wb;
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // ── SIMD special integer ops ────────────────────────────────────────
+
+    fn i8x16Popcnt(self: *Interpreter) TrapError!void {
+        const a: [16]u8 = @bitCast((try self.popValue()).v128);
+        var result: [16]u8 = undefined;
+        for (0..16) |i| result[i] = @popCount(a[i]);
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn i16x8Q15mulrSatS(self: *Interpreter) TrapError!void {
+        const b: [8]u16 = @bitCast((try self.popValue()).v128);
+        const a: [8]u16 = @bitCast((try self.popValue()).v128);
+        var result: [8]u16 = undefined;
+        for (0..8) |i| {
+            const sa: i32 = @as(i16, @bitCast(a[i]));
+            const sb: i32 = @as(i16, @bitCast(b[i]));
+            const product = sa * sb;
+            // Q15 rounding: (product + 0x4000) >> 15, saturated to i16
+            const rounded = (product + 0x4000) >> 15;
+            const clamped = @min(@as(i32, 32767), @max(@as(i32, -32768), rounded));
+            result[i] = @bitCast(@as(i16, @intCast(clamped)));
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn i32x4DotI16x8S(self: *Interpreter) TrapError!void {
+        const b: [8]u16 = @bitCast((try self.popValue()).v128);
+        const a: [8]u16 = @bitCast((try self.popValue()).v128);
+        var result: [4]i32 = undefined;
+        for (0..4) |i| {
+            const a0: i32 = @as(i16, @bitCast(a[i * 2]));
+            const a1: i32 = @as(i16, @bitCast(a[i * 2 + 1]));
+            const b0: i32 = @as(i16, @bitCast(b[i * 2]));
+            const b1: i32 = @as(i16, @bitCast(b[i * 2 + 1]));
+            result[i] = a0 * b0 + a1 * b1;
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // ── SIMD extadd_pairwise ────────────────────────────────────────────
+
+    fn simdExtaddPairwise(self: *Interpreter, comptime Src: type, comptime Dst: type, comptime signed: bool) TrapError!void {
+        const src_count = 16 / @sizeOf(Src);
+        const dst_count = 16 / @sizeOf(Dst);
+        const a: [src_count]Src = @bitCast((try self.popValue()).v128);
+        var result: [dst_count]Dst = undefined;
+        for (0..dst_count) |i| {
+            if (signed) {
+                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const s0: DstSigned = @as(SrcSigned, @bitCast(a[i * 2]));
+                const s1: DstSigned = @as(SrcSigned, @bitCast(a[i * 2 + 1]));
+                result[i] = @bitCast(s0 + s1);
+            } else {
+                const DstT = Dst;
+                result[i] = @as(DstT, a[i * 2]) + @as(DstT, a[i * 2 + 1]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // ── SIMD conversion operations ──────────────────────────────────────
+
+    fn f32x4DemoteF64x2Zero(self: *Interpreter) TrapError!void {
+        const a: [2]f64 = @bitCast((try self.popValue()).v128);
+        var result: [4]f32 = undefined;
+        result[0] = @floatCast(a[0]);
+        result[1] = @floatCast(a[1]);
+        result[2] = 0;
+        result[3] = 0;
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn f64x2PromoteLowF32x4(self: *Interpreter) TrapError!void {
+        const a: [4]f32 = @bitCast((try self.popValue()).v128);
+        var result: [2]f64 = undefined;
+        result[0] = @floatCast(a[0]);
+        result[1] = @floatCast(a[1]);
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn i32x4TruncSatF32x4(self: *Interpreter, comptime signed: bool) TrapError!void {
+        const a: [4]f32 = @bitCast((try self.popValue()).v128);
+        var result: [4]u32 = undefined;
+        for (0..4) |i| {
+            if (signed) {
+                result[i] = @bitCast(truncSatF32ToI32(a[i]));
+            } else {
+                result[i] = truncSatF32ToU32(a[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn f32x4ConvertI32x4(self: *Interpreter, comptime signed: bool) TrapError!void {
+        const a: [4]u32 = @bitCast((try self.popValue()).v128);
+        var result: [4]f32 = undefined;
+        for (0..4) |i| {
+            if (signed) {
+                result[i] = @floatFromInt(@as(i32, @bitCast(a[i])));
+            } else {
+                result[i] = @floatFromInt(a[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn i32x4TruncSatF64x2Zero(self: *Interpreter, comptime signed: bool) TrapError!void {
+        const a: [2]f64 = @bitCast((try self.popValue()).v128);
+        var result: [4]u32 = [4]u32{ 0, 0, 0, 0 };
+        for (0..2) |i| {
+            if (signed) {
+                result[i] = @bitCast(truncSatF64ToI32(a[i]));
+            } else {
+                result[i] = truncSatF64ToU32(a[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn f64x2ConvertLowI32x4(self: *Interpreter, comptime signed: bool) TrapError!void {
+        const a: [4]u32 = @bitCast((try self.popValue()).v128);
+        var result: [2]f64 = undefined;
+        for (0..2) |i| {
+            if (signed) {
+                result[i] = @floatFromInt(@as(i32, @bitCast(a[i])));
+            } else {
+                result[i] = @floatFromInt(a[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    // trunc_sat helpers for SIMD conversions
+    fn truncSatF32ToI32(v: f32) i32 {
+        if (std.math.isNan(v)) return 0;
+        if (v >= @as(f32, @floatFromInt(@as(i32, 2147483647)))) return 2147483647;
+        if (v <= @as(f32, @floatFromInt(@as(i32, -2147483648)))) return -2147483648;
+        return @intFromFloat(v);
+    }
+
+    fn truncSatF32ToU32(v: f32) u32 {
+        if (std.math.isNan(v)) return 0;
+        if (v <= 0.0) return 0;
+        if (v >= @as(f32, @floatFromInt(@as(u32, 4294967295)))) return 4294967295;
+        return @intFromFloat(v);
+    }
+
+    fn truncSatF64ToI32(v: f64) i32 {
+        if (std.math.isNan(v)) return 0;
+        if (v >= 2147483647.0) return 2147483647;
+        if (v <= -2147483648.0) return -2147483648;
+        return @intFromFloat(v);
+    }
+
+    fn truncSatF64ToU32(v: f64) u32 {
+        if (std.math.isNan(v)) return 0;
+        if (v <= 0.0) return 0;
+        if (v >= 4294967295.0) return 4294967295;
+        return @intFromFloat(v);
     }
 
     /// Check if a type index has GC sub-type metadata.
