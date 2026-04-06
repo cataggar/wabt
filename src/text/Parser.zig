@@ -443,11 +443,14 @@ const Parser = struct {
                     }
                 }
                 try self.expect(.r_paren);
-                // Canonicalize: (ref null func) → funcref, (ref null extern) → externref
+                // Canonicalize: (ref null func) → funcref, (ref null extern) → externref, etc.
                 if (nullable and heap_text.len > 0) {
                     if (std.mem.eql(u8, heap_text, "func")) return .funcref;
                     if (std.mem.eql(u8, heap_text, "extern")) return .externref;
                     if (std.mem.eql(u8, heap_text, "any")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "nofunc")) return .nullfuncref;
+                    if (std.mem.eql(u8, heap_text, "noextern")) return .nullexternref;
+                    if (std.mem.eql(u8, heap_text, "none")) return .nullref;
                 }
                 return if (nullable) .ref_null else .ref;
             }

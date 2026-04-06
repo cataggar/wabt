@@ -51,6 +51,11 @@ pub const ValType = enum(i32) {
     struct_ = 0x5f,
     array = 0x5e,
 
+    // GC nullable bottom types (ref null <bottom>)
+    nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
+    nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
+    nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
+
     // Block void type
     void_ = 0x40,
 
@@ -58,7 +63,9 @@ pub const ValType = enum(i32) {
     /// exnref, ref, ref_null).
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .exnref, .ref, .ref_null => true,
+            .funcref, .externref, .anyref, .exnref, .ref, .ref_null,
+            .nullfuncref, .nullexternref, .nullref,
+            => true,
             else => false,
         };
     }

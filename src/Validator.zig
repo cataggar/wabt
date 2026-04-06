@@ -452,6 +452,9 @@ const ValTypeOrUnknown = enum(i32) {
     anyref = @intFromEnum(types.ValType.anyref),
     ref = @intFromEnum(types.ValType.ref),
     ref_null = @intFromEnum(types.ValType.ref_null),
+    nullfuncref = @intFromEnum(types.ValType.nullfuncref),
+    nullexternref = @intFromEnum(types.ValType.nullexternref),
+    nullref = @intFromEnum(types.ValType.nullref),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -466,13 +469,18 @@ const ValTypeOrUnknown = enum(i32) {
             .anyref => .anyref,
             .ref => .ref,
             .ref_null => .ref_null,
+            .nullfuncref => .nullfuncref,
+            .nullexternref => .nullexternref,
+            .nullref => .nullref,
             else => .unknown,
         };
     }
 
     fn isRefType(self: ValTypeOrUnknown) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .ref, .ref_null => true,
+            .funcref, .externref, .anyref, .ref, .ref_null,
+            .nullfuncref, .nullexternref, .nullref,
+            => true,
             else => false,
         };
     }
@@ -481,9 +489,25 @@ const ValTypeOrUnknown = enum(i32) {
         return self == .ref;
     }
 
+    /// Check if self is a subtype of other (for validation).
+    fn isSubtypeOf(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
+        if (self == other) return true;
+        if (self == .unknown or other == .unknown) return true;
+        // Bottom types are subtypes of their respective top types
+        return switch (self) {
+            .nullfuncref => other == .funcref,
+            .nullexternref => other == .externref,
+            .nullref => other == .anyref,
+            .funcref => other == .anyref, // funcref <: anyref in GC
+            else => false,
+        };
+    }
+
     fn matches(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == .unknown or other == .unknown) return true;
-        return self == other;
+        if (self == other) return true;
+        // Check subtyping in both directions
+        return self.isSubtypeOf(other) or other.isSubtypeOf(self);
     }
 };
 
