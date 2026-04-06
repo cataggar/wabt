@@ -3117,15 +3117,13 @@ pub const Interpreter = struct {
     }
 
     fn f32Splat(self: *Interpreter) TrapError!void {
-        const val = try self.popValue();
-        const fval: f32 = @bitCast(val.i32);
+        const fval = try self.popF32();
         const lanes = [4]f32{ fval, fval, fval, fval };
         try self.pushValue(.{ .v128 = @bitCast(lanes) });
     }
 
     fn f64Splat(self: *Interpreter) TrapError!void {
-        const val = try self.popValue();
-        const fval: f64 = @bitCast(val.i64);
+        const fval = try self.popF64();
         const lanes = [2]f64{ fval, fval };
         try self.pushValue(.{ .v128 = @bitCast(lanes) });
     }
@@ -3170,32 +3168,32 @@ pub const Interpreter = struct {
     fn extractLaneF32(self: *Interpreter, lane: u8) TrapError!void {
         const v = try self.popValue();
         if (lane >= 4) return error.Unimplemented;
-        const lanes: [4]u32 = @bitCast(v.v128);
-        try self.pushValue(.{ .i32 = @bitCast(lanes[lane]) });
+        const lanes: [4]f32 = @bitCast(v.v128);
+        try self.pushValue(.{ .f32 = lanes[lane] });
     }
 
     fn replaceLaneF32(self: *Interpreter, lane: u8) TrapError!void {
-        const val = try self.popValue();
+        const fval = try self.popF32();
         const v = try self.popValue();
         if (lane >= 4) return error.Unimplemented;
-        var lanes: [4]u32 = @bitCast(v.v128);
-        lanes[lane] = @bitCast(val.i32);
+        var lanes: [4]f32 = @bitCast(v.v128);
+        lanes[lane] = fval;
         try self.pushValue(.{ .v128 = @bitCast(lanes) });
     }
 
     fn extractLaneF64(self: *Interpreter, lane: u8) TrapError!void {
         const v = try self.popValue();
         if (lane >= 2) return error.Unimplemented;
-        const lanes: [2]u64 = @bitCast(v.v128);
-        try self.pushValue(.{ .i64 = @bitCast(lanes[lane]) });
+        const lanes: [2]f64 = @bitCast(v.v128);
+        try self.pushValue(.{ .f64 = lanes[lane] });
     }
 
     fn replaceLaneF64(self: *Interpreter, lane: u8) TrapError!void {
-        const val = try self.popValue();
+        const fval = try self.popF64();
         const v = try self.popValue();
         if (lane >= 2) return error.Unimplemented;
-        var lanes: [2]u64 = @bitCast(v.v128);
-        lanes[lane] = @bitCast(val.i64);
+        var lanes: [2]f64 = @bitCast(v.v128);
+        lanes[lane] = fval;
         try self.pushValue(.{ .v128 = @bitCast(lanes) });
     }
 
@@ -3512,20 +3510,25 @@ pub const Interpreter = struct {
     fn floatNearest(comptime T: type) fn (T) T {
         return struct {
             fn f(a: T) T {
-                if (std.math.isNan(a)) return a;
+                const UInt = if (T == f32) u32 else u64;
+                const quiet_bit: UInt = if (T == f32) 0x00400000 else 0x0008000000000000;
+                if (std.math.isNan(a)) return @bitCast(@as(UInt, @bitCast(a)) | quiet_bit);
                 if (std.math.isInf(a)) return a;
                 if (a == 0.0) return a; // preserve sign of zero
                 const rounded = @round(a);
                 // Banker's rounding: if exactly halfway, round to even
                 const diff = a - rounded;
+                var result = rounded;
                 if (diff == 0.5 or diff == -0.5) {
                     const half_rounded = rounded / 2.0;
                     if (half_rounded != @round(half_rounded)) {
                         // rounded is odd, adjust
-                        return if (diff > 0) rounded - 1.0 else rounded + 1.0;
+                        result = if (diff > 0) rounded + 1.0 else rounded - 1.0;
                     }
                 }
-                return rounded;
+                // Preserve sign of input when result is zero
+                if (result == 0.0) return std.math.copysign(result, a);
+                return result;
             }
         }.f;
     }
@@ -3799,7 +3802,7 @@ pub const Interpreter = struct {
             const a1: i32 = @as(i16, @bitCast(a[i * 2 + 1]));
             const b0: i32 = @as(i16, @bitCast(b[i * 2]));
             const b1: i32 = @as(i16, @bitCast(b[i * 2 + 1]));
-            result[i] = a0 * b0 + a1 * b1;
+            result[i] = a0 *% b0 +% a1 *% b1;
         }
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }

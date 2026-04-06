@@ -2285,25 +2285,14 @@ const Parser = struct {
 
     fn parseF32Bytes(self: *Parser) [4]u8 {
         const tok = self.advance();
-        if (std.mem.startsWith(u8, tok.text, "nan:")) {
-            // NaN with payload
-            const payload = std.fmt.parseInt(u32, tok.text[4..], 0) catch 0;
-            const val: u32 = 0x7f800000 | payload;
-            return std.mem.toBytes(std.mem.nativeToLittle(u32, val));
-        }
-        const f = std.fmt.parseFloat(f32, tok.text) catch 0.0;
-        return std.mem.toBytes(std.mem.nativeToLittle(f32, f));
+        const bits = parseFloatBits(f32, tok.text);
+        return std.mem.toBytes(std.mem.nativeToLittle(u32, bits));
     }
 
     fn parseF64Bytes(self: *Parser) [8]u8 {
         const tok = self.advance();
-        if (std.mem.startsWith(u8, tok.text, "nan:")) {
-            const payload = std.fmt.parseInt(u64, tok.text[4..], 0) catch 0;
-            const val: u64 = 0x7ff0000000000000 | payload;
-            return std.mem.toBytes(std.mem.nativeToLittle(u64, val));
-        }
-        const f = std.fmt.parseFloat(f64, tok.text) catch 0.0;
-        return std.mem.toBytes(std.mem.nativeToLittle(f64, f));
+        const bits = parseFloatBits(f64, tok.text);
+        return std.mem.toBytes(std.mem.nativeToLittle(u64, bits));
     }
 
     /// Emit an optional memory index for load/store instructions.
@@ -3763,10 +3752,10 @@ fn parseHexFloatBits(comptime F: type, text: []const u8) ?if (F == f32) u32 else
         if (text[pos] == '.') { in_frac = true; continue; }
         const d: u128 = hexDigitVal(text[pos]) orelse break;
         saw_digit = true;
-        if (in_frac) frac_hex_digits += 1;
         if ((sig >> 124) != 0) {
             sig_overflow_sticky = sig_overflow_sticky or (d != 0);
         } else {
+            if (in_frac) frac_hex_digits += 1;
             sig = sig * 16 + d;
         }
     }
