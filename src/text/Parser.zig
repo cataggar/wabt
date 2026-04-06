@@ -116,6 +116,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_elem => try p.parseElem(&module),
             .kw_data => try p.parseData(&module),
             .kw_definition => try p.skipSExpr(),
+            .kw_tag => try p.parseTag(&module),
             .invalid => {
                 p.malformed = true;
                 try p.skipSExpr();
@@ -2202,6 +2203,37 @@ const Parser = struct {
             .init_expr_bytes = owned,
             .owns_init_expr_bytes = true,
         });
+    }
+
+    fn parseTag(self: *Parser, module: *Mod.Module) ParseError!void {
+        const tag_idx: u32 = @intCast(module.tags.items.len);
+        // Skip optional $name
+        if (self.peek().kind == .identifier) _ = self.advance();
+        // Handle inline (export "name") declarations
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance();
+            if (self.peek().kind == .kw_export) {
+                _ = self.advance();
+                const name_tok = self.advance();
+                const exp_name = self.parseName(name_tok.text);
+                if (self.peek().kind == .r_paren) _ = self.advance();
+                module.exports.append(self.allocator, .{
+                    .name = exp_name,
+                    .kind = .tag,
+                    .var_ = .{ .index = tag_idx },
+                }) catch return error.OutOfMemory;
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+        // Register a tag entry and skip remaining content
+        try module.tags.append(self.allocator, .{});
+        // Skip to closing paren of (tag ...)
+        self.skipToRParen();
     }
 
     fn parseImport(self: *Parser, module: *Mod.Module) ParseError!void {
