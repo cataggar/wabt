@@ -1785,18 +1785,34 @@ const Parser = struct {
                 if (self.peek().kind == .r_paren) _ = self.advance();
             },
             else => {
-                // Non-constant instruction in folded form — still emit it for validation
+                // Extended constant expression in folded form (e.g. i32.add).
+                // Emit instruction, then operands, then reorder so operands precede instruction.
+                const instr_start = code.items.len;
                 self.parsePlainInstr(code);
-                // Parse sub-expressions
+                const instr_end = code.items.len;
+                const instr_len = instr_end - instr_start;
+                // Parse sub-expressions (operands)
+                var has_operands = false;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.peek().kind == .l_paren) {
                         _ = self.advance();
                         self.parseInitExprFolded(code);
+                        has_operands = true;
                     } else {
                         self.parseInitExprPlain(code);
+                        has_operands = true;
                     }
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
+                // Reorder: [instr][operands] → [operands][instr]
+                if (has_operands and instr_len > 0 and instr_len <= 32) {
+                    var buf: [32]u8 = undefined;
+                    @memcpy(buf[0..instr_len], code.items[instr_start..instr_end]);
+                    const total = code.items.len;
+                    const operand_len = total - instr_end;
+                    std.mem.copyForwards(u8, code.items[instr_start .. instr_start + operand_len], code.items[instr_end..total]);
+                    @memcpy(code.items[instr_start + operand_len .. instr_start + operand_len + instr_len], buf[0..instr_len]);
+                }
             },
         }
     }

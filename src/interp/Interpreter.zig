@@ -2690,32 +2690,80 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
 
 /// Evaluate a simple constant expression (used for global init and segment offsets).
 fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
+    // Stack-based evaluator for extended constant expressions
+    var stack: [16]Value = undefined;
+    var sp: usize = 0;
     var pc: usize = 0;
     while (pc < expr.len) {
         const op = expr[pc];
         pc += 1;
         switch (op) {
-            0x41 => return .{ .i32 = readCodeS32(expr, &pc) },
-            0x42 => return .{ .i64 = readCodeS64(expr, &pc) },
+            0x41 => { if (sp < 16) { stack[sp] = .{ .i32 = readCodeS32(expr, &pc) }; sp += 1; } },
+            0x42 => { if (sp < 16) { stack[sp] = .{ .i64 = readCodeS64(expr, &pc) }; sp += 1; } },
             0x43 => {
                 const bits = readCodeFixedU32(expr, pc);
-                return .{ .f32 = @bitCast(bits) };
+                pc += 4;
+                if (sp < 16) { stack[sp] = .{ .f32 = @bitCast(bits) }; sp += 1; }
             },
             0x44 => {
                 const bits = readCodeFixedU64(expr, pc);
-                return .{ .f64 = @bitCast(bits) };
+                pc += 8;
+                if (sp < 16) { stack[sp] = .{ .f64 = @bitCast(bits) }; sp += 1; }
             },
             0x23 => { // global.get
                 const idx = readCodeU32(expr, &pc);
-                if (idx < instance.globals.items.len) return instance.globals.items[idx];
+                if (idx < instance.globals.items.len) {
+                    if (sp < 16) { stack[sp] = instance.globals.items[idx]; sp += 1; }
+                } else return null;
+            },
+            0xd0 => { pc += 1; if (sp < 16) { stack[sp] = .{ .ref_null = {} }; sp += 1; } },
+            0xd2 => { if (sp < 16) { stack[sp] = .{ .ref_func = readCodeU32(expr, &pc) }; sp += 1; } },
+            // Extended constant expressions: i32 arithmetic
+            0x6a => { // i32.add
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i32;
+                sp -= 1; const a = stack[sp].i32;
+                stack[sp] = .{ .i32 = a +% b }; sp += 1;
+            },
+            0x6b => { // i32.sub
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i32;
+                sp -= 1; const a = stack[sp].i32;
+                stack[sp] = .{ .i32 = a -% b }; sp += 1;
+            },
+            0x6c => { // i32.mul
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i32;
+                sp -= 1; const a = stack[sp].i32;
+                stack[sp] = .{ .i32 = a *% b }; sp += 1;
+            },
+            // Extended constant expressions: i64 arithmetic
+            0x7c => { // i64.add
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i64;
+                sp -= 1; const a = stack[sp].i64;
+                stack[sp] = .{ .i64 = a +% b }; sp += 1;
+            },
+            0x7d => { // i64.sub
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i64;
+                sp -= 1; const a = stack[sp].i64;
+                stack[sp] = .{ .i64 = a -% b }; sp += 1;
+            },
+            0x7e => { // i64.mul
+                if (sp < 2) return null;
+                sp -= 1; const b = stack[sp].i64;
+                sp -= 1; const a = stack[sp].i64;
+                stack[sp] = .{ .i64 = a *% b }; sp += 1;
+            },
+            0x0b => { // end
+                if (sp > 0) return stack[sp - 1];
                 return null;
             },
-            0xd0 => { pc += 1; return .{ .ref_null = {} }; },
-            0xd2 => return .{ .ref_func = readCodeU32(expr, &pc) },
-            0x0b => return null,
             else => return null,
         }
     }
+    if (sp > 0) return stack[sp - 1];
     return null;
 }
 
