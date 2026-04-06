@@ -285,6 +285,12 @@ pub const TypeMeta = struct {
     is_sub: bool = false,
     is_final: bool = true,
     parent: u32 = std.math.maxInt(u32),
+    /// Rec group identifier (types in the same rec group share this).
+    rec_group: u32 = std.math.maxInt(u32),
+    /// Number of types in the rec group.
+    rec_group_size: u32 = 1,
+    /// Position within the rec group.
+    rec_position: u32 = 0,
     pub const Kind = enum { func, struct_, array };
 };
 

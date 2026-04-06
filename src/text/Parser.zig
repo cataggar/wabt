@@ -778,11 +778,20 @@ const Parser = struct {
             self.in_rec = false;
             self.rec_end = 0;
         }
+        var rec_pos: u32 = 0;
         while (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_type) {
                 _ = self.advance(); // consume 'type'
                 try self.parseType(module);
+                // Stamp the last added type_meta with rec group info
+                if (module.type_meta.items.len > 0) {
+                    var meta = &module.type_meta.items[module.type_meta.items.len - 1];
+                    meta.rec_group = rec_start;
+                    meta.rec_group_size = rec_count;
+                    meta.rec_position = rec_pos;
+                }
+                rec_pos += 1;
             } else {
                 try self.skipSExpr();
             }

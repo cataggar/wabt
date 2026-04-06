@@ -2254,13 +2254,17 @@ pub const Interpreter = struct {
                     if (func_idx >= target_interp.instance.module.funcs.items.len) return error.UndefinedElement;
                     const target = target_interp.instance.module.funcs.items[func_idx];
                     const func_sig = target_interp.resolveSig(target.decl);
-                    // Verify type matches the expected signature (structural)
+                    // Verify type matches: structural signature + rec group compatibility
                     if (type_idx < self.instance.module.module_types.items.len) {
                         switch (self.instance.module.module_types.items[type_idx]) {
                             .func_type => |expected| {
                                 const params_match = std.mem.eql(types.ValType, func_sig.params, expected.params);
                                 const results_match = std.mem.eql(types.ValType, func_sig.results, expected.results);
                                 if (!params_match or !results_match) {
+                                    return error.IndirectCallTypeMismatch;
+                                }
+                                // Check rec group compatibility (GC proposal)
+                                if (!self.recGroupsMatch(type_idx, target.decl.type_var.index, target_interp)) {
                                     return error.IndirectCallTypeMismatch;
                                 }
                             },
@@ -2579,6 +2583,59 @@ pub const Interpreter = struct {
             pc.* += 16;
             try self.pushValue(.{ .v128 = @bitCast(bytes) });
         } else return error.Unimplemented;
+    }
+
+    /// Check if two type indices have compatible rec group structures.
+    /// Returns true if the rec groups match structurally (same size, same kinds at each position).
+    fn recGroupsMatch(self: *const Interpreter, expected_idx: u32, actual_idx: u32, target: *const Interpreter) bool {
+        const exp_mod = self.instance.module;
+        const act_mod = target.instance.module;
+        // If no metadata, assume match (backward compatibility)
+        if (expected_idx >= exp_mod.type_meta.items.len or actual_idx >= act_mod.type_meta.items.len)
+            return true;
+        const exp_meta = exp_mod.type_meta.items[expected_idx];
+        const act_meta = act_mod.type_meta.items[actual_idx];
+        // Singleton groups (no rec) always match on signature alone
+        if (exp_meta.rec_group == std.math.maxInt(u32) and act_meta.rec_group == std.math.maxInt(u32))
+            return true;
+        // If one is in a rec group and the other isn't, check sizes
+        // Rec groups must have the same size and position
+        if (exp_meta.rec_group_size != act_meta.rec_group_size) return false;
+        if (exp_meta.rec_position != act_meta.rec_position) return false;
+        // Check all types in both rec groups have matching kinds
+        const exp_start = exp_meta.rec_group;
+        const act_start = act_meta.rec_group;
+        for (0..exp_meta.rec_group_size) |i| {
+            const ei = exp_start + @as(u32, @intCast(i));
+            const ai = act_start + @as(u32, @intCast(i));
+            if (ei >= exp_mod.type_meta.items.len or ai >= act_mod.type_meta.items.len) return false;
+            if (exp_mod.type_meta.items[ei].kind != act_mod.type_meta.items[ai].kind) return false;
+            // Also check structural content matches for each type in the group
+            if (ei < exp_mod.module_types.items.len and ai < act_mod.module_types.items.len) {
+                const exp_entry = exp_mod.module_types.items[ei];
+                const act_entry = act_mod.module_types.items[ai];
+                switch (exp_entry) {
+                    .func_type => |eft| switch (act_entry) {
+                        .func_type => |aft| {
+                            if (!std.mem.eql(types.ValType, eft.params, aft.params)) return false;
+                            if (!std.mem.eql(types.ValType, eft.results, aft.results)) return false;
+                        },
+                        else => return false,
+                    },
+                    .struct_type => |est| switch (act_entry) {
+                        .struct_type => |ast| {
+                            if (est.fields.items.len != ast.fields.items.len) return false;
+                        },
+                        else => return false,
+                    },
+                    .array_type => switch (act_entry) {
+                        .array_type => {},
+                        else => return false,
+                    },
+                }
+            }
+        }
+        return true;
     }
 };
 
