@@ -386,9 +386,20 @@ const Parser = struct {
                     _ = self.advance(); // consume 'null'
                     nullable = true;
                 }
-                // Skip heap type (could be $id, keyword like func/extern/any, or index)
+                // Parse heap type (could be $id, keyword like func/extern/any, or index)
                 if (self.peek().kind != .r_paren) {
-                    _ = self.advance();
+                    const ht = self.advance();
+                    // Validate type index if it's a number
+                    if (ht.kind == .integer) {
+                        const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
+                            self.malformed = true;
+                            try self.expect(.r_paren);
+                            return if (nullable) .ref_null else .ref;
+                        };
+                        if (self.module) |mod| {
+                            if (idx >= mod.module_types.items.len) self.malformed = true;
+                        }
+                    }
                 }
                 try self.expect(.r_paren);
                 return if (nullable) .ref_null else .ref;

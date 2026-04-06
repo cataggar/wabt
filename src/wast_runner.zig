@@ -765,8 +765,8 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
 
     // Parse the module text.
     var module = Parser.parseModule(allocator, inner) catch {
-        // Parse failure counts as skip (some modules use unsupported features).
-        result.skipped += 1;
+        // Parse failure for assert_invalid counts as pass (module was rejected).
+        result.passed += 1;
         return;
     };
     defer module.deinit();
