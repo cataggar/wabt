@@ -401,6 +401,9 @@ const RunState = struct {
                                         if (!std.mem.eql(types.ValType, imp_ft.params, exp_ft.params) or
                                             !std.mem.eql(types.ValType, imp_ft.results, exp_ft.results))
                                             return false;
+                                        // Check rec group compatibility
+                                        if (!recGroupsCompatible(mod, imp_type_idx, triple.module, exp_type_idx))
+                                            return false;
                                     },
                                     else => {},
                                 },
@@ -1976,6 +1979,50 @@ fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         }
     }
     return res.toOwnedSlice(allocator);
+}
+
+/// Check if two types from different modules have compatible rec group structures.
+fn recGroupsCompatible(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.Module, idx_b: u32) bool {
+    if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len)
+        return true; // No metadata, assume compatible
+    const meta_a = mod_a.type_meta.items[idx_a];
+    const meta_b = mod_b.type_meta.items[idx_b];
+    // Singleton groups (not in rec) always match on signature alone
+    if (meta_a.rec_group == std.math.maxInt(u32) and meta_b.rec_group == std.math.maxInt(u32))
+        return true;
+    if (meta_a.rec_group_size != meta_b.rec_group_size) return false;
+    if (meta_a.rec_position != meta_b.rec_position) return false;
+    // Check all types in both rec groups have matching kinds and content
+    const start_a = meta_a.rec_group;
+    const start_b = meta_b.rec_group;
+    for (0..meta_a.rec_group_size) |i| {
+        const ai = start_a + @as(u32, @intCast(i));
+        const bi = start_b + @as(u32, @intCast(i));
+        if (ai >= mod_a.type_meta.items.len or bi >= mod_b.type_meta.items.len) return false;
+        if (mod_a.type_meta.items[ai].kind != mod_b.type_meta.items[bi].kind) return false;
+        if (ai < mod_a.module_types.items.len and bi < mod_b.module_types.items.len) {
+            switch (mod_a.module_types.items[ai]) {
+                .func_type => |fa| switch (mod_b.module_types.items[bi]) {
+                    .func_type => |fb| {
+                        if (!std.mem.eql(types.ValType, fa.params, fb.params)) return false;
+                        if (!std.mem.eql(types.ValType, fa.results, fb.results)) return false;
+                    },
+                    else => return false,
+                },
+                .struct_type => |sa| switch (mod_b.module_types.items[bi]) {
+                    .struct_type => |sb| {
+                        if (sa.fields.items.len != sb.fields.items.len) return false;
+                    },
+                    else => return false,
+                },
+                .array_type => switch (mod_b.module_types.items[bi]) {
+                    .array_type => {},
+                    else => return false,
+                },
+            }
+        }
+    }
+    return true;
 }
 
 fn hexDigit(c: u8) ?u8 {

@@ -2946,6 +2946,10 @@ const Parser = struct {
                         seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
                     }
                     try self.expect(.r_paren);
+                } else if (!has_elem_type and (inner_kind == .kw_ref or inner_kind == .kw_ref_null)) {
+                    // (ref ...) or (ref null ...) — elem type declaration
+                    self.skipToRParen();
+                    has_elem_type = true;
                 } else {
                     // Post-offset without explicit type: skip
                     try self.skipSExpr();
