@@ -71,15 +71,31 @@ fn checkTypes(m: *const Mod.Module) Error!void {
         }
     }
     // Validate GC subtype declarations
-    for (m.type_meta.items) |meta| {
+    for (m.type_meta.items, 0..) |meta, idx| {
         if (meta.parent != std.math.maxInt(u32)) {
             // Has a parent — validate subtyping
             if (meta.parent >= m.type_meta.items.len) return error.InvalidTypeIndex;
-            const parent = m.type_meta.items[meta.parent];
+            const parent_meta = m.type_meta.items[meta.parent];
             // Parent must be non-final (declared with 'sub' and not 'final')
-            if (parent.is_final) return error.TypeMismatch;
+            if (parent_meta.is_final) return error.TypeMismatch;
             // Kind must match
-            if (meta.kind != parent.kind) return error.TypeMismatch;
+            if (meta.kind != parent_meta.kind) return error.TypeMismatch;
+            // Structural check for func types: param/result counts must match
+            if (meta.kind == .func and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .func_type => |child_ft| switch (m.module_types.items[meta.parent]) {
+                        .func_type => |parent_ft| {
+                            if (child_ft.params.len != parent_ft.params.len or
+                                child_ft.results.len != parent_ft.results.len)
+                                return error.TypeMismatch;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
         }
     }
 }
