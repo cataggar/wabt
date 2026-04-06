@@ -1618,7 +1618,12 @@ fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Inter
             const tok = nextToken(sexpr, &i) orelse return null;
             var clean_buf: [64]u8 = undefined;
             const clean = stripWatUnderscores(tok, &clean_buf);
-            const bits = Parser.parseFloatBits(f32, clean);
+            const bits: u32 = if (std.mem.indexOf(u8, clean, "nan:canonical") != null)
+                nan_canonical_f32
+            else if (std.mem.indexOf(u8, clean, "nan:arithmetic") != null)
+                nan_arithmetic_f32
+            else
+                Parser.parseFloatBits(f32, clean);
             const b: [4]u8 = @bitCast(bits);
             @memcpy(bytes[idx * 4 ..][0..4], &b);
         }
@@ -1627,7 +1632,12 @@ fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Inter
             const tok = nextToken(sexpr, &i) orelse return null;
             var clean_buf: [64]u8 = undefined;
             const clean = stripWatUnderscores(tok, &clean_buf);
-            const bits = Parser.parseFloatBits(f64, clean);
+            const bits: u64 = if (std.mem.indexOf(u8, clean, "nan:canonical") != null)
+                nan_canonical_f64
+            else if (std.mem.indexOf(u8, clean, "nan:arithmetic") != null)
+                nan_arithmetic_f64
+            else
+                Parser.parseFloatBits(f64, clean);
             const b: [8]u8 = @bitCast(bits);
             @memcpy(bytes[idx * 8 ..][0..8], &b);
         }
@@ -1720,7 +1730,54 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             else => false,
         },
         .v128 => |av| switch (b) {
-            .v128 => |bv| av == bv,
+            .v128 => |bv| {
+                if (av == bv) return true;
+                // Per-lane NaN comparison for f32x4
+                const af32: [4]u32 = @bitCast(av);
+                const bf32: [4]u32 = @bitCast(bv);
+                var has_f32_nan = false;
+                for (bf32) |lane| {
+                    if (lane == nan_canonical_f32 or lane == nan_arithmetic_f32) {
+                        has_f32_nan = true;
+                        break;
+                    }
+                }
+                if (has_f32_nan) {
+                    for (0..4) |lane| {
+                        if (bf32[lane] == nan_canonical_f32) {
+                            if ((af32[lane] & 0x7fffffff) != 0x7fc00000) return false;
+                        } else if (bf32[lane] == nan_arithmetic_f32) {
+                            if ((af32[lane] & 0x7fc00000) != 0x7fc00000) return false;
+                        } else {
+                            if (af32[lane] != bf32[lane]) return false;
+                        }
+                    }
+                    return true;
+                }
+                // Per-lane NaN comparison for f64x2
+                const af64: [2]u64 = @bitCast(av);
+                const bf64: [2]u64 = @bitCast(bv);
+                var has_f64_nan = false;
+                for (bf64) |lane| {
+                    if (lane == nan_canonical_f64 or lane == nan_arithmetic_f64) {
+                        has_f64_nan = true;
+                        break;
+                    }
+                }
+                if (has_f64_nan) {
+                    for (0..2) |lane| {
+                        if (bf64[lane] == nan_canonical_f64) {
+                            if ((af64[lane] & 0x7fffffffffffffff) != 0x7ff8000000000000) return false;
+                        } else if (bf64[lane] == nan_arithmetic_f64) {
+                            if ((af64[lane] & 0x7ff8000000000000) != 0x7ff8000000000000) return false;
+                        } else {
+                            if (af64[lane] != bf64[lane]) return false;
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            },
             else => false,
         },
     };
