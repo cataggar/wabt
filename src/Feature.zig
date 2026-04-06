@@ -24,7 +24,7 @@ pub const Set = packed struct {
     code_metadata: bool = false,
     gc: bool = true,
     memory64: bool = true,
-    multi_memory: bool = false,
+    multi_memory: bool = true,
     extended_const: bool = true,
     relaxed_simd: bool = false,
     custom_page_sizes: bool = false,
@@ -115,7 +115,7 @@ test "default features" {
     try std.testing.expect(!defaults.code_metadata);
     try std.testing.expect(defaults.gc);
     try std.testing.expect(defaults.memory64);
-    try std.testing.expect(!defaults.multi_memory);
+    try std.testing.expect(defaults.multi_memory);
     try std.testing.expect(defaults.extended_const);
     try std.testing.expect(!defaults.relaxed_simd);
     try std.testing.expect(!defaults.custom_page_sizes);

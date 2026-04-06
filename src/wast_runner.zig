@@ -294,6 +294,7 @@ const RunState = struct {
 
         var func_import_idx: u32 = 0;
         var global_import_idx: u32 = 0;
+        var memory_import_idx: u32 = 0;
         for (mod.imports.items) |imp| {
             if (imp.kind == .func) {
                 if (func_import_idx >= mod.num_func_imports) continue;
@@ -341,17 +342,23 @@ const RunState = struct {
                     }
                 }
             } else if (imp.kind == .memory) {
+                defer memory_import_idx += 1;
                 // Share memory from exporting module via pointer
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
                 const exp = triple.module.getExport(imp.field_name) orelse continue;
                 if (exp.kind != .memory) continue;
-                // Point to the exporter's memory for true sharing
-                interp.instance.shared_memory = triple.instance.getMemory();
+                // Resolve the exporter's memory index from the export
+                const exp_mem_idx: u32 = switch (exp.var_) {
+                    .index => |i| i,
+                    .name => 0,
+                };
+                // Point to the exporter's specific memory for true sharing
+                interp.instance.shared_memories.put(self.allocator, memory_import_idx, triple.instance.getMemory(exp_mem_idx)) catch {};
                 // Store the exporter's actual max for grow limit checks
-                if (triple.module.memories.items.len > 0) {
-                    const exp_mem = triple.module.memories.items[0];
+                if (exp_mem_idx < triple.module.memories.items.len) {
+                    const exp_mem = triple.module.memories.items[exp_mem_idx];
                     if (exp_mem.@"type".limits.has_max) {
-                        interp.instance.shared_memory_max_pages = exp_mem.@"type".limits.max;
+                        interp.instance.shared_memory_max_pages_map.put(self.allocator, memory_import_idx, exp_mem.@"type".limits.max) catch {};
                     }
                 }
             } else if (imp.kind == .table) {
@@ -418,13 +425,9 @@ const RunState = struct {
                         const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
                         if (exp_idx >= triple.module.memories.items.len) return false;
                         const exp_mem = triple.module.memories.items[exp_idx];
-                        // Actual size must be what's required
-                        const actual = if (triple.instance.shared_memory) |_|
-                            @as(u64, @intCast(triple.instance.getMemory().items.len / 65536))
-                        else
-                            @as(u64, @intCast(triple.instance.getMemory().items.len / 65536));
+                        const actual = @as(u64, @intCast(triple.instance.getMemory(exp_idx).items.len / 65536));
                         if (actual < imp_m.limits.initial) return false;
-                        // If import has max, export must also have max and export.max ≤ import.max
+                        // If import has max, export must also have max and export.max <= import.max
                         if (imp_m.limits.has_max) {
                             if (!exp_mem.@"type".limits.has_max) return false;
                             if (exp_mem.@"type".limits.max > imp_m.limits.max) return false;
@@ -1037,7 +1040,7 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         inst.interp_ref = interp2;
         state.resolveImports(mod, interp2);
 
-        const has_shared = inst.shared_memory != null or inst.shared_tables != null;
+        const has_shared = inst.shared_memories.count() > 0 or inst.shared_tables != null;
         const triple = ModuleTriple{ .module = mod, .instance = inst, .interpreter = interp2 };
 
         inst.instantiate() catch {
