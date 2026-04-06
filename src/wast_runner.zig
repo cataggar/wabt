@@ -630,7 +630,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                             continue;
                         };
                         if (state.setModuleBinary(wasm_bytes)) {
-                            // Module now owns the bytes (slices into them for names/code)
+                            state.owned_sources.append(allocator, wasm_bytes) catch {};
                             result.passed += 1;
                         } else {
                             allocator.free(wasm_bytes);
@@ -907,6 +907,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_func_name) orelse raw_func_name;
+    defer if (func_name.ptr != raw_func_name.ptr) allocator.free(func_name);
 
     var args_buf: [32]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -1080,6 +1081,7 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_name_trap) orelse raw_name_trap;
+    defer if (func_name.ptr != raw_name_trap.ptr) allocator.free(func_name);
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -1109,6 +1111,7 @@ fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, stat
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_exh_name) orelse raw_exh_name;
+    defer if (func_name.ptr != raw_exh_name.ptr) allocator.free(func_name);
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -1199,6 +1202,7 @@ fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunSta
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_inv_name) orelse raw_inv_name;
+    defer if (func_name.ptr != raw_inv_name.ptr) allocator.free(func_name);
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(sexpr, &args_buf);
     _ = interp.callExport(func_name, args) catch {};

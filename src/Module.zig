@@ -316,6 +316,9 @@ pub const Module = struct {
     has_data_count: bool = false,
     data_count: u32 = 0,
 
+    // Heap-allocated name strings (e.g. decoded escape sequences in import/export names).
+    owned_strings: std.ArrayListUnmanaged([]const u8) = .{},
+
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{ .allocator = allocator };
     }
@@ -346,6 +349,10 @@ pub const Module = struct {
             }
         }
         self.globals.deinit(self.allocator);
+        for (self.tags.items) |tag| {
+            if (tag.@"type".sig.params.len > 0) self.allocator.free(tag.@"type".sig.params);
+            if (tag.@"type".sig.results.len > 0) self.allocator.free(tag.@"type".sig.results);
+        }
         self.tags.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.exports.deinit(self.allocator);
@@ -369,6 +376,8 @@ pub const Module = struct {
         }
         self.data_segments.deinit(self.allocator);
         self.customs.deinit(self.allocator);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
     }
 
     /// Get the total number of functions (imports + defined).

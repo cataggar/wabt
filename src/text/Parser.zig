@@ -71,6 +71,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     // Pass 2: process all other declarations (skip type/rec which were already handled).
     p.lexer.pos = saved_pos;
     p.peeked = saved_peeked;
+    const pass1_malformed = p.malformed;
     p.malformed = false; // Reset malformed flag for Pass 2
     var seen_non_import_def = false; // Track if we've seen func/global/table/memory definitions
 
@@ -127,8 +128,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     }
 
     try p.expect(.r_paren);
-    if (p.malformed) {
-        std.debug.print("  DEBUG: malformed detected in parseModule\n", .{});
+    if (p.malformed or pass1_malformed) {
         return error.InvalidModule;
     }
     return module;
@@ -270,6 +270,8 @@ const Parser = struct {
     module: ?*Mod.Module = null,
     /// Set when malformed input is detected (e.g. invalid alignment).
     malformed: bool = false,
+    /// True when parsing inside a (rec ...) group (forward type refs allowed).
+    in_rec: bool = false,
     /// Map from function $name to index (for name resolution in call instructions).
     func_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from type $name to index (for name resolution).
@@ -374,6 +376,11 @@ const Parser = struct {
         return self.parseIndexWithMap(&self.type_names);
     }
 
+    /// Check if an identifier is empty (just "$" with no following chars)
+    fn checkEmptyId(self: *Parser, text: []const u8) void {
+        if (text.len == 1 and text[0] == '$') self.malformed = true;
+    }
+
     fn parseValType(self: *Parser) ParseError!types.ValType {
         // Handle parenthesized reference types: (ref null <heaptype>) / (ref <heaptype>)
         if (self.peek().kind == .l_paren) {
@@ -397,8 +404,17 @@ const Parser = struct {
                             try self.expect(.r_paren);
                             return if (nullable) .ref_null else .ref;
                         };
-                        if (self.module) |mod| {
-                            if (idx >= mod.module_types.items.len) self.malformed = true;
+                        if (!self.in_rec) {
+                            if (self.module) |mod| {
+                                if (idx >= mod.module_types.items.len) self.malformed = true;
+                            }
+                        }
+                    } else if (ht.kind == .identifier and !self.in_rec) {
+                        // Validate named type references are defined (forward refs only allowed in rec)
+                        if (self.type_names.get(ht.text)) |idx| {
+                            if (self.module) |mod| {
+                                if (idx >= mod.module_types.items.len) self.malformed = true;
+                            }
                         }
                     }
                 }
@@ -495,6 +511,8 @@ const Parser = struct {
 
     fn parseRec(self: *Parser, module: *Mod.Module) ParseError!void {
         // (rec (type ...) (type ...) ...)
+        self.in_rec = true;
+        defer self.in_rec = false;
         while (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_type) {
@@ -515,6 +533,7 @@ const Parser = struct {
         self.label_stack.clearRetainingCapacity();
         if (self.peek().kind == .identifier) {
             func.name = self.advance().text;
+            if (func.name) |n| self.checkEmptyId(n);
             // Register name → index for call resolution
             if (func.name) |n| {
                 if (self.func_names.get(n)) |existing| {
@@ -2230,8 +2249,45 @@ const Parser = struct {
                 break;
             }
         }
-        // Register a tag entry and skip remaining content
-        try module.tags.append(self.allocator, .{});
+        // Parse tag type: (param ...) and (result ...)
+        var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        defer params_list.deinit(self.allocator);
+        var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        defer results_list.deinit(self.allocator);
+        while (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance();
+            if (self.peek().kind == .kw_param) {
+                _ = self.advance();
+                if (self.peek().kind == .identifier) _ = self.advance();
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const vt = self.parseValType() catch break;
+                    params_list.append(self.allocator, vt) catch {};
+                }
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            } else if (self.peek().kind == .kw_result) {
+                _ = self.advance();
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const vt = self.parseValType() catch break;
+                    results_list.append(self.allocator, vt) catch {};
+                }
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            } else if (self.peek().kind == .kw_type) {
+                _ = self.advance();
+                _ = self.parseTypeIdx() catch 0;
+                if (self.peek().kind == .r_paren) _ = self.advance();
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+        const params = params_list.toOwnedSlice(self.allocator) catch &.{};
+        const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+        try module.tags.append(self.allocator, .{
+            .@"type" = .{ .sig = .{ .params = params, .results = results } },
+        });
         // Skip to closing paren of (tag ...)
         self.skipToRParen();
     }
@@ -2394,6 +2450,50 @@ const Parser = struct {
                     .is_import = true,
                 });
                 module.num_global_imports += 1;
+            },
+            .kw_tag => {
+                import.kind = .tag;
+                if (self.peek().kind == .identifier) _ = self.advance();
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer params_list.deinit(self.allocator);
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer results_list.deinit(self.allocator);
+                while (self.peek().kind == .l_paren) {
+                    const sp2 = self.lexer.pos;
+                    const spk2 = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_param) {
+                        _ = self.advance();
+                        if (self.peek().kind == .identifier) _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            params_list.append(self.allocator, vt) catch {};
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else if (self.peek().kind == .kw_result) {
+                        _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            results_list.append(self.allocator, vt) catch {};
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else if (self.peek().kind == .kw_type) {
+                        _ = self.advance();
+                        _ = self.parseTypeIdx() catch 0;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = sp2;
+                        self.peeked = spk2;
+                        break;
+                    }
+                }
+                const params = params_list.toOwnedSlice(self.allocator) catch &.{};
+                const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                try module.tags.append(self.allocator, .{
+                    .@"type" = .{ .sig = .{ .params = params, .results = results } },
+                    .is_import = true,
+                });
+                module.num_tag_imports += 1;
             },
             else => try self.skipSExpr(),
         }
@@ -2686,6 +2786,9 @@ const Parser = struct {
             if (decoded.len > 0) {
                 if (!std.unicode.utf8ValidateSlice(decoded)) {
                     self.malformed = true;
+                }
+                if (self.module) |m| {
+                    m.owned_strings.append(self.allocator, decoded) catch {};
                 }
                 return decoded;
             }

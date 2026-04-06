@@ -46,6 +46,7 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkTables(module, options);
     try checkMemories(module, options);
     try checkGlobals(module);
+    try checkTags(module);
     try checkExports(module);
     try checkStart(module);
     try checkElemSegments(module);
@@ -128,6 +129,13 @@ fn checkGlobals(m: *const Mod.Module) Error!void {
             const expected = ValTypeOrUnknown.fromValType(global.type.val_type);
             try checkConstExpr(m, global.init_expr_bytes, expected, @intCast(i));
         }
+    }
+}
+
+fn checkTags(m: *const Mod.Module) Error!void {
+    for (m.tags.items) |tag| {
+        // Tag types must have empty result types per spec.
+        if (tag.@"type".sig.results.len > 0) return error.TypeMismatch;
     }
 }
 
@@ -425,6 +433,9 @@ const ValTypeOrUnknown = enum(i32) {
     v128 = @intFromEnum(types.ValType.v128),
     funcref = @intFromEnum(types.ValType.funcref),
     externref = @intFromEnum(types.ValType.externref),
+    anyref = @intFromEnum(types.ValType.anyref),
+    ref = @intFromEnum(types.ValType.ref),
+    ref_null = @intFromEnum(types.ValType.ref_null),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -436,7 +447,17 @@ const ValTypeOrUnknown = enum(i32) {
             .v128 => .v128,
             .funcref => .funcref,
             .externref => .externref,
+            .anyref => .anyref,
+            .ref => .ref,
+            .ref_null => .ref_null,
             else => .unknown,
+        };
+    }
+
+    fn isRefType(self: ValTypeOrUnknown) bool {
+        return switch (self) {
+            .funcref, .externref, .anyref, .ref, .ref_null => true,
+            else => false,
         };
     }
 
@@ -630,8 +651,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const t2 = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
                 if (t1 != .unknown and t2 != .unknown and t1 != t2) return error.TypeMismatch;
                 const result = if (t1 != .unknown) t1 else t2;
-                // Untyped select only works with numeric types, not ref types
-                if (result == .funcref or result == .externref) return error.TypeMismatch;
+                // Untyped select only works with numeric/vector types, not ref types
+                if (result.isRefType()) return error.TypeMismatch;
                 val_stack.append(gpa(m), result) catch return error.OutOfMemory;
             },
             0x1c => { // select t
