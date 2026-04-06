@@ -38,6 +38,7 @@ pub const Value = union(enum) {
     i64: i64,
     f32: f32,
     f64: f64,
+    v128: u128,
     ref_null: void,
     ref_func: u32,
 };
@@ -490,6 +491,7 @@ pub const Interpreter = struct {
                     .i64 => .{ .i64 = 0 },
                     .f32 => .{ .f32 = 0.0 },
                     .f64 => .{ .f64 = 0.0 },
+                    .v128 => .{ .v128 = 0 },
                     .funcref => .{ .ref_null = {} },
                     .externref => .{ .ref_null = {} },
                     else => .{ .i32 = 0 },
@@ -2551,10 +2553,28 @@ pub const Interpreter = struct {
                         else => return error.Unimplemented,
                     }
                 },
+                0xfd => { // SIMD prefix
+                    var t = pc;
+                    const simd_sub = readCodeU32(code, &t);
+                    pc = t;
+                    switch (simd_sub) {
+                        0x0c => try self.simdConst(code, &pc), // v128.const
+                        else => return error.Unimplemented,
+                    }
+                },
                 else => return error.Unimplemented,
             }
         }
         return pc;
+    }
+
+    fn simdConst(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
+        if (pc.* + 16 <= code.len) {
+            var bytes: [16]u8 = undefined;
+            @memcpy(&bytes, code[pc.*..][0..16]);
+            pc.* += 16;
+            try self.pushValue(.{ .v128 = @bitCast(bytes) });
+        } else return error.Unimplemented;
     }
 };
 
@@ -2759,6 +2779,20 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
             0x0b => { // end
                 if (sp > 0) return stack[sp - 1];
                 return null;
+            },
+            0xfd => { // SIMD prefix
+                const simd_op = readCodeU32(expr, &pc);
+                switch (simd_op) {
+                    0x0c => { // v128.const
+                        if (pc + 16 <= expr.len) {
+                            var bytes: [16]u8 = undefined;
+                            @memcpy(&bytes, expr[pc..][0..16]);
+                            pc += 16;
+                            if (sp < 16) { stack[sp] = .{ .v128 = @bitCast(bytes) }; sp += 1; }
+                        } else return null;
+                    },
+                    else => return null,
+                }
             },
             else => return null,
         }

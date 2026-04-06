@@ -1553,8 +1553,93 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
         return .{ .ref_func = idx }; // non-null externref represented as ref_func
+    } else if (std.mem.eql(u8, kw, "v128.const")) {
+        // val_text is the lane type (i8x16, i16x8, i32x4, i64x2, f32x4, f64x2)
+        return parseV128Const(val_text, sexpr, i);
     }
     return null;
+}
+
+/// Parse a v128.const value from a sexpr starting at position `pos` (after the lane type token).
+fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Interp.Value {
+    var i = start;
+
+    // Read lane values
+    var bytes: [16]u8 = .{0} ** 16;
+    if (std.mem.eql(u8, lane_type, "i8x16")) {
+        for (0..16) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i8, clean, 0) catch blk: {
+                break :blk @as(i8, @bitCast(std.fmt.parseInt(u8, clean, 0) catch return null));
+            };
+            bytes[idx] = @bitCast(v);
+        }
+    } else if (std.mem.eql(u8, lane_type, "i16x8")) {
+        for (0..8) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i16, clean, 0) catch blk: {
+                break :blk @as(i16, @bitCast(std.fmt.parseInt(u16, clean, 0) catch return null));
+            };
+            const b: [2]u8 = @bitCast(v);
+            bytes[idx * 2] = b[0];
+            bytes[idx * 2 + 1] = b[1];
+        }
+    } else if (std.mem.eql(u8, lane_type, "i32x4")) {
+        for (0..4) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i32, clean, 0) catch blk: {
+                break :blk @as(i32, @bitCast(std.fmt.parseInt(u32, clean, 0) catch return null));
+            };
+            const b: [4]u8 = @bitCast(v);
+            @memcpy(bytes[idx * 4 ..][0..4], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "i64x2")) {
+        for (0..2) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i64, clean, 0) catch blk: {
+                break :blk @as(i64, @bitCast(std.fmt.parseInt(u64, clean, 0) catch return null));
+            };
+            const b: [8]u8 = @bitCast(v);
+            @memcpy(bytes[idx * 8 ..][0..8], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "f32x4")) {
+        for (0..4) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            // Try integer first (some tests use integer representation for f32)
+            const bits: u32 = if (std.fmt.parseInt(u32, clean, 0)) |u| u else |_| Parser.parseFloatBits(f32, clean);
+            const b: [4]u8 = @bitCast(bits);
+            @memcpy(bytes[idx * 4 ..][0..4], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "f64x2")) {
+        for (0..2) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const bits = Parser.parseFloatBits(f64, clean);
+            const b: [8]u8 = @bitCast(bits);
+            @memcpy(bytes[idx * 8 ..][0..8], &b);
+        }
+    } else return null;
+
+    return .{ .v128 = @bitCast(bytes) };
+}
+
+fn nextToken(text: []const u8, pos: *usize) ?[]const u8 {
+    while (pos.* < text.len and isWhitespace(text[pos.*])) : (pos.* += 1) {}
+    if (pos.* >= text.len or text[pos.*] == ')') return null;
+    const start = pos.*;
+    while (pos.* < text.len and !isWhitespace(text[pos.*]) and text[pos.*] != ')') : (pos.* += 1) {}
+    return text[start..pos.*];
 }
 
 /// Strip WAT `_` digit separators from a number string.
@@ -1630,6 +1715,10 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
                 if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
                 return av == bv;
             },
+            else => false,
+        },
+        .v128 => |av| switch (b) {
+            .v128 => |bv| av == bv,
             else => false,
         },
     };
