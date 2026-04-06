@@ -29,13 +29,14 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.global_names.deinit(allocator);
     defer p.table_names.deinit(allocator);
     defer p.memory_names.deinit(allocator);
+    defer p.data_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
     p.module = &module;
 
-    // Pre-scan: collect function, type, global, table, and memory names for forward references.
-    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, &p.memory_names, allocator);
+    // Pre-scan: collect function, type, global, table, memory, and data names for forward references.
+    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, &p.memory_names, &p.data_names, allocator);
 
     try p.expect(.l_paren);
     try p.expect(.kw_module);
@@ -141,6 +142,7 @@ fn prescanNames(
     global_names: *std.StringArrayHashMapUnmanaged(u32),
     table_names: *std.StringArrayHashMapUnmanaged(u32),
     memory_names: *std.StringArrayHashMapUnmanaged(u32),
+    data_names: *std.StringArrayHashMapUnmanaged(u32),
     allocator: std.mem.Allocator,
 ) void {
     var lex = Lexer.init(source);
@@ -149,6 +151,7 @@ fn prescanNames(
     var global_idx: u32 = 0;
     var table_idx: u32 = 0;
     var memory_idx: u32 = 0;
+    var data_idx: u32 = 0;
 
     // Skip (module and optional name
     var tok = lex.next();
@@ -191,6 +194,12 @@ fn prescanNames(
                 memory_names.put(allocator, tok.text, memory_idx) catch {};
             }
             memory_idx += 1;
+        } else if (tok.kind == .kw_data) {
+            tok = lex.next();
+            if (tok.kind == .identifier) {
+                data_names.put(allocator, tok.text, data_idx) catch {};
+            }
+            data_idx += 1;
         } else if (tok.kind == .kw_import) {
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
@@ -272,6 +281,8 @@ const Parser = struct {
     table_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from memory $name to index.
     memory_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from data segment $name to index.
+    data_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
 
@@ -1435,6 +1446,10 @@ const Parser = struct {
                 self.emitLeb128U32(code, idx);
                 return;
             }
+            if (self.data_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
             self.emitLeb128U32(code, 0);
             return;
         }
@@ -1651,9 +1666,31 @@ const Parser = struct {
     fn emitBulkMemImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
         switch (sub) {
             0x08 => {
-                // memory.init: data_idx, memory_idx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                // memory.init: WAT syntax is `memory.init $mem $data` or `memory.init $data`
+                // Binary format expects: data_idx, mem_idx
+                const first_kind = self.peek().kind;
+                if (first_kind == .identifier or first_kind == .integer) {
+                    var first_code = std.ArrayListUnmanaged(u8){};
+                    self.emitU32Imm(&first_code);
+                    const second_kind = self.peek().kind;
+                    if (second_kind == .identifier or second_kind == .integer) {
+                        // Two immediates: first is mem_idx, second is data_idx
+                        // Binary order: data_idx, mem_idx
+                        var second_code = std.ArrayListUnmanaged(u8){};
+                        self.emitU32Imm(&second_code);
+                        code.appendSlice(self.allocator, second_code.items) catch {};
+                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        second_code.deinit(self.allocator);
+                    } else {
+                        // One immediate: it's data_idx, mem defaults to 0
+                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        self.emitLeb128U32(code, 0); // mem_idx = 0
+                    }
+                    first_code.deinit(self.allocator);
+                } else {
+                    self.emitLeb128U32(code, 0); // data_idx = 0
+                    self.emitLeb128U32(code, 0); // mem_idx = 0
+                }
             },
             0x09 => self.emitU32Imm(code), // data.drop
             0x0a => {
