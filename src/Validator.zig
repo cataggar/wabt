@@ -1069,23 +1069,25 @@ fn checkBinary(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFra
 }
 
 fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), result_type: ValTypeOrUnknown, alloc: std.mem.Allocator, opcode: u8) Error!void {
+    const mem_idx = readU32(bytes, pos);
     const align_val = readU32(bytes, pos);
     _ = readU32(bytes, pos); // offset
     if (maxAlignmentForOpcode(opcode)) |max_align| {
         if (align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, .i32);
     val_stack.append(alloc, result_type) catch return error.OutOfMemory;
 }
 
 fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), value_type: ValTypeOrUnknown, _: std.mem.Allocator, opcode: u8) Error!void {
+    const mem_idx = readU32(bytes, pos);
     const align_val = readU32(bytes, pos);
     _ = readU32(bytes, pos); // offset
     if (maxAlignmentForOpcode(opcode)) |max_align| {
         if (align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, value_type);
     try popExpect(val_stack, ctrl_stack, .i32);
 }
