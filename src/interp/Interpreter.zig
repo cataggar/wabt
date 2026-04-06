@@ -4151,6 +4151,17 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
                 else => {},
             }
         },
+        0xfd => { // SIMD prefix
+            const sub = readCodeU32(code, &p);
+            switch (sub) {
+                0x00...0x0b => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // v128 load/store: memarg(align, offset) + mem_idx
+                0x0c => p += 16, // v128.const: 16 bytes immediate
+                0x0d => p += 16, // i8x16.shuffle: 16 lane bytes
+                0x15...0x22 => p += 1, // extract_lane/replace_lane: 1 lane byte
+                0x54...0x5d => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); p += 1; }, // v128 load/store lane
+                else => {}, // Most SIMD ops have no immediates
+            }
+        },
         else => {},
     }
     return p;
