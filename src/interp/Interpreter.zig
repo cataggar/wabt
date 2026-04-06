@@ -23,6 +23,7 @@ pub const TrapError = error{
     UndefinedElement,
     UninitializedElement,
     IndirectCallTypeMismatch,
+    CastFailure,
     StackOverflow,
     CallStackExhausted,
     OutOfMemory,
@@ -2570,6 +2571,56 @@ pub const Interpreter = struct {
                         else => return error.Unimplemented,
                     }
                 },
+                0xfb => { // GC prefix
+                    var t = pc;
+                    const gc_sub = readCodeU32(code, &t);
+                    pc = t;
+                    switch (gc_sub) {
+                        0x14, 0x15 => { // ref.test (non-null / nullable)
+                            const heap_type = readCodeS32(code, &pc);
+                            const val = try self.popValue();
+                            const result: i32 = switch (val) {
+                                .ref_null => 0,
+                                .ref_func => |fidx| blk: {
+                                    if (heap_type < 0) break :blk 1; // abstract heap type, funcref matches
+                                    const ht_idx: u32 = @intCast(heap_type);
+                                    if (fidx < self.instance.module.funcs.items.len) {
+                                        const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
+                                        break :blk if (self.isSubtypeOf(func_type, ht_idx, self)) @as(i32, 1) else @as(i32, 0);
+                                    }
+                                    break :blk 0;
+                                },
+                                else => 0,
+                            };
+                            try self.pushValue(.{ .i32 = result });
+                        },
+                        0x16, 0x17 => { // ref.cast (non-null / nullable)
+                            const heap_type = readCodeS32(code, &pc);
+                            const val = try self.popValue();
+                            switch (val) {
+                                .ref_null => {
+                                    if (gc_sub == 0x16) return error.CastFailure; // non-null cast
+                                    try self.pushValue(val);
+                                },
+                                .ref_func => |fidx| {
+                                    if (heap_type < 0) {
+                                        try self.pushValue(val); // abstract heap type, funcref matches
+                                    } else {
+                                        const ht_idx: u32 = @intCast(heap_type);
+                                        if (fidx < self.instance.module.funcs.items.len) {
+                                            const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
+                                            if (self.isSubtypeOf(func_type, ht_idx, self)) {
+                                                try self.pushValue(val);
+                                            } else return error.CastFailure;
+                                        } else return error.CastFailure;
+                                    }
+                                },
+                                else => return error.CastFailure,
+                            }
+                        },
+                        else => return error.Unimplemented,
+                    }
+                },
                 0xfd => { // SIMD prefix
                     var t = pc;
                     const simd_sub = readCodeU32(code, &t);
@@ -2809,6 +2860,13 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
             switch (sub) {
                 0x08, 0x0a, 0x0c, 0x0e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
                 0x09, 0x0b, 0x0d, 0x0f, 0x10, 0x11 => _ = readCodeU32(code, &p),
+                else => {},
+            }
+        },
+        0xfb => { // GC prefix
+            const sub = readCodeU32(code, &p);
+            switch (sub) {
+                0x14, 0x15, 0x16, 0x17 => _ = readCodeS32(code, &p), // ref.test/cast + heaptype
                 else => {},
             }
         },

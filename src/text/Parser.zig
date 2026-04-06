@@ -1616,6 +1616,53 @@ const Parser = struct {
                 code.append(self.allocator, 0xd2) catch return;
                 self.emitU32Imm(code);
             },
+            .kw_ref_test, .kw_ref_cast => {
+                // ref.test (ref [null] <ht>) / ref.cast (ref [null] <ht>)
+                // Encoding: 0xfb + sub_opcode + heaptype
+                code.append(self.allocator, 0xfb) catch return;
+                var nullable = false;
+                // Parse (ref [null] <heaptype>)
+                if (self.peek().kind == .l_paren) {
+                    _ = self.advance(); // consume '('
+                    if (self.peek().kind == .kw_ref) {
+                        _ = self.advance(); // consume 'ref'
+                        if (self.peek().kind == .kw_null) {
+                            _ = self.advance();
+                            nullable = true;
+                        }
+                    }
+                    // Parse heap type
+                    var heap_type_idx: i32 = -1;
+                    if (self.peek().kind == .identifier) {
+                        const name = self.advance().text;
+                        if (self.type_names.get(name)) |idx| {
+                            heap_type_idx = @intCast(idx);
+                        }
+                    } else if (self.peek().kind == .integer) {
+                        heap_type_idx = @intCast(self.parseU32() catch 0);
+                    } else if (self.peek().kind == .kw_func) {
+                        _ = self.advance();
+                        heap_type_idx = 0x70; // func abstract heap type
+                    } else if (self.peek().kind != .r_paren) {
+                        const ht_text = self.advance().text;
+                        if (std.mem.eql(u8, ht_text, "extern")) heap_type_idx = 0x6f
+                        else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e;
+                    }
+                    if (self.peek().kind == .r_paren) _ = self.advance();
+                    // Emit sub-opcode
+                    const sub_op: u32 = if (tok.kind == .kw_ref_test)
+                        (if (nullable) @as(u32, 0x15) else @as(u32, 0x14))
+                    else
+                        (if (nullable) @as(u32, 0x17) else @as(u32, 0x16));
+                    self.emitLeb128U32(code, sub_op);
+                    // Emit heap type as signed LEB128
+                    if (heap_type_idx >= 0) {
+                        var buf: [5]u8 = undefined;
+                        const n = leb128.writeS32Leb128(&buf, heap_type_idx);
+                        code.appendSlice(self.allocator, buf[0..n]) catch {};
+                    }
+                }
+            },
             .opcode => self.emitGenericOpcode(tok.text, code),
             .invalid => {
                 self.malformed = true;

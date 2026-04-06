@@ -54,6 +54,8 @@ pub const TokenKind = enum {
     kw_ref_null,
     kw_ref_func,
     kw_ref_extern,
+    kw_ref_test,
+    kw_ref_cast,
 
     // Control instructions
     kw_block,
@@ -463,6 +465,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "ref.null")) return .kw_ref_null;
     if (eql(text, "ref.func")) return .kw_ref_func;
     if (eql(text, "ref.extern")) return .kw_ref_extern;
+    if (eql(text, "ref.test")) return .kw_ref_test;
+    if (eql(text, "ref.cast")) return .kw_ref_cast;
 
     // Control instructions
     if (eql(text, "block")) return .kw_block;
