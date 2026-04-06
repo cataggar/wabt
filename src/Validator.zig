@@ -961,6 +961,9 @@ const single_f64: [1]types.ValType = .{.f64};
 const single_funcref: [1]types.ValType = .{.funcref};
 const single_externref: [1]types.ValType = .{.externref};
 
+const single_ref_null: [1]types.ValType = .{.ref_null};
+const single_ref: [1]types.ValType = .{.ref};
+
 fn valTypeSlice(byte: u8) []const types.ValType {
     return switch (byte) {
         0x7f => &single_i32,
@@ -969,6 +972,8 @@ fn valTypeSlice(byte: u8) []const types.ValType {
         0x7c => &single_f64,
         0x70 => &single_funcref,
         0x6f => &single_externref,
+        0x63 => &single_ref_null,
+        0x64 => &single_ref,
         else => &.{},
     };
 }
@@ -1069,23 +1074,25 @@ fn checkBinary(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFra
 }
 
 fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), result_type: ValTypeOrUnknown, alloc: std.mem.Allocator, opcode: u8) Error!void {
+    const mem_idx = readU32(bytes, pos);
     const align_val = readU32(bytes, pos);
     _ = readU32(bytes, pos); // offset
     if (maxAlignmentForOpcode(opcode)) |max_align| {
         if (align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, .i32);
     val_stack.append(alloc, result_type) catch return error.OutOfMemory;
 }
 
 fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), value_type: ValTypeOrUnknown, _: std.mem.Allocator, opcode: u8) Error!void {
+    const mem_idx = readU32(bytes, pos);
     const align_val = readU32(bytes, pos);
     _ = readU32(bytes, pos); // offset
     if (maxAlignmentForOpcode(opcode)) |max_align| {
         if (align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, value_type);
     try popExpect(val_stack, ctrl_stack, .i32);
 }
