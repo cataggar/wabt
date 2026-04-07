@@ -3303,6 +3303,28 @@ pub const Interpreter = struct {
                         0xfe => try self.f64x2ConvertLowI32x4(true),
                         0xff => try self.f64x2ConvertLowI32x4(false),
 
+                        // ── Relaxed SIMD (0x100-0x113) ──
+                        0x100 => try self.relaxedSwizzle(),
+                        0x101 => try self.relaxedTruncF32x4(true),
+                        0x102 => try self.relaxedTruncF32x4(false),
+                        0x103 => try self.relaxedTruncF64x2Zero(true),
+                        0x104 => try self.relaxedTruncF64x2Zero(false),
+                        0x105 => try self.relaxedMadd(f32, 4),
+                        0x106 => try self.relaxedNmadd(f32, 4),
+                        0x107 => try self.relaxedMadd(f64, 2),
+                        0x108 => try self.relaxedNmadd(f64, 2),
+                        0x109 => try self.relaxedLaneselect(u8, 16),
+                        0x10a => try self.relaxedLaneselect(u16, 8),
+                        0x10b => try self.relaxedLaneselect(u32, 4),
+                        0x10c => try self.relaxedLaneselect(u64, 2),
+                        0x10d => try self.relaxedMinMax(f32, 4, true),
+                        0x10e => try self.relaxedMinMax(f32, 4, false),
+                        0x10f => try self.relaxedMinMax(f64, 2, true),
+                        0x110 => try self.relaxedMinMax(f64, 2, false),
+                        0x111 => try self.relaxedQ15mulr(),
+                        0x112 => try self.relaxedDotI8x16I7x16S(),
+                        0x113 => try self.relaxedDotI8x16I7x16AddS(),
+
                         else => return error.Unimplemented,
                     }
                 },
@@ -4295,6 +4317,119 @@ pub const Interpreter = struct {
         if (v <= 0.0) return 0;
         if (v >= 4294967295.0) return 4294967295;
         return @intFromFloat(v);
+    }
+
+    // ── Relaxed SIMD operations ─────────────────────────────────────────
+
+    fn relaxedSwizzle(self: *Interpreter) TrapError!void {
+        const s = try self.popValue();
+        const a = try self.popValue();
+        const av: [16]u8 = @bitCast(a.v128);
+        const sv: [16]u8 = @bitCast(s.v128);
+        var result: [16]u8 = undefined;
+        for (0..16) |i| {
+            const idx = sv[i];
+            result[i] = if (idx < 16) av[idx] else 0;
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedTruncF32x4(self: *Interpreter, comptime signed: bool) TrapError!void {
+        try self.i32x4TruncSatF32x4(signed);
+    }
+
+    fn relaxedTruncF64x2Zero(self: *Interpreter, comptime signed: bool) TrapError!void {
+        try self.i32x4TruncSatF64x2Zero(signed);
+    }
+
+    fn relaxedMadd(self: *Interpreter, comptime T: type, comptime lanes: comptime_int) TrapError!void {
+        const c: [lanes]T = @bitCast((try self.popValue()).v128);
+        const b: [lanes]T = @bitCast((try self.popValue()).v128);
+        const a: [lanes]T = @bitCast((try self.popValue()).v128);
+        var result: [lanes]T = undefined;
+        for (0..lanes) |i| {
+            result[i] = @mulAdd(T, a[i], b[i], c[i]);
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedNmadd(self: *Interpreter, comptime T: type, comptime lanes: comptime_int) TrapError!void {
+        const c: [lanes]T = @bitCast((try self.popValue()).v128);
+        const b: [lanes]T = @bitCast((try self.popValue()).v128);
+        const a: [lanes]T = @bitCast((try self.popValue()).v128);
+        var result: [lanes]T = undefined;
+        for (0..lanes) |i| {
+            result[i] = @mulAdd(T, -a[i], b[i], c[i]);
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedLaneselect(self: *Interpreter, comptime T: type, comptime lanes: comptime_int) TrapError!void {
+        const m: [lanes]T = @bitCast((try self.popValue()).v128);
+        const b: [lanes]T = @bitCast((try self.popValue()).v128);
+        const a: [lanes]T = @bitCast((try self.popValue()).v128);
+        var result: [lanes]T = undefined;
+        for (0..lanes) |i| {
+            result[i] = (a[i] & m[i]) | (b[i] & ~m[i]);
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedMinMax(self: *Interpreter, comptime T: type, comptime lanes: comptime_int, comptime is_min: bool) TrapError!void {
+        const b: [lanes]T = @bitCast((try self.popValue()).v128);
+        const a: [lanes]T = @bitCast((try self.popValue()).v128);
+        var result: [lanes]T = undefined;
+        for (0..lanes) |i| {
+            if (is_min) {
+                result[i] = @min(a[i], b[i]);
+            } else {
+                result[i] = @max(a[i], b[i]);
+            }
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedQ15mulr(self: *Interpreter) TrapError!void {
+        const b: [8]i16 = @bitCast((try self.popValue()).v128);
+        const a: [8]i16 = @bitCast((try self.popValue()).v128);
+        var result: [8]i16 = undefined;
+        for (0..8) |i| {
+            const prod: i32 = @as(i32, a[i]) * @as(i32, b[i]);
+            result[i] = @truncate(@as(i32, @intCast((prod + 0x4000) >> 15)));
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedDotI8x16I7x16S(self: *Interpreter) TrapError!void {
+        const b: [16]u8 = @bitCast((try self.popValue()).v128);
+        const a: [16]u8 = @bitCast((try self.popValue()).v128);
+        var result: [8]i16 = undefined;
+        for (0..8) |i| {
+            const a0: i16 = @as(i8, @bitCast(a[i * 2]));
+            const a1: i16 = @as(i8, @bitCast(a[i * 2 + 1]));
+            const b0: i16 = @as(i16, b[i * 2]);
+            const b1: i16 = @as(i16, b[i * 2 + 1]);
+            result[i] = @truncate(@as(i32, a0) * @as(i32, b0) + @as(i32, a1) * @as(i32, b1));
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
+    }
+
+    fn relaxedDotI8x16I7x16AddS(self: *Interpreter) TrapError!void {
+        const c: [4]i32 = @bitCast((try self.popValue()).v128);
+        const b: [16]u8 = @bitCast((try self.popValue()).v128);
+        const a: [16]u8 = @bitCast((try self.popValue()).v128);
+        var result: [4]i32 = undefined;
+        for (0..4) |i| {
+            var sum: i32 = c[i];
+            for (0..4) |j| {
+                const idx = i * 4 + j;
+                const av: i32 = @as(i8, @bitCast(a[idx]));
+                const bv: i32 = @as(i32, b[idx]);
+                sum +%= av * bv;
+            }
+            result[i] = sum;
+        }
+        try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
     /// Check if a type index has GC sub-type metadata.

@@ -2511,20 +2511,23 @@ const Parser = struct {
                     self.emitU32Imm(code);
                 }
             } else {
-                // Prefixed opcode
-                const prefix: u8 = @truncate(op >> 8);
-                const sub: u32 = op & 0xff;
-                code.append(self.allocator, prefix) catch return;
+                // Prefixed opcode: high byte(s) = prefix, low bits = sub-opcode
+                const prefix: u8 = @truncate(op >> 16);
+                const sub: u32 = if (prefix != 0) op & 0xffff else blk: {
+                    // Legacy encoding: prefix in bits 8-15, sub in bits 0-7
+                    break :blk op & 0xff;
+                };
+                const actual_prefix: u8 = if (prefix != 0) prefix else @truncate(op >> 8);
+                code.append(self.allocator, actual_prefix) catch return;
                 var buf: [5]u8 = undefined;
                 const n = leb128.writeU32Leb128(&buf, sub);
                 code.appendSlice(self.allocator, buf[0..n]) catch return;
                 // Atomic/bulk memory instructions may have memarg or other immediates
-                if (prefix == 0xfe and sub >= 0x10) {
-                    // Atomic load/store/rmw/cmpxchg have memarg (no alignment check for now)
+                if (actual_prefix == 0xfe and sub >= 0x10) {
                     self.emitMemarg(code, 0);
-                } else if (prefix == 0xfc) {
+                } else if (actual_prefix == 0xfc) {
                     self.emitBulkMemImm(sub, code);
-                } else if (prefix == 0xfd) {
+                } else if (actual_prefix == 0xfd) {
                     self.emitSimdImm(sub, code);
                 }
             }
@@ -4824,6 +4827,27 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "i64x2.extmul_high_i32x4_s", 0xfddd },
         .{ "i64x2.extmul_low_i32x4_u", 0xfdde },
         .{ "i64x2.extmul_high_i32x4_u", 0xfddf },
+        // Relaxed SIMD (0xfd prefix, sub-opcodes 0x100-0x113)
+        .{ "i8x16.relaxed_swizzle", 0xfd_0100 },
+        .{ "i32x4.relaxed_trunc_f32x4_s", 0xfd_0101 },
+        .{ "i32x4.relaxed_trunc_f32x4_u", 0xfd_0102 },
+        .{ "i32x4.relaxed_trunc_f64x2_s_zero", 0xfd_0103 },
+        .{ "i32x4.relaxed_trunc_f64x2_u_zero", 0xfd_0104 },
+        .{ "f32x4.relaxed_madd", 0xfd_0105 },
+        .{ "f32x4.relaxed_nmadd", 0xfd_0106 },
+        .{ "f64x2.relaxed_madd", 0xfd_0107 },
+        .{ "f64x2.relaxed_nmadd", 0xfd_0108 },
+        .{ "i8x16.relaxed_laneselect", 0xfd_0109 },
+        .{ "i16x8.relaxed_laneselect", 0xfd_010a },
+        .{ "i32x4.relaxed_laneselect", 0xfd_010b },
+        .{ "i64x2.relaxed_laneselect", 0xfd_010c },
+        .{ "f32x4.relaxed_min", 0xfd_010d },
+        .{ "f32x4.relaxed_max", 0xfd_010e },
+        .{ "f64x2.relaxed_min", 0xfd_010f },
+        .{ "f64x2.relaxed_max", 0xfd_0110 },
+        .{ "i16x8.relaxed_q15mulr_s", 0xfd_0111 },
+        .{ "i16x8.relaxed_dot_i8x16_i7x16_s", 0xfd_0112 },
+        .{ "i32x4.relaxed_dot_i8x16_i7x16_add_s", 0xfd_0113 },
     });
     return map.get(text);
 }
