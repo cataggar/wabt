@@ -224,6 +224,7 @@ pub const Table = struct {
     init_expr_bytes: []const u8 = &.{},
     loc: Location = .{},
     is_import: bool = false,
+    is_table64: bool = false,
 };
 
 /// A defined or imported memory.

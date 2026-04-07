@@ -2878,6 +2878,13 @@ const Parser = struct {
             self.table_names.put(self.allocator, name, table_idx) catch {};
         }
 
+        // Check for i64 keyword (table64)
+        var is_table64 = false;
+        if (self.peek().kind == .kw_i64) {
+            _ = self.advance();
+            is_table64 = true;
+        }
+
         // Handle inline (export "name") and (import "mod" "name") on tables
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
@@ -2898,6 +2905,11 @@ const Parser = struct {
                 const mod_name = self.parseName(self.advance().text);
                 const field_name = self.parseName(self.advance().text);
                 try self.expect(.r_paren); // close (import ...)
+                // Check for i64 keyword after import (table64)
+                if (!is_table64 and self.peek().kind == .kw_i64) {
+                    _ = self.advance();
+                    is_table64 = true;
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
@@ -2908,6 +2920,7 @@ const Parser = struct {
                 try module.tables.append(self.allocator, .{
                     .@"type" = .{ .elem_type = elem_type, .limits = limits },
                     .is_import = true,
+                    .is_table64 = is_table64,
                 });
                 module.num_table_imports += 1;
                 var import = Mod.Import{
@@ -2982,15 +2995,19 @@ const Parser = struct {
             const initial: u64 = @intCast(elem_indices.items.len);
             try module.tables.append(self.allocator, .{
                 .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial } },
+                .is_table64 = is_table64,
             });
             // Create active element segment for the inline elements
             if (elem_indices.items.len > 0) {
-                // Build offset expr: i32.const 0
                 const ob = self.allocator.alloc(u8, 2) catch {
                     elem_indices.deinit(self.allocator);
                     return error.OutOfMemory;
                 };
-                ob[0] = 0x41; // i32.const
+                if (is_table64) {
+                    ob[0] = 0x42; // i64.const
+                } else {
+                    ob[0] = 0x41; // i32.const
+                }
                 ob[1] = 0x00; // 0
                 try module.elem_segments.append(self.allocator, .{
                     .kind = .active,
@@ -3048,6 +3065,7 @@ const Parser = struct {
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
             .init_expr_bytes = table_init_bytes,
+            .is_table64 = is_table64,
         });
     }
 
@@ -3129,6 +3147,11 @@ const Parser = struct {
                 const mod_name = self.parseName(self.advance().text);
                 const field_name = self.parseName(self.advance().text);
                 try self.expect(.r_paren); // close (import ...)
+                // Check for i64 keyword after import (memory64)
+                if (!is_memory64 and self.peek().kind == .kw_i64) {
+                    _ = self.advance();
+                    is_memory64 = true;
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {

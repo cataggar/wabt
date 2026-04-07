@@ -597,6 +597,17 @@ const RunState = struct {
             .var_ = .{ .index = 0 },
         }) catch return;
 
+        // table64 for the table64 proposal
+        mod.tables.append(self.allocator, .{
+            .@"type" = .{ .elem_type = .funcref, .limits = .{ .initial = 10, .max = 20, .has_max = true } },
+            .is_table64 = true,
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "table64",
+            .kind = .table,
+            .var_ = .{ .index = 1 },
+        }) catch return;
+
         mod.memories.append(self.allocator, .{
             .@"type" = .{ .limits = .{ .initial = 1, .max = 2, .has_max = true } },
         }) catch return;
@@ -604,6 +615,17 @@ const RunState = struct {
             .name = "memory",
             .kind = .memory,
             .var_ = .{ .index = 0 },
+        }) catch return;
+
+        // memory64 for the memory64 proposal
+        mod.memories.append(self.allocator, .{
+            .@"type" = .{ .limits = .{ .initial = 1, .max = 2, .has_max = true } },
+            .is_memory64 = true,
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "memory64",
+            .kind = .memory,
+            .var_ = .{ .index = 1 },
         }) catch return;
 
         const inst = self.allocator.create(Interp.Instance) catch {

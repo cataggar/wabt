@@ -259,6 +259,7 @@ pub const Instance = struct {
                 if (off_val) |v| {
                     offset = switch (v) {
                         .i32 => |x| @intCast(@as(u32, @bitCast(x))),
+                        .i64 => |x| @intCast(@as(u64, @bitCast(x))),
                         else => 0,
                     };
                 }
@@ -1407,6 +1408,20 @@ pub const Interpreter = struct {
         return false;
     }
 
+    fn isTable64(self: *Interpreter, tbl_idx: u32) bool {
+        if (tbl_idx < self.instance.module.tables.items.len)
+            return self.instance.module.tables.items[tbl_idx].is_table64;
+        return false;
+    }
+
+    fn popTableIdx(self: *Interpreter, tbl_idx: u32) TrapError!u64 {
+        if (self.isTable64(tbl_idx)) {
+            return @bitCast(try self.popI64());
+        } else {
+            return @as(u64, @as(u32, @bitCast(try self.popI32())));
+        }
+    }
+
     fn popMemAddr(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!u64 {
         if (self.isMemory64(mem_idx)) {
             const base = try self.popI64();
@@ -1818,22 +1833,20 @@ pub const Interpreter = struct {
     }
 
     pub fn tableCopy(self: *Interpreter, dst_tbl_idx: u32, src_tbl_idx: u32) TrapError!void {
-        const n_val = try self.popI32();
-        const src_val = try self.popI32();
-        const dst_val = try self.popI32();
-        const n: u32 = @bitCast(n_val);
-        const src: u32 = @bitCast(src_val);
-        const dst: u32 = @bitCast(dst_val);
+        const dst_t64 = self.isTable64(dst_tbl_idx);
+        const n: u64 = if (dst_t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
+        const src_t64 = self.isTable64(src_tbl_idx);
+        const src: u64 = if (src_t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
+        const dst: u64 = if (dst_t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
         const dst_tbl = self.instance.getTable(dst_tbl_idx);
         const src_tbl = self.instance.getTable(src_tbl_idx);
-        if (@as(u64, dst) + n > dst_tbl.items.len or @as(u64, src) + n > src_tbl.items.len)
+        if (dst +% n > dst_tbl.items.len or src +% n > src_tbl.items.len)
             return error.OutOfBoundsTableAccess;
         if (n == 0) return;
         const d: usize = @intCast(dst);
         const s: usize = @intCast(src);
         const len: usize = @intCast(n);
         if (dst_tbl_idx == src_tbl_idx) {
-            // Same table: handle overlap
             const tbl = dst_tbl.items;
             if (d <= s) {
                 var i: usize = 0;
@@ -1846,19 +1859,19 @@ pub const Interpreter = struct {
                 }
             }
         } else {
-            // Different tables: no overlap possible
             var i: usize = 0;
             while (i < len) : (i += 1) dst_tbl.items[d + i] = src_tbl.items[s + i];
         }
     }
 
     pub fn tableInit(self: *Interpreter, elem_idx: u32, tbl_idx: u32) TrapError!void {
+        const t64 = self.isTable64(tbl_idx);
+        // table.init: n and src are always i32 (elem segment offsets), dst follows table type
         const n_val = try self.popI32();
         const src_val = try self.popI32();
-        const dst_val = try self.popI32();
+        const dst: u64 = if (t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
         const n: u32 = @bitCast(n_val);
         const src: u32 = @bitCast(src_val);
-        const dst: u32 = @bitCast(dst_val);
         if (elem_idx >= self.instance.module.elem_segments.items.len)
             return error.OutOfBoundsTableAccess;
         const dropped = elem_idx < self.instance.dropped_elems.capacity() and
@@ -1870,9 +1883,10 @@ pub const Interpreter = struct {
         const seg_len: u32 = if (dropped) 0 else @max(var_len, expr_len);
         const tbl = self.instance.getTable(tbl_idx);
         if (@as(u64, src) + n > seg_len or
-            @as(u64, dst) + n > tbl.items.len)
+            dst +% n > tbl.items.len)
             return error.OutOfBoundsTableAccess;
         if (n == 0) return;
+        const d: usize = @intCast(dst);
         const refs = self.instance.getTableFuncRefs();
 
         // If elem segment uses expressions (funcref/externref), evaluate them
@@ -1896,11 +1910,11 @@ pub const Interpreter = struct {
                 const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start..expr_pc]);
                 if (val) |v| switch (v) {
                     .ref_func => |func_idx| {
-                        tbl.items[dst + i] = func_idx;
-                        refs.put(self.allocator, Instance.makeTableKey(tbl_idx, dst + i), self) catch {};
+                        tbl.items[d + i] = func_idx;
+                        refs.put(self.allocator, Instance.makeTableKey(tbl_idx, @intCast(d + i)), self) catch {};
                     },
                     .ref_null => {
-                        tbl.items[dst + i] = null;
+                        tbl.items[d + i] = null;
                     },
                     else => {},
                 };
@@ -1916,20 +1930,21 @@ pub const Interpreter = struct {
                 .name => 0,
             };
             if (func_idx == std.math.maxInt(u32)) {
-                tbl.items[dst + i] = null;
+                tbl.items[d + i] = null;
             } else {
-                tbl.items[dst + i] = func_idx;
-                refs.put(self.allocator, Instance.makeTableKey(tbl_idx, dst + i), self) catch {};
+                tbl.items[d + i] = func_idx;
+                refs.put(self.allocator, Instance.makeTableKey(tbl_idx, @intCast(d + i)), self) catch {};
             }
         }
     }
 
     pub fn tableGrow(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
         const tbl_idx = readCodeU32(code, pc);
-        const delta = @as(u32, @bitCast(try self.popI32()));
+        const t64 = self.isTable64(tbl_idx);
+        const delta: u64 = if (t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
         const init_val = try self.popValue();
         const tbl = self.instance.getTable(tbl_idx);
-        const old_size: u32 = @intCast(tbl.items.len);
+        const old_size: u64 = @intCast(tbl.items.len);
         const func_ref: ?u32 = switch (init_val) {
             .ref_func => |idx| idx,
             .ref_null => null,
@@ -1937,43 +1952,50 @@ pub const Interpreter = struct {
             else => null,
         };
         if (delta == 0) {
-            try self.pushValue(.{ .i32 = @bitCast(old_size) });
+            if (t64) try self.pushValue(.{ .i64 = @intCast(old_size) })
+            else try self.pushValue(.{ .i32 = @intCast(old_size) });
             return;
         }
-        // Check table maximum
-        const new_size: u64 = @as(u64, old_size) + delta;
-        // Reject growing beyond the implementation limit
+        const new_size: u64 = old_size + delta;
         if (new_size > 10_000_000) {
-            try self.pushValue(.{ .i32 = -1 });
+            if (t64) try self.pushValue(.{ .i64 = -1 })
+            else try self.pushValue(.{ .i32 = -1 });
             return;
         }
         if (tbl_idx < self.instance.module.tables.items.len) {
             const tbl_type = self.instance.module.tables.items[tbl_idx];
             if (tbl_type.@"type".limits.has_max and new_size > tbl_type.@"type".limits.max) {
-                try self.pushValue(.{ .i32 = -1 });
+                if (t64) try self.pushValue(.{ .i64 = -1 })
+                else try self.pushValue(.{ .i32 = -1 });
                 return;
             }
         }
-        tbl.appendNTimes(self.allocator, func_ref, delta) catch {
-            try self.pushValue(.{ .i32 = -1 });
+        tbl.appendNTimes(self.allocator, func_ref, @intCast(delta)) catch {
+            if (t64) try self.pushValue(.{ .i64 = -1 })
+            else try self.pushValue(.{ .i32 = -1 });
             return;
         };
-        try self.pushValue(.{ .i32 = @bitCast(old_size) });
+        if (t64) try self.pushValue(.{ .i64 = @intCast(old_size) })
+        else try self.pushValue(.{ .i32 = @intCast(old_size) });
     }
 
     pub fn tableSize(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
         const tbl_idx = readCodeU32(code, pc);
         const tbl = self.instance.getTable(tbl_idx);
-        try self.pushValue(.{ .i32 = @intCast(tbl.items.len) });
+        if (self.isTable64(tbl_idx))
+            try self.pushValue(.{ .i64 = @intCast(tbl.items.len) })
+        else
+            try self.pushValue(.{ .i32 = @intCast(tbl.items.len) });
     }
 
     pub fn tableFill(self: *Interpreter, code: []const u8, pc: *usize) TrapError!void {
         const tbl_idx = readCodeU32(code, pc);
-        const n = @as(u32, @bitCast(try self.popI32()));
+        const t64 = self.isTable64(tbl_idx);
+        const n: u64 = if (t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
         const val = try self.popValue();
-        const dst = @as(u32, @bitCast(try self.popI32()));
+        const dst: u64 = if (t64) @bitCast(try self.popI64()) else @as(u64, @as(u32, @bitCast(try self.popI32())));
         const tbl = self.instance.getTable(tbl_idx);
-        if (@as(u64, dst) + n > tbl.items.len)
+        if (dst +% n > tbl.items.len)
             return error.OutOfBoundsTableAccess;
         const func_ref: ?u32 = switch (val) {
             .ref_func => |idx| idx,
@@ -1981,8 +2003,9 @@ pub const Interpreter = struct {
             .i32 => |v| @bitCast(v),
             else => null,
         };
-        var i: u32 = 0;
-        while (i < n) : (i += 1) tbl.items[dst + i] = func_ref;
+        var i: usize = 0;
+        const d: usize = @intCast(dst);
+        while (i < n) : (i += 1) tbl.items[d + i] = func_ref;
     }
 
     // ── Sub-word memory loads ───────────────────────────────────────────
@@ -2551,14 +2574,13 @@ pub const Interpreter = struct {
                     const type_idx = readCodeU32(code, &tmp_pc);
                     const ci_tbl_idx = readCodeU32(code, &tmp_pc);
                     pc = tmp_pc;
-                    const elem_idx = try self.popI32();
-                    const uidx: u32 = @bitCast(elem_idx);
+                    const uidx = try self.popTableIdx(ci_tbl_idx);
                     const ci_tbl = self.instance.getTable(ci_tbl_idx);
                     if (uidx >= ci_tbl.items.len) return error.OutOfBoundsTableAccess;
-                    const func_idx = ci_tbl.items[uidx] orelse return error.UninitializedElement;
+                    const func_idx = ci_tbl.items[@intCast(uidx)] orelse return error.UninitializedElement;
 
                     // Check for cross-module function reference
-                    const key = Instance.makeTableKey(ci_tbl_idx, uidx);
+                    const key = Instance.makeTableKey(ci_tbl_idx, @intCast(uidx));
                     const refs = self.instance.getTableFuncRefs();
                     const target_interp = refs.get(key) orelse self;
 
@@ -2615,12 +2637,11 @@ pub const Interpreter = struct {
                     const type_idx = readCodeU32(code, &tmp_pc);
                     const ci_tbl_idx = readCodeU32(code, &tmp_pc);
                     pc = tmp_pc;
-                    const elem_idx = try self.popI32();
-                    const uidx: u32 = @bitCast(elem_idx);
+                    const uidx = try self.popTableIdx(ci_tbl_idx);
                     const ci_tbl = self.instance.getTable(ci_tbl_idx);
                     if (uidx >= ci_tbl.items.len) return error.OutOfBoundsTableAccess;
-                    const func_idx = ci_tbl.items[uidx] orelse return error.UninitializedElement;
-                    const key = Instance.makeTableKey(ci_tbl_idx, uidx);
+                    const func_idx = ci_tbl.items[@intCast(uidx)] orelse return error.UninitializedElement;
+                    const key = Instance.makeTableKey(ci_tbl_idx, @intCast(uidx));
                     const refs = self.instance.getTableFuncRefs();
                     const target_interp = refs.get(key) orelse self;
                     if (func_idx >= target_interp.instance.module.funcs.items.len) return error.UndefinedElement;
@@ -2673,10 +2694,10 @@ pub const Interpreter = struct {
                     var t = pc;
                     const tg_idx = readCodeU32(code, &t);
                     pc = t;
-                    const idx = @as(u32, @bitCast(try self.popI32()));
+                    const idx = try self.popTableIdx(tg_idx);
                     const tg_tbl = self.instance.getTable(tg_idx);
                     if (idx >= tg_tbl.items.len) return error.OutOfBoundsTableAccess;
-                    if (tg_tbl.items[idx]) |func_idx|
+                    if (tg_tbl.items[@intCast(idx)]) |func_idx|
                         try self.pushValue(.{ .ref_func = func_idx })
                     else
                         try self.pushValue(.{ .ref_null = {} });
@@ -2686,10 +2707,10 @@ pub const Interpreter = struct {
                     const ts_idx = readCodeU32(code, &t);
                     pc = t;
                     const val = try self.popValue();
-                    const idx = @as(u32, @bitCast(try self.popI32()));
+                    const idx = try self.popTableIdx(ts_idx);
                     const ts_tbl = self.instance.getTable(ts_idx);
                     if (idx >= ts_tbl.items.len) return error.OutOfBoundsTableAccess;
-                    ts_tbl.items[idx] = switch (val) {
+                    ts_tbl.items[@intCast(idx)] = switch (val) {
                         .ref_func => |fi| fi,
                         .ref_null => null,
                         .i32 => |v| @bitCast(v),
