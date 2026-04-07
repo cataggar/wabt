@@ -2098,6 +2098,38 @@ pub const Interpreter = struct {
         std.mem.writeInt(u32, mem.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
+    // ── Tag identity matching ──────────────────────────────────────────
+
+    /// Check if two tag indices refer to the same tag, handling imported
+    /// tag aliases (multiple imports of the same source tag).
+    fn tagsMatch(self: *Interpreter, a: u32, b: u32) bool {
+        if (a == b) return true;
+        // Check if both are imported tags from the same source
+        const mod = self.instance.module;
+        if (a < mod.tags.items.len and b < mod.tags.items.len) {
+            const ta = mod.tags.items[a];
+            const tb = mod.tags.items[b];
+            if (ta.is_import and tb.is_import) {
+                // Find their import entries and compare (module, field)
+                var tag_idx: u32 = 0;
+                var src_a: ?struct { mod: []const u8, field: []const u8 } = null;
+                var src_b: ?struct { mod: []const u8, field: []const u8 } = null;
+                for (mod.imports.items) |imp| {
+                    if (imp.kind == .tag) {
+                        if (tag_idx == a) src_a = .{ .mod = imp.module_name, .field = imp.field_name };
+                        if (tag_idx == b) src_b = .{ .mod = imp.module_name, .field = imp.field_name };
+                        tag_idx += 1;
+                    }
+                }
+                if (src_a != null and src_b != null) {
+                    return std.mem.eql(u8, src_a.?.mod, src_b.?.mod) and
+                        std.mem.eql(u8, src_a.?.field, src_b.?.field);
+                }
+            }
+        }
+        return false;
+    }
+
     // ── Block stack helpers ──────────────────────────────────────────────
 
     const BlockSig = struct { params: usize, results: usize };
@@ -2313,7 +2345,7 @@ pub const Interpreter = struct {
                         var caught = false;
                         for (catches_buf[0..n_catches]) |clause| {
                             const matches = switch (clause.kind) {
-                                0x00, 0x01 => clause.tag_idx == exc.tag_idx,
+                                0x00, 0x01 => self.tagsMatch(clause.tag_idx, exc.tag_idx),
                                 0x02, 0x03 => true,
                                 else => false,
                             };
