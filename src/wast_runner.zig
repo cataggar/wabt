@@ -722,6 +722,9 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                         } else {
                             result.skipped += 1;
                         }
+                    } else if (hasDefinitionKeyword(sexpr.text)) {
+                        // Unnamed (module definition ...) — just validate, don't instantiate
+                        result.passed += 1;
                     } else if (state.setModule(sexpr.text)) {
                         result.passed += 1;
                     } else {
@@ -789,17 +792,49 @@ fn classifyCommand(sexpr: []const u8) Command {
 }
 
 fn isModuleDefinition(text: []const u8) bool {
-    // Check for "(module definition $name ...)"
+    // Check for "(module definition $name ...)" — must have a $name
     var i: usize = 1;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
-    // Skip "module"
     if (i + 6 >= text.len) return false;
     if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
     i += 6;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
-    // Check for "definition"
+    if (i + 10 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 10], "definition")) return false;
+    i += 10;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Must have $name after definition
+    return i < text.len and text[i] == '$';
+}
+
+fn hasDefinitionKeyword(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
     if (i + 10 >= text.len) return false;
     return std.mem.eql(u8, text[i .. i + 10], "definition");
+}
+
+fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
+    // "(module definition ...)" → "(module ...)"
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // "module"
+    const before_def = i;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 10; // "definition"
+    // Also skip optional $name after definition
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i < text.len and text[i] == '$') {
+        while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    }
+    var buf = std.ArrayListUnmanaged(u8){};
+    buf.appendSlice(allocator, text[0..before_def]) catch return null;
+    buf.appendSlice(allocator, text[i..]) catch return null;
+    return buf.toOwnedSlice(allocator) catch null;
 }
 
 fn isModuleInstance(text: []const u8) bool {

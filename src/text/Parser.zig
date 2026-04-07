@@ -2976,8 +2976,32 @@ const Parser = struct {
         // Parse optional table initializer expression: (ref.null func) etc.
         var table_init_bytes: []const u8 = &.{};
         if (self.peek().kind == .l_paren) {
+            _ = self.advance(); // consume '('
             var init_code: std.ArrayListUnmanaged(u8) = .{};
-            self.parseInitExpr(&init_code);
+            const inner = self.advance();
+            if (inner.kind == .kw_ref_null) {
+                init_code.append(self.allocator, 0xd0) catch {};
+                if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    _ = self.advance(); // consume heaptype
+                }
+                init_code.append(self.allocator, 0x70) catch {};
+            } else if (inner.kind == .kw_ref_func) {
+                init_code.append(self.allocator, 0xd2) catch {};
+                if (self.peek().kind == .identifier) {
+                    const fidx = self.func_names.get(self.advance().text) orelse 0;
+                    self.emitLeb128U32(&init_code, fidx);
+                } else {
+                    self.emitLeb128U32(&init_code, self.parseU32() catch 0);
+                }
+            } else if (inner.kind == .kw_global_get) {
+                init_code.append(self.allocator, 0x23) catch {};
+                self.emitGlobalIdx(&init_code);
+            } else {
+                // Unknown init expr — skip remaining tokens in the paren
+                while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
+            }
+            init_code.append(self.allocator, 0x0b) catch {};
+            if (self.peek().kind == .r_paren) _ = self.advance();
             table_init_bytes = init_code.toOwnedSlice(self.allocator) catch &.{};
         }
         try module.tables.append(self.allocator, .{
