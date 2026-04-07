@@ -29,6 +29,7 @@ pub const TrapError = error{
     OutOfMemory,
     Unimplemented,
     InstructionLimitExceeded,
+    NullReference,
 };
 
 // ── Value ────────────────────────────────────────────────────────────────
@@ -2893,6 +2894,34 @@ pub const Interpreter = struct {
                 0xd0 => { pc += 1; try self.pushValue(.{ .ref_null = {} }); },
                 0xd1 => { const v = try self.popValue(); try self.pushValue(.{ .i32 = @intFromBool(v == .ref_null) }); },
                 0xd2 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(.{ .ref_func = idx }); },
+                0xd4 => { // ref.as_non_null
+                    const v = try self.popValue();
+                    if (v == .ref_null) return error.NullReference;
+                    try self.pushValue(v);
+                },
+                0xd5 => { // br_on_null
+                    var t = pc;
+                    const depth = readCodeU32(code, &t);
+                    pc = t;
+                    const v = try self.popValue();
+                    if (v == .ref_null) {
+                        self.branch_depth = depth;
+                        return pc;
+                    } else {
+                        try self.pushValue(v);
+                    }
+                },
+                0xd6 => { // br_on_non_null
+                    var t = pc;
+                    const depth = readCodeU32(code, &t);
+                    pc = t;
+                    const v = try self.popValue();
+                    if (v != .ref_null) {
+                        try self.pushValue(v);
+                        self.branch_depth = depth;
+                        return pc;
+                    }
+                },
                 // 0xfc prefix: saturating truncation + bulk memory
                 0xfc => {
                     var t = pc;
@@ -4664,6 +4693,7 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         0x44 => p += 8,
         0xd0 => p += 1,
         0xd2 => _ = readCodeU32(code, &p),
+        0xd5, 0xd6 => _ = readCodeU32(code, &p), // br_on_null, br_on_non_null: label depth
         0xfc => {
             const sub = readCodeU32(code, &p);
             switch (sub) {

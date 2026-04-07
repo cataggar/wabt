@@ -2510,6 +2510,10 @@ const Parser = struct {
                 if (op == 0x25 or op == 0x26) {
                     self.emitU32Imm(code);
                 }
+                // br_on_null / br_on_non_null need a label depth immediate
+                if (op == 0xd5 or op == 0xd6) {
+                    self.emitU32Imm(code);
+                }
             } else {
                 // Prefixed opcode: high byte(s) = prefix, low bits = sub-opcode
                 const prefix: u8 = @truncate(op >> 16);
@@ -4388,6 +4392,8 @@ fn opcodeFromText(text: []const u8) ?u32 {
         // Reference
         .{ "ref.is_null", 0xd1 },
         .{ "ref.as_non_null", 0xd4 },
+        .{ "br_on_null", 0xd5 },
+        .{ "br_on_non_null", 0xd6 },
         // Table
         .{ "table.get", 0x25 },
         .{ "table.set", 0x26 },
