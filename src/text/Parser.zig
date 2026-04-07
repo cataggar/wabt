@@ -2011,11 +2011,11 @@ const Parser = struct {
             },
             .kw_global_get => {
                 code.append(self.allocator, 0x23) catch return;
-                self.emitU32Imm(code);
+                self.emitGlobalIdx(code);
             },
             .kw_global_set => {
                 code.append(self.allocator, 0x24) catch return;
-                self.emitU32Imm(code);
+                self.emitGlobalIdx(code);
             },
             .kw_memory_size => {
                 code.append(self.allocator, 0x3f) catch return;
@@ -2278,6 +2278,25 @@ const Parser = struct {
         }
         buf[0] = 0x40; // void
         return 1;
+    }
+
+    fn emitGlobalIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            if (self.global_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            self.emitLeb128U32(code, 0);
+            return;
+        }
+        const tok = self.advance();
+        if (tok.kind == .integer) {
+            const val = std.fmt.parseInt(u32, tok.text, 0) catch 0;
+            self.emitLeb128U32(code, val);
+        } else {
+            self.emitLeb128U32(code, 0);
+        }
     }
 
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
