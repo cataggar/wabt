@@ -2973,6 +2973,12 @@ const Parser = struct {
             limits.has_max = true;
         }
         const elem_type = try self.parseValType();
+        // Skip optional table initializer expression: (ref.null func) etc.
+        if (self.peek().kind == .l_paren) {
+            _ = self.advance();
+            try self.skipSExpr();
+            if (self.peek().kind == .r_paren) _ = self.advance();
+        }
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
         });
