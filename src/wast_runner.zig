@@ -1820,6 +1820,7 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             },
             else => false,
         },
+        .exnref => true, // exnref comparison: any non-null exnref matches
     };
 }
 

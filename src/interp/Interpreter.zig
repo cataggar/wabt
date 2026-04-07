@@ -42,6 +42,7 @@ pub const Value = union(enum) {
     v128: u128,
     ref_null: void,
     ref_func: u32,
+    exnref: u32, // Index into interpreter's caught_exceptions list
 };
 
 const TailCall = struct {
@@ -384,6 +385,9 @@ pub const Interpreter = struct {
     /// Maximum instructions before trap (prevents infinite loops).
     max_instructions: u64 = 10_000_000,
 
+    /// Caught exceptions storage for exnref values.
+    caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .{},
+
     /// Resolved function import links (indexed by func_idx for imported funcs).
     import_links: std.ArrayListUnmanaged(?ImportLink) = .{},
 
@@ -436,6 +440,7 @@ pub const Interpreter = struct {
         self.instruction_count = 0;
         const stack_base = self.stack.items.len;
         try self.callFunc(idx, args);
+        if (self.thrown_exception != null) return error.Unreachable;
         const result: ?Value = if (self.stack.items.len > stack_base) self.stack.items[stack_base] else null;
         self.stack.shrinkRetainingCapacity(stack_base);
         return result;
@@ -452,6 +457,8 @@ pub const Interpreter = struct {
         self.instruction_count = 0;
         const stack_base = self.stack.items.len;
         try self.callFunc(idx, args);
+        // Uncaught exception at top level → error
+        if (self.thrown_exception != null) return error.Unreachable;
         const num_results = self.stack.items.len - stack_base;
         const n = @min(num_results, results_buf.len);
         for (0..n) |i| {
@@ -552,9 +559,6 @@ pub const Interpreter = struct {
 
             self.branch_depth = saved_branch;
             self.returning = saved_returning;
-
-            // Uncaught exception — propagate as error
-            if (self.thrown_exception != null) return error.Unreachable;
 
             // Compact results
             const num_on_stack = self.stack.items.len -| stack_base;
@@ -2146,9 +2150,19 @@ pub const Interpreter = struct {
                     self.thrown_exception = exc;
                     return pc;
                 },
-                0x0a => { // throw_ref — re-throw (simplified: treat as unreachable for now)
-                    _ = try self.popValue();
-                    return error.Unreachable;
+                0x0a => { // throw_ref — re-throw from exnref
+                    const val = try self.popValue();
+                    switch (val) {
+                        .exnref => |idx| {
+                            if (idx < self.caught_exceptions.items.len) {
+                                self.thrown_exception = self.caught_exceptions.items[idx];
+                                return pc;
+                            }
+                            return error.Unreachable;
+                        },
+                        .ref_null => return error.Unreachable,
+                        else => return error.Unreachable,
+                    }
                 },
                 0x02 => { // block
                     const bsig = self.getBlockSig(code, pc);
@@ -2286,16 +2300,21 @@ pub const Interpreter = struct {
                                 else => false,
                             };
                             if (matches) {
+                                const saved_exc = exc;
                                 self.thrown_exception = null;
-                                // Restore stack to block base
                                 self.stack.shrinkRetainingCapacity(try_stack_base);
                                 // Push exception values for catch/catch_ref
                                 if (clause.kind == 0x00 or clause.kind == 0x01) {
-                                    for (0..exc.value_count) |vi| {
-                                        try self.pushValue(exc.values[vi]);
+                                    for (0..saved_exc.value_count) |vi| {
+                                        try self.pushValue(saved_exc.values[vi]);
                                     }
                                 }
-                                // Branch to the catch label
+                                // Push exnref for catch_ref/catch_all_ref
+                                if (clause.kind == 0x01 or clause.kind == 0x03) {
+                                    const exn_idx: u32 = @intCast(self.caught_exceptions.items.len);
+                                    self.caught_exceptions.append(self.allocator, saved_exc) catch {};
+                                    try self.pushValue(.{ .exnref = exn_idx });
+                                }
                                 self.branch_depth = clause.label;
                                 return pc;
                             }
@@ -2368,6 +2387,7 @@ pub const Interpreter = struct {
                         call_args[i] = try self.popValue();
                     }
                     try self.callFunc(idx, call_args);
+                    if (self.thrown_exception != null) return pc;
                 },
                 0x12 => { // return_call (tail call)
                     var tmp_pc = pc;
@@ -2447,6 +2467,7 @@ pub const Interpreter = struct {
                     } else {
                         try self.callFunc(func_idx, call_args);
                     }
+                    if (self.thrown_exception != null) return pc;
                 },
                 0x13 => { // return_call_indirect (tail call)
                     var tmp_pc = pc;
