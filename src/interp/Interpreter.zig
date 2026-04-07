@@ -2293,36 +2293,37 @@ pub const Interpreter = struct {
                     // Check for thrown exception
                     if (self.thrown_exception) |exc| {
                         // Try to match a catch clause
+                        var caught = false;
                         for (catches_buf[0..n_catches]) |clause| {
                             const matches = switch (clause.kind) {
-                                0x00, 0x01 => clause.tag_idx == exc.tag_idx, // catch, catch_ref
-                                0x02, 0x03 => true, // catch_all, catch_all_ref
+                                0x00, 0x01 => clause.tag_idx == exc.tag_idx,
+                                0x02, 0x03 => true,
                                 else => false,
                             };
                             if (matches) {
                                 const saved_exc = exc;
                                 self.thrown_exception = null;
                                 self.stack.shrinkRetainingCapacity(try_stack_base);
-                                // Push exception values for catch/catch_ref
                                 if (clause.kind == 0x00 or clause.kind == 0x01) {
                                     for (0..saved_exc.value_count) |vi| {
                                         try self.pushValue(saved_exc.values[vi]);
                                     }
                                 }
-                                // Push exnref for catch_ref/catch_all_ref
                                 if (clause.kind == 0x01 or clause.kind == 0x03) {
                                     const exn_idx: u32 = @intCast(self.caught_exceptions.items.len);
                                     self.caught_exceptions.append(self.allocator, saved_exc) catch {};
                                     try self.pushValue(.{ .exnref = exn_idx });
                                 }
                                 self.branch_depth = clause.label;
-                                return pc;
+                                caught = true;
+                                break;
                             }
                         }
-                        // No match — propagate exception
-                        return pc;
+                        if (!caught) return pc; // No match — propagate exception
+                        // Fall through to branch_depth handling below
                     }
 
+                    if (self.thrown_exception != null) return pc;
                     if (self.returning) return pc;
                     if (self.branch_depth) |d| {
                         if (d == 0) {
