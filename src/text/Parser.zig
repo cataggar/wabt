@@ -1311,13 +1311,15 @@ const Parser = struct {
                                 if (saw_instr or saw_local) {
                                     if (!last_was_select) { self.malformed = true; break :scan_loop; }
                                 }
-                                last_was_select = false;
+                                // Don't reset last_was_select for consecutive (param ...) after call_indirect
                             } else if (inner.kind == .kw_result) {
                                 if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
                                 // Don't reset last_was_select — allow consecutive (result ...) after select
                             } else if (inner.kind == .kw_local) {
                                 saw_local = true;
                                 last_was_select = false;
+                            } else if (inner.kind == .kw_type) {
+                                // (type ...) after call_indirect/select — keep last_was_select
                             } else {
                                 saw_instr = true;
                                 last_was_select = false;
