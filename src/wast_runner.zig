@@ -63,6 +63,10 @@ const RunState = struct {
     owned_sources: std.ArrayListUnmanaged([]const u8) = .{},
     /// Triples kept alive because they wrote to shared tables (prevent dangling refs).
     zombie_triples: std.ArrayListUnmanaged(ModuleTriple) = .{},
+    /// Module definitions stored by $name for (module definition $name ...).
+    module_definitions: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Named module instances for (module instance $name $def).
+    named_instances: std.StringHashMapUnmanaged(ModuleTriple) = .{},
 
     fn deinit(self: *RunState) void {
         self.destroyCurrent();
@@ -89,6 +93,16 @@ const RunState = struct {
             }
         }
         self.zombie_triples.deinit(self.allocator);
+        self.module_definitions.deinit(self.allocator);
+        // Clean up named instances
+        var ni_it = self.named_instances.iterator();
+        while (ni_it.next()) |entry| {
+            if (!destroyed.contains(entry.value_ptr.module)) {
+                entry.value_ptr.destroy(self.allocator);
+                destroyed.put(self.allocator, entry.value_ptr.module, {}) catch {};
+            }
+        }
+        self.named_instances.deinit(self.allocator);
         self.named_modules.deinit(self.allocator);
         self.registered_modules.deinit(self.allocator);
         for (self.owned_keys.items) |key| self.allocator.free(key);
@@ -666,7 +680,22 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                         result.skipped += 1;
                     }
                 } else {
-                    if (state.setModule(sexpr.text)) {
+                    // Check for (module definition $name ...) or (module instance $name $def)
+                    if (isModuleDefinition(sexpr.text)) {
+                        const def_name = extractModuleDefName(sexpr.text);
+                        if (def_name) |name| {
+                            state.module_definitions.put(allocator, name, sexpr.text) catch {};
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else if (isModuleInstance(sexpr.text)) {
+                        if (processModuleInstance(sexpr.text, &state)) {
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else if (state.setModule(sexpr.text)) {
                         result.passed += 1;
                     } else {
                         result.skipped += 1;
@@ -730,6 +759,110 @@ fn classifyCommand(sexpr: []const u8) Command {
     if (std.mem.eql(u8, word, "register")) return .register;
     if (std.mem.eql(u8, word, "get")) return .get;
     return .unknown;
+}
+
+fn isModuleDefinition(text: []const u8) bool {
+    // Check for "(module definition $name ...)"
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Skip "module"
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Check for "definition"
+    if (i + 10 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 10], "definition");
+}
+
+fn isModuleInstance(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 8 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 8], "instance");
+}
+
+fn extractModuleDefName(text: []const u8) ?[]const u8 {
+    // "(module definition $name ...)" → "$name"
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // skip "module"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 10; // skip "definition"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i >= text.len or text[i] != '$') return null;
+    const start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    return text[start..i];
+}
+
+fn processModuleInstance(text: []const u8, state: *RunState) bool {
+    // "(module instance $inst_name $def_name)" → instantiate $def_name as $inst_name
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // skip "module"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 8; // skip "instance"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Read instance name
+    if (i >= text.len or text[i] != '$') return false;
+    const inst_start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    const inst_name = text[inst_start..i];
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Read definition name
+    if (i >= text.len or text[i] != '$') return false;
+    const def_start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    const def_name = text[def_start..i];
+
+    // Look up the definition
+    const def_text = state.module_definitions.get(def_name) orelse return false;
+
+    // Rewrite: strip "definition $name" to get plain "(module ...)"
+    // Find where the actual module content starts (after "definition $name")
+    var j: usize = 1;
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    j += 6; // "module"
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    j += 10; // "definition"
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    // Skip $name
+    while (j < def_text.len and !isWhitespace(def_text[j]) and def_text[j] != ')') : (j += 1) {}
+
+    // Build "(module <rest>)"
+    var buf = std.ArrayListUnmanaged(u8){};
+    buf.appendSlice(state.allocator, "(module ") catch return false;
+    buf.appendSlice(state.allocator, def_text[j .. def_text.len - 1]) catch return false;
+    buf.append(state.allocator, ')') catch return false;
+    const mod_text = buf.toOwnedSlice(state.allocator) catch return false;
+
+    // Create a fresh instance
+    const mod = state.allocator.create(Mod.Module) catch return false;
+    mod.* = Parser.parseModule(state.allocator, mod_text) catch {
+        state.allocator.destroy(mod);
+        state.allocator.free(mod_text);
+        return false;
+    };
+    state.owned_sources.append(state.allocator, mod_text) catch {};
+
+    const inst = state.allocator.create(Interp.Instance) catch { mod.deinit(); state.allocator.destroy(mod); return false; };
+    inst.* = Interp.Instance.init(state.allocator, mod) catch { state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+
+    const interp = state.allocator.create(Interp.Interpreter) catch { inst.deinit(); state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+    interp.* = Interp.Interpreter.init(state.allocator, inst);
+    inst.interp_ref = interp;
+
+    state.resolveImports(mod, interp);
+    inst.instantiate() catch { interp.deinit(); state.allocator.destroy(interp); inst.deinit(); state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+
+    const triple = ModuleTriple{ .module = mod, .instance = inst, .interpreter = interp };
+    state.named_instances.put(state.allocator, inst_name, triple) catch {};
+    return true;
 }
 
 // ── Assertion processors ────────────────────────────────────────────────
@@ -1287,6 +1420,7 @@ fn processRegister(sexpr: []const u8, state: *RunState, result: *Result) void {
         // Check for an optional $id after the string literal
         if (extractDollarIdAfterString(sexpr)) |id| {
             if (state.named_modules.get(id)) |t| break :blk t;
+            if (state.named_instances.get(id)) |t| break :blk t;
         }
         // Fall back to the current module.
         const mod = state.module orelse {
