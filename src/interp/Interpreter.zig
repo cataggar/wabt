@@ -524,7 +524,7 @@ pub const Interpreter = struct {
                         .f32 => .{ .f32 = 0.0 },
                         .f64 => .{ .f64 = 0.0 },
                         .v128 => .{ .v128 = 0 },
-                        .funcref, .externref, .anyref,
+                        .funcref, .externref, .anyref, .exnref,
                         .nullfuncref, .nullexternref, .nullref,
                         .ref, .ref_null,
                         .ref_func, .ref_extern, .ref_any,
@@ -2090,7 +2090,7 @@ pub const Interpreter = struct {
         if (block_type_pc >= code.len) return .{ .params = 0, .results = 0 };
         const byte = code[block_type_pc];
         if (byte == 0x40) return .{ .params = 0, .results = 0 }; // void
-        if ((byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f or byte == 0x63 or byte == 0x64) return .{ .params = 0, .results = 1 };
+        if ((byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f or byte == 0x69 or byte == 0x63 or byte == 0x64) return .{ .params = 0, .results = 1 };
         // Type index (signed LEB128)
         var tmp = block_type_pc;
         const idx_s32 = readCodeS32(code, &tmp);
@@ -4267,7 +4267,7 @@ fn skipBlockType(code: []const u8, pc: usize) usize {
     if (pc >= code.len) return pc;
     const byte = code[pc];
     // 0x40 = void, or a valtype byte (single-byte block type)
-    if (byte == 0x40 or (byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f or byte == 0x63 or byte == 0x64) {
+    if (byte == 0x40 or (byte >= 0x7b and byte <= 0x7f) or byte == 0x70 or byte == 0x6f or byte == 0x69 or byte == 0x63 or byte == 0x64) {
         return pc + 1;
     }
     // Otherwise it's a signed LEB128 type index

@@ -496,6 +496,7 @@ const Parser = struct {
             .kw_funcref => .funcref,
             .kw_externref => .externref,
             .kw_anyref => .anyref,
+            .kw_exnref => .exnref,
             else => error.InvalidType,
         };
     }
