@@ -3061,6 +3061,13 @@ const Parser = struct {
             self.memory_names.put(self.allocator, name, mem_idx) catch {};
         }
 
+        // Check for i64 keyword (memory64)
+        var is_memory64 = false;
+        if (self.peek().kind == .kw_i64) {
+            _ = self.advance();
+            is_memory64 = true;
+        }
+
         // Handle inline (export "name") declarations
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
@@ -3092,15 +3099,23 @@ const Parser = struct {
                 const pages: u64 = if (data_len == 0) 0 else (data_len + page_size - 1) / page_size;
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true } },
+                    .is_memory64 = is_memory64,
                 });
                 // Create active data segment at offset 0
                 var seg = Mod.DataSegment{};
                 seg.kind = .active;
                 seg.memory_var = .{ .index = mem_idx };
-                const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
-                ob[0] = 0x41; // i32.const
-                ob[1] = 0x00; // 0
-                seg.offset_expr_bytes = ob;
+                if (is_memory64) {
+                    const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
+                    ob[0] = 0x42; // i64.const
+                    ob[1] = 0x00; // 0
+                    seg.offset_expr_bytes = ob;
+                } else {
+                    const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
+                    ob[0] = 0x41; // i32.const
+                    ob[1] = 0x00; // 0
+                    seg.offset_expr_bytes = ob;
+                }
                 seg.owns_offset_expr_bytes = true;
                 if (data_parts.items.len > 0) {
                     seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
@@ -3123,6 +3138,7 @@ const Parser = struct {
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
+                    .is_memory64 = is_memory64,
                 });
                 module.num_memory_imports += 1;
                 var import = Mod.Import{
@@ -3147,7 +3163,8 @@ const Parser = struct {
             limits.has_max = true;
         }
         try module.memories.append(self.allocator, .{
-            .type = .{ .limits = limits },
+            .@"type" = .{ .limits = limits },
+            .is_memory64 = is_memory64,
         });
     }
 
