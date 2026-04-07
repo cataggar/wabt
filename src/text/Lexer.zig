@@ -82,6 +82,8 @@ pub const TokenKind = enum {
     kw_call_indirect,
     kw_return_call,
     kw_return_call_indirect,
+    kw_call_ref,
+    kw_return_call_ref,
 
     // Parametric
     kw_drop,
@@ -503,6 +505,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "call_indirect")) return .kw_call_indirect;
     if (eql(text, "return_call")) return .kw_return_call;
     if (eql(text, "return_call_indirect")) return .kw_return_call_indirect;
+    if (eql(text, "call_ref")) return .kw_call_ref;
+    if (eql(text, "return_call_ref")) return .kw_return_call_ref;
 
     // Parametric
     if (eql(text, "drop")) return .kw_drop;

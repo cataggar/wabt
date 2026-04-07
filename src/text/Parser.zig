@@ -1647,6 +1647,27 @@ const Parser = struct {
                 }
             },
             .kw_throw_ref => code.append(self.allocator, 0x0a) catch return,
+            .kw_call_ref => {
+                code.append(self.allocator, 0x14) catch return;
+                // call_ref $type — type index
+                if (self.peek().kind == .identifier) {
+                    const type_tok = self.advance();
+                    const idx = self.type_names.get(type_tok.text) orelse 0;
+                    self.emitLeb128U32(code, idx);
+                } else {
+                    self.emitU32Imm(code);
+                }
+            },
+            .kw_return_call_ref => {
+                code.append(self.allocator, 0x15) catch return;
+                if (self.peek().kind == .identifier) {
+                    const type_tok = self.advance();
+                    const idx = self.type_names.get(type_tok.text) orelse 0;
+                    self.emitLeb128U32(code, idx);
+                } else {
+                    self.emitU32Imm(code);
+                }
+            },
             .kw_try_table => {
                 code.append(self.allocator, 0x1f) catch return;
                 // Parse optional label

@@ -2406,6 +2406,52 @@ pub const Interpreter = struct {
                     self.returning = true;
                     return pc;
                 },
+                0x14 => { // call_ref
+                    var tmp_pc = pc;
+                    _ = readCodeU32(code, &tmp_pc); // type index (for validation)
+                    pc = tmp_pc;
+                    const ref_val = try self.popValue();
+                    const func_idx = switch (ref_val) {
+                        .ref_func => |idx| idx,
+                        .ref_null => return error.Unreachable, // null funcref trap
+                        else => return error.Unreachable,
+                    };
+                    if (func_idx >= self.instance.module.funcs.items.len) return error.UndefinedElement;
+                    const target = self.instance.module.funcs.items[func_idx];
+                    const sig = self.resolveSig(target.decl);
+                    var call_args = self.allocator.alloc(Value, sig.params.len) catch return error.OutOfMemory;
+                    defer self.allocator.free(call_args);
+                    var i = sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        call_args[i] = try self.popValue();
+                    }
+                    try self.callFunc(func_idx, call_args);
+                    if (self.thrown_exception != null) return pc;
+                },
+                0x15 => { // return_call_ref (tail call)
+                    var tmp_pc = pc;
+                    _ = readCodeU32(code, &tmp_pc); // type index
+                    pc = tmp_pc;
+                    const ref_val = try self.popValue();
+                    const func_idx = switch (ref_val) {
+                        .ref_func => |idx| idx,
+                        .ref_null => return error.Unreachable,
+                        else => return error.Unreachable,
+                    };
+                    if (func_idx >= self.instance.module.funcs.items.len) return error.UndefinedElement;
+                    const target = self.instance.module.funcs.items[func_idx];
+                    const sig = self.resolveSig(target.decl);
+                    var tc2 = TailCall{ .func_idx = func_idx, .arg_count = sig.params.len };
+                    var i = sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        tc2.args[i] = try self.popValue();
+                    }
+                    self.pending_tail_call = tc2;
+                    self.returning = true;
+                    return pc;
+                },
                 0x11 => { // call_indirect
                     var tmp_pc = pc;
                     const type_idx = readCodeU32(code, &tmp_pc);
@@ -4360,7 +4406,7 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
             const count = readCodeU32(code, &p);
             for (0..count + 1) |_| _ = readCodeU32(code, &p);
         },
-        0x10, 0x12 => _ = readCodeU32(code, &p), // call, return_call
+        0x10, 0x12, 0x14, 0x15 => _ = readCodeU32(code, &p), // call, return_call, call_ref, return_call_ref
         0x11, 0x13 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect, return_call_indirect
         0x1c => { // select t*
             const vec_len = readCodeU32(code, &p);
