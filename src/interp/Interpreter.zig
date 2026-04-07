@@ -553,6 +553,9 @@ pub const Interpreter = struct {
             self.branch_depth = saved_branch;
             self.returning = saved_returning;
 
+            // Uncaught exception — propagate as error
+            if (self.thrown_exception != null) return error.Unreachable;
+
             // Compact results
             const num_on_stack = self.stack.items.len -| stack_base;
             const expected = sig.results.len;

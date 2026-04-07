@@ -3203,8 +3203,6 @@ const Parser = struct {
         try module.tags.append(self.allocator, .{
             .@"type" = .{ .sig = .{ .params = params, .results = results } },
         });
-        // Skip to closing paren of (tag ...)
-        self.skipToRParen();
     }
 
     fn parseImport(self: *Parser, module: *Mod.Module) ParseError!void {

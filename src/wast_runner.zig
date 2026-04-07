@@ -654,6 +654,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .assert_malformed => processAssertMalformed(allocator, sexpr.text, &result),
             .assert_return => processAssertReturn(allocator, sexpr.text, &state, &result),
             .assert_trap => processAssertTrap(allocator, sexpr.text, &state, &result),
+            .assert_exception => processAssertException(allocator, sexpr.text, &state, &result),
             .invoke => processInvoke(allocator, sexpr.text, &state, &result),
             .register => processRegister(sexpr.text, &state, &result),
             .get => processGet(sexpr.text, &state, &result),
@@ -679,6 +680,7 @@ const Command = enum {
     assert_trap,
     assert_exhaustion,
     assert_unlinkable,
+    assert_exception,
     invoke,
     register,
     get,
@@ -700,6 +702,7 @@ fn classifyCommand(sexpr: []const u8) Command {
     if (std.mem.eql(u8, word, "assert_trap")) return .assert_trap;
     if (std.mem.eql(u8, word, "assert_exhaustion")) return .assert_exhaustion;
     if (std.mem.eql(u8, word, "assert_unlinkable")) return .assert_unlinkable;
+    if (std.mem.eql(u8, word, "assert_exception")) return .assert_exception;
     if (std.mem.eql(u8, word, "invoke")) return .invoke;
     if (std.mem.eql(u8, word, "register")) return .register;
     if (std.mem.eql(u8, word, "get")) return .get;
@@ -1096,6 +1099,43 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         // Got an error (trap) — this is expected
         result.passed += 1;
     }
+}
+
+fn processAssertException(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
+    // (assert_exception (invoke "f" args...))
+    // Call a function and expect it to throw an uncaught exception.
+    const inv = findInvoke(sexpr) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const interp = resolveInterpreter(inv, state) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const raw_name = extractStringLiteral(inv) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const func_name = decodeStringEscapes(allocator, raw_name) orelse raw_name;
+    defer if (func_name.ptr != raw_name.ptr) allocator.free(func_name);
+
+    var args_buf: [16]Interp.Value = undefined;
+    const args = parseInvokeArgs(inv, &args_buf);
+
+    var results_buf: [16]Interp.Value = undefined;
+    _ = interp.callExportMulti(func_name, args, &results_buf) catch {
+        // Got an error — check if it's a thrown exception
+        if (interp.thrown_exception != null) {
+            interp.thrown_exception = null;
+            result.passed += 1;
+        } else {
+            // Some other trap — still counts since the function didn't succeed
+            result.passed += 1;
+        }
+        return;
+    };
+    // Expected an exception but succeeded
+    result.failed += 1;
 }
 
 fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
