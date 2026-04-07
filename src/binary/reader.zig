@@ -260,7 +260,7 @@ const Reader = struct {
         const has_func_section = (seen_sections & (1 << 3)) != 0;
         const has_code_section = (seen_sections & (1 << 10)) != 0;
         if (has_func_section and !has_code_section and num_defined_funcs > 0) return error.FunctionCodeMismatch;
-        if (!has_func_section and has_code_section) return error.FunctionCodeMismatch;
+        if (!has_func_section and has_code_section and num_defined_funcs > 0) return error.FunctionCodeMismatch;
     }
 
     fn readTypeSection(self: *Reader, _: usize) ReadError!void {
