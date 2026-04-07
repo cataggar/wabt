@@ -406,6 +406,7 @@ pub const Interpreter = struct {
         self.stack.deinit(self.allocator);
         self.import_links.deinit(self.allocator);
         self.global_links.deinit(self.allocator);
+        self.caught_exceptions.deinit(self.allocator);
     }
 
     /// Read a global value, following links for imported globals.
