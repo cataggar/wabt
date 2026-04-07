@@ -1291,12 +1291,14 @@ const Parser = struct {
 
         // Pre-scan: check for misplaced (param ...) or (result ...) in function body.
         // These must appear before any instructions, not after.
+        // Exception: (result ...) after select is a typed select annotation.
         // Also check for (param ...) after (local ...).
         {
             var scan = Lexer.init(self.lexer.source);
             scan.pos = if (self.peeked) |pk| pk.offset else self.lexer.pos;
             var saw_instr = false;
             var saw_local = func.local_types.items.len > 0;
+            var last_was_select = false;
             var depth: u32 = 0;
             scan_loop: while (true) {
                 const stok = scan.next();
@@ -1307,12 +1309,16 @@ const Parser = struct {
                             const inner = scan.next();
                             if (inner.kind == .kw_param) {
                                 if (saw_instr or saw_local) { self.malformed = true; break :scan_loop; }
+                                last_was_select = false;
                             } else if (inner.kind == .kw_result) {
-                                if (saw_instr) { self.malformed = true; break :scan_loop; }
+                                if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
+                                // Don't reset last_was_select — allow consecutive (result ...) after select
                             } else if (inner.kind == .kw_local) {
                                 saw_local = true;
+                                last_was_select = false;
                             } else {
                                 saw_instr = true;
+                                last_was_select = false;
                             }
                         }
                         depth += 1;
@@ -1322,7 +1328,10 @@ const Parser = struct {
                         depth -= 1;
                     },
                     else => {
-                        if (depth == 0) saw_instr = true;
+                        if (depth == 0) {
+                            last_was_select = stok.kind == .kw_select;
+                            saw_instr = true;
+                        }
                     },
                 }
             }
@@ -1970,7 +1979,7 @@ const Parser = struct {
             },
             .kw_drop => code.append(self.allocator, 0x1a) catch return,
             .kw_select => {
-                // Check for typed select: (select (result <type>) ...)
+                // Check for typed select: select (result <type>) ...
                 if (self.peek().kind == .l_paren) {
                     const save_pos2 = self.lexer.pos;
                     const save_peeked2 = self.peeked;
@@ -1978,16 +1987,36 @@ const Parser = struct {
                     if (self.peek().kind == .kw_result) {
                         _ = self.advance(); // consume 'result'
                         code.append(self.allocator, 0x1c) catch return; // typed select
+                        var sel_types: [8]types.ValType = undefined;
                         var count: u32 = 0;
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                             const vt = self.parseValType() catch break;
-                            _ = vt;
+                            if (count < 8) sel_types[count] = vt;
                             count += 1;
                         }
-                        // Encode count + type (simplified: just encode count)
                         self.emitLeb128U32(code, count);
-                        for (0..count) |_| self.emitLeb128U32(code, 0);
+                        for (0..count) |ci| {
+                            if (ci < 8) {
+                                const raw: u32 = @bitCast(@intFromEnum(sel_types[ci]));
+                                code.append(self.allocator, @truncate(raw)) catch {};
+                            }
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance();
+                        // Consume additional (result ...) annotations
+                        while (self.peek().kind == .l_paren) {
+                            const sp3 = self.lexer.pos;
+                            const spk3 = self.peeked;
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_result) {
+                                _ = self.advance();
+                                while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                            } else {
+                                self.lexer.pos = sp3;
+                                self.peeked = spk3;
+                                break;
+                            }
+                        }
                     } else {
                         self.lexer.pos = save_pos2;
                         self.peeked = save_peeked2;
