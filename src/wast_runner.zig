@@ -742,9 +742,35 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .get => processGet(sexpr.text, &state, &result),
             .assert_exhaustion => processAssertExhaustion(allocator, sexpr.text, &state, &result),
             .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &state, &result),
-            .unknown,
-            => {
-                result.skipped += 1;
+            .unknown => {
+                // Check if this is a bare module field keyword (implicit module)
+                if (isBareModuleField(sexpr.text)) {
+                    // Collect all remaining bare fields into one module
+                    var mod_buf = std.ArrayListUnmanaged(u8){};
+                    mod_buf.appendSlice(allocator, "(module ") catch { result.skipped += 1; continue; };
+                    mod_buf.appendSlice(allocator, sexpr.text) catch { result.skipped += 1; continue; };
+                    // Consume subsequent bare fields
+                    while (pos < source.len) {
+                        const next_pos = skipWhitespaceAndComments(source, pos);
+                        if (next_pos >= source.len or source[next_pos] != '(') break;
+                        const next_sexpr = extractSExpr(source, next_pos) orelse break;
+                        if (!isBareModuleField(next_sexpr.text)) break;
+                        mod_buf.append(allocator, ' ') catch break;
+                        mod_buf.appendSlice(allocator, next_sexpr.text) catch break;
+                        pos = next_sexpr.end;
+                    }
+                    mod_buf.append(allocator, ')') catch { result.skipped += 1; continue; };
+                    const mod_text = mod_buf.toOwnedSlice(allocator) catch { result.skipped += 1; continue; };
+                    if (state.setModule(mod_text)) {
+                        state.owned_sources.append(allocator, mod_text) catch {};
+                        result.passed += 1;
+                    } else {
+                        allocator.free(mod_text);
+                        result.skipped += 1;
+                    }
+                } else {
+                    result.skipped += 1;
+                }
             },
         }
     }
@@ -805,6 +831,21 @@ fn isModuleDefinition(text: []const u8) bool {
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
     // Must have $name after definition
     return i < text.len and text[i] == '$';
+}
+
+fn isBareModuleField(text: []const u8) bool {
+    // Check if s-expression starts with a module field keyword (not a command)
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    const start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')' and text[i] != '(') : (i += 1) {}
+    const word = text[start..i];
+    return std.mem.eql(u8, word, "func") or std.mem.eql(u8, word, "memory") or
+        std.mem.eql(u8, word, "table") or std.mem.eql(u8, word, "global") or
+        std.mem.eql(u8, word, "type") or std.mem.eql(u8, word, "elem") or
+        std.mem.eql(u8, word, "data") or std.mem.eql(u8, word, "import") or
+        std.mem.eql(u8, word, "export") or std.mem.eql(u8, word, "start") or
+        std.mem.eql(u8, word, "tag");
 }
 
 fn hasDefinitionKeyword(text: []const u8) bool {
