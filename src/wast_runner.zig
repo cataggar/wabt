@@ -309,6 +309,7 @@ const RunState = struct {
         var func_import_idx: u32 = 0;
         var global_import_idx: u32 = 0;
         var memory_import_idx: u32 = 0;
+        var table_import_idx: u32 = 0;
         for (mod.imports.items) |imp| {
             if (imp.kind == .func) {
                 if (func_import_idx >= mod.num_func_imports) continue;
@@ -376,14 +377,17 @@ const RunState = struct {
                     }
                 }
             } else if (imp.kind == .table) {
-                // Share tables from exporting module via pointer
+                defer table_import_idx += 1;
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
                 const exp = triple.module.getExport(imp.field_name) orelse continue;
                 if (exp.kind != .table) continue;
-                // Point to the exporter's tables for true sharing
+                const exp_tbl_idx: u32 = switch (exp.var_) { .index => |i| i, .name => 0 };
+                // Share the specific source table at this import index
+                const src_tbl = triple.instance.getTable(exp_tbl_idx);
+                interp.instance.shared_table_map.put(self.allocator, table_import_idx, src_tbl) catch {};
+                // Also set legacy shared_tables for single-table compatibility
                 const src_tables = triple.instance.shared_tables orelse &triple.instance.tables;
                 interp.instance.shared_tables = src_tables;
-                // Share the table func refs map for cross-module call_indirect
                 interp.instance.shared_table_func_refs = triple.instance.getTableFuncRefs();
             }
         }

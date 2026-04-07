@@ -88,6 +88,8 @@ pub const Instance = struct {
 
     /// Shared table pointers — when set, table operations use this instead of local tables.
     shared_tables: ?*std.ArrayListUnmanaged(std.ArrayListUnmanaged(?u32)) = null,
+    /// Per-index shared tables (for multiple imports from different sources).
+    shared_table_map: std.AutoHashMapUnmanaged(u32, *std.ArrayListUnmanaged(?u32)) = .{},
 
     /// Per-table-entry interpreter refs for cross-module function references.
     /// Key = (tbl_idx << 32) | entry_idx. Only used when tables are shared.
@@ -123,6 +125,7 @@ pub const Instance = struct {
 
     /// Access a table by index, falling back to index 0.
     pub fn getTable(self: *Instance, idx: u32) *std.ArrayListUnmanaged(?u32) {
+        if (self.shared_table_map.get(idx)) |t| return t;
         const tbls = self.shared_tables orelse &self.tables;
         if (idx < tbls.items.len) return &tbls.items[idx];
         return &tbls.items[0];
@@ -204,6 +207,7 @@ pub const Instance = struct {
         for (self.memories.items) |*m| m.deinit(self.allocator);
         self.memories.deinit(self.allocator);
         self.shared_memories.deinit(self.allocator);
+        self.shared_table_map.deinit(self.allocator);
         self.shared_memory_max_pages_map.deinit(self.allocator);
         self.globals.deinit(self.allocator);
         for (self.tables.items) |*t| t.deinit(self.allocator);
