@@ -3537,14 +3537,21 @@ const Parser = struct {
             .kw_memory => .memory,
             .kw_table => .table,
             .kw_global => .global,
+            .kw_tag => .tag,
             else => return error.UnexpectedToken,
         };
-        const index = switch (kind) {
+        const index: u32 = switch (kind) {
             .func => try self.parseFuncIdx(),
             .global => try self.parseGlobalIdx(),
             .table => try self.parseTableIdx(),
             .memory => self.parseU32() catch 0,
-            else => try self.parseU32(),
+            .tag => blk: {
+                if (self.peek().kind == .identifier) {
+                    const name = self.advance().text;
+                    break :blk self.tag_names.get(name) orelse 0;
+                }
+                break :blk self.parseU32() catch 0;
+            },
         };
         try self.expect(.r_paren);
         try module.exports.append(self.allocator, .{
