@@ -23,6 +23,13 @@ pub const TokenKind = enum {
     kw_elem,
     kw_data,
     kw_tag,
+    kw_throw,
+    kw_throw_ref,
+    kw_try_table,
+    kw_catch,
+    kw_catch_ref,
+    kw_catch_all,
+    kw_catch_all_ref,
     kw_rec,
     kw_definition,
 
@@ -436,6 +443,13 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "elem")) return .kw_elem;
     if (eql(text, "data")) return .kw_data;
     if (eql(text, "tag")) return .kw_tag;
+    if (eql(text, "throw")) return .kw_throw;
+    if (eql(text, "throw_ref")) return .kw_throw_ref;
+    if (eql(text, "try_table")) return .kw_try_table;
+    if (eql(text, "catch")) return .kw_catch;
+    if (eql(text, "catch_ref")) return .kw_catch_ref;
+    if (eql(text, "catch_all")) return .kw_catch_all;
+    if (eql(text, "catch_all_ref")) return .kw_catch_all_ref;
     if (eql(text, "rec")) return .kw_rec;
     if (eql(text, "definition")) return .kw_definition;
 

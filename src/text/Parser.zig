@@ -28,6 +28,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.local_names.deinit(allocator);
     defer p.global_names.deinit(allocator);
     defer p.table_names.deinit(allocator);
+    defer p.tag_names.deinit(allocator);
     defer p.memory_names.deinit(allocator);
     defer p.data_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
@@ -300,6 +301,8 @@ const Parser = struct {
     global_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from table $name to index.
     table_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from tag $name to index.
+    tag_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from memory $name to index.
     memory_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from data segment $name to index.
@@ -1575,6 +1578,83 @@ const Parser = struct {
                 }
             },
             .kw_return => code.append(self.allocator, 0x0f) catch return,
+            .kw_throw => {
+                code.append(self.allocator, 0x08) catch return;
+                // throw $tag_idx
+                if (self.peek().kind == .identifier) {
+                    const tag_tok = self.advance();
+                    const idx = self.tag_names.get(tag_tok.text) orelse 0;
+                    self.emitLeb128U32(code, idx);
+                } else {
+                    self.emitU32Imm(code);
+                }
+            },
+            .kw_throw_ref => code.append(self.allocator, 0x0a) catch return,
+            .kw_try_table => {
+                code.append(self.allocator, 0x1f) catch return;
+                // Parse optional label
+                const label = if (self.peek().kind == .identifier) self.advance().text else null;
+                // Push label for depth resolution (try_table is a block-like construct)
+                self.label_stack.append(self.allocator, label) catch {};
+                self.emitBlockType(code);
+                // Parse catch clauses, building a byte buffer
+                var clause_count: u32 = 0;
+                var catch_bytes = std.ArrayListUnmanaged(u8){};
+                defer catch_bytes.deinit(self.allocator);
+                while (self.peek().kind == .l_paren) {
+                    const sp = self.lexer.pos;
+                    const spk = self.peeked;
+                    _ = self.advance();
+                    const ck = self.peek().kind;
+                    if (ck == .kw_catch or ck == .kw_catch_ref or ck == .kw_catch_all or ck == .kw_catch_all_ref) {
+                        const catch_kind = self.advance().kind;
+                        const catch_code: u8 = switch (catch_kind) {
+                            .kw_catch => 0x00,
+                            .kw_catch_ref => 0x01,
+                            .kw_catch_all => 0x02,
+                            .kw_catch_all_ref => 0x03,
+                            else => 0x00,
+                        };
+                        catch_bytes.append(self.allocator, catch_code) catch {};
+                        // catch/catch_ref have a tag index
+                        if (catch_code <= 0x01) {
+                            var tag_idx: u32 = 0;
+                            if (self.peek().kind == .identifier) {
+                                const tag_tok = self.advance();
+                                tag_idx = self.tag_names.get(tag_tok.text) orelse 0;
+                            } else {
+                                tag_idx = self.parseU32() catch 0;
+                            }
+                            var buf: [5]u8 = undefined;
+                            const n = leb128.writeU32Leb128(&buf, tag_idx);
+                            catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
+                        }
+                        // Label (branch depth)
+                        var depth: u32 = 0;
+                        if (self.peek().kind == .identifier) {
+                            const lbl = self.advance();
+                            depth = self.resolveLabelDepth(lbl.text) orelse 0;
+                        } else {
+                            depth = self.parseU32() catch 0;
+                        }
+                        var buf: [5]u8 = undefined;
+                        const n = leb128.writeU32Leb128(&buf, depth);
+                        catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
+                        clause_count += 1;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        break;
+                    }
+                }
+                // Emit: clause_count + catch clause bytes
+                var cnt_buf: [5]u8 = undefined;
+                const cn = leb128.writeU32Leb128(&cnt_buf, clause_count);
+                code.appendSlice(self.allocator, cnt_buf[0..cn]) catch {};
+                code.appendSlice(self.allocator, catch_bytes.items) catch {};
+                // Instructions inside try_table are parsed by the normal loop; end (0x0b) closes it
+            },
             .kw_call => {
                 code.append(self.allocator, 0x10) catch return;
                 self.emitU32Imm(code);
@@ -3002,8 +3082,11 @@ const Parser = struct {
 
     fn parseTag(self: *Parser, module: *Mod.Module) ParseError!void {
         const tag_idx: u32 = @intCast(module.tags.items.len);
-        // Skip optional $name
-        if (self.peek().kind == .identifier) _ = self.advance();
+        // Parse optional $name
+        if (self.peek().kind == .identifier) {
+            const name_tok = self.advance();
+            self.tag_names.put(self.allocator, name_tok.text, tag_idx) catch {};
+        }
         // Handle inline (export "name") declarations
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
@@ -3229,7 +3312,11 @@ const Parser = struct {
             },
             .kw_tag => {
                 import.kind = .tag;
-                if (self.peek().kind == .identifier) _ = self.advance();
+                const import_tag_idx: u32 = @intCast(module.tags.items.len);
+                if (self.peek().kind == .identifier) {
+                    const tname = self.advance().text;
+                    self.tag_names.put(self.allocator, tname, import_tag_idx) catch {};
+                }
                 var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};

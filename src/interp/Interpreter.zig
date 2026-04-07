@@ -50,6 +50,12 @@ const TailCall = struct {
     arg_count: usize = 0,
 };
 
+const ThrownException = struct {
+    tag_idx: u32,
+    values: [16]Value = undefined,
+    value_count: usize = 0,
+};
+
 // ── Instance ─────────────────────────────────────────────────────────────
 
 /// Runtime module instance — holds mutable state (memory, globals, tables).
@@ -371,6 +377,8 @@ pub const Interpreter = struct {
     returning: bool = false,
     /// Pending tail call: set by return_call/return_call_indirect.
     pending_tail_call: ?TailCall = null,
+    /// Pending thrown exception (propagating upward).
+    thrown_exception: ?ThrownException = null,
     /// Instruction counter for execution limit.
     instruction_count: u64 = 0,
     /// Maximum instructions before trap (prevents infinite loops).
@@ -2117,11 +2125,34 @@ pub const Interpreter = struct {
             switch (opcode) {
                 0x00 => return error.Unreachable,
                 0x01 => {},
+                0x08 => { // throw
+                    var tmp_pc = pc;
+                    const tag_idx = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    // Pop tag params and store as exception
+                    var exc = ThrownException{ .tag_idx = tag_idx };
+                    if (tag_idx < self.instance.module.tags.items.len) {
+                        const tag = self.instance.module.tags.items[tag_idx];
+                        exc.value_count = tag.@"type".sig.params.len;
+                        var i = exc.value_count;
+                        while (i > 0) {
+                            i -= 1;
+                            if (i < 16) exc.values[i] = try self.popValue();
+                        }
+                    }
+                    self.thrown_exception = exc;
+                    return pc;
+                },
+                0x0a => { // throw_ref — re-throw (simplified: treat as unreachable for now)
+                    _ = try self.popValue();
+                    return error.Unreachable;
+                },
                 0x02 => { // block
                     const bsig = self.getBlockSig(code, pc);
                     const body_start = skipBlockType(code, pc);
                     const block_stack_base = self.stack.items.len -| bsig.params;
                     pc = try self.dispatch(code, body_start, locals);
+                    if (self.thrown_exception != null) return pc;
                     if (self.returning) return pc;
                     if (self.branch_depth) |d| {
                         if (d == 0) {
@@ -2144,6 +2175,7 @@ pub const Interpreter = struct {
                     pc = body_start;
                     while (true) {
                         pc = try self.dispatch(code, body_start, locals);
+                        if (self.thrown_exception != null) return pc;
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
@@ -2169,6 +2201,7 @@ pub const Interpreter = struct {
                     const if_stack_base = self.stack.items.len -| isig.params;
                     if (cond != 0) {
                         pc = try self.dispatch(code, body_start, locals);
+                        if (self.thrown_exception != null) return pc;
                         if (self.returning) return pc;
                         if (self.branch_depth) |d| {
                             if (d == 0) {
@@ -2193,6 +2226,7 @@ pub const Interpreter = struct {
                             const else_start = pc;
                             // Execute else branch
                             pc = try self.dispatch(code, pc, locals);
+                            if (self.thrown_exception != null) return pc;
                             if (self.returning) return pc;
                             if (self.branch_depth) |d| {
                                 if (d == 0) {
@@ -2212,6 +2246,75 @@ pub const Interpreter = struct {
                 },
                 0x05 => return pc, // else — end of true branch
                 0x0b => return pc, // end
+                0x1f => { // try_table
+                    const tsig = self.getBlockSig(code, pc);
+                    var body_start = skipBlockType(code, pc);
+                    // Parse catch clauses from bytecode
+                    const catch_count = readCodeU32(code, &body_start);
+                    const CatchClause = struct { kind: u8, tag_idx: u32, label: u32 };
+                    var catches_buf: [16]CatchClause = undefined;
+                    const n_catches = @min(catch_count, 16);
+                    for (0..n_catches) |ci| {
+                        const kind = code[body_start];
+                        body_start += 1;
+                        var tag: u32 = 0;
+                        if (kind <= 0x01) tag = readCodeU32(code, &body_start);
+                        const lbl = readCodeU32(code, &body_start);
+                        catches_buf[ci] = .{ .kind = kind, .tag_idx = tag, .label = lbl };
+                    }
+                    // Skip any remaining catch clauses beyond 16
+                    for (n_catches..catch_count) |_| {
+                        const kind = code[body_start];
+                        body_start += 1;
+                        if (kind <= 0x01) _ = readCodeU32(code, &body_start);
+                        _ = readCodeU32(code, &body_start);
+                    }
+
+                    const try_stack_base = self.stack.items.len -| tsig.params;
+                    pc = try self.dispatch(code, body_start, locals);
+
+                    // Check for thrown exception
+                    if (self.thrown_exception) |exc| {
+                        // Try to match a catch clause
+                        for (catches_buf[0..n_catches]) |clause| {
+                            const matches = switch (clause.kind) {
+                                0x00, 0x01 => clause.tag_idx == exc.tag_idx, // catch, catch_ref
+                                0x02, 0x03 => true, // catch_all, catch_all_ref
+                                else => false,
+                            };
+                            if (matches) {
+                                self.thrown_exception = null;
+                                // Restore stack to block base
+                                self.stack.shrinkRetainingCapacity(try_stack_base);
+                                // Push exception values for catch/catch_ref
+                                if (clause.kind == 0x00 or clause.kind == 0x01) {
+                                    for (0..exc.value_count) |vi| {
+                                        try self.pushValue(exc.values[vi]);
+                                    }
+                                }
+                                // Branch to the catch label
+                                self.branch_depth = clause.label;
+                                return pc;
+                            }
+                        }
+                        // No match — propagate exception
+                        return pc;
+                    }
+
+                    if (self.returning) return pc;
+                    if (self.branch_depth) |d| {
+                        if (d == 0) {
+                            self.branch_depth = null;
+                            self.compactBlockResults(try_stack_base, tsig.results);
+                            pc = scanToEnd(code, body_start);
+                        } else {
+                            self.branch_depth = d - 1;
+                            return pc;
+                        }
+                    } else {
+                        self.compactBlockResults(try_stack_base, tsig.results);
+                    }
+                },
                 0x0c => { // br
                     var tmp_pc = pc;
                     const depth = readCodeU32(code, &tmp_pc);
@@ -4149,6 +4252,20 @@ fn skipBlockType(code: []const u8, pc: usize) usize {
     return tmp;
 }
 
+/// Skip past the catch clause vector for a try_table instruction.
+fn skipCatchClauses(code: []const u8, pc: usize) usize {
+    var p = pc;
+    const count = readCodeU32(code, &p);
+    for (0..count) |_| {
+        if (p >= code.len) break;
+        const kind = code[p];
+        p += 1;
+        if (kind <= 0x01) _ = readCodeU32(code, &p); // catch/catch_ref: tag index
+        _ = readCodeU32(code, &p); // label
+    }
+    return p;
+}
+
 /// Scan forward from `start` to find matching else (0x05) or end (0x0b).
 /// Returns pc just after the terminator byte.
 fn scanToElseOrEnd(code: []const u8, start: usize) usize {
@@ -4160,6 +4277,11 @@ fn scanToElseOrEnd(code: []const u8, start: usize) usize {
         switch (op) {
             0x02, 0x03, 0x04 => {
                 pc = skipBlockType(code, pc);
+                depth += 1;
+            },
+            0x1f => { // try_table
+                pc = skipBlockType(code, pc);
+                pc = skipCatchClauses(code, pc);
                 depth += 1;
             },
             0x05 => {
@@ -4187,6 +4309,11 @@ fn scanToEnd(code: []const u8, start: usize) usize {
                 pc = skipBlockType(code, pc);
                 depth += 1;
             },
+            0x1f => { // try_table
+                pc = skipBlockType(code, pc);
+                pc = skipCatchClauses(code, pc);
+                depth += 1;
+            },
             0x0b => {
                 if (depth == 0) return pc;
                 depth -= 1;
@@ -4201,6 +4328,8 @@ fn scanToEnd(code: []const u8, start: usize) usize {
 fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
     var p = pc;
     switch (op) {
+        0x08 => _ = readCodeU32(code, &p), // throw: tag index
+        0x0a => {}, // throw_ref: no immediates
         0x0c, 0x0d => _ = readCodeU32(code, &p), // br, br_if
         0x0e => { // br_table
             const count = readCodeU32(code, &p);
