@@ -2997,7 +2997,8 @@ const Parser = struct {
                 init_code.append(self.allocator, 0x23) catch {};
                 self.emitGlobalIdx(&init_code);
             } else {
-                // Unknown init expr — skip remaining tokens in the paren
+                // Unknown/invalid init expr — mark as malformed
+                self.malformed = true;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
             }
             init_code.append(self.allocator, 0x0b) catch {};
