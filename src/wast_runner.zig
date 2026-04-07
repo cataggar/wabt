@@ -310,6 +310,15 @@ const RunState = struct {
         var global_import_idx: u32 = 0;
         var memory_import_idx: u32 = 0;
         var table_import_idx: u32 = 0;
+        var tag_import_idx: u32 = 0;
+
+        // Initialize tag canonical IDs: each local tag gets a unique default ID
+        if (mod.tags.items.len > 0) {
+            interp.tag_canonical_ids.resize(self.allocator, mod.tags.items.len) catch {};
+            for (0..mod.tags.items.len) |ti| {
+                interp.tag_canonical_ids.items[ti] = @as(u64, @intFromPtr(mod)) ^ @as(u64, @intCast(ti));
+            }
+        }
         for (mod.imports.items) |imp| {
             if (imp.kind == .func) {
                 if (func_import_idx >= mod.num_func_imports) continue;
@@ -389,6 +398,20 @@ const RunState = struct {
                 const src_tables = triple.instance.shared_tables orelse &triple.instance.tables;
                 interp.instance.shared_tables = src_tables;
                 interp.instance.shared_table_func_refs = triple.instance.getTableFuncRefs();
+            } else if (imp.kind == .tag) {
+                defer tag_import_idx += 1;
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .tag) continue;
+                const src_tag_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                // Set canonical ID from source
+                if (tag_import_idx < interp.tag_canonical_ids.items.len) {
+                    if (src_tag_idx < triple.interpreter.tag_canonical_ids.items.len) {
+                        interp.tag_canonical_ids.items[tag_import_idx] = triple.interpreter.tag_canonical_ids.items[src_tag_idx];
+                    } else {
+                        interp.tag_canonical_ids.items[tag_import_idx] = @as(u64, @intFromPtr(triple.module)) ^ @as(u64, src_tag_idx);
+                    }
+                }
             }
         }
     }

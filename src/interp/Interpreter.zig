@@ -414,6 +414,7 @@ pub const Interpreter = struct {
 
     /// Links imported globals to exporting instance's globals for shared mutation.
     global_links: std.ArrayListUnmanaged(?GlobalLink) = .{},
+    tag_canonical_ids: std.ArrayListUnmanaged(u64) = .{},
 
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
@@ -427,6 +428,7 @@ pub const Interpreter = struct {
         self.stack.deinit(self.allocator);
         self.import_links.deinit(self.allocator);
         self.global_links.deinit(self.allocator);
+        self.tag_canonical_ids.deinit(self.allocator);
         self.caught_exceptions.deinit(self.allocator);
     }
 
@@ -2128,53 +2130,52 @@ pub const Interpreter = struct {
         const exc_tag_idx = exc.tag_idx;
         const exc_mod = exc.source_module orelse mod;
 
-        // Same module: check directly or via alias resolution
+        // Same module: direct comparison or canonical ID
         if (exc_mod == mod) {
             if (catch_tag_idx == exc_tag_idx) return true;
-            // Check alias: both imported from same source
-            if (catch_tag_idx < mod.tags.items.len and exc_tag_idx < mod.tags.items.len) {
-                const ta = mod.tags.items[catch_tag_idx];
-                const tb = mod.tags.items[exc_tag_idx];
-                if (ta.is_import and tb.is_import) {
-                    var tag_idx: u32 = 0;
-                    var src_a: ?struct { m: []const u8, f: []const u8 } = null;
-                    var src_b: ?struct { m: []const u8, f: []const u8 } = null;
-                    for (mod.imports.items) |imp| {
-                        if (imp.kind == .tag) {
-                            if (tag_idx == catch_tag_idx) src_a = .{ .m = imp.module_name, .f = imp.field_name };
-                            if (tag_idx == exc_tag_idx) src_b = .{ .m = imp.module_name, .f = imp.field_name };
-                            tag_idx += 1;
-                        }
-                    }
-                    if (src_a != null and src_b != null)
-                        return std.mem.eql(u8, src_a.?.m, src_b.?.m) and std.mem.eql(u8, src_a.?.f, src_b.?.f);
-                }
-            }
+            // Use canonical IDs for alias resolution
+            if (catch_tag_idx < self.tag_canonical_ids.items.len and
+                exc_tag_idx < self.tag_canonical_ids.items.len)
+                return self.tag_canonical_ids.items[catch_tag_idx] == self.tag_canonical_ids.items[exc_tag_idx];
             return false;
         }
 
-        // Cross-module: the catch tag must be an import that resolves to the
-        // same tag as the exception's source
-        if (catch_tag_idx < mod.tags.items.len and mod.tags.items[catch_tag_idx].is_import) {
-            // Find the catch tag's import source
-            var tag_idx: u32 = 0;
-            for (mod.imports.items) |imp| {
-                if (imp.kind == .tag) {
-                    if (tag_idx == catch_tag_idx) {
-                        // Check if the exception's source module exports this tag
-                        if (exc_mod.getExport(imp.field_name)) |exp| {
-                            if (exp.kind == .tag) {
-                                const exp_tag_idx: u32 = switch (exp.var_) { .index => |i| i, .name => return false };
-                                return exp_tag_idx == exc_tag_idx;
-                            }
-                        }
-                        return false;
-                    }
-                    tag_idx += 1;
-                }
-            }
+        // Cross-module: the thrown exception has a source tag from a different module.
+        // We need to check if our catch tag (imported) resolves to the same source.
+        // Get the catch tag's canonical ID
+        if (catch_tag_idx < self.tag_canonical_ids.items.len) {
+            const catch_canonical = self.tag_canonical_ids.items[catch_tag_idx];
+            // The thrown tag's canonical: use the source module's default ID
+            const thrown_canonical = @as(u64, @intFromPtr(exc_mod)) ^ @as(u64, exc_tag_idx);
+            return catch_canonical == thrown_canonical;
         }
         return false;
+    }
+
+    /// Find the tag index exported by a source module under a given field name.
+    /// Resolves through function import links to find the source module.
+    fn findSourceTagIndex(self: *Interpreter, mod: *const Mod.Module, module_name: []const u8, field_name: []const u8) ?u32 {
+        // Find a function import from the same module to get the source interpreter
+        var func_idx: u32 = 0;
+        for (mod.imports.items) |imp| {
+            if (imp.kind == .func) {
+                if (std.mem.eql(u8, imp.module_name, module_name)) {
+                    if (func_idx < self.import_links.items.len) {
+                        if (self.import_links.items[func_idx]) |link| {
+                            // Found the source module's interpreter
+                            if (link.interpreter.instance.module.getExport(field_name)) |exp| {
+                                if (exp.kind == .tag) {
+                                    return switch (exp.var_) { .index => |i| i, .name => null };
+                                }
+                            }
+                            return null;
+                        }
+                    }
+                }
+                func_idx += 1;
+            }
+        }
+        return null;
     }
 
     // ── Block stack helpers ──────────────────────────────────────────────
