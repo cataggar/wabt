@@ -221,6 +221,7 @@ pub const Global = struct {
 pub const Table = struct {
     name: ?[]const u8 = null,
     @"type": types.TableType = .{},
+    init_expr_bytes: []const u8 = &.{},
     loc: Location = .{},
     is_import: bool = false,
 };

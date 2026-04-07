@@ -225,6 +225,22 @@ pub const Instance = struct {
             }
         }
 
+        // Evaluate table init expressions (fill all entries with init value)
+        for (self.module.tables.items, 0..) |tbl_def, ti| {
+            if (tbl_def.init_expr_bytes.len > 0 and !tbl_def.is_import) {
+                const val = evalConstExpr(self, tbl_def.init_expr_bytes);
+                if (val) |v| {
+                    const func_idx: ?u32 = switch (v) {
+                        .ref_func => |idx| idx,
+                        .ref_null => null,
+                        else => null,
+                    };
+                    const tbl = self.getTable(@intCast(ti));
+                    for (tbl.items) |*entry| entry.* = func_idx;
+                }
+            }
+        }
+
         // Populate tables from active element segments (before data segments per spec)
         for (self.module.elem_segments.items) |seg| {
             if (seg.kind != .active) continue;

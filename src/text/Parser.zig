@@ -2973,14 +2973,16 @@ const Parser = struct {
             limits.has_max = true;
         }
         const elem_type = try self.parseValType();
-        // Skip optional table initializer expression: (ref.null func) etc.
+        // Parse optional table initializer expression: (ref.null func) etc.
+        var table_init_bytes: []const u8 = &.{};
         if (self.peek().kind == .l_paren) {
-            _ = self.advance();
-            try self.skipSExpr();
-            if (self.peek().kind == .r_paren) _ = self.advance();
+            var init_code: std.ArrayListUnmanaged(u8) = .{};
+            self.parseInitExpr(&init_code);
+            table_init_bytes = init_code.toOwnedSlice(self.allocator) catch &.{};
         }
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
+            .init_expr_bytes = table_init_bytes,
         });
     }
 
