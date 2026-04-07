@@ -192,7 +192,22 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
         const vt = ValTypeOrUnknown.fromValType(table.type.elem_type);
         if (vt.isNonNullableRef())
             return error.TypeMismatch;
-        try checkLimits(table.type.limits, std.math.maxInt(u32));
+        try checkLimits(table.@"type".limits, std.math.maxInt(u32));
+        // Validate table init expression type
+        if (table.init_expr_bytes.len > 0) {
+            // Check init expr produces a ref type matching the table's elem type
+            const first_byte = table.init_expr_bytes[0];
+            if (first_byte == 0x41 or first_byte == 0x42 or first_byte == 0x43 or first_byte == 0x44) {
+                // Numeric const — invalid for ref table
+                return error.TypeMismatch;
+            }
+            // Check global.get references an imported global
+            if (first_byte == 0x23) {
+                const gidx = leb128.readU32Leb128(table.init_expr_bytes[1..]) catch return error.TypeMismatch;
+                if (gidx.value >= m.globals.items.len) return error.InvalidGlobalIndex;
+                if (!m.isGlobalImport(gidx.value)) return error.TypeMismatch;
+            }
+        }
     }
 }
 
