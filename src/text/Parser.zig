@@ -1308,7 +1308,9 @@ const Parser = struct {
                         if (depth == 0) {
                             const inner = scan.next();
                             if (inner.kind == .kw_param) {
-                                if (saw_instr or saw_local) { self.malformed = true; break :scan_loop; }
+                                if (saw_instr or saw_local) {
+                                    if (!last_was_select) { self.malformed = true; break :scan_loop; }
+                                }
                                 last_was_select = false;
                             } else if (inner.kind == .kw_result) {
                                 if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
@@ -1329,7 +1331,7 @@ const Parser = struct {
                     },
                     else => {
                         if (depth == 0) {
-                            last_was_select = stok.kind == .kw_select;
+                            last_was_select = stok.kind == .kw_select or stok.kind == .kw_call_indirect or stok.kind == .kw_return_call_indirect;
                             saw_instr = true;
                         }
                     },
