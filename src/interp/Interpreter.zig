@@ -55,6 +55,7 @@ const ThrownException = struct {
     tag_idx: u32,
     values: [16]Value = undefined,
     value_count: usize = 0,
+    source_module: ?*const Mod.Module = null,
 };
 
 // ── Instance ─────────────────────────────────────────────────────────────
@@ -2100,30 +2101,56 @@ pub const Interpreter = struct {
 
     // ── Tag identity matching ──────────────────────────────────────────
 
-    /// Check if two tag indices refer to the same tag, handling imported
-    /// tag aliases (multiple imports of the same source tag).
-    fn tagsMatch(self: *Interpreter, a: u32, b: u32) bool {
-        if (a == b) return true;
-        // Check if both are imported tags from the same source
+    /// Check if catch_tag_idx in the current module matches the thrown
+    /// exception's tag, handling imported aliases and cross-module throws.
+    fn tagsMatchException(self: *Interpreter, catch_tag_idx: u32, exc: ThrownException) bool {
         const mod = self.instance.module;
-        if (a < mod.tags.items.len and b < mod.tags.items.len) {
-            const ta = mod.tags.items[a];
-            const tb = mod.tags.items[b];
-            if (ta.is_import and tb.is_import) {
-                // Find their import entries and compare (module, field)
-                var tag_idx: u32 = 0;
-                var src_a: ?struct { mod: []const u8, field: []const u8 } = null;
-                var src_b: ?struct { mod: []const u8, field: []const u8 } = null;
-                for (mod.imports.items) |imp| {
-                    if (imp.kind == .tag) {
-                        if (tag_idx == a) src_a = .{ .mod = imp.module_name, .field = imp.field_name };
-                        if (tag_idx == b) src_b = .{ .mod = imp.module_name, .field = imp.field_name };
-                        tag_idx += 1;
+        const exc_tag_idx = exc.tag_idx;
+        const exc_mod = exc.source_module orelse mod;
+
+        // Same module: check directly or via alias resolution
+        if (exc_mod == mod) {
+            if (catch_tag_idx == exc_tag_idx) return true;
+            // Check alias: both imported from same source
+            if (catch_tag_idx < mod.tags.items.len and exc_tag_idx < mod.tags.items.len) {
+                const ta = mod.tags.items[catch_tag_idx];
+                const tb = mod.tags.items[exc_tag_idx];
+                if (ta.is_import and tb.is_import) {
+                    var tag_idx: u32 = 0;
+                    var src_a: ?struct { m: []const u8, f: []const u8 } = null;
+                    var src_b: ?struct { m: []const u8, f: []const u8 } = null;
+                    for (mod.imports.items) |imp| {
+                        if (imp.kind == .tag) {
+                            if (tag_idx == catch_tag_idx) src_a = .{ .m = imp.module_name, .f = imp.field_name };
+                            if (tag_idx == exc_tag_idx) src_b = .{ .m = imp.module_name, .f = imp.field_name };
+                            tag_idx += 1;
+                        }
                     }
+                    if (src_a != null and src_b != null)
+                        return std.mem.eql(u8, src_a.?.m, src_b.?.m) and std.mem.eql(u8, src_a.?.f, src_b.?.f);
                 }
-                if (src_a != null and src_b != null) {
-                    return std.mem.eql(u8, src_a.?.mod, src_b.?.mod) and
-                        std.mem.eql(u8, src_a.?.field, src_b.?.field);
+            }
+            return false;
+        }
+
+        // Cross-module: the catch tag must be an import that resolves to the
+        // same tag as the exception's source
+        if (catch_tag_idx < mod.tags.items.len and mod.tags.items[catch_tag_idx].is_import) {
+            // Find the catch tag's import source
+            var tag_idx: u32 = 0;
+            for (mod.imports.items) |imp| {
+                if (imp.kind == .tag) {
+                    if (tag_idx == catch_tag_idx) {
+                        // Check if the exception's source module exports this tag
+                        if (exc_mod.getExport(imp.field_name)) |exp| {
+                            if (exp.kind == .tag) {
+                                const exp_tag_idx: u32 = switch (exp.var_) { .index => |i| i, .name => return false };
+                                return exp_tag_idx == exc_tag_idx;
+                            }
+                        }
+                        return false;
+                    }
+                    tag_idx += 1;
                 }
             }
         }
@@ -2186,7 +2213,7 @@ pub const Interpreter = struct {
                     const tag_idx = readCodeU32(code, &tmp_pc);
                     pc = tmp_pc;
                     // Pop tag params and store as exception
-                    var exc = ThrownException{ .tag_idx = tag_idx };
+                    var exc = ThrownException{ .tag_idx = tag_idx, .source_module = self.instance.module };
                     if (tag_idx < self.instance.module.tags.items.len) {
                         const tag = self.instance.module.tags.items[tag_idx];
                         exc.value_count = tag.@"type".sig.params.len;
@@ -2345,7 +2372,7 @@ pub const Interpreter = struct {
                         var caught = false;
                         for (catches_buf[0..n_catches]) |clause| {
                             const matches = switch (clause.kind) {
-                                0x00, 0x01 => self.tagsMatch(clause.tag_idx, exc.tag_idx),
+                                0x00, 0x01 => self.tagsMatchException(clause.tag_idx, exc),
                                 0x02, 0x03 => true,
                                 else => false,
                             };
