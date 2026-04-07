@@ -2120,6 +2120,10 @@ const Parser = struct {
             .invalid => {
                 self.malformed = true;
             },
+            .kw_catch, .kw_catch_ref, .kw_catch_all, .kw_catch_all_ref => {
+                // catch/catch_ref/catch_all/catch_all_ref outside try_table is malformed
+                self.malformed = true;
+            },
             .kw_local => {
                 // local in function body (after instructions) is an ordering error
                 self.malformed = true;
