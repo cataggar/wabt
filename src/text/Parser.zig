@@ -1697,11 +1697,31 @@ const Parser = struct {
             },
             .kw_return_call_indirect => {
                 code.append(self.allocator, 0x13) catch return;
-                // Same encoding as call_indirect: typeidx tableidx
                 var rci_table_idx: u32 = 0;
                 if (self.peek().kind == .identifier) {
                     const rci_tok = self.advance();
                     rci_table_idx = self.table_names.get(rci_tok.text) orelse 0;
+                } else if (self.peek().kind == .integer) {
+                    // Lookahead: if integer followed by (type/param/result ...), it's a table index
+                    const sp_ti = self.lexer.pos;
+                    const spk_ti = self.peeked;
+                    const maybe_tbl = self.parseU32() catch 0;
+                    if (self.peek().kind == .l_paren) {
+                        const sp2 = self.lexer.pos;
+                        const spk2 = self.peeked;
+                        _ = self.advance();
+                        if (self.peek().kind == .kw_type or self.peek().kind == .kw_param or self.peek().kind == .kw_result) {
+                            rci_table_idx = maybe_tbl;
+                            self.lexer.pos = sp2;
+                            self.peeked = spk2;
+                        } else {
+                            self.lexer.pos = sp_ti;
+                            self.peeked = spk_ti;
+                        }
+                    } else {
+                        self.lexer.pos = sp_ti;
+                        self.peeked = spk_ti;
+                    }
                 }
                 if (self.peek().kind == .l_paren) {
                     const sp = self.lexer.pos;
@@ -1717,6 +1737,7 @@ const Parser = struct {
                             self.emitU32Imm(code);
                         }
                         if (self.peek().kind == .r_paren) _ = self.advance();
+                        // Skip optional trailing (param ...) (result ...) after type
                         while (self.peek().kind == .l_paren) {
                             const sp2 = self.lexer.pos;
                             const spk2 = self.peeked;
@@ -1730,6 +1751,52 @@ const Parser = struct {
                                 self.peeked = spk2;
                                 break;
                             }
+                        }
+                    } else if (self.peek().kind == .kw_param or self.peek().kind == .kw_result) {
+                        // Inline (param ...) (result ...) — parse and create type
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        var rci_params: [16]types.ValType = undefined;
+                        var rci_param_count: u32 = 0;
+                        var rci_results: [16]types.ValType = undefined;
+                        var rci_result_count: u32 = 0;
+                        while (self.peek().kind == .l_paren) {
+                            const sp3 = self.lexer.pos;
+                            const spk3 = self.peeked;
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_param) {
+                                _ = self.advance();
+                                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                                    if (self.parseValType()) |vt| {
+                                        if (rci_param_count < 16) { rci_params[rci_param_count] = vt; rci_param_count += 1; }
+                                    } else |_| break;
+                                }
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                            } else if (self.peek().kind == .kw_result) {
+                                _ = self.advance();
+                                while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                                    if (self.parseValType()) |vt| {
+                                        if (rci_result_count < 16) { rci_results[rci_result_count] = vt; rci_result_count += 1; }
+                                    } else |_| break;
+                                }
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                            } else {
+                                self.lexer.pos = sp3;
+                                self.peeked = spk3;
+                                break;
+                            }
+                        }
+                        // Create func type and emit index
+                        if (self.module) |mod| {
+                            const p = self.allocator.alloc(types.ValType, rci_param_count) catch { self.emitLeb128U32(code, 0); self.emitLeb128U32(code, rci_table_idx); return; };
+                            @memcpy(p, rci_params[0..rci_param_count]);
+                            const r = self.allocator.alloc(types.ValType, rci_result_count) catch { self.emitLeb128U32(code, 0); self.emitLeb128U32(code, rci_table_idx); return; };
+                            @memcpy(r, rci_results[0..rci_result_count]);
+                            const type_idx: u32 = @intCast(mod.module_types.items.len);
+                            mod.module_types.append(self.allocator, .{ .func_type = .{ .params = p, .results = r } }) catch {};
+                            self.emitLeb128U32(code, type_idx);
+                        } else {
+                            self.emitLeb128U32(code, 0);
                         }
                     } else {
                         self.lexer.pos = sp;
