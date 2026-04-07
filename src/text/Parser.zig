@@ -1377,6 +1377,62 @@ const Parser = struct {
                 if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
                 self.skipToRParen();
             },
+            .kw_try_table => {
+                _ = self.advance();
+                code.append(self.allocator, 0x1f) catch return;
+                const label = self.consumeOptionalLabel();
+                self.label_stack.append(self.allocator, label) catch {};
+                self.emitBlockType(code);
+                // Parse catch clauses
+                var clause_count: u32 = 0;
+                var catch_bytes = std.ArrayListUnmanaged(u8){};
+                defer catch_bytes.deinit(self.allocator);
+                while (self.peek().kind == .l_paren) {
+                    const sp = self.lexer.pos;
+                    const spk = self.peeked;
+                    _ = self.advance();
+                    const ck = self.peek().kind;
+                    if (ck == .kw_catch or ck == .kw_catch_ref or ck == .kw_catch_all or ck == .kw_catch_all_ref) {
+                        const catch_kind = self.advance().kind;
+                        const cc: u8 = switch (catch_kind) {
+                            .kw_catch => 0x00, .kw_catch_ref => 0x01,
+                            .kw_catch_all => 0x02, .kw_catch_all_ref => 0x03,
+                            else => 0x00,
+                        };
+                        catch_bytes.append(self.allocator, cc) catch {};
+                        if (cc <= 0x01) {
+                            var tag_idx: u32 = 0;
+                            if (self.peek().kind == .identifier) {
+                                tag_idx = self.tag_names.get(self.advance().text) orelse 0;
+                            } else { tag_idx = self.parseU32() catch 0; }
+                            var buf: [5]u8 = undefined;
+                            const n = leb128.writeU32Leb128(&buf, tag_idx);
+                            catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
+                        }
+                        var depth: u32 = 0;
+                        if (self.peek().kind == .identifier) {
+                            depth = self.resolveLabelDepth(self.advance().text) orelse 0;
+                        } else { depth = self.parseU32() catch 0; }
+                        var buf: [5]u8 = undefined;
+                        const n = leb128.writeU32Leb128(&buf, depth);
+                        catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
+                        clause_count += 1;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        break;
+                    }
+                }
+                var cnt_buf: [5]u8 = undefined;
+                const cn = leb128.writeU32Leb128(&cnt_buf, clause_count);
+                code.appendSlice(self.allocator, cnt_buf[0..cn]) catch {};
+                code.appendSlice(self.allocator, catch_bytes.items) catch {};
+                self.parseFuncBodyInstrs(code);
+                code.append(self.allocator, 0x0b) catch return; // end
+                if (self.label_stack.items.len > 0) _ = self.label_stack.pop();
+                self.skipToRParen();
+            },
             .kw_if => {
                 _ = self.advance();
                 const label = self.consumeOptionalLabel();
