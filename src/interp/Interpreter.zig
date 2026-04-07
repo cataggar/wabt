@@ -498,6 +498,13 @@ pub const Interpreter = struct {
                     if (self.import_links.items[current_func_idx]) |link| {
                         const link_base = link.interpreter.stack.items.len;
                         try link.interpreter.callFunc(link.func_idx, cur_args);
+                        // Propagate thrown exception from imported module
+                        if (link.interpreter.thrown_exception != null) {
+                            self.thrown_exception = link.interpreter.thrown_exception;
+                            link.interpreter.thrown_exception = null;
+                            link.interpreter.stack.shrinkRetainingCapacity(link_base);
+                            return;
+                        }
                         const link_results = link.interpreter.stack.items[link_base..];
                         for (link_results) |v| try self.pushValue(v);
                         link.interpreter.stack.shrinkRetainingCapacity(link_base);
