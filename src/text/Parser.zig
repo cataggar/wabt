@@ -2043,7 +2043,6 @@ const Parser = struct {
             },
             .kw_ref_null => {
                 code.append(self.allocator, 0xd0) catch return;
-                // Parse the heap type for ref.null
                 const next = self.peek().kind;
                 if (next == .kw_funcref) {
                     _ = self.advance();
@@ -2051,11 +2050,18 @@ const Parser = struct {
                 } else if (next == .kw_externref) {
                     _ = self.advance();
                     code.append(self.allocator, 0x6f) catch return;
+                } else if (next == .kw_exnref) {
+                    _ = self.advance();
+                    code.append(self.allocator, 0x69) catch return;
                 } else if (next == .kw_func) {
                     _ = self.advance();
                     code.append(self.allocator, 0x70) catch return;
+                } else if (next == .identifier) {
+                    // Type name reference: $type_name → type index
+                    const name = self.advance().text;
+                    const type_idx = self.type_names.get(name) orelse 0;
+                    self.emitLeb128S32(code, @bitCast(type_idx));
                 } else {
-                    // Check for bare "extern" or other heap type identifiers
                     const save_pos = self.lexer.pos;
                     const save_peeked = self.peeked;
                     if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
@@ -2064,8 +2070,11 @@ const Parser = struct {
                             code.append(self.allocator, 0x6f) catch return;
                         } else if (std.mem.eql(u8, ht.text, "func")) {
                             code.append(self.allocator, 0x70) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "any")) {
+                            code.append(self.allocator, 0x6e) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "exn")) {
+                            code.append(self.allocator, 0x69) catch return;
                         } else {
-                            // Restore and try parseValType
                             self.lexer.pos = save_pos;
                             self.peeked = save_peeked;
                             if (self.parseValType()) |vt| {

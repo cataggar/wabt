@@ -512,8 +512,17 @@ pub const Interpreter = struct {
 
             const sig = self.resolveSig(func.decl);
             const num_locals = sig.params.len + func.local_types.items.len;
-            var locals = self.allocator.alloc(Value, num_locals) catch return error.OutOfMemory;
-            defer self.allocator.free(locals);
+            // Use stack buffer for small local counts, heap for large
+            var locals_stack_buf: [32]Value = undefined;
+            var locals_heap: ?[]Value = null;
+            var locals: []Value = undefined;
+            if (num_locals <= 32) {
+                locals = locals_stack_buf[0..num_locals];
+            } else {
+                locals_heap = self.allocator.alloc(Value, num_locals) catch return error.OutOfMemory;
+                locals = locals_heap.?;
+            }
+            defer if (locals_heap) |h| self.allocator.free(h);
             for (cur_args, 0..) |arg, i| {
                 if (i < locals.len) locals[i] = arg;
             }
@@ -2571,7 +2580,7 @@ pub const Interpreter = struct {
                     pc = t;
                     try self.selectOp();
                 },
-                0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(locals[idx]); },
+                0x20 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; if (idx < locals.len) try self.pushValue(locals[idx]) else return error.Unimplemented; },
                 0x21 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; locals[idx] = try self.popValue(); },
                 0x22 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; const v = try self.popValue(); locals[idx] = v; try self.pushValue(v); },
                 0x23 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(self.getGlobal(idx)); },
