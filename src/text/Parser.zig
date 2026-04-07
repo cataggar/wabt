@@ -1579,6 +1579,10 @@ const Parser = struct {
                 code.append(self.allocator, 0x10) catch return;
                 self.emitU32Imm(code);
             },
+            .kw_return_call => {
+                code.append(self.allocator, 0x12) catch return;
+                self.emitU32Imm(code);
+            },
             .kw_call_indirect => {
                 code.append(self.allocator, 0x11) catch return;
                 // WAT: call_indirect $tableidx? typeuse
@@ -1690,6 +1694,54 @@ const Parser = struct {
                 }
                 // Emit table index
                 self.emitLeb128U32(code, ci_table_idx);
+            },
+            .kw_return_call_indirect => {
+                code.append(self.allocator, 0x13) catch return;
+                // Same encoding as call_indirect: typeidx tableidx
+                var rci_table_idx: u32 = 0;
+                if (self.peek().kind == .identifier) {
+                    const rci_tok = self.advance();
+                    rci_table_idx = self.table_names.get(rci_tok.text) orelse 0;
+                }
+                if (self.peek().kind == .l_paren) {
+                    const sp = self.lexer.pos;
+                    const spk = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_type) {
+                        _ = self.advance();
+                        if (self.peek().kind == .identifier) {
+                            const type_tok = self.advance();
+                            const idx = self.type_names.get(type_tok.text) orelse 0;
+                            self.emitLeb128U32(code, idx);
+                        } else {
+                            self.emitU32Imm(code);
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        while (self.peek().kind == .l_paren) {
+                            const sp2 = self.lexer.pos;
+                            const spk2 = self.peeked;
+                            _ = self.advance();
+                            if (self.peek().kind == .kw_param or self.peek().kind == .kw_result) {
+                                _ = self.advance();
+                                while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
+                                if (self.peek().kind == .r_paren) _ = self.advance();
+                            } else {
+                                self.lexer.pos = sp2;
+                                self.peeked = spk2;
+                                break;
+                            }
+                        }
+                    } else {
+                        self.lexer.pos = sp;
+                        self.peeked = spk;
+                        self.emitLeb128U32(code, 0);
+                    }
+                } else if (self.peek().kind == .integer) {
+                    self.emitU32Imm(code);
+                } else {
+                    self.emitLeb128U32(code, 0);
+                }
+                self.emitLeb128U32(code, rci_table_idx);
             },
             .kw_drop => code.append(self.allocator, 0x1a) catch return,
             .kw_select => {

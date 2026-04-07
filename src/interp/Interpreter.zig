@@ -44,6 +44,12 @@ pub const Value = union(enum) {
     ref_func: u32,
 };
 
+const TailCall = struct {
+    func_idx: u32,
+    args: [64]Value = undefined,
+    arg_count: usize = 0,
+};
+
 // ── Instance ─────────────────────────────────────────────────────────────
 
 /// Runtime module instance — holds mutable state (memory, globals, tables).
@@ -363,6 +369,8 @@ pub const Interpreter = struct {
     branch_depth: ?u32 = null,
     /// Set when a return instruction is executed.
     returning: bool = false,
+    /// Pending tail call: set by return_call/return_call_indirect.
+    pending_tail_call: ?TailCall = null,
     /// Instruction counter for execution limit.
     instruction_count: u64 = 0,
     /// Maximum instructions before trap (prevents infinite loops).
@@ -453,84 +461,103 @@ pub const Interpreter = struct {
         self.call_depth += 1;
         defer self.call_depth -= 1;
 
-        const func = self.instance.module.funcs.items[func_idx];
-        if (func.is_import) {
-            // Resolve via import links
-            if (func_idx < self.import_links.items.len) {
-                if (self.import_links.items[func_idx]) |link| {
-                    const link_base = link.interpreter.stack.items.len;
-                    try link.interpreter.callFunc(link.func_idx, args);
-                    // Copy results from linked interpreter's stack to our stack
-                    const link_results = link.interpreter.stack.items[link_base..];
-                    for (link_results) |v| try self.pushValue(v);
-                    link.interpreter.stack.shrinkRetainingCapacity(link_base);
-                    return;
+        var current_func_idx = func_idx;
+        var current_args_buf: [64]Value = undefined;
+        var current_args_heap: ?[]Value = null;
+        defer if (current_args_heap) |h| self.allocator.free(h);
+        var current_arg_count: usize = args.len;
+        if (args.len <= 64) {
+            for (args, 0..) |a, i| current_args_buf[i] = a;
+        } else {
+            current_args_heap = self.allocator.alloc(Value, args.len) catch return error.OutOfMemory;
+            @memcpy(current_args_heap.?, args);
+        }
+
+        // Tail-call trampoline loop
+        while (true) {
+            const cur_args = if (current_args_heap) |h| h[0..current_arg_count] else current_args_buf[0..current_arg_count];
+            const func = self.instance.module.funcs.items[current_func_idx];
+            if (func.is_import) {
+                if (current_func_idx < self.import_links.items.len) {
+                    if (self.import_links.items[current_func_idx]) |link| {
+                        const link_base = link.interpreter.stack.items.len;
+                        try link.interpreter.callFunc(link.func_idx, cur_args);
+                        const link_results = link.interpreter.stack.items[link_base..];
+                        for (link_results) |v| try self.pushValue(v);
+                        link.interpreter.stack.shrinkRetainingCapacity(link_base);
+                        return;
+                    }
+                }
+                return error.Unimplemented;
+            }
+
+            const code = func.code_bytes;
+            if (code.len == 0) return;
+
+            const sig = self.resolveSig(func.decl);
+            const num_locals = sig.params.len + func.local_types.items.len;
+            var locals = self.allocator.alloc(Value, num_locals) catch return error.OutOfMemory;
+            defer self.allocator.free(locals);
+            for (cur_args, 0..) |arg, i| {
+                if (i < locals.len) locals[i] = arg;
+            }
+            for (sig.params.len..num_locals) |i| {
+                if (i < func.local_types.items.len + sig.params.len) {
+                    const lt = func.local_types.items[i - sig.params.len];
+                    locals[i] = switch (lt) {
+                        .i64 => .{ .i64 = 0 },
+                        .f32 => .{ .f32 = 0.0 },
+                        .f64 => .{ .f64 = 0.0 },
+                        .v128 => .{ .v128 = 0 },
+                        .funcref, .externref, .anyref,
+                        .nullfuncref, .nullexternref, .nullref,
+                        .ref, .ref_null,
+                        .ref_func, .ref_extern, .ref_any,
+                        .ref_none, .ref_nofunc, .ref_noextern,
+                        => .{ .ref_null = {} },
+                        else => .{ .i32 = 0 },
+                    };
                 }
             }
-            return error.Unimplemented;
-        }
 
-        const code = func.code_bytes;
-        if (code.len == 0) return;
+            const saved_branch = self.branch_depth;
+            const saved_returning = self.returning;
+            self.branch_depth = null;
+            self.returning = false;
 
-        // Resolve function signature
-        const sig = self.resolveSig(func.decl);
+            const stack_base = self.stack.items.len;
+            _ = try self.dispatch(code, 0, locals);
 
-        // Initialize locals: params + declared locals
-        const num_locals = sig.params.len + func.local_types.items.len;
-        var locals = self.allocator.alloc(Value, num_locals) catch return error.OutOfMemory;
-        defer self.allocator.free(locals);
-        // Copy arguments into parameter slots
-        for (args, 0..) |arg, i| {
-            if (i < locals.len) locals[i] = arg;
-        }
-        // Zero-initialize declared locals
-        for (sig.params.len..num_locals) |i| {
-            if (i < func.local_types.items.len + sig.params.len) {
-                const lt = func.local_types.items[i - sig.params.len];
-                locals[i] = switch (lt) {
-                    .i64 => .{ .i64 = 0 },
-                    .f32 => .{ .f32 = 0.0 },
-                    .f64 => .{ .f64 = 0.0 },
-                    .v128 => .{ .v128 = 0 },
-                    .funcref, .externref, .anyref,
-                    .nullfuncref, .nullexternref, .nullref,
-                    .ref, .ref_null,
-                    .ref_func, .ref_extern, .ref_any,
-                    .ref_none, .ref_nofunc, .ref_noextern,
-                    => .{ .ref_null = {} },
-                    else => .{ .i32 = 0 },
-                };
+            // Check for tail call before compacting
+            if (self.pending_tail_call) |tc| {
+                self.pending_tail_call = null;
+                self.returning = saved_returning;
+                self.branch_depth = saved_branch;
+                self.stack.shrinkRetainingCapacity(stack_base);
+                current_func_idx = tc.func_idx;
+                current_arg_count = tc.arg_count;
+                // Tail calls always fit in 64 args (TailCall uses [64]Value)
+                if (current_args_heap) |h| { self.allocator.free(h); current_args_heap = null; }
+                for (0..tc.arg_count) |i| current_args_buf[i] = tc.args[i];
+                continue;
             }
-        }
 
-        // Save and restore control flow state across calls
-        const saved_branch = self.branch_depth;
-        const saved_returning = self.returning;
-        self.branch_depth = null;
-        self.returning = false;
-        defer {
             self.branch_depth = saved_branch;
             self.returning = saved_returning;
-        }
 
-        // Record stack depth before execution
-        const stack_base = self.stack.items.len;
-
-        // Execute bytecode
-        _ = try self.dispatch(code, 0, locals);
-
-        // Compact: keep only the last sig.results.len values above stack_base
-        const num_on_stack = self.stack.items.len -| stack_base;
-        const expected = sig.results.len;
-        if (expected > 0 and num_on_stack > expected) {
-            const src_start = self.stack.items.len - expected;
-            for (0..expected) |i| {
-                self.stack.items[stack_base + i] = self.stack.items[src_start + i];
+            // Compact results
+            const num_on_stack = self.stack.items.len -| stack_base;
+            const expected = sig.results.len;
+            if (expected > 0 and num_on_stack > expected) {
+                const src_start = self.stack.items.len - expected;
+                for (0..expected) |i| {
+                    self.stack.items[stack_base + i] = self.stack.items[src_start + i];
+                }
+                self.stack.shrinkRetainingCapacity(stack_base + expected);
+            } else if (expected == 0) {
+                self.stack.shrinkRetainingCapacity(stack_base);
             }
-            self.stack.shrinkRetainingCapacity(stack_base + expected);
-        } else if (expected == 0) {
-            self.stack.shrinkRetainingCapacity(stack_base);
+            break;
         }
     }
 
@@ -2236,6 +2263,22 @@ pub const Interpreter = struct {
                     }
                     try self.callFunc(idx, call_args);
                 },
+                0x12 => { // return_call (tail call)
+                    var tmp_pc = pc;
+                    const idx = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    const target = self.instance.module.funcs.items[idx];
+                    const sig = self.resolveSig(target.decl);
+                    var tc = TailCall{ .func_idx = idx, .arg_count = sig.params.len };
+                    var i = sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        tc.args[i] = try self.popValue();
+                    }
+                    self.pending_tail_call = tc;
+                    self.returning = true;
+                    return pc;
+                },
                 0x11 => { // call_indirect
                     var tmp_pc = pc;
                     const type_idx = readCodeU32(code, &tmp_pc);
@@ -2298,6 +2341,50 @@ pub const Interpreter = struct {
                     } else {
                         try self.callFunc(func_idx, call_args);
                     }
+                },
+                0x13 => { // return_call_indirect (tail call)
+                    var tmp_pc = pc;
+                    const type_idx = readCodeU32(code, &tmp_pc);
+                    const ci_tbl_idx = readCodeU32(code, &tmp_pc);
+                    pc = tmp_pc;
+                    const elem_idx = try self.popI32();
+                    const uidx: u32 = @bitCast(elem_idx);
+                    const ci_tbl = self.instance.getTable(ci_tbl_idx);
+                    if (uidx >= ci_tbl.items.len) return error.OutOfBoundsTableAccess;
+                    const func_idx = ci_tbl.items[uidx] orelse return error.UninitializedElement;
+                    const key = Instance.makeTableKey(ci_tbl_idx, uidx);
+                    const refs = self.instance.getTableFuncRefs();
+                    const target_interp = refs.get(key) orelse self;
+                    if (func_idx >= target_interp.instance.module.funcs.items.len) return error.UndefinedElement;
+                    const target = target_interp.instance.module.funcs.items[func_idx];
+                    const func_sig = target_interp.resolveSig(target.decl);
+                    if (type_idx < self.instance.module.module_types.items.len) {
+                        const actual_type_idx = target.decl.type_var.index;
+                        if (self.hasSubTypeInfo(type_idx) or target_interp.hasSubTypeInfo(actual_type_idx)) {
+                            if (!self.isSubtypeOf(actual_type_idx, type_idx, target_interp))
+                                return error.IndirectCallTypeMismatch;
+                        } else {
+                            switch (self.instance.module.module_types.items[type_idx]) {
+                                .func_type => |expected| {
+                                    if (!std.mem.eql(types.ValType, func_sig.params, expected.params) or
+                                        !std.mem.eql(types.ValType, func_sig.results, expected.results))
+                                        return error.IndirectCallTypeMismatch;
+                                    if (!typesEquivalent(self.instance.module, type_idx, target_interp.instance.module, actual_type_idx))
+                                        return error.IndirectCallTypeMismatch;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    var tc = TailCall{ .func_idx = func_idx, .arg_count = func_sig.params.len };
+                    var i = func_sig.params.len;
+                    while (i > 0) {
+                        i -= 1;
+                        tc.args[i] = try self.popValue();
+                    }
+                    self.pending_tail_call = tc;
+                    self.returning = true;
+                    return pc;
                 },
                 0x1a => _ = try self.popValue(), // drop
                 0x1b => try self.selectOp(), // select
@@ -4119,8 +4206,8 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
             const count = readCodeU32(code, &p);
             for (0..count + 1) |_| _ = readCodeU32(code, &p);
         },
-        0x10 => _ = readCodeU32(code, &p), // call
-        0x11 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect
+        0x10, 0x12 => _ = readCodeU32(code, &p), // call, return_call
+        0x11, 0x13 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // call_indirect, return_call_indirect
         0x1c => { // select t*
             const vec_len = readCodeU32(code, &p);
             var ti: u32 = 0;
