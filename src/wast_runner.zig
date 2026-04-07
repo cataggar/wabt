@@ -948,6 +948,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     var results_buf: [32]Interp.Value = undefined;
     const actuals = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
+        interp.thrown_exception = null; // Clear stale exception state
         result.failed += 1;
         if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
