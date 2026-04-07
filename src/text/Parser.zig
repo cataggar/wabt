@@ -3212,6 +3212,48 @@ const Parser = struct {
                     .kind = .tag,
                     .var_ = .{ .index = tag_idx },
                 }) catch return error.OutOfMemory;
+            } else if (self.peek().kind == .kw_import) {
+                // Inline import: (tag $name (import "mod" "field") ...)
+                _ = self.advance();
+                const mod_name = self.parseName(self.advance().text);
+                const field_name = self.parseName(self.advance().text);
+                if (self.peek().kind == .r_paren) _ = self.advance();
+                var imp_params: std.ArrayListUnmanaged(types.ValType) = .{};
+                defer imp_params.deinit(self.allocator);
+                while (self.peek().kind == .l_paren) {
+                    const sp2 = self.lexer.pos;
+                    const spk2 = self.peeked;
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_param) {
+                        _ = self.advance();
+                        if (self.peek().kind == .identifier) _ = self.advance();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const vt = self.parseValType() catch break;
+                            imp_params.append(self.allocator, vt) catch {};
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else if (self.peek().kind == .kw_type) {
+                        _ = self.advance();
+                        _ = self.parseTypeIdx() catch 0;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        self.lexer.pos = sp2;
+                        self.peeked = spk2;
+                        break;
+                    }
+                }
+                const params = imp_params.toOwnedSlice(self.allocator) catch &.{};
+                module.imports.append(self.allocator, .{
+                    .module_name = mod_name,
+                    .field_name = field_name,
+                    .kind = .tag,
+                }) catch {};
+                try module.tags.append(self.allocator, .{
+                    .@"type" = .{ .sig = .{ .params = params, .results = &.{} } },
+                    .is_import = true,
+                });
+                module.num_tag_imports += 1;
+                return;
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
