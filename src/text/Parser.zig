@@ -1300,21 +1300,20 @@ const Parser = struct {
             var saw_local = func.local_types.items.len > 0;
             var last_was_select = false;
             var depth: u32 = 0;
+            var block_depth: u32 = 0; // Track flat block/loop/if/end nesting
             scan_loop: while (true) {
                 const stok = scan.next();
                 switch (stok.kind) {
                     .eof => break,
                     .l_paren => {
-                        if (depth == 0) {
+                        if (depth == 0 and block_depth == 0) {
                             const inner = scan.next();
                             if (inner.kind == .kw_param) {
                                 if (saw_instr or saw_local) {
                                     if (!last_was_select) { self.malformed = true; break :scan_loop; }
                                 }
-                                // Don't reset last_was_select for consecutive (param ...) after call_indirect
                             } else if (inner.kind == .kw_result) {
                                 if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
-                                // Don't reset last_was_select — allow consecutive (result ...) after select
                             } else if (inner.kind == .kw_local) {
                                 saw_local = true;
                                 last_was_select = false;
@@ -1333,8 +1332,16 @@ const Parser = struct {
                     },
                     else => {
                         if (depth == 0) {
-                            last_was_select = stok.kind == .kw_select or stok.kind == .kw_call_indirect or stok.kind == .kw_return_call_indirect;
-                            saw_instr = true;
+                            // Track flat block nesting
+                            if (stok.kind == .kw_block or stok.kind == .kw_loop or stok.kind == .kw_if or stok.kind == .kw_try_table) {
+                                block_depth += 1;
+                            } else if (stok.kind == .kw_end and block_depth > 0) {
+                                block_depth -= 1;
+                            }
+                            if (block_depth == 0) {
+                                last_was_select = stok.kind == .kw_select or stok.kind == .kw_call_indirect or stok.kind == .kw_return_call_indirect;
+                                saw_instr = true;
+                            }
                         }
                     },
                 }
