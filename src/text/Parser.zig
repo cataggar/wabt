@@ -3220,6 +3220,7 @@ const Parser = struct {
                 if (self.peek().kind == .r_paren) _ = self.advance();
                 var imp_params: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer imp_params.deinit(self.allocator);
+                var inline_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
                     const spk2 = self.peeked;
@@ -3234,7 +3235,18 @@ const Parser = struct {
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else if (self.peek().kind == .kw_type) {
                         _ = self.advance();
-                        _ = self.parseTypeIdx() catch 0;
+                        const tidx = self.parseTypeIdx() catch 0;
+                        inline_tag_type_idx = tidx;
+                        if (self.module) |mod| {
+                            if (tidx < mod.module_types.items.len) {
+                                switch (mod.module_types.items[tidx]) {
+                                    .func_type => |ft| {
+                                        for (ft.params) |p2| imp_params.append(self.allocator, p2) catch {};
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else {
                         self.lexer.pos = sp2;
@@ -3250,6 +3262,7 @@ const Parser = struct {
                 }) catch {};
                 try module.tags.append(self.allocator, .{
                     .@"type" = .{ .sig = .{ .params = params, .results = &.{} } },
+                    .type_idx = inline_tag_type_idx,
                     .is_import = true,
                 });
                 module.num_tag_imports += 1;
@@ -3265,6 +3278,7 @@ const Parser = struct {
         defer params_list.deinit(self.allocator);
         var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
         defer results_list.deinit(self.allocator);
+        var tag_type_idx: u32 = std.math.maxInt(u32);
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
@@ -3286,7 +3300,19 @@ const Parser = struct {
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else if (self.peek().kind == .kw_type) {
                 _ = self.advance();
-                _ = self.parseTypeIdx() catch 0;
+                const tidx = self.parseTypeIdx() catch 0;
+                if (self.module) |mod| {
+                    if (tidx < mod.module_types.items.len) {
+                        switch (mod.module_types.items[tidx]) {
+                            .func_type => |ft| {
+                                for (ft.params) |p| params_list.append(self.allocator, p) catch {};
+                                for (ft.results) |r| results_list.append(self.allocator, r) catch {};
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                tag_type_idx = tidx;
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else {
                 self.lexer.pos = sp;
@@ -3298,6 +3324,7 @@ const Parser = struct {
         const results = results_list.toOwnedSlice(self.allocator) catch &.{};
         try module.tags.append(self.allocator, .{
             .@"type" = .{ .sig = .{ .params = params, .results = results } },
+            .type_idx = tag_type_idx,
         });
     }
 
@@ -3471,6 +3498,7 @@ const Parser = struct {
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer results_list.deinit(self.allocator);
+                var imp_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
                     const spk2 = self.peeked;
@@ -3492,7 +3520,18 @@ const Parser = struct {
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else if (self.peek().kind == .kw_type) {
                         _ = self.advance();
-                        _ = self.parseTypeIdx() catch 0;
+                        const tidx = self.parseTypeIdx() catch 0;
+                        imp_tag_type_idx = tidx;
+                        if (self.module) |mod| {
+                            if (tidx < mod.module_types.items.len) {
+                                switch (mod.module_types.items[tidx]) {
+                                    .func_type => |ft| {
+                                        for (ft.params) |p2| params_list.append(self.allocator, p2) catch {};
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else {
                         self.lexer.pos = sp2;
@@ -3504,6 +3543,7 @@ const Parser = struct {
                 const results = results_list.toOwnedSlice(self.allocator) catch &.{};
                 try module.tags.append(self.allocator, .{
                     .@"type" = .{ .sig = .{ .params = params, .results = results } },
+                    .type_idx = imp_tag_type_idx,
                     .is_import = true,
                 });
                 module.num_tag_imports += 1;

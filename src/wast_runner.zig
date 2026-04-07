@@ -471,6 +471,11 @@ const RunState = struct {
                         const imp_tag = mod.tags.items[imp_tag_idx];
                         if (!std.mem.eql(types.ValType, imp_tag.@"type".sig.params, exp_tag.@"type".sig.params))
                             return false;
+                        // Check rec group compatibility if type indices are available
+                        if (imp_tag.type_idx != std.math.maxInt(u32) and exp_tag.type_idx != std.math.maxInt(u32)) {
+                            if (!recGroupsCompatible(mod, imp_tag.type_idx, triple.module, exp_tag.type_idx))
+                                return false;
+                        }
                     }
                 },
             }

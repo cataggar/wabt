@@ -237,6 +237,7 @@ pub const Memory = struct {
 pub const Tag = struct {
     name: ?[]const u8 = null,
     @"type": types.TagType = .{},
+    type_idx: u32 = std.math.maxInt(u32),
     loc: Location = .{},
     is_import: bool = false,
 };
