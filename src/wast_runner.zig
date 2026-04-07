@@ -454,7 +454,25 @@ const RunState = struct {
                         }
                     }
                 },
-                else => {},
+                .tag => {
+                    const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                    if (exp_idx >= triple.module.tags.items.len) return false;
+                    const exp_tag = triple.module.tags.items[exp_idx];
+                    var imp_tag_idx: u32 = 0;
+                    for (mod.imports.items) |imp2| {
+                        if (imp2.kind == .tag) {
+                            if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                std.mem.eql(u8, imp2.field_name, imp.field_name))
+                                break;
+                            imp_tag_idx += 1;
+                        }
+                    }
+                    if (imp_tag_idx < mod.tags.items.len) {
+                        const imp_tag = mod.tags.items[imp_tag_idx];
+                        if (!std.mem.eql(types.ValType, imp_tag.@"type".sig.params, exp_tag.@"type".sig.params))
+                            return false;
+                    }
+                },
             }
         }
         return true;
