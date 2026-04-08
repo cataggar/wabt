@@ -44,7 +44,20 @@ pub const Value = union(enum) {
     ref_null: void,
     ref_func: u32,
     ref_i31: u32, // i31 reference: stores the 31-bit value
+    ref_struct: u32, // index into gc_objects
+    ref_array: u32, // index into gc_objects
+    ref_extern: u32, // externalized GC reference
     exnref: u32, // Index into interpreter's caught_exceptions list
+};
+
+/// A GC-managed object (struct or array instance).
+pub const GcObject = struct {
+    type_idx: u32, // type index in the module
+    fields: std.ArrayListUnmanaged(Value), // struct fields or array elements
+
+    fn deinit(self: *GcObject, allocator: std.mem.Allocator) void {
+        self.fields.deinit(allocator);
+    }
 };
 
 const TailCall = struct {
@@ -416,6 +429,9 @@ pub const Interpreter = struct {
     /// Caught exceptions storage for exnref values.
     caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .{},
 
+    /// GC object heap for struct and array instances.
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .{},
+
     /// Resolved function import links (indexed by func_idx for imported funcs).
     import_links: std.ArrayListUnmanaged(?ImportLink) = .{},
 
@@ -437,6 +453,55 @@ pub const Interpreter = struct {
         self.global_links.deinit(self.allocator);
         self.tag_canonical_ids.deinit(self.allocator);
         self.caught_exceptions.deinit(self.allocator);
+        for (self.gc_objects.items) |*obj| obj.deinit(self.allocator);
+        self.gc_objects.deinit(self.allocator);
+    }
+
+    /// Allocate a new GC struct object, returns its index.
+    fn allocStruct(self: *Interpreter, type_idx: u32, fields: []const Value) TrapError!u32 {
+        const idx: u32 = @intCast(self.gc_objects.items.len);
+        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        obj.fields.appendSlice(self.allocator, fields) catch return error.OutOfMemory;
+        self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
+        return idx;
+    }
+
+    /// Allocate a new GC array object, returns its index.
+    fn allocArray(self: *Interpreter, type_idx: u32, len: u32, init_val: Value) TrapError!u32 {
+        const idx: u32 = @intCast(self.gc_objects.items.len);
+        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        obj.fields.appendNTimes(self.allocator, init_val, len) catch return error.OutOfMemory;
+        self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
+        return idx;
+    }
+
+    /// Get the number of fields in a struct type.
+    fn getStructFieldCount(self: *Interpreter, type_idx: u32) u32 {
+        if (type_idx < self.instance.module.module_types.items.len) {
+            switch (self.instance.module.module_types.items[type_idx]) {
+                .struct_type => |st| return @intCast(st.fields.items.len),
+                else => {},
+            }
+        }
+        return 0;
+    }
+
+    /// Get the default value for a field at the given index in a struct/array type.
+    fn getDefaultFieldValue(self: *Interpreter, type_idx: u32, field_idx: u32) Value {
+        if (type_idx < self.instance.module.module_types.items.len) {
+            switch (self.instance.module.module_types.items[type_idx]) {
+                .struct_type => |st| {
+                    if (field_idx < st.fields.items.len) {
+                        return defaultForValType(st.fields.items[field_idx].type);
+                    }
+                },
+                .array_type => |at| {
+                    return defaultForValType(at.field.type);
+                },
+                else => {},
+            }
+        }
+        return .{ .i32 = 0 };
     }
 
     /// Read a global value, following links for imported globals.
@@ -3004,13 +3069,272 @@ pub const Interpreter = struct {
                     const gc_sub = readCodeU32(code, &t);
                     pc = t;
                     switch (gc_sub) {
+                        0x00 => { // struct.new
+                            const type_idx = readCodeU32(code, &pc);
+                            const field_count = self.getStructFieldCount(type_idx);
+                            var fields_buf: [64]Value = undefined;
+                            var i: u32 = field_count;
+                            while (i > 0) { i -= 1; fields_buf[i] = try self.popValue(); }
+                            const obj_idx = try self.allocStruct(type_idx, fields_buf[0..field_count]);
+                            try self.pushValue(.{ .ref_struct = obj_idx });
+                        },
+                        0x01 => { // struct.new_default
+                            const type_idx = readCodeU32(code, &pc);
+                            const field_count = self.getStructFieldCount(type_idx);
+                            var fields_buf: [64]Value = undefined;
+                            for (0..field_count) |fi| fields_buf[fi] = self.getDefaultFieldValue(type_idx, @intCast(fi));
+                            const obj_idx = try self.allocStruct(type_idx, fields_buf[0..field_count]);
+                            try self.pushValue(.{ .ref_struct = obj_idx });
+                        },
+                        0x02, 0x03, 0x04 => { // struct.get, struct.get_s, struct.get_u
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const field_idx = readCodeU32(code, &pc);
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) {
+                                .ref_struct => |id| id, .ref_func => |id| id, else => return error.NullReference,
+                            };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            const obj = &self.gc_objects.items[obj_id];
+                            if (field_idx >= obj.fields.items.len) return error.Unimplemented;
+                            const val = obj.fields.items[field_idx];
+                            if (gc_sub == 0x03) { // struct.get_s — sign-extend i8/i16
+                                try self.pushValue(val);
+                            } else if (gc_sub == 0x04) { // struct.get_u
+                                try self.pushValue(val);
+                            } else {
+                                try self.pushValue(val);
+                            }
+                        },
+                        0x05 => { // struct.set
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const field_idx = readCodeU32(code, &pc);
+                            const val = try self.popValue();
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) {
+                                .ref_struct => |id| id, .ref_func => |id| id, else => return error.NullReference,
+                            };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            self.gc_objects.items[obj_id].fields.items[field_idx] = val;
+                        },
+                        0x06 => { // array.new
+                            const type_idx = readCodeU32(code, &pc);
+                            const len: u32 = @bitCast(try self.popI32());
+                            const init_val = try self.popValue();
+                            const obj_idx = try self.allocArray(type_idx, len, init_val);
+                            try self.pushValue(.{ .ref_array = obj_idx });
+                        },
+                        0x07 => { // array.new_default
+                            const type_idx = readCodeU32(code, &pc);
+                            const len: u32 = @bitCast(try self.popI32());
+                            const default_val = self.getDefaultFieldValue(type_idx, 0);
+                            const obj_idx = try self.allocArray(type_idx, len, default_val);
+                            try self.pushValue(.{ .ref_array = obj_idx });
+                        },
+                        0x08 => { // array.new_fixed
+                            const type_idx = readCodeU32(code, &pc);
+                            const count = readCodeU32(code, &pc);
+                            var fields_buf: [256]Value = undefined;
+                            var fi: u32 = count;
+                            while (fi > 0) { fi -= 1; fields_buf[fi] = try self.popValue(); }
+                            const idx: u32 = @intCast(self.gc_objects.items.len);
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            obj.fields.appendSlice(self.allocator, fields_buf[0..count]) catch return error.OutOfMemory;
+                            self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
+                            try self.pushValue(.{ .ref_array = idx });
+                        },
+                        0x09 => { // array.new_data
+                            const type_idx = readCodeU32(code, &pc);
+                            const data_idx = readCodeU32(code, &pc);
+                            const len: u32 = @bitCast(try self.popI32());
+                            const offset: u32 = @bitCast(try self.popI32());
+                            if (data_idx >= self.instance.module.data_segments.items.len)
+                                return error.OutOfBoundsMemoryAccess;
+                            const seg = self.instance.module.data_segments.items[data_idx];
+                            const dropped = data_idx < self.instance.dropped_data.capacity() and
+                                self.instance.dropped_data.isSet(data_idx);
+                            const data = if (dropped) &[0]u8{} else seg.data;
+                            if (@as(u64, offset) + len > data.len) return error.OutOfBoundsMemoryAccess;
+                            const idx: u32 = @intCast(self.gc_objects.items.len);
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            for (0..len) |i| {
+                                obj.fields.append(self.allocator, .{ .i32 = @as(i32, data[offset + i]) }) catch return error.OutOfMemory;
+                            }
+                            self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
+                            try self.pushValue(.{ .ref_array = idx });
+                        },
+                        0x0a => { // array.new_elem
+                            const type_idx = readCodeU32(code, &pc);
+                            const elem_idx = readCodeU32(code, &pc);
+                            const len: u32 = @bitCast(try self.popI32());
+                            const offset: u32 = @bitCast(try self.popI32());
+                            _ = type_idx;
+                            if (elem_idx >= self.instance.module.elem_segments.items.len)
+                                return error.OutOfBoundsTableAccess;
+                            const seg = &self.instance.module.elem_segments.items[elem_idx];
+                            const seg_len: u32 = @intCast(seg.elem_var_indices.items.len);
+                            if (@as(u64, offset) + len > seg_len) return error.OutOfBoundsTableAccess;
+                            const idx: u32 = @intCast(self.gc_objects.items.len);
+                            var obj = GcObject{ .type_idx = 0, .fields = .{} };
+                            for (0..len) |i| {
+                                const var_entry = seg.elem_var_indices.items[offset + i];
+                                const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
+                                if (func_idx == std.math.maxInt(u32)) {
+                                    obj.fields.append(self.allocator, .{ .ref_null = {} }) catch return error.OutOfMemory;
+                                } else {
+                                    obj.fields.append(self.allocator, .{ .ref_func = func_idx }) catch return error.OutOfMemory;
+                                }
+                            }
+                            self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
+                            try self.pushValue(.{ .ref_array = idx });
+                        },
+                        0x0b, 0x0c, 0x0d => { // array.get, array.get_s, array.get_u
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const arr_idx_val: u32 = @bitCast(try self.popI32());
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) {
+                                .ref_array => |id| id, .ref_func => |id| id, else => return error.NullReference,
+                            };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            const obj = &self.gc_objects.items[obj_id];
+                            if (arr_idx_val >= obj.fields.items.len) return error.OutOfBoundsTableAccess;
+                            try self.pushValue(obj.fields.items[arr_idx_val]);
+                        },
+                        0x0e => { // array.set
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const val = try self.popValue();
+                            const arr_idx_val: u32 = @bitCast(try self.popI32());
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) {
+                                .ref_array => |id| id, .ref_func => |id| id, else => return error.NullReference,
+                            };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            self.gc_objects.items[obj_id].fields.items[arr_idx_val] = val;
+                        },
+                        0x0f => { // array.len
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) {
+                                .ref_array => |id| id, .ref_func => |id| id, else => return error.NullReference,
+                            };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            try self.pushValue(.{ .i32 = @intCast(self.gc_objects.items[obj_id].fields.items.len) });
+                        },
+                        0x10 => { // array.fill
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const n: u32 = @bitCast(try self.popI32());
+                            const val = try self.popValue();
+                            const offset2: u32 = @bitCast(try self.popI32());
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) { .ref_array => |id| id, else => return error.NullReference };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            const obj = &self.gc_objects.items[obj_id];
+                            if (@as(u64, offset2) + n > obj.fields.items.len) return error.OutOfBoundsTableAccess;
+                            for (offset2..offset2 + n) |i| obj.fields.items[i] = val;
+                        },
+                        0x11 => { // array.copy
+                            const dst_type = readCodeU32(code, &pc);
+                            _ = readCodeU32(code, &pc); // src_type
+                            _ = dst_type;
+                            const n: u32 = @bitCast(try self.popI32());
+                            const src_off: u32 = @bitCast(try self.popI32());
+                            const src_ref = try self.popValue();
+                            const dst_off: u32 = @bitCast(try self.popI32());
+                            const dst_ref = try self.popValue();
+                            if (src_ref == .ref_null or dst_ref == .ref_null) return error.NullReference;
+                            const src_id = switch (src_ref) { .ref_array => |id| id, else => return error.NullReference };
+                            const dst_id = switch (dst_ref) { .ref_array => |id| id, else => return error.NullReference };
+                            if (src_id >= self.gc_objects.items.len or dst_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            const src_obj = &self.gc_objects.items[src_id];
+                            const dst_obj = &self.gc_objects.items[dst_id];
+                            if (@as(u64, src_off) + n > src_obj.fields.items.len or
+                                @as(u64, dst_off) + n > dst_obj.fields.items.len) return error.OutOfBoundsTableAccess;
+                            if (n > 0) {
+                                // Copy with overlap handling
+                                if (src_id == dst_id and dst_off > src_off) {
+                                    var i: u32 = n;
+                                    while (i > 0) { i -= 1; dst_obj.fields.items[dst_off + i] = src_obj.fields.items[src_off + i]; }
+                                } else {
+                                    for (0..n) |i| dst_obj.fields.items[dst_off + @as(u32, @intCast(i))] = src_obj.fields.items[src_off + @as(u32, @intCast(i))];
+                                }
+                            }
+                        },
+                        0x12 => { // array.init_data
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const data_idx = readCodeU32(code, &pc);
+                            const n: u32 = @bitCast(try self.popI32());
+                            const src_off: u32 = @bitCast(try self.popI32());
+                            const dst_off: u32 = @bitCast(try self.popI32());
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) { .ref_array => |id| id, else => return error.NullReference };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            if (data_idx >= self.instance.module.data_segments.items.len) return error.OutOfBoundsMemoryAccess;
+                            const seg = self.instance.module.data_segments.items[data_idx];
+                            const dropped = data_idx < self.instance.dropped_data.capacity() and self.instance.dropped_data.isSet(data_idx);
+                            const data = if (dropped) &[0]u8{} else seg.data;
+                            if (@as(u64, src_off) + n > data.len) return error.OutOfBoundsMemoryAccess;
+                            const obj = &self.gc_objects.items[obj_id];
+                            if (@as(u64, dst_off) + n > obj.fields.items.len) return error.OutOfBoundsTableAccess;
+                            for (0..n) |i| obj.fields.items[dst_off + @as(u32, @intCast(i))] = .{ .i32 = @as(i32, data[src_off + @as(u32, @intCast(i))]) };
+                        },
+                        0x13 => { // array.init_elem
+                            _ = readCodeU32(code, &pc); // type_idx
+                            const elem_idx = readCodeU32(code, &pc);
+                            const n: u32 = @bitCast(try self.popI32());
+                            const src_off: u32 = @bitCast(try self.popI32());
+                            const dst_off: u32 = @bitCast(try self.popI32());
+                            const ref = try self.popValue();
+                            if (ref == .ref_null) return error.NullReference;
+                            const obj_id = switch (ref) { .ref_array => |id| id, else => return error.NullReference };
+                            if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
+                            if (elem_idx >= self.instance.module.elem_segments.items.len) return error.OutOfBoundsTableAccess;
+                            const seg = &self.instance.module.elem_segments.items[elem_idx];
+                            const seg_len: u32 = @intCast(seg.elem_var_indices.items.len);
+                            if (@as(u64, src_off) + n > seg_len) return error.OutOfBoundsTableAccess;
+                            const obj = &self.gc_objects.items[obj_id];
+                            if (@as(u64, dst_off) + n > obj.fields.items.len) return error.OutOfBoundsTableAccess;
+                            for (0..n) |i| {
+                                const var_entry = seg.elem_var_indices.items[src_off + @as(u32, @intCast(i))];
+                                const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
+                                obj.fields.items[dst_off + @as(u32, @intCast(i))] = if (func_idx == std.math.maxInt(u32)) .{ .ref_null = {} } else .{ .ref_func = func_idx };
+                            }
+                        },
+                        0x1a => { // any.convert_extern — externref to anyref
+                            const val = try self.popValue();
+                            if (val == .ref_null) {
+                                try self.pushValue(.{ .ref_null = {} });
+                            } else {
+                                try self.pushValue(val); // pass through
+                            }
+                        },
+                        0x1b => { // extern.convert_any — anyref to externref
+                            const val = try self.popValue();
+                            if (val == .ref_null) {
+                                try self.pushValue(.{ .ref_null = {} });
+                            } else {
+                                // Wrap as extern ref
+                                const ext_val: u32 = switch (val) {
+                                    .ref_i31 => |v| v,
+                                    .ref_struct => |v| v,
+                                    .ref_array => |v| v,
+                                    .ref_func => |v| v,
+                                    else => 0,
+                                };
+                                try self.pushValue(.{ .ref_extern = ext_val });
+                            }
+                        },
                         0x14, 0x15 => { // ref.test (non-null / nullable)
                             const heap_type = readCodeS32(code, &pc);
                             const val = try self.popValue();
                             const result: i32 = switch (val) {
                                 .ref_null => if (gc_sub == 0x15) @as(i32, 1) else @as(i32, 0),
                                 .ref_func => |fidx| blk: {
-                                    if (heap_type < 0) break :blk 1; // abstract heap type, funcref matches
+                                    if (heap_type < 0) break :blk 1;
                                     const ht_idx: u32 = @intCast(heap_type);
                                     if (fidx < self.instance.module.funcs.items.len) {
                                         const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
@@ -3018,24 +3342,23 @@ pub const Interpreter = struct {
                                     }
                                     break :blk 0;
                                 },
-                                .ref_i31 => 1, // i31 is a subtype of i31/eq/any
+                                .ref_i31 => 1,
+                                .ref_struct => 1,
+                                .ref_array => 1,
+                                .ref_extern => 1,
                                 else => 0,
                             };
                             try self.pushValue(.{ .i32 = result });
                         },
                         0x16, 0x17 => { // ref.cast (non-null / nullable)
-                            const heap_type = readCodeS32(code, &pc);
-                            _ = heap_type;
+                            _ = readCodeS32(code, &pc); // heap_type
                             const val = try self.popValue();
                             switch (val) {
                                 .ref_null => {
-                                    if (gc_sub == 0x16) return error.CastFailure; // non-null cast
+                                    if (gc_sub == 0x16) return error.CastFailure;
                                     try self.pushValue(val);
                                 },
-                                .ref_func => {
-                                    try self.pushValue(val);
-                                },
-                                .ref_i31 => {
+                                .ref_func, .ref_i31, .ref_struct, .ref_array, .ref_extern => {
                                     try self.pushValue(val);
                                 },
                                 else => return error.CastFailure,
@@ -3043,15 +3366,12 @@ pub const Interpreter = struct {
                         },
                         0x18 => { // br_on_cast
                             const depth = readCodeU32(code, &pc);
-                            const cast_flags = code[pc];
-                            pc += 1;
+                            pc += 1; // cast_flags
                             _ = readCodeS32(code, &pc); // target heaptype
                             const val = try self.popValue();
-                            _ = cast_flags;
-                            // Simplified: if val matches target type, branch with val
                             const matches = switch (val) {
                                 .ref_null => false,
-                                .ref_i31, .ref_func => true,
+                                .ref_i31, .ref_func, .ref_struct, .ref_array, .ref_extern => true,
                                 else => false,
                             };
                             if (matches) {
@@ -3064,15 +3384,12 @@ pub const Interpreter = struct {
                         },
                         0x19 => { // br_on_cast_fail
                             const depth = readCodeU32(code, &pc);
-                            const cast_flags = code[pc];
-                            pc += 1;
+                            pc += 1; // cast_flags
                             _ = readCodeS32(code, &pc); // target heaptype
                             const val = try self.popValue();
-                            _ = cast_flags;
-                            // Simplified: if val does NOT match target type, branch with val
                             const matches = switch (val) {
                                 .ref_null => false,
-                                .ref_i31, .ref_func => true,
+                                .ref_i31, .ref_func, .ref_struct, .ref_array, .ref_extern => true,
                                 else => false,
                             };
                             if (!matches) {
@@ -4794,8 +5111,17 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         0xfb => { // GC prefix
             const sub = readCodeU32(code, &p);
             switch (sub) {
+                0x00, 0x01 => _ = readCodeU32(code, &p), // struct.new/new_default: typeidx
+                0x02, 0x03, 0x04, 0x05 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // struct.get/set: typeidx, fieldidx
+                0x06, 0x07 => _ = readCodeU32(code, &p), // array.new/new_default: typeidx
+                0x08 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // array.new_fixed: typeidx, count
+                0x09, 0x0a => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // array.new_data/elem
+                0x0b, 0x0c, 0x0d, 0x0e => _ = readCodeU32(code, &p), // array.get/set: typeidx
+                0x10 => _ = readCodeU32(code, &p), // array.fill: typeidx
+                0x11 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // array.copy: typeidx, typeidx
+                0x12, 0x13 => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); }, // array.init_data/elem
                 0x14, 0x15, 0x16, 0x17 => _ = readCodeS32(code, &p), // ref.test/cast + heaptype
-                0x18, 0x19 => { // br_on_cast, br_on_cast_fail: castflags + label + heaptype
+                0x18, 0x19 => { // br_on_cast, br_on_cast_fail
                     _ = readCodeU32(code, &p); // label
                     p += 1; // castflags
                     _ = readCodeS32(code, &p); // target heaptype
@@ -4817,6 +5143,21 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         else => {},
     }
     return p;
+}
+
+/// Return the default (zero) value for a given ValType.
+fn defaultForValType(vt: types.ValType) Value {
+    return switch (vt) {
+        .i32 => .{ .i32 = 0 },
+        .i64 => .{ .i64 = 0 },
+        .f32 => .{ .f32 = 0.0 },
+        .f64 => .{ .f64 = 0.0 },
+        .v128 => .{ .v128 = 0 },
+        .funcref, .externref, .anyref, .exnref,
+        .nullfuncref, .nullexternref, .nullref, .nullexnref,
+        .ref, .ref_null => .{ .ref_null = {} },
+        else => .{ .i32 = 0 },
+    };
 }
 
 /// Evaluate a simple constant expression (used for global init and segment offsets).

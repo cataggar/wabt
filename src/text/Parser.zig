@@ -2703,11 +2703,51 @@ const Parser = struct {
                     self.emitBulkMemImm(sub, code);
                 } else if (actual_prefix == 0xfd) {
                     self.emitSimdImm(sub, code);
+                } else if (actual_prefix == 0xfb) {
+                    self.emitGcImm(sub, code);
                 }
             }
         } else {
             // Unrecognized opcode text — flag as malformed
             self.malformed = true;
+        }
+    }
+
+    /// Emit immediates for GC (0xfb prefix) instructions.
+    fn emitGcImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
+        switch (sub) {
+            0x00, 0x01 => self.emitU32Imm(code), // struct.new, struct.new_default: typeidx
+            0x02, 0x03, 0x04, 0x05 => { // struct.get/get_s/get_u/set: typeidx, fieldidx
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x06, 0x07 => self.emitU32Imm(code), // array.new, array.new_default: typeidx
+            0x08 => { // array.new_fixed: typeidx, count
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x09, 0x0a => { // array.new_data, array.new_elem: typeidx, dataidx/elemidx
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x0b, 0x0c, 0x0d, 0x0e => self.emitU32Imm(code), // array.get/get_s/get_u/set: typeidx
+            0x0f => {}, // array.len: no immediates
+            0x10 => self.emitU32Imm(code), // array.fill: typeidx
+            0x11 => { // array.copy: typeidx, typeidx
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x12 => { // array.init_data: typeidx, dataidx
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x13 => { // array.init_elem: typeidx, elemidx
+                self.emitU32Imm(code);
+                self.emitU32Imm(code);
+            },
+            0x1a, 0x1b => {}, // any.convert_extern, extern.convert_any: no immediates
+            0x1c, 0x1d, 0x1e => {}, // ref.i31, i31.get_u, i31.get_s: no immediates
+            else => {},
         }
     }
 
@@ -4769,6 +4809,28 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "ref.i31", 0xfb1c },
         .{ "i31.get_u", 0xfb1d },
         .{ "i31.get_s", 0xfb1e },
+        .{ "struct.new", 0xfb00 },
+        .{ "struct.new_default", 0xfb01 },
+        .{ "struct.get", 0xfb02 },
+        .{ "struct.get_s", 0xfb03 },
+        .{ "struct.get_u", 0xfb04 },
+        .{ "struct.set", 0xfb05 },
+        .{ "array.new", 0xfb06 },
+        .{ "array.new_default", 0xfb07 },
+        .{ "array.new_fixed", 0xfb08 },
+        .{ "array.new_data", 0xfb09 },
+        .{ "array.new_elem", 0xfb0a },
+        .{ "array.get", 0xfb0b },
+        .{ "array.get_s", 0xfb0c },
+        .{ "array.get_u", 0xfb0d },
+        .{ "array.set", 0xfb0e },
+        .{ "array.len", 0xfb0f },
+        .{ "array.fill", 0xfb10 },
+        .{ "array.copy", 0xfb11 },
+        .{ "array.init_data", 0xfb12 },
+        .{ "array.init_elem", 0xfb13 },
+        .{ "any.convert_extern", 0xfb1a },
+        .{ "extern.convert_any", 0xfb1b },
         // Saturating truncation (0xfc prefix)
         .{ "i32.trunc_sat_f32_s", 0xfc00 },
         .{ "i32.trunc_sat_f32_u", 0xfc01 },

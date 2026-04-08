@@ -2149,6 +2149,21 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
             else => false,
         },
         .exnref => true, // exnref comparison: any non-null exnref matches
+        .ref_struct => |av| switch (b) {
+            .ref_struct => |bv| av == bv,
+            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            else => false,
+        },
+        .ref_array => |av| switch (b) {
+            .ref_array => |bv| av == bv,
+            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            else => false,
+        },
+        .ref_extern => |av| switch (b) {
+            .ref_extern => |bv| av == bv,
+            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            else => false,
+        },
     };
 }
 
