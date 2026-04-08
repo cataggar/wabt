@@ -3334,32 +3334,92 @@ pub const Interpreter = struct {
                             const result: i32 = switch (val) {
                                 .ref_null => if (gc_sub == 0x15) @as(i32, 1) else @as(i32, 0),
                                 .ref_func => |fidx| blk: {
-                                    if (heap_type < 0) break :blk 1;
-                                    const ht_idx: u32 = @intCast(heap_type);
-                                    if (fidx < self.instance.module.funcs.items.len) {
-                                        const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
-                                        break :blk if (self.isSubtypeOf(func_type, ht_idx, self)) @as(i32, 1) else @as(i32, 0);
+                                    // func matches: func(0x70), any(0x6e)
+                                    if (heap_type == 0x70 or heap_type == 0x6e) break :blk 1;
+                                    if (heap_type >= 0) {
+                                        const ht_idx: u32 = @intCast(heap_type);
+                                        if (fidx < self.instance.module.funcs.items.len) {
+                                            const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
+                                            break :blk if (self.isSubtypeOf(func_type, ht_idx, self)) @as(i32, 1) else @as(i32, 0);
+                                        }
                                     }
                                     break :blk 0;
                                 },
-                                .ref_i31 => 1,
-                                .ref_struct => 1,
-                                .ref_array => 1,
-                                .ref_extern => 1,
+                                .ref_i31 => blk: {
+                                    // i31 matches: i31(0x6c), eq(0x6d), any(0x6e)
+                                    break :blk if (heap_type == 0x6c or heap_type == 0x6d or heap_type == 0x6e) @as(i32, 1) else @as(i32, 0);
+                                },
+                                .ref_struct => |obj_id| blk: {
+                                    // struct matches: struct(0x6b), eq(0x6d), any(0x6e), or concrete type
+                                    if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
+                                    if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                        const obj_type = self.gc_objects.items[obj_id].type_idx;
+                                        const ht_idx: u32 = @intCast(heap_type);
+                                        if (obj_type == ht_idx) break :blk 1;
+                                        if (self.isSubtypeOf(obj_type, ht_idx, self)) break :blk 1;
+                                    }
+                                    break :blk 0;
+                                },
+                                .ref_array => |obj_id| blk: {
+                                    // array matches: array(0x6a), eq(0x6d), any(0x6e), or concrete type
+                                    if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
+                                    if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                        const obj_type = self.gc_objects.items[obj_id].type_idx;
+                                        const ht_idx: u32 = @intCast(heap_type);
+                                        if (obj_type == ht_idx) break :blk 1;
+                                        if (self.isSubtypeOf(obj_type, ht_idx, self)) break :blk 1;
+                                    }
+                                    break :blk 0;
+                                },
+                                .ref_extern => blk: {
+                                    break :blk if (heap_type == 0x6f) @as(i32, 1) else @as(i32, 0);
+                                },
                                 else => 0,
                             };
                             try self.pushValue(.{ .i32 = result });
                         },
                         0x16, 0x17 => { // ref.cast (non-null / nullable)
-                            _ = readCodeS32(code, &pc); // heap_type
+                            const heap_type = readCodeS32(code, &pc);
                             const val = try self.popValue();
                             switch (val) {
                                 .ref_null => {
                                     if (gc_sub == 0x16) return error.CastFailure;
                                     try self.pushValue(val);
                                 },
-                                .ref_func, .ref_i31, .ref_struct, .ref_array, .ref_extern => {
-                                    try self.pushValue(val);
+                                .ref_i31 => {
+                                    if (heap_type == 0x6c or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0)
+                                        try self.pushValue(val)
+                                    else return error.CastFailure;
+                                },
+                                .ref_struct => |obj_id| {
+                                    if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
+                                        try self.pushValue(val);
+                                    } else if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                        const obj_type = self.gc_objects.items[obj_id].type_idx;
+                                        if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
+                                            try self.pushValue(val)
+                                        else return error.CastFailure;
+                                    } else return error.CastFailure;
+                                },
+                                .ref_array => |obj_id| {
+                                    if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
+                                        try self.pushValue(val);
+                                    } else if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                        const obj_type = self.gc_objects.items[obj_id].type_idx;
+                                        if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
+                                            try self.pushValue(val)
+                                        else return error.CastFailure;
+                                    } else return error.CastFailure;
+                                },
+                                .ref_func => {
+                                    if (heap_type == 0x70 or heap_type == 0x6e or heap_type < 0)
+                                        try self.pushValue(val)
+                                    else return error.CastFailure;
+                                },
+                                .ref_extern => {
+                                    if (heap_type == 0x6f or heap_type < 0)
+                                        try self.pushValue(val)
+                                    else return error.CastFailure;
                                 },
                                 else => return error.CastFailure,
                             }
@@ -3367,13 +3427,9 @@ pub const Interpreter = struct {
                         0x18 => { // br_on_cast
                             const depth = readCodeU32(code, &pc);
                             pc += 1; // cast_flags
-                            _ = readCodeS32(code, &pc); // target heaptype
+                            const target_ht = readCodeS32(code, &pc);
                             const val = try self.popValue();
-                            const matches = switch (val) {
-                                .ref_null => false,
-                                .ref_i31, .ref_func, .ref_struct, .ref_array, .ref_extern => true,
-                                else => false,
-                            };
+                            const matches = gcValueMatchesHeapType(self, val, target_ht);
                             if (matches) {
                                 try self.pushValue(val);
                                 self.branch_depth = depth;
@@ -3385,13 +3441,9 @@ pub const Interpreter = struct {
                         0x19 => { // br_on_cast_fail
                             const depth = readCodeU32(code, &pc);
                             pc += 1; // cast_flags
-                            _ = readCodeS32(code, &pc); // target heaptype
+                            const target_ht = readCodeS32(code, &pc);
                             const val = try self.popValue();
-                            const matches = switch (val) {
-                                .ref_null => false,
-                                .ref_i31, .ref_func, .ref_struct, .ref_array, .ref_extern => true,
-                                else => false,
-                            };
+                            const matches = gcValueMatchesHeapType(self, val, target_ht);
                             if (!matches) {
                                 try self.pushValue(val);
                                 self.branch_depth = depth;
@@ -5157,6 +5209,35 @@ fn defaultForValType(vt: types.ValType) Value {
         .nullfuncref, .nullexternref, .nullref, .nullexnref,
         .ref, .ref_null => .{ .ref_null = {} },
         else => .{ .i32 = 0 },
+    };
+}
+
+/// Check if a GC value matches a target heap type for ref.test/ref.cast/br_on_cast.
+fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) bool {
+    return switch (val) {
+        .ref_null => false,
+        .ref_i31 => heap_type == 0x6c or heap_type == 0x6d or heap_type == 0x6e,
+        .ref_struct => |obj_id| {
+            if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) return true;
+            if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                const obj_type = self.gc_objects.items[obj_id].type_idx;
+                const ht: u32 = @intCast(heap_type);
+                return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
+            }
+            return false;
+        },
+        .ref_array => |obj_id| {
+            if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) return true;
+            if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                const obj_type = self.gc_objects.items[obj_id].type_idx;
+                const ht: u32 = @intCast(heap_type);
+                return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
+            }
+            return false;
+        },
+        .ref_func => heap_type == 0x70 or heap_type == 0x6e,
+        .ref_extern => heap_type == 0x6f,
+        else => false,
     };
 }
 
