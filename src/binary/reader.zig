@@ -88,6 +88,11 @@ const Reader = struct {
         return b;
     }
 
+    fn peekByte(self: *Reader) ReadError!u8 {
+        if (self.pos >= self.data.len) return error.UnexpectedEof;
+        return self.data[self.pos];
+    }
+
     fn readBytes(self: *Reader, n: usize) ReadError![]const u8 {
         if (self.pos + n > self.data.len) return error.UnexpectedEof;
         const s = self.data[self.pos .. self.pos + n];
@@ -140,6 +145,26 @@ const Reader = struct {
 
     fn readValType(self: *Reader) ReadError!types.ValType {
         const byte = try self.readByte();
+        return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
+            return error.InvalidType;
+    }
+
+    /// Read a reference type encoding, handling both simple (0x70, 0x6f) and
+    /// GC-style (0x63/0x64 heaptype) encodings.
+    fn readRefType(self: *Reader) ReadError!types.ValType {
+        const byte = try self.readByte();
+        if (byte == 0x63 or byte == 0x64) {
+            // GC-style ref type: 0x63 = ref null, 0x64 = ref
+            const heap_type = try self.readS64();
+            // Map abstract heap types to ValType
+            const ht: i64 = heap_type;
+            if (ht == -0x10) return .funcref; // func (0x70)
+            if (ht == -0x11) return .externref; // extern (0x6f)
+            if (ht == -0x0e) return .funcref; // nofunc (0x72) → map to funcref
+            if (ht == -0x0f) return .externref; // noextern (0x71) → map to externref
+            // Concrete type index or other abstract type → map to funcref for now
+            return .funcref;
+        }
         return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
     }
@@ -368,11 +393,33 @@ const Reader = struct {
     fn readTableSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         for (0..count) |_| {
-            const elem_type = try self.readValType();
-            const limits = try self.readLimits();
-            try self.module.tables.append(self.allocator, .{
-                .type = .{ .elem_type = elem_type, .limits = limits },
-            });
+            const first_byte = try self.peekByte();
+            if (first_byte == 0x40) {
+                // Extended table type: 0x40 flags reftype limits [initexpr]
+                _ = try self.readByte(); // consume 0x40
+                const table_flags = try self.readByte(); // 0x00 = no table64
+                const is_table64 = (table_flags & 0x01) != 0;
+                const has_init = true; // 0x40 prefix indicates init expr
+                const elem_type = try self.readRefType();
+                const limits = try self.readLimits();
+                var init_bytes: []const u8 = &.{};
+                if (has_init) {
+                    const init_start = self.pos;
+                    try self.skipInitExpr();
+                    init_bytes = self.data[init_start..self.pos];
+                }
+                try self.module.tables.append(self.allocator, .{
+                    .type = .{ .elem_type = elem_type, .limits = limits },
+                    .is_table64 = is_table64,
+                    .init_expr_bytes = init_bytes,
+                });
+            } else {
+                const elem_type = try self.readValType();
+                const limits = try self.readLimits();
+                try self.module.tables.append(self.allocator, .{
+                    .type = .{ .elem_type = elem_type, .limits = limits },
+                });
+            }
         }
     }
 
@@ -445,7 +492,7 @@ const Reader = struct {
 
             if (is_passive or has_explicit_index) {
                 if (use_elem_exprs) {
-                    seg.elem_type = try self.readValType();
+                    seg.elem_type = try self.readRefType();
                     // Element segment type must be a reference type
                     if (!seg.elem_type.isRefType()) return error.InvalidType;
                 } else {

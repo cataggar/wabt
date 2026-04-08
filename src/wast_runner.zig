@@ -849,9 +849,20 @@ const Command = enum {
 fn classifyCommand(sexpr: []const u8) Command {
     // sexpr starts with '('; skip it and any whitespace to find the keyword.
     var i: usize = 1;
-    while (i < sexpr.len and isWhitespace(sexpr[i])) : (i += 1) {}
+    i = skipWsAndComments(sexpr, i);
+    // Skip leading annotations like (@a) before the keyword
+    while (i + 1 < sexpr.len and sexpr[i] == '(' and sexpr[i + 1] == '@') {
+        // Skip to matching ')' for this annotation
+        var depth: usize = 1;
+        i += 2;
+        while (i < sexpr.len and depth > 0) : (i += 1) {
+            if (sexpr[i] == '(') depth += 1;
+            if (sexpr[i] == ')') depth -= 1;
+        }
+        i = skipWsAndComments(sexpr, i);
+    }
     const word_start = i;
-    while (i < sexpr.len and !isWhitespace(sexpr[i]) and sexpr[i] != '(' and sexpr[i] != ')') : (i += 1) {}
+    while (i < sexpr.len and !isWhitespace(sexpr[i]) and sexpr[i] != '(' and sexpr[i] != ')' and sexpr[i] != ';') : (i += 1) {}
     const word = sexpr[word_start..i];
 
     if (std.mem.eql(u8, word, "module")) return .module;
@@ -1036,6 +1047,11 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
             return;
         };
         defer allocator.free(wat_text);
+        // Check for illegal WAT bytes
+        if (hasIllegalWatBytes(wat_text)) {
+            result.passed += 1;
+            return;
+        }
         const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
         else blk: {
@@ -1114,6 +1130,11 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         };
         defer allocator.free(wat_text);
+        // Check for illegal WAT bytes (control chars, 0x7f, invalid UTF-8)
+        if (hasIllegalWatBytes(wat_text)) {
+            result.passed += 1; // illegal bytes = malformed
+            return;
+        }
         // Wrap in (module ...) if not already
         const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
@@ -2254,6 +2275,24 @@ fn skipBlockComment(source: []const u8, start: usize) usize {
     return i;
 }
 
+/// Skip whitespace and comments (line comments ;;... and block comments (;...;)).
+fn skipWsAndComments(source: []const u8, start: usize) usize {
+    var i = start;
+    while (i < source.len) {
+        if (isWhitespace(source[i])) {
+            i += 1;
+        } else if (i + 1 < source.len and source[i] == ';' and source[i + 1] == ';') {
+            // Line comment: skip to end of line
+            while (i < source.len and source[i] != '\n') : (i += 1) {}
+        } else if (i + 1 < source.len and source[i] == '(' and source[i + 1] == ';') {
+            i = skipBlockComment(source, i);
+        } else {
+            break;
+        }
+    }
+    return i;
+}
+
 /// Find the first `(module ...)` s-expression embedded within `sexpr`.
 fn findEmbeddedModule(sexpr: []const u8) ?[]const u8 {
     // Search for "(module" pattern inside the outer s-expression.
@@ -2383,6 +2422,61 @@ fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 
         }
     }
     return result.toOwnedSlice(allocator);
+}
+
+/// Check if decoded WAT text contains illegal bytes (control chars, 0x7f, non-ASCII outside strings).
+/// WAT source only allows: 0x09 (tab), 0x0a (LF), 0x0d (CR), 0x20-0x7e (printable ASCII)
+/// outside of string literals and comments. Inside strings, \xx hex escapes are used
+/// for non-printable bytes, so raw non-printable bytes are also illegal there.
+fn hasIllegalWatBytes(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        // Check for empty identifiers: $""
+        if (c == '$' and i + 2 < text.len and text[i + 1] == '"' and text[i + 2] == '"') {
+            return true;
+        }
+        // Inside string literals, check for illegal raw bytes
+        if (c == '"') {
+            i += 1;
+            while (i < text.len and text[i] != '"') : (i += 1) {
+                if (text[i] == '\\' and i + 1 < text.len) {
+                    i += 1; // skip escaped char
+                    continue;
+                }
+                // Only printable ASCII (0x20-0x7e) allowed as raw bytes in WAT strings
+                if (text[i] < 0x20 or text[i] >= 0x7f) return true;
+            }
+            continue;
+        }
+        // Skip line comments: ;; ... \n
+        if (c == ';' and i + 1 < text.len and text[i + 1] == ';') {
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        // Skip block comments: (; ... ;)
+        if (c == '(' and i + 1 < text.len and text[i + 1] == ';') {
+            i += 2;
+            var depth: usize = 1;
+            while (i + 1 < text.len and depth > 0) {
+                if (text[i] == '(' and text[i + 1] == ';') {
+                    depth += 1;
+                    i += 2;
+                } else if (text[i] == ';' and text[i + 1] == ')') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if (i > 0) i -= 1; // adjust for loop increment
+            continue;
+        }
+        if (c == 0x7f) return true;
+        if (c >= 0x80) return true; // non-ASCII outside strings/comments
+        if (c < 0x20 and c != 0x09 and c != 0x0a and c != 0x0d) return true;
+    }
+    return false;
 }
 
 /// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.

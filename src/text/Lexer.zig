@@ -173,10 +173,52 @@ pub const Lexer = struct {
                     self.skipBlockComment();
                     return self.next();
                 }
-                // Check for annotation "(@id"
+                // Check for annotation "(@id" or "(@"string-id"
                 if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '@') {
                     self.pos += 2; // skip '(' and '@'
                     const id_start = self.pos;
+                    if (self.pos < self.source.len and self.source[self.pos] == '"') {
+                        // Quoted annotation id: (@"...") — scan the string
+                        const str_start = self.pos;
+                        self.pos += 1; // skip opening "
+                        var id_len: usize = 0;
+                        var has_invalid_byte = false;
+                        while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                            if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) {
+                                // Check hex escape \xx for non-printable bytes
+                                if (self.pos + 2 < self.source.len) {
+                                    const h1 = hexVal(self.source[self.pos + 1]);
+                                    const h2 = hexVal(self.source[self.pos + 2]);
+                                    if (h1 != null and h2 != null) {
+                                        const byte_val = h1.? * 16 + h2.?;
+                                        if (byte_val < 0x20 or byte_val == 0x7f or byte_val >= 0x80) {
+                                            has_invalid_byte = true;
+                                        }
+                                    }
+                                }
+                                self.pos += 2; // skip escape sequence
+                                id_len += 1;
+                            } else if (self.source[self.pos] == '\n' or self.source[self.pos] == '\r' or self.source[self.pos] == '\t') {
+                                has_invalid_byte = true;
+                                self.pos += 1;
+                                id_len += 1;
+                            } else {
+                                // Check for non-printable or non-ASCII bytes
+                                if (self.source[self.pos] < 0x20 or self.source[self.pos] >= 0x7f) {
+                                    has_invalid_byte = true;
+                                }
+                                self.pos += 1;
+                                id_len += 1;
+                            }
+                        }
+                        if (self.pos < self.source.len) self.pos += 1; // skip closing "
+                        // Empty string or invalid bytes → malformed annotation
+                        if (id_len == 0 or has_invalid_byte) {
+                            return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+                        }
+                        _ = str_start;
+                        return .{ .kind = .annotation, .text = self.source[start..self.pos], .offset = start };
+                    }
                     while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
                         self.pos += 1;
                     }
@@ -236,6 +278,20 @@ pub const Lexer = struct {
         // Identifiers start with '$'
         if (self.source[start] == '$') {
             self.pos += 1;
+            // Check for quoted identifier: $"..."
+            if (self.pos < self.source.len and self.source[self.pos] == '"') {
+                self.pos += 1; // skip opening "
+                while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                    if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) {
+                        self.pos += 2; // skip escape sequence
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                if (self.pos < self.source.len) self.pos += 1; // skip closing "
+                const text = self.source[start..self.pos];
+                return .{ .kind = .identifier, .text = text, .offset = start };
+            }
             while (self.pos < self.source.len and isIdChar(self.source[self.pos])) {
                 self.pos += 1;
             }
@@ -285,6 +341,15 @@ pub const Lexer = struct {
         return switch (c) {
             ' ', '\t', '\n', '\r', '(', ')', '"', ';', '=' => false,
             else => c >= 0x21 and c <= 0x7e,
+        };
+    }
+
+    fn hexVal(c: u8) ?u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => null,
         };
     }
 

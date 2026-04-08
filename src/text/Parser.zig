@@ -42,7 +42,18 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, &p.memory_names, &p.data_names, allocator);
 
     try p.expect(.l_paren);
+    // Skip any annotations between '(' and 'module'
+    while (p.peek().kind == .annotation) {
+        _ = p.advance();
+        try p.skipAnnotation();
+    }
     try p.expect(.kw_module);
+
+    // Skip annotations after 'module'
+    while (p.peek().kind == .annotation) {
+        _ = p.advance();
+        try p.skipAnnotation();
+    }
 
     // Optional module name
     if (p.peek().kind == .identifier) {
@@ -67,6 +78,11 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             continue;
         }
         _ = p.advance(); // consume '('
+        // Skip annotations between '(' and keyword
+        while (p.peek().kind == .annotation) {
+            _ = p.advance();
+            try p.skipAnnotation();
+        }
         const kw = p.advance();
         switch (kw.kind) {
             .kw_type => try p.parseType(&module),
@@ -99,6 +115,11 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             continue;
         }
         _ = p.advance(); // consume '('
+        // Skip annotations between '(' and keyword
+        while (p.peek().kind == .annotation) {
+            _ = p.advance();
+            try p.skipAnnotation();
+        }
         const kw = p.advance();
         switch (kw.kind) {
             .kw_type, .kw_rec => try p.skipSExpr(), // already processed
@@ -359,6 +380,7 @@ const Parser = struct {
     fn skipAnnotation(self: *Parser) ParseError!void {
         // The annotation token (@id has been consumed. Now skip until matching ')'.
         // Annotations can contain nested s-expressions.
+        // Invalid tokens inside annotations (e.g. (@) empty id) are harmless.
         var depth: u32 = 1;
         while (depth > 0) {
             const tok = self.advance();
@@ -366,7 +388,13 @@ const Parser = struct {
                 .l_paren, .annotation => depth += 1,
                 .r_paren => depth -= 1,
                 .eof => return error.InvalidModule,
-                .invalid => self.malformed = true,
+                .invalid => {
+                    // If the invalid token consumed a '(' (e.g. "(@" empty annotation),
+                    // increment depth to account for it.
+                    if (tok.text.len >= 2 and tok.text[0] == '(' and tok.text[1] == '@') {
+                        depth += 1;
+                    }
+                },
                 else => {},
             }
         }
@@ -377,6 +405,13 @@ const Parser = struct {
         if (tok.kind != .integer) return error.InvalidNumber;
         const clean = stripUnderscores(tok.text);
         return std.fmt.parseInt(u32, clean.slice(), 0) catch return error.InvalidNumber;
+    }
+
+    fn parseU64(self: *Parser) ParseError!u64 {
+        const tok = self.advance();
+        if (tok.kind != .integer) return error.InvalidNumber;
+        const clean = stripUnderscores(tok.text);
+        return std.fmt.parseInt(u64, clean.slice(), 0) catch return error.InvalidNumber;
     }
 
     /// Parse an index that may be either a numeric u32 or a $name identifier.
@@ -2982,14 +3017,15 @@ const Parser = struct {
         _ = opcode;
         // Parse optional offset=N and align=N
         var alignment: u32 = 0;
-        var offset: u32 = 0;
+        var offset: u64 = 0;
         var has_align = false;
         for (0..2) |_| {
             if (self.peek().kind == .nat_eq) {
                 const tok = self.advance();
                 // Format: "offset=N" or "align=N"
                 if (std.mem.startsWith(u8, tok.text, "offset=")) {
-                    offset = std.fmt.parseInt(u32, tok.text[7..], 0) catch {
+                    const clean = stripUnderscores(tok.text[7..]);
+                    offset = std.fmt.parseInt(u64, clean.slice(), 0) catch {
                         self.malformed = true;
                         continue;
                     };
@@ -3012,7 +3048,9 @@ const Parser = struct {
             }
         }
         self.emitLeb128U32(code, log2_align);
-        self.emitLeb128U32(code, offset);
+        var buf: [10]u8 = undefined;
+        const n = leb128.writeU64Leb128(&buf, offset);
+        code.appendSlice(self.allocator, buf[0..n]) catch {};
     }
 
     fn emitBulkMemImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
@@ -3225,10 +3263,10 @@ const Parser = struct {
                     _ = self.advance();
                     is_table64 = true;
                 }
-                const initial = try self.parseU32();
+                const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
-                    limits.max = try self.parseU32();
+                    limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
                     limits.has_max = true;
                 }
                 const elem_type = try self.parseValType();
@@ -3344,10 +3382,10 @@ const Parser = struct {
             return;
         }
 
-        const initial = try self.parseU32();
+        const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
-            limits.max = try self.parseU32();
+            limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
             limits.has_max = true;
         }
         const elem_type = try self.parseValType();
@@ -3519,10 +3557,10 @@ const Parser = struct {
             is_memory64 = true;
         }
 
-        const initial = try self.parseU32();
+        const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
-            limits.max = try self.parseU32();
+            limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
             limits.has_max = true;
         }
         try module.memories.append(self.allocator, .{

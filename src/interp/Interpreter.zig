@@ -1423,75 +1423,75 @@ pub const Interpreter = struct {
 
     // ── Memory operations ───────────────────────────────────────────────
 
-    pub fn i32Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Load(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(i32, mem.items[idx..][0..4], .little);
         try self.pushValue(.{ .i32 = val });
     }
 
-    pub fn i32Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Store(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI32();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         std.mem.writeInt(i32, mem.items[idx..][0..4], val, .little);
     }
 
-    pub fn i64Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(i64, mem.items[idx..][0..8], .little);
         try self.pushValue(.{ .i64 = val });
     }
 
-    pub fn i64Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Store(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI64();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         std.mem.writeInt(i64, mem.items[idx..][0..8], val, .little);
     }
 
-    pub fn f32Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn f32Load(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits = std.mem.readInt(u32, mem.items[idx..][0..4], .little);
         try self.pushValue(.{ .f32 = @bitCast(bits) });
     }
 
-    pub fn f32Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn f32Store(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popF32();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits: u32 = @bitCast(val);
         std.mem.writeInt(u32, mem.items[idx..][0..4], bits, .little);
     }
 
-    pub fn f64Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn f64Load(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits = std.mem.readInt(u64, mem.items[idx..][0..8], .little);
         try self.pushValue(.{ .f64 = @bitCast(bits) });
     }
 
-    pub fn f64Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn f64Store(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popF64();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bits: u64 = @bitCast(val);
         std.mem.writeInt(u64, mem.items[idx..][0..8], bits, .little);
@@ -1517,14 +1517,19 @@ pub const Interpreter = struct {
         }
     }
 
-    fn popMemAddr(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!u64 {
+    fn popMemAddr(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!u64 {
         if (self.isMemory64(mem_idx)) {
             const base = try self.popI64();
             return @as(u64, @bitCast(base)) +% offset;
         } else {
             const base = try self.popI32();
-            return @as(u64, @as(u32, @bitCast(base))) + offset;
+            return @as(u64, @as(u32, @bitCast(base))) +% offset;
         }
+    }
+
+    /// Overflow-safe bounds check: returns true if addr + size > mem_len.
+    inline fn memOob(addr: u64, size: u64, mem_len: usize) bool {
+        return size > mem_len or addr > mem_len - size;
     }
 
     pub fn memorySize(self: *Interpreter, mem_idx: u32) TrapError!void {
@@ -2136,87 +2141,87 @@ pub const Interpreter = struct {
 
     // ── Sub-word memory loads ───────────────────────────────────────────
 
-    pub fn i32Load8S(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Load8S(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const val: i8 = @bitCast(mem.items[@intCast(addr)]);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
-    pub fn i32Load8U(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Load8U(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const val = mem.items[@intCast(addr)];
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
-    pub fn i32Load16S(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Load16S(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(i16, mem.items[idx..][0..2], .little);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
-    pub fn i32Load16U(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Load16U(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(u16, mem.items[idx..][0..2], .little);
         try self.pushValue(.{ .i32 = @as(i32, val) });
     }
 
-    pub fn i64Load8S(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load8S(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const val: i8 = @bitCast(mem.items[@intCast(addr)]);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
-    pub fn i64Load8U(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load8U(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const val = mem.items[@intCast(addr)];
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
-    pub fn i64Load16S(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load16S(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(i16, mem.items[idx..][0..2], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
-    pub fn i64Load16U(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load16U(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(u16, mem.items[idx..][0..2], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
-    pub fn i64Load32S(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load32S(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(i32, mem.items[idx..][0..4], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
     }
 
-    pub fn i64Load32U(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Load32U(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const val = std.mem.readInt(u32, mem.items[idx..][0..4], .little);
         try self.pushValue(.{ .i64 = @as(i64, val) });
@@ -2224,45 +2229,45 @@ pub const Interpreter = struct {
 
     // ── Sub-word memory stores ──────────────────────────────────────────
 
-    pub fn i32Store8(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Store8(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI32();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         mem.items[@intCast(addr)] = @truncate(@as(u32, @bitCast(val)));
     }
 
-    pub fn i32Store16(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i32Store16(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI32();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         std.mem.writeInt(u16, mem.items[idx..][0..2], @truncate(@as(u32, @bitCast(val))), .little);
     }
 
-    pub fn i64Store8(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Store8(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI64();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 1 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 1, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         mem.items[@intCast(addr)] = @truncate(@as(u64, @bitCast(val)));
     }
 
-    pub fn i64Store16(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Store16(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI64();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 2 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 2, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         std.mem.writeInt(u16, mem.items[idx..][0..2], @truncate(@as(u64, @bitCast(val))), .little);
     }
 
-    pub fn i64Store32(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    pub fn i64Store32(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popI64();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 4 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 4, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         std.mem.writeInt(u32, mem.items[idx..][0..4], @truncate(@as(u64, @bitCast(val))), .little);
     }
@@ -2870,30 +2875,30 @@ pub const Interpreter = struct {
                     }
                 },
                 // Memory load (format: mem_idx, align, offset)
-                0x28 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load(m, o); },
-                0x29 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load(m, o); },
-                0x2a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.f32Load(m, o); },
-                0x2b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.f64Load(m, o); },
-                0x2c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load8S(m, o); },
-                0x2d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load8U(m, o); },
-                0x2e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load16S(m, o); },
-                0x2f => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load16U(m, o); },
-                0x30 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load8S(m, o); },
-                0x31 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load8U(m, o); },
-                0x32 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load16S(m, o); },
-                0x33 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load16U(m, o); },
-                0x34 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load32S(m, o); },
-                0x35 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Load32U(m, o); },
+                0x28 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load(m, o); },
+                0x29 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load(m, o); },
+                0x2a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f32Load(m, o); },
+                0x2b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f64Load(m, o); },
+                0x2c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load8S(m, o); },
+                0x2d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load8U(m, o); },
+                0x2e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load16S(m, o); },
+                0x2f => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load16U(m, o); },
+                0x30 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load8S(m, o); },
+                0x31 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load8U(m, o); },
+                0x32 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load16S(m, o); },
+                0x33 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load16U(m, o); },
+                0x34 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load32S(m, o); },
+                0x35 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load32U(m, o); },
                 // Memory store (format: mem_idx, align, offset)
-                0x36 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Store(m, o); },
-                0x37 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Store(m, o); },
-                0x38 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.f32Store(m, o); },
-                0x39 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.f64Store(m, o); },
-                0x3a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Store8(m, o); },
-                0x3b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Store16(m, o); },
-                0x3c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Store8(m, o); },
-                0x3d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Store16(m, o); },
-                0x3e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i64Store32(m, o); },
+                0x36 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store(m, o); },
+                0x37 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store(m, o); },
+                0x38 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f32Store(m, o); },
+                0x39 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f64Store(m, o); },
+                0x3a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store8(m, o); },
+                0x3b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store16(m, o); },
+                0x3c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store8(m, o); },
+                0x3d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store16(m, o); },
+                0x3e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store32(m, o); },
                 0x3f => { const m = readCodeU32(code, &pc); try self.memorySize(m); },
                 0x40 => { const m = readCodeU32(code, &pc); try self.memoryGrow(m); },
                 // Constants
@@ -3686,28 +3691,28 @@ pub const Interpreter = struct {
                         0x00 => {
                             const m = readCodeU32(code, &pc);
                             _ = readCodeU32(code, &pc); // align
-                            const o = readCodeU32(code, &pc);
+                            const o = readCodeU64(code, &pc);
                             try self.v128Load(m, o);
                         },
                         // v128.load8x8_s / u
-                        0x01 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load8x8(m, o, true); },
-                        0x02 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load8x8(m, o, false); },
+                        0x01 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load8x8(m, o, true); },
+                        0x02 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load8x8(m, o, false); },
                         // v128.load16x4_s / u
-                        0x03 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load16x4(m, o, true); },
-                        0x04 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load16x4(m, o, false); },
+                        0x03 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load16x4(m, o, true); },
+                        0x04 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load16x4(m, o, false); },
                         // v128.load32x2_s / u
-                        0x05 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load32x2(m, o, true); },
-                        0x06 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128Load32x2(m, o, false); },
+                        0x05 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load32x2(m, o, true); },
+                        0x06 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load32x2(m, o, false); },
                         // v128.load8_splat / load16_splat / load32_splat / load64_splat
-                        0x07 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 1); },
-                        0x08 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 2); },
-                        0x09 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 4); },
-                        0x0a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadSplat(m, o, 8); },
+                        0x07 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 1); },
+                        0x08 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 2); },
+                        0x09 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 4); },
+                        0x0a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 8); },
                         // v128.store (memarg)
                         0x0b => {
                             const m = readCodeU32(code, &pc);
                             _ = readCodeU32(code, &pc); // align
-                            const o = readCodeU32(code, &pc);
+                            const o = readCodeU64(code, &pc);
                             try self.v128Store(m, o);
                         },
                         0x0c => try self.simdConst(code, &pc), // v128.const
@@ -3750,18 +3755,18 @@ pub const Interpreter = struct {
                         0x21 => { const lane = code[pc]; pc += 1; try self.extractLaneF64(lane); },
                         0x22 => { const lane = code[pc]; pc += 1; try self.replaceLaneF64(lane); },
                         // v128.load8_lane .. v128.load64_lane (0x54-0x57)
-                        0x54 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 1, lane); },
-                        0x55 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 2, lane); },
-                        0x56 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 4, lane); },
-                        0x57 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 8, lane); },
+                        0x54 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 1, lane); },
+                        0x55 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 2, lane); },
+                        0x56 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 4, lane); },
+                        0x57 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 8, lane); },
                         // v128.store8_lane .. v128.store64_lane (0x58-0x5b)
-                        0x58 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 1, lane); },
-                        0x59 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 2, lane); },
-                        0x5a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 4, lane); },
-                        0x5b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 8, lane); },
+                        0x58 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 1, lane); },
+                        0x59 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 2, lane); },
+                        0x5a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 4, lane); },
+                        0x5b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 8, lane); },
                         // v128.load32_zero / v128.load64_zero (0x5c-0x5d)
-                        0x5c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 4); },
-                        0x5d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.v128LoadZero(m, o, 8); },
+                        0x5c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadZero(m, o, 4); },
+                        0x5d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadZero(m, o, 8); },
                         // f32x4.demote_f64x2_zero / f64x2.promote_low_f32x4
                         0x5e => try self.f32x4DemoteF64x2Zero(),
                         0x5f => try self.f64x2PromoteLowF32x4(),
@@ -4025,30 +4030,30 @@ pub const Interpreter = struct {
 
     // ── SIMD v128 memory operations ─────────────────────────────────────
 
-    fn v128Load(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    fn v128Load(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 16 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 16, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var bytes: [16]u8 = undefined;
         @memcpy(&bytes, mem.items[idx..][0..16]);
         try self.pushValue(.{ .v128 = @bitCast(bytes) });
     }
 
-    fn v128Store(self: *Interpreter, mem_idx: u32, offset: u32) TrapError!void {
+    fn v128Store(self: *Interpreter, mem_idx: u32, offset: u64) TrapError!void {
         const val = try self.popValue();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 16 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 16, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bytes: [16]u8 = @bitCast(val.v128);
         @memcpy(mem.items[idx..][0..16], &bytes);
     }
 
-    fn v128Load8x8(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+    fn v128Load8x8(self: *Interpreter, mem_idx: u32, offset: u64, signed: bool) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var result: [8]i16 = undefined;
         for (0..8) |i| {
@@ -4061,10 +4066,10 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
-    fn v128Load16x4(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+    fn v128Load16x4(self: *Interpreter, mem_idx: u32, offset: u64, signed: bool) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var result: [4]i32 = undefined;
         for (0..4) |i| {
@@ -4078,10 +4083,10 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
-    fn v128Load32x2(self: *Interpreter, mem_idx: u32, offset: u32, signed: bool) TrapError!void {
+    fn v128Load32x2(self: *Interpreter, mem_idx: u32, offset: u64, signed: bool) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + 8 > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, 8, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var result: [2]i64 = undefined;
         for (0..2) |i| {
@@ -4095,10 +4100,10 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
-    fn v128LoadSplat(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int) TrapError!void {
+    fn v128LoadSplat(self: *Interpreter, mem_idx: u32, offset: u64, comptime size: comptime_int) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, size, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var result: [16]u8 = undefined;
         const count = 16 / size;
@@ -4108,21 +4113,21 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
-    fn v128LoadZero(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int) TrapError!void {
+    fn v128LoadZero(self: *Interpreter, mem_idx: u32, offset: u64, comptime size: comptime_int) TrapError!void {
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, size, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var result: [16]u8 = [_]u8{0} ** 16;
         @memcpy(result[0..size], mem.items[idx..][0..size]);
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
-    fn v128LoadLane(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int, lane: u8) TrapError!void {
+    fn v128LoadLane(self: *Interpreter, mem_idx: u32, offset: u64, comptime size: comptime_int, lane: u8) TrapError!void {
         const v = try self.popValue();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, size, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         var bytes: [16]u8 = @bitCast(v.v128);
         const lane_offset = @as(usize, lane) * size;
@@ -4131,11 +4136,11 @@ pub const Interpreter = struct {
         try self.pushValue(.{ .v128 = @bitCast(bytes) });
     }
 
-    fn v128StoreLane(self: *Interpreter, mem_idx: u32, offset: u32, comptime size: comptime_int, lane: u8) TrapError!void {
+    fn v128StoreLane(self: *Interpreter, mem_idx: u32, offset: u64, comptime size: comptime_int, lane: u8) TrapError!void {
         const v = try self.popValue();
         const addr = try self.popMemAddr(mem_idx, offset);
         const mem = self.instance.getMemory(mem_idx);
-        if (addr + size > mem.items.len) return error.OutOfBoundsMemoryAccess;
+        if (memOob(addr, size, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
         const bytes: [16]u8 = @bitCast(v.v128);
         const lane_offset = @as(usize, lane) * size;
@@ -5217,6 +5222,12 @@ fn readCodeS32(code: []const u8, pc: *usize) i32 {
 
 fn readCodeS64(code: []const u8, pc: *usize) i64 {
     const result = leb128.readS64Leb128(code[pc.*..]) catch return 0;
+    pc.* += result.bytes_read;
+    return result.value;
+}
+
+fn readCodeU64(code: []const u8, pc: *usize) u64 {
+    const result = leb128.readU64Leb128(code[pc.*..]) catch return 0;
     pc.* += result.bytes_read;
     return result.value;
 }
