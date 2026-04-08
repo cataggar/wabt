@@ -1572,8 +1572,11 @@ const Parser = struct {
 
     fn parseFuncBodyInstrs(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+            self.skipAnnotations();
+            if (self.peek().kind == .r_paren or self.peek().kind == .eof) break;
             if (self.peek().kind == .l_paren) {
                 _ = self.advance(); // consume '('
+                self.skipAnnotations();
                 self.parseFoldedInstr(code);
             } else {
                 self.parsePlainInstr(code);
@@ -1586,9 +1589,11 @@ const Parser = struct {
         switch (tok.kind) {
             .kw_block => {
                 _ = self.advance();
+                self.skipAnnotations();
                 code.append(self.allocator, 0x02) catch return;
                 const label = self.consumeOptionalLabel();
                 self.label_stack.append(self.allocator, label) catch {};
+                self.skipAnnotations();
                 self.emitBlockType(code);
                 self.parseFuncBodyInstrs(code);
                 code.append(self.allocator, 0x0b) catch return; // end
@@ -1729,8 +1734,11 @@ const Parser = struct {
                 // Now parse operand sub-expressions (they emit AFTER the instruction in the buffer)
                 var has_operands = false;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    self.skipAnnotations();
+                    if (self.peek().kind == .r_paren or self.peek().kind == .eof) break;
                     if (self.peek().kind == .l_paren) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         self.parseFoldedInstr(code);
                         has_operands = true;
                     } else {
@@ -2617,53 +2625,69 @@ const Parser = struct {
         var result_types_buf: [16]types.ValType = undefined;
 
         // Consume all (param ...) blocks
-        while (self.peek().kind == .l_paren) {
+        while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
+            if (self.peek().kind == .annotation) { _ = self.advance(); self.skipAnnotation() catch break; continue; }
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_param) {
                 _ = self.advance(); // consume 'param'
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    self.skipAnnotations();
+                    if (self.peek().kind == .r_paren) break;
                     const before_pos = self.lexer.pos;
                     if (self.parseValType()) |vt| {
                         if (param_count < 16) param_types_buf[param_count] = vt;
                         param_count += 1;
+                        self.skipAnnotations();
                     } else |_| {
                         if (self.lexer.pos == before_pos) _ = self.advance();
                         break;
                     }
                 }
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
                 break;
             }
+            self.skipAnnotations();
         }
 
         // Consume all (result ...) blocks
-        while (self.peek().kind == .l_paren) {
+        while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
+            if (self.peek().kind == .annotation) { _ = self.advance(); self.skipAnnotation() catch break; continue; }
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_result) {
                 _ = self.advance(); // consume 'result'
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    self.skipAnnotations();
+                    if (self.peek().kind == .r_paren) break;
                     const before_pos = self.lexer.pos;
                     if (self.parseValType()) |vt| {
                         if (result_count < 16) result_types_buf[result_count] = vt;
                         result_count += 1;
+                        self.skipAnnotations();
                     } else |_| {
                         if (self.lexer.pos == before_pos) _ = self.advance();
                         break;
                     }
                 }
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
                 break;
             }
+            self.skipAnnotations();
         }
 
         // No block type annotations found
@@ -2741,6 +2765,7 @@ const Parser = struct {
     }
 
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const tok = self.advance();
             // Check label stack first (for br/br_if $label)
@@ -3277,7 +3302,10 @@ const Parser = struct {
     fn skipToRParen(self: *Parser) void {
         // Skip tokens until we see the matching ')' or eof
         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-            if (self.peek().kind == .l_paren) {
+            if (self.peek().kind == .annotation) {
+                _ = self.advance();
+                self.skipAnnotation() catch return;
+            } else if (self.peek().kind == .l_paren) {
                 _ = self.advance();
                 self.skipToRParen();
             } else {
@@ -4361,7 +4389,9 @@ const Parser = struct {
 
     fn parseStart(self: *Parser, module: *Mod.Module) ParseError!void {
         if (module.start_var != null) return error.InvalidModule;
+        self.skipAnnotations();
         const index = try self.parseFuncIdx();
+        self.skipAnnotations();
         module.start_var = .{ .index = index };
     }
 
