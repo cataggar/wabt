@@ -2303,7 +2303,11 @@ const Parser = struct {
                         else if (std.mem.eql(u8, ht_text, "i31")) heap_type_idx = 0x6c
                         else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d
                         else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b
-                        else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a;
+                        else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a
+                        else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x71
+                        else if (std.mem.eql(u8, ht_text, "nofunc")) heap_type_idx = 0x73
+                        else if (std.mem.eql(u8, ht_text, "noextern")) heap_type_idx = 0x72
+                        else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x68;
                     }
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     // Emit sub-opcode
