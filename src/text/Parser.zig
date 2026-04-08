@@ -3076,6 +3076,12 @@ const Parser = struct {
             }
         }
 
+        // Check for i64 keyword after export/import clauses
+        if (!is_table64 and self.peek().kind == .kw_i64) {
+            _ = self.advance();
+            is_table64 = true;
+        }
+
         // Check for inline element syntax: (table elemtype (elem ...))
         if (self.peek().kind != .integer) {
             // elemtype first — inline elem syntax
@@ -3315,6 +3321,12 @@ const Parser = struct {
                 self.peeked = spk;
                 break;
             }
+        }
+
+        // Check for i64 keyword after export/import clauses
+        if (!is_memory64 and self.peek().kind == .kw_i64) {
+            _ = self.advance();
+            is_memory64 = true;
         }
 
         const initial = try self.parseU32();
