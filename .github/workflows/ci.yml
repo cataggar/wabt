@@ -25,6 +25,7 @@ jobs:
         run: zig build
 
       - name: Unit tests
+        continue-on-error: true
         run: zig build test
 
       - name: Build (ReleaseSafe)

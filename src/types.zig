@@ -108,6 +108,16 @@ pub const ValType = enum(i32) {
             .struct_ => "struct",
             .array => "array",
             .void_ => "void",
+            .nullfuncref => "nullfuncref",
+            .nullexternref => "nullexternref",
+            .nullref => "nullref",
+            .nullexnref => "nullexnref",
+            .ref_func => "(ref func)",
+            .ref_extern => "(ref extern)",
+            .ref_any => "(ref any)",
+            .ref_none => "(ref none)",
+            .ref_nofunc => "(ref nofunc)",
+            .ref_noextern => "(ref noextern)",
         };
     }
 };
