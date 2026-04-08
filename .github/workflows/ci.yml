@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [zig, main]
+  pull_request:
+    branches: [zig, main]
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@a45b28641dba20e38ca50e17acbc2cab6aefcb4c # v2.1.0
+        with:
+          version: 0.15.2
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Unit tests
+        run: zig build test
+
+      - name: Build (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Spec tests
+        run: |
+          total=0 pass=0 fail=0 skip=0
+          failed_files=""
+          for f in third_party/testsuite/*.wast; do
+            result=$(./zig-out/bin/spectest-interp "$f" 2>&1 | tail -1)
+            if [[ "$result" =~ ([0-9]+)\ passed,\ ([0-9]+)\ failed,\ ([0-9]+)\ skipped ]]; then
+              p=${BASH_REMATCH[1]}; f_count=${BASH_REMATCH[2]}; s=${BASH_REMATCH[3]}
+              t=$((p + f_count + s))
+              total=$((total + t)); pass=$((pass + p)); fail=$((fail + f_count)); skip=$((skip + s))
+              if [ "$f_count" -gt 0 ] || [ "$s" -gt 0 ]; then
+                failed_files="$failed_files $(basename $f)(${f_count}f/${s}s)"
+              fi
+            fi
+          done
+          echo "Results: $pass/$total passed, $fail failed, $skip skipped"
+          if [ -n "$failed_files" ]; then
+            echo "Issues:$failed_files"
+          fi
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::$fail spec test failures"
+            exit 1
+          fi
+          if [ "$skip" -gt 0 ]; then
+            echo "::warning::$skip spec tests skipped"
+          fi
