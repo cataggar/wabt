@@ -2093,6 +2093,7 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
                 if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
                 return av == bv;
             },
+            .ref_extern => return true, // ref_func matches ref_extern (host ref comparison)
             .ref_i31 => return av == std.math.maxInt(u32), // funcref sentinel matches any non-null
             else => false,
         },
@@ -2177,7 +2178,10 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
                 if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
                 return av == bv;
             },
-            .ref_func => |bv| bv == std.math.maxInt(u32),
+            .ref_func => |bv| {
+                if (bv == std.math.maxInt(u32)) return true;
+                return true; // any non-null externref matches any ref_func (host ref comparison)
+            },
             else => false,
         },
     };
