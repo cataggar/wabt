@@ -469,9 +469,24 @@ const RunState = struct {
                         const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
                         if (exp_idx >= triple.module.memories.items.len) return false;
                         const exp_mem = triple.module.memories.items[exp_idx];
+                        // Check memory32/64 compatibility
+                        const imp_mem_idx: u32 = blk: {
+                            var idx: u32 = 0;
+                            for (mod.imports.items) |imp2| {
+                                if (imp2.kind == .memory) {
+                                    if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                        std.mem.eql(u8, imp2.field_name, imp.field_name)) break;
+                                    idx += 1;
+                                }
+                            }
+                            break :blk idx;
+                        };
+                        if (imp_mem_idx < mod.memories.items.len) {
+                            if (mod.memories.items[imp_mem_idx].is_memory64 != exp_mem.is_memory64)
+                                return false;
+                        }
                         const actual = @as(u64, @intCast(triple.instance.getMemory(exp_idx).items.len / 65536));
                         if (actual < imp_m.limits.initial) return false;
-                        // If import has max, export must also have max and export.max <= import.max
                         if (imp_m.limits.has_max) {
                             if (!exp_mem.@"type".limits.has_max) return false;
                             if (exp_mem.@"type".limits.max > imp_m.limits.max) return false;
@@ -485,10 +500,24 @@ const RunState = struct {
                         if (exp_idx >= triple.module.tables.items.len) return false;
                         const exp_tbl = triple.module.tables.items[exp_idx];
                         if (imp_t.elem_type != exp_tbl.@"type".elem_type) return false;
-                        // Actual table size must be at least what's required
+                        // Check table32/64 compatibility
+                        const imp_tbl_idx: u32 = blk: {
+                            var idx: u32 = 0;
+                            for (mod.imports.items) |imp2| {
+                                if (imp2.kind == .table) {
+                                    if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                        std.mem.eql(u8, imp2.field_name, imp.field_name)) break;
+                                    idx += 1;
+                                }
+                            }
+                            break :blk idx;
+                        };
+                        if (imp_tbl_idx < mod.tables.items.len) {
+                            if (mod.tables.items[imp_tbl_idx].is_table64 != exp_tbl.is_table64)
+                                return false;
+                        }
                         const actual_size: u64 = @intCast(triple.instance.getTable(exp_idx).items.len);
                         if (actual_size < imp_t.limits.initial) return false;
-                        // If import has max, export must also have max and export.max ≤ import.max
                         if (imp_t.limits.has_max) {
                             if (!exp_tbl.@"type".limits.has_max) return false;
                             if (exp_tbl.@"type".limits.max > imp_t.limits.max) return false;

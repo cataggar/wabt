@@ -3534,6 +3534,12 @@ const Parser = struct {
                     }
                     self.memory_names.put(self.allocator, mname, import_mem_idx) catch {};
                 }
+                // Check for i64 keyword (memory64)
+                var is_memory64 = false;
+                if (self.peek().kind == .kw_i64) {
+                    _ = self.advance();
+                    is_memory64 = true;
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
@@ -3544,6 +3550,7 @@ const Parser = struct {
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
+                    .is_memory64 = is_memory64,
                 });
                 module.num_memory_imports += 1;
             },
@@ -3557,6 +3564,12 @@ const Parser = struct {
                     }
                     self.table_names.put(self.allocator, tname, import_table_idx) catch {};
                 }
+                // Check for i64 keyword (table64)
+                var is_table64 = false;
+                if (self.peek().kind == .kw_i64) {
+                    _ = self.advance();
+                    is_table64 = true;
+                }
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
@@ -3568,6 +3581,7 @@ const Parser = struct {
                 try module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
                     .is_import = true,
+                    .is_table64 = is_table64,
                 });
                 module.num_table_imports += 1;
             },
