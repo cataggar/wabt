@@ -3096,7 +3096,7 @@ pub const Interpreter = struct {
                             try self.pushValue(.{ .ref_struct = obj_idx });
                         },
                         0x02, 0x03, 0x04 => { // struct.get, struct.get_s, struct.get_u
-                            _ = readCodeU32(code, &pc); // type_idx
+                            const stype_idx = readCodeU32(code, &pc);
                             const field_idx = readCodeU32(code, &pc);
                             const ref = try self.popValue();
                             if (ref == .ref_null) return error.NullReference;
@@ -3107,16 +3107,28 @@ pub const Interpreter = struct {
                             const obj = &self.gc_objects.items[obj_id];
                             if (field_idx >= obj.fields.items.len) return error.Unimplemented;
                             const val = obj.fields.items[field_idx];
-                            if (gc_sub == 0x03) { // struct.get_s — sign-extend i8/i16
-                                try self.pushValue(val);
-                            } else if (gc_sub == 0x04) { // struct.get_u
-                                try self.pushValue(val);
+                            // For packed fields (i8/i16), apply sign/zero extension
+                            const field_type = getStructFieldType(self.instance.module, stype_idx, field_idx);
+                            if (gc_sub == 0x03 and field_type == .i8) {
+                                // struct.get_s i8: sign-extend from 8 bits
+                                const raw: i8 = @truncate(val.i32);
+                                try self.pushValue(.{ .i32 = @as(i32, raw) });
+                            } else if (gc_sub == 0x04 and field_type == .i8) {
+                                // struct.get_u i8: zero-extend from 8 bits
+                                const raw: u8 = @truncate(@as(u32, @bitCast(val.i32)));
+                                try self.pushValue(.{ .i32 = @as(i32, @intCast(@as(u32, raw))) });
+                            } else if (gc_sub == 0x03 and field_type == .i16) {
+                                const raw: i16 = @truncate(val.i32);
+                                try self.pushValue(.{ .i32 = @as(i32, raw) });
+                            } else if (gc_sub == 0x04 and field_type == .i16) {
+                                const raw: u16 = @truncate(@as(u32, @bitCast(val.i32)));
+                                try self.pushValue(.{ .i32 = @as(i32, @intCast(@as(u32, raw))) });
                             } else {
                                 try self.pushValue(val);
                             }
                         },
                         0x05 => { // struct.set
-                            _ = readCodeU32(code, &pc); // type_idx
+                            const stype_idx2 = readCodeU32(code, &pc);
                             const field_idx = readCodeU32(code, &pc);
                             const val = try self.popValue();
                             const ref = try self.popValue();
@@ -3125,7 +3137,15 @@ pub const Interpreter = struct {
                                 .ref_struct => |id| id, .ref_func => |id| id, else => return error.NullReference,
                             };
                             if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
-                            self.gc_objects.items[obj_id].fields.items[field_idx] = val;
+                            // For packed fields, truncate the value
+                            const ft = getStructFieldType(self.instance.module, stype_idx2, field_idx);
+                            if (ft == .i8) {
+                                self.gc_objects.items[obj_id].fields.items[field_idx] = .{ .i32 = @as(i32, @as(u8, @truncate(@as(u32, @bitCast(val.i32))))) };
+                            } else if (ft == .i16) {
+                                self.gc_objects.items[obj_id].fields.items[field_idx] = .{ .i32 = @as(i32, @as(u16, @truncate(@as(u32, @bitCast(val.i32))))) };
+                            } else {
+                                self.gc_objects.items[obj_id].fields.items[field_idx] = val;
+                            }
                         },
                         0x06 => { // array.new
                             const type_idx = readCodeU32(code, &pc);
@@ -3203,7 +3223,7 @@ pub const Interpreter = struct {
                             try self.pushValue(.{ .ref_array = idx });
                         },
                         0x0b, 0x0c, 0x0d => { // array.get, array.get_s, array.get_u
-                            _ = readCodeU32(code, &pc); // type_idx
+                            const arr_type_idx = readCodeU32(code, &pc);
                             const arr_idx_val: u32 = @bitCast(try self.popI32());
                             const ref = try self.popValue();
                             if (ref == .ref_null) return error.NullReference;
@@ -3213,7 +3233,23 @@ pub const Interpreter = struct {
                             if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
                             const obj = &self.gc_objects.items[obj_id];
                             if (arr_idx_val >= obj.fields.items.len) return error.OutOfBoundsTableAccess;
-                            try self.pushValue(obj.fields.items[arr_idx_val]);
+                            const val = obj.fields.items[arr_idx_val];
+                            const elem_type = getArrayElemType(self.instance.module, arr_type_idx);
+                            if (gc_sub == 0x0c and elem_type == .i8) {
+                                const raw: i8 = @truncate(val.i32);
+                                try self.pushValue(.{ .i32 = @as(i32, raw) });
+                            } else if (gc_sub == 0x0d and elem_type == .i8) {
+                                const raw: u8 = @truncate(@as(u32, @bitCast(val.i32)));
+                                try self.pushValue(.{ .i32 = @as(i32, @intCast(@as(u32, raw))) });
+                            } else if (gc_sub == 0x0c and elem_type == .i16) {
+                                const raw: i16 = @truncate(val.i32);
+                                try self.pushValue(.{ .i32 = @as(i32, raw) });
+                            } else if (gc_sub == 0x0d and elem_type == .i16) {
+                                const raw: u16 = @truncate(@as(u32, @bitCast(val.i32)));
+                                try self.pushValue(.{ .i32 = @as(i32, @intCast(@as(u32, raw))) });
+                            } else {
+                                try self.pushValue(val);
+                            }
                         },
                         0x0e => { // array.set
                             _ = readCodeU32(code, &pc); // type_idx
@@ -5239,6 +5275,30 @@ fn getArrayElemByteSize(module: *const Mod.Module, type_idx: u32) u32 {
         }
     }
     return 1;
+}
+
+/// Get the field ValType for a struct type at the given field index.
+fn getStructFieldType(module: *const Mod.Module, type_idx: u32, field_idx: u32) types.ValType {
+    if (type_idx < module.module_types.items.len) {
+        switch (module.module_types.items[type_idx]) {
+            .struct_type => |st| {
+                if (field_idx < st.fields.items.len) return st.fields.items[field_idx].type;
+            },
+            else => {},
+        }
+    }
+    return .i32;
+}
+
+/// Get the element ValType for an array type.
+fn getArrayElemType(module: *const Mod.Module, type_idx: u32) types.ValType {
+    if (type_idx < module.module_types.items.len) {
+        switch (module.module_types.items[type_idx]) {
+            .array_type => |at| return at.field.type,
+            else => {},
+        }
+    }
+    return .i32;
 }
 
 /// Get the byte size for a ValType used in packed struct/array fields.
