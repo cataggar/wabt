@@ -154,16 +154,17 @@ const Reader = struct {
     fn readRefType(self: *Reader) ReadError!types.ValType {
         const byte = try self.readByte();
         if (byte == 0x63 or byte == 0x64) {
-            // GC-style ref type: 0x63 = ref null, 0x64 = ref
+            // GC-style ref type: 0x63 = ref null, 0x64 = ref (non-nullable)
+            const nullable = (byte == 0x63);
             const heap_type = try self.readS64();
-            // Map abstract heap types to ValType
             const ht: i64 = heap_type;
-            if (ht == -0x10) return .funcref; // func (0x70)
-            if (ht == -0x11) return .externref; // extern (0x6f)
-            if (ht == -0x0e) return .funcref; // nofunc (0x72) → map to funcref
-            if (ht == -0x0f) return .externref; // noextern (0x71) → map to externref
-            // Concrete type index or other abstract type → map to funcref for now
-            return .funcref;
+            if (ht == -0x10) return if (nullable) .funcref else .ref_func;
+            if (ht == -0x11) return if (nullable) .externref else .ref_extern;
+            if (ht == -0x0e) return if (nullable) .nullfuncref else .ref_nofunc;
+            if (ht == -0x0f) return if (nullable) .nullexternref else .ref_none;
+            if (ht == -0x12) return if (nullable) .anyref else .ref_any;
+            // Concrete type index or other abstract type
+            return if (nullable) .funcref else .ref_func;
         }
         return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
