@@ -2319,7 +2319,9 @@ const Parser = struct {
                 } else if (self.peek().kind == .kw_i31ref or self.peek().kind == .kw_eqref or
                     self.peek().kind == .kw_structref or self.peek().kind == .kw_arrayref or
                     self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
-                    self.peek().kind == .kw_externref)
+                    self.peek().kind == .kw_externref or self.peek().kind == .kw_nullref or
+                    self.peek().kind == .kw_nullfuncref or self.peek().kind == .kw_nullexternref or
+                    self.peek().kind == .kw_nullexnref or self.peek().kind == .kw_exnref)
                 {
                     // Bare type keyword: ref.cast i31ref etc.
                     const vt = self.advance();
@@ -2332,6 +2334,11 @@ const Parser = struct {
                         .kw_funcref => 0x70,
                         .kw_anyref => 0x6e,
                         .kw_externref => 0x6f,
+                        .kw_exnref => 0x69,
+                        .kw_nullref => 0x71,
+                        .kw_nullfuncref => 0x73,
+                        .kw_nullexternref => 0x72,
+                        .kw_nullexnref => 0x68,
                         else => -1,
                     };
                     const sub_op: u32 = if (tok.kind == .kw_ref_test)
