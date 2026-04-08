@@ -3582,7 +3582,7 @@ pub const Interpreter = struct {
                                     else return error.CastFailure;
                                 },
                                 .ref_extern => {
-                                    if (heap_type == 0x6f or heap_type < 0)
+                                    if (heap_type == 0x6f or heap_type == 0x6e or heap_type < 0)
                                         try self.pushValue(val)
                                     else return error.CastFailure;
                                 },
