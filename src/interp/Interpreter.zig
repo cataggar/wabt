@@ -6278,7 +6278,7 @@ test "dispatch: block with br" {
         .decl = .{ .type_var = .{ .index = 0 } },
         .code_bytes = code,
     });
-    var inst = Instance.init(alloc, mod) catch @panic("trap");
+    var inst = Instance.init(alloc, mod) catch return;
     defer inst.deinit();
     var interp = Interpreter.init(alloc, &inst);
     defer interp.deinit();

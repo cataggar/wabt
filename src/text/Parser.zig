@@ -5683,7 +5683,8 @@ test "parse (ref null func) as value type" {
     );
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
-    try std.testing.expectEqual(types.ValType.ref_null, module.globals.items[0].type.val_type);
+    // (ref null func) is canonicalized to funcref (0x70)
+    try std.testing.expectEqual(types.ValType.funcref, module.globals.items[0].type.val_type);
 }
 
 test "parse module with rec type group" {
