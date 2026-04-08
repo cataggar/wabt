@@ -5325,6 +5325,66 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
             0xfb => { // GC prefix
                 const gc_op = readCodeU32(expr, &pc);
                 switch (gc_op) {
+                    0x00 => { // struct.new
+                        const type_idx = readCodeU32(expr, &pc);
+                        if (instance.interp_ref) |interp| {
+                            const field_count = interp.getStructFieldCount(type_idx);
+                            if (sp >= field_count) {
+                                var fields_buf: [64]Value = undefined;
+                                var fi: u32 = field_count;
+                                while (fi > 0) { fi -= 1; sp -= 1; fields_buf[fi] = stack[sp]; }
+                                const obj_idx = interp.allocStruct(type_idx, fields_buf[0..field_count]) catch return null;
+                                stack[sp] = .{ .ref_struct = obj_idx }; sp += 1;
+                            }
+                        } else return null;
+                    },
+                    0x01 => { // struct.new_default
+                        const type_idx = readCodeU32(expr, &pc);
+                        if (instance.interp_ref) |interp| {
+                            const field_count = interp.getStructFieldCount(type_idx);
+                            var fields_buf: [64]Value = undefined;
+                            for (0..field_count) |fi| fields_buf[fi] = interp.getDefaultFieldValue(type_idx, @intCast(fi));
+                            const obj_idx = interp.allocStruct(type_idx, fields_buf[0..field_count]) catch return null;
+                            if (sp < 16) { stack[sp] = .{ .ref_struct = obj_idx }; sp += 1; }
+                        } else return null;
+                    },
+                    0x06 => { // array.new
+                        const type_idx = readCodeU32(expr, &pc);
+                        if (sp >= 2) {
+                            sp -= 1; const len: u32 = @bitCast(stack[sp].i32);
+                            sp -= 1; const init_val = stack[sp];
+                            if (instance.interp_ref) |interp| {
+                                const obj_idx = interp.allocArray(type_idx, len, init_val) catch return null;
+                                stack[sp] = .{ .ref_array = obj_idx }; sp += 1;
+                            } else return null;
+                        } else return null;
+                    },
+                    0x07 => { // array.new_default
+                        const type_idx = readCodeU32(expr, &pc);
+                        if (sp >= 1) {
+                            sp -= 1; const len: u32 = @bitCast(stack[sp].i32);
+                            if (instance.interp_ref) |interp| {
+                                const default_val = interp.getDefaultFieldValue(type_idx, 0);
+                                const obj_idx = interp.allocArray(type_idx, len, default_val) catch return null;
+                                stack[sp] = .{ .ref_array = obj_idx }; sp += 1;
+                            } else return null;
+                        } else return null;
+                    },
+                    0x08 => { // array.new_fixed
+                        const type_idx = readCodeU32(expr, &pc);
+                        const count = readCodeU32(expr, &pc);
+                        if (sp >= count and instance.interp_ref != null) {
+                            const interp = instance.interp_ref.?;
+                            var fields_buf: [256]Value = undefined;
+                            var fi: u32 = count;
+                            while (fi > 0) { fi -= 1; sp -= 1; fields_buf[fi] = stack[sp]; }
+                            const idx: u32 = @intCast(interp.gc_objects.items.len);
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            obj.fields.appendSlice(interp.allocator, fields_buf[0..count]) catch return null;
+                            interp.gc_objects.append(interp.allocator, obj) catch return null;
+                            stack[sp] = .{ .ref_array = idx }; sp += 1;
+                        } else return null;
+                    },
                     0x1c => { // ref.i31
                         if (sp > 0) {
                             sp -= 1;
