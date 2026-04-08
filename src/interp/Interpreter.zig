@@ -3576,10 +3576,19 @@ pub const Interpreter = struct {
                                         else return error.CastFailure;
                                     } else return error.CastFailure;
                                 },
-                                .ref_func => {
-                                    if (heap_type == 0x70 or heap_type == 0x6e or heap_type < 0)
-                                        try self.pushValue(val)
-                                    else return error.CastFailure;
+                                .ref_func => |fidx| {
+                                    if (heap_type == 0x70 or heap_type == 0x6e or heap_type < 0) {
+                                        try self.pushValue(val);
+                                    } else if (heap_type >= 0 and heap_type < 0x68) {
+                                        // Concrete function type check
+                                        const ht_idx: u32 = @intCast(heap_type);
+                                        if (fidx < self.instance.module.funcs.items.len) {
+                                            const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
+                                            if (func_type == ht_idx or self.isSubtypeOf(func_type, ht_idx, self))
+                                                try self.pushValue(val)
+                                            else return error.CastFailure;
+                                        } else return error.CastFailure;
+                                    } else return error.CastFailure;
                                 },
                                 .ref_extern => {
                                     if (heap_type == 0x6f or heap_type == 0x6e or heap_type < 0)
