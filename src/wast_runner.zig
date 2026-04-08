@@ -2436,11 +2436,26 @@ fn hasIllegalWatBytes(text: []const u8) bool {
         if (c == '$' and i + 2 < text.len and text[i + 1] == '"' and text[i + 2] == '"') {
             return true;
         }
-        // Inside string literals, check for illegal raw bytes
+        // Inside string literals, check for illegal raw bytes and invalid hex escapes
         if (c == '"') {
             i += 1;
             while (i < text.len and text[i] != '"') : (i += 1) {
                 if (text[i] == '\\' and i + 1 < text.len) {
+                    const esc = text[i + 1];
+                    // Check \xx hex escapes for UTF-8 validity in identifier strings
+                    if (hexDigit(esc)) |h1| {
+                        if (i + 2 < text.len) {
+                            if (hexDigit(text[i + 2])) |h2| {
+                                const byte_val = h1 * 16 + h2;
+                                // Bytes >= 0x80 must form valid UTF-8 sequences
+                                if (byte_val >= 0x80) {
+                                    if (!validateHexUtf8(text, i)) return true;
+                                }
+                                i += 2; // skip \xx (loop will add 1)
+                                continue;
+                            }
+                        }
+                    }
                     i += 1; // skip escaped char
                     continue;
                 }
@@ -2477,6 +2492,51 @@ fn hasIllegalWatBytes(text: []const u8) bool {
         if (c < 0x20 and c != 0x09 and c != 0x0a and c != 0x0d) return true;
     }
     return false;
+}
+
+/// Check if a \xx hex escape sequence at position `pos` in WAT text starts a valid
+/// UTF-8 multi-byte sequence using subsequent \xx escapes.
+fn validateHexUtf8(text: []const u8, pos: usize) bool {
+    // Decode the first byte from \xx at `pos`
+    const b0 = decodeHexEscape(text, pos) orelse return false;
+    if (b0 < 0x80) return true; // ASCII, always valid
+    if (b0 < 0xc0) return false; // continuation byte without lead
+    // Determine expected sequence length
+    const seq_len: usize = if (b0 < 0xe0) 2 else if (b0 < 0xf0) 3 else if (b0 < 0xf8) 4 else return false;
+    // Check that subsequent \xx escapes produce valid continuation bytes
+    var offset = pos + 3; // skip first \xx (3 chars: \, h, h)
+    for (1..seq_len) |_| {
+        const cb = decodeHexEscape(text, offset) orelse return false;
+        if (cb & 0xc0 != 0x80) return false; // not a continuation byte
+        offset += 3;
+    }
+    // Check for overlong encodings
+    if (seq_len == 2 and b0 < 0xc2) return false;
+    if (seq_len == 3 and b0 == 0xe0) {
+        const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+        if (b1 < 0xa0) return false;
+    }
+    if (seq_len == 4) {
+        if (b0 == 0xf0) {
+            const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+            if (b1 < 0x90) return false;
+        }
+        if (b0 == 0xf4) {
+            const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+            if (b1 > 0x8f) return false;
+        }
+        if (b0 > 0xf4) return false;
+    }
+    return true;
+}
+
+/// Decode a \xx hex escape at the given position, returning the byte value.
+fn decodeHexEscape(text: []const u8, pos: usize) ?u8 {
+    if (pos + 2 >= text.len) return null;
+    if (text[pos] != '\\') return null;
+    const h1 = hexDigit(text[pos + 1]) orelse return null;
+    const h2 = hexDigit(text[pos + 2]) orelse return null;
+    return h1 * 16 + h2;
 }
 
 /// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.

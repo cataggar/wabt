@@ -289,6 +289,14 @@ pub const Lexer = struct {
                     }
                 }
                 if (self.pos < self.source.len) self.pos += 1; // skip closing "
+                // Reject quoted identifier glued to another token
+                if (self.pos < self.source.len) {
+                    const nc = self.source[self.pos];
+                    if (isWordChar(nc) or nc == '$' or nc == '"') {
+                        self.consumeGluedContent();
+                        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+                    }
+                }
                 const text = self.source[start..self.pos];
                 return .{ .kind = .identifier, .text = text, .offset = start };
             }
