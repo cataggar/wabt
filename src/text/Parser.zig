@@ -2766,8 +2766,44 @@ const Parser = struct {
         switch (sub) {
             0x00, 0x01 => self.emitU32Imm(code), // struct.new, struct.new_default: typeidx
             0x02, 0x03, 0x04, 0x05 => { // struct.get/get_s/get_u/set: typeidx, fieldidx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                // First: type index
+                var type_idx: u32 = 0;
+                if (self.peek().kind == .identifier) {
+                    const tok = self.advance();
+                    type_idx = self.type_names.get(tok.text) orelse 0;
+                    self.emitLeb128U32(code, type_idx);
+                } else if (self.peek().kind == .integer) {
+                    type_idx = self.parseU32() catch 0;
+                    self.emitLeb128U32(code, type_idx);
+                } else {
+                    self.emitLeb128U32(code, 0);
+                }
+                // Second: field index (may be $name or numeric)
+                if (self.peek().kind == .identifier) {
+                    const field_tok = self.advance();
+                    // Look up field name in the struct type
+                    var field_idx: u32 = 0;
+                    if (self.module) |mod| {
+                        if (type_idx < mod.module_types.items.len) {
+                            switch (mod.module_types.items[type_idx]) {
+                                .struct_type => |st| {
+                                    for (st.fields.items, 0..) |field, fi| {
+                                        if (field.name) |name| {
+                                            if (std.mem.eql(u8, name, field_tok.text)) {
+                                                field_idx = @intCast(fi);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                    self.emitLeb128U32(code, field_idx);
+                } else {
+                    self.emitU32Imm(code);
+                }
             },
             0x06, 0x07 => self.emitU32Imm(code), // array.new, array.new_default: typeidx
             0x08 => { // array.new_fixed: typeidx, count
