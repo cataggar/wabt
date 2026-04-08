@@ -453,6 +453,10 @@ pub const Interpreter = struct {
     global_links: std.ArrayListUnmanaged(?GlobalLink) = .{},
     tag_canonical_ids: std.ArrayListUnmanaged(u64) = .{},
 
+    /// Maps extern ref index to original Value for any.convert_extern roundtrip.
+    extern_originals: std.AutoHashMapUnmanaged(u32, Value) = .{},
+    next_extern_id: u32 = 0,
+
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
             .allocator = allocator,
@@ -469,6 +473,7 @@ pub const Interpreter = struct {
         self.caught_exceptions.deinit(self.allocator);
         for (self.gc_objects.items) |*obj| obj.deinit(self.allocator);
         self.gc_objects.deinit(self.allocator);
+        self.extern_originals.deinit(self.allocator);
     }
 
     /// Allocate a new GC struct object, returns its index.
@@ -3441,8 +3446,15 @@ pub const Interpreter = struct {
                             const val = try self.popValue();
                             if (val == .ref_null) {
                                 try self.pushValue(.{ .ref_null = {} });
+                            } else if (val == .ref_extern) {
+                                // Restore original value if it was externalized
+                                if (self.extern_originals.get(val.ref_extern)) |orig| {
+                                    try self.pushValue(orig);
+                                } else {
+                                    try self.pushValue(val);
+                                }
                             } else {
-                                try self.pushValue(val); // pass through
+                                try self.pushValue(val);
                             }
                         },
                         0x1b => { // extern.convert_any — anyref to externref
@@ -3450,15 +3462,11 @@ pub const Interpreter = struct {
                             if (val == .ref_null) {
                                 try self.pushValue(.{ .ref_null = {} });
                             } else {
-                                // Wrap as extern ref
-                                const ext_val: u32 = switch (val) {
-                                    .ref_i31 => |v| v,
-                                    .ref_struct => |v| v,
-                                    .ref_array => |v| v,
-                                    .ref_func => |v| v,
-                                    else => 0,
-                                };
-                                try self.pushValue(.{ .ref_extern = ext_val });
+                                // Store original value for roundtrip restoration
+                                const ext_id = self.next_extern_id;
+                                self.next_extern_id +%= 1;
+                                self.extern_originals.put(self.allocator, ext_id, val) catch {};
+                                try self.pushValue(.{ .ref_extern = ext_id });
                             }
                         },
                         0x14, 0x15 => { // ref.test (non-null / nullable)
