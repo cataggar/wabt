@@ -1908,6 +1908,13 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
         return .{ .ref_func = idx }; // non-null externref represented as ref_func
+    } else if (std.mem.eql(u8, kw, "ref.i31")) {
+        // (ref.i31) matches any non-null i31ref
+        return .{ .ref_i31 = std.math.maxInt(u32) }; // sentinel: match any i31
+    } else if (std.mem.eql(u8, kw, "ref.host")) {
+        // (ref.host N) is an externalized reference - treat as non-null
+        const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
+        return .{ .ref_func = idx };
     } else if (std.mem.eql(u8, kw, "v128.const")) {
         // val_text is the lane type (i8x16, i16x8, i32x4, i64x2, f32x4, f64x2)
         return parseV128Const(val_text, sexpr, i);
@@ -2079,6 +2086,15 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
                 if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
                 return av == bv;
             },
+            .ref_i31 => return av == std.math.maxInt(u32), // funcref sentinel matches any non-null
+            else => false,
+        },
+        .ref_i31 => |av| switch (b) {
+            .ref_i31 => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| return bv == std.math.maxInt(u32),
             else => false,
         },
         .v128 => |av| switch (b) {

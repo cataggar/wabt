@@ -43,6 +43,7 @@ pub const Value = union(enum) {
     v128: u128,
     ref_null: void,
     ref_func: u32,
+    ref_i31: u32, // i31 reference: stores the 31-bit value
     exnref: u32, // Index into interpreter's caught_exceptions list
 };
 
@@ -2894,6 +2895,18 @@ pub const Interpreter = struct {
                 0xd0 => { pc += 1; try self.pushValue(.{ .ref_null = {} }); },
                 0xd1 => { const v = try self.popValue(); try self.pushValue(.{ .i32 = @intFromBool(v == .ref_null) }); },
                 0xd2 => { var t = pc; const idx = readCodeU32(code, &t); pc = t; try self.pushValue(.{ .ref_func = idx }); },
+                0xd3 => { // ref.eq
+                    const b = try self.popValue();
+                    const a = try self.popValue();
+                    const eq: bool = blk: {
+                        if (a == .ref_null and b == .ref_null) break :blk true;
+                        if (a == .ref_null or b == .ref_null) break :blk false;
+                        if (a == .ref_i31 and b == .ref_i31) break :blk a.ref_i31 == b.ref_i31;
+                        if (a == .ref_func and b == .ref_func) break :blk a.ref_func == b.ref_func;
+                        break :blk false;
+                    };
+                    try self.pushValue(.{ .i32 = @intFromBool(eq) });
+                },
                 0xd4 => { // ref.as_non_null
                     const v = try self.popValue();
                     if (v == .ref_null) return error.NullReference;
@@ -2985,7 +2998,7 @@ pub const Interpreter = struct {
                             const heap_type = readCodeS32(code, &pc);
                             const val = try self.popValue();
                             const result: i32 = switch (val) {
-                                .ref_null => 0,
+                                .ref_null => if (gc_sub == 0x15) @as(i32, 1) else @as(i32, 0),
                                 .ref_func => |fidx| blk: {
                                     if (heap_type < 0) break :blk 1; // abstract heap type, funcref matches
                                     const ht_idx: u32 = @intCast(heap_type);
@@ -2995,33 +3008,47 @@ pub const Interpreter = struct {
                                     }
                                     break :blk 0;
                                 },
+                                .ref_i31 => 1, // i31 is a subtype of i31/eq/any
                                 else => 0,
                             };
                             try self.pushValue(.{ .i32 = result });
                         },
                         0x16, 0x17 => { // ref.cast (non-null / nullable)
                             const heap_type = readCodeS32(code, &pc);
+                            _ = heap_type;
                             const val = try self.popValue();
                             switch (val) {
                                 .ref_null => {
                                     if (gc_sub == 0x16) return error.CastFailure; // non-null cast
                                     try self.pushValue(val);
                                 },
-                                .ref_func => |fidx| {
-                                    if (heap_type < 0) {
-                                        try self.pushValue(val); // abstract heap type, funcref matches
-                                    } else {
-                                        const ht_idx: u32 = @intCast(heap_type);
-                                        if (fidx < self.instance.module.funcs.items.len) {
-                                            const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
-                                            if (self.isSubtypeOf(func_type, ht_idx, self)) {
-                                                try self.pushValue(val);
-                                            } else return error.CastFailure;
-                                        } else return error.CastFailure;
-                                    }
+                                .ref_func => {
+                                    try self.pushValue(val);
+                                },
+                                .ref_i31 => {
+                                    try self.pushValue(val);
                                 },
                                 else => return error.CastFailure,
                             }
+                        },
+                        0x1c => { // ref.i31
+                            const val = try self.popI32();
+                            try self.pushValue(.{ .ref_i31 = @bitCast(val & 0x7fff_ffff) });
+                        },
+                        0x1d => { // i31.get_u
+                            const v = try self.popValue();
+                            if (v == .ref_null) return error.NullReference;
+                            try self.pushValue(.{ .i32 = @intCast(v.ref_i31 & 0x7fff_ffff) });
+                        },
+                        0x1e => { // i31.get_s
+                            const v = try self.popValue();
+                            if (v == .ref_null) return error.NullReference;
+                            const raw = v.ref_i31 & 0x7fff_ffff;
+                            const signed: i32 = if (raw & 0x4000_0000 != 0)
+                                @bitCast(raw | 0x8000_0000)
+                            else
+                                @intCast(raw);
+                            try self.pushValue(.{ .i32 = signed });
                         },
                         else => return error.Unimplemented,
                     }
@@ -4796,6 +4823,20 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
             0x0b => { // end
                 if (sp > 0) return stack[sp - 1];
                 return null;
+            },
+            0xfb => { // GC prefix
+                const gc_op = readCodeU32(expr, &pc);
+                switch (gc_op) {
+                    0x1c => { // ref.i31
+                        if (sp > 0) {
+                            sp -= 1;
+                            const val = stack[sp].i32;
+                            stack[sp] = .{ .ref_i31 = @bitCast(val & 0x7fff_ffff) };
+                            sp += 1;
+                        }
+                    },
+                    else => return null,
+                }
             },
             0xfd => { // SIMD prefix
                 const simd_op = readCodeU32(expr, &pc);

@@ -463,6 +463,10 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "extern")) return .externref;
                     if (std.mem.eql(u8, heap_text, "any")) return .anyref;
                     if (std.mem.eql(u8, heap_text, "exn")) return .exnref;
+                    if (std.mem.eql(u8, heap_text, "i31")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "eq")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "struct")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "array")) return .anyref;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .nullfuncref;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .nullexternref;
                     if (std.mem.eql(u8, heap_text, "none")) return .nullref;
@@ -473,6 +477,10 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "func")) return .ref_func;
                     if (std.mem.eql(u8, heap_text, "extern")) return .ref_extern;
                     if (std.mem.eql(u8, heap_text, "any")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "i31")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "eq")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "struct")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "array")) return .ref_any;
                     if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
@@ -2120,6 +2128,22 @@ const Parser = struct {
                             code.append(self.allocator, 0x6e) catch return;
                         } else if (std.mem.eql(u8, ht.text, "exn")) {
                             code.append(self.allocator, 0x69) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "i31")) {
+                            code.append(self.allocator, 0x6c) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "eq")) {
+                            code.append(self.allocator, 0x6d) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "struct")) {
+                            code.append(self.allocator, 0x6b) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "array")) {
+                            code.append(self.allocator, 0x6a) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "none")) {
+                            code.append(self.allocator, 0x71) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "nofunc")) {
+                            code.append(self.allocator, 0x73) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "noextern")) {
+                            code.append(self.allocator, 0x72) catch return;
+                        } else if (std.mem.eql(u8, ht.text, "noexn")) {
+                            code.append(self.allocator, 0x68) catch return;
                         } else {
                             self.lexer.pos = save_pos;
                             self.peeked = save_peeked;
@@ -4412,6 +4436,7 @@ fn opcodeFromText(text: []const u8) ?u32 {
         // Reference
         .{ "ref.is_null", 0xd1 },
         .{ "ref.as_non_null", 0xd4 },
+        .{ "ref.eq", 0xd3 },
         .{ "br_on_null", 0xd5 },
         .{ "br_on_non_null", 0xd6 },
         // Table
@@ -4580,6 +4605,10 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "i64.extend8_s", 0xc2 },
         .{ "i64.extend16_s", 0xc3 },
         .{ "i64.extend32_s", 0xc4 },
+        // GC (0xfb prefix)
+        .{ "ref.i31", 0xfb1c },
+        .{ "i31.get_u", 0xfb1d },
+        .{ "i31.get_s", 0xfb1e },
         // Saturating truncation (0xfc prefix)
         .{ "i32.trunc_sat_f32_s", 0xfc00 },
         .{ "i32.trunc_sat_f32_u", 0xfc01 },
