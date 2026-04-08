@@ -3365,6 +3365,19 @@ const Parser = struct {
             } else if (inner.kind == .kw_global_get) {
                 init_code.append(self.allocator, 0x23) catch {};
                 self.emitGlobalIdx(&init_code);
+            } else if (inner.kind == .opcode and std.mem.eql(u8, inner.text, "ref.i31")) {
+                // ref.i31 init expression: (ref.i31 (i32.const N))
+                // Operand first, then ref.i31 (stack order)
+                if (self.peek().kind == .l_paren) {
+                    _ = self.advance();
+                    self.parseInitExprFolded(&init_code);
+                } else {
+                    self.parseInitExprPlain(&init_code);
+                }
+                init_code.append(self.allocator, 0xfb) catch {};
+                var sub_buf: [5]u8 = undefined;
+                const sub_n = leb128.writeU32Leb128(&sub_buf, 0x1c);
+                init_code.appendSlice(self.allocator, sub_buf[0..sub_n]) catch {};
             } else {
                 // Unknown/invalid init expr — mark as malformed
                 self.malformed = true;
