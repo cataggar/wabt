@@ -262,30 +262,35 @@ fn prescanNames(
             func_idx += 1;
         } else if (tok.kind == .kw_type) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 type_names.put(allocator, normalizeIdentifier(allocator, tok.text), type_idx) catch {};
             }
             type_idx += 1;
         } else if (tok.kind == .kw_global) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 global_names.put(allocator, normalizeIdentifier(allocator, tok.text), global_idx) catch {};
             }
             global_idx += 1;
         } else if (tok.kind == .kw_table) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 table_names.put(allocator, normalizeIdentifier(allocator, tok.text), table_idx) catch {};
             }
             table_idx += 1;
         } else if (tok.kind == .kw_memory) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 memory_names.put(allocator, normalizeIdentifier(allocator, tok.text), memory_idx) catch {};
             }
             memory_idx += 1;
         } else if (tok.kind == .kw_data) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 data_names.put(allocator, normalizeIdentifier(allocator, tok.text), data_idx) catch {};
             }
@@ -654,27 +659,36 @@ const Parser = struct {
         errdefer results.deinit(self.allocator);
         var seen_result = false;
 
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance();
+            self.skipAnnotations();
             const kw = self.peek();
             if (kw.kind == .kw_param) {
                 if (seen_result) return error.UnexpectedToken; // param after result
                 _ = self.advance();
+                self.skipAnnotations();
                 // Optional identifier
                 if (self.peek().kind == .identifier) _ = self.advance();
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren) {
                     try params.append(self.allocator, try self.parseValType());
+                    self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else if (kw.kind == .kw_result) {
                 seen_result = true;
                 _ = self.advance();
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren) {
                     try results.append(self.allocator, try self.parseValType());
+                    self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else {
                 self.lexer.pos = save_pos;
                 self.peeked = save_peeked;
@@ -697,10 +711,12 @@ const Parser = struct {
         self.in_type_parse = true;
         defer self.in_type_parse = false;
         // (type $name? (func (param ...) (result ...)))
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             self.type_names.put(self.allocator, name, @intCast(module.module_types.items.len)) catch {};
         }
+        self.skipAnnotations();
         try self.expect(.l_paren);
 
         // Check for (sub ...) wrapper
@@ -728,11 +744,14 @@ const Parser = struct {
         }
 
         // Parse the inner type: func, struct, or array
+        self.skipAnnotations();
         const inner_text = self.peek().text;
         if (self.peek().kind == .kw_func) {
             meta.kind = .func;
             _ = self.advance();
+            self.skipAnnotations();
             const sig = try self.parseFuncSig(module);
+            self.skipAnnotations();
             try self.expect(.r_paren);
             if (meta.is_sub) try self.expect(.r_paren); // close (sub ...)
             try module.module_types.append(self.allocator, .{
@@ -1151,6 +1170,7 @@ const Parser = struct {
         // Clear per-function local name map
         self.local_names.clearRetainingCapacity();
         self.label_stack.clearRetainingCapacity();
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             func.name = self.advance().text;
             if (func.name) |n| self.checkEmptyId(n);
@@ -1165,24 +1185,32 @@ const Parser = struct {
         }
 
         // Handle inline (export "name") and (import "mod" "name") declarations
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_export) {
                 _ = self.advance(); // consume 'export'
+                self.skipAnnotations();
                 const name_tok = self.advance();
                 const exp_name = self.parseName(name_tok.text);
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
                     .kind = .func,
                     .var_ = .{ .index = func_idx },
                 }) catch return error.OutOfMemory;
+                self.skipAnnotations();
             } else if (self.peek().kind == .kw_import) {
                 _ = self.advance(); // consume 'import'
+                self.skipAnnotations();
                 const mod_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 const field_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 try self.expect(.r_paren); // close (import ...)
 
                 // Parse optional (type $idx) and inline sig
@@ -1192,29 +1220,40 @@ const Parser = struct {
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer results_list.deinit(self.allocator);
 
+                self.skipAnnotations();
                 while (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
                     const spk2 = self.peeked;
                     _ = self.advance();
+                    self.skipAnnotations();
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = self.parseTypeIdx() catch 0;
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
+                        self.skipAnnotations();
                     } else if (self.peek().kind == .kw_param) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         if (self.peek().kind == .identifier) _ = self.advance();
+                        self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                             const vt = self.parseValType() catch break;
                             params_list.append(self.allocator, vt) catch {};
+                            self.skipAnnotations();
                         }
                         try self.expect(.r_paren);
+                        self.skipAnnotations();
                     } else if (self.peek().kind == .kw_result) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                             const vt = self.parseValType() catch break;
                             results_list.append(self.allocator, vt) catch {};
+                            self.skipAnnotations();
                         }
                         try self.expect(.r_paren);
+                        self.skipAnnotations();
                     } else {
                         self.lexer.pos = sp2;
                         self.peeked = spk2;
@@ -1255,10 +1294,12 @@ const Parser = struct {
         }
 
         // Check for (type $idx)
+        self.skipAnnotations();
         if (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_type) {
                 _ = self.advance();
                 if (self.peek().kind == .identifier) {
@@ -1285,14 +1326,17 @@ const Parser = struct {
 
         var seen_results = false;
 
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             const inner = self.peek().kind;
             if (inner == .kw_param) {
                 if (seen_results) self.malformed = true;
                 _ = self.advance(); // consume 'param'
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
                     const idx: u32 = @intCast(params_list.items.len);
@@ -1301,19 +1345,25 @@ const Parser = struct {
                     }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
                     params_list.append(self.allocator, vt) catch return error.OutOfMemory;
+                    self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else if (inner == .kw_result) {
                 seen_results = true;
                 _ = self.advance(); // consume 'result'
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
                     results_list.append(self.allocator, vt) catch return error.OutOfMemory;
+                    self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else if (inner == .kw_type) {
                 // (type ...) after (param/result ...) is malformed
                 if (params_list.items.len > 0 or results_list.items.len > 0) {
@@ -1414,12 +1464,15 @@ const Parser = struct {
             }
             break :blk 0;
         };
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_local) {
                 _ = self.advance(); // consume 'local'
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
                     const idx: u32 = actual_param_count + @as(u32, @intCast(func.local_types.items.len));
@@ -1428,11 +1481,14 @@ const Parser = struct {
                     }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     const vt = self.parseValType() catch break;
                     func.local_types.append(self.allocator, vt) catch return error.OutOfMemory;
+                    self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else {
                 // Not local — restore and stop
                 self.lexer.pos = save_pos;
@@ -2761,6 +2817,7 @@ const Parser = struct {
     }
 
     fn emitS32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind != .integer) {
             self.malformed = true;
@@ -2782,6 +2839,7 @@ const Parser = struct {
     }
 
     fn emitS64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind != .integer) {
             self.malformed = true;
@@ -2802,6 +2860,7 @@ const Parser = struct {
     }
 
     fn emitF32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
             if (!isValidNumLiteral(tok.text)) self.malformed = true;
@@ -2816,6 +2875,7 @@ const Parser = struct {
     }
 
     fn emitF64Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
             if (!isValidNumLiteral(tok.text)) self.malformed = true;
@@ -3230,18 +3290,22 @@ const Parser = struct {
     /// Parse a sequence of instructions in an init expression context and emit bytecode.
     /// Handles both plain instructions and folded (parenthesized) instructions.
     fn parseInitExpr(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
             if (self.peek().kind == .l_paren) {
                 _ = self.advance(); // consume '('
+                self.skipAnnotations();
                 self.parseInitExprFolded(code);
             } else {
                 self.parseInitExprPlain(code);
             }
+            self.skipAnnotations();
         }
     }
 
     /// Parse a folded (parenthesized) init expression instruction.
     fn parseInitExprFolded(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         const tok = self.peek();
         switch (tok.kind) {
             .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const,
@@ -3249,13 +3313,16 @@ const Parser = struct {
                 // Parse nested args first, then the instruction
                 self.parseInitExprPlain(code);
                 // Skip to closing paren
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.peek().kind == .l_paren) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         self.parseInitExprFolded(code);
                     } else {
                         self.parseInitExprPlain(code);
                     }
+                    self.skipAnnotations();
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
             },
@@ -3268,15 +3335,18 @@ const Parser = struct {
                 const instr_len = instr_end - instr_start;
                 // Parse sub-expressions (operands)
                 var has_operands = false;
+                self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                     if (self.peek().kind == .l_paren) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         self.parseInitExprFolded(code);
                         has_operands = true;
                     } else {
                         self.parseInitExprPlain(code);
                         has_operands = true;
                     }
+                    self.skipAnnotations();
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
                 // Reorder: [instr][operands] → [operands][instr]
@@ -3300,14 +3370,17 @@ const Parser = struct {
     /// Parse an init expression that is wrapped in parens, e.g. (i32.const 0).
     /// This handles a single folded instruction expression.
     fn parseInitExprWrapped(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
         if (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             self.parseInitExprFolded(code);
         }
     }
 
     fn parseTable(self: *Parser, module: *Mod.Module) ParseError!void {
         const table_idx: u32 = @intCast(module.tables.items.len);
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.table_names.get(name)) |existing| {
@@ -3316,6 +3389,7 @@ const Parser = struct {
             self.table_names.put(self.allocator, name, table_idx) catch {};
         }
 
+        self.skipAnnotations();
         // Check for i64 keyword (table64)
         var is_table64 = false;
         if (self.peek().kind == .kw_i64) {
@@ -3324,36 +3398,48 @@ const Parser = struct {
         }
 
         // Handle inline (export "name") and (import "mod" "name") on tables
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance();
+            self.skipAnnotations();
             if (self.peek().kind == .kw_export) {
                 _ = self.advance();
+                self.skipAnnotations();
                 const name_tok = self.advance();
                 const exp_name = self.parseName(name_tok.text);
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance();
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
                     .kind = .table,
                     .var_ = .{ .index = table_idx },
                 }) catch return error.OutOfMemory;
+                self.skipAnnotations();
             } else if (self.peek().kind == .kw_import) {
                 _ = self.advance(); // consume 'import'
+                self.skipAnnotations();
                 const mod_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 const field_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 try self.expect(.r_paren); // close (import ...)
+                self.skipAnnotations();
                 // Check for i64 keyword after import (table64)
                 if (!is_table64 and self.peek().kind == .kw_i64) {
                     _ = self.advance();
                     is_table64 = true;
                 }
+                self.skipAnnotations();
                 const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
+                self.skipAnnotations();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
                     limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
                     limits.has_max = true;
                 }
+                self.skipAnnotations();
                 const elem_type = try self.parseValType();
                 try module.tables.append(self.allocator, .{
                     .@"type" = .{ .elem_type = elem_type, .limits = limits },
@@ -3377,12 +3463,14 @@ const Parser = struct {
         }
 
         // Check for i64 keyword after export/import clauses
+        self.skipAnnotations();
         if (!is_table64 and self.peek().kind == .kw_i64) {
             _ = self.advance();
             is_table64 = true;
         }
 
         // Check for inline element syntax: (table elemtype (elem ...))
+        self.skipAnnotations();
         if (self.peek().kind != .integer) {
             // elemtype first — inline elem syntax
             const elem_type = self.parseValType() catch .funcref;
@@ -3467,12 +3555,15 @@ const Parser = struct {
             return;
         }
 
+        self.skipAnnotations();
         const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
+        self.skipAnnotations();
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
             limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
             limits.has_max = true;
         }
+        self.skipAnnotations();
         const elem_type = try self.parseValType();
         // Parse optional table initializer expression: (ref.null func) etc.
         var table_init_bytes: []const u8 = &.{};
@@ -3528,6 +3619,7 @@ const Parser = struct {
 
     fn parseMemory(self: *Parser, module: *Mod.Module) ParseError!void {
         const mem_idx: u32 = @intCast(module.memories.items.len);
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.memory_names.get(name)) |existing| {
@@ -3536,6 +3628,7 @@ const Parser = struct {
             self.memory_names.put(self.allocator, name, mem_idx) catch {};
         }
 
+        self.skipAnnotations();
         // Check for i64 keyword (memory64)
         var is_memory64 = false;
         if (self.peek().kind == .kw_i64) {
@@ -3544,20 +3637,25 @@ const Parser = struct {
         }
 
         // Handle inline (export "name") declarations
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_export) {
                 _ = self.advance(); // consume 'export'
+                self.skipAnnotations();
                 const name_tok = self.advance();
                 const exp_name = self.parseName(name_tok.text);
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
                     .kind = .memory,
                     .var_ = .{ .index = mem_idx },
                 }) catch return error.OutOfMemory;
+                self.skipAnnotations();
             } else if (self.peek().kind == .kw_data) {
                 // Inline (data "...") abbreviation
                 _ = self.advance(); // consume 'data'
@@ -3601,15 +3699,21 @@ const Parser = struct {
             } else if (self.peek().kind == .kw_import) {
                 // Inline (import "mod" "name") abbreviation for memory
                 _ = self.advance(); // consume 'import'
+                self.skipAnnotations();
                 const mod_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 const field_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 try self.expect(.r_paren); // close (import ...)
+                self.skipAnnotations();
                 // Check for i64 keyword after import (memory64)
                 if (!is_memory64 and self.peek().kind == .kw_i64) {
                     _ = self.advance();
                     is_memory64 = true;
                 }
+                self.skipAnnotations();
                 const initial = try self.parseU32();
+                self.skipAnnotations();
                 var limits = types.Limits{ .initial = initial };
                 if (self.peek().kind == .integer) {
                     limits.max = try self.parseU32();
@@ -3637,12 +3741,15 @@ const Parser = struct {
         }
 
         // Check for i64 keyword after export/import clauses
+        self.skipAnnotations();
         if (!is_memory64 and self.peek().kind == .kw_i64) {
             _ = self.advance();
             is_memory64 = true;
         }
 
+        self.skipAnnotations();
         const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
+        self.skipAnnotations();
         var limits = types.Limits{ .initial = initial };
         if (self.peek().kind == .integer) {
             limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
@@ -3656,6 +3763,7 @@ const Parser = struct {
 
     fn parseGlobal(self: *Parser, module: *Mod.Module) ParseError!void {
         const global_idx: u32 = @intCast(module.globals.items.len);
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             // Detect duplicate $name: prescan sets index on first occurrence,
@@ -3668,27 +3776,36 @@ const Parser = struct {
         }
 
         // Handle inline (export "name") and (import "mod" "name") declarations
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
+            self.skipAnnotations();
             if (self.peek().kind == .kw_export) {
                 _ = self.advance(); // consume 'export'
+                self.skipAnnotations();
                 const name_tok = self.advance();
                 const exp_name = self.parseName(name_tok.text);
+                self.skipAnnotations();
                 if (self.peek().kind == .r_paren) _ = self.advance(); // consume ')'
                 module.exports.append(self.allocator, .{
                     .name = exp_name,
                     .kind = .global,
                     .var_ = .{ .index = global_idx },
                 }) catch return error.OutOfMemory;
+                self.skipAnnotations();
             } else if (self.peek().kind == .kw_import) {
                 _ = self.advance(); // consume 'import'
+                self.skipAnnotations();
                 const mod_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 const field_name = self.parseName(self.advance().text);
+                self.skipAnnotations();
                 try self.expect(.r_paren); // close (import ...)
 
                 // Parse type after import
+                self.skipAnnotations();
                 var mutability: types.Mutability = .immutable;
                 var val_type: types.ValType = undefined;
                 if (self.peek().kind == .l_paren) {
@@ -3699,6 +3816,7 @@ const Parser = struct {
                         _ = self.advance();
                         mutability = .mutable;
                         val_type = try self.parseValType();
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else {
                         self.lexer.pos = sp2;
@@ -3728,6 +3846,7 @@ const Parser = struct {
             }
         }
 
+        self.skipAnnotations();
         var mutability: types.Mutability = .immutable;
         var val_type: types.ValType = undefined;
 
@@ -3741,6 +3860,7 @@ const Parser = struct {
                 _ = self.advance();
                 mutability = .mutable;
                 val_type = try self.parseValType();
+                self.skipAnnotations();
                 try self.expect(.r_paren);
             } else {
                 // Not (mut ...) — restore and let parseValType handle it
@@ -3753,6 +3873,7 @@ const Parser = struct {
         }
 
         // Encode init expression into bytecode
+        self.skipAnnotations();
         var code: std.ArrayListUnmanaged(u8) = .{};
         defer code.deinit(self.allocator);
         self.parseInitExpr(&code);
@@ -4247,6 +4368,7 @@ const Parser = struct {
     fn parseElem(self: *Parser, module: *Mod.Module) ParseError!void {
         var seg = Mod.ElemSegment{};
         const elem_idx: u32 = @intCast(module.elem_segments.items.len);
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             self.elem_names.put(self.allocator, name, elem_idx) catch {};
@@ -4256,6 +4378,7 @@ const Parser = struct {
         seg.elem_var_indices = .{};
 
         // Check for declarative/passive keywords
+        self.skipAnnotations();
         if (self.peek().kind == .kw_declare) {
             _ = self.advance();
             seg.kind = .declared;
@@ -4273,7 +4396,10 @@ const Parser = struct {
         defer elem_expr_code.deinit(self.allocator);
         var elem_expr_count: u32 = 0;
 
+        self.skipAnnotations();
         while (self.peek().kind != .r_paren) {
+            self.skipAnnotations();
+            if (self.peek().kind == .r_paren) break;
             if (self.peek().kind == .l_paren) {
                 const save_pos = self.lexer.pos;
                 const save_peeked = self.peeked;
@@ -4433,6 +4559,7 @@ const Parser = struct {
 
     fn parseData(self: *Parser, module: *Mod.Module) ParseError!void {
         var seg = Mod.DataSegment{};
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) _ = self.advance();
 
         // Parse offset expression
@@ -4440,20 +4567,25 @@ const Parser = struct {
         defer offset_code.deinit(self.allocator);
         var has_offset = false;
 
+        self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
 
+            self.skipAnnotations();
             const inner_kind = self.peek().kind;
             if (inner_kind == .kw_offset) {
                 _ = self.advance(); // consume 'offset'
                 self.parseInitExpr(&offset_code);
+                self.skipAnnotations();
                 try self.expect(.r_paren);
                 has_offset = true;
+                self.skipAnnotations();
             } else if (inner_kind == .kw_memory) {
                 // (memory $m) — resolve memory index
                 _ = self.advance(); // consume 'memory'
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const mtok = self.advance();
                     if (self.memory_names.get(mtok.text)) |idx| {
@@ -4464,16 +4596,21 @@ const Parser = struct {
                     const idx = std.fmt.parseInt(u32, mtok.text, 0) catch 0;
                     seg.memory_var = .{ .index = idx };
                 }
+                self.skipAnnotations();
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             } else if (!has_offset) {
                 // First non-offset/memory parenthesized expr is the offset expression
                 self.lexer.pos = save_pos;
                 self.peeked = save_peeked;
                 self.parseInitExprWrapped(&offset_code);
                 has_offset = true;
+                self.skipAnnotations();
             } else {
                 try self.skipSExpr();
+                self.skipAnnotations();
                 try self.expect(.r_paren);
+                self.skipAnnotations();
             }
         }
 
@@ -4489,10 +4626,12 @@ const Parser = struct {
         // Read data string(s), decoding WAT escape sequences
         var data_parts: std.ArrayListUnmanaged(u8) = .{};
         defer data_parts.deinit(self.allocator);
+        self.skipAnnotations();
         while (self.peek().kind == .string) {
             const tok = self.advance();
             const stripped = stripQuotes(tok.text);
             decodeWatStringInto(stripped, &data_parts, self.allocator);
+            self.skipAnnotations();
         }
         if (data_parts.items.len > 0) {
             seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
