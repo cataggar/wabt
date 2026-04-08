@@ -511,6 +511,10 @@ const Parser = struct {
             .kw_nullfuncref => .nullfuncref,
             .kw_nullexternref => .nullexternref,
             .kw_nullexnref => .nullexnref,
+            .kw_i31ref => .anyref,
+            .kw_eqref => .anyref,
+            .kw_structref => .anyref,
+            .kw_arrayref => .anyref,
             else => error.InvalidType,
         };
     }
@@ -3837,9 +3841,9 @@ const Parser = struct {
                         }
                     } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
                         seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
-                    } else {
-                        seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
                     }
+                    // For other expressions (ref.i31 etc.), don't add to var_indices;
+                    // they will be evaluated from elem_expr_bytes at instantiation time.
                     try self.expect(.r_paren);
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
@@ -3865,8 +3869,6 @@ const Parser = struct {
                         }
                     } else if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd0) {
                         seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
-                    } else {
-                        seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
                     }
                     try self.expect(.r_paren);
                 } else if (!has_elem_type and (inner_kind == .kw_ref or inner_kind == .kw_ref_null)) {
@@ -3892,6 +3894,14 @@ const Parser = struct {
                 _ = self.advance();
                 has_elem_type = true;
                 elem_type_is_externref = true;
+            } else if (self.peek().kind == .kw_anyref or
+                self.peek().kind == .kw_i31ref or
+                self.peek().kind == .kw_eqref or
+                self.peek().kind == .kw_structref or
+                self.peek().kind == .kw_arrayref)
+            {
+                _ = self.advance();
+                has_elem_type = true;
             } else if (self.peek().kind == .kw_func) {
                 _ = self.advance();
             } else if (self.peek().kind == .eof) {

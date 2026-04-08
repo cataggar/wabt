@@ -238,6 +238,7 @@ pub const Instance = struct {
                 if (val) |v| {
                     const func_idx: ?u32 = switch (v) {
                         .ref_func => |idx| idx,
+                        .ref_i31 => |iv| iv,
                         .ref_null => null,
                         else => null,
                     };
@@ -308,6 +309,9 @@ pub const Instance = struct {
                                 const refs = self.getTableFuncRefs();
                                 refs.put(self.allocator, makeTableKey(tbl_idx, entry_idx), interp) catch {};
                             }
+                        },
+                        .ref_i31 => |i31_val| {
+                            tbl.items[entry_idx] = i31_val;
                         },
                         .ref_null => {
                             tbl.items[entry_idx] = null;
@@ -1915,6 +1919,9 @@ pub const Interpreter = struct {
                         tbl.items[d + i] = func_idx;
                         refs.put(self.allocator, Instance.makeTableKey(tbl_idx, @intCast(d + i)), self) catch {};
                     },
+                    .ref_i31 => |i31_val| {
+                        tbl.items[d + i] = i31_val;
+                    },
                     .ref_null => {
                         tbl.items[d + i] = null;
                     },
@@ -1949,6 +1956,7 @@ pub const Interpreter = struct {
         const old_size: u64 = @intCast(tbl.items.len);
         const func_ref: ?u32 = switch (init_val) {
             .ref_func => |idx| idx,
+            .ref_i31 => |v| v,
             .ref_null => null,
             .i32 => |v| @bitCast(v),
             else => null,
@@ -2001,6 +2009,7 @@ pub const Interpreter = struct {
             return error.OutOfBoundsTableAccess;
         const func_ref: ?u32 = switch (val) {
             .ref_func => |idx| idx,
+            .ref_i31 => |v| v,
             .ref_null => null,
             .i32 => |v| @bitCast(v),
             else => null,
@@ -2714,6 +2723,7 @@ pub const Interpreter = struct {
                     if (idx >= ts_tbl.items.len) return error.OutOfBoundsTableAccess;
                     ts_tbl.items[@intCast(idx)] = switch (val) {
                         .ref_func => |fi| fi,
+                        .ref_i31 => |v| v,
                         .ref_null => null,
                         .i32 => |v| @bitCast(v),
                         else => null,
@@ -3038,16 +3048,26 @@ pub const Interpreter = struct {
                         0x1d => { // i31.get_u
                             const v = try self.popValue();
                             if (v == .ref_null) return error.NullReference;
-                            try self.pushValue(.{ .i32 = @intCast(v.ref_i31 & 0x7fff_ffff) });
+                            const raw = switch (v) {
+                                .ref_i31 => |r| r,
+                                .ref_func => |r| r, // table.get returns ref_func for i31 values
+                                else => return error.NullReference,
+                            };
+                            try self.pushValue(.{ .i32 = @intCast(raw & 0x7fff_ffff) });
                         },
                         0x1e => { // i31.get_s
                             const v = try self.popValue();
                             if (v == .ref_null) return error.NullReference;
-                            const raw = v.ref_i31 & 0x7fff_ffff;
-                            const signed: i32 = if (raw & 0x4000_0000 != 0)
-                                @bitCast(raw | 0x8000_0000)
+                            const raw = switch (v) {
+                                .ref_i31 => |r| r,
+                                .ref_func => |r| r,
+                                else => return error.NullReference,
+                            };
+                            const masked = raw & 0x7fff_ffff;
+                            const signed: i32 = if (masked & 0x4000_0000 != 0)
+                                @bitCast(masked | 0x8000_0000)
                             else
-                                @intCast(raw);
+                                @intCast(masked);
                             try self.pushValue(.{ .i32 = signed });
                         },
                         else => return error.Unimplemented,
