@@ -89,6 +89,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_rec => try p.parseRec(&module),
             else => try p.skipSExpr(),
         }
+        p.skipAnnotations();
         try p.expect(.r_paren);
     }
 
@@ -161,9 +162,12 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             },
             else => try p.skipSExpr(),
         }
+        p.skipAnnotations();
         try p.expect(.r_paren);
+        p.skipAnnotations();
     }
 
+    p.skipAnnotations();
     try p.expect(.r_paren);
     // Check for unexpected trailing tokens
     if (p.peek().kind != .eof) p.malformed = true;
@@ -171,6 +175,25 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         return error.InvalidModule;
     }
     return module;
+}
+
+/// Skip an annotation and its content in prescan mode (no Parser struct available).
+fn skipPrescanAnnotation(lex: *Lexer) void {
+    var depth: u32 = 1;
+    while (depth > 0) {
+        const tok = lex.next();
+        switch (tok.kind) {
+            .l_paren, .annotation => depth += 1,
+            .r_paren => depth -= 1,
+            .eof => return,
+            .invalid => {
+                if (tok.text.len >= 2 and tok.text[0] == '(' and tok.text[1] == '@') {
+                    depth += 1;
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 /// Fast pre-scan of source text to collect function, type, and global names
@@ -197,15 +220,42 @@ fn prescanNames(
     var tok = lex.next();
     if (tok.kind != .l_paren) return;
     tok = lex.next();
+    // Skip annotations between ( and module
+    while (tok.kind == .annotation) {
+        skipPrescanAnnotation(&lex);
+        tok = lex.next();
+    }
     if (tok.kind != .kw_module) return;
     tok = lex.next();
+    // Skip annotations after module keyword
+    while (tok.kind == .annotation) {
+        skipPrescanAnnotation(&lex);
+        tok = lex.next();
+    }
     if (tok.kind == .identifier) tok = lex.next();
+    // Skip annotations after module name
+    while (tok.kind == .annotation) {
+        skipPrescanAnnotation(&lex);
+        tok = lex.next();
+    }
 
     // Scan top-level fields
-    while (tok.kind == .l_paren) {
+    while (tok.kind == .l_paren or tok.kind == .annotation) {
+        // Skip module-level annotations
+        if (tok.kind == .annotation) {
+            skipPrescanAnnotation(&lex);
+            tok = lex.next();
+            continue;
+        }
         tok = lex.next();
+        // Skip annotations between ( and keyword
+        while (tok.kind == .annotation) {
+            skipPrescanAnnotation(&lex);
+            tok = lex.next();
+        }
         if (tok.kind == .kw_func) {
             tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .identifier) {
                 func_names.put(allocator, normalizeIdentifier(allocator, tok.text), func_idx) catch {};
             }
@@ -244,31 +294,41 @@ fn prescanNames(
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
             // Skip module and field strings, then read the '(' before kind desc
-            _ = lex.next(); // module string
-            _ = lex.next(); // field string
-            tok = lex.next(); // should be '(' before kind desc (e.g. "(func ...")
+            tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            // module string consumed
+            tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            // field string consumed
+            tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
             if (tok.kind == .l_paren) {
                 tok = lex.next();
+                while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
                 if (tok.kind == .kw_func) {
                     tok = lex.next();
+                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
                     if (tok.kind == .identifier) {
                         func_names.put(allocator, normalizeIdentifier(allocator, tok.text), func_idx) catch {};
                     }
                     func_idx += 1;
                 } else if (tok.kind == .kw_global) {
                     tok = lex.next();
+                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
                     if (tok.kind == .identifier) {
                         global_names.put(allocator, normalizeIdentifier(allocator, tok.text), global_idx) catch {};
                     }
                     global_idx += 1;
                 } else if (tok.kind == .kw_table) {
                     tok = lex.next();
+                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
                     if (tok.kind == .identifier) {
                         table_names.put(allocator, normalizeIdentifier(allocator, tok.text), table_idx) catch {};
                     }
                     table_idx += 1;
                 } else if (tok.kind == .kw_memory) {
                     tok = lex.next();
+                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
                     if (tok.kind == .identifier) {
                         memory_names.put(allocator, normalizeIdentifier(allocator, tok.text), memory_idx) catch {};
                     }
@@ -276,25 +336,25 @@ fn prescanNames(
                 }
                 // Skip remaining tokens in kind desc '(func/global/... ...)' 
                 var inner_depth: u32 = 1;
-                if (tok.kind == .l_paren) inner_depth += 1;
+                if (tok.kind == .l_paren or tok.kind == .annotation) inner_depth += 1;
                 while (inner_depth > 0) {
                     tok = lex.next();
-                    if (tok.kind == .l_paren) inner_depth += 1;
+                    if (tok.kind == .l_paren or tok.kind == .annotation) inner_depth += 1;
                     if (tok.kind == .r_paren) inner_depth -= 1;
                     if (tok.kind == .eof) return;
+                    if (tok.kind == .invalid and tok.text.len >= 2 and tok.text[0] == '(' and tok.text[1] == '@') inner_depth += 1;
                 }
             }
         }
         // Skip to matching ')'
-        // If a branch consumed a '(' (e.g. kw_func read past $name into '(export'),
-        // account for the extra nesting level.
         var depth: u32 = 1;
-        if (tok.kind == .l_paren) depth += 1;
+        if (tok.kind == .l_paren or tok.kind == .annotation) depth += 1;
         while (depth > 0) {
             tok = lex.next();
-            if (tok.kind == .l_paren) depth += 1;
+            if (tok.kind == .l_paren or tok.kind == .annotation) depth += 1;
             if (tok.kind == .r_paren) depth -= 1;
             if (tok.kind == .eof) return;
+            if (tok.kind == .invalid and tok.text.len >= 2 and tok.text[0] == '(' and tok.text[1] == '@') depth += 1;
         }
         tok = lex.next(); // next top-level field
     }
@@ -397,6 +457,14 @@ const Parser = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    /// Skip any adjacent annotation tokens at the current position.
+    fn skipAnnotations(self: *Parser) void {
+        while (self.peek().kind == .annotation) {
+            _ = self.advance();
+            self.skipAnnotation() catch return;
         }
     }
 
@@ -3837,13 +3905,17 @@ const Parser = struct {
     }
 
     fn parseImport(self: *Parser, module: *Mod.Module) ParseError!void {
+        self.skipAnnotations();
         const module_name = self.advance().text; // string literal
+        self.skipAnnotations();
         const field_name = self.advance().text;
         // Strip quotes
         const mod_str = self.parseName(module_name);
         const field_str = self.parseName(field_name);
 
+        self.skipAnnotations();
         try self.expect(.l_paren);
+        self.skipAnnotations();
         const kind_tok = self.advance();
 
         var import = Mod.Import{
@@ -3868,34 +3940,50 @@ const Parser = struct {
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer results_list.deinit(self.allocator);
-                while (self.peek().kind == .l_paren) {
+                self.skipAnnotations();
+                while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
+                    if (self.peek().kind == .annotation) {
+                        _ = self.advance();
+                        self.skipAnnotation() catch break;
+                        continue;
+                    }
                     const sp2 = self.lexer.pos;
                     const spk2 = self.peeked;
                     _ = self.advance();
+                    self.skipAnnotations();
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = try self.parseTypeIdx();
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else if (self.peek().kind == .kw_param) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         if (self.peek().kind == .identifier) _ = self.advance();
-                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                        self.skipAnnotations();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof and self.peek().kind != .annotation) {
                             const vt = self.parseValType() catch break;
                             params_list.append(self.allocator, vt) catch {};
+                            self.skipAnnotations();
                         }
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else if (self.peek().kind == .kw_result) {
                         _ = self.advance();
-                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                        self.skipAnnotations();
+                        while (self.peek().kind != .r_paren and self.peek().kind != .eof and self.peek().kind != .annotation) {
                             const vt = self.parseValType() catch break;
                             results_list.append(self.allocator, vt) catch {};
+                            self.skipAnnotations();
                         }
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else {
                         self.lexer.pos = sp2;
                         self.peeked = spk2;
                         break;
                     }
+                    self.skipAnnotations();
                 }
                 if (params_list.items.len > 0 or results_list.items.len > 0) {
                     const params = params_list.toOwnedSlice(self.allocator) catch &.{};
@@ -3915,6 +4003,7 @@ const Parser = struct {
             .kw_memory => {
                 import.kind = .memory;
                 const import_mem_idx: u32 = @intCast(module.memories.items.len);
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const mname = self.advance().text;
                     if (self.memory_names.get(mname)) |existing| {
@@ -3922,18 +4011,22 @@ const Parser = struct {
                     }
                     self.memory_names.put(self.allocator, mname, import_mem_idx) catch {};
                 }
+                self.skipAnnotations();
                 // Check for i64 keyword (memory64)
                 var is_memory64 = false;
                 if (self.peek().kind == .kw_i64) {
                     _ = self.advance();
                     is_memory64 = true;
                 }
+                self.skipAnnotations();
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
+                self.skipAnnotations();
                 if (self.peek().kind == .integer) {
                     limits.max = try self.parseU32();
                     limits.has_max = true;
                 }
+                self.skipAnnotations();
                 import.memory = .{ .limits = limits };
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
@@ -3945,6 +4038,7 @@ const Parser = struct {
             .kw_table => {
                 import.kind = .table;
                 const import_table_idx: u32 = @intCast(module.tables.items.len);
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const tname = self.advance().text;
                     if (self.table_names.get(tname)) |existing| {
@@ -3952,19 +4046,24 @@ const Parser = struct {
                     }
                     self.table_names.put(self.allocator, tname, import_table_idx) catch {};
                 }
+                self.skipAnnotations();
                 // Check for i64 keyword (table64)
                 var is_table64 = false;
                 if (self.peek().kind == .kw_i64) {
                     _ = self.advance();
                     is_table64 = true;
                 }
+                self.skipAnnotations();
                 const initial = try self.parseU32();
                 var limits = types.Limits{ .initial = initial };
+                self.skipAnnotations();
                 if (self.peek().kind == .integer) {
                     limits.max = try self.parseU32();
                     limits.has_max = true;
                 }
+                self.skipAnnotations();
                 const elem_type = try self.parseValType();
+                self.skipAnnotations();
                 import.table = .{ .elem_type = elem_type, .limits = limits };
                 try module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
@@ -3976,6 +4075,7 @@ const Parser = struct {
             .kw_global => {
                 import.kind = .global;
                 const import_global_idx: u32 = @intCast(module.globals.items.len);
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const gname = self.advance().text;
                     if (self.global_names.get(gname)) |existing| {
@@ -3983,16 +4083,20 @@ const Parser = struct {
                     }
                     self.global_names.put(self.allocator, gname, import_global_idx) catch {};
                 }
+                self.skipAnnotations();
                 var mutability: types.Mutability = .immutable;
                 var val_type: types.ValType = undefined;
                 if (self.peek().kind == .l_paren) {
                     const save_pos = self.lexer.pos;
                     const save_peeked = self.peeked;
                     _ = self.advance();
+                    self.skipAnnotations();
                     if (self.peek().kind == .kw_mut) {
                         _ = self.advance();
+                        self.skipAnnotations();
                         mutability = .mutable;
                         val_type = try self.parseValType();
+                        self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else {
                         self.lexer.pos = save_pos;
@@ -4002,6 +4106,7 @@ const Parser = struct {
                 } else {
                     val_type = try self.parseValType();
                 }
+                self.skipAnnotations();
                 import.global = .{ .val_type = val_type, .mutability = mutability };
                 try module.globals.append(self.allocator, .{
                     .type = .{ .val_type = val_type, .mutability = mutability },
@@ -4075,7 +4180,10 @@ const Parser = struct {
 
         // Consume remaining tokens in the desc
         while (self.peek().kind != .r_paren) {
-            if (self.peek().kind == .l_paren) {
+            if (self.peek().kind == .annotation) {
+                _ = self.advance();
+                self.skipAnnotation() catch break;
+            } else if (self.peek().kind == .l_paren) {
                 _ = self.advance();
                 try self.skipSExpr();
                 try self.expect(.r_paren);
@@ -4085,14 +4193,18 @@ const Parser = struct {
                 _ = self.advance();
             }
         }
+        self.skipAnnotations();
         try self.expect(.r_paren); // close the desc (func/memory/...)
         try module.imports.append(self.allocator, import);
     }
 
     fn parseExport(self: *Parser, module: *Mod.Module) ParseError!void {
+        self.skipAnnotations();
         const name_tok = self.advance();
         const exp_name = self.parseName(name_tok.text);
+        self.skipAnnotations();
         try self.expect(.l_paren);
+        self.skipAnnotations();
         const kind_tok = self.advance();
         const kind: types.ExternalKind = switch (kind_tok.kind) {
             .kw_func => .func,
@@ -4102,6 +4214,7 @@ const Parser = struct {
             .kw_tag => .tag,
             else => return error.UnexpectedToken,
         };
+        self.skipAnnotations();
         const index: u32 = switch (kind) {
             .func => try self.parseFuncIdx(),
             .global => try self.parseGlobalIdx(),
@@ -4115,7 +4228,9 @@ const Parser = struct {
                 break :blk self.parseU32() catch 0;
             },
         };
+        self.skipAnnotations();
         try self.expect(.r_paren);
+        self.skipAnnotations();
         try module.exports.append(self.allocator, .{
             .name = exp_name,
             .kind = kind,
