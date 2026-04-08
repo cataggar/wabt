@@ -3567,10 +3567,12 @@ pub const Interpreter = struct {
                         },
                         0x18 => { // br_on_cast
                             const depth = readCodeU32(code, &pc);
-                            pc += 1; // cast_flags
+                            const cast_flags = code[pc];
+                            pc += 1;
                             const target_ht = readCodeS32(code, &pc);
                             const val = try self.popValue();
-                            const matches = gcValueMatchesHeapType(self, val, target_ht);
+                            const dst_nullable = (cast_flags & 2) != 0;
+                            const matches = if (val == .ref_null) dst_nullable else gcValueMatchesHeapType(self, val, target_ht);
                             if (matches) {
                                 try self.pushValue(val);
                                 self.branch_depth = depth;
@@ -3581,10 +3583,12 @@ pub const Interpreter = struct {
                         },
                         0x19 => { // br_on_cast_fail
                             const depth = readCodeU32(code, &pc);
-                            pc += 1; // cast_flags
+                            const cast_flags = code[pc];
+                            pc += 1;
                             const target_ht = readCodeS32(code, &pc);
                             const val = try self.popValue();
-                            const matches = gcValueMatchesHeapType(self, val, target_ht);
+                            const dst_nullable = (cast_flags & 2) != 0;
+                            const matches = if (val == .ref_null) dst_nullable else gcValueMatchesHeapType(self, val, target_ht);
                             if (!matches) {
                                 try self.pushValue(val);
                                 self.branch_depth = depth;
