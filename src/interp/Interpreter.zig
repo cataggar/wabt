@@ -457,6 +457,10 @@ pub const Interpreter = struct {
     extern_originals: std.AutoHashMapUnmanaged(u32, Value) = .{},
     next_extern_id: u32 = 0,
 
+    /// Cache for evaluated elem segment expression values.
+    /// Key: (elem_idx << 16 | entry_idx).
+    elem_expr_cache: std.AutoHashMapUnmanaged(u32, Value) = .{},
+
     pub fn init(allocator: std.mem.Allocator, instance: *Instance) Interpreter {
         return .{
             .allocator = allocator,
@@ -474,6 +478,7 @@ pub const Interpreter = struct {
         for (self.gc_objects.items) |*obj| obj.deinit(self.allocator);
         self.gc_objects.deinit(self.allocator);
         self.extern_originals.deinit(self.allocator);
+        self.elem_expr_cache.deinit(self.allocator);
     }
 
     /// Allocate a new GC struct object, returns its index.
@@ -3448,11 +3453,21 @@ pub const Interpreter = struct {
                                     if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
                                 }
                                 for (0..n) |i| {
-                                    const expr_start2 = expr_pc2;
-                                    while (expr_pc2 < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc2] != 0x0b) expr_pc2 += 1;
-                                    if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
-                                    const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start2..expr_pc2]);
-                                    obj.fields.items[dst_off + @as(u32, @intCast(i))] = val orelse .{ .ref_null = {} };
+                                    const cache_key = (elem_idx << 16) | (src_off + @as(u32, @intCast(i)));
+                                    if (self.elem_expr_cache.get(cache_key)) |cached| {
+                                        obj.fields.items[dst_off + @as(u32, @intCast(i))] = cached;
+                                        // Skip past this expression in bytecode
+                                        while (expr_pc2 < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc2] != 0x0b) expr_pc2 += 1;
+                                        if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
+                                    } else {
+                                        const expr_start2 = expr_pc2;
+                                        while (expr_pc2 < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc2] != 0x0b) expr_pc2 += 1;
+                                        if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
+                                        const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start2..expr_pc2]);
+                                        const v: Value = val orelse Value{ .ref_null = {} };
+                                        obj.fields.items[dst_off + @as(u32, @intCast(i))] = v;
+                                        self.elem_expr_cache.put(self.allocator, cache_key, v) catch {};
+                                    }
                                 }
                             } else {
                                 for (0..n) |i| {
