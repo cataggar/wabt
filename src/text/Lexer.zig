@@ -61,6 +61,8 @@ pub const TokenKind = enum {
     kw_eqref,
     kw_structref,
     kw_arrayref,
+    kw_i8,
+    kw_i16,
 
     // Bare reference keywords (GC proposal)
     kw_ref,
@@ -496,6 +498,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "eqref")) return .kw_eqref;
     if (eql(text, "structref")) return .kw_structref;
     if (eql(text, "arrayref")) return .kw_arrayref;
+    if (eql(text, "i8")) return .kw_i8;
+    if (eql(text, "i16")) return .kw_i16;
 
     // Bare reference keywords (GC proposal)
     if (eql(text, "ref")) return .kw_ref;

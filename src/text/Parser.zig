@@ -518,6 +518,8 @@ const Parser = struct {
             .kw_eqref => .anyref,
             .kw_structref => .anyref,
             .kw_arrayref => .anyref,
+            .kw_i8 => .i8,
+            .kw_i16 => .i16,
             else => error.InvalidType,
         };
     }
