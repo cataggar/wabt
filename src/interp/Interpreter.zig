@@ -3447,14 +3447,18 @@ pub const Interpreter = struct {
                             if (val == .ref_null) {
                                 try self.pushValue(.{ .ref_null = {} });
                             } else if (val == .ref_extern) {
-                                // Restore original value if it was externalized
+                                // Restore original value if it was externalized by extern.convert_any
                                 if (self.extern_originals.get(val.ref_extern)) |orig| {
                                     try self.pushValue(orig);
                                 } else {
+                                    // Host externref — keep as ref_extern (won't match eq types)
                                     try self.pushValue(val);
                                 }
                             } else {
-                                try self.pushValue(val);
+                                // Host externref (ref_func from wast_runner) — wrap as ref_extern
+                                const ext_id = self.next_extern_id;
+                                self.next_extern_id +%= 1;
+                                try self.pushValue(.{ .ref_extern = ext_id });
                             }
                         },
                         0x1b => { // extern.convert_any — anyref to externref
@@ -3513,7 +3517,7 @@ pub const Interpreter = struct {
                                     break :blk 0;
                                 },
                                 .ref_extern => blk: {
-                                    break :blk if (heap_type == 0x6f) @as(i32, 1) else @as(i32, 0);
+                                    break :blk if (heap_type == 0x6f or heap_type == 0x6e) @as(i32, 1) else @as(i32, 0);
                                 },
                                 else => 0,
                             };
@@ -5441,7 +5445,7 @@ fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) 
             return false;
         },
         .ref_func => heap_type == 0x70 or heap_type == 0x6e,
-        .ref_extern => heap_type == 0x6f,
+        .ref_extern => heap_type == 0x6f or heap_type == 0x6e,
         else => false,
     };
 }
