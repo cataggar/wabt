@@ -3164,11 +3164,15 @@ pub const Interpreter = struct {
                             const dropped = data_idx < self.instance.dropped_data.capacity() and
                                 self.instance.dropped_data.isSet(data_idx);
                             const data = if (dropped) &[0]u8{} else seg.data;
-                            if (@as(u64, offset) + len > data.len) return error.OutOfBoundsMemoryAccess;
+                            const elem_size = getArrayElemByteSize(self.instance.module, type_idx);
+                            const byte_len: u64 = @as(u64, len) * elem_size;
+                            if (@as(u64, offset) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
                             var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
                             for (0..len) |i| {
-                                obj.fields.append(self.allocator, .{ .i32 = @as(i32, data[offset + i]) }) catch return error.OutOfMemory;
+                                const off = offset + @as(u32, @intCast(i)) * elem_size;
+                                const val = readArrayElemFromData(data, off, elem_size);
+                                obj.fields.append(self.allocator, val) catch return error.OutOfMemory;
                             }
                             self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
                             try self.pushValue(.{ .ref_array = idx });
@@ -3273,7 +3277,7 @@ pub const Interpreter = struct {
                             }
                         },
                         0x12 => { // array.init_data
-                            _ = readCodeU32(code, &pc); // type_idx
+                            const type_idx = readCodeU32(code, &pc);
                             const data_idx = readCodeU32(code, &pc);
                             const n: u32 = @bitCast(try self.popI32());
                             const src_off: u32 = @bitCast(try self.popI32());
@@ -3286,10 +3290,15 @@ pub const Interpreter = struct {
                             const seg = self.instance.module.data_segments.items[data_idx];
                             const dropped = data_idx < self.instance.dropped_data.capacity() and self.instance.dropped_data.isSet(data_idx);
                             const data = if (dropped) &[0]u8{} else seg.data;
-                            if (@as(u64, src_off) + n > data.len) return error.OutOfBoundsMemoryAccess;
+                            const elem_size = getArrayElemByteSize(self.instance.module, type_idx);
+                            const byte_len: u64 = @as(u64, n) * elem_size;
+                            if (@as(u64, src_off) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
                             const obj = &self.gc_objects.items[obj_id];
                             if (@as(u64, dst_off) + n > obj.fields.items.len) return error.OutOfBoundsTableAccess;
-                            for (0..n) |i| obj.fields.items[dst_off + @as(u32, @intCast(i))] = .{ .i32 = @as(i32, data[src_off + @as(u32, @intCast(i))]) };
+                            for (0..n) |i| {
+                                const off = src_off + @as(u32, @intCast(i)) * elem_size;
+                                obj.fields.items[dst_off + @as(u32, @intCast(i))] = readArrayElemFromData(data, off, elem_size);
+                            }
                         },
                         0x13 => { // array.init_elem
                             _ = readCodeU32(code, &pc); // type_idx
@@ -5218,6 +5227,42 @@ fn defaultForValType(vt: types.ValType) Value {
         .nullfuncref, .nullexternref, .nullref, .nullexnref,
         .ref, .ref_null => .{ .ref_null = {} },
         else => .{ .i32 = 0 },
+    };
+}
+
+/// Get the byte size of an array element type.
+fn getArrayElemByteSize(module: *const Mod.Module, type_idx: u32) u32 {
+    if (type_idx < module.module_types.items.len) {
+        switch (module.module_types.items[type_idx]) {
+            .array_type => |at| return valTypeByteSize(at.field.type),
+            else => {},
+        }
+    }
+    return 1;
+}
+
+/// Get the byte size for a ValType used in packed struct/array fields.
+fn valTypeByteSize(vt: types.ValType) u32 {
+    return switch (vt) {
+        .i8 => 1,
+        .i16 => 2,
+        .i32, .f32 => 4,
+        .i64, .f64 => 8,
+        .v128 => 16,
+        else => 1,
+    };
+}
+
+/// Read an array element value from raw data bytes at the given offset.
+fn readArrayElemFromData(data: []const u8, offset: u32, elem_size: u32) Value {
+    const off: usize = offset;
+    if (off + elem_size > data.len) return .{ .i32 = 0 };
+    return switch (elem_size) {
+        1 => .{ .i32 = @as(i32, data[off]) },
+        2 => .{ .i32 = @as(i32, std.mem.readInt(u16, data[off..][0..2], .little)) },
+        4 => .{ .i32 = @bitCast(std.mem.readInt(u32, data[off..][0..4], .little)) },
+        8 => .{ .i64 = @bitCast(std.mem.readInt(u64, data[off..][0..8], .little)) },
+        else => .{ .i32 = @as(i32, data[off]) },
     };
 }
 
