@@ -3041,6 +3041,48 @@ pub const Interpreter = struct {
                                 else => return error.CastFailure,
                             }
                         },
+                        0x18 => { // br_on_cast
+                            const depth = readCodeU32(code, &pc);
+                            const cast_flags = code[pc];
+                            pc += 1;
+                            _ = readCodeS32(code, &pc); // target heaptype
+                            const val = try self.popValue();
+                            _ = cast_flags;
+                            // Simplified: if val matches target type, branch with val
+                            const matches = switch (val) {
+                                .ref_null => false,
+                                .ref_i31, .ref_func => true,
+                                else => false,
+                            };
+                            if (matches) {
+                                try self.pushValue(val);
+                                self.branch_depth = depth;
+                                return pc;
+                            } else {
+                                try self.pushValue(val);
+                            }
+                        },
+                        0x19 => { // br_on_cast_fail
+                            const depth = readCodeU32(code, &pc);
+                            const cast_flags = code[pc];
+                            pc += 1;
+                            _ = readCodeS32(code, &pc); // target heaptype
+                            const val = try self.popValue();
+                            _ = cast_flags;
+                            // Simplified: if val does NOT match target type, branch with val
+                            const matches = switch (val) {
+                                .ref_null => false,
+                                .ref_i31, .ref_func => true,
+                                else => false,
+                            };
+                            if (!matches) {
+                                try self.pushValue(val);
+                                self.branch_depth = depth;
+                                return pc;
+                            } else {
+                                try self.pushValue(val);
+                            }
+                        },
                         0x1c => { // ref.i31
                             const val = try self.popI32();
                             try self.pushValue(.{ .ref_i31 = @bitCast(val & 0x7fff_ffff) });
@@ -4753,6 +4795,11 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
             const sub = readCodeU32(code, &p);
             switch (sub) {
                 0x14, 0x15, 0x16, 0x17 => _ = readCodeS32(code, &p), // ref.test/cast + heaptype
+                0x18, 0x19 => { // br_on_cast, br_on_cast_fail: castflags + label + heaptype
+                    _ = readCodeU32(code, &p); // label
+                    p += 1; // castflags
+                    _ = readCodeS32(code, &p); // target heaptype
+                },
                 else => {},
             }
         },

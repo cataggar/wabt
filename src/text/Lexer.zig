@@ -85,6 +85,10 @@ pub const TokenKind = enum {
     kw_br,
     kw_br_if,
     kw_br_table,
+    kw_br_on_null,
+    kw_br_on_non_null,
+    kw_br_on_cast,
+    kw_br_on_cast_fail,
     kw_return,
     kw_call,
     kw_call_indirect,
@@ -516,6 +520,10 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "br")) return .kw_br;
     if (eql(text, "br_if")) return .kw_br_if;
     if (eql(text, "br_table")) return .kw_br_table;
+    if (eql(text, "br_on_null")) return .kw_br_on_null;
+    if (eql(text, "br_on_non_null")) return .kw_br_on_non_null;
+    if (eql(text, "br_on_cast")) return .kw_br_on_cast;
+    if (eql(text, "br_on_cast_fail")) return .kw_br_on_cast_fail;
     if (eql(text, "return")) return .kw_return;
     if (eql(text, "call")) return .kw_call;
     if (eql(text, "call_indirect")) return .kw_call_indirect;

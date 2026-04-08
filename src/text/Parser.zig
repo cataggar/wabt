@@ -1673,6 +1673,103 @@ const Parser = struct {
                 }
             },
             .kw_return => code.append(self.allocator, 0x0f) catch return,
+            .kw_br_on_null => {
+                code.append(self.allocator, 0xd5) catch return;
+                self.emitU32Imm(code);
+            },
+            .kw_br_on_non_null => {
+                code.append(self.allocator, 0xd6) catch return;
+                self.emitU32Imm(code);
+            },
+            .kw_br_on_cast, .kw_br_on_cast_fail => {
+                code.append(self.allocator, 0xfb) catch return;
+                const sub: u32 = if (tok.kind == .kw_br_on_cast) 0x18 else 0x19;
+                var buf_sub: [5]u8 = undefined;
+                const n_sub = leb128.writeU32Leb128(&buf_sub, sub);
+                code.appendSlice(self.allocator, buf_sub[0..n_sub]) catch return;
+                // br_on_cast/br_on_cast_fail: castflags label rt1 rt2
+                // castflags: 1 byte (bit 0 = src nullable, bit 1 = dst nullable)
+                var cast_flags: u8 = 0;
+                // Parse (ref [null] ht1) (ref [null] ht2) label
+                // Actually format is: label (ref [null] ht1) (ref [null] ht2)
+                self.emitU32Imm(code); // label depth
+                // Parse source ref type
+                if (self.peek().kind == .l_paren) {
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_ref) {
+                        _ = self.advance();
+                        if (self.peek().kind == .kw_null) {
+                            _ = self.advance();
+                            cast_flags |= 1;
+                        }
+                        if (self.peek().kind != .r_paren and self.peek().kind != .eof)
+                            _ = self.advance(); // heap type
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        // bare type keyword
+                        const vt = self.peek();
+                        if (vt.kind == .kw_funcref or vt.kind == .kw_anyref or
+                            vt.kind == .kw_externref or vt.kind == .kw_eqref or
+                            vt.kind == .kw_i31ref or vt.kind == .kw_structref or
+                            vt.kind == .kw_arrayref or vt.kind == .kw_exnref)
+                        {
+                            cast_flags |= 1; // bare ref types are nullable
+                            _ = self.advance();
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    }
+                } else if (self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
+                    self.peek().kind == .kw_externref or self.peek().kind == .kw_eqref or
+                    self.peek().kind == .kw_i31ref or self.peek().kind == .kw_exnref)
+                {
+                    cast_flags |= 1;
+                    _ = self.advance();
+                }
+                // Parse target ref type
+                var target_heap: i32 = -0x10; // default: func
+                if (self.peek().kind == .l_paren) {
+                    _ = self.advance();
+                    if (self.peek().kind == .kw_ref) {
+                        _ = self.advance();
+                        if (self.peek().kind == .kw_null) {
+                            _ = self.advance();
+                            cast_flags |= 2;
+                        }
+                        if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const ht_tok = self.advance();
+                            if (std.mem.eql(u8, ht_tok.text, "i31")) { target_heap = 0x6c; }
+                            else if (std.mem.eql(u8, ht_tok.text, "eq")) { target_heap = 0x6d; }
+                            else if (std.mem.eql(u8, ht_tok.text, "any")) { target_heap = 0x6e; }
+                            else if (std.mem.eql(u8, ht_tok.text, "func")) { target_heap = 0x70; }
+                            else if (std.mem.eql(u8, ht_tok.text, "extern")) { target_heap = 0x6f; }
+                            else if (std.mem.eql(u8, ht_tok.text, "struct")) { target_heap = 0x6b; }
+                            else if (std.mem.eql(u8, ht_tok.text, "array")) { target_heap = 0x6a; }
+                            else if (std.mem.eql(u8, ht_tok.text, "none")) { target_heap = 0x71; }
+                            else if (std.mem.eql(u8, ht_tok.text, "nofunc")) { target_heap = 0x73; }
+                            else if (std.mem.eql(u8, ht_tok.text, "noextern")) { target_heap = 0x72; }
+                            else if (ht_tok.kind == .identifier) {
+                                target_heap = @intCast(self.type_names.get(ht_tok.text) orelse 0);
+                            } else if (ht_tok.kind == .integer) {
+                                target_heap = @intCast(std.fmt.parseInt(u32, ht_tok.text, 0) catch 0);
+                            }
+                        }
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    } else {
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                    }
+                } else if (self.peek().kind == .kw_i31ref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6c;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_eqref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6d;
+                    _ = self.advance();
+                }
+                // Emit: castflags (1 byte), then encode source/target heap types
+                code.append(self.allocator, cast_flags) catch return;
+                self.emitLeb128S32(code, target_heap);
+            },
             .kw_throw => {
                 code.append(self.allocator, 0x08) catch return;
                 // throw $tag_idx
@@ -4447,8 +4544,6 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "ref.is_null", 0xd1 },
         .{ "ref.as_non_null", 0xd4 },
         .{ "ref.eq", 0xd3 },
-        .{ "br_on_null", 0xd5 },
-        .{ "br_on_non_null", 0xd6 },
         // Table
         .{ "table.get", 0x25 },
         .{ "table.set", 0x26 },
