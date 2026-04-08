@@ -31,6 +31,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     defer p.tag_names.deinit(allocator);
     defer p.memory_names.deinit(allocator);
     defer p.data_names.deinit(allocator);
+    defer p.elem_names.deinit(allocator);
     defer p.label_stack.deinit(allocator);
     defer p.collected_type_refs.deinit(allocator);
     var module = Mod.Module.init(allocator);
@@ -307,6 +308,8 @@ const Parser = struct {
     memory_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Map from data segment $name to index.
     data_names: std.StringArrayHashMapUnmanaged(u32) = .{},
+    /// Map from elem segment $name to index.
+    elem_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
     label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
     /// Type indices referenced during current type parsing (for iso-recursive canonicalization).
@@ -2269,7 +2272,7 @@ const Parser = struct {
                 // Encoding: 0xfb + sub_opcode + heaptype
                 code.append(self.allocator, 0xfb) catch return;
                 var nullable = false;
-                // Parse (ref [null] <heaptype>)
+                // Parse (ref [null] <heaptype>) or bare type keyword
                 if (self.peek().kind == .l_paren) {
                     _ = self.advance(); // consume '('
                     if (self.peek().kind == .kw_ref) {
@@ -2294,7 +2297,11 @@ const Parser = struct {
                     } else if (self.peek().kind != .r_paren) {
                         const ht_text = self.advance().text;
                         if (std.mem.eql(u8, ht_text, "extern")) heap_type_idx = 0x6f
-                        else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e;
+                        else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e
+                        else if (std.mem.eql(u8, ht_text, "i31")) heap_type_idx = 0x6c
+                        else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d
+                        else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b
+                        else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a;
                     }
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     // Emit sub-opcode
@@ -2304,6 +2311,34 @@ const Parser = struct {
                         (if (nullable) @as(u32, 0x17) else @as(u32, 0x16));
                     self.emitLeb128U32(code, sub_op);
                     // Emit heap type as signed LEB128
+                    if (heap_type_idx >= 0) {
+                        var buf: [5]u8 = undefined;
+                        const n = leb128.writeS32Leb128(&buf, heap_type_idx);
+                        code.appendSlice(self.allocator, buf[0..n]) catch {};
+                    }
+                } else if (self.peek().kind == .kw_i31ref or self.peek().kind == .kw_eqref or
+                    self.peek().kind == .kw_structref or self.peek().kind == .kw_arrayref or
+                    self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
+                    self.peek().kind == .kw_externref)
+                {
+                    // Bare type keyword: ref.cast i31ref etc.
+                    const vt = self.advance();
+                    nullable = true; // bare ref types are nullable
+                    const heap_type_idx: i32 = switch (vt.kind) {
+                        .kw_i31ref => 0x6c,
+                        .kw_eqref => 0x6d,
+                        .kw_structref => 0x6b,
+                        .kw_arrayref => 0x6a,
+                        .kw_funcref => 0x70,
+                        .kw_anyref => 0x6e,
+                        .kw_externref => 0x6f,
+                        else => -1,
+                    };
+                    const sub_op: u32 = if (tok.kind == .kw_ref_test)
+                        (if (nullable) @as(u32, 0x15) else @as(u32, 0x14))
+                    else
+                        (if (nullable) @as(u32, 0x17) else @as(u32, 0x16));
+                    self.emitLeb128U32(code, sub_op);
                     if (heap_type_idx >= 0) {
                         var buf: [5]u8 = undefined;
                         const n = leb128.writeS32Leb128(&buf, heap_type_idx);
@@ -2503,6 +2538,10 @@ const Parser = struct {
                 return;
             }
             if (self.data_names.get(tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+                return;
+            }
+            if (self.elem_names.get(tok.text)) |idx| {
                 self.emitLeb128U32(code, idx);
                 return;
             }
@@ -3886,7 +3925,11 @@ const Parser = struct {
 
     fn parseElem(self: *Parser, module: *Mod.Module) ParseError!void {
         var seg = Mod.ElemSegment{};
-        if (self.peek().kind == .identifier) _ = self.advance();
+        const elem_idx: u32 = @intCast(module.elem_segments.items.len);
+        if (self.peek().kind == .identifier) {
+            const name = self.advance().text;
+            self.elem_names.put(self.allocator, name, elem_idx) catch {};
+        }
 
         // Parse offset expression and elem indices
         seg.elem_var_indices = .{};
