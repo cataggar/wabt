@@ -112,6 +112,10 @@ pub const Instance = struct {
     /// Points to the table owner's table_func_refs when tables are shared.
     shared_table_func_refs: ?*std.AutoHashMapUnmanaged(u64, *Interpreter) = null,
 
+    /// Per-table-entry GC value type tags. Key = (tbl_idx << 32) | entry_idx.
+    /// Stores the Value tag (0=ref_func, 1=ref_i31, 2=ref_struct, 3=ref_array, 4=ref_extern).
+    table_value_tags: std.AutoHashMapUnmanaged(u64, u8) = .{},
+
     /// Back-reference to the owning interpreter (set after creation).
     interp_ref: ?*Interpreter = null,
 
@@ -228,6 +232,7 @@ pub const Instance = struct {
         for (self.tables.items) |*t| t.deinit(self.allocator);
         self.tables.deinit(self.allocator);
         self.table_func_refs.deinit(self.allocator);
+        self.table_value_tags.deinit(self.allocator);
         self.global_func_interps.deinit(self.allocator);
         self.dropped_data.deinit(self.allocator);
         self.dropped_elems.deinit(self.allocator);
@@ -325,6 +330,15 @@ pub const Instance = struct {
                         },
                         .ref_i31 => |i31_val| {
                             tbl.items[entry_idx] = i31_val;
+                            self.table_value_tags.put(self.allocator, makeTableKey(tbl_idx, entry_idx), 1) catch {};
+                        },
+                        .ref_struct => |s_val| {
+                            tbl.items[entry_idx] = s_val;
+                            self.table_value_tags.put(self.allocator, makeTableKey(tbl_idx, entry_idx), 2) catch {};
+                        },
+                        .ref_array => |a_val| {
+                            tbl.items[entry_idx] = a_val;
+                            self.table_value_tags.put(self.allocator, makeTableKey(tbl_idx, entry_idx), 3) catch {};
                         },
                         .ref_null => {
                             tbl.items[entry_idx] = null;
@@ -2779,10 +2793,19 @@ pub const Interpreter = struct {
                     const idx = try self.popTableIdx(tg_idx);
                     const tg_tbl = self.instance.getTable(tg_idx);
                     if (idx >= tg_tbl.items.len) return error.OutOfBoundsTableAccess;
-                    if (tg_tbl.items[@intCast(idx)]) |func_idx|
-                        try self.pushValue(.{ .ref_func = func_idx })
-                    else
+                    if (tg_tbl.items[@intCast(idx)]) |raw_val| {
+                        const key = Instance.makeTableKey(tg_idx, @intCast(idx));
+                        const tag = self.instance.table_value_tags.get(key) orelse 0;
+                        try self.pushValue(switch (tag) {
+                            1 => Value{ .ref_i31 = raw_val },
+                            2 => Value{ .ref_struct = raw_val },
+                            3 => Value{ .ref_array = raw_val },
+                            4 => Value{ .ref_extern = raw_val },
+                            else => Value{ .ref_func = raw_val },
+                        });
+                    } else {
                         try self.pushValue(.{ .ref_null = {} });
+                    }
                 },
                 0x26 => { // table.set
                     var t = pc;
@@ -2802,6 +2825,19 @@ pub const Interpreter = struct {
                         .i32 => |v| @bitCast(v),
                         else => null,
                     };
+                    // Store value type tag for correct reconstruction on table.get
+                    const tag: u8 = switch (val) {
+                        .ref_i31 => 1,
+                        .ref_struct => 2,
+                        .ref_array => 3,
+                        .ref_extern => 4,
+                        .ref_null => 5,
+                        else => 0,
+                    };
+                    if (tag != 0 and tag != 5) {
+                        const key = Instance.makeTableKey(ts_idx, @intCast(idx));
+                        self.instance.table_value_tags.put(self.allocator, key, tag) catch {};
+                    }
                 },
                 // Memory load (format: mem_idx, align, offset)
                 0x28 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU32(code, &pc); try self.i32Load(m, o); },
@@ -2987,6 +3023,9 @@ pub const Interpreter = struct {
                         if (a == .ref_null or b == .ref_null) break :blk false;
                         if (a == .ref_i31 and b == .ref_i31) break :blk a.ref_i31 == b.ref_i31;
                         if (a == .ref_func and b == .ref_func) break :blk a.ref_func == b.ref_func;
+                        if (a == .ref_struct and b == .ref_struct) break :blk a.ref_struct == b.ref_struct;
+                        if (a == .ref_array and b == .ref_array) break :blk a.ref_array == b.ref_array;
+                        if (a == .ref_extern and b == .ref_extern) break :blk a.ref_extern == b.ref_extern;
                         break :blk false;
                     };
                     try self.pushValue(.{ .i32 = @intFromBool(eq) });
