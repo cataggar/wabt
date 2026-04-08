@@ -1906,11 +1906,18 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.func")) {
         return .{ .ref_func = std.math.maxInt(u32) }; // sentinel: match any non-null funcref
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
+        if (val_text.len == 0) {
+            return .{ .ref_extern = std.math.maxInt(u32) }; // sentinel: match any non-null externref
+        }
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
-        return .{ .ref_func = idx }; // non-null externref represented as ref_func
+        return .{ .ref_func = idx }; // specific externref comparison uses ref_func
     } else if (std.mem.eql(u8, kw, "ref.i31")) {
         // (ref.i31) matches any non-null i31ref
         return .{ .ref_i31 = std.math.maxInt(u32) }; // sentinel: match any i31
+    } else if (std.mem.eql(u8, kw, "ref.struct")) {
+        return .{ .ref_struct = std.math.maxInt(u32) }; // sentinel: match any struct
+    } else if (std.mem.eql(u8, kw, "ref.array")) {
+        return .{ .ref_array = std.math.maxInt(u32) }; // sentinel: match any array
     } else if (std.mem.eql(u8, kw, "ref.host")) {
         // (ref.host N) is an externalized reference - treat as non-null
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
@@ -2150,18 +2157,27 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
         },
         .exnref => true, // exnref comparison: any non-null exnref matches
         .ref_struct => |av| switch (b) {
-            .ref_struct => |bv| av == bv,
-            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            .ref_struct => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| bv == std.math.maxInt(u32),
             else => false,
         },
         .ref_array => |av| switch (b) {
-            .ref_array => |bv| av == bv,
-            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            .ref_array => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| bv == std.math.maxInt(u32),
             else => false,
         },
         .ref_extern => |av| switch (b) {
-            .ref_extern => |bv| av == bv,
-            .ref_func => |bv| bv == std.math.maxInt(u32), // sentinel match
+            .ref_extern => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| bv == std.math.maxInt(u32),
             else => false,
         },
     };
