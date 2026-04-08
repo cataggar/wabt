@@ -640,32 +640,37 @@ const Parser = struct {
                             }
                         }
                         var fmut = false;
-                        if (self.peek().kind == .l_paren) {
-                            const sp2 = self.lexer.pos;
-                            const spk2 = self.peeked;
-                            _ = self.advance();
-                            if (self.peek().kind == .kw_mut) {
+                        if (self.peek().kind == .r_paren) {
+                            // Empty field group: (field) — skip
+                            _ = self.advance(); // consume )
+                        } else {
+                            if (self.peek().kind == .l_paren) {
+                                const sp2 = self.lexer.pos;
+                                const spk2 = self.peeked;
                                 _ = self.advance();
-                                fmut = true;
-                                const ftype = self.parseValType() catch .ref_null;
-                                if (self.peek().kind == .r_paren) _ = self.advance();
-                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut }) catch {};
+                                if (self.peek().kind == .kw_mut) {
+                                    _ = self.advance();
+                                    fmut = true;
+                                    const ftype = self.parseValType() catch .ref_null;
+                                    if (self.peek().kind == .r_paren) _ = self.advance();
+                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut }) catch {};
+                                } else {
+                                    self.lexer.pos = sp2;
+                                    self.peeked = spk2;
+                                    const ftype = self.parseValType() catch .ref_null;
+                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                                }
                             } else {
-                                self.lexer.pos = sp2;
-                                self.peeked = spk2;
                                 const ftype = self.parseValType() catch .ref_null;
                                 fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
                             }
-                        } else {
-                            const ftype = self.parseValType() catch .ref_null;
-                            fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                            // Handle multiple anonymous fields: (field type type type ...)
+                            while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                                const extra_type = self.parseValType() catch break;
+                                fields.append(self.allocator, .{ .@"type" = extra_type }) catch {};
+                            }
+                            if (self.peek().kind == .r_paren) _ = self.advance();
                         }
-                        // Handle multiple anonymous fields: (field type type type ...)
-                        while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                            const extra_type = self.parseValType() catch break;
-                            fields.append(self.allocator, .{ .@"type" = extra_type }) catch {};
-                        }
-                        if (self.peek().kind == .r_paren) _ = self.advance();
                     } else {
                         self.lexer.pos = sp;
                         self.peeked = spk;
