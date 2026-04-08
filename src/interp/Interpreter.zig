@@ -3241,21 +3241,41 @@ pub const Interpreter = struct {
                             const elem_idx = readCodeU32(code, &pc);
                             const len: u32 = @bitCast(try self.popI32());
                             const offset: u32 = @bitCast(try self.popI32());
-                            _ = type_idx;
                             if (elem_idx >= self.instance.module.elem_segments.items.len)
                                 return error.OutOfBoundsTableAccess;
                             const seg = &self.instance.module.elem_segments.items[elem_idx];
-                            const seg_len: u32 = @intCast(seg.elem_var_indices.items.len);
+                            const dropped = elem_idx < self.instance.dropped_elems.capacity() and
+                                self.instance.dropped_elems.isSet(elem_idx);
+                            const var_len: u32 = @intCast(seg.elem_var_indices.items.len);
+                            const expr_len: u32 = seg.elem_expr_count;
+                            const seg_len: u32 = if (dropped) 0 else @max(var_len, expr_len);
                             if (@as(u64, offset) + len > seg_len) return error.OutOfBoundsTableAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = 0, .fields = .{} };
-                            for (0..len) |i| {
-                                const var_entry = seg.elem_var_indices.items[offset + i];
-                                const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
-                                if (func_idx == std.math.maxInt(u32)) {
-                                    obj.fields.append(self.allocator, .{ .ref_null = {} }) catch return error.OutOfMemory;
-                                } else {
-                                    obj.fields.append(self.allocator, .{ .ref_func = func_idx }) catch return error.OutOfMemory;
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            if (var_len == 0 and expr_len > 0 and seg.elem_expr_bytes.len > 0) {
+                                // Expression-based elem segment
+                                var expr_pc: usize = 0;
+                                var skip: u32 = 0;
+                                while (skip < offset and expr_pc < seg.elem_expr_bytes.len) : (skip += 1) {
+                                    while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) expr_pc += 1;
+                                    if (expr_pc < seg.elem_expr_bytes.len) expr_pc += 1;
+                                }
+                                for (0..len) |_| {
+                                    const expr_start = expr_pc;
+                                    while (expr_pc < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc] != 0x0b) expr_pc += 1;
+                                    if (expr_pc < seg.elem_expr_bytes.len) expr_pc += 1;
+                                    const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start..expr_pc]);
+                                    obj.fields.append(self.allocator, val orelse .{ .ref_null = {} }) catch return error.OutOfMemory;
+                                }
+                            } else {
+                                for (0..len) |i| {
+                                    const var_entry = seg.elem_var_indices.items[offset + i];
+                                    const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
+                                    if (func_idx == std.math.maxInt(u32)) {
+                                        obj.fields.append(self.allocator, .{ .ref_null = {} }) catch return error.OutOfMemory;
+                                    } else {
+                                        obj.fields.append(self.allocator, .{ .ref_func = func_idx }) catch return error.OutOfMemory;
+                                    }
                                 }
                             }
                             self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
@@ -3387,14 +3407,34 @@ pub const Interpreter = struct {
                             if (obj_id >= self.gc_objects.items.len) return error.Unimplemented;
                             if (elem_idx >= self.instance.module.elem_segments.items.len) return error.OutOfBoundsTableAccess;
                             const seg = &self.instance.module.elem_segments.items[elem_idx];
-                            const seg_len: u32 = @intCast(seg.elem_var_indices.items.len);
-                            if (@as(u64, src_off) + n > seg_len) return error.OutOfBoundsTableAccess;
+                            const dropped2 = elem_idx < self.instance.dropped_elems.capacity() and
+                                self.instance.dropped_elems.isSet(elem_idx);
+                            const var_len2: u32 = @intCast(seg.elem_var_indices.items.len);
+                            const expr_len2: u32 = seg.elem_expr_count;
+                            const seg_len2: u32 = if (dropped2) 0 else @max(var_len2, expr_len2);
+                            if (@as(u64, src_off) + n > seg_len2) return error.OutOfBoundsTableAccess;
                             const obj = &self.gc_objects.items[obj_id];
                             if (@as(u64, dst_off) + n > obj.fields.items.len) return error.OutOfBoundsTableAccess;
-                            for (0..n) |i| {
-                                const var_entry = seg.elem_var_indices.items[src_off + @as(u32, @intCast(i))];
-                                const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
-                                obj.fields.items[dst_off + @as(u32, @intCast(i))] = if (func_idx == std.math.maxInt(u32)) .{ .ref_null = {} } else .{ .ref_func = func_idx };
+                            if (var_len2 == 0 and expr_len2 > 0 and seg.elem_expr_bytes.len > 0) {
+                                var expr_pc2: usize = 0;
+                                var skip2: u32 = 0;
+                                while (skip2 < src_off and expr_pc2 < seg.elem_expr_bytes.len) : (skip2 += 1) {
+                                    while (expr_pc2 < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc2] != 0x0b) expr_pc2 += 1;
+                                    if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
+                                }
+                                for (0..n) |i| {
+                                    const expr_start2 = expr_pc2;
+                                    while (expr_pc2 < seg.elem_expr_bytes.len and seg.elem_expr_bytes[expr_pc2] != 0x0b) expr_pc2 += 1;
+                                    if (expr_pc2 < seg.elem_expr_bytes.len) expr_pc2 += 1;
+                                    const val = evalConstExpr(self.instance, seg.elem_expr_bytes[expr_start2..expr_pc2]);
+                                    obj.fields.items[dst_off + @as(u32, @intCast(i))] = val orelse .{ .ref_null = {} };
+                                }
+                            } else {
+                                for (0..n) |i| {
+                                    const var_entry = seg.elem_var_indices.items[src_off + @as(u32, @intCast(i))];
+                                    const func_idx = switch (var_entry) { .index => |fi2| fi2, .name => 0 };
+                                    obj.fields.items[dst_off + @as(u32, @intCast(i))] = if (func_idx == std.math.maxInt(u32)) .{ .ref_null = {} } else .{ .ref_func = func_idx };
+                                }
                             }
                         },
                         0x1a => { // any.convert_extern — externref to anyref
