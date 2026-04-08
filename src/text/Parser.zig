@@ -4068,8 +4068,8 @@ const Parser = struct {
             const owned = offset_code.toOwnedSlice(self.allocator) catch &.{};
             seg.offset_expr_bytes = owned;
             seg.owns_offset_expr_bytes = true;
-        } else if (has_elem_type and seg.kind != .declared) {
-            // funcref/externref without an offset → passive segment
+        } else if (seg.kind != .declared) {
+            // No offset → passive segment (or declared if only 'func' keyword)
             seg.kind = .passive;
         }
 
