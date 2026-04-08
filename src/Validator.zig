@@ -1041,19 +1041,22 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         if (idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                     },
                     0x0a => { // memory.copy
-                        _ = readU32(bytes, &pos);
-                        _ = readU32(bytes, &pos);
+                        const dst_mem = readU32(bytes, &pos);
+                        const src_mem = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        const dst_m64 = dst_mem < m.memories.items.len and m.memories.items[dst_mem].is_memory64;
+                        const src_m64 = src_mem < m.memories.items.len and m.memories.items[src_mem].is_memory64;
+                        try popExpect(&val_stack, &ctrl_stack, if (dst_m64) .i64 else .i32); // n
+                        try popExpect(&val_stack, &ctrl_stack, if (src_m64) .i64 else .i32); // src
+                        try popExpect(&val_stack, &ctrl_stack, if (dst_m64) .i64 else .i32); // dst
                     },
                     0x0b => { // memory.fill
-                        _ = readU32(bytes, &pos);
+                        const mem_idx = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        const m64 = mem_idx < m.memories.items.len and m.memories.items[mem_idx].is_memory64;
+                        try popExpect(&val_stack, &ctrl_stack, if (m64) .i64 else .i32); // n
+                        try popExpect(&val_stack, &ctrl_stack, .i32); // val (always i32)
+                        try popExpect(&val_stack, &ctrl_stack, if (m64) .i64 else .i32); // dst
                     },
                     0x0c => { // table.init
                         _ = readU32(bytes, &pos);
