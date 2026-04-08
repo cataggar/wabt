@@ -3501,7 +3501,7 @@ pub const Interpreter = struct {
                                 .ref_func => |fidx| blk: {
                                     // func matches: func(0x70), any(0x6e)
                                     if (heap_type == 0x70 or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0) {
+                                    if (heap_type >= 0 and heap_type < 0x68) {
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (fidx < self.instance.module.funcs.items.len) {
                                             const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
