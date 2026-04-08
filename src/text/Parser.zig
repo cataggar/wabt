@@ -440,6 +440,11 @@ const Parser = struct {
                         if (self.in_rec) {
                             // Within rec group, allow refs within the group but not beyond
                             if (idx >= self.rec_end) self.malformed = true;
+                        } else if (self.in_type_parse) {
+                            // During type definition, allow self-reference (idx == current type)
+                            if (self.module) |mod| {
+                                if (idx > mod.module_types.items.len) self.malformed = true;
+                            }
                         } else {
                             if (self.module) |mod| {
                                 if (idx >= mod.module_types.items.len) self.malformed = true;
@@ -451,6 +456,10 @@ const Parser = struct {
                             resolved_type_idx = idx;
                             if (self.in_rec) {
                                 if (idx >= self.rec_end) self.malformed = true;
+                            } else if (self.in_type_parse) {
+                                if (self.module) |mod| {
+                                    if (idx > mod.module_types.items.len) self.malformed = true;
+                                }
                             } else {
                                 if (self.module) |mod| {
                                     if (idx >= mod.module_types.items.len) self.malformed = true;
