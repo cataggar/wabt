@@ -1725,7 +1725,10 @@ const Parser = struct {
                     }
                 } else if (self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
                     self.peek().kind == .kw_externref or self.peek().kind == .kw_eqref or
-                    self.peek().kind == .kw_i31ref or self.peek().kind == .kw_exnref)
+                    self.peek().kind == .kw_i31ref or self.peek().kind == .kw_exnref or
+                    self.peek().kind == .kw_structref or self.peek().kind == .kw_arrayref or
+                    self.peek().kind == .kw_nullref or self.peek().kind == .kw_nullfuncref or
+                    self.peek().kind == .kw_nullexternref or self.peek().kind == .kw_nullexnref)
                 {
                     cast_flags |= 1;
                     _ = self.advance();
@@ -1769,6 +1772,38 @@ const Parser = struct {
                 } else if (self.peek().kind == .kw_eqref) {
                     cast_flags |= 2;
                     target_heap = 0x6d;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_structref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6b;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_arrayref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6a;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_funcref) {
+                    cast_flags |= 2;
+                    target_heap = 0x70;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_anyref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6e;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_externref) {
+                    cast_flags |= 2;
+                    target_heap = 0x6f;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_nullref) {
+                    cast_flags |= 2;
+                    target_heap = 0x71;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_nullfuncref) {
+                    cast_flags |= 2;
+                    target_heap = 0x73;
+                    _ = self.advance();
+                } else if (self.peek().kind == .kw_nullexternref) {
+                    cast_flags |= 2;
+                    target_heap = 0x72;
                     _ = self.advance();
                 }
                 // Emit: castflags (1 byte), then encode source/target heap types
