@@ -2072,6 +2072,16 @@ pub const Interpreter = struct {
             else try self.pushValue(.{ .i32 = -1 });
             return;
         };
+        // Store value type tags for new entries
+        const tag: u8 = switch (init_val) {
+            .ref_i31 => 1, .ref_struct => 2, .ref_array => 3, .ref_extern => 4, else => 0,
+        };
+        if (tag != 0) {
+            var ei: u64 = old_size;
+            while (ei < new_size) : (ei += 1) {
+                self.instance.table_value_tags.put(self.allocator, Instance.makeTableKey(tbl_idx, @intCast(ei)), tag) catch {};
+            }
+        }
         if (t64) try self.pushValue(.{ .i64 = @intCast(old_size) })
         else try self.pushValue(.{ .i32 = @intCast(old_size) });
     }
@@ -2107,6 +2117,16 @@ pub const Interpreter = struct {
         var i: usize = 0;
         const d: usize = @intCast(dst);
         while (i < n) : (i += 1) tbl.items[d + i] = func_ref;
+        // Store value type tags for filled entries
+        const fill_tag: u8 = switch (val) {
+            .ref_i31 => 1, .ref_struct => 2, .ref_array => 3, .ref_extern => 4, .ref_null => 5, else => 0,
+        };
+        if (fill_tag != 0 and fill_tag != 5) {
+            var j: usize = 0;
+            while (j < n) : (j += 1) {
+                self.instance.table_value_tags.put(self.allocator, Instance.makeTableKey(tbl_idx, @intCast(d + j)), fill_tag) catch {};
+            }
+        }
     }
 
     // ── Sub-word memory loads ───────────────────────────────────────────
