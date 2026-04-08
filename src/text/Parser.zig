@@ -462,9 +462,11 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "func")) return .funcref;
                     if (std.mem.eql(u8, heap_text, "extern")) return .externref;
                     if (std.mem.eql(u8, heap_text, "any")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "exn")) return .exnref;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .nullfuncref;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .nullexternref;
                     if (std.mem.eql(u8, heap_text, "none")) return .nullref;
+                    if (std.mem.eql(u8, heap_text, "noexn")) return .nullexnref;
                 }
                 // Canonicalize non-nullable abstract heap types
                 if (!nullable and heap_text.len > 0) {
@@ -497,6 +499,10 @@ const Parser = struct {
             .kw_externref => .externref,
             .kw_anyref => .anyref,
             .kw_exnref => .exnref,
+            .kw_nullref => .nullref,
+            .kw_nullfuncref => .nullfuncref,
+            .kw_nullexternref => .nullexternref,
+            .kw_nullexnref => .nullexnref,
             else => error.InvalidType,
         };
     }

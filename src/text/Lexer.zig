@@ -53,6 +53,10 @@ pub const TokenKind = enum {
     kw_externref,
     kw_anyref,
     kw_exnref,
+    kw_nullref,
+    kw_nullfuncref,
+    kw_nullexternref,
+    kw_nullexnref,
 
     // Bare reference keywords (GC proposal)
     kw_ref,
@@ -476,6 +480,10 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "externref")) return .kw_externref;
     if (eql(text, "anyref")) return .kw_anyref;
     if (eql(text, "exnref")) return .kw_exnref;
+    if (eql(text, "nullref")) return .kw_nullref;
+    if (eql(text, "nullfuncref")) return .kw_nullfuncref;
+    if (eql(text, "nullexternref")) return .kw_nullexternref;
+    if (eql(text, "nullexnref")) return .kw_nullexnref;
 
     // Bare reference keywords (GC proposal)
     if (eql(text, "ref")) return .kw_ref;
