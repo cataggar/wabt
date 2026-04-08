@@ -4066,25 +4066,36 @@ const Parser = struct {
                     // Post-type elem expressions (passive/declarative segment)
                     if (inner_kind == .kw_item) {
                         _ = self.advance(); // consume 'item'
-                    }
-                    const expr_start = elem_expr_code.items.len;
-                    self.parseInitExpr(&elem_expr_code);
-                    elem_expr_code.append(self.allocator, 0x0b) catch {};
-                    elem_expr_count += 1;
-                    // Extract func index from emitted bytecode for elem_var_indices
-                    const expr_bytes = elem_expr_code.items[expr_start .. elem_expr_code.items.len - 1];
-                    if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
-                        if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
-                            seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
-                        } else |_| {
-                            seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                        // item body: use parseInitExpr (flat form inside item)
+                        const expr_start = elem_expr_code.items.len;
+                        self.parseInitExpr(&elem_expr_code);
+                        elem_expr_code.append(self.allocator, 0x0b) catch {};
+                        elem_expr_count += 1;
+                        const expr_bytes = elem_expr_code.items[expr_start .. elem_expr_code.items.len - 1];
+                        if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
+                            if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
+                                seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                            } else |_| {}
+                        } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
                         }
-                    } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
-                        seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                        try self.expect(.r_paren);
+                    } else {
+                        // Direct folded expression (outer ( already consumed)
+                        const expr_start = elem_expr_code.items.len;
+                        self.parseInitExprFolded(&elem_expr_code);
+                        elem_expr_code.append(self.allocator, 0x0b) catch {};
+                        elem_expr_count += 1;
+                        const expr_bytes = elem_expr_code.items[expr_start .. elem_expr_code.items.len - 1];
+                        if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
+                            if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
+                                seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                            } else |_| {}
+                        } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                        }
+                        // parseInitExprFolded already consumed the closing )
                     }
-                    // For other expressions (ref.i31 etc.), don't add to var_indices;
-                    // they will be evaluated from elem_expr_bytes at instantiation time.
-                    try self.expect(.r_paren);
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
                     self.lexer.pos = save_pos;
@@ -4095,22 +4106,33 @@ const Parser = struct {
                     // Post-offset with explicit elem type: encode elem expressions
                     if (inner_kind == .kw_item) {
                         _ = self.advance(); // consume 'item'
-                    }
-                    const expr_start2 = elem_expr_code.items.len;
-                    self.parseInitExpr(&elem_expr_code);
-                    elem_expr_code.append(self.allocator, 0x0b) catch {};
-                    elem_expr_count += 1;
-                    const expr_bytes2 = elem_expr_code.items[expr_start2 .. elem_expr_code.items.len - 1];
-                    if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd2) {
-                        if (leb128.readU32Leb128(expr_bytes2[1..])) |r| {
-                            seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
-                        } else |_| {
-                            seg.elem_var_indices.append(self.allocator, .{ .index = 0 }) catch {};
+                        const expr_start2 = elem_expr_code.items.len;
+                        self.parseInitExpr(&elem_expr_code);
+                        elem_expr_code.append(self.allocator, 0x0b) catch {};
+                        elem_expr_count += 1;
+                        const expr_bytes2 = elem_expr_code.items[expr_start2 .. elem_expr_code.items.len - 1];
+                        if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd2) {
+                            if (leb128.readU32Leb128(expr_bytes2[1..])) |r| {
+                                seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                            } else |_| {}
+                        } else if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd0) {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
                         }
-                    } else if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd0) {
-                        seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                        try self.expect(.r_paren);
+                    } else {
+                        const expr_start2 = elem_expr_code.items.len;
+                        self.parseInitExprFolded(&elem_expr_code);
+                        elem_expr_code.append(self.allocator, 0x0b) catch {};
+                        elem_expr_count += 1;
+                        const expr_bytes2 = elem_expr_code.items[expr_start2 .. elem_expr_code.items.len - 1];
+                        if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd2) {
+                            if (leb128.readU32Leb128(expr_bytes2[1..])) |r| {
+                                seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+                            } else |_| {}
+                        } else if (expr_bytes2.len >= 1 and expr_bytes2[0] == 0xd0) {
+                            seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+                        }
                     }
-                    try self.expect(.r_paren);
                 } else if (!has_elem_type and (inner_kind == .kw_ref or inner_kind == .kw_ref_null)) {
                     // (ref ...) or (ref null ...) — elem type declaration
                     self.skipToRParen();
