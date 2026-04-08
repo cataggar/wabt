@@ -1906,11 +1906,8 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.func")) {
         return .{ .ref_func = std.math.maxInt(u32) }; // sentinel: match any non-null funcref
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
-        if (val_text.len == 0) {
-            return .{ .ref_extern = std.math.maxInt(u32) }; // sentinel: match any non-null externref
-        }
-        const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
-        return .{ .ref_func = idx }; // specific externref comparison uses ref_func
+        // All ref.extern values (bare or with N) match any non-null externref
+        return .{ .ref_extern = std.math.maxInt(u32) };
     } else if (std.mem.eql(u8, kw, "ref.i31")) {
         // (ref.i31) matches any non-null i31ref
         return .{ .ref_i31 = std.math.maxInt(u32) }; // sentinel: match any i31
