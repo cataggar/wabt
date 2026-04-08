@@ -3493,7 +3493,7 @@ pub const Interpreter = struct {
                                 .ref_struct => |obj_id| blk: {
                                     // struct matches: struct(0x6b), eq(0x6d), any(0x6e), or concrete type
                                     if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                    if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (obj_type == ht_idx) break :blk 1;
@@ -3504,7 +3504,7 @@ pub const Interpreter = struct {
                                 .ref_array => |obj_id| blk: {
                                     // array matches: array(0x6a), eq(0x6d), any(0x6e), or concrete type
                                     if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                    if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (obj_type == ht_idx) break :blk 1;
@@ -3535,7 +3535,7 @@ pub const Interpreter = struct {
                                 .ref_struct => |obj_id| {
                                     if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
                                         try self.pushValue(val);
-                                    } else if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                    } else if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
                                             try self.pushValue(val)
@@ -3545,7 +3545,7 @@ pub const Interpreter = struct {
                                 .ref_array => |obj_id| {
                                     if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
                                         try self.pushValue(val);
-                                    } else if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+                                    } else if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
                                             try self.pushValue(val)
@@ -5424,7 +5424,7 @@ fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) 
         .ref_i31 => heap_type == 0x6c or heap_type == 0x6d or heap_type == 0x6e,
         .ref_struct => |obj_id| {
             if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) return true;
-            if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+            if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                 const obj_type = self.gc_objects.items[obj_id].type_idx;
                 const ht: u32 = @intCast(heap_type);
                 return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
@@ -5433,7 +5433,7 @@ fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) 
         },
         .ref_array => |obj_id| {
             if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) return true;
-            if (heap_type >= 0 and obj_id < self.gc_objects.items.len) {
+            if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
                 const obj_type = self.gc_objects.items[obj_id].type_idx;
                 const ht: u32 = @intCast(heap_type);
                 return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
