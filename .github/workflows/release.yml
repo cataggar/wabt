@@ -30,6 +30,25 @@ jobs:
           - os: windows-latest
             target: x86_64-windows
             name: windows-x64
+          # Cross-compiled targets
+          - os: ubuntu-22.04
+            target: x86_64-macos
+            name: macos-x64
+          - os: ubuntu-22.04
+            target: x86_64-linux-musl
+            name: linux-musl-x64
+          - os: ubuntu-22.04
+            target: aarch64-linux-musl
+            name: linux-musl-arm64
+          - os: ubuntu-22.04
+            target: riscv64-linux
+            name: linux-riscv64
+          - os: ubuntu-22.04
+            target: aarch64-windows
+            name: windows-arm64
+          - os: ubuntu-22.04
+            target: wasm32-wasi
+            name: wasi
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -49,13 +68,20 @@ jobs:
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package
         shell: bash
         run: |
           PKGNAME="wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}"
+          TOOLS="wat2wasm wasm2wat wast2json wasm-validate wasm-objdump wasm-interp wasm-decompile wasm-strip wasm-stats wat-desugar"
           mkdir -p "$PKGNAME/bin"
-          cp zig-out/bin/* "$PKGNAME/bin/"
+          case "${{ matrix.target }}" in
+            wasm32-wasi) EXT=".wasm" ;;
+            *-windows)   EXT=".exe" ;;
+            *)           EXT="" ;;
+          esac
+          for tool in $TOOLS; do
+            cp "zig-out/bin/${tool}${EXT}" "$PKGNAME/bin/"
+          done
           cp LICENSE README.md "$PKGNAME/"
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           if command -v sha256sum &>/dev/null; then
@@ -63,17 +89,6 @@ jobs:
           else
             shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
           fi
-
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          PKGNAME="wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}"
-          mkdir -p "$PKGNAME/bin"
-          cp zig-out/bin/*.exe "$PKGNAME/bin/"
-          cp LICENSE README.md "$PKGNAME/"
-          tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-          sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -151,8 +166,11 @@ jobs:
             - Build system: `build.zig` with cross-compilation
             - Zig 0.15.2 (pure Zig source, libc linked for stack canaries)
             - Built with `ReleaseSafe` (runtime safety checks) + stack protector
+            - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
 
-            **Tools included:** wat2wasm, wasm2wat, wast2json, wasm-validate, wasm-objdump, wasm2c, wasm-interp, wasm-decompile, wasm-strip, wasm-stats, wat-desugar, spectest-interp, wasm2wat-fuzz
+            **Tools included:** wat2wasm, wasm2wat, wast2json, wasm-validate, wasm-objdump, wasm-interp, wasm-decompile, wasm-strip, wasm-stats, wat-desugar
+
+            **Install via pip:** `pip install wabt-bin`
           files: |
             wabt-*.tar.gz
             wabt-*.tar.xz
