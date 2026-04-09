@@ -14,7 +14,7 @@ pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wat2wasm {s} - translate WebAssembly text format to binary
+        \\wat2wasm {s} translate WebAssembly text format to binary
         \\
         \\Usage: wat2wasm [options] <file>
         \\

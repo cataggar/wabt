@@ -11,7 +11,7 @@ pub fn strip(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-strip {s} - strip custom sections from a WebAssembly binary
+        \\wasm-strip {s} strip custom sections from a WebAssembly binary
         \\
         \\Usage: wasm-strip [options] <file>
         \\

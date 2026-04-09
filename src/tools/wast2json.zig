@@ -17,7 +17,7 @@ pub fn wastToJson(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wast2json {s} - translate WebAssembly spec test format to JSON
+        \\wast2json {s} translate WebAssembly spec test format to JSON
         \\
         \\Usage: wast2json [options] <file>
         \\
