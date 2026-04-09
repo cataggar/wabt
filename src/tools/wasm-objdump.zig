@@ -34,7 +34,7 @@ pub fn dump(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-objdump - dump the contents of a WebAssembly binary
+        \\wasm-objdump {s} - dump the contents of a WebAssembly binary
         \\
         \\Usage: wasm-objdump [options] <file>
         \\
@@ -43,7 +43,7 @@ pub fn main() void {
         \\  -x, --details     Show section details
         \\  -s, --full-contents  Show full section contents
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "empty module produces header info" {

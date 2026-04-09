@@ -1,8 +1,14 @@
-# WABT: The WebAssembly Binary Toolkit (Zig)
+# WABT: The WebAssembly Binary Toolkit
 
 A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C++ to Zig and maintained with AI assistance.
 
 **100% WebAssembly 3.0 spec conformance** — 65,011/65,011 tests passing.
+
+## Install
+
+```console
+$ pip install wabt-bin
+```
 
 ## Tools
 
@@ -12,12 +18,10 @@ A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C+
  - **wasm-interp**: decode and run a WebAssembly binary file using a stack-based interpreter
  - **wasm-decompile**: decompile a wasm binary into readable C-like syntax
  - **wat-desugar**: parse .wat text form and print canonical flat format
- - **wasm2c**: convert a WebAssembly binary file to a C source and header
  - **wasm-strip**: remove sections of a WebAssembly binary file
  - **wasm-validate**: validate a file in the WebAssembly binary format
  - **wast2json**: convert a file in the wasm spec test format to a JSON file and associated wasm binary files
  - **wasm-stats**: output stats for a module
- - **spectest-interp**: run WebAssembly spec tests (.wast files)
 
 ## Building
 

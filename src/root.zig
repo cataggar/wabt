@@ -33,6 +33,8 @@ pub const interp = struct {
 /// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
 pub const max_input_file_size = 256 * 1024 * 1024;
 
+pub const version = "2.0.0-dev.1";
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("integration_tests.zig");

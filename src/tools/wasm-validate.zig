@@ -12,13 +12,13 @@ pub fn validateBytes(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-validate - validate a WebAssembly binary
+        \\wasm-validate {s} - validate a WebAssembly binary
         \\
         \\Usage: wasm-validate [options] <file>
         \\
         \\  -h, --help            Show this help message
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "validate minimal module" {
