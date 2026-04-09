@@ -3,12 +3,14 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
 
     // Core library module
     const wabt_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
     });
 
     // Static library
@@ -42,6 +44,7 @@ pub fn build(b: *std.Build) void {
             ),
             .target = target,
             .optimize = optimize,
+            .strip = if (strip) true else null,
             .imports = &.{
                 .{ .name = "wabt", .module = wabt_mod },
             },
