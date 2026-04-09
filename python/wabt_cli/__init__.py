@@ -5,12 +5,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-try:
-    from importlib.metadata import version
 
-    __version__ = version("wabt-bin")
-except Exception:
-    __version__ = "0.0.0"
+def _get_version() -> str:
+    try:
+        from importlib.metadata import version
+
+        return version("wabt-bin")
+    except Exception:
+        return "0.0.0"
 
 _TOOLS = [
     "wat2wasm",
