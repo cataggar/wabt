@@ -72,12 +72,14 @@ pub fn build(b: *std.Build) void {
     }
 
     // Tests
+    const lib_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lib_test_mod.addOptions("build_options", options);
     const lib_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
+        .root_module = lib_test_mod,
     });
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
