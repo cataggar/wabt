@@ -59,10 +59,10 @@ def sha256_digest(data: bytes) -> str:
     return urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
-def download_asset(version: str, platform_key: str) -> bytes:
+def download_asset(release_version: str, platform_key: str) -> bytes:
     """Download a wabt release asset."""
-    asset_name = f"wabt-{version}-{platform_key}.tar.gz"
-    url = f"https://github.com/{WABT_REPO}/releases/download/v{version}/{asset_name}"
+    asset_name = f"wabt-{release_version}-{platform_key}.tar.gz"
+    url = f"https://github.com/{WABT_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
     resp = requests.get(url, allow_redirects=True, timeout=300)
     resp.raise_for_status()
@@ -80,10 +80,11 @@ def _is_executable(path: Path) -> bool:
 
 
 def build_wheel(
-    version: str, platform_key: str, platform_tag: str, dist_dir: Path
+    version: str, platform_key: str, platform_tag: str, dist_dir: Path,
+    release_version: str | None = None,
 ) -> Path:
     """Build a single platform wheel."""
-    data = download_asset(version, platform_key)
+    data = download_asset(release_version or version, platform_key)
 
     # Extract the tarball
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
@@ -183,22 +184,33 @@ def build_wheel(
     return wheel_path
 
 
+def to_pep440(version: str) -> str:
+    """Convert a semver-style version to PEP 440. e.g. 2.0.0-dev.2 -> 2.0.0.dev2"""
+    import re
+
+    m = re.match(r"^(\d+\.\d+\.\d+)-dev\.(\d+)$", version)
+    if m:
+        return f"{m.group(1)}.dev{m.group(2)}"
+    return version
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <version>")
         print(f"Example: {sys.argv[0]} 2.0.0")
         sys.exit(1)
 
-    version = sys.argv[1]
+    raw_version = sys.argv[1]
+    version = to_pep440(raw_version)
     dist_dir = Path("dist")
     dist_dir.mkdir(exist_ok=True)
 
-    print(f"Building wheels for wabt v{version}\n")
+    print(f"Building wheels for wabt v{raw_version} (PyPI: {version})\n")
 
     wheels: list[Path] = []
     for platform_key, info in PLATFORMS.items():
         print(f"[{platform_key}]")
-        wheel = build_wheel(version, platform_key, info["tag"], dist_dir)
+        wheel = build_wheel(version, platform_key, info["tag"], dist_dir, raw_version)
         wheels.append(wheel)
         print()
 
