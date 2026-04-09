@@ -42,7 +42,7 @@ jobs:
           version: 0.15.2
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true
 
       - name: Get version
         id: version
@@ -141,8 +141,8 @@ jobs:
             **Highlights:**
             - 100% WebAssembly 3.0 spec conformance (65011/65011 assertions)
             - Build system: `build.zig` with cross-compilation
-            - Zig 0.15.2 (no C/C++ dependencies)
-            - Built with `ReleaseSafe` (runtime bounds/overflow checks enabled)
+            - Zig 0.15.2 (pure Zig source, libc linked for stack canaries)
+            - Built with `ReleaseFast` + stack protector (stack canaries enabled)
 
             **Tools included:** wat2wasm, wasm2wat, wast2json, wasm-validate, wasm-objdump, wasm2c, wasm-interp, wasm-decompile, wasm-strip, wasm-stats, wat-desugar, spectest-interp, wasm2wat-fuzz
           files: |
