@@ -75,6 +75,13 @@ jobs:
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
 
+      - name: Generate SBOM
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with:
+          path: zig-out/bin/
+          output-file: wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}.sbom.spdx.json
+          upload-artifact: false
+
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -82,6 +89,7 @@ jobs:
           path: |
             wabt-*.tar.gz
             wabt-*.sha256
+            wabt-*.sbom.spdx.json
 
   source:
     name: Source tarball
@@ -149,5 +157,6 @@ jobs:
             wabt-*.tar.gz
             wabt-*.tar.xz
             wabt-*.sha256
+            wabt-*.sbom.spdx.json
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}
