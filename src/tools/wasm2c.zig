@@ -10,14 +10,14 @@ pub fn wasmToC(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm2c - translate WebAssembly binary to C source
+        \\wasm2c {s} - translate WebAssembly binary to C source
         \\
         \\Usage: wasm2c [options] <file>
         \\
         \\  -o, --output <file>   Output C file
         \\  -n, --module-name     Module name (default: derived from filename)
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "empty module produces C header" {

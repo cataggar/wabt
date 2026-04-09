@@ -14,14 +14,14 @@ pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wat2wasm - translate WebAssembly text format to binary
+        \\wat2wasm {s} - translate WebAssembly text format to binary
         \\
         \\Usage: wat2wasm [options] <file>
         \\
         \\  -h, --help            Show this help message
         \\  -o, --output <file>   Output file (default: <input>.wasm)
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "convert empty module" {

@@ -127,7 +127,7 @@ def build_wheel(
         f"Name: wabt-bin\n"
         f"Version: {version}\n"
         f"Summary: WebAssembly Binary Toolkit — native CLI tools\n"
-        f"Home-page: https://github.com/WebAssembly/wabt\n"
+        f"Home-page: https://github.com/cataggar/wabt\n"
         f"License: Apache-2.0\n"
         f"Requires-Python: >=3.9\n"
         f"Description-Content-Type: text/markdown\n"

@@ -10,13 +10,13 @@ pub fn decompile(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-decompile - decompile a WebAssembly binary
+        \\wasm-decompile {s} - decompile a WebAssembly binary
         \\
         \\Usage: wasm-decompile [options] <file>
         \\
         \\  -o, --output <file>   Output file (default: stdout)
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "empty module produces minimal output" {

@@ -10,13 +10,13 @@ pub fn desugar(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wat-desugar - remove syntactic sugar from WebAssembly text
+        \\wat-desugar {s} - remove syntactic sugar from WebAssembly text
         \\
         \\Usage: wat-desugar [options] <file>
         \\
         \\  -o, --output <file>   Output file (default: stdout)
         \\
-    , .{});
+    , .{wabt.version});
 }
 
 test "empty module round-trips" {
