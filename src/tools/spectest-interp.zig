@@ -26,7 +26,7 @@ pub fn main() !void {
     while (args_it.next()) |arg| {
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
-                \\spectest-interp {s} - run WebAssembly spec tests (.wast)
+                \\spectest-interp {s} run WebAssembly spec tests (.wast)
                 \\
                 \\Usage: spectest-interp [options] <file.wast>
                 \\

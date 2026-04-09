@@ -9,7 +9,7 @@ pub fn fuzzWasm2Wat(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 
 }
 
 pub fn main() void {
-    std.debug.print("wasm2wat-fuzz {s} - fuzz target for wasm to wat conversion\n", .{wabt.version});
+    std.debug.print("wasm2wat-fuzz {s} fuzz target for wasm to wat conversion\n", .{wabt.version});
 }
 
 test "empty module fuzz target works" {

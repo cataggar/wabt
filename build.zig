@@ -7,6 +7,10 @@ pub fn build(b: *std.Build) void {
 
     const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc linkage)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link against libc") orelse stack_protector;
+    const version = b.option([]const u8, "version", "Version string") orelse "dev";
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
 
     // Core library module
     const wabt_mod = b.createModule(.{
@@ -17,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .stack_protector = if (stack_protector) true else null,
         .link_libc = if (link_libc) true else null,
     });
+    wabt_mod.addOptions("build_options", options);
 
     // Static library
     const lib = b.addLibrary(.{

@@ -35,7 +35,7 @@ pub fn stats(allocator: std.mem.Allocator, wasm_bytes: []const u8) !Stats {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-stats {s} - show statistics for a WebAssembly binary
+        \\wasm-stats {s} show statistics for a WebAssembly binary
         \\
         \\Usage: wasm-stats [options] <file>
         \\

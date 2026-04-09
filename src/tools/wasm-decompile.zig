@@ -10,7 +10,7 @@ pub fn decompile(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm-decompile {s} - decompile a WebAssembly binary
+        \\wasm-decompile {s} decompile a WebAssembly binary
         \\
         \\Usage: wasm-decompile [options] <file>
         \\
