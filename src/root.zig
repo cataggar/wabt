@@ -30,6 +30,9 @@ pub const interp = struct {
     pub const Interpreter = @import("interp/Interpreter.zig");
 };
 
+/// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
+pub const max_input_file_size = 256 * 1024 * 1024;
+
 test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("integration_tests.zig");

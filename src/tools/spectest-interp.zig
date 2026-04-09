@@ -44,7 +44,7 @@ pub fn main() !void {
         return;
     };
 
-    const source = std.fs.cwd().readFileAlloc(alloc, in_path, 64 * 1024 * 1024) catch |err| {
+    const source = std.fs.cwd().readFileAlloc(alloc, in_path, wabt.max_input_file_size) catch |err| {
         std.debug.print("cannot read '{s}': {any}\n", .{ in_path, err });
         return err;
     };
