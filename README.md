@@ -6,8 +6,14 @@ A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C+
 
 ## Install
 
+Pre-built binaries are published to [GitHub Releases](https://github.com/cataggar/wabt/releases) and [PyPI](https://pypi.org/project/wabt-bin/). See [installation details](https://github.com/cataggar/wabt/issues/69).
+
 ```console
-$ pip install wabt-bin
+$ dist install cataggar/wabt
+```
+
+```console
+$ uv tool install wabt-bin
 ```
 
 ## Tools
