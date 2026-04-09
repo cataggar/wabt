@@ -181,6 +181,6 @@ test "count returns number of non-default features" {
     s.mutable_globals = false; // default true → changed
     try std.testing.expectEqual(@as(usize, 2), s.count());
 
-    // all has 6 non-default features (the 6 still false/off by default).
-    try std.testing.expectEqual(@as(usize, 6), Set.all.count());
+    // all has 5 non-default features (the 5 still false/off by default).
+    try std.testing.expectEqual(@as(usize, 5), Set.all.count());
 }

@@ -23,6 +23,13 @@ pub const TokenKind = enum {
     kw_elem,
     kw_data,
     kw_tag,
+    kw_throw,
+    kw_throw_ref,
+    kw_try_table,
+    kw_catch,
+    kw_catch_ref,
+    kw_catch_all,
+    kw_catch_all_ref,
     kw_rec,
     kw_definition,
 
@@ -45,6 +52,17 @@ pub const TokenKind = enum {
     kw_funcref,
     kw_externref,
     kw_anyref,
+    kw_exnref,
+    kw_nullref,
+    kw_nullfuncref,
+    kw_nullexternref,
+    kw_nullexnref,
+    kw_i31ref,
+    kw_eqref,
+    kw_structref,
+    kw_arrayref,
+    kw_i8,
+    kw_i16,
 
     // Bare reference keywords (GC proposal)
     kw_ref,
@@ -54,6 +72,8 @@ pub const TokenKind = enum {
     kw_ref_null,
     kw_ref_func,
     kw_ref_extern,
+    kw_ref_test,
+    kw_ref_cast,
 
     // Control instructions
     kw_block,
@@ -67,9 +87,17 @@ pub const TokenKind = enum {
     kw_br,
     kw_br_if,
     kw_br_table,
+    kw_br_on_null,
+    kw_br_on_non_null,
+    kw_br_on_cast,
+    kw_br_on_cast_fail,
     kw_return,
     kw_call,
     kw_call_indirect,
+    kw_return_call,
+    kw_return_call_indirect,
+    kw_call_ref,
+    kw_return_call_ref,
 
     // Parametric
     kw_drop,
@@ -145,11 +173,58 @@ pub const Lexer = struct {
                     self.skipBlockComment();
                     return self.next();
                 }
-                // Check for annotation "(@id"
+                // Check for annotation "(@id" or "(@"string-id"
                 if (self.pos + 1 < self.source.len and self.source[self.pos + 1] == '@') {
                     self.pos += 2; // skip '(' and '@'
+                    const id_start = self.pos;
+                    if (self.pos < self.source.len and self.source[self.pos] == '"') {
+                        // Quoted annotation id: (@"...") — scan the string
+                        const str_start = self.pos;
+                        self.pos += 1; // skip opening "
+                        var id_len: usize = 0;
+                        var has_invalid_byte = false;
+                        while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                            if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) {
+                                // Check hex escape \xx for non-printable bytes
+                                if (self.pos + 2 < self.source.len) {
+                                    const h1 = hexVal(self.source[self.pos + 1]);
+                                    const h2 = hexVal(self.source[self.pos + 2]);
+                                    if (h1 != null and h2 != null) {
+                                        const byte_val = h1.? * 16 + h2.?;
+                                        if (byte_val < 0x20 or byte_val == 0x7f or byte_val >= 0x80) {
+                                            has_invalid_byte = true;
+                                        }
+                                    }
+                                }
+                                self.pos += 2; // skip escape sequence
+                                id_len += 1;
+                            } else if (self.source[self.pos] == '\n' or self.source[self.pos] == '\r' or self.source[self.pos] == '\t') {
+                                has_invalid_byte = true;
+                                self.pos += 1;
+                                id_len += 1;
+                            } else {
+                                // Check for non-printable or non-ASCII bytes
+                                if (self.source[self.pos] < 0x20 or self.source[self.pos] >= 0x7f) {
+                                    has_invalid_byte = true;
+                                }
+                                self.pos += 1;
+                                id_len += 1;
+                            }
+                        }
+                        if (self.pos < self.source.len) self.pos += 1; // skip closing "
+                        // Empty string or invalid bytes → malformed annotation
+                        if (id_len == 0 or has_invalid_byte) {
+                            return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+                        }
+                        _ = str_start;
+                        return .{ .kind = .annotation, .text = self.source[start..self.pos], .offset = start };
+                    }
                     while (self.pos < self.source.len and isWordChar(self.source[self.pos])) {
                         self.pos += 1;
+                    }
+                    // Empty annotation id: (@) or (@ x) — return invalid
+                    if (self.pos == id_start) {
+                        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
                     }
                     return .{ .kind = .annotation, .text = self.source[start..self.pos], .offset = start };
                 }
@@ -203,6 +278,28 @@ pub const Lexer = struct {
         // Identifiers start with '$'
         if (self.source[start] == '$') {
             self.pos += 1;
+            // Check for quoted identifier: $"..."
+            if (self.pos < self.source.len and self.source[self.pos] == '"') {
+                self.pos += 1; // skip opening "
+                while (self.pos < self.source.len and self.source[self.pos] != '"') {
+                    if (self.source[self.pos] == '\\' and self.pos + 1 < self.source.len) {
+                        self.pos += 2; // skip escape sequence
+                    } else {
+                        self.pos += 1;
+                    }
+                }
+                if (self.pos < self.source.len) self.pos += 1; // skip closing "
+                // Reject quoted identifier glued to another token
+                if (self.pos < self.source.len) {
+                    const nc = self.source[self.pos];
+                    if (isWordChar(nc) or nc == '$' or nc == '"') {
+                        self.consumeGluedContent();
+                        return .{ .kind = .invalid, .text = self.source[start..self.pos], .offset = start };
+                    }
+                }
+                const text = self.source[start..self.pos];
+                return .{ .kind = .identifier, .text = text, .offset = start };
+            }
             while (self.pos < self.source.len and isIdChar(self.source[self.pos])) {
                 self.pos += 1;
             }
@@ -252,6 +349,15 @@ pub const Lexer = struct {
         return switch (c) {
             ' ', '\t', '\n', '\r', '(', ')', '"', ';', '=' => false,
             else => c >= 0x21 and c <= 0x7e,
+        };
+    }
+
+    fn hexVal(c: u8) ?u8 {
+        return switch (c) {
+            '0'...'9' => c - '0',
+            'a'...'f' => c - 'a' + 10,
+            'A'...'F' => c - 'A' + 10,
+            else => null,
         };
     }
 
@@ -427,6 +533,13 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "elem")) return .kw_elem;
     if (eql(text, "data")) return .kw_data;
     if (eql(text, "tag")) return .kw_tag;
+    if (eql(text, "throw")) return .kw_throw;
+    if (eql(text, "throw_ref")) return .kw_throw_ref;
+    if (eql(text, "try_table")) return .kw_try_table;
+    if (eql(text, "catch")) return .kw_catch;
+    if (eql(text, "catch_ref")) return .kw_catch_ref;
+    if (eql(text, "catch_all")) return .kw_catch_all;
+    if (eql(text, "catch_all_ref")) return .kw_catch_all_ref;
     if (eql(text, "rec")) return .kw_rec;
     if (eql(text, "definition")) return .kw_definition;
 
@@ -449,6 +562,17 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "funcref")) return .kw_funcref;
     if (eql(text, "externref")) return .kw_externref;
     if (eql(text, "anyref")) return .kw_anyref;
+    if (eql(text, "exnref")) return .kw_exnref;
+    if (eql(text, "nullref")) return .kw_nullref;
+    if (eql(text, "nullfuncref")) return .kw_nullfuncref;
+    if (eql(text, "nullexternref")) return .kw_nullexternref;
+    if (eql(text, "nullexnref")) return .kw_nullexnref;
+    if (eql(text, "i31ref")) return .kw_i31ref;
+    if (eql(text, "eqref")) return .kw_eqref;
+    if (eql(text, "structref")) return .kw_structref;
+    if (eql(text, "arrayref")) return .kw_arrayref;
+    if (eql(text, "i8")) return .kw_i8;
+    if (eql(text, "i16")) return .kw_i16;
 
     // Bare reference keywords (GC proposal)
     if (eql(text, "ref")) return .kw_ref;
@@ -458,6 +582,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "ref.null")) return .kw_ref_null;
     if (eql(text, "ref.func")) return .kw_ref_func;
     if (eql(text, "ref.extern")) return .kw_ref_extern;
+    if (eql(text, "ref.test")) return .kw_ref_test;
+    if (eql(text, "ref.cast")) return .kw_ref_cast;
 
     // Control instructions
     if (eql(text, "block")) return .kw_block;
@@ -471,9 +597,17 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "br")) return .kw_br;
     if (eql(text, "br_if")) return .kw_br_if;
     if (eql(text, "br_table")) return .kw_br_table;
+    if (eql(text, "br_on_null")) return .kw_br_on_null;
+    if (eql(text, "br_on_non_null")) return .kw_br_on_non_null;
+    if (eql(text, "br_on_cast")) return .kw_br_on_cast;
+    if (eql(text, "br_on_cast_fail")) return .kw_br_on_cast_fail;
     if (eql(text, "return")) return .kw_return;
     if (eql(text, "call")) return .kw_call;
     if (eql(text, "call_indirect")) return .kw_call_indirect;
+    if (eql(text, "return_call")) return .kw_return_call;
+    if (eql(text, "return_call_indirect")) return .kw_return_call_indirect;
+    if (eql(text, "call_ref")) return .kw_call_ref;
+    if (eql(text, "return_call_ref")) return .kw_return_call_ref;
 
     // Parametric
     if (eql(text, "drop")) return .kw_drop;

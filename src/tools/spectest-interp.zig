@@ -15,9 +15,7 @@ pub fn runBinaryValidation(allocator: std.mem.Allocator, wasm_bytes: []const u8)
 }
 
 pub fn main() !void {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const alloc = gpa_state.allocator();
+    const alloc = std.heap.page_allocator;
 
     var args_it = try std.process.ArgIterator.initWithAllocator(alloc);
     defer args_it.deinit();
