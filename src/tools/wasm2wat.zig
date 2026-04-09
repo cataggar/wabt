@@ -12,7 +12,7 @@ pub fn convert(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
 
 pub fn main() void {
     std.debug.print(
-        \\wasm2wat — translate WebAssembly binary to text format
+        \\wasm2wat - translate WebAssembly binary to text format
         \\
         \\Usage: wasm2wat [options] <file>
         \\
