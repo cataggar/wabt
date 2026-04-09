@@ -3,12 +3,19 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = b.option(bool, "strip", "Strip debug info from binaries") orelse false;
+
+    const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc linkage)") orelse false;
+    const link_libc = b.option(bool, "link-libc", "Link against libc") orelse stack_protector;
 
     // Core library module
     const wabt_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .strip = if (strip) true else null,
+        .stack_protector = if (stack_protector) true else null,
+        .link_libc = if (link_libc) true else null,
     });
 
     // Static library
@@ -42,6 +49,9 @@ pub fn build(b: *std.Build) void {
             ),
             .target = target,
             .optimize = optimize,
+            .strip = if (strip) true else null,
+            .stack_protector = if (stack_protector) true else null,
+            .link_libc = if (link_libc) true else null,
             .imports = &.{
                 .{ .name = "wabt", .module = wabt_mod },
             },

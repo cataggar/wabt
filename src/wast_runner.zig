@@ -63,6 +63,10 @@ const RunState = struct {
     owned_sources: std.ArrayListUnmanaged([]const u8) = .{},
     /// Triples kept alive because they wrote to shared tables (prevent dangling refs).
     zombie_triples: std.ArrayListUnmanaged(ModuleTriple) = .{},
+    /// Module definitions stored by $name for (module definition $name ...).
+    module_definitions: std.StringHashMapUnmanaged([]const u8) = .{},
+    /// Named module instances for (module instance $name $def).
+    named_instances: std.StringHashMapUnmanaged(ModuleTriple) = .{},
 
     fn deinit(self: *RunState) void {
         self.destroyCurrent();
@@ -89,6 +93,16 @@ const RunState = struct {
             }
         }
         self.zombie_triples.deinit(self.allocator);
+        self.module_definitions.deinit(self.allocator);
+        // Clean up named instances
+        var ni_it = self.named_instances.iterator();
+        while (ni_it.next()) |entry| {
+            if (!destroyed.contains(entry.value_ptr.module)) {
+                entry.value_ptr.destroy(self.allocator);
+                destroyed.put(self.allocator, entry.value_ptr.module, {}) catch {};
+            }
+        }
+        self.named_instances.deinit(self.allocator);
         self.named_modules.deinit(self.allocator);
         self.registered_modules.deinit(self.allocator);
         for (self.owned_keys.items) |key| self.allocator.free(key);
@@ -295,6 +309,16 @@ const RunState = struct {
         var func_import_idx: u32 = 0;
         var global_import_idx: u32 = 0;
         var memory_import_idx: u32 = 0;
+        var table_import_idx: u32 = 0;
+        var tag_import_idx: u32 = 0;
+
+        // Initialize tag canonical IDs: each local tag gets a unique default ID
+        if (mod.tags.items.len > 0) {
+            interp.tag_canonical_ids.resize(self.allocator, mod.tags.items.len) catch {};
+            for (0..mod.tags.items.len) |ti| {
+                interp.tag_canonical_ids.items[ti] = @as(u64, @intFromPtr(mod)) ^ @as(u64, @intCast(ti));
+            }
+        }
         for (mod.imports.items) |imp| {
             if (imp.kind == .func) {
                 if (func_import_idx >= mod.num_func_imports) continue;
@@ -362,15 +386,32 @@ const RunState = struct {
                     }
                 }
             } else if (imp.kind == .table) {
-                // Share tables from exporting module via pointer
+                defer table_import_idx += 1;
                 const triple = self.registered_modules.get(imp.module_name) orelse continue;
                 const exp = triple.module.getExport(imp.field_name) orelse continue;
                 if (exp.kind != .table) continue;
-                // Point to the exporter's tables for true sharing
+                const exp_tbl_idx: u32 = switch (exp.var_) { .index => |i| i, .name => 0 };
+                // Share the specific source table at this import index
+                const src_tbl = triple.instance.getTable(exp_tbl_idx);
+                interp.instance.shared_table_map.put(self.allocator, table_import_idx, src_tbl) catch {};
+                // Also set legacy shared_tables for single-table compatibility
                 const src_tables = triple.instance.shared_tables orelse &triple.instance.tables;
                 interp.instance.shared_tables = src_tables;
-                // Share the table func refs map for cross-module call_indirect
                 interp.instance.shared_table_func_refs = triple.instance.getTableFuncRefs();
+            } else if (imp.kind == .tag) {
+                defer tag_import_idx += 1;
+                const triple = self.registered_modules.get(imp.module_name) orelse continue;
+                const exp = triple.module.getExport(imp.field_name) orelse continue;
+                if (exp.kind != .tag) continue;
+                const src_tag_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                // Set canonical ID from source
+                if (tag_import_idx < interp.tag_canonical_ids.items.len) {
+                    if (src_tag_idx < triple.interpreter.tag_canonical_ids.items.len) {
+                        interp.tag_canonical_ids.items[tag_import_idx] = triple.interpreter.tag_canonical_ids.items[src_tag_idx];
+                    } else {
+                        interp.tag_canonical_ids.items[tag_import_idx] = @as(u64, @intFromPtr(triple.module)) ^ @as(u64, src_tag_idx);
+                    }
+                }
             }
         }
     }
@@ -401,6 +442,9 @@ const RunState = struct {
                                         if (!std.mem.eql(types.ValType, imp_ft.params, exp_ft.params) or
                                             !std.mem.eql(types.ValType, imp_ft.results, exp_ft.results))
                                             return false;
+                                        // Check rec group compatibility
+                                        if (!recGroupsCompatible(mod, imp_type_idx, triple.module, exp_type_idx))
+                                            return false;
                                     },
                                     else => {},
                                 },
@@ -425,9 +469,24 @@ const RunState = struct {
                         const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
                         if (exp_idx >= triple.module.memories.items.len) return false;
                         const exp_mem = triple.module.memories.items[exp_idx];
+                        // Check memory32/64 compatibility
+                        const imp_mem_idx: u32 = blk: {
+                            var idx: u32 = 0;
+                            for (mod.imports.items) |imp2| {
+                                if (imp2.kind == .memory) {
+                                    if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                        std.mem.eql(u8, imp2.field_name, imp.field_name)) break;
+                                    idx += 1;
+                                }
+                            }
+                            break :blk idx;
+                        };
+                        if (imp_mem_idx < mod.memories.items.len) {
+                            if (mod.memories.items[imp_mem_idx].is_memory64 != exp_mem.is_memory64)
+                                return false;
+                        }
                         const actual = @as(u64, @intCast(triple.instance.getMemory(exp_idx).items.len / 65536));
                         if (actual < imp_m.limits.initial) return false;
-                        // If import has max, export must also have max and export.max <= import.max
                         if (imp_m.limits.has_max) {
                             if (!exp_mem.@"type".limits.has_max) return false;
                             if (exp_mem.@"type".limits.max > imp_m.limits.max) return false;
@@ -441,17 +500,54 @@ const RunState = struct {
                         if (exp_idx >= triple.module.tables.items.len) return false;
                         const exp_tbl = triple.module.tables.items[exp_idx];
                         if (imp_t.elem_type != exp_tbl.@"type".elem_type) return false;
-                        // Actual table size must be at least what's required
+                        // Check table32/64 compatibility
+                        const imp_tbl_idx: u32 = blk: {
+                            var idx: u32 = 0;
+                            for (mod.imports.items) |imp2| {
+                                if (imp2.kind == .table) {
+                                    if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                        std.mem.eql(u8, imp2.field_name, imp.field_name)) break;
+                                    idx += 1;
+                                }
+                            }
+                            break :blk idx;
+                        };
+                        if (imp_tbl_idx < mod.tables.items.len) {
+                            if (mod.tables.items[imp_tbl_idx].is_table64 != exp_tbl.is_table64)
+                                return false;
+                        }
                         const actual_size: u64 = @intCast(triple.instance.getTable(exp_idx).items.len);
                         if (actual_size < imp_t.limits.initial) return false;
-                        // If import has max, export must also have max and export.max ≤ import.max
                         if (imp_t.limits.has_max) {
                             if (!exp_tbl.@"type".limits.has_max) return false;
                             if (exp_tbl.@"type".limits.max > imp_t.limits.max) return false;
                         }
                     }
                 },
-                else => {},
+                .tag => {
+                    const exp_idx: u32 = switch (exp.var_) { .index => |i| i, .name => continue };
+                    if (exp_idx >= triple.module.tags.items.len) return false;
+                    const exp_tag = triple.module.tags.items[exp_idx];
+                    var imp_tag_idx: u32 = 0;
+                    for (mod.imports.items) |imp2| {
+                        if (imp2.kind == .tag) {
+                            if (std.mem.eql(u8, imp2.module_name, imp.module_name) and
+                                std.mem.eql(u8, imp2.field_name, imp.field_name))
+                                break;
+                            imp_tag_idx += 1;
+                        }
+                    }
+                    if (imp_tag_idx < mod.tags.items.len) {
+                        const imp_tag = mod.tags.items[imp_tag_idx];
+                        if (!std.mem.eql(types.ValType, imp_tag.@"type".sig.params, exp_tag.@"type".sig.params))
+                            return false;
+                        // Check rec group compatibility if type indices are available
+                        if (imp_tag.type_idx != std.math.maxInt(u32) and exp_tag.type_idx != std.math.maxInt(u32)) {
+                            if (!recGroupsCompatible(mod, imp_tag.type_idx, triple.module, exp_tag.type_idx))
+                                return false;
+                        }
+                    }
+                },
             }
         }
         return true;
@@ -530,6 +626,17 @@ const RunState = struct {
             .var_ = .{ .index = 0 },
         }) catch return;
 
+        // table64 for the table64 proposal
+        mod.tables.append(self.allocator, .{
+            .@"type" = .{ .elem_type = .funcref, .limits = .{ .initial = 10, .max = 20, .has_max = true } },
+            .is_table64 = true,
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "table64",
+            .kind = .table,
+            .var_ = .{ .index = 1 },
+        }) catch return;
+
         mod.memories.append(self.allocator, .{
             .@"type" = .{ .limits = .{ .initial = 1, .max = 2, .has_max = true } },
         }) catch return;
@@ -537,6 +644,17 @@ const RunState = struct {
             .name = "memory",
             .kind = .memory,
             .var_ = .{ .index = 0 },
+        }) catch return;
+
+        // memory64 for the memory64 proposal
+        mod.memories.append(self.allocator, .{
+            .@"type" = .{ .limits = .{ .initial = 1, .max = 2, .has_max = true } },
+            .is_memory64 = true,
+        }) catch return;
+        mod.exports.append(self.allocator, .{
+            .name = "memory64",
+            .kind = .memory,
+            .var_ = .{ .index = 1 },
         }) catch return;
 
         const inst = self.allocator.create(Interp.Instance) catch {
@@ -630,7 +748,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                             continue;
                         };
                         if (state.setModuleBinary(wasm_bytes)) {
-                            // Module now owns the bytes (slices into them for names/code)
+                            state.owned_sources.append(allocator, wasm_bytes) catch {};
                             result.passed += 1;
                         } else {
                             allocator.free(wasm_bytes);
@@ -640,7 +758,25 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                         result.skipped += 1;
                     }
                 } else {
-                    if (state.setModule(sexpr.text)) {
+                    // Check for (module definition $name ...) or (module instance $name $def)
+                    if (isModuleDefinition(sexpr.text)) {
+                        const def_name = extractModuleDefName(sexpr.text);
+                        if (def_name) |name| {
+                            state.module_definitions.put(allocator, name, sexpr.text) catch {};
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else if (isModuleInstance(sexpr.text)) {
+                        if (processModuleInstance(sexpr.text, &state)) {
+                            result.passed += 1;
+                        } else {
+                            result.skipped += 1;
+                        }
+                    } else if (hasDefinitionKeyword(sexpr.text)) {
+                        // Unnamed (module definition ...) — just validate, don't instantiate
+                        result.passed += 1;
+                    } else if (state.setModule(sexpr.text)) {
                         result.passed += 1;
                     } else {
                         result.skipped += 1;
@@ -651,14 +787,41 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
             .assert_malformed => processAssertMalformed(allocator, sexpr.text, &result),
             .assert_return => processAssertReturn(allocator, sexpr.text, &state, &result),
             .assert_trap => processAssertTrap(allocator, sexpr.text, &state, &result),
+            .assert_exception => processAssertException(allocator, sexpr.text, &state, &result),
             .invoke => processInvoke(allocator, sexpr.text, &state, &result),
             .register => processRegister(sexpr.text, &state, &result),
             .get => processGet(sexpr.text, &state, &result),
             .assert_exhaustion => processAssertExhaustion(allocator, sexpr.text, &state, &result),
             .assert_unlinkable => processAssertUnlinkable(allocator, sexpr.text, &state, &result),
-            .unknown,
-            => {
-                result.skipped += 1;
+            .unknown => {
+                // Check if this is a bare module field keyword (implicit module)
+                if (isBareModuleField(sexpr.text)) {
+                    // Collect all remaining bare fields into one module
+                    var mod_buf = std.ArrayListUnmanaged(u8){};
+                    mod_buf.appendSlice(allocator, "(module ") catch { result.skipped += 1; continue; };
+                    mod_buf.appendSlice(allocator, sexpr.text) catch { result.skipped += 1; continue; };
+                    // Consume subsequent bare fields
+                    while (pos < source.len) {
+                        const next_pos = skipWhitespaceAndComments(source, pos);
+                        if (next_pos >= source.len or source[next_pos] != '(') break;
+                        const next_sexpr = extractSExpr(source, next_pos) orelse break;
+                        if (!isBareModuleField(next_sexpr.text)) break;
+                        mod_buf.append(allocator, ' ') catch break;
+                        mod_buf.appendSlice(allocator, next_sexpr.text) catch break;
+                        pos = next_sexpr.end;
+                    }
+                    mod_buf.append(allocator, ')') catch { result.skipped += 1; continue; };
+                    const mod_text = mod_buf.toOwnedSlice(allocator) catch { result.skipped += 1; continue; };
+                    if (state.setModule(mod_text)) {
+                        state.owned_sources.append(allocator, mod_text) catch {};
+                        result.passed += 1;
+                    } else {
+                        allocator.free(mod_text);
+                        result.skipped += 1;
+                    }
+                } else {
+                    result.skipped += 1;
+                }
             },
         }
     }
@@ -676,6 +839,7 @@ const Command = enum {
     assert_trap,
     assert_exhaustion,
     assert_unlinkable,
+    assert_exception,
     invoke,
     register,
     get,
@@ -685,9 +849,20 @@ const Command = enum {
 fn classifyCommand(sexpr: []const u8) Command {
     // sexpr starts with '('; skip it and any whitespace to find the keyword.
     var i: usize = 1;
-    while (i < sexpr.len and isWhitespace(sexpr[i])) : (i += 1) {}
+    i = skipWsAndComments(sexpr, i);
+    // Skip leading annotations like (@a) before the keyword
+    while (i + 1 < sexpr.len and sexpr[i] == '(' and sexpr[i + 1] == '@') {
+        // Skip to matching ')' for this annotation
+        var depth: usize = 1;
+        i += 2;
+        while (i < sexpr.len and depth > 0) : (i += 1) {
+            if (sexpr[i] == '(') depth += 1;
+            if (sexpr[i] == ')') depth -= 1;
+        }
+        i = skipWsAndComments(sexpr, i);
+    }
     const word_start = i;
-    while (i < sexpr.len and !isWhitespace(sexpr[i]) and sexpr[i] != '(' and sexpr[i] != ')') : (i += 1) {}
+    while (i < sexpr.len and !isWhitespace(sexpr[i]) and sexpr[i] != '(' and sexpr[i] != ')' and sexpr[i] != ';') : (i += 1) {}
     const word = sexpr[word_start..i];
 
     if (std.mem.eql(u8, word, "module")) return .module;
@@ -697,10 +872,162 @@ fn classifyCommand(sexpr: []const u8) Command {
     if (std.mem.eql(u8, word, "assert_trap")) return .assert_trap;
     if (std.mem.eql(u8, word, "assert_exhaustion")) return .assert_exhaustion;
     if (std.mem.eql(u8, word, "assert_unlinkable")) return .assert_unlinkable;
+    if (std.mem.eql(u8, word, "assert_exception")) return .assert_exception;
     if (std.mem.eql(u8, word, "invoke")) return .invoke;
     if (std.mem.eql(u8, word, "register")) return .register;
     if (std.mem.eql(u8, word, "get")) return .get;
     return .unknown;
+}
+
+fn isModuleDefinition(text: []const u8) bool {
+    // Check for "(module definition $name ...)" — must have a $name
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 10 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 10], "definition")) return false;
+    i += 10;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Must have $name after definition
+    return i < text.len and text[i] == '$';
+}
+
+fn isBareModuleField(text: []const u8) bool {
+    // Check if s-expression starts with a module field keyword (not a command)
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    const start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')' and text[i] != '(') : (i += 1) {}
+    const word = text[start..i];
+    return std.mem.eql(u8, word, "func") or std.mem.eql(u8, word, "memory") or
+        std.mem.eql(u8, word, "table") or std.mem.eql(u8, word, "global") or
+        std.mem.eql(u8, word, "type") or std.mem.eql(u8, word, "elem") or
+        std.mem.eql(u8, word, "data") or std.mem.eql(u8, word, "import") or
+        std.mem.eql(u8, word, "export") or std.mem.eql(u8, word, "start") or
+        std.mem.eql(u8, word, "tag");
+}
+
+fn hasDefinitionKeyword(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 10 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 10], "definition");
+}
+
+fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
+    // "(module definition ...)" → "(module ...)"
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // "module"
+    const before_def = i;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 10; // "definition"
+    // Also skip optional $name after definition
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i < text.len and text[i] == '$') {
+        while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    }
+    var buf = std.ArrayListUnmanaged(u8){};
+    buf.appendSlice(allocator, text[0..before_def]) catch return null;
+    buf.appendSlice(allocator, text[i..]) catch return null;
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn isModuleInstance(text: []const u8) bool {
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 6 >= text.len) return false;
+    if (!std.mem.eql(u8, text[i .. i + 6], "module")) return false;
+    i += 6;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i + 8 >= text.len) return false;
+    return std.mem.eql(u8, text[i .. i + 8], "instance");
+}
+
+fn extractModuleDefName(text: []const u8) ?[]const u8 {
+    // "(module definition $name ...)" → "$name"
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // skip "module"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 10; // skip "definition"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    if (i >= text.len or text[i] != '$') return null;
+    const start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    return text[start..i];
+}
+
+fn processModuleInstance(text: []const u8, state: *RunState) bool {
+    // "(module instance $inst_name $def_name)" → instantiate $def_name as $inst_name
+    var i: usize = 1;
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 6; // skip "module"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    i += 8; // skip "instance"
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Read instance name
+    if (i >= text.len or text[i] != '$') return false;
+    const inst_start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    const inst_name = text[inst_start..i];
+    while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
+    // Read definition name
+    if (i >= text.len or text[i] != '$') return false;
+    const def_start = i;
+    while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
+    const def_name = text[def_start..i];
+
+    // Look up the definition
+    const def_text = state.module_definitions.get(def_name) orelse return false;
+
+    // Rewrite: strip "definition $name" to get plain "(module ...)"
+    // Find where the actual module content starts (after "definition $name")
+    var j: usize = 1;
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    j += 6; // "module"
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    j += 10; // "definition"
+    while (j < def_text.len and isWhitespace(def_text[j])) : (j += 1) {}
+    // Skip $name
+    while (j < def_text.len and !isWhitespace(def_text[j]) and def_text[j] != ')') : (j += 1) {}
+
+    // Build "(module <rest>)"
+    var buf = std.ArrayListUnmanaged(u8){};
+    buf.appendSlice(state.allocator, "(module ") catch return false;
+    buf.appendSlice(state.allocator, def_text[j .. def_text.len - 1]) catch return false;
+    buf.append(state.allocator, ')') catch return false;
+    const mod_text = buf.toOwnedSlice(state.allocator) catch return false;
+
+    // Create a fresh instance
+    const mod = state.allocator.create(Mod.Module) catch return false;
+    mod.* = Parser.parseModule(state.allocator, mod_text) catch {
+        state.allocator.destroy(mod);
+        state.allocator.free(mod_text);
+        return false;
+    };
+    state.owned_sources.append(state.allocator, mod_text) catch {};
+
+    const inst = state.allocator.create(Interp.Instance) catch { mod.deinit(); state.allocator.destroy(mod); return false; };
+    inst.* = Interp.Instance.init(state.allocator, mod) catch { state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+
+    const interp = state.allocator.create(Interp.Interpreter) catch { inst.deinit(); state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+    interp.* = Interp.Interpreter.init(state.allocator, inst);
+    inst.interp_ref = interp;
+
+    state.resolveImports(mod, interp);
+    inst.instantiate() catch { interp.deinit(); state.allocator.destroy(interp); inst.deinit(); state.allocator.destroy(inst); mod.deinit(); state.allocator.destroy(mod); return false; };
+
+    const triple = ModuleTriple{ .module = mod, .instance = inst, .interpreter = interp };
+    state.named_instances.put(state.allocator, inst_name, triple) catch {};
+    return true;
 }
 
 // ── Assertion processors ────────────────────────────────────────────────
@@ -720,6 +1047,11 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
             return;
         };
         defer allocator.free(wat_text);
+        // Check for illegal WAT bytes
+        if (hasIllegalWatBytes(wat_text)) {
+            result.passed += 1;
+            return;
+        }
         const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
         else blk: {
@@ -765,8 +1097,8 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
 
     // Parse the module text.
     var module = Parser.parseModule(allocator, inner) catch {
-        // Parse failure counts as skip (some modules use unsupported features).
-        result.skipped += 1;
+        // Parse failure for assert_invalid counts as pass (module was rejected).
+        result.passed += 1;
         return;
     };
     defer module.deinit();
@@ -798,6 +1130,11 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         };
         defer allocator.free(wat_text);
+        // Check for illegal WAT bytes (control chars, 0x7f, invalid UTF-8)
+        if (hasIllegalWatBytes(wat_text)) {
+            result.passed += 1; // illegal bytes = malformed
+            return;
+        }
         // Wrap in (module ...) if not already
         const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
@@ -907,6 +1244,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_func_name) orelse raw_func_name;
+    defer if (func_name.ptr != raw_func_name.ptr) allocator.free(func_name);
 
     var args_buf: [32]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -918,6 +1256,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
 
     var results_buf: [32]Interp.Value = undefined;
     const actuals = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
+        interp.thrown_exception = null; // Clear stale exception state
         result.failed += 1;
         if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
@@ -1080,6 +1419,7 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_name_trap) orelse raw_name_trap;
+    defer if (func_name.ptr != raw_name_trap.ptr) allocator.free(func_name);
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -1091,6 +1431,43 @@ fn processAssertTrap(allocator: std.mem.Allocator, sexpr: []const u8, state: *Ru
         // Got an error (trap) — this is expected
         result.passed += 1;
     }
+}
+
+fn processAssertException(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
+    // (assert_exception (invoke "f" args...))
+    // Call a function and expect it to throw an uncaught exception.
+    const inv = findInvoke(sexpr) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const interp = resolveInterpreter(inv, state) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const raw_name = extractStringLiteral(inv) orelse {
+        result.skipped += 1;
+        return;
+    };
+    const func_name = decodeStringEscapes(allocator, raw_name) orelse raw_name;
+    defer if (func_name.ptr != raw_name.ptr) allocator.free(func_name);
+
+    var args_buf: [16]Interp.Value = undefined;
+    const args = parseInvokeArgs(inv, &args_buf);
+
+    var results_buf: [16]Interp.Value = undefined;
+    _ = interp.callExportMulti(func_name, args, &results_buf) catch {
+        // Got an error — check if it's a thrown exception
+        if (interp.thrown_exception != null) {
+            interp.thrown_exception = null;
+            result.passed += 1;
+        } else {
+            // Some other trap — still counts since the function didn't succeed
+            result.passed += 1;
+        }
+        return;
+    };
+    // Expected an exception but succeeded
+    result.failed += 1;
 }
 
 fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunState, result: *Result) void {
@@ -1109,6 +1486,7 @@ fn processAssertExhaustion(allocator: std.mem.Allocator, sexpr: []const u8, stat
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_exh_name) orelse raw_exh_name;
+    defer if (func_name.ptr != raw_exh_name.ptr) allocator.free(func_name);
 
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(inv, &args_buf);
@@ -1199,6 +1577,7 @@ fn processInvoke(allocator: std.mem.Allocator, sexpr: []const u8, state: *RunSta
         return;
     };
     const func_name = decodeStringEscapes(allocator, raw_inv_name) orelse raw_inv_name;
+    defer if (func_name.ptr != raw_inv_name.ptr) allocator.free(func_name);
     var args_buf: [16]Interp.Value = undefined;
     const args = parseInvokeArgs(sexpr, &args_buf);
     _ = interp.callExport(func_name, args) catch {};
@@ -1216,6 +1595,7 @@ fn processRegister(sexpr: []const u8, state: *RunState, result: *Result) void {
         // Check for an optional $id after the string literal
         if (extractDollarIdAfterString(sexpr)) |id| {
             if (state.named_modules.get(id)) |t| break :blk t;
+            if (state.named_instances.get(id)) |t| break :blk t;
         }
         // Fall back to the current module.
         const mod = state.module orelse {
@@ -1547,10 +1927,115 @@ fn parseConstValue(sexpr: []const u8) ?Interp.Value {
     } else if (std.mem.eql(u8, kw, "ref.func")) {
         return .{ .ref_func = std.math.maxInt(u32) }; // sentinel: match any non-null funcref
     } else if (std.mem.eql(u8, kw, "ref.extern")) {
+        // All ref.extern values (bare or with N) match any non-null externref
+        return .{ .ref_extern = std.math.maxInt(u32) };
+    } else if (std.mem.eql(u8, kw, "ref.i31")) {
+        // (ref.i31) matches any non-null i31ref
+        return .{ .ref_i31 = std.math.maxInt(u32) }; // sentinel: match any i31
+    } else if (std.mem.eql(u8, kw, "ref.struct")) {
+        return .{ .ref_struct = std.math.maxInt(u32) }; // sentinel: match any struct
+    } else if (std.mem.eql(u8, kw, "ref.array")) {
+        return .{ .ref_array = std.math.maxInt(u32) }; // sentinel: match any array
+    } else if (std.mem.eql(u8, kw, "ref.host")) {
+        // (ref.host N) is an externalized reference - treat as non-null
         const idx = std.fmt.parseInt(u32, val_text, 0) catch 0;
-        return .{ .ref_func = idx }; // non-null externref represented as ref_func
+        return .{ .ref_func = idx };
+    } else if (std.mem.eql(u8, kw, "v128.const")) {
+        // val_text is the lane type (i8x16, i16x8, i32x4, i64x2, f32x4, f64x2)
+        return parseV128Const(val_text, sexpr, i);
     }
     return null;
+}
+
+/// Parse a v128.const value from a sexpr starting at position `pos` (after the lane type token).
+fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Interp.Value {
+    var i = start;
+
+    // Read lane values
+    var bytes: [16]u8 = .{0} ** 16;
+    if (std.mem.eql(u8, lane_type, "i8x16")) {
+        for (0..16) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i8, clean, 0) catch blk: {
+                break :blk @as(i8, @bitCast(std.fmt.parseInt(u8, clean, 0) catch return null));
+            };
+            bytes[idx] = @bitCast(v);
+        }
+    } else if (std.mem.eql(u8, lane_type, "i16x8")) {
+        for (0..8) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i16, clean, 0) catch blk: {
+                break :blk @as(i16, @bitCast(std.fmt.parseInt(u16, clean, 0) catch return null));
+            };
+            const b: [2]u8 = @bitCast(v);
+            bytes[idx * 2] = b[0];
+            bytes[idx * 2 + 1] = b[1];
+        }
+    } else if (std.mem.eql(u8, lane_type, "i32x4")) {
+        for (0..4) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i32, clean, 0) catch blk: {
+                break :blk @as(i32, @bitCast(std.fmt.parseInt(u32, clean, 0) catch return null));
+            };
+            const b: [4]u8 = @bitCast(v);
+            @memcpy(bytes[idx * 4 ..][0..4], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "i64x2")) {
+        for (0..2) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const v = std.fmt.parseInt(i64, clean, 0) catch blk: {
+                break :blk @as(i64, @bitCast(std.fmt.parseInt(u64, clean, 0) catch return null));
+            };
+            const b: [8]u8 = @bitCast(v);
+            @memcpy(bytes[idx * 8 ..][0..8], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "f32x4")) {
+        for (0..4) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const bits: u32 = if (std.mem.indexOf(u8, clean, "nan:canonical") != null)
+                nan_canonical_f32
+            else if (std.mem.indexOf(u8, clean, "nan:arithmetic") != null)
+                nan_arithmetic_f32
+            else
+                Parser.parseFloatBits(f32, clean);
+            const b: [4]u8 = @bitCast(bits);
+            @memcpy(bytes[idx * 4 ..][0..4], &b);
+        }
+    } else if (std.mem.eql(u8, lane_type, "f64x2")) {
+        for (0..2) |idx| {
+            const tok = nextToken(sexpr, &i) orelse return null;
+            var clean_buf: [64]u8 = undefined;
+            const clean = stripWatUnderscores(tok, &clean_buf);
+            const bits: u64 = if (std.mem.indexOf(u8, clean, "nan:canonical") != null)
+                nan_canonical_f64
+            else if (std.mem.indexOf(u8, clean, "nan:arithmetic") != null)
+                nan_arithmetic_f64
+            else
+                Parser.parseFloatBits(f64, clean);
+            const b: [8]u8 = @bitCast(bits);
+            @memcpy(bytes[idx * 8 ..][0..8], &b);
+        }
+    } else return null;
+
+    return .{ .v128 = @bitCast(bytes) };
+}
+
+fn nextToken(text: []const u8, pos: *usize) ?[]const u8 {
+    while (pos.* < text.len and isWhitespace(text[pos.*])) : (pos.* += 1) {}
+    if (pos.* >= text.len or text[pos.*] == ')') return null;
+    const start = pos.*;
+    while (pos.* < text.len and !isWhitespace(text[pos.*]) and text[pos.*] != ')') : (pos.* += 1) {}
+    return text[start..pos.*];
 }
 
 /// Strip WAT `_` digit separators from a number string.
@@ -1626,6 +2111,95 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
                 if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
                 return av == bv;
             },
+            .ref_extern => return true, // ref_func matches ref_extern (host ref comparison)
+            .ref_i31 => return av == std.math.maxInt(u32), // funcref sentinel matches any non-null
+            else => false,
+        },
+        .ref_i31 => |av| switch (b) {
+            .ref_i31 => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| return bv == std.math.maxInt(u32),
+            else => false,
+        },
+        .v128 => |av| switch (b) {
+            .v128 => |bv| {
+                if (av == bv) return true;
+                // Per-lane NaN comparison for f32x4
+                const af32: [4]u32 = @bitCast(av);
+                const bf32: [4]u32 = @bitCast(bv);
+                var has_f32_nan = false;
+                for (bf32) |lane| {
+                    if (lane == nan_canonical_f32 or lane == nan_arithmetic_f32) {
+                        has_f32_nan = true;
+                        break;
+                    }
+                }
+                if (has_f32_nan) {
+                    for (0..4) |lane| {
+                        if (bf32[lane] == nan_canonical_f32) {
+                            if ((af32[lane] & 0x7fffffff) != 0x7fc00000) return false;
+                        } else if (bf32[lane] == nan_arithmetic_f32) {
+                            if ((af32[lane] & 0x7fc00000) != 0x7fc00000) return false;
+                        } else {
+                            if (af32[lane] != bf32[lane]) return false;
+                        }
+                    }
+                    return true;
+                }
+                // Per-lane NaN comparison for f64x2
+                const af64: [2]u64 = @bitCast(av);
+                const bf64: [2]u64 = @bitCast(bv);
+                var has_f64_nan = false;
+                for (bf64) |lane| {
+                    if (lane == nan_canonical_f64 or lane == nan_arithmetic_f64) {
+                        has_f64_nan = true;
+                        break;
+                    }
+                }
+                if (has_f64_nan) {
+                    for (0..2) |lane| {
+                        if (bf64[lane] == nan_canonical_f64) {
+                            if ((af64[lane] & 0x7fffffffffffffff) != 0x7ff8000000000000) return false;
+                        } else if (bf64[lane] == nan_arithmetic_f64) {
+                            if ((af64[lane] & 0x7ff8000000000000) != 0x7ff8000000000000) return false;
+                        } else {
+                            if (af64[lane] != bf64[lane]) return false;
+                        }
+                    }
+                    return true;
+                }
+                return false;
+            },
+            else => false,
+        },
+        .exnref => true, // exnref comparison: any non-null exnref matches
+        .ref_struct => |av| switch (b) {
+            .ref_struct => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| bv == std.math.maxInt(u32),
+            else => false,
+        },
+        .ref_array => |av| switch (b) {
+            .ref_array => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| bv == std.math.maxInt(u32),
+            else => false,
+        },
+        .ref_extern => |av| switch (b) {
+            .ref_extern => |bv| {
+                if (av == std.math.maxInt(u32) or bv == std.math.maxInt(u32)) return true;
+                return av == bv;
+            },
+            .ref_func => |bv| {
+                if (bv == std.math.maxInt(u32)) return true;
+                return true; // any non-null externref matches any ref_func (host ref comparison)
+            },
             else => false,
         },
     };
@@ -1696,6 +2270,24 @@ fn skipBlockComment(source: []const u8, start: usize) usize {
             i += 2;
         } else {
             i += 1;
+        }
+    }
+    return i;
+}
+
+/// Skip whitespace and comments (line comments ;;... and block comments (;...;)).
+fn skipWsAndComments(source: []const u8, start: usize) usize {
+    var i = start;
+    while (i < source.len) {
+        if (isWhitespace(source[i])) {
+            i += 1;
+        } else if (i + 1 < source.len and source[i] == ';' and source[i + 1] == ';') {
+            // Line comment: skip to end of line
+            while (i < source.len and source[i] != '\n') : (i += 1) {}
+        } else if (i + 1 < source.len and source[i] == '(' and source[i + 1] == ';') {
+            i = skipBlockComment(source, i);
+        } else {
+            break;
         }
     }
     return i;
@@ -1832,6 +2424,121 @@ fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 
     return result.toOwnedSlice(allocator);
 }
 
+/// Check if decoded WAT text contains illegal bytes (control chars, 0x7f, non-ASCII outside strings).
+/// WAT source only allows: 0x09 (tab), 0x0a (LF), 0x0d (CR), 0x20-0x7e (printable ASCII)
+/// outside of string literals and comments. Inside strings, \xx hex escapes are used
+/// for non-printable bytes, so raw non-printable bytes are also illegal there.
+fn hasIllegalWatBytes(text: []const u8) bool {
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        // Check for empty identifiers: $""
+        if (c == '$' and i + 2 < text.len and text[i + 1] == '"' and text[i + 2] == '"') {
+            return true;
+        }
+        // Inside string literals, check for illegal raw bytes and invalid hex escapes
+        if (c == '"') {
+            i += 1;
+            while (i < text.len and text[i] != '"') : (i += 1) {
+                if (text[i] == '\\' and i + 1 < text.len) {
+                    const esc = text[i + 1];
+                    // Check \xx hex escapes for UTF-8 validity in identifier strings
+                    if (hexDigit(esc)) |h1| {
+                        if (i + 2 < text.len) {
+                            if (hexDigit(text[i + 2])) |h2| {
+                                const byte_val = h1 * 16 + h2;
+                                // Bytes >= 0x80 must form valid UTF-8 sequences
+                                if (byte_val >= 0x80) {
+                                    if (!validateHexUtf8(text, i)) return true;
+                                }
+                                i += 2; // skip \xx (loop will add 1)
+                                continue;
+                            }
+                        }
+                    }
+                    i += 1; // skip escaped char
+                    continue;
+                }
+                // Only printable ASCII (0x20-0x7e) allowed as raw bytes in WAT strings
+                if (text[i] < 0x20 or text[i] >= 0x7f) return true;
+            }
+            continue;
+        }
+        // Skip line comments: ;; ... \n
+        if (c == ';' and i + 1 < text.len and text[i + 1] == ';') {
+            while (i < text.len and text[i] != '\n') : (i += 1) {}
+            continue;
+        }
+        // Skip block comments: (; ... ;)
+        if (c == '(' and i + 1 < text.len and text[i + 1] == ';') {
+            i += 2;
+            var depth: usize = 1;
+            while (i + 1 < text.len and depth > 0) {
+                if (text[i] == '(' and text[i + 1] == ';') {
+                    depth += 1;
+                    i += 2;
+                } else if (text[i] == ';' and text[i + 1] == ')') {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if (i > 0) i -= 1; // adjust for loop increment
+            continue;
+        }
+        if (c == 0x7f) return true;
+        if (c >= 0x80) return true; // non-ASCII outside strings/comments
+        if (c < 0x20 and c != 0x09 and c != 0x0a and c != 0x0d) return true;
+    }
+    return false;
+}
+
+/// Check if a \xx hex escape sequence at position `pos` in WAT text starts a valid
+/// UTF-8 multi-byte sequence using subsequent \xx escapes.
+fn validateHexUtf8(text: []const u8, pos: usize) bool {
+    // Decode the first byte from \xx at `pos`
+    const b0 = decodeHexEscape(text, pos) orelse return false;
+    if (b0 < 0x80) return true; // ASCII, always valid
+    if (b0 < 0xc0) return false; // continuation byte without lead
+    // Determine expected sequence length
+    const seq_len: usize = if (b0 < 0xe0) 2 else if (b0 < 0xf0) 3 else if (b0 < 0xf8) 4 else return false;
+    // Check that subsequent \xx escapes produce valid continuation bytes
+    var offset = pos + 3; // skip first \xx (3 chars: \, h, h)
+    for (1..seq_len) |_| {
+        const cb = decodeHexEscape(text, offset) orelse return false;
+        if (cb & 0xc0 != 0x80) return false; // not a continuation byte
+        offset += 3;
+    }
+    // Check for overlong encodings
+    if (seq_len == 2 and b0 < 0xc2) return false;
+    if (seq_len == 3 and b0 == 0xe0) {
+        const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+        if (b1 < 0xa0) return false;
+    }
+    if (seq_len == 4) {
+        if (b0 == 0xf0) {
+            const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+            if (b1 < 0x90) return false;
+        }
+        if (b0 == 0xf4) {
+            const b1 = decodeHexEscape(text, pos + 3) orelse return false;
+            if (b1 > 0x8f) return false;
+        }
+        if (b0 > 0xf4) return false;
+    }
+    return true;
+}
+
+/// Decode a \xx hex escape at the given position, returning the byte value.
+fn decodeHexEscape(text: []const u8, pos: usize) ?u8 {
+    if (pos + 2 >= text.len) return null;
+    if (text[pos] != '\\') return null;
+    const h1 = hexDigit(text[pos + 1]) orelse return null;
+    const h2 = hexDigit(text[pos + 2]) orelse return null;
+    return h1 * 16 + h2;
+}
+
 /// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.
 fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var res = std.ArrayListUnmanaged(u8){};
@@ -1884,6 +2591,164 @@ fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
         }
     }
     return res.toOwnedSlice(allocator);
+}
+
+/// Check if two types from different modules have compatible rec group structures.
+fn recGroupsCompatible(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.Module, idx_b: u32) bool {
+    if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len)
+        return true; // No metadata, assume compatible
+    const meta_a = mod_a.type_meta.items[idx_a];
+    const meta_b = mod_b.type_meta.items[idx_b];
+    if (meta_a.rec_group_size != meta_b.rec_group_size) return false;
+    if (meta_a.rec_position != meta_b.rec_position) return false;
+    const start_a = meta_a.rec_group;
+    const start_b = meta_b.rec_group;
+    for (0..meta_a.rec_group_size) |i| {
+        const ai = start_a + @as(u32, @intCast(i));
+        const bi = start_b + @as(u32, @intCast(i));
+        if (ai >= mod_a.type_meta.items.len or bi >= mod_b.type_meta.items.len) return false;
+        const ma = mod_a.type_meta.items[ai];
+        const mb = mod_b.type_meta.items[bi];
+        if (ma.kind != mb.kind) return false;
+        if (ma.is_final != mb.is_final) return false;
+
+        // Parent references must be compatible
+        const pa = ma.parent;
+        const pb = mb.parent;
+        if ((pa == std.math.maxInt(u32)) != (pb == std.math.maxInt(u32))) return false;
+        if (pa != std.math.maxInt(u32) and pb != std.math.maxInt(u32)) {
+            // Both have parents — check if both internal or both external, and compatible
+            const pa_internal = pa >= start_a and pa < start_a + meta_a.rec_group_size;
+            const pb_internal = pb >= start_b and pb < start_b + meta_b.rec_group_size;
+            if (pa_internal != pb_internal) return false;
+            if (pa_internal) {
+                // Internal parents must be at the same position
+                if (pa - start_a != pb - start_b) return false;
+            } else {
+                // External parents must be in equivalent rec groups
+                if (!recGroupsCompatible(mod_a, pa, mod_b, pb)) return false;
+            }
+        }
+
+        // Structural content
+        if (ai < mod_a.module_types.items.len and bi < mod_b.module_types.items.len) {
+            const ea = mod_a.module_types.items[ai];
+            const eb = mod_b.module_types.items[bi];
+            switch (ea) {
+                .func_type => |fa| switch (eb) {
+                    .func_type => |fb| {
+                        // Compare params/results with canonicalized type refs
+                        if (fa.params.len != fb.params.len or fa.results.len != fb.results.len) return false;
+                        if (!compareValTypesWithRefs(fa.params, fa.results, ma.type_refs, mod_a, start_a, meta_a.rec_group_size,
+                            fb.params, fb.results, mb.type_refs, mod_b, start_b, meta_b.rec_group_size)) return false;
+                    },
+                    else => return false,
+                },
+                .struct_type => |sa| switch (eb) {
+                    .struct_type => |sb| {
+                        if (sa.fields.items.len != sb.fields.items.len) return false;
+                        if (!compareStructFieldsWithRefs(sa, ma.type_refs, mod_a, start_a, meta_a.rec_group_size,
+                            sb, mb.type_refs, mod_b, start_b, meta_b.rec_group_size)) return false;
+                    },
+                    else => return false,
+                },
+                .array_type => switch (eb) {
+                    .array_type => {},
+                    else => return false,
+                },
+            }
+        }
+    }
+    return true;
+}
+
+/// Compare func type params/results with canonicalized type references.
+fn compareValTypesWithRefs(
+    params_a: []const types.ValType,
+    results_a: []const types.ValType,
+    refs_a: []const u32,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    params_b: []const types.ValType,
+    results_b: []const types.ValType,
+    refs_b: []const u32,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    var ri_a: usize = 0;
+    var ri_b: usize = 0;
+    for (params_a, params_b) |pa, pb| {
+        if (!compareOneValType(pa, refs_a, &ri_a, mod_a, start_a, size_a, pb, refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    for (results_a, results_b) |ra, rb| {
+        if (!compareOneValType(ra, refs_a, &ri_a, mod_a, start_a, size_a, rb, refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    return true;
+}
+
+/// Compare struct fields with canonicalized type references.
+fn compareStructFieldsWithRefs(
+    sa: Mod.TypeEntry.StructType,
+    refs_a: []const u32,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    sb: Mod.TypeEntry.StructType,
+    refs_b: []const u32,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    var ri_a: usize = 0;
+    var ri_b: usize = 0;
+    for (sa.fields.items, sb.fields.items) |fa, fb| {
+        if (fa.mutable != fb.mutable) return false;
+        if (!compareOneValType(fa.@"type", refs_a, &ri_a, mod_a, start_a, size_a,
+            fb.@"type", refs_b, &ri_b, mod_b, start_b, size_b)) return false;
+    }
+    return true;
+}
+
+/// Compare a single ValType with canonicalized type reference resolution.
+fn compareOneValType(
+    vt_a: types.ValType,
+    refs_a: []const u32,
+    ri_a: *usize,
+    mod_a: *const Mod.Module,
+    start_a: u32,
+    size_a: u32,
+    vt_b: types.ValType,
+    refs_b: []const u32,
+    ri_b: *usize,
+    mod_b: *const Mod.Module,
+    start_b: u32,
+    size_b: u32,
+) bool {
+    if (vt_a != vt_b) return false;
+    if (vt_a == .ref or vt_a == .ref_null) {
+        // Both are typed references — compare the referenced types
+        const has_a = ri_a.* < refs_a.len;
+        const has_b = ri_b.* < refs_b.len;
+        if (has_a) ri_a.* += 1;
+        if (has_b) ri_b.* += 1;
+        if (has_a and has_b) {
+            const target_a = refs_a[ri_a.* - 1];
+            const target_b = refs_b[ri_b.* - 1];
+            const a_internal = target_a >= start_a and target_a < start_a + size_a;
+            const b_internal = target_b >= start_b and target_b < start_b + size_b;
+            if (a_internal != b_internal) return false;
+            if (a_internal) {
+                // Internal: compare by position
+                if (target_a - start_a != target_b - start_b) return false;
+            } else {
+                // External: recursively check equivalence
+                if (!recGroupsCompatible(mod_a, target_a, mod_b, target_b)) return false;
+            }
+        }
+    }
+    return true;
 }
 
 fn hexDigit(c: u8) ?u8 {

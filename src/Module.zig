@@ -221,8 +221,10 @@ pub const Global = struct {
 pub const Table = struct {
     name: ?[]const u8 = null,
     @"type": types.TableType = .{},
+    init_expr_bytes: []const u8 = &.{},
     loc: Location = .{},
     is_import: bool = false,
+    is_table64: bool = false,
 };
 
 /// A defined or imported memory.
@@ -231,12 +233,14 @@ pub const Memory = struct {
     @"type": types.MemoryType = .{},
     loc: Location = .{},
     is_import: bool = false,
+    is_memory64: bool = false,
 };
 
 /// A defined or imported tag (exception-handling proposal).
 pub const Tag = struct {
     name: ?[]const u8 = null,
     @"type": types.TagType = .{},
+    type_idx: u32 = std.math.maxInt(u32),
     loc: Location = .{},
     is_import: bool = false,
 };
@@ -279,6 +283,26 @@ pub const Custom = struct {
     data: []const u8 = &.{},
 };
 
+/// Per-type metadata for GC subtyping validation.
+pub const TypeMeta = struct {
+    kind: Kind = .func,
+    is_sub: bool = false,
+    is_final: bool = true,
+    parent: u32 = std.math.maxInt(u32),
+    /// Rec group identifier (types in the same rec group share this).
+    rec_group: u32 = std.math.maxInt(u32),
+    /// Number of types in the rec group.
+    rec_group_size: u32 = 1,
+    /// Position within the rec group.
+    rec_position: u32 = 0,
+    /// Type indices referenced by this type's structural content (params/results/fields),
+    /// in order of appearance. Used for iso-recursive type canonicalization.
+    type_refs: []const u32 = &.{},
+    /// Canonical rec group ID — types in iso-recursively equivalent rec groups share this.
+    canonical_group: u32 = std.math.maxInt(u32),
+    pub const Kind = enum { func, struct_, array };
+};
+
 // ── Module ───────────────────────────────────────────────────────────────
 
 /// A parsed WebAssembly module — the main IR container.
@@ -289,6 +313,8 @@ pub const Module = struct {
 
     // Type section
     module_types: std.ArrayListUnmanaged(TypeEntry) = .{},
+    /// Per-type metadata for GC subtyping validation.
+    type_meta: std.ArrayListUnmanaged(TypeMeta) = .{},
 
     // Entity lists
     funcs: std.ArrayListUnmanaged(Func) = .{},
@@ -316,6 +342,9 @@ pub const Module = struct {
     has_data_count: bool = false,
     data_count: u32 = 0,
 
+    // Heap-allocated name strings (e.g. decoded escape sequences in import/export names).
+    owned_strings: std.ArrayListUnmanaged([]const u8) = .{},
+
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{ .allocator = allocator };
     }
@@ -327,10 +356,18 @@ pub const Module = struct {
                     if (ft.params.len > 0) self.allocator.free(ft.params);
                     if (ft.results.len > 0) self.allocator.free(ft.results);
                 },
+                .struct_type => |st| {
+                    var fields = st.fields;
+                    fields.deinit(self.allocator);
+                },
                 else => {},
             }
         }
         self.module_types.deinit(self.allocator);
+        for (self.type_meta.items) |tm| {
+            if (tm.type_refs.len > 0) self.allocator.free(tm.type_refs);
+        }
+        self.type_meta.deinit(self.allocator);
         for (self.funcs.items) |*func| {
             func.local_types.deinit(self.allocator);
             if (func.owns_code_bytes and func.code_bytes.len > 0) {
@@ -346,6 +383,10 @@ pub const Module = struct {
             }
         }
         self.globals.deinit(self.allocator);
+        for (self.tags.items) |tag| {
+            if (tag.@"type".sig.params.len > 0) self.allocator.free(tag.@"type".sig.params);
+            if (tag.@"type".sig.results.len > 0) self.allocator.free(tag.@"type".sig.results);
+        }
         self.tags.deinit(self.allocator);
         self.imports.deinit(self.allocator);
         self.exports.deinit(self.allocator);
@@ -369,6 +410,8 @@ pub const Module = struct {
         }
         self.data_segments.deinit(self.allocator);
         self.customs.deinit(self.allocator);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
     }
 
     /// Get the total number of functions (imports + defined).

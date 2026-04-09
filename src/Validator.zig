@@ -46,6 +46,7 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkTables(module, options);
     try checkMemories(module, options);
     try checkGlobals(module);
+    try checkTags(module);
     try checkExports(module);
     try checkStart(module);
     try checkElemSegments(module);
@@ -67,6 +68,94 @@ fn checkTypes(m: *const Mod.Module) Error!void {
                 }
             },
             else => {},
+        }
+    }
+    // Validate GC subtype declarations
+    for (m.type_meta.items, 0..) |meta, idx| {
+        if (meta.parent != std.math.maxInt(u32)) {
+            // Has a parent — validate subtyping
+            if (meta.parent >= m.type_meta.items.len) return error.InvalidTypeIndex;
+            const parent_meta = m.type_meta.items[meta.parent];
+            // Parent must be non-final (declared with 'sub' and not 'final')
+            if (parent_meta.is_final) return error.TypeMismatch;
+            // Kind must match
+            if (meta.kind != parent_meta.kind) return error.TypeMismatch;
+            // Structural check for func types: param/result counts must match
+            if (meta.kind == .func and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .func_type => |child_ft| switch (m.module_types.items[meta.parent]) {
+                        .func_type => |parent_ft| {
+                            if (child_ft.params.len != parent_ft.params.len or
+                                child_ft.results.len != parent_ft.results.len)
+                                return error.TypeMismatch;
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+            // Structural check for array types: element types must be compatible
+            if (meta.kind == .array and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .array_type => |child_at| switch (m.module_types.items[meta.parent]) {
+                        .array_type => |parent_at| {
+                            // Mutable fields must have exact same type; immutable: child <: parent
+                            if (child_at.field.mutable != parent_at.field.mutable)
+                                return error.TypeMismatch;
+                            if (child_at.field.mutable) {
+                                // Mutable: types must be exactly equal
+                                if (child_at.field.@"type" != parent_at.field.@"type")
+                                    return error.TypeMismatch;
+                            } else {
+                                // Immutable: child element type must be subtype of parent
+                                if (child_at.field.@"type" != parent_at.field.@"type") {
+                                    // Check basic subtyping
+                                    const cv = ValTypeOrUnknown.fromValType(child_at.field.@"type");
+                                    const pv = ValTypeOrUnknown.fromValType(parent_at.field.@"type");
+                                    if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
+                                }
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
+            // Structural check for struct types: fields must be compatible
+            if (meta.kind == .struct_ and idx < m.module_types.items.len and
+                meta.parent < m.module_types.items.len)
+            {
+                switch (m.module_types.items[idx]) {
+                    .struct_type => |child_st| switch (m.module_types.items[meta.parent]) {
+                        .struct_type => |parent_st| {
+                            // Child must have at least as many fields as parent
+                            if (child_st.fields.items.len < parent_st.fields.items.len)
+                                return error.TypeMismatch;
+                            // Each parent field must be compatible with corresponding child field
+                            for (parent_st.fields.items, 0..) |pf, fi| {
+                                if (fi >= child_st.fields.items.len) break;
+                                const cf = child_st.fields.items[fi];
+                                if (cf.mutable != pf.mutable) return error.TypeMismatch;
+                                if (cf.mutable) {
+                                    if (cf.@"type" != pf.@"type") return error.TypeMismatch;
+                                } else {
+                                    if (cf.@"type" != pf.@"type") {
+                                        const cv = ValTypeOrUnknown.fromValType(cf.@"type");
+                                        const pv = ValTypeOrUnknown.fromValType(pf.@"type");
+                                        if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    },
+                    else => {},
+                }
+            }
         }
     }
 }
@@ -99,7 +188,26 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
     for (m.tables.items) |table| {
         if (!table.type.elem_type.isRefType())
             return error.InvalidElemType;
-        try checkLimits(table.type.limits, std.math.maxInt(u32));
+        // Non-nullable ref types require init expr (tables without init are invalid)
+        const vt = ValTypeOrUnknown.fromValType(table.type.elem_type);
+        if (vt.isNonNullableRef())
+            return error.TypeMismatch;
+        try checkLimits(table.@"type".limits, std.math.maxInt(u32));
+        // Validate table init expression type
+        if (table.init_expr_bytes.len > 0) {
+            // Check init expr produces a ref type matching the table's elem type
+            const first_byte = table.init_expr_bytes[0];
+            if (first_byte == 0x41 or first_byte == 0x42 or first_byte == 0x43 or first_byte == 0x44) {
+                // Numeric const — invalid for ref table
+                return error.TypeMismatch;
+            }
+            // Check global.get references an imported global
+            if (first_byte == 0x23) {
+                const gidx = leb128.readU32Leb128(table.init_expr_bytes[1..]) catch return error.TypeMismatch;
+                if (gidx.value >= m.globals.items.len) return error.InvalidGlobalIndex;
+                if (!m.isGlobalImport(gidx.value)) return error.TypeMismatch;
+            }
+        }
     }
 }
 
@@ -125,6 +233,13 @@ fn checkGlobals(m: *const Mod.Module) Error!void {
             const expected = ValTypeOrUnknown.fromValType(global.type.val_type);
             try checkConstExpr(m, global.init_expr_bytes, expected, @intCast(i));
         }
+    }
+}
+
+fn checkTags(m: *const Mod.Module) Error!void {
+    for (m.tags.items) |tag| {
+        // Tag types must have empty result types per spec.
+        if (tag.@"type".sig.results.len > 0) return error.TypeMismatch;
     }
 }
 
@@ -414,6 +529,22 @@ fn resolveSig(m: *const Mod.Module, decl: Mod.FuncDeclaration) struct { params: 
 
 const ValStack = std.ArrayListUnmanaged(ValTypeOrUnknown);
 
+/// Pack local initialization state into a compact bitset (up to 256 locals).
+fn packInitState(local_inited: []const bool) [4]u64 {
+    var bits: [4]u64 = .{ 0, 0, 0, 0 };
+    for (local_inited, 0..) |v, i| {
+        if (v) bits[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+    }
+    return bits;
+}
+
+/// Restore local initialization state from a packed bitset.
+fn unpackInitState(bits: [4]u64, local_inited: []bool) void {
+    for (local_inited, 0..) |*v, i| {
+        v.* = (bits[i / 64] >> @intCast(i % 64)) & 1 != 0;
+    }
+}
+
 const ValTypeOrUnknown = enum(i32) {
     i32 = @intFromEnum(types.ValType.i32),
     i64 = @intFromEnum(types.ValType.i64),
@@ -422,6 +553,18 @@ const ValTypeOrUnknown = enum(i32) {
     v128 = @intFromEnum(types.ValType.v128),
     funcref = @intFromEnum(types.ValType.funcref),
     externref = @intFromEnum(types.ValType.externref),
+    anyref = @intFromEnum(types.ValType.anyref),
+    ref = @intFromEnum(types.ValType.ref),
+    ref_null = @intFromEnum(types.ValType.ref_null),
+    nullfuncref = @intFromEnum(types.ValType.nullfuncref),
+    nullexternref = @intFromEnum(types.ValType.nullexternref),
+    nullref = @intFromEnum(types.ValType.nullref),
+    ref_func = @intFromEnum(types.ValType.ref_func),
+    ref_extern = @intFromEnum(types.ValType.ref_extern),
+    ref_any = @intFromEnum(types.ValType.ref_any),
+    ref_none = @intFromEnum(types.ValType.ref_none),
+    ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
+    ref_noextern = @intFromEnum(types.ValType.ref_noextern),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -433,13 +576,63 @@ const ValTypeOrUnknown = enum(i32) {
             .v128 => .v128,
             .funcref => .funcref,
             .externref => .externref,
+            .anyref => .anyref,
+            .ref => .ref,
+            .ref_null => .ref_null,
+            .nullfuncref => .nullfuncref,
+            .nullexternref => .nullexternref,
+            .nullref => .nullref,
+            .ref_func => .ref_func,
+            .ref_extern => .ref_extern,
+            .ref_any => .ref_any,
+            .ref_none => .ref_none,
+            .ref_nofunc => .ref_nofunc,
+            .ref_noextern => .ref_noextern,
             else => .unknown,
+        };
+    }
+
+    fn isRefType(self: ValTypeOrUnknown) bool {
+        return switch (self) {
+            .funcref, .externref, .anyref, .ref, .ref_null,
+            .nullfuncref, .nullexternref, .nullref,
+            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isNonNullableRef(self: ValTypeOrUnknown) bool {
+        return switch (self) {
+            .ref, .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern => true,
+            else => false,
+        };
+    }
+
+    /// Check if self is a subtype of other (for validation).
+    fn isSubtypeOf(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
+        if (self == other) return true;
+        if (self == .unknown or other == .unknown) return true;
+        // GC type hierarchy (three SEPARATE hierarchies):
+        // Internal: any > eq > struct/array/i31 > none
+        // Function: func > nofunc (NOT under any)
+        // External: extern > noextern (NOT under any)
+        return switch (self) {
+            .nullfuncref => other == .funcref,
+            .nullexternref => other == .externref,
+            .nullref => other == .anyref,
+            .ref_nofunc => other == .ref_func,
+            .ref_noextern => other == .ref_extern,
+            .ref_none => other == .ref_any,
+            else => false,
         };
     }
 
     fn matches(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == .unknown or other == .unknown) return true;
-        return self == other;
+        if (self == other) return true;
+        // Check subtyping in both directions
+        return self.isSubtypeOf(other) or other.isSubtypeOf(self);
     }
 };
 
@@ -450,6 +643,8 @@ const CtrlFrame = struct {
     height: usize,
     unreachable_flag: bool,
     else_seen: bool,
+    // Local initialization state at frame entry (for conservative merge at join points)
+    saved_init: [4]u64 = .{ 0, 0, 0, 0 },
 };
 
 fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const std.AutoHashMapUnmanaged(u32, void)) Error!void {
@@ -465,6 +660,13 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
         for (func.local_types.items, 0..) |lt, i| local_types_buf[num_params + i] = ValTypeOrUnknown.fromValType(lt);
         local_types = local_types_buf[0..num_locals];
     }
+
+    // Track initialization of non-nullable ref locals (params are always initialized)
+    var local_inited_buf: [256]bool = undefined;
+    for (0..@min(num_locals, 256)) |i| {
+        local_inited_buf[i] = if (i < num_params) true else !local_types_buf[i].isNonNullableRef();
+    }
+    const local_inited: []bool = if (num_locals <= 256) local_inited_buf[0..num_locals] else &.{};
 
     var val_stack: ValStack = .{};
     defer val_stack.deinit(gpa(m));
@@ -513,6 +715,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (bt.params.len > 0)
                     try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x04, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                // Save init state at if entry for conservative merge
+                ctrl_stack.items[ctrl_stack.items.len - 1].saved_init = packInitState(local_inited);
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x05 => { // else
@@ -523,6 +727,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (val_stack.items.len != frame.height) return error.TypeMismatch;
                 frame.unreachable_flag = false;
                 frame.else_seen = true;
+                // Restore init state from if entry (else branch didn't execute then)
+                unpackInitState(frame.saved_init, local_inited);
                 pushVals(&val_stack, frame.start_types, gpa(m)) catch return error.OutOfMemory;
             },
             0x0b => { // end
@@ -535,6 +741,10 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     // Check if start_types match end_types (if with no else must have matching in/out)
                     if (!std.mem.eql(types.ValType, frame.start_types, frame.end_types))
                         return error.TypeMismatch;
+                }
+                // Restore init state from frame entry (conservative merge)
+                if (frame.opcode == 0x04 or frame.opcode == 0x02) {
+                    unpackInitState(frame.saved_init, local_inited);
                 }
                 _ = ctrl_stack.pop();
                 pushVals(&val_stack, frame.end_types, gpa(m)) catch return error.OutOfMemory;
@@ -627,8 +837,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const t2 = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
                 if (t1 != .unknown and t2 != .unknown and t1 != t2) return error.TypeMismatch;
                 const result = if (t1 != .unknown) t1 else t2;
-                // Untyped select only works with numeric types, not ref types
-                if (result == .funcref or result == .externref) return error.TypeMismatch;
+                // Untyped select only works with numeric/vector types, not ref types
+                if (result.isRefType()) return error.TypeMismatch;
                 val_stack.append(gpa(m), result) catch return error.OutOfMemory;
             },
             0x1c => { // select t
@@ -643,6 +853,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const idx = readU32(bytes, &pos);
                 if (idx >= num_locals) return error.InvalidLocalIndex;
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
+                // Non-nullable ref locals must be initialized before use
+                if (idx < local_inited.len and !local_inited[idx]) return error.TypeMismatch;
                 val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
             },
             0x21 => { // local.set
@@ -650,6 +862,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (idx >= num_locals) return error.InvalidLocalIndex;
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
                 try popExpect(&val_stack, &ctrl_stack, lt);
+                if (idx < local_inited.len) local_inited[idx] = true;
             },
             0x22 => { // local.tee
                 const idx = readU32(bytes, &pos);
@@ -657,6 +870,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 const lt = if (idx < local_types.len) local_types[idx] else ValTypeOrUnknown.unknown;
                 try popExpect(&val_stack, &ctrl_stack, lt);
                 val_stack.append(gpa(m), lt) catch return error.OutOfMemory;
+                if (idx < local_inited.len) local_inited[idx] = true;
             },
             0x23 => { // global.get
                 const idx = readU32(bytes, &pos);
@@ -827,19 +1041,22 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         if (idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                     },
                     0x0a => { // memory.copy
-                        _ = readU32(bytes, &pos);
-                        _ = readU32(bytes, &pos);
+                        const dst_mem = readU32(bytes, &pos);
+                        const src_mem = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        const dst_m64 = dst_mem < m.memories.items.len and m.memories.items[dst_mem].is_memory64;
+                        const src_m64 = src_mem < m.memories.items.len and m.memories.items[src_mem].is_memory64;
+                        try popExpect(&val_stack, &ctrl_stack, if (dst_m64) .i64 else .i32); // n
+                        try popExpect(&val_stack, &ctrl_stack, if (src_m64) .i64 else .i32); // src
+                        try popExpect(&val_stack, &ctrl_stack, if (dst_m64) .i64 else .i32); // dst
                     },
                     0x0b => { // memory.fill
-                        _ = readU32(bytes, &pos);
+                        const mem_idx = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
-                        try popExpect(&val_stack, &ctrl_stack, .i32);
+                        const m64 = mem_idx < m.memories.items.len and m.memories.items[mem_idx].is_memory64;
+                        try popExpect(&val_stack, &ctrl_stack, if (m64) .i64 else .i32); // n
+                        try popExpect(&val_stack, &ctrl_stack, .i32); // val (always i32)
+                        try popExpect(&val_stack, &ctrl_stack, if (m64) .i64 else .i32); // dst
                     },
                     0x0c => { // table.init
                         _ = readU32(bytes, &pos);
@@ -1133,10 +1350,10 @@ test "validate too many memories" {
     defer module.deinit();
     try module.memories.append(std.testing.allocator, .{});
     try module.memories.append(std.testing.allocator, .{});
-    // With multi_memory disabled (default), two memories should fail
-    try std.testing.expectError(error.TooManyMemories, validate(&module, .{}));
-    // With multi_memory enabled, should pass
-    try validate(&module, .{ .features = .{ .multi_memory = true } });
+    // With multi_memory disabled, two memories should fail
+    try std.testing.expectError(error.TooManyMemories, validate(&module, .{ .features = .{ .multi_memory = false } }));
+    // With multi_memory enabled (default), should pass
+    try validate(&module, .{});
 }
 
 test "validate invalid limits (max < initial)" {

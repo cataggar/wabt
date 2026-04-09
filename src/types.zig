@@ -51,6 +51,20 @@ pub const ValType = enum(i32) {
     struct_ = 0x5f,
     array = 0x5e,
 
+    // GC nullable bottom types (ref null <bottom>)
+    nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
+    nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
+    nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
+    nullexnref = 0x68,    // (ref null noexn) — bottom of exn hierarchy
+
+    // Non-nullable abstract heap types (internal-only, not binary encoded)
+    ref_func = -1,     // (ref func) — non-nullable func
+    ref_extern = -2,   // (ref extern) — non-nullable extern
+    ref_any = -3,      // (ref any) — non-nullable any
+    ref_none = -4,     // (ref none) — non-nullable none (bottom)
+    ref_nofunc = -5,   // (ref nofunc) — non-nullable nofunc (bottom)
+    ref_noextern = -6, // (ref noextern) — non-nullable noextern (bottom)
+
     // Block void type
     void_ = 0x40,
 
@@ -58,7 +72,10 @@ pub const ValType = enum(i32) {
     /// exnref, ref, ref_null).
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .exnref, .ref, .ref_null => true,
+            .funcref, .externref, .anyref, .exnref, .ref, .ref_null,
+            .nullfuncref, .nullexternref, .nullref, .nullexnref,
+            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
+            => true,
             else => false,
         };
     }
@@ -91,6 +108,16 @@ pub const ValType = enum(i32) {
             .struct_ => "struct",
             .array => "array",
             .void_ => "void",
+            .nullfuncref => "nullfuncref",
+            .nullexternref => "nullexternref",
+            .nullref => "nullref",
+            .nullexnref => "nullexnref",
+            .ref_func => "(ref func)",
+            .ref_extern => "(ref extern)",
+            .ref_any => "(ref any)",
+            .ref_none => "(ref none)",
+            .ref_nofunc => "(ref nofunc)",
+            .ref_noextern => "(ref noextern)",
         };
     }
 };

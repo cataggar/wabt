@@ -88,6 +88,11 @@ const Reader = struct {
         return b;
     }
 
+    fn peekByte(self: *Reader) ReadError!u8 {
+        if (self.pos >= self.data.len) return error.UnexpectedEof;
+        return self.data[self.pos];
+    }
+
     fn readBytes(self: *Reader, n: usize) ReadError![]const u8 {
         if (self.pos + n > self.data.len) return error.UnexpectedEof;
         const s = self.data[self.pos .. self.pos + n];
@@ -140,6 +145,27 @@ const Reader = struct {
 
     fn readValType(self: *Reader) ReadError!types.ValType {
         const byte = try self.readByte();
+        return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
+            return error.InvalidType;
+    }
+
+    /// Read a reference type encoding, handling both simple (0x70, 0x6f) and
+    /// GC-style (0x63/0x64 heaptype) encodings.
+    fn readRefType(self: *Reader) ReadError!types.ValType {
+        const byte = try self.readByte();
+        if (byte == 0x63 or byte == 0x64) {
+            // GC-style ref type: 0x63 = ref null, 0x64 = ref (non-nullable)
+            const nullable = (byte == 0x63);
+            const heap_type = try self.readS64();
+            const ht: i64 = heap_type;
+            if (ht == -0x10) return if (nullable) .funcref else .ref_func;
+            if (ht == -0x11) return if (nullable) .externref else .ref_extern;
+            if (ht == -0x0e) return if (nullable) .nullfuncref else .ref_nofunc;
+            if (ht == -0x0f) return if (nullable) .nullexternref else .ref_none;
+            if (ht == -0x12) return if (nullable) .anyref else .ref_any;
+            // Concrete type index or other abstract type
+            return if (nullable) .funcref else .ref_func;
+        }
         return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
     }
@@ -260,7 +286,7 @@ const Reader = struct {
         const has_func_section = (seen_sections & (1 << 3)) != 0;
         const has_code_section = (seen_sections & (1 << 10)) != 0;
         if (has_func_section and !has_code_section and num_defined_funcs > 0) return error.FunctionCodeMismatch;
-        if (!has_func_section and has_code_section) return error.FunctionCodeMismatch;
+        if (!has_func_section and has_code_section and num_defined_funcs > 0) return error.FunctionCodeMismatch;
     }
 
     fn readTypeSection(self: *Reader, _: usize) ReadError!void {
@@ -368,11 +394,33 @@ const Reader = struct {
     fn readTableSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         for (0..count) |_| {
-            const elem_type = try self.readValType();
-            const limits = try self.readLimits();
-            try self.module.tables.append(self.allocator, .{
-                .type = .{ .elem_type = elem_type, .limits = limits },
-            });
+            const first_byte = try self.peekByte();
+            if (first_byte == 0x40) {
+                // Extended table type: 0x40 flags reftype limits [initexpr]
+                _ = try self.readByte(); // consume 0x40
+                const table_flags = try self.readByte(); // 0x00 = no table64
+                const is_table64 = (table_flags & 0x01) != 0;
+                const has_init = true; // 0x40 prefix indicates init expr
+                const elem_type = try self.readRefType();
+                const limits = try self.readLimits();
+                var init_bytes: []const u8 = &.{};
+                if (has_init) {
+                    const init_start = self.pos;
+                    try self.skipInitExpr();
+                    init_bytes = self.data[init_start..self.pos];
+                }
+                try self.module.tables.append(self.allocator, .{
+                    .type = .{ .elem_type = elem_type, .limits = limits },
+                    .is_table64 = is_table64,
+                    .init_expr_bytes = init_bytes,
+                });
+            } else {
+                const elem_type = try self.readValType();
+                const limits = try self.readLimits();
+                try self.module.tables.append(self.allocator, .{
+                    .type = .{ .elem_type = elem_type, .limits = limits },
+                });
+            }
         }
     }
 
@@ -445,7 +493,7 @@ const Reader = struct {
 
             if (is_passive or has_explicit_index) {
                 if (use_elem_exprs) {
-                    seg.elem_type = try self.readValType();
+                    seg.elem_type = try self.readRefType();
                     // Element segment type must be a reference type
                     if (!seg.elem_type.isRefType()) return error.InvalidType;
                 } else {

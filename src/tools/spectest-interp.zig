@@ -15,9 +15,7 @@ pub fn runBinaryValidation(allocator: std.mem.Allocator, wasm_bytes: []const u8)
 }
 
 pub fn main() !void {
-    var gpa_state: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa_state.deinit();
-    const alloc = gpa_state.allocator();
+    const alloc = std.heap.page_allocator;
 
     var args_it = try std.process.ArgIterator.initWithAllocator(alloc);
     defer args_it.deinit();
@@ -46,7 +44,7 @@ pub fn main() !void {
         return;
     };
 
-    const source = std.fs.cwd().readFileAlloc(alloc, in_path, 64 * 1024 * 1024) catch |err| {
+    const source = std.fs.cwd().readFileAlloc(alloc, in_path, wabt.max_input_file_size) catch |err| {
         std.debug.print("cannot read '{s}': {any}\n", .{ in_path, err });
         return err;
     };
