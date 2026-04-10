@@ -9,3 +9,5 @@
 /cmake-build-debug/
 /.zig-cache/
 /zig-out/
+*.wasm
+tests/*.json
