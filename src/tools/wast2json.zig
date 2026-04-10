@@ -5,8 +5,159 @@ const Parser = wabt.text.Parser;
 const writer = wabt.binary.writer;
 const Validator = wabt.Validator;
 
-/// Convert a .wast file to JSON + .wasm files (like C++ wabt wast2json).
-/// Outputs a JSON file with all commands and separate .wasm files for each module.
+/// Result of in-memory wast2json conversion.
+pub const WastToJsonResult = struct {
+    json: []u8,
+    /// Map of filename → wasm bytes for each module.
+    modules: std.StringHashMapUnmanaged([]u8),
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WastToJsonResult) void {
+        self.allocator.free(self.json);
+        var it = self.modules.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.modules.deinit(self.allocator);
+    }
+
+    /// Look up a module's wasm bytes by filename.
+    pub fn getModule(self: *const WastToJsonResult, filename: []const u8) ?[]const u8 {
+        return self.modules.get(filename);
+    }
+};
+
+/// Convert .wast source to JSON + in-memory wasm modules (no disk I/O).
+pub fn wastToJsonInMemory(allocator: std.mem.Allocator, source: []const u8, base_name: []const u8) !WastToJsonResult {
+    var json: std.ArrayListUnmanaged(u8) = .empty;
+    var modules: std.StringHashMapUnmanaged([]u8) = .{};
+    const w = json.writer(allocator);
+    try w.writeAll("{\"commands\":[");
+
+    var pos: usize = 0;
+    var module_idx: u32 = 0;
+    var first = true;
+    var line_num: u32 = 1;
+
+    while (pos < source.len) {
+        pos = wast.skipWhitespaceAndComments(source, pos);
+        if (pos >= source.len) break;
+        if (source[pos] != '(') { pos += 1; continue; }
+
+        line_num = 1;
+        for (source[0..pos]) |c| { if (c == '\n') line_num += 1; }
+
+        const sexpr = wast.extractSExpr(source, pos) orelse break;
+        pos = sexpr.end;
+
+        if (!first) try w.writeByte(',');
+        first = false;
+
+        const cmd = wast.classifyCommand(sexpr.text);
+        switch (cmd) {
+            .module => {
+                const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                if (wast.isBinaryOrQuoteModule(sexpr.text)) {
+                    if (wast.isBinaryModule(sexpr.text)) {
+                        const wasm_bytes = wast.decodeWastHexStrings(allocator, sexpr.text) catch {
+                            try writeModuleCmd(w, line_num, filename, "binary");
+                            module_idx += 1;
+                            continue;
+                        };
+                        modules.put(allocator, filename, wasm_bytes) catch {};
+                        try writeModuleCmd(w, line_num, filename, "binary");
+                    } else {
+                        try writeModuleCmd(w, line_num, filename, "text");
+                        allocator.free(filename);
+                    }
+                } else {
+                    var mod = Parser.parseModule(allocator, sexpr.text) catch {
+                        try writeModuleCmd(w, line_num, filename, "text");
+                        module_idx += 1;
+                        allocator.free(filename);
+                        continue;
+                    };
+                    defer mod.deinit();
+                    const wasm_bytes = writer.writeModule(allocator, &mod) catch {
+                        try writeModuleCmd(w, line_num, filename, "text");
+                        module_idx += 1;
+                        allocator.free(filename);
+                        continue;
+                    };
+                    modules.put(allocator, filename, wasm_bytes) catch {};
+                    try writeModuleCmd(w, line_num, filename, "binary");
+                }
+                module_idx += 1;
+            },
+            .assert_return => try writeAssertCmd(w, sexpr.text, "assert_return", line_num),
+            .assert_trap => try writeAssertCmd(w, sexpr.text, "assert_trap", line_num),
+            .assert_invalid, .assert_malformed, .assert_unlinkable => {
+                const type_str = switch (cmd) {
+                    .assert_invalid => "assert_invalid",
+                    .assert_malformed => "assert_malformed",
+                    .assert_unlinkable => "assert_unlinkable",
+                    else => unreachable,
+                };
+                const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx });
+                module_idx += 1;
+                const mod_start = std.mem.indexOf(u8, sexpr.text, "(module") orelse {
+                    try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"binary\"}}", .{ type_str, line_num, filename });
+                    allocator.free(filename);
+                    continue;
+                };
+                const mod_sexpr = wast.extractSExpr(sexpr.text, mod_start) orelse {
+                    try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"binary\"}}", .{ type_str, line_num, filename });
+                    allocator.free(filename);
+                    continue;
+                };
+                const module_type = if (wast.isQuoteModule(mod_sexpr.text)) "text" else "binary";
+                if (wast.isBinaryModule(mod_sexpr.text)) {
+                    const wasm_bytes = wast.decodeWastHexStrings(allocator, mod_sexpr.text) catch {
+                        try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"{s}\"}}", .{ type_str, line_num, filename, module_type });
+                        allocator.free(filename);
+                        continue;
+                    };
+                    modules.put(allocator, filename, wasm_bytes) catch {};
+                } else if (!wast.isQuoteModule(mod_sexpr.text)) {
+                    var mod2 = Parser.parseModule(allocator, mod_sexpr.text) catch {
+                        try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"text\"}}", .{ type_str, line_num, filename });
+                        allocator.free(filename);
+                        continue;
+                    };
+                    defer mod2.deinit();
+                    const wasm_bytes = writer.writeModule(allocator, &mod2) catch {
+                        try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"text\"}}", .{ type_str, line_num, filename });
+                        allocator.free(filename);
+                        continue;
+                    };
+                    modules.put(allocator, filename, wasm_bytes) catch {};
+                } else {
+                    allocator.free(filename);
+                }
+                const text = extractQuotedStringAfterModule(sexpr.text) orelse "";
+                const fn2 = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx - 1 });
+                defer allocator.free(fn2);
+                try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"text\":\"{s}\",\"module_type\":\"{s}\"}}", .{ type_str, line_num, fn2, text, module_type });
+            },
+            .assert_exhaustion => try writeAssertCmd(w, sexpr.text, "assert_exhaustion", line_num),
+            .register => try writeRegisterCmd(w, sexpr.text, line_num),
+            .invoke => try writeAssertCmd(w, sexpr.text, "action", line_num),
+            .get => try writeAssertCmd(w, sexpr.text, "action", line_num),
+            .assert_exception => try writeAssertCmd(w, sexpr.text, "assert_trap", line_num),
+            .unknown => { first = true; }, // undo the comma
+        }
+    }
+
+    try w.writeAll("]}");
+    return .{
+        .json = try json.toOwnedSlice(allocator),
+        .modules = modules,
+        .allocator = allocator,
+    };
+}
+
+/// Convert a .wast file to JSON + .wasm files on disk (CLI mode).
 pub fn wastToJson(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, base_name: []const u8) ![]u8 {
     var json: std.ArrayListUnmanaged(u8) = .empty;
     const w = json.writer(allocator);
