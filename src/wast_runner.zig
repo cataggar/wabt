@@ -831,7 +831,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
 
 // ── Command classification ──────────────────────────────────────────────
 
-const Command = enum {
+pub const Command = enum {
     module,
     assert_invalid,
     assert_malformed,
@@ -846,7 +846,7 @@ const Command = enum {
     unknown,
 };
 
-fn classifyCommand(sexpr: []const u8) Command {
+pub fn classifyCommand(sexpr: []const u8) Command {
     // sexpr starts with '('; skip it and any whitespace to find the keyword.
     var i: usize = 1;
     i = skipWsAndComments(sexpr, i);
@@ -2205,14 +2205,14 @@ fn valuesEqual(a: Interp.Value, b: Interp.Value) bool {
     };
 }
 
-const SExpr = struct {
+pub const SExpr = struct {
     text: []const u8,
     end: usize,
 };
 
 /// Extract a balanced s-expression starting at `start` in `source`.
 /// Returns the slice and the position just past the closing ')'.
-fn extractSExpr(source: []const u8, start: usize) ?SExpr {
+pub fn extractSExpr(source: []const u8, start: usize) ?SExpr {
     if (start >= source.len or source[start] != '(') return null;
     var depth: u32 = 0;
     var i = start;
@@ -2342,16 +2342,16 @@ fn hasWordAt(source: []const u8, pos: usize, word: []const u8) bool {
 }
 
 /// Check whether a module s-expression is `(module binary ...)` or `(module quote ...)`.
-fn isBinaryOrQuoteModule(mod_text: []const u8) bool {
+pub fn isBinaryOrQuoteModule(mod_text: []const u8) bool {
     return isBinaryModule(mod_text) or isQuoteModule(mod_text);
 }
 
-fn isBinaryModule(mod_text: []const u8) bool {
+pub fn isBinaryModule(mod_text: []const u8) bool {
     const i = skipModulePrefix(mod_text);
     return i + 6 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 6], "binary");
 }
 
-fn isQuoteModule(mod_text: []const u8) bool {
+pub fn isQuoteModule(mod_text: []const u8) bool {
     const i = skipModulePrefix(mod_text);
     return i + 5 <= mod_text.len and std.mem.eql(u8, mod_text[i .. i + 5], "quote");
 }
@@ -2540,7 +2540,7 @@ fn decodeHexEscape(text: []const u8, pos: usize) ?u8 {
 }
 
 /// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.
-fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+pub fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var res = std.ArrayListUnmanaged(u8){};
     errdefer res.deinit(allocator);
     var i: usize = 0;
@@ -2765,7 +2765,7 @@ fn isWhitespace(c: u8) bool {
 }
 
 /// Skip whitespace and comments (line comments ";;" and block comments "(; ... ;)").
-fn skipWhitespaceAndComments(source: []const u8, start: usize) usize {
+pub fn skipWhitespaceAndComments(source: []const u8, start: usize) usize {
     var i = start;
     while (i < source.len) {
         const c = source[i];
