@@ -3056,8 +3056,7 @@ const Parser = struct {
     /// Emit immediates for SIMD (0xfd prefix) instructions.
     fn emitSimdImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
         if (sub <= 0x0b or (sub >= 0x5c and sub <= 0x5d)) {
-            // v128.load/store variants + load_zero: memarg
-            self.emitMemIdx(code);
+            // v128.load/store variants + load_zero: memarg only (no separate mem_idx)
             self.emitMemarg(code, 0);
         } else if (sub == 0x0d) {
             // i8x16.shuffle: 16 lane index bytes
@@ -3071,7 +3070,6 @@ const Parser = struct {
             code.append(self.allocator, @truncate(lane_val)) catch {};
         } else if (sub >= 0x54 and sub <= 0x5b) {
             // v128.load*_lane / v128.store*_lane: memarg + 1 byte lane
-            self.emitMemIdx(code);
             self.emitMemarg(code, 0);
             const lane_val = self.parseU32() catch 0;
             code.append(self.allocator, @truncate(lane_val)) catch {};
@@ -5764,6 +5762,28 @@ test "memory load with explicit offset and align" {
     try std.testing.expectEqual(@as(u8, 0x02), code[3]); // align=2 (log2(4))
     try std.testing.expectEqual(@as(u8, 0x08), code[4]); // offset=8
     try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
+}
+
+test "v128.store has correct memarg encoding (no extra mem_idx)" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module (memory 1) (func (v128.store (i32.const 0) (v128.const i32x4 0 0 0 0))))
+    );
+    defer module.deinit();
+    const code = module.funcs.items[0].code_bytes;
+    // Find v128.store opcode (fd 0b)
+    var found = false;
+    for (0..code.len) |i| {
+        if (i + 1 < code.len and code[i] == 0xfd and code[i + 1] == 0x0b) {
+            // Next two bytes should be memarg: align=0, offset=0
+            try std.testing.expectEqual(@as(u8, 0x00), code[i + 2]); // align
+            try std.testing.expectEqual(@as(u8, 0x00), code[i + 3]); // offset
+            // Byte after offset should be end (0x0b) — NOT another 0x00
+            try std.testing.expectEqual(@as(u8, 0x0b), code[i + 4]); // end
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 /// Normalize a WAT identifier token text for name-map lookups.
