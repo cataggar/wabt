@@ -437,3 +437,62 @@ test "round-trip exports" {
     try std.testing.expectEqual(@as(usize, 1), module2.exports.items.len);
     try std.testing.expect(std.mem.eql(u8, "mem", module2.exports.items[0].name));
 }
+
+test "round-trip code section preserves function bodies" {
+    const allocator = std.testing.allocator;
+    // Module with: type (i32,i32)->i32, 1 func, export "add",
+    // code: local.get 0 (0x20 0x00), local.get 1 (0x20 0x01), i32.add (0x6a), end (0x0b)
+    const input = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic + version
+        0x01, 0x07, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f, // type: (i32,i32)->i32
+        0x03, 0x02, 0x01, 0x00, // func: 1 func, type 0
+        0x07, 0x07, 0x01, 0x03, 'a', 'd', 'd', 0x00, 0x00, // export: "add" func 0
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b, // code
+    };
+    var module = try reader.readModule(allocator, &input);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module.funcs.items.len);
+    try std.testing.expect(module.funcs.items[0].code_bytes.len > 0);
+
+    const output = try writeModule(allocator, &module);
+    defer allocator.free(output);
+
+    // Re-read and verify function body preserved
+    var module2 = try reader.readModule(allocator, output);
+    defer module2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module2.funcs.items.len);
+    const code = module2.funcs.items[0].code_bytes;
+    // Should contain local.get 0, local.get 1, i32.add, end
+    try std.testing.expect(code.len >= 4);
+    try std.testing.expectEqual(@as(u8, 0x20), code[0]); // local.get
+    try std.testing.expectEqual(@as(u8, 0x00), code[1]); // idx 0
+    try std.testing.expectEqual(@as(u8, 0x20), code[2]); // local.get
+    try std.testing.expectEqual(@as(u8, 0x01), code[3]); // idx 1
+    try std.testing.expectEqual(@as(u8, 0x6a), code[4]); // i32.add
+    try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
+}
+
+test "text parse + binary write: memory load has correct encoding" {
+    // End-to-end: parse WAT with memory load → write binary → verify no extra mem_idx
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+    var module = try Parser.parseModule(allocator,
+        \\(module (memory 1) (func (export "f") (result i32) (i32.load (i32.const 0))))
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    // Re-read and verify the code
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.memories.items.len);
+    const code = module2.funcs.items[0].code_bytes;
+    // Should be: i32.const 0 (41 00), i32.load align=0 offset=0 (28 00 00), end (0b)
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+    try std.testing.expectEqual(@as(u8, 0x28), code[2]); // i32.load
+    try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
+}

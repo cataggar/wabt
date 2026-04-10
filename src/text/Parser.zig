@@ -2938,9 +2938,8 @@ const Parser = struct {
         if (opcode) |op| {
             if (op <= 0xff) {
                 code.append(self.allocator, @truncate(op)) catch return;
-                // Memory load/store instructions: emit mem_idx + memarg
+                // Memory load/store instructions: emit memarg (align + offset)
                 if (op >= 0x28 and op <= 0x3e) {
-                    self.emitMemIdx(code);
                     self.emitMemarg(code, @truncate(op));
                 }
                 // table.get / table.set need a table index immediate
@@ -5714,6 +5713,57 @@ test "parse module with annotation" {
     );
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.memories.items.len);
+}
+
+test "memory load emits correct memarg without extra mem_idx byte" {
+    // i32.load should emit: opcode(0x28) + align(LEB u32) + offset(LEB u32)
+    // NOT: opcode(0x28) + mem_idx(0x00) + align + offset
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module (memory 1) (func (export "f") (result i32) (i32.load (i32.const 0))))
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.funcs.items.len);
+    const code = module.funcs.items[0].code_bytes;
+    // Expected: i32.const 0 (41 00), i32.load align=0 offset=0 (28 00 00), end (0b)
+    // Total: 6 bytes
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+    try std.testing.expectEqual(@as(u8, 0x41), code[0]); // i32.const
+    try std.testing.expectEqual(@as(u8, 0x00), code[1]); // 0
+    try std.testing.expectEqual(@as(u8, 0x28), code[2]); // i32.load
+    try std.testing.expectEqual(@as(u8, 0x00), code[3]); // align=0
+    try std.testing.expectEqual(@as(u8, 0x00), code[4]); // offset=0
+    try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
+}
+
+test "memory store emits correct memarg" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module (memory 1) (func (export "f") (i32.store (i32.const 0) (i32.const 42))))
+    );
+    defer module.deinit();
+    const code = module.funcs.items[0].code_bytes;
+    // i32.const 0 (41 00), i32.const 42 (41 2a), i32.store align=0 offset=0 (36 00 00), end (0b)
+    try std.testing.expectEqual(@as(usize, 8), code.len);
+    try std.testing.expectEqual(@as(u8, 0x36), code[4]); // i32.store
+    try std.testing.expectEqual(@as(u8, 0x00), code[5]); // align=0
+    try std.testing.expectEqual(@as(u8, 0x00), code[6]); // offset=0
+    try std.testing.expectEqual(@as(u8, 0x0b), code[7]); // end
+}
+
+test "memory load with explicit offset and align" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module (memory 1) (func (export "f") (result i32) (i32.load offset=8 align=4 (i32.const 0))))
+    );
+    defer module.deinit();
+    const code = module.funcs.items[0].code_bytes;
+    // i32.const 0 (41 00), i32.load align=log2(4)=2 offset=8 (28 02 08), end (0b)
+    try std.testing.expectEqual(@as(usize, 6), code.len);
+    try std.testing.expectEqual(@as(u8, 0x28), code[2]); // i32.load
+    try std.testing.expectEqual(@as(u8, 0x02), code[3]); // align=2 (log2(4))
+    try std.testing.expectEqual(@as(u8, 0x08), code[4]); // offset=8
+    try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
 }
 
 /// Normalize a WAT identifier token text for name-map lookups.
