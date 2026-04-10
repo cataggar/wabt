@@ -3,7 +3,6 @@ const wabt = @import("wabt");
 const wast = wabt.wast_runner;
 const Parser = wabt.text.Parser;
 const writer = wabt.binary.writer;
-const Validator = wabt.Validator;
 
 /// Result of in-memory wast2json conversion.
 pub const WastToJsonResult = struct {
