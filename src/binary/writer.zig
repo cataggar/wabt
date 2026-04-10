@@ -214,34 +214,42 @@ const Writer = struct {
         for (module.globals.items[module.num_global_imports..]) |global| {
             try self.writeValType(global.type.val_type);
             try self.appendByte(if (global.type.mutability == .mutable) @as(u8, 1) else 0);
-            // Default init expr: type.const 0, end
-            switch (global.type.val_type) {
-                .i32 => {
-                    try self.appendByte(0x41);
-                    try self.writeS32Leb(0);
-                },
-                .i64 => {
-                    try self.appendByte(0x42);
-                    try self.writeS32Leb(0); // i64.const 0
-                },
-                .f32 => {
-                    try self.appendByte(0x43);
-                    try self.writeU32LE(0);
-                },
-                .f64 => {
-                    try self.appendByte(0x44);
-                    try self.appendSlice(&[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
-                },
-                .funcref, .externref => {
-                    try self.appendByte(0xd0); // ref.null
-                    try self.writeValType(global.type.val_type);
-                },
-                else => {
-                    try self.appendByte(0x41);
-                    try self.writeS32Leb(0);
-                },
+            // Write init expression
+            if (global.init_expr_bytes.len > 0) {
+                try self.appendSlice(global.init_expr_bytes);
+                if (global.init_expr_bytes[global.init_expr_bytes.len - 1] != 0x0b) {
+                    try self.appendByte(0x0b);
+                }
+            } else {
+                // Default init expr: type.const 0, end
+                switch (global.type.val_type) {
+                    .i32 => {
+                        try self.appendByte(0x41);
+                        try self.writeS32Leb(0);
+                    },
+                    .i64 => {
+                        try self.appendByte(0x42);
+                        try self.writeS32Leb(0);
+                    },
+                    .f32 => {
+                        try self.appendByte(0x43);
+                        try self.writeU32LE(0);
+                    },
+                    .f64 => {
+                        try self.appendByte(0x44);
+                        try self.appendSlice(&[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
+                    },
+                    .funcref, .externref => {
+                        try self.appendByte(0xd0); // ref.null
+                        try self.writeValType(global.type.val_type);
+                    },
+                    else => {
+                        try self.appendByte(0x41);
+                        try self.writeS32Leb(0);
+                    },
+                }
+                try self.appendByte(0x0b); // end
             }
-            try self.appendByte(0x0b); // end
         }
         self.endSection(ph);
     }
@@ -276,10 +284,19 @@ const Writer = struct {
             try self.writeU32Leb(flags);
 
             if (seg.kind == .active) {
-                // offset expression: i32.const 0, end
-                try self.appendByte(0x41);
-                try self.writeS32Leb(0);
-                try self.appendByte(0x0b);
+                // Write offset expression
+                if (seg.offset_expr_bytes.len > 0) {
+                    try self.appendSlice(seg.offset_expr_bytes);
+                    // Add end byte if not already present (text parser omits it)
+                    if (seg.offset_expr_bytes[seg.offset_expr_bytes.len - 1] != 0x0b) {
+                        try self.appendByte(0x0b);
+                    }
+                } else {
+                    // Default: i32.const 0, end
+                    try self.appendByte(0x41);
+                    try self.writeS32Leb(0);
+                    try self.appendByte(0x0b);
+                }
             }
 
             if (seg.kind != .active) {
@@ -349,10 +366,18 @@ const Writer = struct {
                 try self.writeU32Leb(1); // flags: passive
             } else {
                 try self.writeU32Leb(0); // flags: active, memory 0
-                // offset expression: i32.const 0, end
-                try self.appendByte(0x41);
-                try self.writeS32Leb(0);
-                try self.appendByte(0x0b);
+                // Write offset expression
+                if (seg.offset_expr_bytes.len > 0) {
+                    try self.appendSlice(seg.offset_expr_bytes);
+                    if (seg.offset_expr_bytes[seg.offset_expr_bytes.len - 1] != 0x0b) {
+                        try self.appendByte(0x0b);
+                    }
+                } else {
+                    // Default: i32.const 0, end
+                    try self.appendByte(0x41);
+                    try self.writeS32Leb(0);
+                    try self.appendByte(0x0b);
+                }
             }
             try self.writeU32Leb(@intCast(seg.data.len));
             try self.appendSlice(seg.data);
@@ -495,4 +520,74 @@ test "text parse + binary write: memory load has correct encoding" {
     try std.testing.expectEqual(@as(usize, 6), code.len);
     try std.testing.expectEqual(@as(u8, 0x28), code[2]); // i32.load
     try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
+}
+
+test "text parse + binary write: data segment offset preserved" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module (memory 1) (data (i32.const 16) "\aa\bb"))
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.data_segments.items.len);
+    try std.testing.expectEqual(@as(usize, 2), module2.data_segments.items[0].data.len);
+    // The offset expression should contain i32.const 16, not i32.const 0
+    const offset_bytes = module2.data_segments.items[0].offset_expr_bytes;
+    try std.testing.expect(offset_bytes.len >= 3);
+    try std.testing.expectEqual(@as(u8, 0x41), offset_bytes[0]); // i32.const
+    // LEB128 for 16 = 0x10
+    try std.testing.expectEqual(@as(u8, 0x10), offset_bytes[1]);
+}
+
+test "text parse + binary write: global init expression preserved" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module (global (export "g") i32 (i32.const 42)))
+    );
+    defer module.deinit();
+
+    // Verify the text parser stored the init expr
+    try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
+    const init = module.globals.items[0].init_expr_bytes;
+    try std.testing.expect(init.len >= 2);
+    try std.testing.expectEqual(@as(u8, 0x41), init[0]); // i32.const
+    try std.testing.expectEqual(@as(u8, 42), init[1]); // 42
+
+    // Write to binary and verify the global section encodes the value
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    // Find global section (id=6) and verify init expr bytes
+    var i: usize = 8;
+    while (i < wasm.len) {
+        const sid = wasm[i];
+        i += 1;
+        const r = leb128.readU32Leb128(wasm[i..]) catch return error.TestUnexpectedResult;
+        const sz = r.value;
+        i += r.bytes_read;
+        if (sid == 6) {
+            // Global section: count, {valtype, mut, init_expr}*
+            // Skip count LEB128
+            const r2 = leb128.readU32Leb128(wasm[i..]) catch return error.TestUnexpectedResult;
+            const start = i + r2.bytes_read;
+            // Skip valtype + mutability
+            const expr_start = start + 2;
+            try std.testing.expectEqual(@as(u8, 0x41), wasm[expr_start]); // i32.const
+            try std.testing.expectEqual(@as(u8, 42), wasm[expr_start + 1]); // 42
+            try std.testing.expectEqual(@as(u8, 0x0b), wasm[expr_start + 2]); // end
+            return;
+        }
+        i += sz;
+    }
+    return error.TestUnexpectedResult; // global section not found
 }
