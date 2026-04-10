@@ -299,13 +299,39 @@ const Writer = struct {
         if (defined == 0) return;
         const ph = try self.beginSection(10);
         try self.writeU32Leb(@intCast(defined));
-        for (0..defined) |_| {
-            // Placeholder body: 0 locals + end
+        for (module.funcs.items[module.num_func_imports..]) |func| {
             const body_ph = self.buf.items.len;
             try self.appendSlice(&[5]u8{ 0, 0, 0, 0, 0 }); // body size placeholder
             const body_start = self.buf.items.len;
-            try self.writeU32Leb(0); // 0 local declarations
-            try self.appendByte(0x0b); // end
+
+            // Write compressed local declarations (run-length encoded)
+            const locals = func.local_types.items;
+            if (locals.len == 0) {
+                try self.writeU32Leb(0);
+            } else {
+                // Count runs of same type
+                var num_decls: u32 = 1;
+                for (1..locals.len) |i| {
+                    if (locals[i] != locals[i - 1]) num_decls += 1;
+                }
+                try self.writeU32Leb(num_decls);
+                var run_start: usize = 0;
+                while (run_start < locals.len) {
+                    var run_end = run_start + 1;
+                    while (run_end < locals.len and locals[run_end] == locals[run_start]) : (run_end += 1) {}
+                    try self.writeU32Leb(@intCast(run_end - run_start));
+                    try self.writeValType(locals[run_start]);
+                    run_start = run_end;
+                }
+            }
+
+            // Write instruction bytes (includes final 0x0b end)
+            if (func.code_bytes.len > 0) {
+                try self.appendSlice(func.code_bytes);
+            } else {
+                try self.appendByte(0x0b); // bare end for empty bodies
+            }
+
             const body_size: u32 = @intCast(self.buf.items.len - body_start);
             var tmp: [5]u8 = undefined;
             leb128.writeFixedU32Leb128(&tmp, body_size);
