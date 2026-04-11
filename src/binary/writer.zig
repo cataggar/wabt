@@ -390,7 +390,13 @@ const Writer = struct {
             if (seg.kind == .passive) {
                 try self.writeU32Leb(1); // flags: passive
             } else {
-                try self.writeU32Leb(0); // flags: active, memory 0
+                const mem_idx = seg.memory_var.index;
+                if (mem_idx != 0) {
+                    try self.writeU32Leb(2); // flags: active, explicit memory index
+                    try self.writeU32Leb(mem_idx);
+                } else {
+                    try self.writeU32Leb(0); // flags: active, memory 0 (implicit)
+                }
                 // Write offset expression
                 if (seg.offset_expr_bytes.len > 0) {
                     try self.appendSlice(seg.offset_expr_bytes);
