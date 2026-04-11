@@ -2694,12 +2694,18 @@ const Parser = struct {
         if (param_count == 0 and result_count == 0) {
             // Fall through to check for (type N) below
         } else if (param_count == 0 and result_count == 1 and @intFromEnum(result_types_buf[0]) > 0) {
-            // Simple single-result block type: emit valtype byte (only for standard types)
-            const raw: u32 = @bitCast(@intFromEnum(result_types_buf[0]));
-            buf[0] = @truncate(raw);
-            return 1;
-        } else {
-            // Multi-value: create a func type entry and emit type index
+            // Simple single-result block type: emit valtype byte
+            // BUT ref/ref_null need the multi-value path (type index) because
+            // they require a heap type that can't be encoded in a single byte
+            const rt = result_types_buf[0];
+            if (rt != .ref_null and rt != .ref) {
+                const raw: u32 = @bitCast(@intFromEnum(rt));
+                buf[0] = @truncate(raw);
+                return 1;
+            }
+        }
+        // Multi-value or ref/ref_null: create a func type entry and emit type index
+        if (param_count > 0 or result_count > 0) {
             if (self.module) |mod| {
                 const p = self.allocator.alloc(types.ValType, param_count) catch {
                     buf[0] = 0x40;
@@ -3535,7 +3541,15 @@ const Parser = struct {
         self.skipAnnotations();
         if (self.peek().kind != .integer) {
             // elemtype first — inline elem syntax
+            const saved_refs_len2 = self.collected_type_refs.items.len;
+            const saved_in_type2 = self.in_type_parse;
+            self.in_type_parse = true;
             const elem_type = self.parseValType() catch .funcref;
+            self.in_type_parse = saved_in_type2;
+            const inline_type_idx: u32 = if (self.collected_type_refs.items.len > saved_refs_len2)
+                self.collected_type_refs.items[saved_refs_len2]
+            else
+                0xFFFFFFFF;
             // Parse (elem func_refs...)
             var elem_indices: std.ArrayListUnmanaged(Mod.Var) = .{};
             if (self.peek().kind == .l_paren) {
@@ -3589,6 +3603,7 @@ const Parser = struct {
             const initial: u64 = @intCast(elem_indices.items.len);
             try module.tables.append(self.allocator, .{
                 .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial } },
+                .type_idx = inline_type_idx,
                 .is_table64 = is_table64,
             });
             // Create active element segment for the inline elements
@@ -3626,7 +3641,16 @@ const Parser = struct {
             limits.has_max = true;
         }
         self.skipAnnotations();
+        // Capture concrete type index if elem type is (ref null $t) / (ref $t)
+        const saved_refs_len = self.collected_type_refs.items.len;
+        const saved_in_type = self.in_type_parse;
+        self.in_type_parse = true;
         const elem_type = try self.parseValType();
+        self.in_type_parse = saved_in_type;
+        const table_type_idx: u32 = if (self.collected_type_refs.items.len > saved_refs_len)
+            self.collected_type_refs.items[saved_refs_len]
+        else
+            0xFFFFFFFF;
         // Parse optional table initializer expression: (ref.null func) etc.
         var table_init_bytes: []const u8 = &.{};
         if (self.peek().kind == .l_paren) {
@@ -3675,6 +3699,7 @@ const Parser = struct {
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
             .init_expr_bytes = table_init_bytes,
+            .type_idx = table_type_idx,
             .is_table64 = is_table64,
         });
     }

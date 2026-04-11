@@ -222,6 +222,7 @@ pub const Table = struct {
     name: ?[]const u8 = null,
     @"type": types.TableType = .{},
     init_expr_bytes: []const u8 = &.{},
+    type_idx: u32 = 0xFFFFFFFF,
     loc: Location = .{},
     is_import: bool = false,
     is_table64: bool = false,
