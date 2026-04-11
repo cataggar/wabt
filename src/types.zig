@@ -146,6 +146,10 @@ pub const Limits = struct {
 pub const FuncType = struct {
     params: []const ValType = &.{},
     results: []const ValType = &.{},
+    /// Concrete type indices parallel to params (0xFFFFFFFF = abstract).
+    param_type_idxs: []const u32 = &.{},
+    /// Concrete type indices parallel to results (0xFFFFFFFF = abstract).
+    result_type_idxs: []const u32 = &.{},
 };
 
 /// Memory type.
