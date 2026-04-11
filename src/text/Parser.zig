@@ -63,6 +63,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     // Parse module fields — two passes:
     // Pass 1: process only (type ...) declarations to build the type section first.
     // This ensures explicit type indices are assigned before implicit function types.
+    p.module = &module;
     const saved_pos = p.lexer.pos;
     const saved_peeked = p.peeked;
 
@@ -95,6 +96,9 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
 
     // Canonicalize rec groups for iso-recursive type equivalence
     p.canonicalizeTypes(&module);
+
+    // Record declared type count (before implicit types from funcs/blocks are added)
+    module.num_declared_types = @intCast(module.module_types.items.len);
 
     // Pass 2: process all other declarations (skip type/rec which were already handled).
     p.lexer.pos = saved_pos;
@@ -560,13 +564,14 @@ const Parser = struct {
                             // Within rec group, allow refs within the group but not beyond
                             if (idx >= self.rec_end) self.malformed = true;
                         } else if (self.in_type_parse) {
-                            // During type definition, allow self-reference (idx == current type)
                             if (self.module) |mod| {
-                                if (idx > mod.module_types.items.len) self.malformed = true;
+                                const max = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len));
+                                if (idx >= max) self.malformed = true;
                             }
                         } else {
                             if (self.module) |mod| {
-                                if (idx >= mod.module_types.items.len) self.malformed = true;
+                                const max_types = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len));
+                                if (idx >= max_types) self.malformed = true;
                             }
                         }
                     } else if (ht.kind == .identifier) {

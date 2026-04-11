@@ -345,6 +345,9 @@ pub const Module = struct {
     num_global_imports: types.Index = 0,
     num_tag_imports: types.Index = 0,
 
+    // Count of explicitly declared types (from (type ...) definitions)
+    num_declared_types: u32 = 0,
+
     // Data count section
     has_data_count: bool = false,
     data_count: u32 = 0,
