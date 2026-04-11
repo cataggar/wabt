@@ -6047,3 +6047,4 @@ fn normalizeIdentifier(allocator: std.mem.Allocator, text: []const u8) []const u
     }
     return result.toOwnedSlice(allocator) catch text;
 }
+
