@@ -131,6 +131,8 @@ pub const ExprType = enum {
 pub const FuncSignature = struct {
     params: []const types.ValType = &.{},
     results: []const types.ValType = &.{},
+    param_type_idxs: []const u32 = &.{},
+    result_type_idxs: []const u32 = &.{},
 
     pub fn eql(a: FuncSignature, b: FuncSignature) bool {
         return std.mem.eql(types.ValType, a.params, b.params) and
@@ -356,6 +358,8 @@ pub const Module = struct {
                 .func_type => |ft| {
                     if (ft.params.len > 0) self.allocator.free(ft.params);
                     if (ft.results.len > 0) self.allocator.free(ft.results);
+                    if (ft.param_type_idxs.len > 0) self.allocator.free(ft.param_type_idxs);
+                    if (ft.result_type_idxs.len > 0) self.allocator.free(ft.result_type_idxs);
                 },
                 .struct_type => |st| {
                     var fields = st.fields;

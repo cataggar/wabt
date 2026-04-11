@@ -75,8 +75,17 @@ const Writer = struct {
     }
 
     fn writeValType(self: *Writer, vt: types.ValType) WriteError!void {
-        // ValType has i32 discriminant; binary encodes as single byte
-        try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+        try self.writeValTypeWithTidx(vt, 0xFFFFFFFF);
+    }
+
+    fn writeValTypeWithTidx(self: *Writer, vt: types.ValType, tidx: u32) WriteError!void {
+        if ((vt == .ref_null or vt == .ref) and tidx != 0xFFFFFFFF) {
+            // Concrete typed ref: write prefix + type index
+            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+            try self.writeU32Leb(tidx);
+        } else {
+            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+        }
     }
 
     fn writeLimits(self: *Writer, limits: types.Limits) WriteError!void {
@@ -131,9 +140,15 @@ const Writer = struct {
                 .func_type => |ft| {
                     try self.appendByte(0x60);
                     try self.writeU32Leb(@intCast(ft.params.len));
-                    for (ft.params) |p| try self.writeValType(p);
+                    for (ft.params, 0..) |p, pi| {
+                        const tidx: u32 = if (pi < ft.param_type_idxs.len) ft.param_type_idxs[pi] else 0xFFFFFFFF;
+                        try self.writeValTypeWithTidx(p, tidx);
+                    }
                     try self.writeU32Leb(@intCast(ft.results.len));
-                    for (ft.results) |r| try self.writeValType(r);
+                    for (ft.results, 0..) |r, ri| {
+                        const tidx: u32 = if (ri < ft.result_type_idxs.len) ft.result_type_idxs[ri] else 0xFFFFFFFF;
+                        try self.writeValTypeWithTidx(r, tidx);
+                    }
                 },
                 else => {}, // struct/array not yet supported
             }

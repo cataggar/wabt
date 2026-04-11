@@ -652,11 +652,15 @@ const Parser = struct {
         };
     }
 
-    fn parseFuncSig(self: *Parser, module: *Mod.Module) ParseError!struct { params: []const types.ValType, results: []const types.ValType } {
+    fn parseFuncSig(self: *Parser, module: *Mod.Module) ParseError!struct { params: []const types.ValType, results: []const types.ValType, param_type_idxs: []const u32, result_type_idxs: []const u32 } {
         var params: std.ArrayListUnmanaged(types.ValType) = .{};
         errdefer params.deinit(self.allocator);
+        var param_tidxs: std.ArrayListUnmanaged(u32) = .{};
+        errdefer param_tidxs.deinit(self.allocator);
         var results: std.ArrayListUnmanaged(types.ValType) = .{};
         errdefer results.deinit(self.allocator);
+        var result_tidxs: std.ArrayListUnmanaged(u32) = .{};
+        errdefer result_tidxs.deinit(self.allocator);
         var seen_result = false;
 
         self.skipAnnotations();
@@ -674,7 +678,13 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) _ = self.advance();
                 self.skipAnnotations();
                 while (self.peek().kind != .r_paren) {
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
                     try params.append(self.allocator, try self.parseValType());
+                    self.in_type_parse = saved_itp;
+                    const tidx: u32 = if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF;
+                    param_tidxs.append(self.allocator, tidx) catch {};
                     self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
@@ -684,7 +694,13 @@ const Parser = struct {
                 _ = self.advance();
                 self.skipAnnotations();
                 while (self.peek().kind != .r_paren) {
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
                     try results.append(self.allocator, try self.parseValType());
+                    self.in_type_parse = saved_itp;
+                    const tidx: u32 = if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF;
+                    result_tidxs.append(self.allocator, tidx) catch {};
                     self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
@@ -700,6 +716,8 @@ const Parser = struct {
         return .{
             .params = try params.toOwnedSlice(self.allocator),
             .results = try results.toOwnedSlice(self.allocator),
+            .param_type_idxs = try param_tidxs.toOwnedSlice(self.allocator),
+            .result_type_idxs = try result_tidxs.toOwnedSlice(self.allocator),
         };
     }
 
@@ -755,7 +773,7 @@ const Parser = struct {
             try self.expect(.r_paren);
             if (meta.is_sub) try self.expect(.r_paren); // close (sub ...)
             try module.module_types.append(self.allocator, .{
-                .func_type = .{ .params = sig.params, .results = sig.results },
+                .func_type = .{ .params = sig.params, .results = sig.results, .param_type_idxs = sig.param_type_idxs, .result_type_idxs = sig.result_type_idxs },
             });
         } else {
             if (std.mem.eql(u8, inner_text, "struct")) {
@@ -2621,8 +2639,10 @@ const Parser = struct {
         // Check for (param ...) (result ...), (result <valtype>+), or bare (param ...)
         var param_count: u32 = 0;
         var param_types_buf: [16]types.ValType = undefined;
+        var param_tidxs_buf: [16]u32 = .{0xFFFFFFFF} ** 16;
         var result_count: u32 = 0;
         var result_types_buf: [16]types.ValType = undefined;
+        var result_tidxs_buf: [16]u32 = .{0xFFFFFFFF} ** 16;
 
         // Consume all (param ...) blocks
         while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
@@ -2638,11 +2658,19 @@ const Parser = struct {
                     self.skipAnnotations();
                     if (self.peek().kind == .r_paren) break;
                     const before_pos = self.lexer.pos;
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
                     if (self.parseValType()) |vt| {
-                        if (param_count < 16) param_types_buf[param_count] = vt;
+                        self.in_type_parse = saved_itp;
+                        if (param_count < 16) {
+                            param_types_buf[param_count] = vt;
+                            param_tidxs_buf[param_count] = if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF;
+                        }
                         param_count += 1;
                         self.skipAnnotations();
                     } else |_| {
+                        self.in_type_parse = saved_itp;
                         if (self.lexer.pos == before_pos) _ = self.advance();
                         break;
                     }
@@ -2671,11 +2699,19 @@ const Parser = struct {
                     self.skipAnnotations();
                     if (self.peek().kind == .r_paren) break;
                     const before_pos = self.lexer.pos;
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
                     if (self.parseValType()) |vt| {
-                        if (result_count < 16) result_types_buf[result_count] = vt;
+                        self.in_type_parse = saved_itp;
+                        if (result_count < 16) {
+                            result_types_buf[result_count] = vt;
+                            result_tidxs_buf[result_count] = if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF;
+                        }
                         result_count += 1;
                         self.skipAnnotations();
                     } else |_| {
+                        self.in_type_parse = saved_itp;
                         if (self.lexer.pos == before_pos) _ = self.advance();
                         break;
                     }
@@ -2712,14 +2748,24 @@ const Parser = struct {
                     return 1;
                 };
                 @memcpy(p, param_types_buf[0..param_count]);
+                const pt = self.allocator.alloc(u32, param_count) catch {
+                    buf[0] = 0x40;
+                    return 1;
+                };
+                @memcpy(pt, param_tidxs_buf[0..param_count]);
                 const r = self.allocator.alloc(types.ValType, result_count) catch {
                     buf[0] = 0x40;
                     return 1;
                 };
                 @memcpy(r, result_types_buf[0..result_count]);
+                const rt = self.allocator.alloc(u32, result_count) catch {
+                    buf[0] = 0x40;
+                    return 1;
+                };
+                @memcpy(rt, result_tidxs_buf[0..result_count]);
                 const type_idx: u32 = @intCast(mod.module_types.items.len);
                 mod.module_types.append(self.allocator, .{
-                    .func_type = .{ .params = p, .results = r },
+                    .func_type = .{ .params = p, .results = r, .param_type_idxs = pt, .result_type_idxs = rt },
                 }) catch {
                     buf[0] = 0x40;
                     return 1;
