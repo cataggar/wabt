@@ -83,6 +83,24 @@ const Writer = struct {
             // Concrete typed ref: write prefix + type index
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
             try self.writeU32Leb(tidx);
+        } else if (vt == .ref_func) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x70); // func
+        } else if (vt == .ref_extern) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6F); // extern
+        } else if (vt == .ref_any) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6E); // any
+        } else if (vt == .ref_none) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x65); // none
+        } else if (vt == .ref_nofunc) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x73); // nofunc
+        } else if (vt == .ref_noextern) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x72); // noextern
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
         }
@@ -215,9 +233,7 @@ const Writer = struct {
                 try self.writeValType(et);
                 try self.writeLimits(table.type.limits);
                 try self.appendSlice(table.init_expr_bytes);
-                if (table.init_expr_bytes[table.init_expr_bytes.len - 1] != 0x0b) {
-                    try self.appendByte(0x0b);
-                }
+                try self.appendByte(0x0b);
             } else if ((et == .ref_null or et == .ref) and table.type_idx != 0xFFFFFFFF) {
                 // Typed reference: write prefix + concrete type index
                 try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(et)))));
@@ -253,9 +269,7 @@ const Writer = struct {
             // Write init expression
             if (global.init_expr_bytes.len > 0) {
                 try self.appendSlice(global.init_expr_bytes);
-                if (global.init_expr_bytes[global.init_expr_bytes.len - 1] != 0x0b) {
-                    try self.appendByte(0x0b);
-                }
+                try self.appendByte(0x0b);
             } else {
                 // Empty init expression: emit just end opcode (invalid per spec)
                 try self.appendByte(0x0b);
