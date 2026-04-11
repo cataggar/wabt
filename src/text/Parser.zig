@@ -1720,7 +1720,7 @@ const Parser = struct {
                 const label = self.consumeOptionalLabel();
                 // Parse block type
                 var block_type_buf: [6]u8 = undefined;
-                const bt_len = self.readBlockType(&block_type_buf);
+                const bt_len = self.readBlockType(&block_type_buf, false);
 
                 // Check for (then ...) and (else ...) sub-expressions
                 // First parse condition operands (before then)
@@ -2263,7 +2263,7 @@ const Parser = struct {
                         self.peeked = spk;
                         // Check for inline (param ...) (result ...) without (type ...)
                         var ci_buf: [6]u8 = undefined;
-                        const ci_n = self.readBlockType(&ci_buf);
+                        const ci_n = self.readBlockType(&ci_buf, true);
                         // readBlockType emits signed s33 for type indices, but
                         // readBlockType emits signed s33 for type indices, but
                         // call_indirect uses unsigned u32. Re-encode if needed.
@@ -2681,11 +2681,11 @@ const Parser = struct {
 
     fn emitBlockType(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         var buf: [6]u8 = undefined;
-        const len = self.readBlockType(&buf);
+        const len = self.readBlockType(&buf, false);
         code.appendSlice(self.allocator, buf[0..len]) catch {};
     }
 
-    fn readBlockType(self: *Parser, buf: *[6]u8) usize {
+    fn readBlockType(self: *Parser, buf: *[6]u8, force_type_index: bool) usize {
         // Check for (param ...) (result ...), (result <valtype>+), or bare (param ...)
         var param_count: u32 = 0;
         var param_types_buf: [16]types.ValType = undefined;
@@ -2784,7 +2784,7 @@ const Parser = struct {
             // BUT ref/ref_null need the multi-value path (type index) because
             // they require a heap type that can't be encoded in a single byte
             const rt = result_types_buf[0];
-            if (rt != .ref_null and rt != .ref) {
+            if (rt != .ref_null and rt != .ref and !force_type_index) {
                 const raw: u32 = @bitCast(@intFromEnum(rt));
                 buf[0] = @truncate(raw);
                 return 1;
