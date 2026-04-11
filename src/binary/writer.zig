@@ -83,10 +83,13 @@ const Writer = struct {
         var flags: u8 = 0;
         if (limits.has_max) flags |= 0x01;
         if (limits.is_shared) flags |= 0x02;
-        if (limits.is_64) flags |= 0x04;
+        // Auto-detect 64-bit: if values exceed u32 range, force 64-bit encoding
+        const needs_64 = limits.is_64 or limits.initial > std.math.maxInt(u32) or
+            (limits.has_max and limits.max > std.math.maxInt(u32));
+        if (needs_64) flags |= 0x04;
         try self.appendByte(flags);
 
-        if (limits.is_64) {
+        if (needs_64) {
             var tmp: [leb128.max_u64_bytes]u8 = undefined;
             var n = leb128.writeU64Leb128(&tmp, limits.initial);
             try self.appendSlice(tmp[0..n]);
