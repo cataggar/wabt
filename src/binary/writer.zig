@@ -278,34 +278,59 @@ const Writer = struct {
         const ph = try self.beginSection(9);
         try self.writeU32Leb(@intCast(module.elem_segments.items.len));
         for (module.elem_segments.items) |seg| {
+            const has_table_idx = seg.kind == .active and seg.table_var.index != 0;
+            const has_exprs = seg.elem_expr_bytes.len > 0;
+
+            // Compute flags per the wasm binary format:
+            // bit 0: passive/declared (non-active)
+            // bit 1: explicit table index (or elemkind/reftype for non-active)
+            // bit 2: elem expressions instead of function indices
             var flags: u32 = 0;
             if (seg.kind == .passive) flags |= 1;
             if (seg.kind == .declared) flags |= 3;
+            if (has_table_idx) flags |= 2;
+            if (has_exprs) flags |= 4;
+            // For passive/declared with func indices, bit 1 is set to indicate elemkind
+            if (seg.kind != .active and !has_exprs) flags |= 2;
             try self.writeU32Leb(flags);
 
+            // Table index (only for active with explicit table)
+            if (has_table_idx) {
+                try self.writeU32Leb(seg.table_var.index);
+            }
+
+            // Offset expression (only for active segments)
             if (seg.kind == .active) {
-                // Write offset expression
                 if (seg.offset_expr_bytes.len > 0) {
                     try self.appendSlice(seg.offset_expr_bytes);
-                    // Add end byte if not already present (text parser omits it)
                     if (seg.offset_expr_bytes[seg.offset_expr_bytes.len - 1] != 0x0b) {
                         try self.appendByte(0x0b);
                     }
                 } else {
-                    // Default: i32.const 0, end
                     try self.appendByte(0x41);
                     try self.writeS32Leb(0);
                     try self.appendByte(0x0b);
                 }
             }
 
-            if (seg.kind != .active) {
-                try self.appendByte(0x00); // elemkind funcref
-            }
-
-            try self.writeU32Leb(@intCast(seg.elem_var_indices.items.len));
-            for (seg.elem_var_indices.items) |v| {
-                try self.writeU32Leb(v.index);
+            if (has_exprs) {
+                // Elem expressions: reftype + count + expression bytes
+                if (flags & 3 != 0) {
+                    // Non-active or explicit table: write reftype
+                    try self.writeValType(seg.elem_type);
+                }
+                try self.writeU32Leb(seg.elem_expr_count);
+                try self.appendSlice(seg.elem_expr_bytes);
+            } else {
+                // Function indices
+                if (flags & 3 != 0) {
+                    // Non-active or explicit table: write elemkind (0x00 = funcref)
+                    try self.appendByte(0x00);
+                }
+                try self.writeU32Leb(@intCast(seg.elem_var_indices.items.len));
+                for (seg.elem_var_indices.items) |v| {
+                    try self.writeU32Leb(v.index);
+                }
             }
         }
         self.endSection(ph);
@@ -590,4 +615,55 @@ test "text parse + binary write: global init expression preserved" {
         i += sz;
     }
     return error.TestUnexpectedResult; // global section not found
+}
+
+test "text parse + binary write: elem segment with function indices" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module
+        \\  (table 10 funcref)
+        \\  (func) (func) (func)
+        \\  (elem (i32.const 2) func 0 1 2)
+        \\)
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.elem_segments.items.len);
+    const seg = module2.elem_segments.items[0];
+    try std.testing.expectEqual(@as(usize, 3), seg.elem_var_indices.items.len);
+    try std.testing.expectEqual(@as(u32, 0), seg.elem_var_indices.items[0].index);
+    try std.testing.expectEqual(@as(u32, 1), seg.elem_var_indices.items[1].index);
+    try std.testing.expectEqual(@as(u32, 2), seg.elem_var_indices.items[2].index);
+}
+
+test "text parse + binary write: passive elem segment" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module
+        \\  (table 10 funcref)
+        \\  (func) (func)
+        \\  (elem funcref (ref.func 0) (ref.func 1))
+        \\)
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.elem_segments.items.len);
+    // Passive segment with elem expressions
+    try std.testing.expect(module2.elem_segments.items[0].kind == .passive);
 }
