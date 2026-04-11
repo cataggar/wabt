@@ -1452,8 +1452,11 @@ const Parser = struct {
                 @memcpy(rt, result_tidxs_list.items);
                 const new_sig = Mod.FuncSignature{ .params = p, .results = r, .param_type_idxs = pt, .result_type_idxs = rt };
                 // Deduplicate: reuse existing type if signature matches
+                // Only deduplicate against implicit types (after declared types)
+                // to preserve explicit type identity for call_indirect
                 const type_idx = blk: {
-                    for (module.module_types.items, 0..) |entry, idx| {
+                    const dedup_start = module.num_declared_types;
+                    for (module.module_types.items[dedup_start..], dedup_start..) |entry, idx| {
                         switch (entry) {
                             .func_type => |ft| if (ft.eql(new_sig)) {
                                 self.allocator.free(p);
@@ -1475,7 +1478,8 @@ const Parser = struct {
                 // Empty func with no type — deduplicate void->void type
                 const empty_sig = Mod.FuncSignature{};
                 const type_idx = blk: {
-                    for (module.module_types.items, 0..) |entry, idx| {
+                    const dedup_start2 = module.num_declared_types;
+                    for (module.module_types.items[dedup_start2..], dedup_start2..) |entry, idx| {
                         switch (entry) {
                             .func_type => |ft| if (ft.eql(empty_sig)) break :blk idx,
                             else => {},
