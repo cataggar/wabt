@@ -327,9 +327,7 @@ const Writer = struct {
             if (seg.kind == .active) {
                 if (seg.offset_expr_bytes.len > 0) {
                     try self.appendSlice(seg.offset_expr_bytes);
-                    if (seg.offset_expr_bytes[seg.offset_expr_bytes.len - 1] != 0x0b) {
-                        try self.appendByte(0x0b);
-                    }
+                    try self.appendByte(0x0b);
                 } else {
                     // Empty offset expression: emit just end opcode (invalid per spec)
                     try self.appendByte(0x0b);
@@ -424,9 +422,7 @@ const Writer = struct {
                 // Write offset expression
                 if (seg.offset_expr_bytes.len > 0) {
                     try self.appendSlice(seg.offset_expr_bytes);
-                    if (seg.offset_expr_bytes[seg.offset_expr_bytes.len - 1] != 0x0b) {
-                        try self.appendByte(0x0b);
-                    }
+                    try self.appendByte(0x0b);
                 } else {
                     // Empty offset expression: emit just end opcode (invalid per spec)
                     try self.appendByte(0x0b);

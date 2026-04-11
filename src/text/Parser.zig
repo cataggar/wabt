@@ -3788,7 +3788,6 @@ const Parser = struct {
                 self.malformed = true;
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
             }
-            init_code.append(self.allocator, 0x0b) catch {};
             if (self.peek().kind == .r_paren) _ = self.advance();
             table_init_bytes = init_code.toOwnedSlice(self.allocator) catch &.{};
         }
