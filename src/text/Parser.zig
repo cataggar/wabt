@@ -2261,12 +2261,32 @@ const Parser = struct {
                     } else {
                         self.lexer.pos = sp;
                         self.peeked = spk;
-                        self.emitLeb128U32(code, 0); // default type 0
+                        // Check for inline (param ...) (result ...) without (type ...)
+                        var ci_buf: [6]u8 = undefined;
+                        const ci_n = self.readBlockType(&ci_buf);
+                        // readBlockType emits signed s33 for type indices, but
+                        // readBlockType emits signed s33 for type indices, but
+                        // call_indirect uses unsigned u32. Re-encode if needed.
+                        if (ci_n > 1 or (ci_n == 1 and ci_buf[0] != 0x40)) {
+                            // Type index from readBlockType — decode s33 and re-encode as u32
+                            if (leb128.readS32Leb128(ci_buf[0..ci_n])) |sr| {
+                                if (sr.value >= 0) {
+                                    self.emitLeb128U32(code, @intCast(sr.value));
+                                } else {
+                                    self.emitLeb128U32(code, 0);
+                                }
+                            } else |_| {
+                                self.emitLeb128U32(code, 0);
+                            }
+                        } else {
+                            self.emitLeb128U32(code, 0);
+                        }
                     }
                 } else if (self.peek().kind == .integer) {
                     self.emitU32Imm(code); // numeric type index
                 } else {
-                    self.emitLeb128U32(code, 0); // default type 0
+                    // No type use at all — void type, use type 0
+                    self.emitLeb128U32(code, 0);
                 }
                 // Emit table index
                 self.emitLeb128U32(code, ci_table_idx);
