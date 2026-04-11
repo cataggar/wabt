@@ -192,8 +192,26 @@ const Writer = struct {
         const ph = try self.beginSection(4);
         try self.writeU32Leb(@intCast(defined));
         for (module.tables.items[module.num_table_imports..]) |table| {
-            try self.writeValType(table.type.elem_type);
-            try self.writeLimits(table.type.limits);
+            const et = table.type.elem_type;
+            if (table.init_expr_bytes.len > 0 and et != .ref_null and et != .ref) {
+                // Table with init expression: 0x40 0x00 reftype limits expr
+                try self.appendByte(0x40);
+                try self.appendByte(0x00);
+                try self.writeValType(et);
+                try self.writeLimits(table.type.limits);
+                try self.appendSlice(table.init_expr_bytes);
+                if (table.init_expr_bytes[table.init_expr_bytes.len - 1] != 0x0b) {
+                    try self.appendByte(0x0b);
+                }
+            } else if ((et == .ref_null or et == .ref) and table.type_idx != 0xFFFFFFFF) {
+                // Typed reference: write prefix + concrete type index
+                try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(et)))));
+                try self.writeU32Leb(table.type_idx);
+                try self.writeLimits(table.type.limits);
+            } else {
+                try self.writeValType(et);
+                try self.writeLimits(table.type.limits);
+            }
         }
         self.endSection(ph);
     }
@@ -224,34 +242,8 @@ const Writer = struct {
                     try self.appendByte(0x0b);
                 }
             } else {
-                // Default init expr: type.const 0, end
-                switch (global.type.val_type) {
-                    .i32 => {
-                        try self.appendByte(0x41);
-                        try self.writeS32Leb(0);
-                    },
-                    .i64 => {
-                        try self.appendByte(0x42);
-                        try self.writeS32Leb(0);
-                    },
-                    .f32 => {
-                        try self.appendByte(0x43);
-                        try self.writeU32LE(0);
-                    },
-                    .f64 => {
-                        try self.appendByte(0x44);
-                        try self.appendSlice(&[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 });
-                    },
-                    .funcref, .externref => {
-                        try self.appendByte(0xd0); // ref.null
-                        try self.writeValType(global.type.val_type);
-                    },
-                    else => {
-                        try self.appendByte(0x41);
-                        try self.writeS32Leb(0);
-                    },
-                }
-                try self.appendByte(0x0b); // end
+                // Empty init expression: emit just end opcode (invalid per spec)
+                try self.appendByte(0x0b);
             }
         }
         self.endSection(ph);
@@ -310,8 +302,7 @@ const Writer = struct {
                         try self.appendByte(0x0b);
                     }
                 } else {
-                    try self.appendByte(0x41);
-                    try self.writeS32Leb(0);
+                    // Empty offset expression: emit just end opcode (invalid per spec)
                     try self.appendByte(0x0b);
                 }
             }
@@ -407,9 +398,7 @@ const Writer = struct {
                         try self.appendByte(0x0b);
                     }
                 } else {
-                    // Default: i32.const 0, end
-                    try self.appendByte(0x41);
-                    try self.writeS32Leb(0);
+                    // Empty offset expression: emit just end opcode (invalid per spec)
                     try self.appendByte(0x0b);
                 }
             }
