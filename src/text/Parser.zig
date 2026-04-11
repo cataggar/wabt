@@ -1339,8 +1339,12 @@ const Parser = struct {
         // Parse inline (param ...) and (result ...) to build a signature
         var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
         defer params_list.deinit(self.allocator);
+        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        defer param_tidxs_list.deinit(self.allocator);
         var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
         defer results_list.deinit(self.allocator);
+        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        defer result_tidxs_list.deinit(self.allocator);
 
         var seen_results = false;
 
@@ -1365,8 +1369,13 @@ const Parser = struct {
                 }
                 self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                    const vt = self.parseValType() catch break;
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
+                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    self.in_type_parse = saved_itp;
                     params_list.append(self.allocator, vt) catch return error.OutOfMemory;
+                    param_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                     self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
@@ -1376,8 +1385,13 @@ const Parser = struct {
                 _ = self.advance(); // consume 'result'
                 self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                    const vt = self.parseValType() catch break;
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
+                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    self.in_type_parse = saved_itp;
                     results_list.append(self.allocator, vt) catch return error.OutOfMemory;
+                    result_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                     self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
@@ -1425,9 +1439,13 @@ const Parser = struct {
             if (params_list.items.len > 0 or results_list.items.len > 0) {
                 const p = self.allocator.alloc(types.ValType, params_list.items.len) catch return error.OutOfMemory;
                 @memcpy(p, params_list.items);
+                const pt = self.allocator.alloc(u32, param_tidxs_list.items.len) catch return error.OutOfMemory;
+                @memcpy(pt, param_tidxs_list.items);
                 const r = self.allocator.alloc(types.ValType, results_list.items.len) catch return error.OutOfMemory;
                 @memcpy(r, results_list.items);
-                const new_sig = Mod.FuncSignature{ .params = p, .results = r };
+                const rt = self.allocator.alloc(u32, result_tidxs_list.items.len) catch return error.OutOfMemory;
+                @memcpy(rt, result_tidxs_list.items);
+                const new_sig = Mod.FuncSignature{ .params = p, .results = r, .param_type_idxs = pt, .result_type_idxs = rt };
                 // Deduplicate: reuse existing type if signature matches
                 const type_idx = blk: {
                     for (module.module_types.items, 0..) |entry, idx| {
@@ -1435,6 +1453,8 @@ const Parser = struct {
                             .func_type => |ft| if (ft.eql(new_sig)) {
                                 self.allocator.free(p);
                                 self.allocator.free(r);
+                                if (pt.len > 0) self.allocator.free(pt);
+                                if (rt.len > 0) self.allocator.free(rt);
                                 break :blk idx;
                             },
                             else => {},
@@ -1501,8 +1521,13 @@ const Parser = struct {
                 }
                 self.skipAnnotations();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                    const vt = self.parseValType() catch break;
+                    const refs_before = self.collected_type_refs.items.len;
+                    const saved_itp = self.in_type_parse;
+                    self.in_type_parse = true;
+                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    self.in_type_parse = saved_itp;
                     func.local_types.append(self.allocator, vt) catch return error.OutOfMemory;
+                    func.local_type_idxs.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                     self.skipAnnotations();
                 }
                 try self.expect(.r_paren);
@@ -3941,6 +3966,7 @@ const Parser = struct {
                 self.skipAnnotations();
                 var mutability: types.Mutability = .immutable;
                 var val_type: types.ValType = undefined;
+                var imp_global_tidx: u32 = 0xFFFFFFFF;
                 if (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
                     const spk2 = self.peeked;
@@ -3948,19 +3974,35 @@ const Parser = struct {
                     if (self.peek().kind == .kw_mut) {
                         _ = self.advance();
                         mutability = .mutable;
+                        const rb = self.collected_type_refs.items.len;
+                        const si = self.in_type_parse;
+                        self.in_type_parse = true;
                         val_type = try self.parseValType();
+                        self.in_type_parse = si;
+                        if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
                         self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else {
                         self.lexer.pos = sp2;
                         self.peeked = spk2;
+                        const rb = self.collected_type_refs.items.len;
+                        const si = self.in_type_parse;
+                        self.in_type_parse = true;
                         val_type = try self.parseValType();
+                        self.in_type_parse = si;
+                        if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
                     }
                 } else {
+                    const rb = self.collected_type_refs.items.len;
+                    const si = self.in_type_parse;
+                    self.in_type_parse = true;
                     val_type = try self.parseValType();
+                    self.in_type_parse = si;
+                    if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
                 }
                 try module.globals.append(self.allocator, .{
                     .type = .{ .val_type = val_type, .mutability = mutability },
+                    .type_idx = imp_global_tidx,
                     .is_import = true,
                 });
                 module.num_global_imports += 1;
@@ -3970,6 +4012,7 @@ const Parser = struct {
                     .kind = .global,
                 };
                 import.global = .{ .val_type = val_type, .mutability = mutability };
+                import.global_type_idx = imp_global_tidx;
                 try module.imports.append(self.allocator, import);
                 return;
             } else {
@@ -3982,27 +4025,41 @@ const Parser = struct {
         self.skipAnnotations();
         var mutability: types.Mutability = .immutable;
         var val_type: types.ValType = undefined;
+        var global_tidx: u32 = 0xFFFFFFFF;
 
         // Check for (mut <valtype>) — requires two-token lookahead
         if (self.peek().kind == .l_paren) {
-            // Save lexer state to allow backtracking
             const save_pos = self.lexer.pos;
             const save_peeked = self.peeked;
             _ = self.advance(); // consume '('
             if (self.peek().kind == .kw_mut) {
                 _ = self.advance();
                 mutability = .mutable;
+                const rb = self.collected_type_refs.items.len;
+                const si = self.in_type_parse;
+                self.in_type_parse = true;
                 val_type = try self.parseValType();
+                self.in_type_parse = si;
+                if (self.collected_type_refs.items.len > rb) global_tidx = self.collected_type_refs.items[rb];
                 self.skipAnnotations();
                 try self.expect(.r_paren);
             } else {
-                // Not (mut ...) — restore and let parseValType handle it
                 self.lexer.pos = save_pos;
                 self.peeked = save_peeked;
+                const rb = self.collected_type_refs.items.len;
+                const si = self.in_type_parse;
+                self.in_type_parse = true;
                 val_type = try self.parseValType();
+                self.in_type_parse = si;
+                if (self.collected_type_refs.items.len > rb) global_tidx = self.collected_type_refs.items[rb];
             }
         } else {
+            const rb = self.collected_type_refs.items.len;
+            const si = self.in_type_parse;
+            self.in_type_parse = true;
             val_type = try self.parseValType();
+            self.in_type_parse = si;
+            if (self.collected_type_refs.items.len > rb) global_tidx = self.collected_type_refs.items[rb];
         }
 
         // Encode init expression into bytecode
@@ -4015,6 +4072,7 @@ const Parser = struct {
 
         try module.globals.append(self.allocator, .{
             .type = .{ .val_type = val_type, .mutability = mutability },
+            .type_idx = global_tidx,
             .init_expr_bytes = owned,
             .owns_init_expr_bytes = true,
         });

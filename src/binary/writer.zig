@@ -168,7 +168,7 @@ const Writer = struct {
                 .func => try self.writeU32Leb(if (imp.func) |f| f.type_var.index else 0),
                 .table => {
                     if (imp.table) |t| {
-                        try self.writeValType(t.elem_type);
+                        try self.writeValTypeWithTidx(t.elem_type, imp.table_type_idx);
                         try self.writeLimits(t.limits);
                     }
                 },
@@ -177,7 +177,7 @@ const Writer = struct {
                 },
                 .global => {
                     if (imp.global) |g| {
-                        try self.writeValType(g.val_type);
+                        try self.writeValTypeWithTidx(g.val_type, imp.global_type_idx);
                         try self.appendByte(if (g.mutability == .mutable) @as(u8, 1) else 0);
                     }
                 },
@@ -248,7 +248,7 @@ const Writer = struct {
         const ph = try self.beginSection(6);
         try self.writeU32Leb(@intCast(defined));
         for (module.globals.items[module.num_global_imports..]) |global| {
-            try self.writeValType(global.type.val_type);
+            try self.writeValTypeWithTidx(global.type.val_type, global.type_idx);
             try self.appendByte(if (global.type.mutability == .mutable) @as(u8, 1) else 0);
             // Write init expression
             if (global.init_expr_bytes.len > 0) {
@@ -371,7 +371,8 @@ const Writer = struct {
                     var run_end = run_start + 1;
                     while (run_end < locals.len and locals[run_end] == locals[run_start]) : (run_end += 1) {}
                     try self.writeU32Leb(@intCast(run_end - run_start));
-                    try self.writeValType(locals[run_start]);
+                    const tidx: u32 = if (run_start < func.local_type_idxs.items.len) func.local_type_idxs.items[run_start] else 0xFFFFFFFF;
+                    try self.writeValTypeWithTidx(locals[run_start], tidx);
                     run_start = run_end;
                 }
             }

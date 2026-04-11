@@ -180,8 +180,10 @@ pub const Import = struct {
     kind: types.ExternalKind,
     func: ?FuncDeclaration = null,
     table: ?types.TableType = null,
+    table_type_idx: u32 = 0xFFFFFFFF,
     memory: ?types.MemoryType = null,
     global: ?types.GlobalType = null,
+    global_type_idx: u32 = 0xFFFFFFFF,
     tag: ?types.TagType = null,
 };
 
@@ -199,6 +201,7 @@ pub const Func = struct {
     name: ?[]const u8 = null,
     decl: FuncDeclaration = .{},
     local_types: std.ArrayListUnmanaged(types.ValType) = .{},
+    local_type_idxs: std.ArrayListUnmanaged(u32) = .{},
     loc: Location = .{},
     is_import: bool = false,
     /// Raw instruction bytes (binary format) for validation.
@@ -212,6 +215,7 @@ pub const Func = struct {
 pub const Global = struct {
     name: ?[]const u8 = null,
     @"type": types.GlobalType = .{},
+    type_idx: u32 = 0xFFFFFFFF,
     loc: Location = .{},
     is_import: bool = false,
     /// Raw bytecode for the init expression (constant expr).
@@ -375,6 +379,7 @@ pub const Module = struct {
         self.type_meta.deinit(self.allocator);
         for (self.funcs.items) |*func| {
             func.local_types.deinit(self.allocator);
+            func.local_type_idxs.deinit(self.allocator);
             if (func.owns_code_bytes and func.code_bytes.len > 0) {
                 self.allocator.free(func.code_bytes);
             }
