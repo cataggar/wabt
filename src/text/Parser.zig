@@ -3182,6 +3182,38 @@ const Parser = struct {
 
     fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
         _ = opcode;
+        // Parse optional memory index: $name or integer before offset=/align=
+        var mem_idx: u32 = 0;
+        var has_mem_idx = false;
+        if (self.peek().kind == .identifier) {
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            const tok = self.advance();
+            // Check if this is a memory name (not a local/etc)
+            if (self.memory_names.get(tok.text)) |idx| {
+                mem_idx = idx;
+                has_mem_idx = true;
+            } else {
+                // Not a memory name — rewind
+                self.lexer.pos = save_pos;
+                self.peeked = save_peeked;
+            }
+        } else if (self.peek().kind == .integer and self.peek().text.len > 0 and self.peek().text[0] != '-') {
+            // Check if next token is a bare integer (memory index) before offset=/align=
+            // Only consume if followed by offset=, align=, or end of args
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            const tok = self.advance();
+            const next = self.peek().kind;
+            if (next == .nat_eq or next == .l_paren or next == .r_paren or next == .eof) {
+                mem_idx = std.fmt.parseInt(u32, tok.text, 0) catch 0;
+                if (mem_idx > 0) has_mem_idx = true;
+            } else {
+                self.lexer.pos = save_pos;
+                self.peeked = save_peeked;
+            }
+        }
+
         // Parse optional offset=N and align=N
         var alignment: u32 = 0;
         var offset: u64 = 0;
@@ -3189,7 +3221,6 @@ const Parser = struct {
         for (0..2) |_| {
             if (self.peek().kind == .nat_eq) {
                 const tok = self.advance();
-                // Format: "offset=N" or "align=N"
                 if (std.mem.startsWith(u8, tok.text, "offset=")) {
                     const clean = stripUnderscores(tok.text[7..]);
                     offset = std.fmt.parseInt(u64, clean.slice(), 0) catch {
@@ -3214,7 +3245,13 @@ const Parser = struct {
                 log2_align = @ctz(alignment);
             }
         }
-        self.emitLeb128U32(code, log2_align);
+        // Encode alignment with multi-memory bit 6
+        if (has_mem_idx) {
+            self.emitLeb128U32(code, log2_align | 0x40);
+            self.emitLeb128U32(code, mem_idx);
+        } else {
+            self.emitLeb128U32(code, log2_align);
+        }
         var buf: [10]u8 = undefined;
         const n = leb128.writeU64Leb128(&buf, offset);
         code.appendSlice(self.allocator, buf[0..n]) catch {};
