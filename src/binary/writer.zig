@@ -29,6 +29,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) Writ
     try w.writeExportSection(module);
     try w.writeStartSection(module);
     try w.writeElementSection(module);
+    try w.writeDataCountSection(module);
     try w.writeCodeSection(module);
     try w.writeDataSection(module);
     try w.writeCustomSections(module);
@@ -452,6 +453,13 @@ const Writer = struct {
                 }
             }
         }
+        self.endSection(ph);
+    }
+
+    fn writeDataCountSection(self: *Writer, module: *const Mod.Module) WriteError!void {
+        if (module.data_segments.items.len == 0) return;
+        const ph = try self.beginSection(12); // data count section ID
+        try self.writeU32Leb(@intCast(module.data_segments.items.len));
         self.endSection(ph);
     }
 
