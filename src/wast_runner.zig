@@ -879,7 +879,7 @@ pub fn classifyCommand(sexpr: []const u8) Command {
     return .unknown;
 }
 
-fn isModuleDefinition(text: []const u8) bool {
+pub fn isModuleDefinition(text: []const u8) bool {
     // Check for "(module definition $name ...)" — must have a $name
     var i: usize = 1;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
@@ -921,7 +921,7 @@ fn hasDefinitionKeyword(text: []const u8) bool {
     return std.mem.eql(u8, text[i .. i + 10], "definition");
 }
 
-fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
+pub fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[]u8 {
     // "(module definition ...)" → "(module ...)"
     var i: usize = 1;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
@@ -940,7 +940,7 @@ fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[]u8 
     return buf.toOwnedSlice(allocator) catch null;
 }
 
-fn isModuleInstance(text: []const u8) bool {
+pub fn isModuleInstance(text: []const u8) bool {
     var i: usize = 1;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
     if (i + 6 >= text.len) return false;
@@ -951,7 +951,7 @@ fn isModuleInstance(text: []const u8) bool {
     return std.mem.eql(u8, text[i .. i + 8], "instance");
 }
 
-fn extractModuleDefName(text: []const u8) ?[]const u8 {
+pub fn extractModuleDefName(text: []const u8) ?[]const u8 {
     // "(module definition $name ...)" → "$name"
     var i: usize = 1;
     while (i < text.len and isWhitespace(text[i])) : (i += 1) {}
