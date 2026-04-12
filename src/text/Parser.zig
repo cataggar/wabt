@@ -4272,6 +4272,7 @@ const Parser = struct {
                     } else |_| {}
                 }
                 var type_index: types.Index = 0;
+                var has_explicit_type = false;
                 var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
@@ -4290,6 +4291,7 @@ const Parser = struct {
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = try self.parseTypeIdx();
+                        has_explicit_type = true;
                         self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else if (self.peek().kind == .kw_param) {
@@ -4321,7 +4323,7 @@ const Parser = struct {
                     }
                     self.skipAnnotations();
                 }
-                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                if (!has_explicit_type) {
                     const params = params_list.toOwnedSlice(self.allocator) catch &.{};
                     const results = results_list.toOwnedSlice(self.allocator) catch &.{};
                     type_index = @intCast(module.module_types.items.len);
@@ -4672,6 +4674,59 @@ const Parser = struct {
                         }
                         // parseInitExprFolded already consumed the closing )
                     }
+                } else if (!has_elem_type and inner_kind == .kw_ref) {
+                    // (ref ...) — non-nullable elem type declaration (e.g., (ref func))
+                    // Must come before offset detection to avoid misinterpreting as init expr
+                    // Note: (ref.null ...) is an instruction, not matched here
+                    _ = self.advance(); // consume 'ref'
+                    const next_kind = self.peek().kind;
+                    if (next_kind == .kw_func) {
+                        _ = self.advance();
+                        seg.elem_type = .ref_func;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        has_elem_type = true;
+                    } else if (next_kind == .kw_externref) {
+                        _ = self.advance();
+                        seg.elem_type = .ref_extern;
+                        elem_type_is_externref = true;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        has_elem_type = true;
+                    } else if (next_kind == .kw_null) {
+                        // (ref null <heaptype>) — nullable elem type
+                        _ = self.advance(); // consume 'null'
+                        const ht_kind = self.peek().kind;
+                        if (ht_kind == .kw_func) {
+                            _ = self.advance();
+                            seg.elem_type = .funcref;
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        } else if (ht_kind == .kw_externref) {
+                            _ = self.advance();
+                            seg.elem_type = .externref;
+                            elem_type_is_externref = true;
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        } else {
+                            // Unknown heap type in (ref null ...) after offset — elem type
+                            self.skipToRParen();
+                            has_elem_type = true;
+                        }
+                    } else {
+                        if (!has_offset) {
+                            // Before offset: (ref <concrete>) could be offset expr — revert
+                            self.lexer.pos = save_pos;
+                            self.peeked = save_peeked;
+                            self.parseInitExprWrapped(&offset_code);
+                            has_offset = true;
+                        } else {
+                            // After offset: (ref <concrete>) is elem type annotation
+                            seg.elem_type = .ref_func;
+                            while (self.peek().kind != .r_paren and self.peek().kind != .eof)
+                                _ = self.advance();
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        }
+                    }
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
                     self.lexer.pos = save_pos;
@@ -4709,10 +4764,6 @@ const Parser = struct {
                             seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
                         }
                     }
-                } else if (!has_elem_type and (inner_kind == .kw_ref or inner_kind == .kw_ref_null)) {
-                    // (ref ...) or (ref null ...) — elem type declaration
-                    self.skipToRParen();
-                    has_elem_type = true;
                 } else {
                     // Post-offset without explicit type: skip
                     try self.skipSExpr();
