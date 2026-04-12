@@ -24,6 +24,7 @@ pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) Writ
     try w.writeFunctionSection(module);
     try w.writeTableSection(module);
     try w.writeMemorySection(module);
+    try w.writeTagSection(module);
     try w.writeGlobalSection(module);
     try w.writeExportSection(module);
     try w.writeStartSection(module);
@@ -313,6 +314,46 @@ const Writer = struct {
             try self.writeLimits(mem.type.limits);
         }
         self.endSection(ph);
+    }
+
+    fn writeTagSection(self: *Writer, module: *const Mod.Module) WriteError!void {
+        const defined = module.tags.items.len - module.num_tag_imports;
+        if (defined == 0) return;
+        const ph = try self.beginSection(13); // tag section ID
+        try self.writeU32Leb(@intCast(defined));
+        for (module.tags.items[module.num_tag_imports..]) |tag| {
+            try self.appendByte(0); // attribute: 0 = exception
+            // Resolve type index: if not set, find matching type by signature
+            var tidx = tag.type_idx;
+            if (tidx == std.math.maxInt(u32)) {
+                tidx = findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
+            }
+            try self.writeU32Leb(tidx);
+        }
+        self.endSection(ph);
+    }
+
+    fn findMatchingType(module: *const Mod.Module, params: []const types.ValType, results: []const types.ValType) ?u32 {
+        for (module.module_types.items, 0..) |entry, i| {
+            switch (entry) {
+                .func_type => |ft| {
+                    if (ft.params.len == params.len and ft.results.len == results.len) {
+                        var match = true;
+                        for (ft.params, params) |a, b| {
+                            if (a != b) { match = false; break; }
+                        }
+                        if (match) {
+                            for (ft.results, results) |a, b| {
+                                if (a != b) { match = false; break; }
+                            }
+                        }
+                        if (match) return @intCast(i);
+                    }
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn writeGlobalSection(self: *Writer, module: *const Mod.Module) WriteError!void {
