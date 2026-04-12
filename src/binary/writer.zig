@@ -152,9 +152,55 @@ const Writer = struct {
     fn writeTypeSection(self: *Writer, module: *const Mod.Module) WriteError!void {
         if (module.module_types.items.len == 0) return;
         const ph = try self.beginSection(1);
-        try self.writeU32Leb(@intCast(module.module_types.items.len));
-        for (module.module_types.items) |entry| {
-            switch (entry) {
+        // Count top-level entries: each rec group counts as 1, standalone types count as 1
+        var top_count: u32 = 0;
+        {
+            var i: usize = 0;
+            while (i < module.module_types.items.len) {
+                const rgs = if (i < module.type_meta.items.len) module.type_meta.items[i].rec_group_size else 1;
+                if (rgs > 1) {
+                    i += rgs;
+                } else {
+                    i += 1;
+                }
+                top_count += 1;
+            }
+        }
+        try self.writeU32Leb(top_count);
+        var idx: usize = 0;
+        while (idx < module.module_types.items.len) {
+            const meta = if (idx < module.type_meta.items.len) module.type_meta.items[idx] else Mod.TypeMeta{};
+            if (meta.rec_group_size > 1) {
+                try self.appendByte(0x4E); // rec group marker
+                try self.writeU32Leb(meta.rec_group_size);
+                var ri: u32 = 0;
+                while (ri < meta.rec_group_size) : (ri += 1) {
+                    const sub_idx = idx + ri;
+                    const sub_meta = if (sub_idx < module.type_meta.items.len) module.type_meta.items[sub_idx] else Mod.TypeMeta{};
+                    try self.writeOneType(module, sub_idx, sub_meta);
+                }
+                idx += meta.rec_group_size;
+            } else {
+                try self.writeOneType(module, idx, meta);
+                idx += 1;
+            }
+        }
+        self.endSection(ph);
+    }
+
+    fn writeOneType(self: *Writer, module: *const Mod.Module, idx: usize, meta: Mod.TypeMeta) WriteError!void {
+        if (meta.is_sub or !meta.is_final or meta.parent != std.math.maxInt(u32)) {
+            // sub/sub final type
+            try self.appendByte(if (meta.is_final) 0x4F else 0x50);
+            if (meta.parent != std.math.maxInt(u32)) {
+                try self.writeU32Leb(1);
+                try self.writeU32Leb(meta.parent);
+            } else {
+                try self.writeU32Leb(0);
+            }
+        }
+        if (idx < module.module_types.items.len) {
+            switch (module.module_types.items[idx]) {
                 .func_type => |ft| {
                     try self.appendByte(0x60);
                     try self.writeU32Leb(@intCast(ft.params.len));
@@ -168,10 +214,21 @@ const Writer = struct {
                         try self.writeValTypeWithTidx(r, tidx);
                     }
                 },
-                else => {}, // struct/array not yet supported
+                .struct_type => |st| {
+                    try self.appendByte(0x5F);
+                    try self.writeU32Leb(@intCast(st.fields.items.len));
+                    for (st.fields.items) |f| {
+                        try self.writeValTypeWithTidx(f.@"type", 0xFFFFFFFF);
+                        try self.appendByte(if (f.mutable) 1 else 0);
+                    }
+                },
+                .array_type => |at| {
+                    try self.appendByte(0x5E);
+                    try self.writeValTypeWithTidx(at.field.@"type", 0xFFFFFFFF);
+                    try self.appendByte(if (at.field.mutable) 1 else 0);
+                },
             }
         }
-        self.endSection(ph);
     }
 
     fn writeImportSection(self: *Writer, module: *const Mod.Module) WriteError!void {
