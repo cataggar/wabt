@@ -816,23 +816,39 @@ const Parser = struct {
                                 if (self.peek().kind == .kw_mut) {
                                     _ = self.advance();
                                     fmut = true;
+                                    const rb1 = self.collected_type_refs.items.len;
+                                    const si1 = self.in_type_parse; self.in_type_parse = true;
                                     const ftype = self.parseValType() catch .ref_null;
+                                    self.in_type_parse = si1;
+                                    const ft1: u32 = if (self.collected_type_refs.items.len > rb1) self.collected_type_refs.items[rb1] else 0xFFFFFFFF;
                                     if (self.peek().kind == .r_paren) _ = self.advance();
-                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut }) catch {};
+                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut, .type_idx = ft1 }) catch {};
                                 } else {
                                     self.lexer.pos = sp2;
                                     self.peeked = spk2;
+                                    const rb2 = self.collected_type_refs.items.len;
+                                    const si2 = self.in_type_parse; self.in_type_parse = true;
                                     const ftype = self.parseValType() catch .ref_null;
-                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                                    self.in_type_parse = si2;
+                                    const ft2: u32 = if (self.collected_type_refs.items.len > rb2) self.collected_type_refs.items[rb2] else 0xFFFFFFFF;
+                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft2 }) catch {};
                                 }
                             } else {
+                                const rb3 = self.collected_type_refs.items.len;
+                                const si3 = self.in_type_parse; self.in_type_parse = true;
                                 const ftype = self.parseValType() catch .ref_null;
-                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false }) catch {};
+                                self.in_type_parse = si3;
+                                const ft3: u32 = if (self.collected_type_refs.items.len > rb3) self.collected_type_refs.items[rb3] else 0xFFFFFFFF;
+                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft3 }) catch {};
                             }
                             // Handle multiple anonymous fields: (field type type type ...)
                             while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                                const rb4 = self.collected_type_refs.items.len;
+                                const si4 = self.in_type_parse; self.in_type_parse = true;
                                 const extra_type = self.parseValType() catch break;
-                                fields.append(self.allocator, .{ .@"type" = extra_type }) catch {};
+                                self.in_type_parse = si4;
+                                const ft4: u32 = if (self.collected_type_refs.items.len > rb4) self.collected_type_refs.items[rb4] else 0xFFFFFFFF;
+                                fields.append(self.allocator, .{ .@"type" = extra_type, .type_idx = ft4 }) catch {};
                             }
                             if (self.peek().kind == .r_paren) _ = self.advance();
                         }
