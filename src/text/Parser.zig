@@ -734,6 +734,17 @@ const Parser = struct {
         self.collected_type_refs.clearRetainingCapacity();
         self.in_type_parse = true;
         defer self.in_type_parse = false;
+        // Allow self-referencing types (standalone types form implicit singleton rec groups)
+        const was_in_rec = self.in_rec;
+        const old_rec_end = self.rec_end;
+        if (!self.in_rec) {
+            self.in_rec = true;
+            self.rec_end = @as(u32, @intCast(module.module_types.items.len)) + 1;
+        }
+        defer {
+            self.in_rec = was_in_rec;
+            self.rec_end = old_rec_end;
+        }
         // (type $name? (func (param ...) (result ...)))
         self.skipAnnotations();
         if (self.peek().kind == .identifier) {
