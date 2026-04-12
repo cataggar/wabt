@@ -2372,7 +2372,7 @@ fn skipModulePrefix(mod_text: []const u8) usize {
 }
 
 /// Decode `(module quote "..." "..." ...)` — extract and concatenate quoted WAT strings.
-fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 {
+pub fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 {
     var result = std.ArrayListUnmanaged(u8){};
     errdefer result.deinit(allocator);
 
