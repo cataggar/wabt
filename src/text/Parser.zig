@@ -565,7 +565,8 @@ const Parser = struct {
                             if (idx >= self.rec_end) self.malformed = true;
                         } else if (self.in_type_parse) {
                             if (self.module) |mod| {
-                                const max = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len));
+                                // Allow self-reference: idx == items.len refers to the type currently being parsed
+                                const max = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len)) + 1;
                                 if (idx >= max) self.malformed = true;
                             }
                         } else {
