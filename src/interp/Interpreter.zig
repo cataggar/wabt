@@ -3654,7 +3654,7 @@ pub const Interpreter = struct {
                             const val = try self.popI32();
                             try self.pushValue(.{ .ref_i31 = @bitCast(val & 0x7fff_ffff) });
                         },
-                        0x1d => { // i31.get_u
+                        0x1d => { // i31.get_s
                             const v = try self.popValue();
                             if (v == .ref_null) return error.NullReference;
                             const raw = switch (v) {
@@ -3664,7 +3664,7 @@ pub const Interpreter = struct {
                             };
                             try self.pushValue(.{ .i32 = @intCast(raw & 0x7fff_ffff) });
                         },
-                        0x1e => { // i31.get_s
+                        0x1e => { // i31.get_u
                             const v = try self.popValue();
                             if (v == .ref_null) return error.NullReference;
                             const raw = switch (v) {

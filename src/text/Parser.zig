@@ -3205,7 +3205,7 @@ const Parser = struct {
                 self.emitU32Imm(code);
             },
             0x1a, 0x1b => {}, // any.convert_extern, extern.convert_any: no immediates
-            0x1c, 0x1d, 0x1e => {}, // ref.i31, i31.get_u, i31.get_s: no immediates
+            0x1c, 0x1d, 0x1e => {}, // ref.i31, i31.get_s, i31.get_u: no immediates
             else => {},
         }
     }
@@ -5635,8 +5635,8 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "i64.extend32_s", 0xc4 },
         // GC (0xfb prefix)
         .{ "ref.i31", 0xfb1c },
-        .{ "i31.get_u", 0xfb1d },
-        .{ "i31.get_s", 0xfb1e },
+        .{ "i31.get_s", 0xfb1d },
+        .{ "i31.get_u", 0xfb1e },
         .{ "struct.new", 0xfb00 },
         .{ "struct.new_default", 0xfb01 },
         .{ "struct.get", 0xfb02 },
