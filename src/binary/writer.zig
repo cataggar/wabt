@@ -218,13 +218,13 @@ const Writer = struct {
                     try self.appendByte(0x5F);
                     try self.writeU32Leb(@intCast(st.fields.items.len));
                     for (st.fields.items) |f| {
-                        try self.writeValTypeWithTidx(f.@"type", 0xFFFFFFFF);
+                        try self.writeValTypeWithTidx(f.@"type", f.type_idx);
                         try self.appendByte(if (f.mutable) 1 else 0);
                     }
                 },
                 .array_type => |at| {
                     try self.appendByte(0x5E);
-                    try self.writeValTypeWithTidx(at.field.@"type", 0xFFFFFFFF);
+                    try self.writeValTypeWithTidx(at.field.@"type", at.field.type_idx);
                     try self.appendByte(if (at.field.mutable) 1 else 0);
                 },
             }

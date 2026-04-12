@@ -155,6 +155,7 @@ pub const TypeEntry = union(enum) {
             name: ?[]const u8 = null,
             @"type": types.ValType,
             mutable: bool = false,
+            type_idx: u32 = 0xFFFFFFFF,
         };
     };
 
