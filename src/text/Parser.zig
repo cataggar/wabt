@@ -981,20 +981,29 @@ const Parser = struct {
 
     fn parseRec(self: *Parser, module: *Mod.Module) ParseError!void {
         // (rec (type ...) (type ...) ...)
-        // Pre-count types to determine the rec group boundary.
+        // Pre-count types and pre-register names so forward refs resolve.
         const save_pos = self.lexer.pos;
         const save_peeked = self.peeked;
         var rec_count: u32 = 0;
+        const rec_start: u32 = @intCast(module.module_types.items.len);
         while (self.peek().kind == .l_paren) {
             _ = self.advance();
-            if (self.peek().kind == .kw_type) rec_count += 1;
+            if (self.peek().kind == .kw_type) {
+                _ = self.advance(); // consume 'type'
+                // Pre-register type name for forward references within rec group
+                self.skipAnnotations();
+                if (self.peek().kind == .identifier) {
+                    const name = self.advance().text;
+                    self.type_names.put(self.allocator, name, rec_start + rec_count) catch {};
+                }
+                rec_count += 1;
+            }
             self.skipSExpr() catch {};
             if (self.peek().kind == .r_paren) _ = self.advance();
         }
         self.lexer.pos = save_pos;
         self.peeked = save_peeked;
 
-        const rec_start: u32 = @intCast(module.module_types.items.len);
         self.in_rec = true;
         self.rec_end = rec_start + rec_count;
         defer {
@@ -1238,10 +1247,15 @@ const Parser = struct {
 
                 // Parse optional (type $idx) and inline sig
                 var type_index: types.Index = 0;
+                var has_explicit_type2 = false;
                 var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer results_list.deinit(self.allocator);
+                var param_tidxs_list2: std.ArrayListUnmanaged(u32) = .{};
+                defer param_tidxs_list2.deinit(self.allocator);
+                var result_tidxs_list2: std.ArrayListUnmanaged(u32) = .{};
+                defer result_tidxs_list2.deinit(self.allocator);
 
                 self.skipAnnotations();
                 while (self.peek().kind == .l_paren) {
@@ -1252,6 +1266,7 @@ const Parser = struct {
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = self.parseTypeIdx() catch 0;
+                        has_explicit_type2 = true;
                         self.skipAnnotations();
                         try self.expect(.r_paren);
                         self.skipAnnotations();
@@ -1261,8 +1276,13 @@ const Parser = struct {
                         if (self.peek().kind == .identifier) _ = self.advance();
                         self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const refs_before = self.collected_type_refs.items.len;
+                            const saved_itp = self.in_type_parse;
+                            self.in_type_parse = true;
                             const vt = self.parseValType() catch break;
+                            self.in_type_parse = saved_itp;
                             params_list.append(self.allocator, vt) catch {};
+                            param_tidxs_list2.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             self.skipAnnotations();
                         }
                         try self.expect(.r_paren);
@@ -1271,8 +1291,13 @@ const Parser = struct {
                         _ = self.advance();
                         self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const refs_before = self.collected_type_refs.items.len;
+                            const saved_itp = self.in_type_parse;
+                            self.in_type_parse = true;
                             const vt = self.parseValType() catch break;
+                            self.in_type_parse = saved_itp;
                             results_list.append(self.allocator, vt) catch {};
+                            result_tidxs_list2.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             self.skipAnnotations();
                         }
                         try self.expect(.r_paren);
@@ -1288,13 +1313,15 @@ const Parser = struct {
                 func.is_import = true;
                 func.decl.type_var = .{ .index = type_index };
 
-                // Build func type if inline sig provided
-                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                // Build func type if inline sig provided (no explicit type ref)
+                if (!has_explicit_type2) {
                     const params = params_list.toOwnedSlice(self.allocator) catch &.{};
                     const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                    const pt = param_tidxs_list2.toOwnedSlice(self.allocator) catch &.{};
+                    const rt = result_tidxs_list2.toOwnedSlice(self.allocator) catch &.{};
                     type_index = @intCast(module.module_types.items.len);
                     module.module_types.append(self.allocator, .{
-                        .func_type = .{ .params = params, .results = results },
+                        .func_type = .{ .params = params, .results = results, .param_type_idxs = pt, .result_type_idxs = rt },
                     }) catch {};
                     func.decl.type_var = .{ .index = type_index };
                 }
@@ -4272,10 +4299,15 @@ const Parser = struct {
                     } else |_| {}
                 }
                 var type_index: types.Index = 0;
+                var has_explicit_type = false;
                 var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
                 defer results_list.deinit(self.allocator);
+                var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+                defer param_tidxs_list.deinit(self.allocator);
+                var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+                defer result_tidxs_list.deinit(self.allocator);
                 self.skipAnnotations();
                 while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
                     if (self.peek().kind == .annotation) {
@@ -4290,6 +4322,7 @@ const Parser = struct {
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         type_index = try self.parseTypeIdx();
+                        has_explicit_type = true;
                         self.skipAnnotations();
                         try self.expect(.r_paren);
                     } else if (self.peek().kind == .kw_param) {
@@ -4298,8 +4331,13 @@ const Parser = struct {
                         if (self.peek().kind == .identifier) _ = self.advance();
                         self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof and self.peek().kind != .annotation) {
+                            const refs_before = self.collected_type_refs.items.len;
+                            const saved_itp = self.in_type_parse;
+                            self.in_type_parse = true;
                             const vt = self.parseValType() catch break;
+                            self.in_type_parse = saved_itp;
                             params_list.append(self.allocator, vt) catch {};
+                            param_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             self.skipAnnotations();
                         }
                         self.skipAnnotations();
@@ -4308,8 +4346,13 @@ const Parser = struct {
                         _ = self.advance();
                         self.skipAnnotations();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof and self.peek().kind != .annotation) {
+                            const refs_before = self.collected_type_refs.items.len;
+                            const saved_itp = self.in_type_parse;
+                            self.in_type_parse = true;
                             const vt = self.parseValType() catch break;
+                            self.in_type_parse = saved_itp;
                             results_list.append(self.allocator, vt) catch {};
+                            result_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             self.skipAnnotations();
                         }
                         self.skipAnnotations();
@@ -4321,12 +4364,14 @@ const Parser = struct {
                     }
                     self.skipAnnotations();
                 }
-                if (params_list.items.len > 0 or results_list.items.len > 0) {
+                if (!has_explicit_type) {
                     const params = params_list.toOwnedSlice(self.allocator) catch &.{};
                     const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                    const pt = param_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
+                    const rt = result_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
                     type_index = @intCast(module.module_types.items.len);
                     module.module_types.append(self.allocator, .{
-                        .func_type = .{ .params = params, .results = results },
+                        .func_type = .{ .params = params, .results = results, .param_type_idxs = pt, .result_type_idxs = rt },
                     }) catch {};
                 }
                 import.func = .{ .type_var = .{ .index = type_index } };
@@ -4672,6 +4717,59 @@ const Parser = struct {
                         }
                         // parseInitExprFolded already consumed the closing )
                     }
+                } else if (!has_elem_type and inner_kind == .kw_ref) {
+                    // (ref ...) — non-nullable elem type declaration (e.g., (ref func))
+                    // Must come before offset detection to avoid misinterpreting as init expr
+                    // Note: (ref.null ...) is an instruction, not matched here
+                    _ = self.advance(); // consume 'ref'
+                    const next_kind = self.peek().kind;
+                    if (next_kind == .kw_func) {
+                        _ = self.advance();
+                        seg.elem_type = .ref_func;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        has_elem_type = true;
+                    } else if (next_kind == .kw_externref) {
+                        _ = self.advance();
+                        seg.elem_type = .ref_extern;
+                        elem_type_is_externref = true;
+                        if (self.peek().kind == .r_paren) _ = self.advance();
+                        has_elem_type = true;
+                    } else if (next_kind == .kw_null) {
+                        // (ref null <heaptype>) — nullable elem type
+                        _ = self.advance(); // consume 'null'
+                        const ht_kind = self.peek().kind;
+                        if (ht_kind == .kw_func) {
+                            _ = self.advance();
+                            seg.elem_type = .funcref;
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        } else if (ht_kind == .kw_externref) {
+                            _ = self.advance();
+                            seg.elem_type = .externref;
+                            elem_type_is_externref = true;
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        } else {
+                            // Unknown heap type in (ref null ...) after offset — elem type
+                            self.skipToRParen();
+                            has_elem_type = true;
+                        }
+                    } else {
+                        if (!has_offset) {
+                            // Before offset: (ref <concrete>) could be offset expr — revert
+                            self.lexer.pos = save_pos;
+                            self.peeked = save_peeked;
+                            self.parseInitExprWrapped(&offset_code);
+                            has_offset = true;
+                        } else {
+                            // After offset: (ref <concrete>) is elem type annotation
+                            seg.elem_type = .ref_func;
+                            while (self.peek().kind != .r_paren and self.peek().kind != .eof)
+                                _ = self.advance();
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                        }
+                    }
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
                     self.lexer.pos = save_pos;
@@ -4709,10 +4807,6 @@ const Parser = struct {
                             seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
                         }
                     }
-                } else if (!has_elem_type and (inner_kind == .kw_ref or inner_kind == .kw_ref_null)) {
-                    // (ref ...) or (ref null ...) — elem type declaration
-                    self.skipToRParen();
-                    has_elem_type = true;
                 } else {
                     // Post-offset without explicit type: skip
                     try self.skipSExpr();

@@ -283,11 +283,11 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(defined));
         for (module.tables.items[module.num_table_imports..]) |table| {
             const et = table.type.elem_type;
-            if (table.init_expr_bytes.len > 0 and et != .ref_null and et != .ref) {
+            if (table.init_expr_bytes.len > 0) {
                 // Table with init expression: 0x40 0x00 reftype limits expr
                 try self.appendByte(0x40);
                 try self.appendByte(0x00);
-                try self.writeValType(et);
+                try self.writeValTypeWithTidx(et, table.type_idx);
                 try self.writeLimits(table.type.limits);
                 try self.appendSlice(table.init_expr_bytes);
                 try self.appendByte(0x0b);
