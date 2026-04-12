@@ -3653,7 +3653,7 @@ const Parser = struct {
                 self.skipAnnotations();
                 const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
                 self.skipAnnotations();
-                var limits = types.Limits{ .initial = initial };
+                var limits = types.Limits{ .initial = initial, .is_64 = is_table64 };
                 if (self.peek().kind == .integer) {
                     limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
                     limits.has_max = true;
@@ -3760,7 +3760,7 @@ const Parser = struct {
             }
             const initial: u64 = @intCast(elem_indices.items.len);
             try module.tables.append(self.allocator, .{
-                .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial } },
+                .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial, .is_64 = is_table64 } },
                 .type_idx = inline_type_idx,
                 .is_table64 = is_table64,
             });
@@ -3793,7 +3793,7 @@ const Parser = struct {
         self.skipAnnotations();
         const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
         self.skipAnnotations();
-        var limits = types.Limits{ .initial = initial };
+        var limits = types.Limits{ .initial = initial, .is_64 = is_table64 };
         if (self.peek().kind == .integer) {
             limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
             limits.has_max = true;
@@ -3915,7 +3915,7 @@ const Parser = struct {
                 const page_size: u64 = 65536;
                 const pages: u64 = if (data_len == 0) 0 else (data_len + page_size - 1) / page_size;
                 try module.memories.append(self.allocator, .{
-                    .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true } },
+                    .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true, .is_64 = is_memory64 } },
                     .is_memory64 = is_memory64,
                 });
                 // Create active data segment at offset 0
@@ -3956,11 +3956,11 @@ const Parser = struct {
                     is_memory64 = true;
                 }
                 self.skipAnnotations();
-                const initial = try self.parseU32();
+                const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
                 self.skipAnnotations();
-                var limits = types.Limits{ .initial = initial };
+                var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
                 if (self.peek().kind == .integer) {
-                    limits.max = try self.parseU32();
+                    limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
                     limits.has_max = true;
                 }
                 try module.memories.append(self.allocator, .{
@@ -3994,7 +3994,7 @@ const Parser = struct {
         self.skipAnnotations();
         const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
         self.skipAnnotations();
-        var limits = types.Limits{ .initial = initial };
+        var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
         if (self.peek().kind == .integer) {
             limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
             limits.has_max = true;
@@ -4296,10 +4296,44 @@ const Parser = struct {
         }
         const params = params_list.toOwnedSlice(self.allocator) catch &.{};
         const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+        // If no explicit type index, register a function type for this tag's signature
+        if (tag_type_idx == std.math.maxInt(u32)) {
+            tag_type_idx = self.findOrAddFuncType(module, params, results);
+        }
         try module.tags.append(self.allocator, .{
             .@"type" = .{ .sig = .{ .params = params, .results = results } },
             .type_idx = tag_type_idx,
         });
+    }
+
+    /// Find a matching function type index in module_types, or add a new one.
+    fn findOrAddFuncType(self: *Parser, module: *Mod.Module, params: []const types.ValType, results: []const types.ValType) u32 {
+        // Search existing types
+        for (module.module_types.items, 0..) |entry, i| {
+            switch (entry) {
+                .func_type => |ft| {
+                    if (ft.params.len == params.len and ft.results.len == results.len) {
+                        var match = true;
+                        for (ft.params, params) |a, b| {
+                            if (a != b) { match = false; break; }
+                        }
+                        if (match) {
+                            for (ft.results, results) |a, b| {
+                                if (a != b) { match = false; break; }
+                            }
+                        }
+                        if (match) return @intCast(i);
+                    }
+                },
+                else => {},
+            }
+        }
+        // Not found — add a new type
+        const new_idx: u32 = @intCast(module.module_types.items.len);
+        const p_copy = self.allocator.dupe(types.ValType, params) catch return new_idx;
+        const r_copy = self.allocator.dupe(types.ValType, results) catch return new_idx;
+        module.module_types.append(self.allocator, .{ .func_type = .{ .params = p_copy, .results = r_copy } }) catch {};
+        return new_idx;
     }
 
     fn parseImport(self: *Parser, module: *Mod.Module) ParseError!void {
@@ -4435,11 +4469,11 @@ const Parser = struct {
                     is_memory64 = true;
                 }
                 self.skipAnnotations();
-                const initial = try self.parseU32();
-                var limits = types.Limits{ .initial = initial };
+                const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
+                var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
                 self.skipAnnotations();
                 if (self.peek().kind == .integer) {
-                    limits.max = try self.parseU32();
+                    limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
                     limits.has_max = true;
                 }
                 self.skipAnnotations();
@@ -4470,12 +4504,12 @@ const Parser = struct {
                     is_table64 = true;
                 }
                 self.skipAnnotations();
-                const initial = try self.parseU32();
-                var limits = types.Limits{ .initial = initial };
+                const t_initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
+                var t_limits = types.Limits{ .initial = t_initial, .is_64 = is_table64 };
                 self.skipAnnotations();
                 if (self.peek().kind == .integer) {
-                    limits.max = try self.parseU32();
-                    limits.has_max = true;
+                    t_limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
+                    t_limits.has_max = true;
                 }
                 self.skipAnnotations();
                 const refs_before_table = self.collected_type_refs.items.len;
@@ -4485,10 +4519,10 @@ const Parser = struct {
                 self.in_type_parse = saved_itp_table;
                 const import_table_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_table) self.collected_type_refs.items[refs_before_table] else 0xFFFFFFFF;
                 self.skipAnnotations();
-                import.table = .{ .elem_type = elem_type, .limits = limits };
+                import.table = .{ .elem_type = elem_type, .limits = t_limits };
                 import.table_type_idx = import_table_tidx;
                 try module.tables.append(self.allocator, .{
-                    .type = .{ .elem_type = elem_type, .limits = limits },
+                    .type = .{ .elem_type = elem_type, .limits = t_limits },
                     .is_import = true,
                     .is_table64 = is_table64,
                 });
