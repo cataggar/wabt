@@ -3647,11 +3647,17 @@ const Parser = struct {
                     limits.has_max = true;
                 }
                 self.skipAnnotations();
+                const refs_before_it = self.collected_type_refs.items.len;
+                const saved_itp_it = self.in_type_parse;
+                self.in_type_parse = true;
                 const elem_type = try self.parseValType();
+                self.in_type_parse = saved_itp_it;
+                const import_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_it) self.collected_type_refs.items[refs_before_it] else 0xFFFFFFFF;
                 try module.tables.append(self.allocator, .{
                     .@"type" = .{ .elem_type = elem_type, .limits = limits },
                     .is_import = true,
                     .is_table64 = is_table64,
+                    .type_idx = import_tidx,
                 });
                 module.num_table_imports += 1;
                 var import = Mod.Import{
@@ -3660,6 +3666,7 @@ const Parser = struct {
                     .kind = .table,
                 };
                 import.table = .{ .elem_type = elem_type, .limits = limits };
+                import.table_type_idx = import_tidx;
                 try module.imports.append(self.allocator, import);
                 return;
             } else {
@@ -4459,9 +4466,15 @@ const Parser = struct {
                     limits.has_max = true;
                 }
                 self.skipAnnotations();
+                const refs_before_table = self.collected_type_refs.items.len;
+                const saved_itp_table = self.in_type_parse;
+                self.in_type_parse = true;
                 const elem_type = try self.parseValType();
+                self.in_type_parse = saved_itp_table;
+                const import_table_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_table) self.collected_type_refs.items[refs_before_table] else 0xFFFFFFFF;
                 self.skipAnnotations();
                 import.table = .{ .elem_type = elem_type, .limits = limits };
+                import.table_type_idx = import_table_tidx;
                 try module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
                     .is_import = true,
