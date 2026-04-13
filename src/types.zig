@@ -54,7 +54,7 @@ pub const ValType = enum(i32) {
     // GC nullable bottom types (ref null <bottom>)
     nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
-    nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
+    nullref = 0x65,       // (ref null none) — bottom of internal hierarchy
     nullexnref = 0x68,    // (ref null noexn) — bottom of exn hierarchy
 
     // Non-nullable abstract heap types (internal-only, not binary encoded)
