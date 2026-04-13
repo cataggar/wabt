@@ -4421,6 +4421,7 @@ const Parser = struct {
             .kw_func => {
                 import.kind = .func;
                 const import_func_idx: u32 = @intCast(module.funcs.items.len);
+                self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const fname = self.advance().text;
                     if (self.func_names.getOrPut(self.allocator, fname)) |gop| {
