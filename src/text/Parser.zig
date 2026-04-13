@@ -600,10 +600,10 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "extern")) return .externref;
                     if (std.mem.eql(u8, heap_text, "any")) return .anyref;
                     if (std.mem.eql(u8, heap_text, "exn")) return .exnref;
-                    if (std.mem.eql(u8, heap_text, "i31")) return .anyref;
-                    if (std.mem.eql(u8, heap_text, "eq")) return .anyref;
-                    if (std.mem.eql(u8, heap_text, "struct")) return .anyref;
-                    if (std.mem.eql(u8, heap_text, "array")) return .anyref;
+                    if (std.mem.eql(u8, heap_text, "i31")) return .i31ref;
+                    if (std.mem.eql(u8, heap_text, "eq")) return .eqref;
+                    if (std.mem.eql(u8, heap_text, "struct")) return .structref;
+                    if (std.mem.eql(u8, heap_text, "array")) return .arrayref;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .nullfuncref;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .nullexternref;
                     if (std.mem.eql(u8, heap_text, "none")) return .nullref;
@@ -614,10 +614,11 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "func")) return .ref_func;
                     if (std.mem.eql(u8, heap_text, "extern")) return .ref_extern;
                     if (std.mem.eql(u8, heap_text, "any")) return .ref_any;
-                    if (std.mem.eql(u8, heap_text, "i31")) return .ref_any;
-                    if (std.mem.eql(u8, heap_text, "eq")) return .ref_any;
-                    if (std.mem.eql(u8, heap_text, "struct")) return .ref_any;
-                    if (std.mem.eql(u8, heap_text, "array")) return .ref_any;
+                    if (std.mem.eql(u8, heap_text, "i31")) return .ref_i31;
+                    if (std.mem.eql(u8, heap_text, "eq")) return .ref_eq;
+                    if (std.mem.eql(u8, heap_text, "struct")) return .ref_struct;
+                    if (std.mem.eql(u8, heap_text, "array")) return .ref_array;
+                    if (std.mem.eql(u8, heap_text, "exn")) return .ref_exn;
                     if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
@@ -648,10 +649,10 @@ const Parser = struct {
             .kw_nullfuncref => .nullfuncref,
             .kw_nullexternref => .nullexternref,
             .kw_nullexnref => .nullexnref,
-            .kw_i31ref => .anyref,
-            .kw_eqref => .anyref,
-            .kw_structref => .anyref,
-            .kw_arrayref => .anyref,
+            .kw_i31ref => .i31ref,
+            .kw_eqref => .eqref,
+            .kw_structref => .structref,
+            .kw_arrayref => .arrayref,
             .kw_i8 => .i8,
             .kw_i16 => .i16,
             else => error.InvalidType,
@@ -896,29 +897,44 @@ const Parser = struct {
                     if (self.peek().kind == .kw_mut) {
                         _ = self.advance();
                         elem_mut = true;
+                        const rb = self.collected_type_refs.items.len;
+                        const prev_itp = self.in_type_parse;
+                        self.in_type_parse = true;
+                        defer self.in_type_parse = prev_itp;
                         const elem_type = self.parseValType() catch .ref_null;
+                        const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                         if (self.peek().kind == .r_paren) _ = self.advance();
                         try self.expect(.r_paren); // close array
                         if (meta.is_sub) try self.expect(.r_paren);
                         try module.module_types.append(self.allocator, .{
-                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = elem_mut } },
+                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = elem_mut, .type_idx = tidx } },
                         });
                     } else {
                         self.lexer.pos = sp;
                         self.peeked = spk;
+                        const rb = self.collected_type_refs.items.len;
+                        const prev_itp = self.in_type_parse;
+                        self.in_type_parse = true;
+                        defer self.in_type_parse = prev_itp;
                         const elem_type = self.parseValType() catch .ref_null;
+                        const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                         try self.expect(.r_paren); // close array
                         if (meta.is_sub) try self.expect(.r_paren);
                         try module.module_types.append(self.allocator, .{
-                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false } },
+                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false, .type_idx = tidx } },
                         });
                     }
                 } else {
+                    const rb = self.collected_type_refs.items.len;
+                    const prev_itp = self.in_type_parse;
+                    self.in_type_parse = true;
+                    defer self.in_type_parse = prev_itp;
                     const elem_type = self.parseValType() catch .ref_null;
+                    const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                     try self.expect(.r_paren); // close array
                     if (meta.is_sub) try self.expect(.r_paren);
                     try module.module_types.append(self.allocator, .{
-                        .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false } },
+                        .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false, .type_idx = tidx } },
                     });
                 }
             } else {
@@ -4276,6 +4292,13 @@ const Parser = struct {
         defer params_list.deinit(self.allocator);
         var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
         defer results_list.deinit(self.allocator);
+        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        defer param_tidxs_list.deinit(self.allocator);
+        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        defer result_tidxs_list.deinit(self.allocator);
+        const prev_itp = self.in_type_parse;
+        self.in_type_parse = true;
+        defer self.in_type_parse = prev_itp;
         var tag_type_idx: u32 = std.math.maxInt(u32);
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
@@ -4285,14 +4308,18 @@ const Parser = struct {
                 _ = self.advance();
                 if (self.peek().kind == .identifier) _ = self.advance();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const refs_before = self.collected_type_refs.items.len;
                     const vt = self.parseValType() catch break;
+                    param_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                     params_list.append(self.allocator, vt) catch {};
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else if (self.peek().kind == .kw_result) {
                 _ = self.advance();
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                    const refs_before = self.collected_type_refs.items.len;
                     const vt = self.parseValType() catch break;
+                    result_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                     results_list.append(self.allocator, vt) catch {};
                 }
                 if (self.peek().kind == .r_paren) _ = self.advance();
@@ -4305,6 +4332,8 @@ const Parser = struct {
                             .func_type => |ft| {
                                 for (ft.params) |p| params_list.append(self.allocator, p) catch {};
                                 for (ft.results) |r| results_list.append(self.allocator, r) catch {};
+                                for (ft.param_type_idxs) |ti| param_tidxs_list.append(self.allocator, ti) catch {};
+                                for (ft.result_type_idxs) |ti| result_tidxs_list.append(self.allocator, ti) catch {};
                             },
                             else => {},
                         }
@@ -4320,9 +4349,11 @@ const Parser = struct {
         }
         const params = params_list.toOwnedSlice(self.allocator) catch &.{};
         const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+        const param_tidxs = param_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
+        const result_tidxs = result_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
         // If no explicit type index, register a function type for this tag's signature
         if (tag_type_idx == std.math.maxInt(u32)) {
-            tag_type_idx = self.findOrAddFuncType(module, params, results);
+            tag_type_idx = self.findOrAddFuncTypeWithTidxs(module, params, results, param_tidxs, result_tidxs);
         }
         try module.tags.append(self.allocator, .{
             .@"type" = .{ .sig = .{ .params = params, .results = results } },
@@ -4332,6 +4363,10 @@ const Parser = struct {
 
     /// Find a matching function type index in module_types, or add a new one.
     fn findOrAddFuncType(self: *Parser, module: *Mod.Module, params: []const types.ValType, results: []const types.ValType) u32 {
+        return self.findOrAddFuncTypeWithTidxs(module, params, results, &.{}, &.{});
+    }
+
+    fn findOrAddFuncTypeWithTidxs(self: *Parser, module: *Mod.Module, params: []const types.ValType, results: []const types.ValType, param_tidxs: []const u32, result_tidxs: []const u32) u32 {
         // Search existing types
         for (module.module_types.items, 0..) |entry, i| {
             switch (entry) {
@@ -4356,7 +4391,9 @@ const Parser = struct {
         const new_idx: u32 = @intCast(module.module_types.items.len);
         const p_copy = self.allocator.dupe(types.ValType, params) catch return new_idx;
         const r_copy = self.allocator.dupe(types.ValType, results) catch return new_idx;
-        module.module_types.append(self.allocator, .{ .func_type = .{ .params = p_copy, .results = r_copy } }) catch {};
+        const pt_copy = if (param_tidxs.len > 0) (self.allocator.dupe(u32, param_tidxs) catch &.{}) else @as([]const u32, &.{});
+        const rt_copy = if (result_tidxs.len > 0) (self.allocator.dupe(u32, result_tidxs) catch &.{}) else @as([]const u32, &.{});
+        module.module_types.append(self.allocator, .{ .func_type = .{ .params = p_copy, .results = r_copy, .param_type_idxs = pt_copy, .result_type_idxs = rt_copy } }) catch {};
         return new_idx;
     }
 

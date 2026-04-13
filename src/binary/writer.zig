@@ -103,6 +103,24 @@ const Writer = struct {
         } else if (vt == .ref_noextern) {
             try self.appendByte(0x64); // ref
             try self.appendByte(0x72); // noextern
+        } else if (vt == .ref_eq) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6D); // eq
+        } else if (vt == .ref_i31) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6C); // i31
+        } else if (vt == .ref_struct) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6B); // struct
+        } else if (vt == .ref_array) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6A); // array
+        } else if (vt == .ref_exn) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x69); // exn
+        } else if (vt == .ref_noexn) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x68); // noexn
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
         }

@@ -38,6 +38,10 @@ pub const ValType = enum(i32) {
     funcref = 0x70,
     externref = 0x6f,
     anyref = 0x6e,
+    eqref = 0x6d,
+    i31ref = 0x6c,
+    structref = 0x6b,
+    arrayref = 0x6a,
     exnref = 0x69,
 
     // Typed references (GC proposal)
@@ -64,6 +68,12 @@ pub const ValType = enum(i32) {
     ref_none = -4,     // (ref none) — non-nullable none (bottom)
     ref_nofunc = -5,   // (ref nofunc) — non-nullable nofunc (bottom)
     ref_noextern = -6, // (ref noextern) — non-nullable noextern (bottom)
+    ref_eq = -7,       // (ref eq) — non-nullable eq
+    ref_i31 = -8,      // (ref i31) — non-nullable i31
+    ref_struct = -9,   // (ref struct) — non-nullable struct
+    ref_array = -10,   // (ref array) — non-nullable array
+    ref_exn = -11,     // (ref exn) — non-nullable exn
+    ref_noexn = -12,   // (ref noexn) — non-nullable noexn (bottom)
 
     // Block void type
     void_ = 0x40,
@@ -72,9 +82,10 @@ pub const ValType = enum(i32) {
     /// exnref, ref, ref_null).
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .exnref, .ref, .ref_null,
+            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .ref, .ref_null,
             .nullfuncref, .nullexternref, .nullref, .nullexnref,
-            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
+            .ref_func, .ref_extern, .ref_any, .ref_eq, .ref_i31, .ref_struct, .ref_array,
+            .ref_none, .ref_nofunc, .ref_noextern, .ref_exn, .ref_noexn,
             => true,
             else => false,
         };
@@ -102,6 +113,10 @@ pub const ValType = enum(i32) {
             .externref => "externref",
             .anyref => "anyref",
             .exnref => "exnref",
+            .eqref => "eqref",
+            .i31ref => "i31ref",
+            .structref => "structref",
+            .arrayref => "arrayref",
             .ref => "ref",
             .ref_null => "ref_null",
             .func => "func",
@@ -118,6 +133,12 @@ pub const ValType = enum(i32) {
             .ref_none => "(ref none)",
             .ref_nofunc => "(ref nofunc)",
             .ref_noextern => "(ref noextern)",
+            .ref_eq => "(ref eq)",
+            .ref_i31 => "(ref i31)",
+            .ref_struct => "(ref struct)",
+            .ref_array => "(ref array)",
+            .ref_exn => "(ref exn)",
+            .ref_noexn => "(ref noexn)",
         };
     }
 };
