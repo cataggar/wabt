@@ -3816,14 +3816,48 @@ const Parser = struct {
                     ob[0] = 0x41; // i32.const
                 }
                 ob[1] = 0x00; // 0
-                try module.elem_segments.append(self.allocator, .{
-                    .kind = .active,
-                    .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
-                    .elem_type = elem_type,
-                    .elem_var_indices = elem_indices,
-                    .offset_expr_bytes = ob,
-                    .owns_offset_expr_bytes = true,
-                });
+                // Check if any ref.null present — if so, use expression encoding
+                var has_null = false;
+                for (elem_indices.items) |v| {
+                    if (v.index == std.math.maxInt(u32)) { has_null = true; break; }
+                }
+                if (has_null) {
+                    // Generate expression bytes: ref.func $idx end | ref.null funcref end
+                    var expr_buf: std.ArrayListUnmanaged(u8) = .{};
+                    var leb_buf: [5]u8 = undefined;
+                    const elem_count: u32 = @intCast(elem_indices.items.len);
+                    for (elem_indices.items) |v| {
+                        if (v.index == std.math.maxInt(u32)) {
+                            expr_buf.append(self.allocator, 0xD0) catch {}; // ref.null
+                            expr_buf.append(self.allocator, 0x70) catch {}; // funcref
+                            expr_buf.append(self.allocator, 0x0B) catch {}; // end
+                        } else {
+                            expr_buf.append(self.allocator, 0xD2) catch {}; // ref.func
+                            const n = leb128.writeU32Leb128(&leb_buf, v.index);
+                            expr_buf.appendSlice(self.allocator, leb_buf[0..n]) catch {};
+                            expr_buf.append(self.allocator, 0x0B) catch {}; // end
+                        }
+                    }
+                    elem_indices.deinit(self.allocator);
+                    try module.elem_segments.append(self.allocator, .{
+                        .kind = .active,
+                        .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
+                        .elem_type = elem_type,
+                        .offset_expr_bytes = ob,
+                        .owns_offset_expr_bytes = true,
+                        .elem_expr_bytes = expr_buf.toOwnedSlice(self.allocator) catch &.{},
+                        .elem_expr_count = elem_count,
+                    });
+                } else {
+                    try module.elem_segments.append(self.allocator, .{
+                        .kind = .active,
+                        .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
+                        .elem_type = elem_type,
+                        .elem_var_indices = elem_indices,
+                        .offset_expr_bytes = ob,
+                        .owns_offset_expr_bytes = true,
+                    });
+                }
             } else {
                 elem_indices.deinit(self.allocator);
             }
@@ -4892,7 +4926,23 @@ const Parser = struct {
                             has_elem_type = true;
                         }
                     } else {
-                        if (!has_offset) {
+                        // (ref <concrete_type>) — concrete type reference for elem type
+                        if (self.peek().kind == .identifier or self.peek().kind == .integer) {
+                            // Concrete type index — this is elem type (ref $type)
+                            const type_tok = self.advance();
+                            var resolved_idx: u32 = 0xFFFFFFFF;
+                            if (type_tok.kind == .identifier) {
+                                resolved_idx = self.type_names.get(type_tok.text) orelse 0xFFFFFFFF;
+                            } else if (type_tok.kind == .integer) {
+                                resolved_idx = std.fmt.parseInt(u32, type_tok.text, 0) catch 0xFFFFFFFF;
+                            }
+                            seg.elem_type = .ref;
+                            seg.elem_type_idx = resolved_idx;
+                            if (self.peek().kind == .r_paren) _ = self.advance();
+                            has_elem_type = true;
+                            // Mark as declarative if no offset
+                            if (!has_offset) seg.kind = .declared;
+                        } else if (!has_offset) {
                             // Before offset: (ref <concrete>) could be offset expr — revert
                             self.lexer.pos = save_pos;
                             self.peeked = save_peeked;

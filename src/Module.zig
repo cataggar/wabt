@@ -261,6 +261,7 @@ pub const ElemSegment = struct {
     kind: types.SegmentKind = .active,
     table_var: Var = .{ .index = 0 },
     elem_type: types.ValType = .funcref,
+    elem_type_idx: u32 = 0xFFFFFFFF,
     elem_var_indices: std.ArrayListUnmanaged(Var) = .{},
     /// Raw bytecode for the offset expression (constant expr).
     offset_expr_bytes: []const u8 = &.{},

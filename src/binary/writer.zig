@@ -455,7 +455,7 @@ const Writer = struct {
                 // Elem expressions: reftype + count + expression bytes
                 if (flags & 3 != 0) {
                     // Non-active or explicit table: write reftype
-                    try self.writeValType(seg.elem_type);
+                    try self.writeValTypeWithTidx(seg.elem_type, seg.elem_type_idx);
                 }
                 try self.writeU32Leb(seg.elem_expr_count);
                 try self.appendSlice(seg.elem_expr_bytes);
