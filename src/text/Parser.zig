@@ -3227,8 +3227,32 @@ const Parser = struct {
             code.append(self.allocator, @truncate(lane_val)) catch {};
         } else if (sub >= 0x54 and sub <= 0x5b) {
             // v128.load*_lane / v128.store*_lane: memarg + 1 byte lane
-            self.emitMemarg(code, 0);
+            // Binary format: memarg then lane byte
+            // WAT format: optional "offset=N align=N" then lane_idx
+            // Don't use emitMemarg (it may consume the lane integer as memory index).
+            // Parse memarg keywords manually.
+            var alignment: u32 = 0;
+            var offset: u64 = 0;
+            for (0..2) |_| {
+                if (self.peek().kind == .nat_eq) {
+                    const tok = self.advance();
+                    if (std.mem.startsWith(u8, tok.text, "offset=")) {
+                        offset = std.fmt.parseInt(u64, tok.text[7..], 0) catch 0;
+                    } else if (std.mem.startsWith(u8, tok.text, "align=")) {
+                        alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch 0;
+                    }
+                }
+            }
+            // Lane index
             const lane_val = self.parseU32() catch 0;
+            // Emit memarg: alignment LEB + offset LEB
+            var abuf: [5]u8 = undefined;
+            const an = leb128.writeU32Leb128(&abuf, alignment);
+            code.appendSlice(self.allocator, abuf[0..an]) catch {};
+            var obuf: [5]u8 = undefined;
+            const on = leb128.writeU32Leb128(&obuf, @truncate(offset));
+            code.appendSlice(self.allocator, obuf[0..on]) catch {};
+            // Lane byte
             code.append(self.allocator, @truncate(lane_val)) catch {};
         }
         // All other SIMD ops (arithmetic, comparison, etc.) have no immediates
