@@ -286,6 +286,9 @@ fn checkStart(m: *const Mod.Module) Error!void {
 
 fn checkElemSegments(m: *const Mod.Module) Error!void {
     for (m.elem_segments.items) |seg| {
+        // Validate elem type index references a valid type
+        if (seg.elem_type_idx != 0xFFFFFFFF and seg.elem_type_idx >= m.module_types.items.len)
+            return error.InvalidTypeIndex;
         if (seg.kind == .active) {
             if (m.tables.items.len == 0 or seg.table_var.index >= m.tables.items.len)
                 return error.InvalidTableIndex;

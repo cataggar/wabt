@@ -103,6 +103,24 @@ const Writer = struct {
         } else if (vt == .ref_noextern) {
             try self.appendByte(0x64); // ref
             try self.appendByte(0x72); // noextern
+        } else if (vt == .ref_eq) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6D); // eq
+        } else if (vt == .ref_i31) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6C); // i31
+        } else if (vt == .ref_struct) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6B); // struct
+        } else if (vt == .ref_array) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x6A); // array
+        } else if (vt == .ref_exn) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x69); // exn
+        } else if (vt == .ref_noexn) {
+            try self.appendByte(0x64); // ref
+            try self.appendByte(0x68); // noexn
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
         }
@@ -415,10 +433,15 @@ const Writer = struct {
             if (has_exprs) flags |= 4;
             // For passive/declared with func indices, bit 1 is set to indicate elemkind
             if (seg.kind != .active and !has_exprs) flags |= 2;
+            // Active expr segments with non-default reftype need explicit table idx (flags=6)
+            // so the reftype byte is included in the encoding
+            const needs_explicit_reftype = has_exprs and seg.kind == .active and
+                seg.elem_type != .funcref and (flags & 2 == 0);
+            if (needs_explicit_reftype) flags |= 2;
             try self.writeU32Leb(flags);
 
-            // Table index (only for active with explicit table)
-            if (has_table_idx) {
+            // Table index (for active with explicit table — bit 1 set)
+            if (has_table_idx or needs_explicit_reftype) {
                 try self.writeU32Leb(seg.table_var.index);
             }
 
@@ -435,9 +458,9 @@ const Writer = struct {
 
             if (has_exprs) {
                 // Elem expressions: reftype + count + expression bytes
-                if (flags & 3 != 0) {
-                    // Non-active or explicit table: write reftype
-                    try self.writeValType(seg.elem_type);
+                if (flags & 3 != 0 or needs_explicit_reftype) {
+                    // Non-active, explicit table, or non-default reftype: write reftype
+                    try self.writeValTypeWithTidx(seg.elem_type, seg.elem_type_idx);
                 }
                 try self.writeU32Leb(seg.elem_expr_count);
                 try self.appendSlice(seg.elem_expr_bytes);

@@ -1,20 +1,18 @@
-"""wabt-bin — WebAssembly Binary Toolkit CLI tools."""
+"""wabt-bin — WebAssembly Binary Toolkit CLI tools.
+
+Provides helpers to locate wabt tool binaries installed via
+the data/scripts/ wheel layout. The binaries (wat2wasm, wasm2wat, etc.)
+are placed directly in the scripts directory by pip and do not require
+Python at runtime.
+"""
+
+from __future__ import annotations
 
 import os
-import subprocess
 import sys
-from pathlib import Path
+import sysconfig
 
-
-def _get_version() -> str:
-    try:
-        from importlib.metadata import version
-
-        return version("wabt-bin")
-    except Exception:
-        return "0.0.0"
-
-_TOOLS = [
+TOOLS = [
     "wat2wasm",
     "wasm2wat",
     "wast2json",
@@ -27,62 +25,39 @@ _TOOLS = [
     "wat-desugar",
 ]
 
-_EXT = ".exe" if sys.platform == "win32" else ""
 
+def find_wabt_bin(tool: str = "wat2wasm") -> str:
+    """Return the path to a wabt tool binary.
 
-def _binary_path(tool_name: str) -> Path:
-    """Return the path to a wabt tool binary."""
-    return Path(__file__).parent / f"{tool_name}{_EXT}"
+    Searches the scripts directories where pip installs data/scripts/ files.
+    """
+    ext = ".exe" if sys.platform == "win32" else ""
+    exe = f"{tool}{ext}"
 
+    targets = [
+        sysconfig.get_path("scripts"),
+        sysconfig.get_path("scripts", vars={"base": sys.base_prefix}),
+    ]
 
-def _run(tool_name: str) -> None:
-    """Run a wabt tool binary, replacing the current process on Unix."""
-    binary = _binary_path(tool_name)
-    if not binary.exists():
-        print(f"{tool_name} binary not found at {binary}", file=sys.stderr)
-        sys.exit(1)
-    args = [str(binary), *sys.argv[1:]]
-    if sys.platform != "win32":
-        os.execv(args[0], args)
+    # User scheme
+    if sys.version_info >= (3, 10):
+        user_scheme = sysconfig.get_preferred_scheme("user")
+    elif os.name == "nt":
+        user_scheme = "nt_user"
     else:
-        raise SystemExit(subprocess.call(args))
+        user_scheme = "posix_user"
+    targets.append(sysconfig.get_path("scripts", scheme=user_scheme))
 
+    seen: list[str] = []
+    for target in targets:
+        if not target or target in seen:
+            continue
+        seen.append(target)
+        path = os.path.join(target, exe)
+        if os.path.isfile(path):
+            return path
 
-def wat2wasm() -> None:
-    _run("wat2wasm")
-
-
-def wasm2wat() -> None:
-    _run("wasm2wat")
-
-
-def wast2json() -> None:
-    _run("wast2json")
-
-
-def wasm_validate() -> None:
-    _run("wasm-validate")
-
-
-def wasm_objdump() -> None:
-    _run("wasm-objdump")
-
-
-def wasm_interp() -> None:
-    _run("wasm-interp")
-
-
-def wasm_decompile() -> None:
-    _run("wasm-decompile")
-
-
-def wasm_strip() -> None:
-    _run("wasm-strip")
-
-
-def wasm_stats() -> None:
-    _run("wasm-stats")
-
-
-def wat_desugar() -> None:
-    _run("wat-desugar")
+    locations = "\n".join(f" - {t}" for t in seen)
+    raise FileNotFoundError(
+        f"Could not find {exe} in:\n{locations}\n"
+    )
