@@ -81,7 +81,7 @@ pub const Instance = struct {
     module: *const Mod.Module,
 
     /// Linear memories — memories[0] is the default; multi-memory adds more.
-    memories: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .{},
+    memories: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .empty,
 
     /// Global variable values.
     globals: std.ArrayListUnmanaged(Value),
@@ -121,7 +121,7 @@ pub const Instance = struct {
 
     /// Interpreter refs for imported funcref globals.
     /// Maps global index to the interpreter that owns the referenced function.
-    global_func_interps: std.ArrayListUnmanaged(?*Interpreter) = .{},
+    global_func_interps: std.ArrayListUnmanaged(?*Interpreter) = .empty,
 
     /// Get memory by index, following shared memory pointers.
     pub fn getMemory(self: *Instance, idx: u32) *std.ArrayListUnmanaged(u8) {
@@ -163,8 +163,8 @@ pub const Instance = struct {
         var inst = Instance{
             .allocator = allocator,
             .module = module,
-            .globals = .{},
-            .tables = .{},
+            .globals = .empty,
+            .tables = .empty,
         };
 
         // Allocate drop tracking bitsets.
@@ -179,7 +179,7 @@ pub const Instance = struct {
         const num_mems = if (module.memories.items.len > 0) module.memories.items.len else 1;
         inst.memories.resize(allocator, num_mems) catch return error.OutOfMemory;
         for (0..num_mems) |i| {
-            inst.memories.items[i] = .{};
+            inst.memories.items[i] = .empty;
         }
         for (module.memories.items, 0..) |mem, i| {
             if (mem.is_import) continue;
@@ -207,7 +207,7 @@ pub const Instance = struct {
         if (module.tables.items.len > 0) {
             inst.tables.resize(allocator, module.tables.items.len) catch return error.OutOfMemory;
             for (module.tables.items, 0..) |tbl, i| {
-                inst.tables.items[i] = .{};
+                inst.tables.items[i] = .empty;
                 if (tbl.is_import) continue; // will be shared via pointer
                 const initial: usize = @intCast(tbl.@"type".limits.initial);
                 inst.tables.items[i].resize(allocator, initial) catch return error.OutOfMemory;
@@ -216,7 +216,7 @@ pub const Instance = struct {
         } else {
             // Ensure at least one empty table exists so table() doesn't panic.
             inst.tables.resize(allocator, 1) catch return error.OutOfMemory;
-            inst.tables.items[0] = .{};
+            inst.tables.items[0] = .empty;
         }
 
         return inst;
@@ -441,17 +441,17 @@ pub const Interpreter = struct {
     max_instructions: u64 = 10_000_000,
 
     /// Caught exceptions storage for exnref values.
-    caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .{},
+    caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .empty,
 
     /// GC object heap for struct and array instances.
-    gc_objects: std.ArrayListUnmanaged(GcObject) = .{},
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
 
     /// Resolved function import links (indexed by func_idx for imported funcs).
-    import_links: std.ArrayListUnmanaged(?ImportLink) = .{},
+    import_links: std.ArrayListUnmanaged(?ImportLink) = .empty,
 
     /// Links imported globals to exporting instance's globals for shared mutation.
-    global_links: std.ArrayListUnmanaged(?GlobalLink) = .{},
-    tag_canonical_ids: std.ArrayListUnmanaged(u64) = .{},
+    global_links: std.ArrayListUnmanaged(?GlobalLink) = .empty,
+    tag_canonical_ids: std.ArrayListUnmanaged(u64) = .empty,
 
     /// Maps extern ref index to original Value for any.convert_extern roundtrip.
     extern_originals: std.AutoHashMapUnmanaged(u32, Value) = .{},
@@ -465,7 +465,7 @@ pub const Interpreter = struct {
         return .{
             .allocator = allocator,
             .instance = instance,
-            .stack = .{},
+            .stack = .empty,
         };
     }
 
@@ -484,7 +484,7 @@ pub const Interpreter = struct {
     /// Allocate a new GC struct object, returns its index.
     fn allocStruct(self: *Interpreter, type_idx: u32, fields: []const Value) TrapError!u32 {
         const idx: u32 = @intCast(self.gc_objects.items.len);
-        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
         obj.fields.appendSlice(self.allocator, fields) catch return error.OutOfMemory;
         self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
         return idx;
@@ -493,7 +493,7 @@ pub const Interpreter = struct {
     /// Allocate a new GC array object, returns its index.
     fn allocArray(self: *Interpreter, type_idx: u32, len: u32, init_val: Value) TrapError!u32 {
         const idx: u32 = @intCast(self.gc_objects.items.len);
-        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
         obj.fields.appendNTimes(self.allocator, init_val, len) catch return error.OutOfMemory;
         self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
         return idx;
@@ -3242,7 +3242,7 @@ pub const Interpreter = struct {
                             var fi: u32 = count;
                             while (fi > 0) { fi -= 1; fields_buf[fi] = try self.popValue(); }
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             obj.fields.appendSlice(self.allocator, fields_buf[0..count]) catch return error.OutOfMemory;
                             self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
                             try self.pushValue(.{ .ref_array = idx });
@@ -3262,7 +3262,7 @@ pub const Interpreter = struct {
                             const byte_len: u64 = @as(u64, len) * elem_size;
                             if (@as(u64, offset) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             for (0..len) |i| {
                                 const off = offset + @as(u32, @intCast(i)) * elem_size;
                                 const val = readArrayElemFromData(data, off, elem_size);
@@ -3286,7 +3286,7 @@ pub const Interpreter = struct {
                             const seg_len: u32 = if (dropped) 0 else @max(var_len, expr_len);
                             if (@as(u64, offset) + len > seg_len) return error.OutOfBoundsTableAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             if (var_len == 0 and expr_len > 0 and seg.elem_expr_bytes.len > 0) {
                                 // Expression-based elem segment
                                 var expr_pc: usize = 0;
@@ -5634,7 +5634,7 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
                             var fi: u32 = count;
                             while (fi > 0) { fi -= 1; sp -= 1; fields_buf[fi] = stack[sp]; }
                             const idx: u32 = @intCast(interp.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             obj.fields.appendSlice(interp.allocator, fields_buf[0..count]) catch return null;
                             interp.gc_objects.append(interp.allocator, obj) catch return null;
                             stack[sp] = .{ .ref_array = idx }; sp += 1;
@@ -5749,15 +5749,15 @@ fn testInterpreter() struct { interp: Interpreter, inst: *Instance, mod: *Mod.Mo
     inst.* = Instance{
         .allocator = alloc,
         .module = mod,
-        .globals = .{},
-        .tables = .{},
+        .globals = .empty,
+        .tables = .empty,
     };
     // Ensure at least one empty memory for getMemory(0) accessor
     inst.memories.resize(alloc, 1) catch @panic("OOM");
-    inst.memories.items[0] = .{};
+    inst.memories.items[0] = .empty;
     // Ensure at least one empty table for table() accessor
     inst.tables.resize(alloc, 1) catch @panic("OOM");
-    inst.tables.items[0] = .{};
+    inst.tables.items[0] = .empty;
     return .{
         .interp = Interpreter.init(alloc, inst),
         .inst = inst,

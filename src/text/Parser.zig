@@ -401,9 +401,9 @@ const Parser = struct {
     /// Map from elem segment $name to index.
     elem_names: std.StringArrayHashMapUnmanaged(u32) = .{},
     /// Stack of label $names for block/loop/if — most recent label at the end.
-    label_stack: std.ArrayListUnmanaged(?[]const u8) = .{},
+    label_stack: std.ArrayListUnmanaged(?[]const u8) = .empty,
     /// Type indices referenced during current type parsing (for iso-recursive canonicalization).
-    collected_type_refs: std.ArrayListUnmanaged(u32) = .{},
+    collected_type_refs: std.ArrayListUnmanaged(u32) = .empty,
     /// True when parsing a type section entry (controls type ref collection).
     in_type_parse: bool = false,
 
@@ -660,13 +660,13 @@ const Parser = struct {
     }
 
     fn parseFuncSig(self: *Parser, module: *Mod.Module) ParseError!struct { params: []const types.ValType, results: []const types.ValType, param_type_idxs: []const u32, result_type_idxs: []const u32 } {
-        var params: std.ArrayListUnmanaged(types.ValType) = .{};
+        var params: std.ArrayListUnmanaged(types.ValType) = .empty;
         errdefer params.deinit(self.allocator);
-        var param_tidxs: std.ArrayListUnmanaged(u32) = .{};
+        var param_tidxs: std.ArrayListUnmanaged(u32) = .empty;
         errdefer param_tidxs.deinit(self.allocator);
-        var results: std.ArrayListUnmanaged(types.ValType) = .{};
+        var results: std.ArrayListUnmanaged(types.ValType) = .empty;
         errdefer results.deinit(self.allocator);
-        var result_tidxs: std.ArrayListUnmanaged(u32) = .{};
+        var result_tidxs: std.ArrayListUnmanaged(u32) = .empty;
         errdefer result_tidxs.deinit(self.allocator);
         var seen_result = false;
 
@@ -798,7 +798,7 @@ const Parser = struct {
                 meta.kind = .struct_;
                 _ = self.advance(); // consume 'struct'
                 // Parse struct fields: (field [$name] [mut] <valtype>) ...
-                var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .{};
+                var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
                 while (self.peek().kind == .l_paren) {
                     const sp = self.lexer.pos;
                     const spk = self.peeked;
@@ -1106,7 +1106,7 @@ const Parser = struct {
             const group_size = meta_items[i].rec_group_size;
 
             // Build canonical key for this rec group
-            var key: std.ArrayListUnmanaged(u8) = .{};
+            var key: std.ArrayListUnmanaged(u8) = .empty;
             defer key.deinit(self.allocator);
             self.buildRecGroupKey(&key, module, group_start, group_size);
 
@@ -1292,13 +1292,13 @@ const Parser = struct {
                 // Parse optional (type $idx) and inline sig
                 var type_index: types.Index = 0;
                 var has_explicit_type2 = false;
-                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer params_list.deinit(self.allocator);
-                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer results_list.deinit(self.allocator);
-                var param_tidxs_list2: std.ArrayListUnmanaged(u32) = .{};
+                var param_tidxs_list2: std.ArrayListUnmanaged(u32) = .empty;
                 defer param_tidxs_list2.deinit(self.allocator);
-                var result_tidxs_list2: std.ArrayListUnmanaged(u32) = .{};
+                var result_tidxs_list2: std.ArrayListUnmanaged(u32) = .empty;
                 defer result_tidxs_list2.deinit(self.allocator);
 
                 self.skipAnnotations();
@@ -1413,13 +1413,13 @@ const Parser = struct {
         }
 
         // Parse inline (param ...) and (result ...) to build a signature
-        var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        var params_list: std.ArrayListUnmanaged(types.ValType) = .empty;
         defer params_list.deinit(self.allocator);
-        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
         defer param_tidxs_list.deinit(self.allocator);
-        var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
         defer results_list.deinit(self.allocator);
-        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
         defer result_tidxs_list.deinit(self.allocator);
 
         var seen_results = false;
@@ -1676,7 +1676,7 @@ const Parser = struct {
         }
 
         // Parse function body instructions → emit bytecode
-        var code: std.ArrayListUnmanaged(u8) = .{};
+        var code: std.ArrayListUnmanaged(u8) = .empty;
         defer code.deinit(self.allocator);
         self.parseFuncBodyInstrs(&code);
         // Emit final end
@@ -1738,7 +1738,7 @@ const Parser = struct {
                 self.emitBlockType(code);
                 // Parse catch clauses
                 var clause_count: u32 = 0;
-                var catch_bytes = std.ArrayListUnmanaged(u8){};
+                var catch_bytes = std.ArrayListUnmanaged(u8).empty;
                 defer catch_bytes.deinit(self.allocator);
                 while (self.peek().kind == .l_paren) {
                     const sp = self.lexer.pos;
@@ -1966,7 +1966,7 @@ const Parser = struct {
             .kw_br_table => {
                 code.append(self.allocator, 0x0e) catch return;
                 // Collect all targets (integer depths or $label identifiers)
-                var targets: std.ArrayListUnmanaged(u32) = .{};
+                var targets: std.ArrayListUnmanaged(u32) = .empty;
                 defer targets.deinit(self.allocator);
                 while (self.peek().kind == .integer or self.peek().kind == .identifier) {
                     if (self.peek().kind == .integer) {
@@ -2166,7 +2166,7 @@ const Parser = struct {
                 self.emitBlockType(code);
                 // Parse catch clauses, building a byte buffer
                 var clause_count: u32 = 0;
-                var catch_bytes = std.ArrayListUnmanaged(u8){};
+                var catch_bytes = std.ArrayListUnmanaged(u8).empty;
                 defer catch_bytes.deinit(self.allocator);
                 while (self.peek().kind == .l_paren) {
                     const sp = self.lexer.pos;
@@ -3461,13 +3461,13 @@ const Parser = struct {
                 // Binary format expects: data_idx, mem_idx
                 const first_kind = self.peek().kind;
                 if (first_kind == .identifier or first_kind == .integer) {
-                    var first_code = std.ArrayListUnmanaged(u8){};
+                    var first_code = std.ArrayListUnmanaged(u8).empty;
                     self.emitU32Imm(&first_code);
                     const second_kind = self.peek().kind;
                     if (second_kind == .identifier or second_kind == .integer) {
                         // Two immediates: first is mem_idx, second is data_idx
                         // Binary order: data_idx, mem_idx
-                        var second_code = std.ArrayListUnmanaged(u8){};
+                        var second_code = std.ArrayListUnmanaged(u8).empty;
                         self.emitU32Imm(&second_code);
                         code.appendSlice(self.allocator, second_code.items) catch {};
                         code.appendSlice(self.allocator, first_code.items) catch {};
@@ -3495,13 +3495,13 @@ const Parser = struct {
                 // Binary format expects: elem_idx, table_idx
                 const first_kind = self.peek().kind;
                 if (first_kind == .identifier or first_kind == .integer) {
-                    var first_code = std.ArrayListUnmanaged(u8){};
+                    var first_code = std.ArrayListUnmanaged(u8).empty;
                     self.emitU32Imm(&first_code);
                     const second_kind = self.peek().kind;
                     if (second_kind == .identifier or second_kind == .integer) {
                         // Two immediates: first is table_idx, second is elem_idx
                         // Binary order: elem_idx, table_idx
-                        var second_code = std.ArrayListUnmanaged(u8){};
+                        var second_code = std.ArrayListUnmanaged(u8).empty;
                         self.emitU32Imm(&second_code);
                         code.appendSlice(self.allocator, second_code.items) catch {};
                         code.appendSlice(self.allocator, first_code.items) catch {};
@@ -3749,7 +3749,7 @@ const Parser = struct {
             else
                 0xFFFFFFFF;
             // Parse (elem func_refs...)
-            var elem_indices: std.ArrayListUnmanaged(Mod.Var) = .{};
+            var elem_indices: std.ArrayListUnmanaged(Mod.Var) = .empty;
             if (self.peek().kind == .l_paren) {
                 const sp2 = self.lexer.pos;
                 const spk2 = self.peeked;
@@ -3823,7 +3823,7 @@ const Parser = struct {
                 }
                 if (has_null) {
                     // Generate expression bytes: ref.func $idx end | ref.null funcref end
-                    var expr_buf: std.ArrayListUnmanaged(u8) = .{};
+                    var expr_buf: std.ArrayListUnmanaged(u8) = .empty;
                     var leb_buf: [5]u8 = undefined;
                     const elem_count: u32 = @intCast(elem_indices.items.len);
                     for (elem_indices.items) |v| {
@@ -3887,7 +3887,7 @@ const Parser = struct {
         var table_init_bytes: []const u8 = &.{};
         if (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
-            var init_code: std.ArrayListUnmanaged(u8) = .{};
+            var init_code: std.ArrayListUnmanaged(u8) = .empty;
             const inner = self.advance();
             if (inner.kind == .kw_ref_null) {
                 init_code.append(self.allocator, 0xd0) catch {};
@@ -3977,7 +3977,7 @@ const Parser = struct {
             } else if (self.peek().kind == .kw_data) {
                 // Inline (data "...") abbreviation
                 _ = self.advance(); // consume 'data'
-                var data_parts: std.ArrayListUnmanaged(u8) = .{};
+                var data_parts: std.ArrayListUnmanaged(u8) = .empty;
                 defer data_parts.deinit(self.allocator);
                 while (self.peek().kind == .string) {
                     const tok = self.advance();
@@ -4224,7 +4224,7 @@ const Parser = struct {
 
         // Encode init expression into bytecode
         self.skipAnnotations();
-        var code: std.ArrayListUnmanaged(u8) = .{};
+        var code: std.ArrayListUnmanaged(u8) = .empty;
         defer code.deinit(self.allocator);
         self.parseInitExpr(&code);
 
@@ -4266,7 +4266,7 @@ const Parser = struct {
                 const mod_name = self.parseName(self.advance().text);
                 const field_name = self.parseName(self.advance().text);
                 if (self.peek().kind == .r_paren) _ = self.advance();
-                var imp_params: std.ArrayListUnmanaged(types.ValType) = .{};
+                var imp_params: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer imp_params.deinit(self.allocator);
                 var inline_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
@@ -4322,13 +4322,13 @@ const Parser = struct {
             }
         }
         // Parse tag type: (param ...) and (result ...)
-        var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        var params_list: std.ArrayListUnmanaged(types.ValType) = .empty;
         defer params_list.deinit(self.allocator);
-        var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+        var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
         defer results_list.deinit(self.allocator);
-        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        var param_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
         defer param_tidxs_list.deinit(self.allocator);
-        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+        var result_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
         defer result_tidxs_list.deinit(self.allocator);
         const prev_itp = self.in_type_parse;
         self.in_type_parse = true;
@@ -4465,13 +4465,13 @@ const Parser = struct {
                 }
                 var type_index: types.Index = 0;
                 var has_explicit_type = false;
-                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer params_list.deinit(self.allocator);
-                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer results_list.deinit(self.allocator);
-                var param_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+                var param_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
                 defer param_tidxs_list.deinit(self.allocator);
-                var result_tidxs_list: std.ArrayListUnmanaged(u32) = .{};
+                var result_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
                 defer result_tidxs_list.deinit(self.allocator);
                 self.skipAnnotations();
                 while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
@@ -4673,9 +4673,9 @@ const Parser = struct {
                     const tname = self.advance().text;
                     self.tag_names.put(self.allocator, tname, import_tag_idx) catch {};
                 }
-                var params_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var params_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer params_list.deinit(self.allocator);
-                var results_list: std.ArrayListUnmanaged(types.ValType) = .{};
+                var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer results_list.deinit(self.allocator);
                 var imp_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
@@ -4808,7 +4808,7 @@ const Parser = struct {
         }
 
         // Parse offset expression and elem indices
-        seg.elem_var_indices = .{};
+        seg.elem_var_indices = .empty;
 
         // Check for declarative/passive keywords
         self.skipAnnotations();
@@ -4818,14 +4818,14 @@ const Parser = struct {
         }
 
         // Encode offset expression if present (active segment)
-        var offset_code: std.ArrayListUnmanaged(u8) = .{};
+        var offset_code: std.ArrayListUnmanaged(u8) = .empty;
         defer offset_code.deinit(self.allocator);
         var has_offset = false;
         // Track elem type keyword presence for validation
         var has_elem_type = false;
         var elem_type_is_externref = false;
         // Encode elem expressions
-        var elem_expr_code: std.ArrayListUnmanaged(u8) = .{};
+        var elem_expr_code: std.ArrayListUnmanaged(u8) = .empty;
         defer elem_expr_code.deinit(self.allocator);
         var elem_expr_count: u32 = 0;
 
@@ -5061,7 +5061,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) _ = self.advance();
 
         // Parse offset expression
-        var offset_code: std.ArrayListUnmanaged(u8) = .{};
+        var offset_code: std.ArrayListUnmanaged(u8) = .empty;
         defer offset_code.deinit(self.allocator);
         var has_offset = false;
 
@@ -5122,7 +5122,7 @@ const Parser = struct {
         }
 
         // Read data string(s), decoding WAT escape sequences
-        var data_parts: std.ArrayListUnmanaged(u8) = .{};
+        var data_parts: std.ArrayListUnmanaged(u8) = .empty;
         defer data_parts.deinit(self.allocator);
         self.skipAnnotations();
         while (self.peek().kind == .string) {
@@ -5172,7 +5172,7 @@ const Parser = struct {
 
 /// Decode WAT string escape sequences (\nn hex, \t, \n, \r, \\, \").
 fn decodeWatString(allocator: std.mem.Allocator, raw: []const u8) []const u8 {
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < raw.len) {
         if (raw[i] == '\\' and i + 1 < raw.len) {
@@ -6279,7 +6279,7 @@ fn normalizeIdentifier(allocator: std.mem.Allocator, text: []const u8) []const u
         return buf;
     }
     // Has escapes — decode them
-    var result = std.ArrayListUnmanaged(u8){};
+    var result = std.ArrayListUnmanaged(u8).empty;
     result.append(allocator, '$') catch return text;
     var i: usize = 0;
     while (i < inner.len) {

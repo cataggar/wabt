@@ -29,9 +29,10 @@ pub const WastToJsonResult = struct {
 
 /// Convert .wast source to JSON + in-memory wasm modules (no disk I/O).
 pub fn wastToJsonInMemory(allocator: std.mem.Allocator, source: []const u8, base_name: []const u8) !WastToJsonResult {
-    var json: std.ArrayListUnmanaged(u8) = .empty;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
     var modules: std.StringHashMapUnmanaged([]u8) = .{};
-    const w = json.writer(allocator);
+    const w = &aw.writer;
     try w.writeAll("{\"commands\":[");
 
     var pos: usize = 0;
@@ -150,16 +151,17 @@ pub fn wastToJsonInMemory(allocator: std.mem.Allocator, source: []const u8, base
 
     try w.writeAll("]}");
     return .{
-        .json = try json.toOwnedSlice(allocator),
+        .json = try aw.toOwnedSlice(),
         .modules = modules,
         .allocator = allocator,
     };
 }
 
 /// Convert a .wast file to JSON + .wasm files on disk (CLI mode).
-pub fn wastToJson(allocator: std.mem.Allocator, source: []const u8, output_dir: []const u8, base_name: []const u8) ![]u8 {
-    var json: std.ArrayListUnmanaged(u8) = .empty;
-    const w = json.writer(allocator);
+pub fn wastToJson(allocator: std.mem.Allocator, io: std.Io, source: []const u8, output_dir: []const u8, base_name: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
+    const w = &aw.writer;
     try w.writeAll("{\"commands\":[");
 
     var pos: usize = 0;
@@ -198,7 +200,7 @@ pub fn wastToJson(allocator: std.mem.Allocator, source: []const u8, output_dir: 
                             continue;
                         };
                         defer allocator.free(wasm_bytes);
-                        writeWasmFile(output_dir, filename, wasm_bytes) catch {};
+                        writeWasmFile(io, output_dir, filename, wasm_bytes) catch {};
                         try writeModuleCmd(w, line_num, filename, "binary");
                     } else {
                         try writeSkippedModule(w, line_num, filename, "text");
@@ -217,16 +219,16 @@ pub fn wastToJson(allocator: std.mem.Allocator, source: []const u8, output_dir: 
                         continue;
                     };
                     defer allocator.free(wasm_bytes);
-                    writeWasmFile(output_dir, filename, wasm_bytes) catch {};
+                    writeWasmFile(io, output_dir, filename, wasm_bytes) catch {};
                     try writeModuleCmd(w, line_num, filename, "binary");
                 }
                 module_idx += 1;
             },
             .assert_return => try writeAssertCmd(w, sexpr.text, "assert_return", line_num),
             .assert_trap => try writeAssertCmd(w, sexpr.text, "assert_trap", line_num),
-            .assert_invalid => try writeAssertFileCmd(w, allocator, sexpr.text, "assert_invalid", line_num, base_name, &module_idx, output_dir),
-            .assert_malformed => try writeAssertFileCmd(w, allocator, sexpr.text, "assert_malformed", line_num, base_name, &module_idx, output_dir),
-            .assert_unlinkable => try writeAssertFileCmd(w, allocator, sexpr.text, "assert_unlinkable", line_num, base_name, &module_idx, output_dir),
+            .assert_invalid => try writeAssertFileCmd(w, allocator, io, sexpr.text, "assert_invalid", line_num, base_name, &module_idx, output_dir),
+            .assert_malformed => try writeAssertFileCmd(w, allocator, io, sexpr.text, "assert_malformed", line_num, base_name, &module_idx, output_dir),
+            .assert_unlinkable => try writeAssertFileCmd(w, allocator, io, sexpr.text, "assert_unlinkable", line_num, base_name, &module_idx, output_dir),
             .assert_exhaustion => try writeAssertCmd(w, sexpr.text, "assert_exhaustion", line_num),
             .register => try writeRegisterCmd(w, sexpr.text, line_num),
             .invoke => try writeAssertCmd(w, sexpr.text, "action", line_num),
@@ -237,7 +239,7 @@ pub fn wastToJson(allocator: std.mem.Allocator, source: []const u8, output_dir: 
     }
 
     try w.writeAll("]}");
-    return json.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 fn writeModuleCmd(w: anytype, line: u32, filename: []const u8, module_type: []const u8) !void {
@@ -254,7 +256,7 @@ fn writeAssertCmd(w: anytype, sexpr: []const u8, cmd_type: []const u8, line: u32
     try w.print("{{\"type\":\"{s}\",\"line\":{d},\"text\":\"{s}\"}}", .{ cmd_type, line, text });
 }
 
-fn writeAssertFileCmd(w: anytype, allocator: std.mem.Allocator, sexpr: []const u8, cmd_type: []const u8, line: u32, base_name: []const u8, module_idx: *u32, output_dir: []const u8) !void {
+fn writeAssertFileCmd(w: anytype, allocator: std.mem.Allocator, io: std.Io, sexpr: []const u8, cmd_type: []const u8, line: u32, base_name: []const u8, module_idx: *u32, output_dir: []const u8) !void {
     const filename = try std.fmt.allocPrint(allocator, "{s}.{d}.wasm", .{ base_name, module_idx.* });
     defer allocator.free(filename);
     module_idx.* += 1;
@@ -280,7 +282,7 @@ fn writeAssertFileCmd(w: anytype, allocator: std.mem.Allocator, sexpr: []const u
             return;
         };
         defer allocator.free(wasm_bytes);
-        writeWasmFile(output_dir, filename, wasm_bytes) catch {};
+        writeWasmFile(io, output_dir, filename, wasm_bytes) catch {};
     } else if (!wast.isQuoteModule(mod_sexpr.text)) {
         var mod = Parser.parseModule(allocator, mod_sexpr.text) catch {
             try w.print("{{\"type\":\"{s}\",\"line\":{d},\"filename\":\"{s}\",\"module_type\":\"text\"}}", .{ cmd_type, line, filename });
@@ -292,7 +294,7 @@ fn writeAssertFileCmd(w: anytype, allocator: std.mem.Allocator, sexpr: []const u
             return;
         };
         defer allocator.free(wasm_bytes);
-        writeWasmFile(output_dir, filename, wasm_bytes) catch {};
+        writeWasmFile(io, output_dir, filename, wasm_bytes) catch {};
     }
 
     const text = extractQuotedStringAfterModule(sexpr) orelse "";
@@ -304,10 +306,10 @@ fn writeRegisterCmd(w: anytype, sexpr: []const u8, line: u32) !void {
     try w.print("{{\"type\":\"register\",\"line\":{d},\"as\":\"{s}\"}}", .{ line, name });
 }
 
-fn writeWasmFile(dir: []const u8, filename: []const u8, data: []const u8) !void {
+fn writeWasmFile(io: std.Io, dir: []const u8, filename: []const u8, data: []const u8) !void {
     const path = try std.fs.path.join(std.heap.page_allocator, &.{ dir, filename });
     defer std.heap.page_allocator.free(path);
-    try std.fs.cwd().writeFile(.{ .sub_path = path, .data = data });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
 }
 
 fn extractQuotedString(text: []const u8) ?[]const u8 {
@@ -344,9 +346,9 @@ fn findModuleEnd(text: []const u8) ?usize {
     return sexpr.end;
 }
 
-pub fn main() !void {
-    const alloc = std.heap.page_allocator;
-    var args_it = try std.process.ArgIterator.initWithAllocator(alloc);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    var args_it = try init.minimal.args.iterateAllocator(alloc);
     defer args_it.deinit();
     _ = args_it.next();
 
@@ -377,7 +379,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const source = std.fs.cwd().readFileAlloc(alloc, in_path, wabt.max_input_file_size) catch |err| {
+    const source = std.Io.Dir.cwd().readFileAlloc(init.io, in_path, alloc, std.Io.Limit.limited(wabt.max_input_file_size)) catch |err| {
         std.debug.print("error: cannot read '{s}': {any}\n", .{ in_path, err });
         std.process.exit(1);
     };
@@ -388,21 +390,21 @@ pub fn main() !void {
     const dir = std.fs.path.dirname(out_path) orelse ".";
     const base = std.fs.path.stem(out_path);
 
-    const json = wastToJson(alloc, source, dir, base) catch |err| {
+    const json = wastToJson(alloc, init.io, source, dir, base) catch |err| {
         std.debug.print("error: {any}\n", .{err});
         std.process.exit(1);
     };
     defer alloc.free(json);
 
-    std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = json }) catch |err| {
+    std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = json }) catch |err| {
         std.debug.print("error: cannot write '{s}': {any}\n", .{ out_path, err });
         std.process.exit(1);
     };
 }
 
 test "empty module produces JSON with commands array" {
-    const json = try wastToJson(std.testing.allocator, "(module)", ".", "test");
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"commands\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"module\"") != null);
+    var result = try wastToJsonInMemory(std.testing.allocator, "(module)", "test");
+    defer result.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"commands\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.json, "\"module\"") != null);
 }

@@ -2,7 +2,7 @@
     .name = .wabt,
     .version = "2.0.0-dev.1",
     .fingerprint = 0x9e1a5a2ee6c5ad78,
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .paths = .{
         "build.zig",
         "build.zig.zon",

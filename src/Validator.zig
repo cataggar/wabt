@@ -671,9 +671,9 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
     }
     const local_inited: []bool = if (num_locals <= 256) local_inited_buf[0..num_locals] else &.{};
 
-    var val_stack: ValStack = .{};
+    var val_stack: ValStack = .empty;
     defer val_stack.deinit(gpa(m));
-    var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .{};
+    var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .empty;
     defer ctrl_stack.deinit(gpa(m));
 
     // Push the function frame

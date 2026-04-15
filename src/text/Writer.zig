@@ -9,7 +9,7 @@ const Mod = @import("../Module.zig");
 pub const WriteError = error{OutOfMemory};
 
 pub fn writeModule(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var w = WatWriter{ .allocator = allocator, .buf = .{} };
+    var w = WatWriter{ .allocator = allocator, .buf = .empty };
     errdefer w.buf.deinit(allocator);
     try w.write(module);
     return w.buf.toOwnedSlice(allocator);
