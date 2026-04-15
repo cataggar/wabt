@@ -166,7 +166,7 @@ jobs:
             Experimental fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) rewritten from C++ to Zig.
 
             **Highlights:**
-            - 100% WebAssembly 3.0 spec conformance (65011/65011 assertions)
+            - 100% WebAssembly 3.0 spec conformance
             - Build system: `build.zig` with cross-compilation
             - Zig 0.16.0 (pure Zig source, libc linked for stack canaries)
             - Built with `ReleaseSafe` (runtime safety checks) + stack protector
