@@ -15,7 +15,10 @@ permissions: {}
 jobs:
   build:
     runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      (github.event_name == 'workflow_dispatch' && !contains(inputs.version, 'dev'))
+      || (github.event.workflow_run.conclusion == 'success'
+          && !contains(github.event.workflow_run.head_branch, 'dev'))
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
