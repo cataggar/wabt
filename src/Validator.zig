@@ -217,7 +217,7 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
 
     for (m.memories.items) |mem| {
         const max_pages: u64 = if (mem.type.limits.is_64)
-            std.math.maxInt(u64)
+            1 << 48
         else
             65536; // 4GiB = 65536 pages of 64KiB
         try checkLimits(mem.type.limits, max_pages);
