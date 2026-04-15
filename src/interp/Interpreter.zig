@@ -81,7 +81,7 @@ pub const Instance = struct {
     module: *const Mod.Module,
 
     /// Linear memories — memories[0] is the default; multi-memory adds more.
-    memories: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .{},
+    memories: std.ArrayListUnmanaged(std.ArrayListUnmanaged(u8)) = .empty,
 
     /// Global variable values.
     globals: std.ArrayListUnmanaged(Value),
@@ -121,7 +121,7 @@ pub const Instance = struct {
 
     /// Interpreter refs for imported funcref globals.
     /// Maps global index to the interpreter that owns the referenced function.
-    global_func_interps: std.ArrayListUnmanaged(?*Interpreter) = .{},
+    global_func_interps: std.ArrayListUnmanaged(?*Interpreter) = .empty,
 
     /// Get memory by index, following shared memory pointers.
     pub fn getMemory(self: *Instance, idx: u32) *std.ArrayListUnmanaged(u8) {
@@ -163,8 +163,8 @@ pub const Instance = struct {
         var inst = Instance{
             .allocator = allocator,
             .module = module,
-            .globals = .{},
-            .tables = .{},
+            .globals = .empty,
+            .tables = .empty,
         };
 
         // Allocate drop tracking bitsets.
@@ -179,7 +179,7 @@ pub const Instance = struct {
         const num_mems = if (module.memories.items.len > 0) module.memories.items.len else 1;
         inst.memories.resize(allocator, num_mems) catch return error.OutOfMemory;
         for (0..num_mems) |i| {
-            inst.memories.items[i] = .{};
+            inst.memories.items[i] = .empty;
         }
         for (module.memories.items, 0..) |mem, i| {
             if (mem.is_import) continue;
@@ -207,7 +207,7 @@ pub const Instance = struct {
         if (module.tables.items.len > 0) {
             inst.tables.resize(allocator, module.tables.items.len) catch return error.OutOfMemory;
             for (module.tables.items, 0..) |tbl, i| {
-                inst.tables.items[i] = .{};
+                inst.tables.items[i] = .empty;
                 if (tbl.is_import) continue; // will be shared via pointer
                 const initial: usize = @intCast(tbl.@"type".limits.initial);
                 inst.tables.items[i].resize(allocator, initial) catch return error.OutOfMemory;
@@ -216,7 +216,7 @@ pub const Instance = struct {
         } else {
             // Ensure at least one empty table exists so table() doesn't panic.
             inst.tables.resize(allocator, 1) catch return error.OutOfMemory;
-            inst.tables.items[0] = .{};
+            inst.tables.items[0] = .empty;
         }
 
         return inst;
@@ -441,17 +441,17 @@ pub const Interpreter = struct {
     max_instructions: u64 = 10_000_000,
 
     /// Caught exceptions storage for exnref values.
-    caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .{},
+    caught_exceptions: std.ArrayListUnmanaged(ThrownException) = .empty,
 
     /// GC object heap for struct and array instances.
-    gc_objects: std.ArrayListUnmanaged(GcObject) = .{},
+    gc_objects: std.ArrayListUnmanaged(GcObject) = .empty,
 
     /// Resolved function import links (indexed by func_idx for imported funcs).
-    import_links: std.ArrayListUnmanaged(?ImportLink) = .{},
+    import_links: std.ArrayListUnmanaged(?ImportLink) = .empty,
 
     /// Links imported globals to exporting instance's globals for shared mutation.
-    global_links: std.ArrayListUnmanaged(?GlobalLink) = .{},
-    tag_canonical_ids: std.ArrayListUnmanaged(u64) = .{},
+    global_links: std.ArrayListUnmanaged(?GlobalLink) = .empty,
+    tag_canonical_ids: std.ArrayListUnmanaged(u64) = .empty,
 
     /// Maps extern ref index to original Value for any.convert_extern roundtrip.
     extern_originals: std.AutoHashMapUnmanaged(u32, Value) = .{},
@@ -465,7 +465,7 @@ pub const Interpreter = struct {
         return .{
             .allocator = allocator,
             .instance = instance,
-            .stack = .{},
+            .stack = .empty,
         };
     }
 
@@ -484,7 +484,7 @@ pub const Interpreter = struct {
     /// Allocate a new GC struct object, returns its index.
     fn allocStruct(self: *Interpreter, type_idx: u32, fields: []const Value) TrapError!u32 {
         const idx: u32 = @intCast(self.gc_objects.items.len);
-        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
         obj.fields.appendSlice(self.allocator, fields) catch return error.OutOfMemory;
         self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
         return idx;
@@ -493,7 +493,7 @@ pub const Interpreter = struct {
     /// Allocate a new GC array object, returns its index.
     fn allocArray(self: *Interpreter, type_idx: u32, len: u32, init_val: Value) TrapError!u32 {
         const idx: u32 = @intCast(self.gc_objects.items.len);
-        var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+        var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
         obj.fields.appendNTimes(self.allocator, init_val, len) catch return error.OutOfMemory;
         self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
         return idx;
@@ -2875,30 +2875,30 @@ pub const Interpreter = struct {
                     }
                 },
                 // Memory load (format: mem_idx, align, offset)
-                0x28 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load(m, o); },
-                0x29 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load(m, o); },
-                0x2a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f32Load(m, o); },
-                0x2b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f64Load(m, o); },
-                0x2c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load8S(m, o); },
-                0x2d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load8U(m, o); },
-                0x2e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load16S(m, o); },
-                0x2f => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Load16U(m, o); },
-                0x30 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load8S(m, o); },
-                0x31 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load8U(m, o); },
-                0x32 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load16S(m, o); },
-                0x33 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load16U(m, o); },
-                0x34 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load32S(m, o); },
-                0x35 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Load32U(m, o); },
+                0x28 => { const ma = readMemarg(code, &pc); try self.i32Load(ma.mem_idx, ma.offset); },
+                0x29 => { const ma = readMemarg(code, &pc); try self.i64Load(ma.mem_idx, ma.offset); },
+                0x2a => { const ma = readMemarg(code, &pc); try self.f32Load(ma.mem_idx, ma.offset); },
+                0x2b => { const ma = readMemarg(code, &pc); try self.f64Load(ma.mem_idx, ma.offset); },
+                0x2c => { const ma = readMemarg(code, &pc); try self.i32Load8S(ma.mem_idx, ma.offset); },
+                0x2d => { const ma = readMemarg(code, &pc); try self.i32Load8U(ma.mem_idx, ma.offset); },
+                0x2e => { const ma = readMemarg(code, &pc); try self.i32Load16S(ma.mem_idx, ma.offset); },
+                0x2f => { const ma = readMemarg(code, &pc); try self.i32Load16U(ma.mem_idx, ma.offset); },
+                0x30 => { const ma = readMemarg(code, &pc); try self.i64Load8S(ma.mem_idx, ma.offset); },
+                0x31 => { const ma = readMemarg(code, &pc); try self.i64Load8U(ma.mem_idx, ma.offset); },
+                0x32 => { const ma = readMemarg(code, &pc); try self.i64Load16S(ma.mem_idx, ma.offset); },
+                0x33 => { const ma = readMemarg(code, &pc); try self.i64Load16U(ma.mem_idx, ma.offset); },
+                0x34 => { const ma = readMemarg(code, &pc); try self.i64Load32S(ma.mem_idx, ma.offset); },
+                0x35 => { const ma = readMemarg(code, &pc); try self.i64Load32U(ma.mem_idx, ma.offset); },
                 // Memory store (format: mem_idx, align, offset)
-                0x36 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store(m, o); },
-                0x37 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store(m, o); },
-                0x38 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f32Store(m, o); },
-                0x39 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.f64Store(m, o); },
-                0x3a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store8(m, o); },
-                0x3b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i32Store16(m, o); },
-                0x3c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store8(m, o); },
-                0x3d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store16(m, o); },
-                0x3e => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.i64Store32(m, o); },
+                0x36 => { const ma = readMemarg(code, &pc); try self.i32Store(ma.mem_idx, ma.offset); },
+                0x37 => { const ma = readMemarg(code, &pc); try self.i64Store(ma.mem_idx, ma.offset); },
+                0x38 => { const ma = readMemarg(code, &pc); try self.f32Store(ma.mem_idx, ma.offset); },
+                0x39 => { const ma = readMemarg(code, &pc); try self.f64Store(ma.mem_idx, ma.offset); },
+                0x3a => { const ma = readMemarg(code, &pc); try self.i32Store8(ma.mem_idx, ma.offset); },
+                0x3b => { const ma = readMemarg(code, &pc); try self.i32Store16(ma.mem_idx, ma.offset); },
+                0x3c => { const ma = readMemarg(code, &pc); try self.i64Store8(ma.mem_idx, ma.offset); },
+                0x3d => { const ma = readMemarg(code, &pc); try self.i64Store16(ma.mem_idx, ma.offset); },
+                0x3e => { const ma = readMemarg(code, &pc); try self.i64Store32(ma.mem_idx, ma.offset); },
                 0x3f => { const m = readCodeU32(code, &pc); try self.memorySize(m); },
                 0x40 => { const m = readCodeU32(code, &pc); try self.memoryGrow(m); },
                 // Constants
@@ -3242,7 +3242,7 @@ pub const Interpreter = struct {
                             var fi: u32 = count;
                             while (fi > 0) { fi -= 1; fields_buf[fi] = try self.popValue(); }
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             obj.fields.appendSlice(self.allocator, fields_buf[0..count]) catch return error.OutOfMemory;
                             self.gc_objects.append(self.allocator, obj) catch return error.OutOfMemory;
                             try self.pushValue(.{ .ref_array = idx });
@@ -3262,7 +3262,7 @@ pub const Interpreter = struct {
                             const byte_len: u64 = @as(u64, len) * elem_size;
                             if (@as(u64, offset) + byte_len > data.len) return error.OutOfBoundsMemoryAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             for (0..len) |i| {
                                 const off = offset + @as(u32, @intCast(i)) * elem_size;
                                 const val = readArrayElemFromData(data, off, elem_size);
@@ -3286,7 +3286,7 @@ pub const Interpreter = struct {
                             const seg_len: u32 = if (dropped) 0 else @max(var_len, expr_len);
                             if (@as(u64, offset) + len > seg_len) return error.OutOfBoundsTableAccess;
                             const idx: u32 = @intCast(self.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             if (var_len == 0 and expr_len > 0 and seg.elem_expr_bytes.len > 0) {
                                 // Expression-based elem segment
                                 var expr_pc: usize = 0;
@@ -3521,7 +3521,7 @@ pub const Interpreter = struct {
                                 .ref_func => |fidx| blk: {
                                     // func matches: func(0x70), any(0x6e)
                                     if (heap_type == 0x70 or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0 and heap_type < 0x68) {
+                                    if (heap_type >= 0 and heap_type < 0x65) {
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (fidx < self.instance.module.funcs.items.len) {
                                             const func_type = self.instance.module.funcs.items[fidx].decl.type_var.index;
@@ -3537,7 +3537,7 @@ pub const Interpreter = struct {
                                 .ref_struct => |obj_id| blk: {
                                     // struct matches: struct(0x6b), eq(0x6d), any(0x6e), or concrete type
                                     if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+                                    if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (obj_type == ht_idx) break :blk 1;
@@ -3548,7 +3548,7 @@ pub const Interpreter = struct {
                                 .ref_array => |obj_id| blk: {
                                     // array matches: array(0x6a), eq(0x6d), any(0x6e), or concrete type
                                     if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) break :blk 1;
-                                    if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+                                    if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (obj_type == ht_idx) break :blk 1;
@@ -3579,7 +3579,7 @@ pub const Interpreter = struct {
                                 .ref_struct => |obj_id| {
                                     if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
                                         try self.pushValue(val);
-                                    } else if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+                                    } else if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
                                             try self.pushValue(val)
@@ -3589,7 +3589,7 @@ pub const Interpreter = struct {
                                 .ref_array => |obj_id| {
                                     if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e or heap_type < 0) {
                                         try self.pushValue(val);
-                                    } else if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+                                    } else if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                                         const obj_type = self.gc_objects.items[obj_id].type_idx;
                                         if (obj_type == @as(u32, @intCast(heap_type)) or self.isSubtypeOf(obj_type, @intCast(heap_type), self))
                                             try self.pushValue(val)
@@ -3599,7 +3599,7 @@ pub const Interpreter = struct {
                                 .ref_func => |fidx| {
                                     if (heap_type == 0x70 or heap_type == 0x6e or heap_type < 0) {
                                         try self.pushValue(val);
-                                    } else if (heap_type >= 0 and heap_type < 0x68) {
+                                    } else if (heap_type >= 0 and heap_type < 0x65) {
                                         // Concrete function type check
                                         const ht_idx: u32 = @intCast(heap_type);
                                         if (fidx < self.instance.module.funcs.items.len) {
@@ -3662,7 +3662,7 @@ pub const Interpreter = struct {
                                 .ref_func => |r| r, // table.get returns ref_func for i31 values
                                 else => return error.NullReference,
                             };
-                            try self.pushValue(.{ .i32 = @intCast(raw & 0x7fff_ffff) });
+                            const masked = raw & 0x7fff_ffff; const signed: i32 = if (masked & 0x4000_0000 != 0) @bitCast(masked | 0x8000_0000) else @intCast(masked); try self.pushValue(.{ .i32 = signed });
                         },
                         0x1e => { // i31.get_u
                             const v = try self.popValue();
@@ -3672,12 +3672,7 @@ pub const Interpreter = struct {
                                 .ref_func => |r| r,
                                 else => return error.NullReference,
                             };
-                            const masked = raw & 0x7fff_ffff;
-                            const signed: i32 = if (masked & 0x4000_0000 != 0)
-                                @bitCast(masked | 0x8000_0000)
-                            else
-                                @intCast(masked);
-                            try self.pushValue(.{ .i32 = signed });
+                            try self.pushValue(.{ .i32 = @intCast(raw & 0x7fff_ffff) });
                         },
                         else => return error.Unimplemented,
                     }
@@ -3689,31 +3684,27 @@ pub const Interpreter = struct {
                     switch (simd_sub) {
                         // v128.load (memarg)
                         0x00 => {
-                            const m = readCodeU32(code, &pc);
-                            _ = readCodeU32(code, &pc); // align
-                            const o = readCodeU64(code, &pc);
-                            try self.v128Load(m, o);
+                            const ma = readMemarg(code, &pc);
+                            try self.v128Load(ma.mem_idx, ma.offset);
                         },
                         // v128.load8x8_s / u
-                        0x01 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load8x8(m, o, true); },
-                        0x02 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load8x8(m, o, false); },
+                        0x01 => { const ma = readMemarg(code, &pc); try self.v128Load8x8(ma.mem_idx, ma.offset, true); },
+                        0x02 => { const ma = readMemarg(code, &pc); try self.v128Load8x8(ma.mem_idx, ma.offset, false); },
                         // v128.load16x4_s / u
-                        0x03 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load16x4(m, o, true); },
-                        0x04 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load16x4(m, o, false); },
+                        0x03 => { const ma = readMemarg(code, &pc); try self.v128Load16x4(ma.mem_idx, ma.offset, true); },
+                        0x04 => { const ma = readMemarg(code, &pc); try self.v128Load16x4(ma.mem_idx, ma.offset, false); },
                         // v128.load32x2_s / u
-                        0x05 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load32x2(m, o, true); },
-                        0x06 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128Load32x2(m, o, false); },
+                        0x05 => { const ma = readMemarg(code, &pc); try self.v128Load32x2(ma.mem_idx, ma.offset, true); },
+                        0x06 => { const ma = readMemarg(code, &pc); try self.v128Load32x2(ma.mem_idx, ma.offset, false); },
                         // v128.load8_splat / load16_splat / load32_splat / load64_splat
-                        0x07 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 1); },
-                        0x08 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 2); },
-                        0x09 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 4); },
-                        0x0a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadSplat(m, o, 8); },
+                        0x07 => { const ma = readMemarg(code, &pc); try self.v128LoadSplat(ma.mem_idx, ma.offset, 1); },
+                        0x08 => { const ma = readMemarg(code, &pc); try self.v128LoadSplat(ma.mem_idx, ma.offset, 2); },
+                        0x09 => { const ma = readMemarg(code, &pc); try self.v128LoadSplat(ma.mem_idx, ma.offset, 4); },
+                        0x0a => { const ma = readMemarg(code, &pc); try self.v128LoadSplat(ma.mem_idx, ma.offset, 8); },
                         // v128.store (memarg)
                         0x0b => {
-                            const m = readCodeU32(code, &pc);
-                            _ = readCodeU32(code, &pc); // align
-                            const o = readCodeU64(code, &pc);
-                            try self.v128Store(m, o);
+                            const ma = readMemarg(code, &pc);
+                            try self.v128Store(ma.mem_idx, ma.offset);
                         },
                         0x0c => try self.simdConst(code, &pc), // v128.const
                         // i8x16.shuffle
@@ -3755,18 +3746,18 @@ pub const Interpreter = struct {
                         0x21 => { const lane = code[pc]; pc += 1; try self.extractLaneF64(lane); },
                         0x22 => { const lane = code[pc]; pc += 1; try self.replaceLaneF64(lane); },
                         // v128.load8_lane .. v128.load64_lane (0x54-0x57)
-                        0x54 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 1, lane); },
-                        0x55 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 2, lane); },
-                        0x56 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 4, lane); },
-                        0x57 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(m, o, 8, lane); },
+                        0x54 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(ma.mem_idx, ma.offset, 1, lane); },
+                        0x55 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(ma.mem_idx, ma.offset, 2, lane); },
+                        0x56 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(ma.mem_idx, ma.offset, 4, lane); },
+                        0x57 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128LoadLane(ma.mem_idx, ma.offset, 8, lane); },
                         // v128.store8_lane .. v128.store64_lane (0x58-0x5b)
-                        0x58 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 1, lane); },
-                        0x59 => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 2, lane); },
-                        0x5a => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 4, lane); },
-                        0x5b => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(m, o, 8, lane); },
+                        0x58 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(ma.mem_idx, ma.offset, 1, lane); },
+                        0x59 => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(ma.mem_idx, ma.offset, 2, lane); },
+                        0x5a => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(ma.mem_idx, ma.offset, 4, lane); },
+                        0x5b => { const ma = readMemarg(code, &pc); const lane = code[pc]; pc += 1; try self.v128StoreLane(ma.mem_idx, ma.offset, 8, lane); },
                         // v128.load32_zero / v128.load64_zero (0x5c-0x5d)
-                        0x5c => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadZero(m, o, 4); },
-                        0x5d => { const m = readCodeU32(code, &pc); _ = readCodeU32(code, &pc); const o = readCodeU64(code, &pc); try self.v128LoadZero(m, o, 8); },
+                        0x5c => { const ma = readMemarg(code, &pc); try self.v128LoadZero(ma.mem_idx, ma.offset, 4); },
+                        0x5d => { const ma = readMemarg(code, &pc); try self.v128LoadZero(ma.mem_idx, ma.offset, 8); },
                         // f32x4.demote_f64x2_zero / f64x2.promote_low_f32x4
                         0x5e => try self.f32x4DemoteF64x2Zero(),
                         0x5f => try self.f64x2PromoteLowF32x4(),
@@ -5147,7 +5138,7 @@ pub const Interpreter = struct {
     /// Check if two types are iso-recursively equivalent using canonical group IDs.
     fn typesEquivalent(mod_a: *const Mod.Module, idx_a: u32, mod_b: *const Mod.Module, idx_b: u32) bool {
         // Types without metadata (e.g., inline func types) match by signature alone
-        if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len) return true;
+        if (idx_a >= mod_a.type_meta.items.len or idx_b >= mod_b.type_meta.items.len) return idx_a < 0x65 and idx_b < 0x65;
         const meta_a = mod_a.type_meta.items[idx_a];
         const meta_b = mod_b.type_meta.items[idx_b];
         // Both must have valid canonical groups
@@ -5240,6 +5231,21 @@ fn readCodeFixedU32(code: []const u8, pc: usize) u32 {
 fn readCodeFixedU64(code: []const u8, pc: usize) u64 {
     if (pc + 8 > code.len) return 0;
     return std.mem.readInt(u64, code[pc..][0..8], .little);
+}
+
+const Memarg = struct { mem_idx: u32, offset: u64 };
+
+fn readMemarg(code: []const u8, pc: *usize) Memarg {
+    const align_byte = readCodeU32(code, pc);
+    const mem_idx: u32 = if (align_byte & 0x40 != 0) readCodeU32(code, pc) else 0;
+    const offset = readCodeU64(code, pc);
+    return .{ .mem_idx = mem_idx, .offset = offset };
+}
+
+fn skipMemarg(code: []const u8, pc: *usize) void {
+    const align_byte = readCodeU32(code, pc);
+    if (align_byte & 0x40 != 0) _ = readCodeU32(code, pc);
+    _ = readCodeU64(code, pc);
 }
 
 fn skipBlockType(code: []const u8, pc: usize) usize {
@@ -5347,7 +5353,7 @@ fn skipImmediates(code: []const u8, pc: usize, op: u8) usize {
         },
         0x20, 0x21, 0x22, 0x23, 0x24 => _ = readCodeU32(code, &p),
         0x25, 0x26 => _ = readCodeU32(code, &p), // table.get/set
-        0x28...0x3e => { _ = readCodeU32(code, &p); _ = readCodeU32(code, &p); },
+        0x28...0x3e => skipMemarg(code, &p),
         0x3f, 0x40 => _ = readCodeU32(code, &p),
         0x41 => _ = readCodeS32(code, &p),
         0x42 => _ = readCodeS64(code, &p),
@@ -5483,7 +5489,7 @@ fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) 
         .ref_i31 => heap_type == 0x6c or heap_type == 0x6d or heap_type == 0x6e,
         .ref_struct => |obj_id| {
             if (heap_type == 0x6b or heap_type == 0x6d or heap_type == 0x6e) return true;
-            if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+            if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                 const obj_type = self.gc_objects.items[obj_id].type_idx;
                 const ht: u32 = @intCast(heap_type);
                 return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
@@ -5492,7 +5498,7 @@ fn gcValueMatchesHeapType(self: *const Interpreter, val: Value, heap_type: i32) 
         },
         .ref_array => |obj_id| {
             if (heap_type == 0x6a or heap_type == 0x6d or heap_type == 0x6e) return true;
-            if (heap_type >= 0 and heap_type < 0x68 and obj_id < self.gc_objects.items.len) {
+            if (heap_type >= 0 and heap_type < 0x65 and obj_id < self.gc_objects.items.len) {
                 const obj_type = self.gc_objects.items[obj_id].type_idx;
                 const ht: u32 = @intCast(heap_type);
                 return obj_type == ht or self.isSubtypeOf(obj_type, ht, self);
@@ -5634,7 +5640,7 @@ fn evalConstExpr(instance: *const Instance, expr: []const u8) ?Value {
                             var fi: u32 = count;
                             while (fi > 0) { fi -= 1; sp -= 1; fields_buf[fi] = stack[sp]; }
                             const idx: u32 = @intCast(interp.gc_objects.items.len);
-                            var obj = GcObject{ .type_idx = type_idx, .fields = .{} };
+                            var obj = GcObject{ .type_idx = type_idx, .fields = .empty };
                             obj.fields.appendSlice(interp.allocator, fields_buf[0..count]) catch return null;
                             interp.gc_objects.append(interp.allocator, obj) catch return null;
                             stack[sp] = .{ .ref_array = idx }; sp += 1;
@@ -5749,15 +5755,15 @@ fn testInterpreter() struct { interp: Interpreter, inst: *Instance, mod: *Mod.Mo
     inst.* = Instance{
         .allocator = alloc,
         .module = mod,
-        .globals = .{},
-        .tables = .{},
+        .globals = .empty,
+        .tables = .empty,
     };
     // Ensure at least one empty memory for getMemory(0) accessor
     inst.memories.resize(alloc, 1) catch @panic("OOM");
-    inst.memories.items[0] = .{};
+    inst.memories.items[0] = .empty;
     // Ensure at least one empty table for table() accessor
     inst.tables.resize(alloc, 1) catch @panic("OOM");
-    inst.tables.items[0] = .{};
+    inst.tables.items[0] = .empty;
     return .{
         .interp = Interpreter.init(alloc, inst),
         .inst = inst,

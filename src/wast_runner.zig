@@ -58,11 +58,11 @@ const RunState = struct {
     /// Modules registered by string name (e.g. `(register "Mf")` → "Mf").
     registered_modules: std.StringHashMapUnmanaged(ModuleTriple) = .{},
     /// Keys that are owned by this state and must be freed.
-    owned_keys: std.ArrayListUnmanaged([]const u8) = .{},
+    owned_keys: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Source texts from decoded quote modules (kept alive for name slices).
-    owned_sources: std.ArrayListUnmanaged([]const u8) = .{},
+    owned_sources: std.ArrayListUnmanaged([]const u8) = .empty,
     /// Triples kept alive because they wrote to shared tables (prevent dangling refs).
-    zombie_triples: std.ArrayListUnmanaged(ModuleTriple) = .{},
+    zombie_triples: std.ArrayListUnmanaged(ModuleTriple) = .empty,
     /// Module definitions stored by $name for (module definition $name ...).
     module_definitions: std.StringHashMapUnmanaged([]const u8) = .{},
     /// Named module instances for (module instance $name $def).
@@ -722,10 +722,10 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                             result.skipped += 1;
                             continue;
                         };
-                        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+                        const wrapped = if (std.mem.startsWith(u8, std.mem.trimStart(u8, wat_text, " \t\n\r"), "(module"))
                             wat_text
                         else blk: {
-                            var buf2 = std.ArrayListUnmanaged(u8){};
+                            var buf2 = std.ArrayListUnmanaged(u8).empty;
                             buf2.appendSlice(allocator, "(module ") catch { result.skipped += 1; allocator.free(wat_text); continue; };
                             buf2.appendSlice(allocator, wat_text) catch { result.skipped += 1; allocator.free(wat_text); continue; };
                             buf2.append(allocator, ')') catch { result.skipped += 1; allocator.free(wat_text); continue; };
@@ -797,7 +797,7 @@ pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
                 // Check if this is a bare module field keyword (implicit module)
                 if (isBareModuleField(sexpr.text)) {
                     // Collect all remaining bare fields into one module
-                    var mod_buf = std.ArrayListUnmanaged(u8){};
+                    var mod_buf = std.ArrayListUnmanaged(u8).empty;
                     mod_buf.appendSlice(allocator, "(module ") catch { result.skipped += 1; continue; };
                     mod_buf.appendSlice(allocator, sexpr.text) catch { result.skipped += 1; continue; };
                     // Consume subsequent bare fields
@@ -934,7 +934,7 @@ pub fn stripDefinitionKeyword(allocator: std.mem.Allocator, text: []const u8) ?[
     if (i < text.len and text[i] == '$') {
         while (i < text.len and !isWhitespace(text[i]) and text[i] != ')') : (i += 1) {}
     }
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     buf.appendSlice(allocator, text[0..before_def]) catch return null;
     buf.appendSlice(allocator, text[i..]) catch return null;
     return buf.toOwnedSlice(allocator) catch null;
@@ -1000,7 +1000,7 @@ fn processModuleInstance(text: []const u8, state: *RunState) bool {
     while (j < def_text.len and !isWhitespace(def_text[j]) and def_text[j] != ')') : (j += 1) {}
 
     // Build "(module <rest>)"
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     buf.appendSlice(state.allocator, "(module ") catch return false;
     buf.appendSlice(state.allocator, def_text[j .. def_text.len - 1]) catch return false;
     buf.append(state.allocator, ')') catch return false;
@@ -1052,10 +1052,10 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
             result.passed += 1;
             return;
         }
-        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+        const wrapped = if (std.mem.startsWith(u8, std.mem.trimStart(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
         else blk: {
-            var buf = std.ArrayListUnmanaged(u8){};
+            var buf = std.ArrayListUnmanaged(u8).empty;
             buf.appendSlice(allocator, "(module ") catch { result.skipped += 1; return; };
             buf.appendSlice(allocator, wat_text) catch { result.skipped += 1; return; };
             buf.append(allocator, ')') catch { result.skipped += 1; return; };
@@ -1136,10 +1136,10 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             return;
         }
         // Wrap in (module ...) if not already
-        const wrapped = if (std.mem.startsWith(u8, std.mem.trimLeft(u8, wat_text, " \t\n\r"), "(module"))
+        const wrapped = if (std.mem.startsWith(u8, std.mem.trimStart(u8, wat_text, " \t\n\r"), "(module"))
             wat_text
         else blk: {
-            var buf = std.ArrayListUnmanaged(u8){};
+            var buf = std.ArrayListUnmanaged(u8).empty;
             buf.appendSlice(allocator, "(module ") catch { result.passed += 1; return; };
             buf.appendSlice(allocator, wat_text) catch { result.passed += 1; return; };
             buf.append(allocator, ')') catch { result.passed += 1; return; };
@@ -1789,7 +1789,7 @@ fn extractStringLiteral(sexpr: []const u8) ?[]const u8 {
 fn decodeStringEscapes(allocator: std.mem.Allocator, raw: []const u8) ?[]const u8 {
     // Quick check: if no escapes, return as-is
     if (std.mem.indexOfScalar(u8, raw, '\\') == null) return raw;
-    var buf = std.ArrayListUnmanaged(u8){};
+    var buf = std.ArrayListUnmanaged(u8).empty;
     var i: usize = 0;
     while (i < raw.len) {
         if (raw[i] == '\\' and i + 1 < raw.len) {
@@ -2373,7 +2373,7 @@ fn skipModulePrefix(mod_text: []const u8) usize {
 
 /// Decode `(module quote "..." "..." ...)` — extract and concatenate quoted WAT strings.
 pub fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![]u8 {
-    var result = std.ArrayListUnmanaged(u8){};
+    var result = std.ArrayListUnmanaged(u8).empty;
     errdefer result.deinit(allocator);
 
     var i = skipModulePrefix(mod_text);
@@ -2541,7 +2541,7 @@ fn decodeHexEscape(text: []const u8, pos: usize) ?u8 {
 
 /// Decode `(module binary "\xx\xx" ...)` — extract hex-encoded binary bytes.
 pub fn decodeWastHexStrings(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
-    var res = std.ArrayListUnmanaged(u8){};
+    var res = std.ArrayListUnmanaged(u8).empty;
     errdefer res.deinit(allocator);
     var i: usize = 0;
     while (i < text.len) {

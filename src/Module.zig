@@ -201,8 +201,8 @@ pub const Export = struct {
 pub const Func = struct {
     name: ?[]const u8 = null,
     decl: FuncDeclaration = .{},
-    local_types: std.ArrayListUnmanaged(types.ValType) = .{},
-    local_type_idxs: std.ArrayListUnmanaged(u32) = .{},
+    local_types: std.ArrayListUnmanaged(types.ValType) = .empty,
+    local_type_idxs: std.ArrayListUnmanaged(u32) = .empty,
     loc: Location = .{},
     is_import: bool = false,
     /// Raw instruction bytes (binary format) for validation.
@@ -262,7 +262,7 @@ pub const ElemSegment = struct {
     table_var: Var = .{ .index = 0 },
     elem_type: types.ValType = .funcref,
     elem_type_idx: u32 = 0xFFFFFFFF,
-    elem_var_indices: std.ArrayListUnmanaged(Var) = .{},
+    elem_var_indices: std.ArrayListUnmanaged(Var) = .empty,
     /// Raw bytecode for the offset expression (constant expr).
     offset_expr_bytes: []const u8 = &.{},
     owns_offset_expr_bytes: bool = false,
@@ -321,21 +321,21 @@ pub const Module = struct {
     loc: Location = .{},
 
     // Type section
-    module_types: std.ArrayListUnmanaged(TypeEntry) = .{},
+    module_types: std.ArrayListUnmanaged(TypeEntry) = .empty,
     /// Per-type metadata for GC subtyping validation.
-    type_meta: std.ArrayListUnmanaged(TypeMeta) = .{},
+    type_meta: std.ArrayListUnmanaged(TypeMeta) = .empty,
 
     // Entity lists
-    funcs: std.ArrayListUnmanaged(Func) = .{},
-    tables: std.ArrayListUnmanaged(Table) = .{},
-    memories: std.ArrayListUnmanaged(Memory) = .{},
-    globals: std.ArrayListUnmanaged(Global) = .{},
-    tags: std.ArrayListUnmanaged(Tag) = .{},
-    imports: std.ArrayListUnmanaged(Import) = .{},
-    exports: std.ArrayListUnmanaged(Export) = .{},
-    elem_segments: std.ArrayListUnmanaged(ElemSegment) = .{},
-    data_segments: std.ArrayListUnmanaged(DataSegment) = .{},
-    customs: std.ArrayListUnmanaged(Custom) = .{},
+    funcs: std.ArrayListUnmanaged(Func) = .empty,
+    tables: std.ArrayListUnmanaged(Table) = .empty,
+    memories: std.ArrayListUnmanaged(Memory) = .empty,
+    globals: std.ArrayListUnmanaged(Global) = .empty,
+    tags: std.ArrayListUnmanaged(Tag) = .empty,
+    imports: std.ArrayListUnmanaged(Import) = .empty,
+    exports: std.ArrayListUnmanaged(Export) = .empty,
+    elem_segments: std.ArrayListUnmanaged(ElemSegment) = .empty,
+    data_segments: std.ArrayListUnmanaged(DataSegment) = .empty,
+    customs: std.ArrayListUnmanaged(Custom) = .empty,
 
     // Start function (optional)
     start_var: ?Var = null,
@@ -355,7 +355,7 @@ pub const Module = struct {
     data_count: u32 = 0,
 
     // Heap-allocated name strings (e.g. decoded escape sequences in import/export names).
-    owned_strings: std.ArrayListUnmanaged([]const u8) = .{},
+    owned_strings: std.ArrayListUnmanaged([]const u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Module {
         return .{ .allocator = allocator };

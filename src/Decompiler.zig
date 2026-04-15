@@ -11,7 +11,7 @@ pub const WriteError = error{OutOfMemory};
 
 /// Generate readable pseudo-code from a Module IR.
 pub fn decompile(allocator: std.mem.Allocator, module: *const Mod.Module) WriteError![]u8 {
-    var d = Decomp{ .allocator = allocator, .buf = .{} };
+    var d = Decomp{ .allocator = allocator, .buf = .empty };
     errdefer d.buf.deinit(allocator);
     try d.emit(module);
     return d.buf.toOwnedSlice(allocator);

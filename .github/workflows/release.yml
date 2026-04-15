@@ -58,7 +58,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Get version
         id: version
@@ -166,9 +166,9 @@ jobs:
             Experimental fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) rewritten from C++ to Zig.
 
             **Highlights:**
-            - 100% WebAssembly 3.0 spec conformance (65011/65011 assertions)
+            - 100% WebAssembly 3.0 spec conformance
             - Build system: `build.zig` with cross-compilation
-            - Zig 0.15.2 (pure Zig source, libc linked for stack canaries)
+            - Zig 0.16.0 (pure Zig source, libc linked for stack canaries)
             - Built with `ReleaseSafe` (runtime safety checks) + stack protector
             - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
 

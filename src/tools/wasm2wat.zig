@@ -10,9 +10,9 @@ pub fn convert(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     return wabt.text.Writer.writeModule(allocator, &module);
 }
 
-pub fn main() !void {
-    const alloc = std.heap.page_allocator;
-    var args_it = try std.process.ArgIterator.initWithAllocator(alloc);
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    var args_it = try init.minimal.args.iterateAllocator(alloc);
     defer args_it.deinit();
     _ = args_it.next();
 
@@ -43,7 +43,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
 
-    const source = std.fs.cwd().readFileAlloc(alloc, in_path, wabt.max_input_file_size) catch |err| {
+    const source = std.Io.Dir.cwd().readFileAlloc(init.io, in_path, alloc, std.Io.Limit.limited(wabt.max_input_file_size)) catch |err| {
         std.debug.print("error: cannot read '{s}': {any}\n", .{ in_path, err });
         std.process.exit(1);
     };
@@ -56,12 +56,12 @@ pub fn main() !void {
     defer alloc.free(wat);
 
     if (output_file) |out_path| {
-        std.fs.cwd().writeFile(.{ .sub_path = out_path, .data = wat }) catch |err| {
+        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = wat }) catch |err| {
             std.debug.print("error: cannot write '{s}': {any}\n", .{ out_path, err });
             std.process.exit(1);
         };
     } else {
-        std.fs.File.stdout().writeAll(wat) catch {};
+        std.Io.File.stdout().writeStreamingAll(init.io, wat) catch {};
     }
 }
 

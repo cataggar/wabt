@@ -217,7 +217,7 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
 
     for (m.memories.items) |mem| {
         const max_pages: u64 = if (mem.type.limits.is_64)
-            std.math.maxInt(u64)
+            1 << 48
         else
             65536; // 4GiB = 65536 pages of 64KiB
         try checkLimits(mem.type.limits, max_pages);
@@ -671,9 +671,9 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
     }
     const local_inited: []bool = if (num_locals <= 256) local_inited_buf[0..num_locals] else &.{};
 
-    var val_stack: ValStack = .{};
+    var val_stack: ValStack = .empty;
     defer val_stack.deinit(gpa(m));
-    var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .{};
+    var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .empty;
     defer ctrl_stack.deinit(gpa(m));
 
     // Push the function frame
