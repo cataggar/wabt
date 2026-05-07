@@ -1,6 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt parse [options] <file.wat>
+    \\
+    \\Translate WebAssembly text format to a wasm binary.
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output file (default: <input>.wasm)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Convert WAT text format to WASM binary.
 /// Parses the source, validates the module, then serializes to binary.
 pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
@@ -12,36 +23,32 @@ pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
     return wabt.binary.writer.writeModule(allocator, &module);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next(); // skip program name
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wat2wasm {s} translate WebAssembly text format to binary
-                \\
-                \\Usage: wat2wasm [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output file (default: <input>.wasm)
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
         } else {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help parse` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -58,7 +65,6 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(wasm);
 
     const out_path = output_file orelse blk: {
-        // Replace .wat with .wasm
         if (std.mem.endsWith(u8, in_path, ".wat")) {
             const stem = in_path[0 .. in_path.len - 4];
             break :blk std.fmt.allocPrint(alloc, "{s}.wasm", .{stem}) catch in_path;
@@ -73,6 +79,11 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
+}
+
 test "convert empty module" {
     const wasm = try convert(std.testing.allocator, "(module)");
     defer std.testing.allocator.free(wasm);
@@ -83,9 +94,7 @@ test "convert module round-trips through binary" {
     const source = "(module)";
     const wasm = try convert(std.testing.allocator, source);
     defer std.testing.allocator.free(wasm);
-    // Verify it starts with magic + version
     try std.testing.expect(wasm.len >= 8);
     try std.testing.expectEqualSlices(u8, &wabt.binary.reader.magic, wasm[0..4]);
-    // Version 1
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, wasm[4..8], .little));
 }

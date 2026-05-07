@@ -4,6 +4,18 @@ const wast = wabt.wast_runner;
 const Parser = wabt.text.Parser;
 const writer = wabt.binary.writer;
 
+pub const usage =
+    \\Usage: wabt json-from-wast [options] <file.wast>
+    \\
+    \\Convert a `*.wast` WebAssembly spec test into a `*.json` file
+    \\and associated `*.wasm` binaries.
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output JSON file (default: output.json)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Result of in-memory wast2json conversion.
 pub const WastToJsonResult = struct {
     json: []u8,
@@ -346,36 +358,32 @@ fn findModuleEnd(text: []const u8) ?usize {
     return sexpr.end;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wast2json {s} translate WebAssembly spec test format to JSON
-                \\
-                \\Usage: wast2json [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output JSON file
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
         } else {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help json-from-wast` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -400,6 +408,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("error: cannot write '{s}': {any}\n", .{ out_path, err });
         std.process.exit(1);
     };
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
 test "empty module produces JSON with commands array" {

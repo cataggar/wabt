@@ -21,18 +21,7 @@ IMPORT_NAME = "wabt_cli"
 DIST_NAME = "wabt_bin"
 WABT_REPO = "cataggar/wabt"
 
-TOOLS = [
-    "wat2wasm",
-    "wasm2wat",
-    "wast2json",
-    "wasm-validate",
-    "wasm-objdump",
-    "wasm-interp",
-    "wasm-decompile",
-    "wasm-strip",
-    "wasm-stats",
-    "wat-desugar",
-]
+TOOLS = ["wabt"]
 
 PLATFORMS = {
     "linux-x64": {

@@ -30,46 +30,64 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    // CLI tools
-    const tool_names = [_][]const u8{
-        "wat2wasm",
-        "wasm2wat",
-        "wast2json",
-        "wasm-validate",
-        "wasm-objdump",
-        "wasm2c",
-        "wasm-interp",
-        "wasm-decompile",
-        "wasm-strip",
-        "wasm-stats",
-        "wat-desugar",
-        "spectest-interp",
-        "wasm2wat-fuzz",
+    // Per-subcommand source files (each exposes pub const usage and pub fn run).
+    // Order is unimportant; this list drives both the inline-test loop and
+    // documents the subcommand inventory.
+    const subcommand_sources = [_][]const u8{
+        "src/tools/parse.zig",
+        "src/tools/print.zig",
+        "src/tools/validate.zig",
+        "src/tools/objdump.zig",
+        "src/tools/strip.zig",
+        "src/tools/json_from_wast.zig",
+        "src/tools/decompile.zig",
+        "src/tools/stats.zig",
+        "src/tools/desugar.zig",
+        "src/tools/spectest.zig",
     };
 
-    for (tool_names) |name| {
-        const tool_mod = b.createModule(.{
-            .root_source_file = b.path(
-                b.fmt("src/tools/{s}.zig", .{name}),
-            ),
-            .target = target,
-            .optimize = optimize,
-            .strip = if (strip) true else null,
-            .stack_protector = if (stack_protector) true else null,
-            .link_libc = if (link_libc) true else null,
-            .imports = &.{
-                .{ .name = "wabt", .module = wabt_mod },
-            },
-        });
+    // Single wabt CLI exe — dispatches to subcommand modules at runtime.
+    const wabt_cli_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/wabt.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = if (strip) true else null,
+        .stack_protector = if (stack_protector) true else null,
+        .link_libc = if (link_libc) true else null,
+        .imports = &.{
+            .{ .name = "wabt", .module = wabt_mod },
+        },
+    });
 
-        const exe = b.addExecutable(.{
-            .name = name,
-            .root_module = tool_mod,
-        });
-        // Increase default stack size for deeply nested Wasm blocks
-        exe.stack_size = 128 * 1024 * 1024; // 128 MB
-        b.installArtifact(exe);
-    }
+    const wabt_exe = b.addExecutable(.{
+        .name = "wabt",
+        .root_module = wabt_cli_mod,
+    });
+    // Increase default stack size for deeply nested Wasm blocks
+    wabt_exe.stack_size = 128 * 1024 * 1024; // 128 MB
+    b.installArtifact(wabt_exe);
+
+    // wasm2wat-fuzz: buildable but NOT installed. Existing fuzz scripts
+    // expect this exe to live somewhere reachable; keep it as an explicit
+    // build step.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/wasm2wat-fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+        .strip = if (strip) true else null,
+        .stack_protector = if (stack_protector) true else null,
+        .link_libc = if (link_libc) true else null,
+        .imports = &.{
+            .{ .name = "wabt", .module = wabt_mod },
+        },
+    });
+    const fuzz_exe = b.addExecutable(.{
+        .name = "wasm2wat-fuzz",
+        .root_module = fuzz_mod,
+    });
+    fuzz_exe.stack_size = 128 * 1024 * 1024;
+    const fuzz_step = b.step("fuzz-bin", "Build the wasm2wat-fuzz harness (not installed)");
+    fuzz_step.dependOn(&fuzz_exe.step);
 
     // Tests
     const lib_test_mod = b.createModule(.{
@@ -86,13 +104,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
 
-    // Tool tests
-    for (tool_names) |name| {
-        const tool_test = b.addTest(.{
+    // Per-subcommand inline tests
+    for (subcommand_sources) |src| {
+        const sub_test = b.addTest(.{
             .root_module = b.createModule(.{
-                .root_source_file = b.path(
-                    b.fmt("src/tools/{s}.zig", .{name}),
-                ),
+                .root_source_file = b.path(src),
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
@@ -100,7 +116,46 @@ pub fn build(b: *std.Build) void {
                 },
             }),
         });
-        const run_tool_test = b.addRunArtifact(tool_test);
-        test_step.dependOn(&run_tool_test.step);
+        const run_sub_test = b.addRunArtifact(sub_test);
+        test_step.dependOn(&run_sub_test.step);
+    }
+
+    // Inline tests for the dispatcher itself (parseSubcommand etc.).
+    const dispatcher_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tools/wabt.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "wabt", .module = wabt_mod },
+            },
+        }),
+    });
+    const run_dispatcher_test = b.addRunArtifact(dispatcher_test);
+    test_step.dependOn(&run_dispatcher_test.step);
+
+    // CLI smoke assertions: subcommand layout, exit codes, version-on-stdout.
+    {
+        const wabt_version_line = b.fmt("wabt {s}\n", .{version});
+
+        const wabt_version_run = b.addRunArtifact(wabt_exe);
+        wabt_version_run.addArg("version");
+        wabt_version_run.expectExitCode(0);
+        wabt_version_run.expectStdOutEqual(wabt_version_line);
+        test_step.dependOn(&wabt_version_run.step);
+
+        const wabt_help_run = b.addRunArtifact(wabt_exe);
+        wabt_help_run.addArg("help");
+        wabt_help_run.expectExitCode(0);
+        test_step.dependOn(&wabt_help_run.step);
+
+        const wabt_no_subcmd = b.addRunArtifact(wabt_exe);
+        wabt_no_subcmd.expectExitCode(1);
+        test_step.dependOn(&wabt_no_subcmd.step);
+
+        const wabt_unknown = b.addRunArtifact(wabt_exe);
+        wabt_unknown.addArg("not-a-real-subcommand");
+        wabt_unknown.expectExitCode(1);
+        test_step.dependOn(&wabt_unknown.step);
     }
 }

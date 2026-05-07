@@ -1,6 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt strip [options] <file.wasm>
+    \\
+    \\Strip custom sections from a WebAssembly binary.
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output file (default: overwrite input)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Strip custom sections from a WebAssembly binary.
 pub fn strip(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     var module = try wabt.binary.reader.readModule(allocator, wasm_bytes);
@@ -9,36 +20,32 @@ pub fn strip(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     return wabt.binary.writer.writeModule(allocator, &module);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wasm-strip {s} strip custom sections from a WebAssembly binary
-                \\
-                \\Usage: wasm-strip [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output file (default: overwrite input)
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
         } else {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help strip` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -61,6 +68,11 @@ pub fn main(init: std.process.Init) !void {
     };
 }
 
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
+}
+
 test "module with custom section is stripped" {
     const wasm_with_custom = &[_]u8{
         0x00, 0x61, 0x73, 0x6d, // magic
@@ -73,7 +85,6 @@ test "module with custom section is stripped" {
     const result = try strip(std.testing.allocator, wasm_with_custom);
     defer std.testing.allocator.free(result);
 
-    // Re-read and verify no custom sections remain
     var module = try wabt.binary.reader.readModule(std.testing.allocator, result);
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.customs.items.len);

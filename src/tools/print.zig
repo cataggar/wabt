@@ -1,6 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt print [options] <file.wasm>
+    \\
+    \\Print a WebAssembly binary as WebAssembly text format.
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output file (default: stdout)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Convert WASM binary to WAT text format.
 /// Reads the binary module and serializes it as WAT text.
 pub fn convert(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
@@ -10,36 +21,32 @@ pub fn convert(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     return wabt.text.Writer.writeModule(allocator, &module);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wasm2wat {s} translate WebAssembly binary to text format
-                \\
-                \\Usage: wasm2wat [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output file (default: stdout)
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
         } else {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help print` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -65,8 +72,12 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
+}
+
 test "convert minimal wasm module" {
-    // Minimal valid wasm: magic + version
     const wasm = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
     const wat = try convert(std.testing.allocator, &wasm);
     defer std.testing.allocator.free(wat);

@@ -1,9 +1,11 @@
-"""wabt-bin — WebAssembly Binary Toolkit CLI tools.
+"""wabt-bin — WebAssembly Binary Toolkit CLI tool.
 
-Provides helpers to locate wabt tool binaries installed via
-the data/scripts/ wheel layout. The binaries (wat2wasm, wasm2wat, etc.)
-are placed directly in the scripts directory by pip and do not require
-Python at runtime.
+Provides a helper to locate the `wabt` binary installed via the
+data/scripts/ wheel layout. The binary is placed directly in the scripts
+directory by pip and does not require Python at runtime.
+
+Invoke subcommands as `wabt parse`, `wabt validate`, `wabt spectest`, etc.
+Run `wabt help` for a full list.
 """
 
 from __future__ import annotations
@@ -12,22 +14,11 @@ import os
 import sys
 import sysconfig
 
-TOOLS = [
-    "wat2wasm",
-    "wasm2wat",
-    "wast2json",
-    "wasm-validate",
-    "wasm-objdump",
-    "wasm-interp",
-    "wasm-decompile",
-    "wasm-strip",
-    "wasm-stats",
-    "wat-desugar",
-]
+TOOLS = ["wabt"]
 
 
-def find_wabt_bin(tool: str = "wat2wasm") -> str:
-    """Return the path to a wabt tool binary.
+def find_wabt_bin(tool: str = "wabt") -> str:
+    """Return the path to the wabt binary.
 
     Searches the scripts directories where pip installs data/scripts/ files.
     """

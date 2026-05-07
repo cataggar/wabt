@@ -1,6 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt objdump [options] <file.wasm>
+    \\
+    \\Dump information about sections in a WebAssembly binary.
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output file (default: stdout)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Read a WebAssembly binary and produce a text summary of its sections.
 pub fn dump(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     var module = try wabt.binary.reader.readModule(allocator, wasm_bytes);
@@ -32,36 +43,32 @@ pub fn dump(allocator: std.mem.Allocator, wasm_bytes: []const u8) ![]u8 {
     });
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wasm-objdump {s} dump the contents of a WebAssembly binary
-                \\
-                \\Usage: wasm-objdump [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output file (default: stdout)
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
-        } else if (arg[0] != '-') {
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
+        } else if (arg.len > 0 and arg[0] != '-') {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help objdump` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -85,6 +92,11 @@ pub fn main(init: std.process.Init) !void {
     } else {
         std.Io.File.stdout().writeStreamingAll(init.io, output) catch {};
     }
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
 test "empty module produces header info" {

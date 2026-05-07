@@ -1,6 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt desugar [options] <file.wat>
+    \\
+    \\Parse and re-emit WebAssembly text format (removes syntactic sugar).
+    \\
+    \\Options:
+    \\  -o, --output <file>   Output file (default: stdout)
+    \\  -h, --help            Show this help
+    \\
+;
+
 /// Parse WAT source and write it back (identity transform / desugaring).
 pub fn desugar(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
     var module = try wabt.text.Parser.parseModule(allocator, wat_source);
@@ -8,36 +19,32 @@ pub fn desugar(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
     return wabt.text.Writer.writeModule(allocator, &module);
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wat-desugar {s} remove syntactic sugar from WebAssembly text
-                \\
-                \\Usage: wat-desugar [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\  -o, --output <file>   Output file (default: stdout)
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
-            output_file = args_it.next();
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            output_file = sub_args[i];
         } else {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help desugar` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -61,6 +68,11 @@ pub fn main(init: std.process.Init) !void {
     } else {
         std.Io.File.stdout().writeStreamingAll(init.io, output) catch {};
     }
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
 test "empty module round-trips" {

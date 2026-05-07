@@ -1,0 +1,125 @@
+.Dd $Mdocdate$
+.Dt WABT 1
+.Os
+.Sh NAME
+.Nm wabt
+.Nd WebAssembly Binary Toolkit
+.Sh SYNOPSIS
+.Nm wabt
+.Cm subcommand
+.Op Ar args ...
+.Sh DESCRIPTION
+.Nm
+is a single-binary CLI that consolidates the WebAssembly Binary Toolkit
+into one executable with subcommands, in the style of
+.Xr wasm-tools 1
+and
+.Xr zig 1 .
+.Pp
+The available subcommands are:
+.Bl -tag -width "json-from-wast"
+.It Cm parse
+Translate WebAssembly text format
+.Pq .wat
+to a wasm binary.
+Replaces the previous
+.Sy wat2wasm
+binary.
+.It Cm print
+Print a wasm binary as WebAssembly text format.
+Replaces the previous
+.Sy wasm2wat
+binary.
+.It Cm validate
+Validate a WebAssembly binary.
+Replaces the previous
+.Sy wasm-validate
+binary.
+.It Cm objdump
+Dump information about sections in a WebAssembly binary.
+Replaces the previous
+.Sy wasm-objdump
+binary.
+.It Cm strip
+Strip custom sections from a WebAssembly binary.
+Replaces the previous
+.Sy wasm-strip
+binary.
+.It Cm json-from-wast
+Convert a
+.Pa *.wast
+spec test into a
+.Pa *.json
+file and associated
+.Pa *.wasm
+binaries.
+Replaces the previous
+.Sy wast2json
+binary.
+.It Cm decompile
+Decompile a wasm binary into readable C-like pseudo-code.
+Replaces the previous
+.Sy wasm-decompile
+binary.
+.It Cm stats
+Print module statistics for a wasm binary.
+Replaces the previous
+.Sy wasm-stats
+binary.
+.It Cm desugar
+Parse and re-emit WebAssembly text format
+.Pq removes syntactic sugar .
+Replaces the previous
+.Sy wat-desugar
+binary.
+.It Cm spectest
+Run a WebAssembly spec test
+.Pq Pa .wast .
+Replaces the previous
+.Sy spectest-interp
+binary.
+.It Cm version
+Print the wabt version on stdout and exit.
+.It Cm help Op Ar subcommand
+Print top-level help, or help for a specific subcommand.
+.El
+.Sh SUBCOMMAND OPTIONS
+Most subcommands accept the following options where they are meaningful:
+.Bl -tag -width "-o, --output FILE"
+.It Fl h , Fl Fl help
+Print subcommand-specific help on stdout and exit.
+.It Fl o , Fl Fl output Ar file
+Write output to
+.Ar file
+instead of the default location
+.Pq usually stdout, or a derived path next to the input .
+.El
+.Sh EXAMPLES
+Translate
+.Pa test.wat
+to
+.Pa test.wasm :
+.Pp
+.Dl $ wabt parse test.wat
+.Pp
+Print a wasm binary as text:
+.Pp
+.Dl $ wabt print test.wasm
+.Pp
+Validate a wasm binary:
+.Pp
+.Dl $ wabt validate test.wasm
+.Pp
+Run a spec test:
+.Pp
+.Dl $ wabt spectest third_party/testsuite/i32.wast
+.Pp
+Print version:
+.Pp
+.Dl $ wabt version
+.Sh SEE ALSO
+.Xr wasm-tools 1
+.Sh BUGS
+If you find a bug, please report it at
+.br
+.Lk https://github.com/cataggar/wabt/issues .
