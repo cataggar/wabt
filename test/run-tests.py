@@ -941,6 +941,10 @@ def main(args):
                         help='test patterns.')
     parser.add_argument('--exclude-dir', action='append', default=[],
                         help='directory to exclude.')
+    parser.add_argument('--allowlist', metavar='FILE',
+                        help='only run tests whose paths appear in FILE '
+                             '(one per line, repo-relative). Lines starting '
+                             'with # and blank lines are ignored.')
     options = parser.parse_args(args)
     exclude_dirs = options.exclude_dir
 
@@ -961,6 +965,27 @@ def main(args):
         exclude_dirs += ['wasi']
 
     test_names = FindTestFiles('.txt', pattern_re, exclude_dirs)
+
+    if options.allowlist:
+        with open(options.allowlist) as fh:
+            allowed = set()
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                allowed.add(line.replace('\\', '/'))
+        before = len(test_names)
+        test_names = [t for t in test_names
+                      if t.replace(os.sep, '/') in allowed]
+        missing = allowed - {t.replace(os.sep, '/') for t in test_names}
+        if missing:
+            print('error: %d allowlist entries did not match any test:' %
+                  len(missing), file=sys.stderr)
+            for m in sorted(missing):
+                print('  ' + m, file=sys.stderr)
+            return 1
+        print('allowlist: running %d/%d tests' % (len(test_names), before),
+              file=sys.stderr)
 
     if options.list:
         for test_name in test_names:
