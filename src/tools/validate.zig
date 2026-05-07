@@ -1,6 +1,16 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt validate [options] <file.wasm>
+    \\
+    \\Validate a WebAssembly binary.
+    \\
+    \\Options:
+    \\  -h, --help   Show this help
+    \\
+;
+
 /// Validate a WASM binary module.
 /// Reads the binary, then runs the validator over the resulting module.
 pub fn validateBytes(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void {
@@ -10,24 +20,16 @@ pub fn validateBytes(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void
     try wabt.Validator.validate(&module, .{});
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next();
 
     var input_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\wasm-validate {s} validate a WebAssembly binary
-                \\
-                \\Usage: wasm-validate [options] <file>
-                \\
-                \\  -h, --help            Show this help message
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else {
             input_file = arg;
@@ -35,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const in_path = input_file orelse {
-        std.debug.print("error: no input file. Use --help for usage.\n", .{});
+        std.debug.print("error: no input file. Use `wabt help validate` for usage.\n", .{});
         std.process.exit(1);
     };
 
@@ -49,6 +51,11 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("{s}: validation error: {any}\n", .{ in_path, err });
         std.process.exit(1);
     };
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
 test "validate minimal module" {

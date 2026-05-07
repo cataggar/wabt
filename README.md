@@ -18,16 +18,32 @@ $ uv tool install wabt-bin
 
 ## Tools
 
- - **wat2wasm**: translate from [WebAssembly text format](https://webassembly.github.io/spec/core/text/index.html) to the [WebAssembly binary format](https://webassembly.github.io/spec/core/binary/index.html)
- - **wasm2wat**: the inverse of wat2wasm, translate from the binary format back to the text format (also known as a .wat)
- - **wasm-objdump**: print information about a wasm binary. Similar to objdump.
- - **wasm-interp**: decode and run a WebAssembly binary file using a stack-based interpreter
- - **wasm-decompile**: decompile a wasm binary into readable C-like syntax
- - **wat-desugar**: parse .wat text form and print canonical flat format
- - **wasm-strip**: remove sections of a WebAssembly binary file
- - **wasm-validate**: validate a file in the WebAssembly binary format
- - **wast2json**: convert a file in the wasm spec test format to a JSON file and associated wasm binary files
- - **wasm-stats**: output stats for a module
+All tools are exposed as subcommands of a single `wabt` binary, in the
+style of [wasm-tools](https://github.com/bytecodealliance/wasm-tools)
+and `zig`:
+
+```console
+$ wabt help
+wabt - WebAssembly Binary Toolkit
+
+Usage: wabt <subcommand> [args...]
+
+Subcommands:
+  parse           Translate WebAssembly text format to binary (was wat2wasm)
+  print           Print a wasm binary as WebAssembly text format (was wasm2wat)
+  validate        Validate a WebAssembly binary
+  objdump         Dump information about a WebAssembly binary
+  strip           Strip custom sections from a WebAssembly binary
+  json-from-wast  Convert a .wast spec test to JSON + .wasm files (was wast2json)
+  decompile       Decompile a wasm binary into readable pseudo-code
+  stats           Print module statistics
+  desugar         Parse and re-emit WebAssembly text format
+  spectest        Run a WebAssembly spec test (.wast)
+  version         Print the wabt version and exit
+  help            Print this help; `wabt help <subcommand>` for details
+```
+
+Run `wabt help <subcommand>` for details on any subcommand.
 
 ## Building
 
@@ -65,7 +81,7 @@ Wasm 3.0 spec tests:
 
 ```console
 $ zig build -Doptimize=ReleaseSafe
-$ ./zig-out/bin/spectest-interp third_party/testsuite/i32.wast
+$ ./zig-out/bin/wabt spectest third_party/testsuite/i32.wast
 ```
 
 ## Wasm 3.0 proposals

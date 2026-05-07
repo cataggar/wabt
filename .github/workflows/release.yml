@@ -72,16 +72,13 @@ jobs:
         shell: bash
         run: |
           PKGNAME="wabt-${{ steps.version.outputs.version }}-${{ matrix.name }}"
-          TOOLS="wat2wasm wasm2wat wast2json wasm-validate wasm-objdump wasm-interp wasm-decompile wasm-strip wasm-stats wat-desugar"
           mkdir -p "$PKGNAME/bin"
           case "${{ matrix.target }}" in
             wasm32-wasi) EXT=".wasm" ;;
             *-windows)   EXT=".exe" ;;
             *)           EXT="" ;;
           esac
-          for tool in $TOOLS; do
-            cp "zig-out/bin/${tool}${EXT}" "$PKGNAME/bin/"
-          done
+          cp "zig-out/bin/wabt${EXT}" "$PKGNAME/bin/"
           cp LICENSE README.md "$PKGNAME/"
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           if command -v sha256sum &>/dev/null; then
@@ -172,7 +169,13 @@ jobs:
             - Built with `ReleaseSafe` (runtime safety checks) + stack protector
             - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
 
-            **Tools included:** wat2wasm, wasm2wat, wast2json, wasm-validate, wasm-objdump, wasm-interp, wasm-decompile, wasm-strip, wasm-stats, wat-desugar
+            **Tools included:** Single `wabt` executable with subcommands:
+            `parse`, `print`, `validate`, `objdump`, `strip`, `json-from-wast`,
+            `decompile`, `stats`, `desugar`, `spectest`. Run `wabt help` for
+            details. (Replaces the previous per-tool binaries `wat2wasm`,
+            `wasm2wat`, `wast2json`, `wasm-validate`, `wasm-objdump`,
+            `wasm-decompile`, `wasm-strip`, `wasm-stats`, `wat-desugar`,
+            `spectest-interp`.)
 
             **Install:**
             ```

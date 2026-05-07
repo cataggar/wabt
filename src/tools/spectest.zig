@@ -1,6 +1,16 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+pub const usage =
+    \\Usage: wabt spectest [options] <file.wast>
+    \\
+    \\Run a WebAssembly spec test (.wast file).
+    \\
+    \\Options:
+    \\  -h, --help   Show this help
+    \\
+;
+
 /// Run a WebAssembly spec test (.wast): parse commands and return results.
 pub fn runSpecTest(allocator: std.mem.Allocator, wast_source: []const u8) wabt.wast_runner.Result {
     return wabt.wast_runner.run(allocator, wast_source);
@@ -14,25 +24,16 @@ pub fn runBinaryValidation(allocator: std.mem.Allocator, wasm_bytes: []const u8)
     return true;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
-
-    var args_it = try init.minimal.args.iterateAllocator(alloc);
-    defer args_it.deinit();
-    _ = args_it.next(); // skip program name
 
     var input_file: ?[]const u8 = null;
 
-    while (args_it.next()) |arg| {
+    var i: usize = 0;
+    while (i < sub_args.len) : (i += 1) {
+        const arg = sub_args[i];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
-                \\spectest-interp {s} run WebAssembly spec tests (.wast)
-                \\
-                \\Usage: spectest-interp [options] <file.wast>
-                \\
-                \\  -h, --help   Show this help message
-                \\
-            , .{wabt.version});
+            writeStdout(init.io, usage);
             return;
         } else {
             input_file = arg;
@@ -40,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const in_path = input_file orelse {
-        std.debug.print("no input file specified. Use --help for usage.\n", .{});
+        std.debug.print("no input file specified. Use `wabt help spectest` for usage.\n", .{});
         return;
     };
 
@@ -59,6 +60,11 @@ pub fn main(init: std.process.Init) !void {
         result.skipped,
         result.total(),
     });
+}
+
+fn writeStdout(io: std.Io, text: []const u8) void {
+    var stdout_file = std.Io.File.stdout();
+    stdout_file.writeStreamingAll(io, text) catch {};
 }
 
 test "basic binary validation stub" {

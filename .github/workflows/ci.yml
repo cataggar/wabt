@@ -35,7 +35,7 @@ jobs:
           total=0 pass=0 fail=0 skip=0
           failed_files=""
           for f in third_party/testsuite/*.wast; do
-            result=$(./zig-out/bin/spectest-interp "$f" 2>&1 | tail -1)
+            result=$(./zig-out/bin/wabt spectest "$f" 2>&1 | tail -1)
             if [[ "$result" =~ ([0-9]+)\ passed,\ ([0-9]+)\ failed,\ ([0-9]+)\ skipped ]]; then
               p=${BASH_REMATCH[1]}; f_count=${BASH_REMATCH[2]}; s=${BASH_REMATCH[3]}
               t=$((p + f_count + s))
