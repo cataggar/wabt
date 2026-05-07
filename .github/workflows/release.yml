@@ -140,11 +140,7 @@ jobs:
 
       - name: Get version
         id: version
-        run: |
-          RAW="${GITHUB_REF_NAME#v}"
-          echo "version=${RAW}" >> "$GITHUB_OUTPUT"
-          PEP440=$(echo "$RAW" | sed -E 's/^([0-9]+\.[0-9]+\.[0-9]+)-dev\.([0-9]+)$/\1.dev\2/')
-          echo "pep440=${PEP440}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
@@ -158,34 +154,11 @@ jobs:
         with:
           name: wabt ${{ steps.version.outputs.version }}
           body: |
-            ## wabt ${{ steps.version.outputs.version }} — Zig rewrite
-
-            Experimental fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) rewritten from C++ to Zig.
-
-            **Highlights:**
-            - 100% WebAssembly 3.0 spec conformance
-            - Build system: `build.zig` with cross-compilation
-            - Zig 0.16.0 (pure Zig source, libc linked for stack canaries)
-            - Built with `ReleaseSafe` (runtime safety checks) + stack protector
-            - 11 platform targets (linux, macOS, Windows, musl, RISC-V, WASI)
-
-            **Tools included:** Single `wabt` executable with subcommands:
-            `parse`, `print`, `validate`, `objdump`, `strip`, `json-from-wast`,
-            `decompile`, `stats`, `desugar`, `spectest`. Run `wabt help` for
-            details. (Replaces the previous per-tool binaries `wat2wasm`,
-            `wasm2wat`, `wast2json`, `wasm-validate`, `wasm-objdump`,
-            `wasm-decompile`, `wasm-strip`, `wasm-stats`, `wat-desugar`,
-            `spectest-interp`.)
-
             **Install:**
-            ```
-            dist install cataggar/wabt@v${{ steps.version.outputs.version }}
-            ```
-            ```
-            uv tool install wabt-bin==${{ steps.version.outputs.pep440 }}
-            ```
 
-            See [installation details](https://github.com/cataggar/wabt/issues/69) for more options.
+            ```
+            ghr install cataggar/wabt@v${{ steps.version.outputs.version }}
+            ```
           files: |
             wabt-*.tar.gz
             wabt-*.tar.xz
