@@ -1,16 +1,16 @@
 # WABT: The WebAssembly Binary Toolkit
 
-A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C++ to Zig and maintained with AI assistance.
-
-**100% WebAssembly 3.0 spec conformance** — 65,011/65,011 tests passing.
+A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C++ to Zig and maintained with AI assistance. It supports the Wasm 3.0 proposals and passes the [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) at 65,011/65,011 assertions.
 
 ## Install
 
-Pre-built binaries are published to [GitHub Releases](https://github.com/cataggar/wabt/releases) and [PyPI](https://pypi.org/project/wabt-bin/). See [installation details](https://github.com/cataggar/wabt/issues/69).
+Install pre-built binaries from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-$ dist install cataggar/wabt
+$ ghr install cataggar/wabt
 ```
+
+Wheels are also published to [PyPI](https://pypi.org/project/wabt-bin/):
 
 ```console
 $ uv tool install wabt-bin
@@ -47,7 +47,7 @@ Run `wabt help <subcommand>` for details on any subcommand.
 
 ## Building
 
-Requires [Zig](https://ziglang.org/) 0.15.x. No other dependencies.
+Requires [Zig](https://ziglang.org/) 0.16. No other dependencies.
 
 ```console
 $ git clone --recursive https://github.com/cataggar/wabt
@@ -83,25 +83,6 @@ Wasm 3.0 spec tests:
 $ zig build -Doptimize=ReleaseSafe
 $ ./zig-out/bin/wabt spectest third_party/testsuite/i32.wast
 ```
-
-## Wasm 3.0 proposals
-
-All ratified Wasm 3.0 proposals are enabled by default:
-
-| Proposal | Status |
-| --- | --- |
-| [Exception handling](https://github.com/WebAssembly/exception-handling) | ✓ |
-| [GC (garbage collection)](https://github.com/WebAssembly/gc) | ✓ |
-| [Memory64](https://github.com/WebAssembly/memory64) | ✓ |
-| [Multi-memory](https://github.com/WebAssembly/multi-memory) | ✓ |
-| [Tail calls](https://github.com/WebAssembly/tail-call) | ✓ |
-| [Relaxed SIMD](https://github.com/WebAssembly/relaxed-simd) | ✓ |
-| [Extended const](https://github.com/WebAssembly/extended-const) | ✓ |
-| [SIMD](https://github.com/WebAssembly/simd) | ✓ |
-| [Bulk memory](https://github.com/WebAssembly/bulk-memory-operations) | ✓ |
-| [Reference types](https://github.com/WebAssembly/reference-types) | ✓ |
-| [Multi-value](https://github.com/WebAssembly/multi-value) | ✓ |
-| [Annotations](https://github.com/WebAssembly/annotations) | ✓ |
 
 ## License
 
