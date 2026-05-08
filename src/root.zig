@@ -33,6 +33,7 @@ pub const interp = struct {
 pub const component = struct {
     pub const types = @import("component/types.zig");
     pub const loader = @import("component/loader.zig");
+    pub const writer = @import("component/writer.zig");
 };
 
 /// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
@@ -45,6 +46,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     _ = @import("component/types.zig");
     _ = @import("component/loader.zig");
+    _ = @import("component/writer.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
