@@ -43,6 +43,9 @@ pub const component = struct {
         pub const metadata_encode = @import("component/wit/metadata_encode.zig");
         pub const metadata_decode = @import("component/wit/metadata_decode.zig");
     };
+    pub const adapter = struct {
+        pub const decode = @import("component/adapter/decode.zig");
+    };
 };
 
 /// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
@@ -63,6 +66,7 @@ test {
     _ = @import("component/wit/resolver.zig");
     _ = @import("component/wit/metadata_encode.zig");
     _ = @import("component/wit/metadata_decode.zig");
+    _ = @import("component/adapter/decode.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
