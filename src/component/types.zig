@@ -433,6 +433,40 @@ pub const CustomSection = struct {
     payload: []const u8,
 };
 
+/// Physical section kind. Used by `Component.section_order` to drive
+/// interleaved emission when conventional section order would re-order
+/// type-indexspace contributors and break references between them.
+pub const SectionKind = enum {
+    custom,
+    core_module,
+    core_instance,
+    core_type,
+    component,
+    instance,
+    alias,
+    type,
+    canon,
+    start,
+    import,
+    @"export",
+};
+
+/// One physical section emission. `start..start+count` indexes into
+/// the corresponding per-section field on `Component` (e.g. for
+/// `.type`, into `component.types[]`; for `.alias`, into
+/// `component.aliases[]`). For `.start`, both fields are ignored (the
+/// field is a singleton). For `.custom`, indexes into
+/// `component.custom_sections[]`.
+///
+/// Multiple entries with the same `kind` produce multiple physical
+/// sections — legal and routinely necessary when the encoded shape
+/// requires types and imports to interleave.
+pub const SectionEntry = struct {
+    kind: SectionKind,
+    start: u32 = 0,
+    count: u32 = 0,
+};
+
 // ── Top-level Component ─────────────────────────────────────────────────────
 
 /// A parsed WebAssembly Component.
@@ -503,6 +537,14 @@ pub const Component = struct {
     /// only way to faithfully preserve a component's original
     /// section interleaving (which the AST flattens away).
     raw_bytes: ?[]const u8 = null,
+    /// Optional explicit section emission order. When non-null, the
+    /// writer emits one physical section per entry, in order, drawing
+    /// items from the corresponding per-section field. When null, the
+    /// writer falls back to the conventional "types, imports, core
+    /// modules, …" ordering. Required for components whose type
+    /// indexspace interleaves type defs, imports, and aliases — the
+    /// shape `wasm-tools component new --adapt` produces.
+    section_order: ?[]const SectionEntry = null,
 };
 
 /// A single contributor to the core-func index space.

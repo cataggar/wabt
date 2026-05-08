@@ -56,6 +56,11 @@ pub fn encode(allocator: Allocator, component: *const ctypes.Component) EncodeEr
     try w.writeU32LE(wasm_magic);
     try w.writeU32LE(component_version);
 
+    if (component.section_order) |order| {
+        try writeOrdered(&w, component, order);
+        return w.buf.toOwnedSlice(allocator);
+    }
+
     // Custom sections are emitted up-front — the wit-component
     // encoding marker section needs to appear before the type section
     // for downstream tooling that scans for it positionally.
@@ -88,6 +93,36 @@ pub fn encode(allocator: Allocator, component: *const ctypes.Component) EncodeEr
     if (component.exports.len > 0) try writeExportSection(&w, component.exports);
 
     return w.buf.toOwnedSlice(allocator);
+}
+
+/// Drive section emission from `component.section_order`. Each entry
+/// produces exactly one physical section containing
+/// `component.<field>[start .. start+count]`.
+fn writeOrdered(
+    w: *Writer,
+    component: *const ctypes.Component,
+    order: []const ctypes.SectionEntry,
+) EncodeError!void {
+    for (order) |entry| {
+        const s = entry.start;
+        const n = entry.count;
+        switch (entry.kind) {
+            .custom => for (component.custom_sections[s .. s + n]) |cs| {
+                try writeCustomSection(w, cs);
+            },
+            .core_module => try writeCoreModuleSection(w, component.core_modules[s .. s + n]),
+            .core_instance => try writeCoreInstanceSection(w, component.core_instances[s .. s + n]),
+            .core_type => try writeCoreTypeSection(w, component.core_types[s .. s + n]),
+            .component => try writeNestedComponentSection(w, component.components[s .. s + n]),
+            .instance => try writeInstanceSection(w, component.instances[s .. s + n]),
+            .alias => try writeAliasSection(w, component.aliases[s .. s + n]),
+            .type => try writeTypeSection(w, component.types[s .. s + n]),
+            .canon => try writeCanonSection(w, component.canons[s .. s + n]),
+            .start => if (component.start) |st| try writeStartSection(w, st),
+            .import => try writeImportSection(w, component.imports[s .. s + n]),
+            .@"export" => try writeExportSection(w, component.exports[s .. s + n]),
+        }
+    }
 }
 
 // ── Internal writer ─────────────────────────────────────────────────────────
@@ -932,4 +967,117 @@ test "encode: import+export round-trip" {
     try std.testing.expectEqual(@as(usize, 1), decoded.exports.len);
     try std.testing.expectEqualStrings("do-thing", decoded.exports[0].name);
     try std.testing.expect(decoded.exports[0].desc == .func);
+}
+
+test "encode: section_order interleaves type+import+alias for resource sharing" {
+    // Mimic the shape `wasm-tools component new --adapt` produces:
+    //
+    //   type 0 = instance { (sub resource) "error" }
+    //   import "wasi:io/error"   instance(type 0)        -> instance idx 0
+    //   alias  export 0 "error"  type                    -> type idx 1
+    //   type 2 = instance { (alias outer 1 1) (eq 1) "error" }
+    //   import "wasi:io/streams" instance(type 2)        -> instance idx 1
+    //
+    // The conventional order ("all types first, then imports, then
+    // aliases") would put alias output at type idx 28 instead of 1,
+    // breaking the `(alias outer 1 1)` ref inside the io/streams
+    // instance type body. `section_order` preserves the interleaving
+    // and keeps the references valid.
+    const allocator = std.testing.allocator;
+
+    const error_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{
+            .name = "error",
+            .desc = .{ .type = .sub_resource },
+        } },
+    };
+    const streams_decls = [_]ctypes.Decl{
+        .{ .alias = .{ .outer = .{
+            .sort = .type,
+            .outer_count = 1,
+            .idx = 1,
+        } } },
+        .{ .@"export" = .{
+            .name = "error",
+            .desc = .{ .type = .{ .eq = 1 } },
+        } },
+    };
+    const types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &error_decls } },
+        .{ .instance = .{ .decls = &streams_decls } },
+    };
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 1 } },
+    };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = 0,
+            .name = "error",
+        } },
+    };
+
+    const order = [_]ctypes.SectionEntry{
+        .{ .kind = .type, .start = 0, .count = 1 },
+        .{ .kind = .import, .start = 0, .count = 1 },
+        .{ .kind = .alias, .start = 0, .count = 1 },
+        .{ .kind = .type, .start = 1, .count = 1 },
+        .{ .kind = .import, .start = 1, .count = 1 },
+    };
+
+    const c = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &types,
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
+        .section_order = &order,
+    };
+
+    const bytes = try encode(allocator, &c);
+    defer allocator.free(bytes);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const decoded = try loader.load(bytes, arena.allocator());
+
+    try std.testing.expectEqual(@as(usize, 2), decoded.types.len);
+    try std.testing.expectEqual(@as(usize, 2), decoded.imports.len);
+    try std.testing.expectEqual(@as(usize, 1), decoded.aliases.len);
+    try std.testing.expectEqualStrings("wasi:io/error@0.2.6", decoded.imports[0].name);
+    try std.testing.expectEqualStrings("wasi:io/streams@0.2.6", decoded.imports[1].name);
+    // Alias placed between the imports — its output is type idx 1, so
+    // the streams instance's `(alias outer 1 1)` resolves correctly.
+    try std.testing.expect(decoded.aliases[0] == .instance_export);
+    try std.testing.expectEqualStrings("error", decoded.aliases[0].instance_export.name);
+}
+
+test "encode: section_order with no entries emits empty body after preamble" {
+    const allocator = std.testing.allocator;
+
+    const c = ctypes.Component{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+        .section_order = &.{},
+    };
+
+    const bytes = try encode(allocator, &c);
+    defer allocator.free(bytes);
+
+    try std.testing.expectEqual(@as(usize, 8), bytes.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 }, bytes);
 }
