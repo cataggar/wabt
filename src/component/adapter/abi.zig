@@ -166,14 +166,63 @@ fn resolveTypeIdxIn(
 fn resolveAlias(a: ctypes.Alias, outer_decls: []const ctypes.Decl) ?ctypes.TypeDef {
     return switch (a) {
         .outer => |o| if (o.sort == .type)
-            resolveTypeIdxIn(outer_decls, o.idx, &.{})
+            resolveOuterType(outer_decls, o.idx)
         else
             null,
-        // `(alias export <inst-idx> <name> (type T))` inside an
-        // instance type body would be unusual; we don't try to
-        // resolve cross-instance refs here. Treat as opaque.
-        .instance_export => null,
+        // `(alias export <inst-idx> <name> (type T))` resolves into
+        // the instance type body for `inst-idx` to find a named
+        // type export. Used heavily by WASI types that pull other
+        // namespaces' types in (e.g. wasi:filesystem/types
+        // pulling datetime from wasi:clocks/wall-clock).
+        .instance_export => |ie| resolveInstanceTypeExport(outer_decls, ie.instance_idx, ie.name),
     };
+}
+
+/// Resolve a type idx in the OUTER (world) scope, including any
+/// alias chains that resolve to other parts of the same world. The
+/// outer scope is its own "outer" — there is no further outer here.
+fn resolveOuterType(outer_decls: []const ctypes.Decl, target: u32) ?ctypes.TypeDef {
+    return resolveTypeIdxIn(outer_decls, target, outer_decls);
+}
+
+/// At the world level, locate the instance type body backing the
+/// instance at `instance_idx` in the world's instance indexspace,
+/// then look up `name` as a type export in that body and resolve
+/// its bound back to a `TypeDef`.
+fn resolveInstanceTypeExport(world_decls: []const ctypes.Decl, instance_idx: u32, name: []const u8) ?ctypes.TypeDef {
+    const inst_decls = findInstanceBodyAtIdx(world_decls, instance_idx) orelse return null;
+    for (inst_decls) |d| switch (d) {
+        .@"export" => |e| {
+            if (e.desc != .type) continue;
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            return resolveTypeBound(e.desc.type, inst_decls, world_decls);
+        },
+        else => {},
+    };
+    return null;
+}
+
+/// Walk world-level decls and find the body of the instance type
+/// at the given world-level instance indexspace position. Counts
+/// instance imports + instance type defs (and instance-typed
+/// exports / aliases, for completeness) per the spec's instance
+/// indexspace ordering.
+fn findInstanceBodyAtIdx(world_decls: []const ctypes.Decl, target: u32) ?[]const ctypes.Decl {
+    var cursor: u32 = 0;
+    for (world_decls) |d| switch (d) {
+        .import => |im| {
+            if (im.desc == .instance) {
+                if (cursor == target) {
+                    const td = resolveOuterType(world_decls, im.desc.instance) orelse return null;
+                    if (td != .instance) return null;
+                    return td.instance.decls;
+                }
+                cursor += 1;
+            }
+        },
+        else => {},
+    };
+    return null;
 }
 
 fn resolveTypeBound(
@@ -482,38 +531,190 @@ pub fn classifyFunc(ftr: FuncTypeRef) Classification {
 /// then `(memory option)` adds nothing extra to the core sig
 /// because `(memory)` is a per-call option, not a param).
 ///
+/// Slot types follow the canon-ABI flattening rules:
+/// `bool`/`s8`/`u8`/`s16`/`u16`/`s32`/`u32`/`char`/handle → `i32`,
+/// `s64`/`u64` → `i64`, `f32` → `f32`, `f64` → `f64`,
+/// `string`/`list` → `(i32, i32)` (ptr, len),
+/// `record`/`tuple` → field-wise concatenation,
+/// `variant`/`option`/`result` → `i32` discriminant + `join`ed
+/// payload across cases (`join(t,t)=t`, `join(i32,f32)=i32`,
+/// otherwise `i64`).
+///
 /// Caveat: when results-flat > MAX_FLAT_RESULTS, the canon ABI
 /// passes results through a returned pointer, which means the core
 /// sig actually has 0 results and one extra `i32` param (the output
 /// pointer). We model that here.
 pub fn lowerCoreSig(
     arena: Allocator,
-    cls: Classification,
+    ftr: FuncTypeRef,
 ) Error!struct {
-    params: []const @import("../../types.zig").ValType,
-    results: []const @import("../../types.zig").ValType,
+    params: []const wtypes.ValType,
+    results: []const wtypes.ValType,
 } {
-    const wtypes = @import("../../types.zig");
-    const params_flat = cls.params_flat;
-    const ret_via_pointer = cls.results_flat > MAX_FLAT_RESULTS;
+    const ft = ftr.func;
+    const resolver = ftr.resolver;
 
-    const total_params: u32 = if (ret_via_pointer)
-        saturatingAdd(params_flat, 1)
-    else
-        params_flat;
+    var params = std.ArrayListUnmanaged(wtypes.ValType).empty;
+    for (ft.params) |p| try flattenSlots(arena, p.type, resolver, 0, &params);
 
-    const total_results: u32 = if (ret_via_pointer)
-        0
-    else
-        cls.results_flat;
+    var results = std.ArrayListUnmanaged(wtypes.ValType).empty;
+    switch (ft.results) {
+        .none => {},
+        .unnamed => |vt| try flattenSlots(arena, vt, resolver, 0, &results),
+        .named => |list| for (list) |nv|
+            try flattenSlots(arena, nv.type, resolver, 0, &results),
+    }
 
-    const params = try arena.alloc(wtypes.ValType, total_params);
-    for (params) |*p| p.* = .i32;
+    if (results.items.len > MAX_FLAT_RESULTS) {
+        // Indirect result: callee writes into caller-supplied
+        // pointer. Core sig becomes (params + ret_ptr) -> ().
+        try params.append(arena, .i32);
+        results.clearRetainingCapacity();
+    }
 
-    const results = try arena.alloc(wtypes.ValType, total_results);
-    for (results) |*r| r.* = .i32;
+    return .{
+        .params = try params.toOwnedSlice(arena),
+        .results = try results.toOwnedSlice(arena),
+    };
+}
 
-    return .{ .params = params, .results = results };
+const wtypes = @import("../../types.zig");
+
+/// Append the canon-ABI flat slot types of `vt` into `out`.
+fn flattenSlots(
+    arena: Allocator,
+    vt: ctypes.ValType,
+    resolver: TypeResolver,
+    depth: u32,
+    out: *std.ArrayListUnmanaged(wtypes.ValType),
+) Error!void {
+    if (depth > 32) {
+        try out.append(arena, .i32);
+        return;
+    }
+    switch (vt) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .char => try out.append(arena, .i32),
+        .s64, .u64 => try out.append(arena, .i64),
+        .f32 => try out.append(arena, .f32),
+        .f64 => try out.append(arena, .f64),
+        .own, .borrow => try out.append(arena, .i32),
+        .string => {
+            try out.append(arena, .i32);
+            try out.append(arena, .i32);
+        },
+        .list => {
+            try out.append(arena, .i32);
+            try out.append(arena, .i32);
+        },
+        .type_idx,
+        .record,
+        .variant,
+        .tuple,
+        .flags,
+        .option,
+        .result,
+        => |idx| {
+            if (resolver.resolveLocal(idx)) |td| {
+                try flattenTypeDefSlots(arena, td, resolver, depth + 1, out);
+            } else {
+                // Unresolvable (likely outer-aliased resource handle).
+                // Default depends on the leaf shape.
+                switch (vt) {
+                    .variant, .option, .result => {
+                        try out.append(arena, .i32);
+                        try out.append(arena, .i32);
+                    },
+                    else => try out.append(arena, .i32),
+                }
+            }
+        },
+        .enum_ => try out.append(arena, .i32),
+    }
+}
+
+fn flattenTypeDefSlots(
+    arena: Allocator,
+    td: ctypes.TypeDef,
+    resolver: TypeResolver,
+    depth: u32,
+    out: *std.ArrayListUnmanaged(wtypes.ValType),
+) Error!void {
+    switch (td) {
+        .val => |vt| try flattenSlots(arena, vt, resolver, depth, out),
+        .record => |r| {
+            for (r.fields) |f| try flattenSlots(arena, f.type, resolver, depth, out);
+        },
+        .tuple => |t| {
+            for (t.fields) |fty| try flattenSlots(arena, fty, resolver, depth, out);
+        },
+        .flags => |f| {
+            const slots = (f.names.len + 31) / 32;
+            const slots_u32: u32 = if (slots == 0) 1 else @intCast(slots);
+            var i: u32 = 0;
+            while (i < slots_u32) : (i += 1) try out.append(arena, .i32);
+        },
+        .enum_ => try out.append(arena, .i32),
+        .variant => |v| {
+            // i32 discriminant + slot-wise join across case payloads.
+            try out.append(arena, .i32);
+            var payload = std.ArrayListUnmanaged(wtypes.ValType).empty;
+            for (v.cases) |c| {
+                if (c.type) |vt| {
+                    var case_slots = std.ArrayListUnmanaged(wtypes.ValType).empty;
+                    try flattenSlots(arena, vt, resolver, depth, &case_slots);
+                    try joinInto(arena, &payload, case_slots.items);
+                }
+            }
+            try out.appendSlice(arena, payload.items);
+        },
+        .option => |o| {
+            try out.append(arena, .i32);
+            try flattenSlots(arena, o.inner, resolver, depth, out);
+        },
+        .result => |r| {
+            try out.append(arena, .i32);
+            var payload = std.ArrayListUnmanaged(wtypes.ValType).empty;
+            inline for (.{ r.ok, r.err }) |maybe_vt| {
+                if (maybe_vt) |vt| {
+                    var case_slots = std.ArrayListUnmanaged(wtypes.ValType).empty;
+                    try flattenSlots(arena, vt, resolver, depth, &case_slots);
+                    try joinInto(arena, &payload, case_slots.items);
+                }
+            }
+            try out.appendSlice(arena, payload.items);
+        },
+        .list => |l| {
+            try out.append(arena, .i32);
+            try out.append(arena, .i32);
+            _ = l;
+        },
+        .resource => try out.append(arena, .i32),
+        .func, .component, .instance => try out.append(arena, .i32),
+    }
+}
+
+/// Join `case_slots` into `acc` slot-wise per the canon-ABI rule:
+/// extend `acc` if `case_slots` is longer; for overlapping slots,
+/// use `joinValType`.
+fn joinInto(
+    arena: Allocator,
+    acc: *std.ArrayListUnmanaged(wtypes.ValType),
+    case_slots: []const wtypes.ValType,
+) Error!void {
+    var i: usize = 0;
+    while (i < case_slots.len) : (i += 1) {
+        if (i < acc.items.len) {
+            acc.items[i] = joinValType(acc.items[i], case_slots[i]);
+        } else {
+            try acc.append(arena, case_slots[i]);
+        }
+    }
+}
+
+fn joinValType(a: wtypes.ValType, b: wtypes.ValType) wtypes.ValType {
+    if (a == b) return a;
+    if ((a == .i32 and b == .f32) or (a == .f32 and b == .i32)) return .i32;
+    return .i64;
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
@@ -730,30 +931,63 @@ test "classifyFunc: () -> own<resource> is direct (handle is i32)" {
     try testing.expectEqual(@as(u32, 1), cls.results_flat);
 }
 
-test "lowerCoreSig: 2-flat result becomes (i32 in, no out) with output pointer" {
+test "lowerCoreSig: option<u32> result becomes ret-ptr (i32) -> ()" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const sig = try lowerCoreSig(arena.allocator(), .{
-        .class = .indirect,
-        .opts = .{ .memory = true, .realloc = false, .string_encoding = false },
-        .params_flat = 1,
-        .results_flat = 2,
-        .has_result = true,
-    });
-    try testing.expectEqual(@as(usize, 2), sig.params.len); // 1 real + 1 ret-ptr
+    const a = arena.allocator();
+
+    var inst_decls = try a.alloc(ctypes.Decl, 3);
+    inst_decls[0] = .{ .type = .{ .option = .{ .inner = .u32 } } };
+    inst_decls[1] = .{ .type = .{ .func = .{
+        .params = &.{},
+        .results = .{ .unnamed = .{ .type_idx = 0 } },
+    } } };
+    inst_decls[2] = .{ .@"export" = .{ .name = "f", .desc = .{ .func = 1 } } };
+
+    const world = try buildSyntheticWorld(a, inst_decls, 1);
+    const ftr = try findFuncImport(world, 0, "f");
+    const sig = try lowerCoreSig(a, ftr);
+    try testing.expectEqual(@as(usize, 1), sig.params.len);
+    try testing.expectEqual(wtypes.ValType.i32, sig.params[0]);
     try testing.expectEqual(@as(usize, 0), sig.results.len);
 }
 
 test "lowerCoreSig: 1-flat result keeps 1 result, no extra param" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const sig = try lowerCoreSig(arena.allocator(), .{
-        .class = .direct,
-        .opts = .{ .memory = false, .realloc = false, .string_encoding = false },
-        .params_flat = 0,
-        .results_flat = 1,
-        .has_result = true,
-    });
+    const a = arena.allocator();
+
+    var inst_decls = try a.alloc(ctypes.Decl, 2);
+    inst_decls[0] = .{ .type = .{ .func = .{
+        .params = &.{},
+        .results = .{ .unnamed = .u32 },
+    } } };
+    inst_decls[1] = .{ .@"export" = .{ .name = "f", .desc = .{ .func = 0 } } };
+
+    const world = try buildSyntheticWorld(a, inst_decls, 0);
+    const ftr = try findFuncImport(world, 0, "f");
+    const sig = try lowerCoreSig(a, ftr);
     try testing.expectEqual(@as(usize, 0), sig.params.len);
     try testing.expectEqual(@as(usize, 1), sig.results.len);
+    try testing.expectEqual(wtypes.ValType.i32, sig.results[0]);
+}
+
+test "lowerCoreSig: u64 params lower to i64" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var inst_decls = try a.alloc(ctypes.Decl, 2);
+    inst_decls[0] = .{ .type = .{ .func = .{
+        .params = &.{ .{ .name = "a", .type = .u64 }, .{ .name = "b", .type = .u32 } },
+        .results = .none,
+    } } };
+    inst_decls[1] = .{ .@"export" = .{ .name = "f", .desc = .{ .func = 0 } } };
+
+    const world = try buildSyntheticWorld(a, inst_decls, 0);
+    const ftr = try findFuncImport(world, 0, "f");
+    const sig = try lowerCoreSig(a, ftr);
+    try testing.expectEqual(@as(usize, 2), sig.params.len);
+    try testing.expectEqual(wtypes.ValType.i64, sig.params[0]);
+    try testing.expectEqual(wtypes.ValType.i32, sig.params[1]);
 }
