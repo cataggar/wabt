@@ -8,6 +8,7 @@ const std = @import("std");
 
 const embed_cmd = @import("component_embed.zig");
 const new_cmd = @import("component_new.zig");
+const compose_cmd = @import("component_compose.zig");
 
 pub const usage =
     \\Usage: wabt component <verb> [args...]
@@ -15,8 +16,7 @@ pub const usage =
     \\Component-model subcommands:
     \\  embed          Embed a `component-type` custom section into a core wasm
     \\  new            Wrap a core wasm + embedded metadata into a component
-    \\
-    \\(Future verb: `compose` — link components by matching imports to exports.)
+    \\  compose        Link a consumer component's imports to provider exports
     \\
     \\Run `wabt help component <verb>` for verb-specific help.
     \\
@@ -25,12 +25,14 @@ pub const usage =
 pub const Verb = enum {
     embed,
     new,
+    compose,
     help,
 };
 
 pub fn parseVerb(s: []const u8) ?Verb {
     if (std.mem.eql(u8, s, "embed")) return .embed;
     if (std.mem.eql(u8, s, "new")) return .new;
+    if (std.mem.eql(u8, s, "compose")) return .compose;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
 }
@@ -48,6 +50,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     switch (verb) {
         .embed => try embed_cmd.run(init, verb_args),
         .new => try new_cmd.run(init, verb_args),
+        .compose => try compose_cmd.run(init, verb_args),
         .help => {
             if (verb_args.len == 0) {
                 writeStdout(init.io, usage);
@@ -60,6 +63,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             writeStdout(init.io, switch (v) {
                 .embed => embed_cmd.usage,
                 .new => new_cmd.usage,
+                .compose => compose_cmd.usage,
                 .help => usage,
             });
         },

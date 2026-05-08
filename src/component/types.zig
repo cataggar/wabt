@@ -496,6 +496,13 @@ pub const Component = struct {
     /// drop custom sections, so this field is write-only — round-trip
     /// (load → encode) does not preserve them.
     custom_sections: []const CustomSection = &.{},
+    /// Optional raw-bytes override used by `writer.encode` when this
+    /// component is emitted as a nested-component section. When set
+    /// (e.g. by `compose` after `loader.load`), the writer skips
+    /// re-serialization and passes the bytes through verbatim — the
+    /// only way to faithfully preserve a component's original
+    /// section interleaving (which the AST flattens away).
+    raw_bytes: ?[]const u8 = null,
 };
 
 /// A single contributor to the core-func index space.

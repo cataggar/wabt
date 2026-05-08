@@ -34,6 +34,7 @@ pub const component = struct {
     pub const types = @import("component/types.zig");
     pub const loader = @import("component/loader.zig");
     pub const writer = @import("component/writer.zig");
+    pub const compose = @import("component/compose.zig");
     pub const wit = struct {
         pub const lexer = @import("component/wit/lexer.zig");
         pub const ast = @import("component/wit/ast.zig");
@@ -54,6 +55,7 @@ test {
     _ = @import("component/types.zig");
     _ = @import("component/loader.zig");
     _ = @import("component/writer.zig");
+    _ = @import("component/compose.zig");
     _ = @import("component/wit/lexer.zig");
     _ = @import("component/wit/ast.zig");
     _ = @import("component/wit/parser.zig");

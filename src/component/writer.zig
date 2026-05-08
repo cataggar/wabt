@@ -65,16 +65,20 @@ pub fn encode(allocator: Allocator, component: *const ctypes.Component) EncodeEr
     // emitting them in that case (the binary is shorter and still
     // structurally equivalent under loader's reading).
     //
-    // Order is *forward-only*: aliases and canons (which build on
-    // core instances and types) come *before* component instances
-    // (which may reference the lifted funcs the canons produce) and
-    // exports (which may reference the produced instances). Re-using
-    // an instance/alias/canon group later in the binary is legal but
-    // wabt only emits each kind once.
+    // Order is *forward-only* with respect to the index spaces:
+    //   * types come first because imports may declare instance/func
+    //     imports referencing them by type idx;
+    //   * aliases and canons (which build on core instances and
+    //     types) come *before* component instances (which may
+    //     reference the lifted funcs the canons produce) and
+    //     exports (which may reference the produced instances).
+    //
+    // Re-using an instance/alias/canon group later in the binary is
+    // legal but wabt only emits each kind once.
+    if (component.types.len > 0) try writeTypeSection(&w, component.types);
     if (component.imports.len > 0) try writeImportSection(&w, component.imports);
     if (component.core_modules.len > 0) try writeCoreModuleSection(&w, component.core_modules);
     if (component.core_types.len > 0) try writeCoreTypeSection(&w, component.core_types);
-    if (component.types.len > 0) try writeTypeSection(&w, component.types);
     if (component.components.len > 0) try writeNestedComponentSection(&w, component.components);
     if (component.core_instances.len > 0) try writeCoreInstanceSection(&w, component.core_instances);
     if (component.aliases.len > 0) try writeAliasSection(&w, component.aliases);
@@ -172,9 +176,15 @@ fn writeNestedComponentSection(
     components: []const *ctypes.Component,
 ) EncodeError!void {
     for (components) |child| {
-        const child_bytes = try encode(w.allocator, child);
-        defer w.allocator.free(child_bytes);
-        try emitSection(w, SECTION_COMPONENT, child_bytes);
+        if (child.raw_bytes) |raw| {
+            // Pass through verbatim — preserves original section
+            // interleaving that the AST cannot represent.
+            try emitSection(w, SECTION_COMPONENT, raw);
+        } else {
+            const child_bytes = try encode(w.allocator, child);
+            defer w.allocator.free(child_bytes);
+            try emitSection(w, SECTION_COMPONENT, child_bytes);
+        }
     }
 }
 
