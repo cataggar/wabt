@@ -528,3 +528,62 @@ test "composeBinaries: bubbles up unmet imports" {
     try testing.expectEqual(@as(usize, 1), loaded.imports.len);
     try testing.expectEqualStrings("wasi:cli/environment@0.2.0", loaded.imports[0].name);
 }
+
+test "composeBinaries: multi-package consumer + provider end-to-end" {
+    // Mirrors the wamr `zig-calculator-cmd` topology: a consumer
+    // component imports `docs:adder/add@0.1.0` from a sibling
+    // package, and a provider component exports the same qualified
+    // interface. Composing the two should fully bind the import
+    // (zero leftover imports) — exactly the case Track #4 of the
+    // multi-package PR is meant to enable.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const qname = "docs:adder/add@0.1.0";
+
+    // Provider: one instance export under the qualified name.
+    const prov_inst_exps = [_]ctypes.InlineExport{};
+    const prov_instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &prov_inst_exps },
+    };
+    const prov_exports = [_]ctypes.ExportDecl{
+        .{
+            .name = qname,
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &prov_instances, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &.{}, .exports = &prov_exports,
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    // Consumer: imports the same qualified name, no exports.
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = qname, .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    var providers_buf = [_][]u8{provider_bytes};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Cross-package import should be fully resolved by the provider.
+    try testing.expectEqual(@as(usize, 0), loaded.imports.len);
+    // Both components nested + bound through an alias.
+    try testing.expectEqual(@as(usize, 2), loaded.components.len);
+    try testing.expectEqual(@as(usize, 2), loaded.instances.len);
+    try testing.expectEqual(@as(usize, 1), loaded.aliases.len);
+}
