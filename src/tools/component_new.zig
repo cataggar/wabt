@@ -4,27 +4,32 @@
 //! Drop-in subset of `wasm-tools component new` for the wamr build
 //! pipeline:
 //!
-//!   wabt component new [-o <out>] [--skip-validation] <input.wasm>
+//!   wabt component new [-o <out>] [--skip-validation]
+//!                      [--adapt <name>=<adapter.wasm>] <input.wasm>
 //!
 //! The input core wasm must already have a `component-type:<world>`
 //! custom section produced by `wabt component embed` (or
 //! `wasm-tools component embed`).
 //!
-//! For each export interface declared by the world, this builds:
+//! Two paths:
 //!
-//!   * a core-instance alias for the matching `<iface>#<func>` core
-//!     export,
-//!   * a component-level func type matching the interface's signature,
-//!   * a `(canon lift)` wrapping the core export at the component
-//!     type,
-//!   * a component-level instance bundling the lifted func(s),
-//!   * a top-level export of that instance under the qualified name.
+//! 1. **Plain wrap** (no `--adapt`): for each export interface in the
+//!    world, build a core-instance alias for the matching
+//!    `<iface>#<func>` export, a component-level func type matching
+//!    the interface's signature, a `(canon lift)`, an instance
+//!    bundling the lifted funcs, and a top-level export under the
+//!    qualified interface name. Suitable for plain reactor-style
+//!    cores like the wamr `zig-adder` fixture.
 //!
-//! Exports without param/return types and any *imports* declared by
-//! the world are deferred to the next iteration (`--adapt` /
-//! WASI-preview1 splicing). This is enough to handle the wamr
-//! `zig-adder` fixture end-to-end (one export interface, one func,
-//! u32×2 → u32) and serves as the substrate for the import path.
+//! 2. **Adapter splice** (`--adapt wasi_snapshot_preview1=<a.wasm>`):
+//!    delegate to `wabt.component.adapter.adapter.splice`, which
+//!    composes the embed core with the given preview1→component
+//!    adapter into a four- or five-core-module component (shim,
+//!    embed, adapter, fixup, optional `__main_module__` fallback)
+//!    and lifts `wasi:cli/run` for top-level export. Mirrors
+//!    `wasm-tools component new --adapt …` and unblocks the
+//!    `zig-hello`, `zig-calculator-cmd`, and `mixed-zig-rust-calc`
+//!    wamr command-component fixtures.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -46,7 +51,8 @@ pub const usage =
     \\Options:
     \\  -o, --output <file>     Output file (default: <input>.component.wasm)
     \\      --skip-validation   Skip post-encoding component validation
-    \\      --adapt <n>=<file>  (Reserved — adapter splicing TBD)
+    \\      --adapt <n>=<file>  Splice in a wasi-preview1 adapter (e.g.
+    \\                          --adapt wasi_snapshot_preview1=path/to/adapter.wasm)
     \\  -h, --help              Show this help
     \\
 ;
@@ -57,6 +63,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var output_file: ?[]const u8 = null;
     var skip_validation: bool = false;
     var input_path: ?[]const u8 = null;
+    var adapt_name: ?[]const u8 = null;
+    var adapt_file: ?[]const u8 = null;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -74,8 +82,22 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--skip-validation")) {
             skip_validation = true;
         } else if (std.mem.eql(u8, arg, "--adapt")) {
-            std.debug.print("error: --adapt is not yet implemented in wabt\n", .{});
-            std.process.exit(1);
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: --adapt requires an argument of the form <name>=<file>\n", .{});
+                std.process.exit(1);
+            }
+            const spec = sub_args[i];
+            const eq = std.mem.indexOfScalar(u8, spec, '=') orelse {
+                std.debug.print("error: --adapt expects <name>=<file>, got '{s}'\n", .{spec});
+                std.process.exit(1);
+            };
+            if (adapt_name != null) {
+                std.debug.print("error: only one --adapt is supported\n", .{});
+                std.process.exit(1);
+            }
+            adapt_name = spec[0..eq];
+            adapt_file = spec[eq + 1 ..];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown option '{s}'. Use `wabt help component`.\n", .{arg});
             std.process.exit(1);
@@ -112,9 +134,28 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         break :blk std.fmt.allocPrint(alloc, "{s}.component.wasm", .{in_path}) catch in_path;
     };
 
-    const out_bytes = buildComponent(alloc, core_bytes) catch |err| {
-        std.debug.print("error: building component: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+    const out_bytes = blk: {
+        if (adapt_name) |aname| {
+            const adp_path = adapt_file.?;
+            const adp_bytes = std.Io.Dir.cwd().readFileAlloc(
+                init.io,
+                adp_path,
+                alloc,
+                std.Io.Limit.limited(wabt.max_input_file_size),
+            ) catch |err| {
+                std.debug.print("error: cannot read adapter '{s}': {any}\n", .{ adp_path, err });
+                std.process.exit(1);
+            };
+            defer alloc.free(adp_bytes);
+            break :blk wabt.component.adapter.adapter.splice(alloc, core_bytes, adp_bytes, aname) catch |err| {
+                std.debug.print("error: splicing adapter '{s}': {s}\n", .{ aname, @errorName(err) });
+                std.process.exit(1);
+            };
+        }
+        break :blk buildComponent(alloc, core_bytes) catch |err| {
+            std.debug.print("error: building component: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
     };
     defer alloc.free(out_bytes);
 
