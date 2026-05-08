@@ -39,6 +39,7 @@ pub const component = struct {
         pub const lexer = @import("component/wit/lexer.zig");
         pub const ast = @import("component/wit/ast.zig");
         pub const parser = @import("component/wit/parser.zig");
+        pub const resolver = @import("component/wit/resolver.zig");
         pub const metadata_encode = @import("component/wit/metadata_encode.zig");
         pub const metadata_decode = @import("component/wit/metadata_decode.zig");
     };
@@ -59,6 +60,7 @@ test {
     _ = @import("component/wit/lexer.zig");
     _ = @import("component/wit/ast.zig");
     _ = @import("component/wit/parser.zig");
+    _ = @import("component/wit/resolver.zig");
     _ = @import("component/wit/metadata_encode.zig");
     _ = @import("component/wit/metadata_decode.zig");
     _ = @import("integration_tests.zig");

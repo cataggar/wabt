@@ -6,11 +6,17 @@
 //!
 //!   wabt component embed [-w <world>] [-o <out>] <wit-path> <core.wasm>
 //!
-//! `<wit-path>` is a `.wit` file or a directory containing `.wit`
-//! files. When a directory is given, all top-level `.wit` files are
-//! concatenated into a single source for parsing. (Subdirectories
-//! such as `deps/` — used by `wasm-tools` for multi-package
-//! resolution — are deferred to the `wit-resolve` todo.)
+//! `<wit-path>` is one of:
+//!
+//!   * A single `.wit` file.
+//!   * A directory of `.wit` files. Top-level `.wit` files are
+//!     concatenated into a single "main" package; entries under
+//!     `<dir>/deps/<pkg>/` (or `<dir>/deps/<pkg>.wit`) are parsed
+//!     as sibling packages and made available for cross-package
+//!     interface lookup. This matches the layout convention
+//!     `wasm-tools` / `wit-bindgen` use, and lets a world `import
+//!     docs:adder/add@0.1.0;` resolve against
+//!     `<dir>/deps/adder/world.wit`.
 //!
 //! The output is the original core wasm with a `component-type:<world>`
 //! custom section appended. Existing custom sections with the same
@@ -27,6 +33,9 @@ pub const usage =
     \\into a component.
     \\
     \\<wit-path> is a `.wit` file or a directory of `.wit` files.
+    \\When a directory is given, sibling packages under <wit-path>/deps/
+    \\are also parsed so qualified interface refs like
+    \\`docs:adder/add@0.1.0` resolve correctly.
     \\
     \\Options:
     \\  -w, --world <name>      World to embed (required if the WIT defines
@@ -85,26 +94,21 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const wit_path = positionals[0].?;
     const core_path = positionals[1].?;
 
-    const source = readWitSource(alloc, init.io, wit_path) catch |err| {
-        std.debug.print("error: reading WIT '{s}': {any}\n", .{ wit_path, err });
-        std.process.exit(1);
-    };
-    defer alloc.free(source);
-
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
-    var diag: wabt.component.wit.parser.ParseDiagnostic = .{};
-    const doc = wabt.component.wit.parser.parse(arena.allocator(), source, &diag) catch |err| {
-        std.debug.print("error: parsing WIT: {s} at offset {d}: {s}\n", .{ @errorName(err), diag.span.start, diag.msg });
+    const ar = arena.allocator();
+
+    const resolver = wabt.component.wit.resolver.parseLayout(ar, init.io, wit_path) catch |err| {
+        std.debug.print("error: parsing WIT layout '{s}': {s}\n", .{ wit_path, @errorName(err) });
         std.process.exit(1);
     };
 
-    const world_name = world_arg orelse autoselectWorld(doc) orelse {
+    const world_name = world_arg orelse autoselectWorld(resolver.main) orelse {
         std.debug.print("error: --world is required (no unique world found in WIT)\n", .{});
         std.process.exit(1);
     };
 
-    const ct_payload = wabt.component.wit.metadata_encode.encodeWorld(alloc, doc, world_name) catch |err| {
+    const ct_payload = wabt.component.wit.metadata_encode.encodeWorldFromResolver(alloc, resolver, world_name) catch |err| {
         std.debug.print("error: encoding world '{s}': {s}\n", .{ world_name, @errorName(err) });
         std.process.exit(1);
     };
@@ -153,45 +157,6 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 fn writeStdout(io: std.Io, text: []const u8) void {
     var stdout_file = std.Io.File.stdout();
     stdout_file.writeStreamingAll(io, text) catch {};
-}
-
-/// Read a `.wit` path. If `path` is a directory, concatenate all
-/// top-level `.wit` files (sorted by name for determinism).
-fn readWitSource(alloc: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| return err;
-    if (stat.kind == .directory) {
-        var dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
-        defer dir.close(io);
-        var entries = std.ArrayListUnmanaged([]const u8).empty;
-        defer {
-            for (entries.items) |e| alloc.free(e);
-            entries.deinit(alloc);
-        }
-        var it = dir.iterate();
-        while (try it.next(io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".wit")) continue;
-            try entries.append(alloc, try alloc.dupe(u8, entry.name));
-        }
-        std.mem.sort([]const u8, entries.items, {}, struct {
-            fn lt(_: void, a: []const u8, b: []const u8) bool {
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lt);
-
-        var combined = std.ArrayListUnmanaged(u8).empty;
-        defer combined.deinit(alloc);
-        for (entries.items) |name| {
-            const full = try std.fs.path.join(alloc, &.{ path, name });
-            defer alloc.free(full);
-            const buf = try std.Io.Dir.cwd().readFileAlloc(io, full, alloc, std.Io.Limit.limited(wabt.max_input_file_size));
-            defer alloc.free(buf);
-            try combined.appendSlice(alloc, buf);
-            try combined.append(alloc, '\n');
-        }
-        return try combined.toOwnedSlice(alloc);
-    }
-    return try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, std.Io.Limit.limited(wabt.max_input_file_size));
 }
 
 /// If exactly one world is defined in the document, return its name.
