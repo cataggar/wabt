@@ -591,15 +591,39 @@ fn writeExportSection(w: *Writer, exports: []const ctypes.ExportDecl) EncodeErro
         // at least produce a valid binary).
         const si = e.sort_idx orelse synthSortIdxFromDesc(e.desc);
         try writeSortIdx(&body, si);
-        // Always emit the descriptor explicitly (`0x01` prefix). The
-        // optional-omit form (`0x00`) is only safe when the descriptor
-        // can be fully inferred from the sort, which is true only for
-        // a subset of sorts. Always emitting is the simpler, lossless
-        // choice and round-trips through the loader.
-        try body.appendByte(0x01);
-        try writeExternDesc(&body, e.desc);
+        // Emit the un-ascribed (`0x00`) form when the descriptor is
+        // exactly what the sort_idx would already imply. Tools like
+        // `wasm-tools component new` *require* the omitted form for
+        // type exports — they reject `0x01 type=eq{idx}` even when
+        // the descriptor is identical to the sort's inferred form.
+        // Otherwise emit the explicit (`0x01`) form. Both round-trip
+        // through our loader.
+        if (descMatchesSort(e.desc, si)) {
+            try body.appendByte(0x00);
+        } else {
+            try body.appendByte(0x01);
+            try writeExternDesc(&body, e.desc);
+        }
     }
     try emitSection(w, SECTION_EXPORT, body.buf.items);
+}
+
+/// True iff `desc` is exactly what `synthSortIdxFromDesc` would
+/// reconstruct from the sort_idx — meaning we can omit the explicit
+/// descriptor on the wire.
+fn descMatchesSort(desc: ctypes.ExternDesc, si: ctypes.SortIdx) bool {
+    return switch (desc) {
+        .type => |bound| switch (bound) {
+            .eq => |idx| si.sort == .type and si.idx == idx,
+            .sub_resource => false,
+        },
+        // For func/component/instance, the omitted form sets the
+        // descriptor's *type idx* to 0 (since the sort_idx only
+        // carries the index in the sort's own space — distinct from
+        // the type space). We only claim a match when both happen
+        // to be 0, which is the conservative choice.
+        else => false,
+    };
 }
 
 fn synthSortIdxFromDesc(desc: ctypes.ExternDesc) ctypes.SortIdx {

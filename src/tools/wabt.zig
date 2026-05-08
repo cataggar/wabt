@@ -30,6 +30,7 @@ const stats_cmd = @import("stats.zig");
 const desugar_cmd = @import("desugar.zig");
 const spectest_cmd = @import("spectest.zig");
 const shrink_cmd = @import("shrink.zig");
+const component_cmd = @import("component.zig");
 
 pub const Subcommand = enum {
     parse,
@@ -43,6 +44,7 @@ pub const Subcommand = enum {
     desugar,
     spectest,
     shrink,
+    component,
     version,
     help,
 };
@@ -59,6 +61,7 @@ pub fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "desugar")) return .desugar;
     if (std.mem.eql(u8, s, "spectest")) return .spectest;
     if (std.mem.eql(u8, s, "shrink")) return .shrink;
+    if (std.mem.eql(u8, s, "component")) return .component;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -101,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
         .desugar => try desugar_cmd.run(init, sub_args),
         .spectest => try spectest_cmd.run(init, sub_args),
         .shrink => try shrink_cmd.run(init, sub_args),
+        .component => try component_cmd.run(init, sub_args),
     }
 }
 
@@ -121,6 +125,7 @@ const top_usage =
     \\  desugar         Parse and re-emit WebAssembly text format
     \\  spectest        Run a WebAssembly spec test (.wast)
     \\  shrink          Minimize a wasm binary while preserving a property
+    \\  component       Component-model subcommands (embed)
     \\  version         Print the wabt version and exit
     \\  help            Print this help; `wabt help <subcommand>` for details
     \\
@@ -161,6 +166,7 @@ fn runHelp(io: std.Io, args: []const []const u8) void {
         .desugar => desugar_cmd.usage,
         .spectest => spectest_cmd.usage,
         .shrink => shrink_cmd.usage,
+        .component => component_cmd.usage,
         .version => version_usage,
         .help => help_usage,
     });
