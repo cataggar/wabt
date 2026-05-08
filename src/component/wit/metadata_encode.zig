@@ -51,6 +51,7 @@ const Allocator = std.mem.Allocator;
 const ast = @import("ast.zig");
 const lexer = @import("lexer.zig");
 const witParser = @import("parser.zig");
+const wit_resolver = @import("resolver.zig");
 const ctypes = @import("../types.zig");
 const writer = @import("../writer.zig");
 
@@ -68,12 +69,28 @@ pub fn encodeWorld(
     doc: ast.Document,
     world_name: []const u8,
 ) EncodeError![]u8 {
+    return encodeWorldFromResolver(
+        allocator,
+        wit_resolver.Resolver.init(doc, &.{}),
+        world_name,
+    );
+}
+
+/// Encode the named world using a multi-package resolver. Imports
+/// like `import docs:adder/add@0.1.0;` resolve their interface body
+/// against `resolver.deps`. The world itself is always taken from
+/// `resolver.main`.
+pub fn encodeWorldFromResolver(
+    allocator: Allocator,
+    resolver: wit_resolver.Resolver,
+    world_name: []const u8,
+) EncodeError![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const ar = arena.allocator();
 
-    const world = findWorld(doc, world_name) orelse return error.UnknownWorld;
-    const pkg_id = doc.package orelse return error.InvalidWit;
+    const world = findWorld(resolver.main, world_name) orelse return error.UnknownWorld;
+    const pkg_id = resolver.main.package orelse return error.InvalidWit;
 
     // Build the world's body component-type decls.
     var world_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
@@ -87,7 +104,7 @@ pub fn encodeWorld(
                 const is_export = item == .@"export";
                 const ext = we;
                 const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
-                const iface_decls = try buildInterfaceBody(ar, doc, ext);
+                const iface_decls = try buildInterfaceBody(ar, resolver, ext);
                 try world_decls.append(ar, .{ .type = .{
                     .instance = .{ .decls = iface_decls },
                 } });
@@ -179,13 +196,6 @@ fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
     return null;
 }
 
-fn findInterface(doc: ast.Document, name: []const u8) ?ast.Interface {
-    for (doc.items) |it| {
-        if (it == .interface and std.mem.eql(u8, it.interface.name, name)) return it.interface;
-    }
-    return null;
-}
-
 /// Compute the qualified name to advertise on the wire for a world's
 /// extern. `<id>;` and `<id>@<ver>;` get prefixed by the document's
 /// package; `<ns>:<pkg>/<iface>[@<ver>];` is used as-is.
@@ -222,7 +232,7 @@ fn formatQualifiedName(
 /// Lower an interface's WIT items to instance-type decls.
 fn buildInterfaceBody(
     ar: Allocator,
-    doc: ast.Document,
+    resolver: wit_resolver.Resolver,
     ext: ast.WorldExtern,
 ) EncodeError![]const ctypes.Decl {
     const ref = switch (ext) {
@@ -230,23 +240,12 @@ fn buildInterfaceBody(
         else => return error.UnsupportedWitFeature,
     };
 
-    // For in-package iface refs (no package qualifier), look up the
-    // interface body in the same document. For qualified refs, we
-    // would need a full package resolver — defer to a later todo and
-    // emit an empty body so the type still encodes (the consumer
-    // tooling rejects an empty instance-type for a useful import,
-    // but the wamr `mixed-zig-rust-calc` and `zig-calculator-cmd`
-    // worlds happen to import the same `docs:adder/add` interface
-    // that they ship in `wit/deps/adder/`).
-    const iface_name = ref.name;
-    var iface = findInterface(doc, iface_name);
-
-    // If the qualified-form interface isn't in this document,
-    // attempt to look up by short name as a best-effort (the
-    // wamr-style `wit/` directory packing puts deps as adjacent
-    // packages with the same interface name).
-    if (iface == null) iface = findInterface(doc, iface_name);
-    const iface_body = iface orelse return error.UnknownInterface;
+    // Resolve the interface body across packages: same-package refs
+    // (no `pkg/` qualifier) hit the main doc; `<ns>:<pkg>/<iface>[@<ver>]`
+    // refs traverse the deps (populated by `parseLayout` walking
+    // `<root>/deps/<pkg>/`). The resolver returns the same shape
+    // either way.
+    const iface_body = resolver.findInterface(ref) orelse return error.UnknownInterface;
 
     var decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
     var func_idx: u32 = 0;
@@ -401,4 +400,61 @@ test "metadata_encode: unknown world reports error" {
     const source = "package docs:adder@0.1.0;\nworld adder { }";
     const r = encodeWorldFromSource(testing.allocator, source, "missing");
     try testing.expectError(error.UnknownWorld, r);
+}
+
+test "metadata_encode: multi-package resolver — cross-package import" {
+    // Mirrors the wamr `zig-calculator-cmd` layout: the main package
+    // defines a world that imports from a sibling package found under
+    // `<root>/deps/adder/`. This test exercises the resolver path
+    // end-to-end (resolver → metadata_encode → loader) without
+    // touching disk, proving the deps walk and metadata encoding
+    // are wired correctly for compose with multi-package inputs.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+
+    const main_src =
+        \\package docs:zigcalc@0.1.0;
+        \\world app { import docs:adder/add@0.1.0; }
+    ;
+    const dep_src =
+        \\package docs:adder@0.1.0;
+        \\interface add { add: func(x: u32, y: u32) -> u32; }
+    ;
+    const main_doc = try parser.parse(ar, main_src, null);
+    const dep_doc = try parser.parse(ar, dep_src, null);
+    var deps = try ar.alloc(@import("ast.zig").Document, 1);
+    deps[0] = dep_doc;
+    const resolver = resolver_mod.Resolver.init(main_doc, deps);
+
+    const bytes = try encodeWorldFromResolver(testing.allocator, resolver, "app");
+    defer testing.allocator.free(bytes);
+
+    // Round-trip the encoded payload through the component loader.
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // Outer component-type wraps a world component-type whose body
+    // has the `add` interface as an instance type and the matching
+    // qualified import declaration.
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("docs:adder/add@0.1.0", world.decls[1].import.name);
+
+    // The interface body picks up the func from the *dep* package.
+    const iface = world.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("add", iface.decls[1].@"export".name);
 }
