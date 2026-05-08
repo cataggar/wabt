@@ -36,7 +36,7 @@ Subcommands:
   desugar         Parse and re-emit WebAssembly text format
   spectest        Run a WebAssembly spec test (.wast)
   shrink          Minimize a wasm binary while preserving a property
-  component       Component-model subcommands (embed)
+  component       Component-model subcommands (embed, new, compose)
   version         Print the wabt version and exit
   help            Print this help; `wabt help <subcommand>` for details
 ```
