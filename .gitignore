@@ -13,3 +13,5 @@ __pycache__/
 
 # Stray wasm artifacts
 *.wasm
+# ...except fixtures embedded into tests via @embedFile
+!src/**/fixtures/*.wasm
