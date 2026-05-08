@@ -5,8 +5,10 @@
 //! (after main + adapter). Its job is to write the adapter's
 //! preview1 exports into the shim's funcref table so that calls
 //! through the shim trampolines reach real adapter funcs instead of
-//! trapping. Once the fixup's start function runs, the shim is
-//! "fully wired".
+//! trapping. We use an *active* element segment that initialises
+//! the imported table with the imported funcs at offset 0 — this
+//! runs implicitly during instantiation and avoids the need for a
+//! start function (matching `wit-component`'s emitter exactly).
 //!
 //! Wire shape:
 //!
@@ -14,19 +16,12 @@
 //!   │ types: one (func ...) per UNIQUE preview1-import signature  │
 //!   │   (matches the shim's type list, in the same order)         │
 //!   │ imports:                                                    │
-//!   │   "" "$imports" table funcref       (the shim's table)      │
 //!   │   "" "0" func sig0                  (adapter export 0)      │
 //!   │   "" "1" func sig1                  (adapter export 1)      │
 //!   │   …                                                         │
-//!   │ elem 0: declarative funcref, [func 0, func 1, …]            │
-//!   │   (declares every imported adapter func so ref.func is      │
-//!   │    legal)                                                   │
-//!   │ func N: the start function — body                           │
-//!   │   for each i in 0..N:                                       │
-//!   │     i32.const i                                             │
-//!   │     ref.func i                                              │
-//!   │     table.set 0                                             │
-//!   │ start: func N                                               │
+//!   │   "" "\$imports" table funcref      (the shim's table)      │
+//!   │ elem 0: active (table 0, offset i32.const 0)                │
+//!   │   funcs: [0, 1, 2, …, N-1]                                  │
 //!   └─────────────────────────────────────────────────────────────┘
 //!
 //! Slot order matches `shim.zig`'s slot order — same i'th index
@@ -44,16 +39,14 @@ pub const Error = error{OutOfMemory};
 /// Build the fixup core wasm bytes.
 ///
 /// The slots must match the shim's slots — same length, same order,
-/// same signatures — because the fixup's start function pairs up
-/// imported adapter func i with shim table slot i.
+/// same signatures — because the fixup pairs imported adapter func
+/// i with shim table slot i.
 pub fn build(gpa: Allocator, slots: []const Slot) Error![]u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(gpa);
 
     try out.appendSlice(gpa, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
 
-    // Deduplicate sigs (parallel to shim's logic; we just need the
-    // type table to match each imported func to a typeidx).
     var sig_idx_for_slot = try gpa.alloc(u32, slots.len);
     defer gpa.free(sig_idx_for_slot);
 
@@ -80,8 +73,7 @@ pub fn build(gpa: Allocator, slots: []const Slot) Error![]u8 {
     {
         var body = std.ArrayListUnmanaged(u8).empty;
         defer body.deinit(gpa);
-        // Plus the start func's () -> () type as the LAST entry.
-        try writeU32Leb(gpa, &body, @intCast(unique_sigs.items.len + 1));
+        try writeU32Leb(gpa, &body, @intCast(unique_sigs.items.len));
         for (unique_sigs.items) |s| {
             try body.append(gpa, 0x60);
             try writeU32Leb(gpa, &body, @intCast(s.params.len));
@@ -89,20 +81,27 @@ pub fn build(gpa: Allocator, slots: []const Slot) Error![]u8 {
             try writeU32Leb(gpa, &body, @intCast(s.results.len));
             for (s.results) |r| try body.append(gpa, valTypeByte(r));
         }
-        try body.append(gpa, 0x60);
-        try body.append(gpa, 0x00);
-        try body.append(gpa, 0x00);
         try writeSection(gpa, &out, 0x01, body.items);
     }
 
-    const start_type_idx: u32 = @intCast(unique_sigs.items.len);
-
-    // import section: 1 table + N funcs
+    // import section: N funcs, then the table (matching wit-
+    // component's order so func indexspace is 0..N-1 for the
+    // imported adapter funcs).
     {
         var body = std.ArrayListUnmanaged(u8).empty;
         defer body.deinit(gpa);
         try writeU32Leb(gpa, &body, @intCast(slots.len + 1));
-        // table import: "" "$imports" funcref min/max=N
+
+        var name_buf: [16]u8 = undefined;
+        for (sig_idx_for_slot, 0..) |t, i| {
+            try writeU32Leb(gpa, &body, 0);
+            const name = std.fmt.bufPrint(&name_buf, "{d}", .{i}) catch unreachable;
+            try writeU32Leb(gpa, &body, @intCast(name.len));
+            try body.appendSlice(gpa, name);
+            try body.append(gpa, 0x00); // import desc: func
+            try writeU32Leb(gpa, &body, t);
+        }
+
         try writeU32Leb(gpa, &body, 0); // module ""
         const tbl_field = "$imports";
         try writeU32Leb(gpa, &body, @intCast(tbl_field.len));
@@ -113,74 +112,25 @@ pub fn build(gpa: Allocator, slots: []const Slot) Error![]u8 {
         try writeU32Leb(gpa, &body, @intCast(slots.len));
         try writeU32Leb(gpa, &body, @intCast(slots.len));
 
-        // func imports
-        var name_buf: [16]u8 = undefined;
-        for (sig_idx_for_slot, 0..) |t, i| {
-            try writeU32Leb(gpa, &body, 0);
-            const name = std.fmt.bufPrint(&name_buf, "{d}", .{i}) catch unreachable;
-            try writeU32Leb(gpa, &body, @intCast(name.len));
-            try body.appendSlice(gpa, name);
-            try body.append(gpa, 0x00); // import desc: func
-            try writeU32Leb(gpa, &body, t);
-        }
         try writeSection(gpa, &out, 0x02, body.items);
     }
 
-    // function section: 1 defined func (the start)
-    {
-        var body = std.ArrayListUnmanaged(u8).empty;
-        defer body.deinit(gpa);
-        try body.append(gpa, 0x01);
-        try writeU32Leb(gpa, &body, start_type_idx);
-        try writeSection(gpa, &out, 0x03, body.items);
-    }
-
-    // start section: idx of our start func (= N imported funcs)
-    {
-        var body = std.ArrayListUnmanaged(u8).empty;
-        defer body.deinit(gpa);
-        try writeU32Leb(gpa, &body, @intCast(slots.len));
-        try writeSection(gpa, &out, 0x08, body.items);
-    }
-
-    // element section: one declarative funcref segment listing every
-    // imported func — needed so `ref.func i` is a valid expression in
-    // the start body.
+    // element section: one active elem segment that initialises
+    // table 0 starting at offset 0 with funcs 0..N-1.
     if (slots.len > 0) {
         var body = std.ArrayListUnmanaged(u8).empty;
         defer body.deinit(gpa);
         try body.append(gpa, 0x01); // 1 segment
-        // flags = 3 (declarative + uses elem kind, i.e. funcref of
-        // funcidx). encoding: 0x03, elemkind=0x00 (funcref via
-        // funcidx), then count + funcidxs.
-        try body.append(gpa, 0x03);
+        // flags = 0: active, table 0, funcref via funcidx
         try body.append(gpa, 0x00);
+        // offset: i32.const 0; end
+        try body.append(gpa, 0x41);
+        try writeS32Leb(gpa, &body, 0);
+        try body.append(gpa, 0x0b);
+        // funcidx vector
         try writeU32Leb(gpa, &body, @intCast(slots.len));
         for (0..slots.len) |i| try writeU32Leb(gpa, &body, @intCast(i));
         try writeSection(gpa, &out, 0x09, body.items);
-    }
-
-    // code section: the start func body
-    {
-        var fn_body = std.ArrayListUnmanaged(u8).empty;
-        defer fn_body.deinit(gpa);
-        try fn_body.append(gpa, 0x00); // 0 local decls
-        for (0..slots.len) |i| {
-            try fn_body.append(gpa, 0x41); // i32.const
-            try writeS32Leb(gpa, &fn_body, @intCast(i));
-            try fn_body.append(gpa, 0xd2); // ref.func
-            try writeU32Leb(gpa, &fn_body, @intCast(i));
-            try fn_body.append(gpa, 0x26); // table.set
-            try writeU32Leb(gpa, &fn_body, 0); // tableidx 0
-        }
-        try fn_body.append(gpa, 0x0b); // end
-
-        var body = std.ArrayListUnmanaged(u8).empty;
-        defer body.deinit(gpa);
-        try writeU32Leb(gpa, &body, 1); // 1 func
-        try writeU32Leb(gpa, &body, @intCast(fn_body.items.len));
-        try body.appendSlice(gpa, fn_body.items);
-        try writeSection(gpa, &out, 0x0a, body.items);
     }
 
     return out.toOwnedSlice(gpa);
@@ -239,15 +189,14 @@ test "build: empty slot list still produces a valid module" {
     var module = try reader.readModule(testing.allocator, bytes);
     defer module.deinit();
 
-    // Just the table import + 1 defined start func.
+    // Only the table import (no funcs, no element segment).
     try testing.expectEqual(@as(usize, 1), module.imports.items.len);
     try testing.expectEqual(wtypes.ExternalKind.table, module.imports.items[0].kind);
     try testing.expectEqualStrings("$imports", module.imports.items[0].field_name);
-    try testing.expectEqual(@as(usize, 1), module.funcs.items.len);
-    try testing.expect(module.start_var != null);
+    try testing.expectEqual(@as(usize, 0), module.elem_segments.items.len);
 }
 
-test "build: one i32->i32 slot — imports table + 1 func, start defined" {
+test "build: one i32->i32 slot — N funcs + table imports + active elem" {
     const i32_p = [_]wtypes.ValType{.i32};
     const i32_r = [_]wtypes.ValType{.i32};
     const slots = [_]Slot{
@@ -259,16 +208,15 @@ test "build: one i32->i32 slot — imports table + 1 func, start defined" {
     var module = try reader.readModule(testing.allocator, bytes);
     defer module.deinit();
 
-    // Table + 1 func import + 1 defined start.
+    // N func imports + 1 table import.
     try testing.expectEqual(@as(usize, 2), module.imports.items.len);
-    try testing.expectEqual(wtypes.ExternalKind.table, module.imports.items[0].kind);
-    try testing.expectEqual(wtypes.ExternalKind.func, module.imports.items[1].kind);
-    try testing.expectEqualStrings("0", module.imports.items[1].field_name);
+    try testing.expectEqual(wtypes.ExternalKind.func, module.imports.items[0].kind);
+    try testing.expectEqualStrings("0", module.imports.items[0].field_name);
+    try testing.expectEqual(wtypes.ExternalKind.table, module.imports.items[1].kind);
+    try testing.expectEqualStrings("$imports", module.imports.items[1].field_name);
 
-    try testing.expectEqual(@as(usize, 2), module.funcs.items.len); // 1 imported + 1 defined
-    try testing.expect(module.start_var != null);
-    try testing.expectEqual(@as(u32, 1), module.start_var.?.index);
-
-    // 1 element segment (declarative).
+    try testing.expectEqual(@as(usize, 1), module.funcs.items.len); // imported only
     try testing.expectEqual(@as(usize, 1), module.elem_segments.items.len);
+    // No start function — the active elem runs at instantiation time.
+    try testing.expect(module.start_var == null);
 }
