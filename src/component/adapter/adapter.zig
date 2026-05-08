@@ -1308,3 +1308,128 @@ fn writeU32Leb(arena: Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) Splic
         if (x == 0) break;
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "stripComponentTypeSections: drops component-type custom, keeps others" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var src = std.ArrayListUnmanaged(u8).empty;
+    try src.appendSlice(arena, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+
+    // custom section "component-type:wit-bindgen:0.43.0:foo:encoded world"
+    {
+        const name = "component-type:wit-bindgen:0.43.0:foo:encoded world";
+        var body = std.ArrayListUnmanaged(u8).empty;
+        try writeU32Leb(arena, &body, @intCast(name.len));
+        try body.appendSlice(arena, name);
+        try body.appendSlice(arena, "payload");
+        try writeSection(arena, &src, 0x00, body.items);
+    }
+    // unrelated custom section "name"
+    {
+        const name = "name";
+        var body = std.ArrayListUnmanaged(u8).empty;
+        try writeU32Leb(arena, &body, @intCast(name.len));
+        try body.appendSlice(arena, name);
+        try body.appendSlice(arena, "\x00\x00");
+        try writeSection(arena, &src, 0x00, body.items);
+    }
+    // unrelated bare custom "component-type" (intentionally NOT prefixed
+    // with "component-type:" — strip should leave it alone).
+    {
+        const name = "component-type";
+        var body = std.ArrayListUnmanaged(u8).empty;
+        try writeU32Leb(arena, &body, @intCast(name.len));
+        try body.appendSlice(arena, name);
+        try body.appendSlice(arena, "embed-payload");
+        try writeSection(arena, &src, 0x00, body.items);
+    }
+
+    const stripped = try stripComponentTypeSections(arena, src.items);
+
+    // Magic + version preserved.
+    try testing.expectEqualSlices(u8, src.items[0..8], stripped[0..8]);
+    // The dropped section's payload should not appear.
+    try testing.expect(std.mem.indexOf(u8, stripped, "wit-bindgen") == null);
+    // The kept sections' payloads should both still appear.
+    try testing.expect(std.mem.indexOf(u8, stripped, "name") != null);
+    try testing.expect(std.mem.indexOf(u8, stripped, "embed-payload") != null);
+}
+
+test "stripComponentTypeSections: rejects non-core bytes" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expectError(error.InvalidAdapterCore, stripComponentTypeSections(arena, "not-wasm"));
+}
+
+test "buildMainModuleFallback: synthesizes trapping export per __main_module__ import" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const realloc_params = [_]wtypes.ValType{ .i32, .i32, .i32, .i32 };
+    const realloc_results = [_]wtypes.ValType{.i32};
+    const start_params = [_]wtypes.ValType{};
+    const start_results = [_]wtypes.ValType{};
+    const imports = [_]core_imports.ImportEntry{
+        .{
+            .module_name = "__main_module__",
+            .field_name = "cabi_realloc",
+            .kind = .func,
+            .sig = .{ .params = &realloc_params, .results = &realloc_results },
+        },
+        .{
+            .module_name = "__main_module__",
+            .field_name = "_start",
+            .kind = .func,
+            .sig = .{ .params = &start_params, .results = &start_results },
+        },
+        // Non-__main_module__ imports must be ignored.
+        .{
+            .module_name = "wasi:cli/environment@0.2.6",
+            .field_name = "get-environment",
+            .kind = .func,
+            .sig = .{ .params = &start_params, .results = &start_results },
+        },
+    };
+    const iface = core_imports.CoreInterface{
+        .imports = &imports,
+        .exports = &.{},
+    };
+
+    const wasm = try buildMainModuleFallback(arena, iface);
+
+    // The result is a valid core wasm and re-parses through core_imports.
+    var owned = try core_imports.extract(testing.allocator, wasm);
+    defer owned.deinit();
+
+    // Two exports, one per __main_module__ import; their sigs match.
+    try testing.expectEqual(@as(usize, 2), owned.interface.exports.len);
+
+    const realloc_e = owned.interface.findExport("cabi_realloc") orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(wtypes.ExternalKind.func, realloc_e.kind);
+    try testing.expect(realloc_e.sig != null);
+    try testing.expectEqualSlices(wtypes.ValType, &realloc_params, realloc_e.sig.?.params);
+    try testing.expectEqualSlices(wtypes.ValType, &realloc_results, realloc_e.sig.?.results);
+
+    const start_e = owned.interface.findExport("_start") orelse return error.TestUnexpectedResult;
+    try testing.expect(start_e.sig != null);
+    try testing.expectEqual(@as(usize, 0), start_e.sig.?.params.len);
+    try testing.expectEqual(@as(usize, 0), start_e.sig.?.results.len);
+
+    // The unrelated wasi import must NOT have been turned into an export.
+    try testing.expect(owned.interface.findExport("get-environment") == null);
+}
+
+test "coreToCompValType: maps numeric wasm types to component analogues" {
+    try testing.expectEqual(ctypes.ValType.u32, coreToCompValType(.i32));
+    try testing.expectEqual(ctypes.ValType.u64, coreToCompValType(.i64));
+    try testing.expectEqual(ctypes.ValType.f32, coreToCompValType(.f32));
+    try testing.expectEqual(ctypes.ValType.f64, coreToCompValType(.f64));
+}

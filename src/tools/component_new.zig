@@ -4,27 +4,32 @@
 //! Drop-in subset of `wasm-tools component new` for the wamr build
 //! pipeline:
 //!
-//!   wabt component new [-o <out>] [--skip-validation] <input.wasm>
+//!   wabt component new [-o <out>] [--skip-validation]
+//!                      [--adapt <name>=<adapter.wasm>] <input.wasm>
 //!
 //! The input core wasm must already have a `component-type:<world>`
 //! custom section produced by `wabt component embed` (or
 //! `wasm-tools component embed`).
 //!
-//! For each export interface declared by the world, this builds:
+//! Two paths:
 //!
-//!   * a core-instance alias for the matching `<iface>#<func>` core
-//!     export,
-//!   * a component-level func type matching the interface's signature,
-//!   * a `(canon lift)` wrapping the core export at the component
-//!     type,
-//!   * a component-level instance bundling the lifted func(s),
-//!   * a top-level export of that instance under the qualified name.
+//! 1. **Plain wrap** (no `--adapt`): for each export interface in the
+//!    world, build a core-instance alias for the matching
+//!    `<iface>#<func>` export, a component-level func type matching
+//!    the interface's signature, a `(canon lift)`, an instance
+//!    bundling the lifted funcs, and a top-level export under the
+//!    qualified interface name. Suitable for plain reactor-style
+//!    cores like the wamr `zig-adder` fixture.
 //!
-//! Exports without param/return types and any *imports* declared by
-//! the world are deferred to the next iteration (`--adapt` /
-//! WASI-preview1 splicing). This is enough to handle the wamr
-//! `zig-adder` fixture end-to-end (one export interface, one func,
-//! u32×2 → u32) and serves as the substrate for the import path.
+//! 2. **Adapter splice** (`--adapt wasi_snapshot_preview1=<a.wasm>`):
+//!    delegate to `wabt.component.adapter.adapter.splice`, which
+//!    composes the embed core with the given preview1→component
+//!    adapter into a four- or five-core-module component (shim,
+//!    embed, adapter, fixup, optional `__main_module__` fallback)
+//!    and lifts `wasi:cli/run` for top-level export. Mirrors
+//!    `wasm-tools component new --adapt …` and unblocks the
+//!    `zig-hello`, `zig-calculator-cmd`, and `mixed-zig-rust-calc`
+//!    wamr command-component fixtures.
 
 const std = @import("std");
 const wabt = @import("wabt");
