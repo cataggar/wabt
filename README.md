@@ -1,20 +1,16 @@
 # WABT: The WebAssembly Binary Toolkit
 
-A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C++ to Zig and maintained with AI assistance. It supports the Wasm 3.0 proposals and passes the [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) at 65,011/65,011 assertions.
+A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C++ to Zig and maintained with AI assistance. It supports the Wasm 3.0 proposals and passes the [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) at 65k+ assertions.
 
 ## Install
 
 Install pre-built binaries from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-$ ghr install cataggar/wabt
+$ ghr install cataggar/wabt@v3.0.0-dev.1
 ```
 
-Wheels are also published to [PyPI](https://pypi.org/project/wabt-bin/):
-
-```console
-$ uv tool install wabt-bin
-```
+See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip, dist) and detailed instructions.
 
 ## Tools
 
@@ -77,10 +73,16 @@ Unit tests:
 $ zig build test
 ```
 
-Wasm 3.0 spec tests:
+Wasm 3.0 spec tests — run the full [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) (257 `.wast` files, 65k+ assertions) and compare against the pinned baseline at [`test/spec-baseline.tsv`](test/spec-baseline.tsv):
 
 ```console
 $ zig build -Doptimize=ReleaseSafe
+$ python3 scripts/check_spec_baseline.py
+```
+
+To run a single file:
+
+```console
 $ ./zig-out/bin/wabt spectest third_party/testsuite/i32.wast
 ```
 
