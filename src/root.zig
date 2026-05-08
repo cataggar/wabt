@@ -46,6 +46,8 @@ pub const component = struct {
     pub const adapter = struct {
         pub const decode = @import("component/adapter/decode.zig");
         pub const core_imports = @import("component/adapter/core_imports.zig");
+        pub const shim = @import("component/adapter/shim.zig");
+        pub const fixup = @import("component/adapter/fixup.zig");
     };
 };
 
@@ -69,6 +71,8 @@ test {
     _ = @import("component/wit/metadata_decode.zig");
     _ = @import("component/adapter/decode.zig");
     _ = @import("component/adapter/core_imports.zig");
+    _ = @import("component/adapter/shim.zig");
+    _ = @import("component/adapter/fixup.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
