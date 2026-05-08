@@ -1,13 +1,15 @@
-/bin
-/build
-/out
-/fuzz-out
-/emscripten
-*.pyc
-.idea/
-.vscode/
-/cmake-build-debug/
+# Build artifacts
 /.zig-cache/
 /zig-out/
+/out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editors
+.idea/
+.vscode/
+
+# Stray wasm artifacts
 *.wasm
-tests/*.json

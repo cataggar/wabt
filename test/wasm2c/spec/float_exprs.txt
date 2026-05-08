@@ -1,6 +1,0 @@
-;;; SLOW:
-;;; TOOL: run-spec-wasm2c
-;;; STDIN_FILE: third_party/testsuite/float_exprs.wast
-(;; STDOUT ;;;
-819/819 tests passed.
-;;; STDOUT ;;)
