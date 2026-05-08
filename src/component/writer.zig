@@ -56,6 +56,11 @@ pub fn encode(allocator: Allocator, component: *const ctypes.Component) EncodeEr
     try w.writeU32LE(wasm_magic);
     try w.writeU32LE(component_version);
 
+    // Custom sections are emitted up-front — the wit-component
+    // encoding marker section needs to appear before the type section
+    // for downstream tooling that scans for it positionally.
+    for (component.custom_sections) |cs| try writeCustomSection(&w, cs);
+
     // Conventional section order. Some sections may be empty; we skip
     // emitting them in that case (the binary is shorter and still
     // structurally equivalent under loader's reading).
@@ -132,6 +137,14 @@ fn emitSection(
     try w.appendByte(id);
     try w.writeU32Leb(@intCast(body.len));
     try w.appendSlice(body);
+}
+
+fn writeCustomSection(w: *Writer, cs: ctypes.CustomSection) EncodeError!void {
+    var body = Writer.init(w.allocator);
+    defer body.deinit();
+    try body.writeName(cs.name);
+    try body.appendSlice(cs.payload);
+    try emitSection(w, 0, body.buf.items);
 }
 
 // ── Section writers ─────────────────────────────────────────────────────────

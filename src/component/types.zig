@@ -427,6 +427,12 @@ pub const Start = struct {
     results: u32, // number of result values
 };
 
+/// Component custom section (id=0). Carries a name and an opaque payload.
+pub const CustomSection = struct {
+    name: []const u8,
+    payload: []const u8,
+};
+
 // ── Top-level Component ─────────────────────────────────────────────────────
 
 /// A parsed WebAssembly Component.
@@ -485,6 +491,11 @@ pub const Component = struct {
     /// `wasm-tools compose` output where instance and alias sections
     /// interleave (issue #355).
     comp_instance_indexspace: []const CompInstanceContributor = &.{},
+    /// Custom sections to emit at the start of the encoded binary
+    /// (right after the preamble, before any known sections). Loaders
+    /// drop custom sections, so this field is write-only — round-trip
+    /// (load → encode) does not preserve them.
+    custom_sections: []const CustomSection = &.{},
 };
 
 /// A single contributor to the core-func index space.
