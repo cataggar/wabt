@@ -420,7 +420,7 @@ fn parseInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             const count = try reader.readU32();
             const exps = try allocator.alloc(ctypes.InlineExport, count);
             for (exps) |*e| {
-                e.name = try reader.readName();
+                e.name = try readExternName(reader);
                 e.sort_idx = try readSortIdx(reader);
             }
             return .{ .exports = exps };

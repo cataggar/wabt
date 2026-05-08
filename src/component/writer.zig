@@ -64,15 +64,22 @@ pub fn encode(allocator: Allocator, component: *const ctypes.Component) EncodeEr
     // Conventional section order. Some sections may be empty; we skip
     // emitting them in that case (the binary is shorter and still
     // structurally equivalent under loader's reading).
+    //
+    // Order is *forward-only*: aliases and canons (which build on
+    // core instances and types) come *before* component instances
+    // (which may reference the lifted funcs the canons produce) and
+    // exports (which may reference the produced instances). Re-using
+    // an instance/alias/canon group later in the binary is legal but
+    // wabt only emits each kind once.
     if (component.imports.len > 0) try writeImportSection(&w, component.imports);
     if (component.core_modules.len > 0) try writeCoreModuleSection(&w, component.core_modules);
     if (component.core_types.len > 0) try writeCoreTypeSection(&w, component.core_types);
     if (component.types.len > 0) try writeTypeSection(&w, component.types);
     if (component.components.len > 0) try writeNestedComponentSection(&w, component.components);
     if (component.core_instances.len > 0) try writeCoreInstanceSection(&w, component.core_instances);
-    if (component.instances.len > 0) try writeInstanceSection(&w, component.instances);
     if (component.aliases.len > 0) try writeAliasSection(&w, component.aliases);
     if (component.canons.len > 0) try writeCanonSection(&w, component.canons);
+    if (component.instances.len > 0) try writeInstanceSection(&w, component.instances);
     if (component.start) |s| try writeStartSection(&w, s);
     if (component.exports.len > 0) try writeExportSection(&w, component.exports);
 
@@ -287,7 +294,7 @@ fn writeInstanceExpr(w: *Writer, ie: ctypes.InstanceExpr) EncodeError!void {
             if (exps.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(exps.len));
             for (exps) |e| {
-                try w.writeName(e.name);
+                try writeExternName(w, e.name);
                 try writeSortIdx(w, e.sort_idx);
             }
         },
@@ -617,11 +624,16 @@ fn descMatchesSort(desc: ctypes.ExternDesc, si: ctypes.SortIdx) bool {
             .eq => |idx| si.sort == .type and si.idx == idx,
             .sub_resource => false,
         },
-        // For func/component/instance, the omitted form sets the
-        // descriptor's *type idx* to 0 (since the sort_idx only
-        // carries the index in the sort's own space — distinct from
-        // the type space). We only claim a match when both happen
-        // to be 0, which is the conservative choice.
+        // For func/component/instance, the omitted form derives the
+        // descriptor's type from the runtime sort_idx lookup. When
+        // we have no concrete type and the AST stores `idx = 0` as a
+        // placeholder, emitting the un-ascribed form lets the loader
+        // re-derive the correct type — which is more robust than
+        // emitting an explicit `idx=0` that may not actually point
+        // at the right type-space entry.
+        .func => |idx| si.sort == .func and idx == 0,
+        .instance => |idx| si.sort == .instance and idx == 0,
+        .component => |idx| si.sort == .component and idx == 0,
         else => false,
     };
 }
