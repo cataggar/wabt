@@ -34,6 +34,11 @@ pub const component = struct {
     pub const types = @import("component/types.zig");
     pub const loader = @import("component/loader.zig");
     pub const writer = @import("component/writer.zig");
+    pub const wit = struct {
+        pub const lexer = @import("component/wit/lexer.zig");
+        pub const ast = @import("component/wit/ast.zig");
+        pub const parser = @import("component/wit/parser.zig");
+    };
 };
 
 /// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
@@ -47,6 +52,9 @@ test {
     _ = @import("component/types.zig");
     _ = @import("component/loader.zig");
     _ = @import("component/writer.zig");
+    _ = @import("component/wit/lexer.zig");
+    _ = @import("component/wit/ast.zig");
+    _ = @import("component/wit/parser.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
