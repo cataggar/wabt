@@ -30,6 +30,20 @@ pub const interp = struct {
     pub const Interpreter = @import("interp/Interpreter.zig");
 };
 
+pub const component = struct {
+    pub const types = @import("component/types.zig");
+    pub const loader = @import("component/loader.zig");
+    pub const writer = @import("component/writer.zig");
+    pub const compose = @import("component/compose.zig");
+    pub const wit = struct {
+        pub const lexer = @import("component/wit/lexer.zig");
+        pub const ast = @import("component/wit/ast.zig");
+        pub const parser = @import("component/wit/parser.zig");
+        pub const metadata_encode = @import("component/wit/metadata_encode.zig");
+        pub const metadata_decode = @import("component/wit/metadata_decode.zig");
+    };
+};
+
 /// Maximum input file size (256 MiB). Prevents OOM from oversized or malicious input.
 pub const max_input_file_size = 256 * 1024 * 1024;
 
@@ -38,6 +52,15 @@ pub const version: []const u8 = build_options.version;
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("component/types.zig");
+    _ = @import("component/loader.zig");
+    _ = @import("component/writer.zig");
+    _ = @import("component/compose.zig");
+    _ = @import("component/wit/lexer.zig");
+    _ = @import("component/wit/ast.zig");
+    _ = @import("component/wit/parser.zig");
+    _ = @import("component/wit/metadata_encode.zig");
+    _ = @import("component/wit/metadata_decode.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
