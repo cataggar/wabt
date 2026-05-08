@@ -44,6 +44,7 @@ pub fn build(b: *std.Build) void {
         "src/tools/stats.zig",
         "src/tools/desugar.zig",
         "src/tools/spectest.zig",
+        "src/tools/shrink.zig",
     };
 
     // Single wabt CLI exe — dispatches to subcommand modules at runtime.

@@ -29,6 +29,7 @@ const decompile_cmd = @import("decompile.zig");
 const stats_cmd = @import("stats.zig");
 const desugar_cmd = @import("desugar.zig");
 const spectest_cmd = @import("spectest.zig");
+const shrink_cmd = @import("shrink.zig");
 
 pub const Subcommand = enum {
     parse,
@@ -41,6 +42,7 @@ pub const Subcommand = enum {
     stats,
     desugar,
     spectest,
+    shrink,
     version,
     help,
 };
@@ -56,6 +58,7 @@ pub fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "stats")) return .stats;
     if (std.mem.eql(u8, s, "desugar")) return .desugar;
     if (std.mem.eql(u8, s, "spectest")) return .spectest;
+    if (std.mem.eql(u8, s, "shrink")) return .shrink;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -97,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
         .stats => try stats_cmd.run(init, sub_args),
         .desugar => try desugar_cmd.run(init, sub_args),
         .spectest => try spectest_cmd.run(init, sub_args),
+        .shrink => try shrink_cmd.run(init, sub_args),
     }
 }
 
@@ -116,6 +120,7 @@ const top_usage =
     \\  stats           Print module statistics
     \\  desugar         Parse and re-emit WebAssembly text format
     \\  spectest        Run a WebAssembly spec test (.wast)
+    \\  shrink          Minimize a wasm binary while preserving a property
     \\  version         Print the wabt version and exit
     \\  help            Print this help; `wabt help <subcommand>` for details
     \\
@@ -155,6 +160,7 @@ fn runHelp(io: std.Io, args: []const []const u8) void {
         .stats => stats_cmd.usage,
         .desugar => desugar_cmd.usage,
         .spectest => spectest_cmd.usage,
+        .shrink => shrink_cmd.usage,
         .version => version_usage,
         .help => help_usage,
     });
@@ -171,6 +177,7 @@ test "parseSubcommand recognizes all subcommands" {
     try std.testing.expectEqual(@as(?Subcommand, .stats), parseSubcommand("stats"));
     try std.testing.expectEqual(@as(?Subcommand, .desugar), parseSubcommand("desugar"));
     try std.testing.expectEqual(@as(?Subcommand, .spectest), parseSubcommand("spectest"));
+    try std.testing.expectEqual(@as(?Subcommand, .shrink), parseSubcommand("shrink"));
     try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
     try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
 }

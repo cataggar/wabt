@@ -35,6 +35,7 @@ Subcommands:
   stats           Print module statistics
   desugar         Parse and re-emit WebAssembly text format
   spectest        Run a WebAssembly spec test (.wast)
+  shrink          Minimize a wasm binary while preserving a property
   version         Print the wabt version and exit
   help            Print this help; `wabt help <subcommand>` for details
 ```
