@@ -125,14 +125,16 @@ pub fn extractEncodedWorld(adapter_core_bytes: []const u8) DecodeError!?[]const 
         const name_len = n.value;
         if (n.bytes_read + name_len > body.len) return error.InvalidAdapterCore;
         const sec_name = body[n.bytes_read .. n.bytes_read + name_len];
-        // Match by suffix to track wit-bindgen version drift.
+        // Match either the wit-bindgen-style `:encoded world`
+        // suffix (used by adapters) or the bare `component-type`
+        // name (used by `wasm-tools component embed --world …`).
         const suffix = ":encoded world";
-        if (sec_name.len < suffix.len) continue;
-        if (!std.mem.eql(u8, sec_name[sec_name.len - suffix.len ..], suffix)) continue;
-        // Custom section also requires the conventional
-        // `component-type:` prefix to avoid matching unrelated
-        // customs that happen to end in `:encoded world`.
-        if (!std.mem.startsWith(u8, sec_name, "component-type:")) continue;
+        const prefix = "component-type:";
+        const is_encoded_world = sec_name.len >= suffix.len and
+            std.mem.eql(u8, sec_name[sec_name.len - suffix.len ..], suffix) and
+            std.mem.startsWith(u8, sec_name, prefix);
+        const is_bare = std.mem.eql(u8, sec_name, "component-type");
+        if (!is_encoded_world and !is_bare) continue;
         return body[n.bytes_read + name_len ..];
     }
     return null;
