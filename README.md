@@ -10,7 +10,7 @@ Install pre-built binaries from GitHub Releases with [ghr](https://github.com/ca
 $ ghr install cataggar/wabt@v3.0.0-dev.1
 ```
 
-See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip, dist) and detailed instructions.
+See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip) and detailed instructions.
 
 ## Tools
 

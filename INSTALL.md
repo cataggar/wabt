@@ -34,14 +34,6 @@ uv tool install wabt-bin
 python3 -m pip install wabt-bin
 ```
 
-## dist
-
-[dist](https://github.com/ekristen/distillery) is a GitHub release installer.
-
-```sh
-dist install cataggar/wabt
-```
-
 ## From source
 
 Requires [Zig](https://ziglang.org/) 0.16. No other dependencies.
