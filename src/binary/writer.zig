@@ -717,9 +717,11 @@ test "text parse + binary write: data segment offset preserved" {
 
     try std.testing.expectEqual(@as(usize, 1), module2.data_segments.items.len);
     try std.testing.expectEqual(@as(usize, 2), module2.data_segments.items[0].data.len);
-    // The offset expression should contain i32.const 16, not i32.const 0
+    // The offset expression should contain i32.const 16, not i32.const 0.
+    // Convention: reader stores offset_expr_bytes WITHOUT trailing 0x0b
+    // (writer appends 0x0b).
     const offset_bytes = module2.data_segments.items[0].offset_expr_bytes;
-    try std.testing.expect(offset_bytes.len >= 3);
+    try std.testing.expectEqual(@as(usize, 2), offset_bytes.len);
     try std.testing.expectEqual(@as(u8, 0x41), offset_bytes[0]); // i32.const
     // LEB128 for 16 = 0x10
     try std.testing.expectEqual(@as(u8, 0x10), offset_bytes[1]);
@@ -819,4 +821,91 @@ test "text parse + binary write: passive elem segment" {
     try std.testing.expectEqual(@as(usize, 1), module2.elem_segments.items.len);
     // Passive segment with elem expressions
     try std.testing.expect(module2.elem_segments.items[0].kind == .passive);
+}
+
+test "text parse + binary write: active elem segment offset preserved without trailing 0x0b" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module
+        \\  (table 10 funcref)
+        \\  (func) (func)
+        \\  (elem (i32.const 5) func 0 1)
+        \\)
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.elem_segments.items.len);
+    const seg = module2.elem_segments.items[0];
+    try std.testing.expect(seg.kind == .active);
+    // offset_expr_bytes should be `i32.const 5` only — no trailing 0x0b
+    // (writer appends it when re-encoding).
+    try std.testing.expectEqual(@as(usize, 2), seg.offset_expr_bytes.len);
+    try std.testing.expectEqual(@as(u8, 0x41), seg.offset_expr_bytes[0]);
+    try std.testing.expectEqual(@as(u8, 5), seg.offset_expr_bytes[1]);
+
+    // Round-trip a second time: writing the read-back module must
+    // produce a valid binary with exactly one 0x0b terminator on the
+    // offset expr (regression for the prior "writer appends 0x0b on
+    // top of a slice that already includes 0x0b" double-terminator
+    // bug).
+    const wasm2 = try writeModule(allocator, &module2);
+    defer allocator.free(wasm2);
+    var module3 = try reader.readModule(allocator, wasm2);
+    defer module3.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module3.elem_segments.items.len);
+    try std.testing.expectEqual(@as(usize, 2), module3.elem_segments.items[0].offset_expr_bytes.len);
+}
+
+test "binary read+write: defined table with init expression round-trips" {
+    // Hand-rolled core wasm with a table that carries an init expr
+    // (extended form, 0x40 prefix) — exercises the fixed
+    // readTableSection init-expr capture path.
+    const allocator = std.testing.allocator;
+
+    // Module: table type section + table section with one
+    // funcref-typed table whose init expression is `ref.null func`
+    // (the only init expr currently representable for funcref tables
+    // without referencing a function).
+    //
+    //   magic + version
+    //   table section (id 4):
+    //     count=1
+    //     0x40 0x00      -- extended-form prefix
+    //     0x70           -- funcref reftype
+    //     0x00 0x01      -- limits: min=1, no max
+    //     0xd0 0x70 0x0b -- init expr: ref.null func; end
+    const src = [_]u8{
+        // preamble
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // table section: id=4, size=9, count=1, body
+        0x04, 0x09, 0x01,
+        0x40, 0x00, 0x70, 0x00, 0x01,
+        0xd0, 0x70, 0x0b,
+    };
+
+    var module = try reader.readModule(allocator, &src);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module.tables.items.len);
+    const t = module.tables.items[0];
+    // Reader should have stripped the trailing 0x0b.
+    try std.testing.expectEqual(@as(usize, 2), t.init_expr_bytes.len);
+    try std.testing.expectEqual(@as(u8, 0xd0), t.init_expr_bytes[0]); // ref.null
+    try std.testing.expectEqual(@as(u8, 0x70), t.init_expr_bytes[1]); // funcref
+
+    // Round-trip writes a structurally equivalent module.
+    const wasm2 = try writeModule(allocator, &module);
+    defer allocator.free(wasm2);
+    var module2 = try reader.readModule(allocator, wasm2);
+    defer module2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module2.tables.items.len);
+    try std.testing.expectEqual(@as(usize, 2), module2.tables.items[0].init_expr_bytes.len);
 }
