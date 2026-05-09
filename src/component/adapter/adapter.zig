@@ -72,10 +72,40 @@ pub const SpliceError = error{
     InvalidBody,
     MissingRequiredExport,
     InvalidIndex,
+    // Multi-adapter errors.
+    NoAdapters,
+    MissingRunAdapter,
+    AmbiguousRunAdapter,
+    AdapterNamespaceCollision,
+    SecondaryAdapterUnsupported,
 } || writer.EncodeError;
 
-/// Splice a preview1 embed and an adapter into a wrapping component.
+/// One preview1-style adapter to splice in. `name` is the core
+/// import module name the embed uses to refer to this adapter (e.g.
+/// `wasi_snapshot_preview1`); `bytes` is the adapter core wasm.
+pub const Adapter = struct {
+    name: []const u8,
+    bytes: []const u8,
+};
+
+/// Splice an embed against one or more preview1-style adapters into
+/// a wrapping component. Mirrors the `wasm-tools component new
+/// --adapt name1=… --adapt name2=…` surface; adapters are
+/// instantiated in declaration order. Exactly one adapter must
+/// declare a `wasi:cli/run` export.
+///
 /// Caller frees the returned slice via `gpa`.
+pub fn spliceMany(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) ![]u8 {
+    if (adapters.len == 0) return error.NoAdapters;
+    if (adapters.len == 1) {
+        return splice(gpa, embed_bytes, adapters[0].bytes, adapters[0].name);
+    }
+    return spliceN(gpa, embed_bytes, adapters);
+}
+
+/// Single-adapter splice. Preserved as a thin wrapper around the
+/// canonical implementation for backward compatibility and for the
+/// (common) N=1 path's byte-equivalence.
 pub fn splice(
     gpa: Allocator,
     embed_bytes: []const u8,
@@ -172,6 +202,213 @@ pub fn splice(
         .preview1_slots = preview1_slots,
         .buckets = buckets,
     });
+}
+
+/// Multi-adapter splice (N >= 2). Routes the primary (the unique
+/// adapter declaring `wasi:cli/run@…`) through the existing single-
+/// adapter pipeline and layers each secondary's bare host-shim
+/// exports through the shim/fixup table alongside the primary's
+/// preview1 slots.
+///
+/// Restrictions for #114 — see plan.md and #116:
+///   * exactly one adapter declares `wasi:cli/run@…` (the primary);
+///   * each secondary imports only `env.<x>` (no WASI namespaces, no
+///     `__main_module__.<x>`).
+fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // ── Identify primary + validate secondaries ────────────────────────────
+    const primary_idx = try findPrimaryAdapter(a, adapters);
+    const primary = adapters[primary_idx];
+
+    // Pre-validate every secondary against the bare-shim contract
+    // before doing any GC / decode work; surfaces a clean error
+    // before any expensive operations.
+    for (adapters, 0..) |ad, i| {
+        if (i == primary_idx) continue;
+        try validateBareShimSecondary(a, ad);
+    }
+
+    // ── Phase A.0: GC the primary core wasm ────────────────────────────────
+    const primary_required = try computeRequiredAdapterExports(a, embed_bytes, primary.bytes, primary.name);
+    const primary_gc_initial = try gc.run(gpa, primary.bytes, primary_required);
+    defer gpa.free(primary_gc_initial);
+
+    // ── Phase A.1: GC the primary's encoded-world AST ──────────────────────
+    const pristine_world = try decode.parseFromAdapterCore(a, primary_gc_initial);
+    var pristine_iface = try core_imports.extract(gpa, primary_gc_initial);
+    defer pristine_iface.deinit();
+
+    const live_namespaces = try collectLiveNamespaces(a, pristine_iface.interface);
+    const live_methods_by_namespace = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
+    const live_export_names = try collectLiveExportNames(a, pristine_world);
+
+    const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_methods_by_namespace, live_export_names);
+    const primary_gc_bytes = try world_gc.replaceEncodedWorldSection(a, primary_gc_initial, gc_world_result.payload_bytes);
+
+    // ── Phase A: decode + classify (primary only) ──────────────────────────
+    const world = gc_world_result.world;
+
+    var primary_owned = try core_imports.extract(gpa, primary_gc_bytes);
+    defer primary_owned.deinit();
+    var embed_owned = try core_imports.extract(gpa, embed_bytes);
+    defer embed_owned.deinit();
+
+    const hoisted = try types_import.hoist(a, world);
+
+    const embed_world: ?decode.AdapterWorld = blk: {
+        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
+        const payload = ct orelse break :blk null;
+        break :blk decode.parse(a, payload) catch null;
+    };
+
+    const preview1_slots = try collectPreview1Slots(a, embed_owned.interface, primary.name);
+    const buckets = try classifyAdapterImports(a, primary_owned.interface, world, hoisted);
+    const indirect_slots = try collectIndirectSlots(a, buckets);
+
+    // ── Phase A.2: GC each secondary + collect its slots ───────────────────
+    // Secondary required exports are the bare names the embed imports
+    // under `<sec.name>.<x>`. (No `<iface>#…` exports — that's the
+    // primary's role.)
+    const SecondaryOwned = struct {
+        owned: core_imports.Owned,
+        gc_bytes: []const u8,
+        slots: []const Preview1Slot,
+    };
+    const secondaries_owned = try a.alloc(SecondaryOwned, adapters.len - 1);
+    var sec_i: usize = 0;
+    var total_secondary_slots: u32 = 0;
+    for (adapters, 0..) |ad, i| {
+        if (i == primary_idx) continue;
+        const sec_required = try computeBareSecondaryRequiredExports(a, embed_bytes, ad.name);
+        const sec_gc = try gc.run(gpa, ad.bytes, sec_required);
+        // Note: we deliberately don't `defer gpa.free(sec_gc)` here
+        // because the bytes need to live until `assemble` consumes
+        // them. We free them all at the end of this function.
+        const sec_owned = try core_imports.extract(gpa, sec_gc);
+        const slots = try collectPreview1Slots(a, embed_owned.interface, ad.name);
+        secondaries_owned[sec_i] = .{ .owned = sec_owned, .gc_bytes = sec_gc, .slots = slots };
+        total_secondary_slots += @intCast(slots.len);
+        sec_i += 1;
+    }
+    defer for (secondaries_owned) |*s| {
+        gpa.free(s.gc_bytes);
+        s.owned.deinit();
+    };
+
+    // ── Build SecondaryInputs (with slot_offsets) ──────────────────────────
+    const secondary_inputs = try a.alloc(SecondaryInputs, secondaries_owned.len);
+    {
+        var slot_cursor: u32 = @intCast(preview1_slots.len);
+        var k: usize = 0;
+        for (adapters, 0..) |ad, i| {
+            if (i == primary_idx) continue;
+            secondary_inputs[k] = .{
+                .name = ad.name,
+                .bytes = secondaries_owned[k].gc_bytes,
+                .iface = secondaries_owned[k].owned.interface,
+                .slots = secondaries_owned[k].slots,
+                .slot_offset = slot_cursor,
+            };
+            slot_cursor += @intCast(secondaries_owned[k].slots.len);
+            k += 1;
+        }
+    }
+
+    // ── Phase B: build shim + fixup with the COMBINED slot table ───────────
+    var all_slots = try a.alloc(shim.Slot, preview1_slots.len + total_secondary_slots + indirect_slots.len);
+    for (preview1_slots, 0..) |p1, i| {
+        all_slots[i] = .{ .params = p1.params, .results = p1.results };
+    }
+    {
+        var cursor: usize = preview1_slots.len;
+        for (secondary_inputs) |sin| {
+            for (sin.slots) |s| {
+                all_slots[cursor] = .{ .params = s.params, .results = s.results };
+                cursor += 1;
+            }
+        }
+    }
+    @memcpy(all_slots[preview1_slots.len + total_secondary_slots ..], indirect_slots);
+
+    const shim_bytes = try shim.build(a, all_slots);
+    const fixup_bytes = try fixup.build(a, all_slots);
+
+    // ── Phase C: assemble + encode ─────────────────────────────────────────
+    return try assemble(.{
+        .gpa = gpa,
+        .arena = a,
+        .embed_bytes = try stripComponentTypeSections(a, embed_bytes),
+        .adapter_bytes = primary_gc_bytes,
+        .shim_bytes = shim_bytes,
+        .fixup_bytes = fixup_bytes,
+        .adapter_name = primary.name,
+        .world = world,
+        .embed_world = embed_world,
+        .hoisted = hoisted,
+        .embed_iface = embed_owned.interface,
+        .adapter_iface = primary_owned.interface,
+        .preview1_slots = preview1_slots,
+        .buckets = buckets,
+        .secondaries = secondary_inputs,
+    });
+}
+
+/// Find the primary adapter — the unique one declaring an export
+/// whose name contains `#` (the canonical splice run-export shape,
+/// e.g. `wasi:cli/run@0.1.0#run`). Reject if none or > 1.
+fn findPrimaryAdapter(arena: Allocator, adapters: []const Adapter) SpliceError!usize {
+    var primary_idx: ?usize = null;
+    for (adapters, 0..) |ad, i| {
+        const owned = try core_imports.extract(arena, ad.bytes);
+        const has_run = blk: {
+            for (owned.interface.exports) |ex| {
+                if (std.mem.indexOfScalar(u8, ex.name, '#') != null) break :blk true;
+            }
+            break :blk false;
+        };
+        if (has_run) {
+            if (primary_idx != null) return error.AmbiguousRunAdapter;
+            primary_idx = i;
+        }
+    }
+    return primary_idx orelse error.MissingRunAdapter;
+}
+
+/// Validate that an adapter is a bare-shim secondary: every core
+/// import has `module_name == "env"`. Reject anything else with
+/// `error.SecondaryAdapterUnsupported` — `__main_module__`,
+/// `wasi:*`, and any other host module imports require the
+/// reactor/library plumbing tracked in #116.
+fn validateBareShimSecondary(arena: Allocator, ad: Adapter) SpliceError!void {
+    const owned = try core_imports.extract(arena, ad.bytes);
+    for (owned.interface.imports) |im| {
+        if (!std.mem.eql(u8, im.module_name, "env")) {
+            return error.SecondaryAdapterUnsupported;
+        }
+    }
+}
+
+/// Compute the required core-wasm exports a secondary must keep
+/// alive after GC: every name the embed imports under
+/// `<secondary.name>.<x>`. Secondaries don't have `<iface>#…`
+/// exports.
+fn computeBareSecondaryRequiredExports(
+    arena: Allocator,
+    embed_bytes: []const u8,
+    secondary_name: []const u8,
+) SpliceError![]const []const u8 {
+    const owned_embed = try core_imports.extract(arena, embed_bytes);
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    for (owned_embed.interface.imports) |im| {
+        if (im.kind != .func) continue;
+        if (!std.mem.eql(u8, im.module_name, secondary_name)) continue;
+        const name = try arena.dupe(u8, im.field_name);
+        try out.append(arena, name);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// Collect the set of unique component-instance import names from the
@@ -511,6 +748,29 @@ const Inputs = struct {
     adapter_iface: core_imports.CoreInterface,
     preview1_slots: []const Preview1Slot,
     buckets: []NamespaceBucket,
+    /// Optional secondary "bare-shim" adapters layered alongside the
+    /// primary. Each secondary contributes additional slots to the
+    /// shim/fixup table (located at
+    /// `[primary preview1 | secondary[0] | … | secondary[N-1] | primary indirect]`)
+    /// and one extra core module + core instance in the assembled
+    /// component. Empty for the single-adapter case.
+    secondaries: []const SecondaryInputs = &.{},
+};
+
+/// Per-secondary data needed by `assemble`. Built by `spliceN`.
+pub const SecondaryInputs = struct {
+    name: []const u8,
+    /// Already-GC'd core wasm bytes.
+    bytes: []const u8,
+    iface: core_imports.CoreInterface,
+    /// Preview1-style export slots — names this secondary exports
+    /// that the embed imports under `<name>.<x>`. Treated identically
+    /// to primary preview1 slots downstream.
+    slots: []const Preview1Slot,
+    /// Position in the combined shim/fixup slot table where this
+    /// secondary's slots begin. Used by `assemble` when emitting
+    /// shim alias names (`{slot_total}`) for each export.
+    slot_offset: u32,
 };
 
 /// `Builder` accumulates per-section arrays + section_order entries
@@ -726,11 +986,17 @@ fn assemble(in: Inputs) ![]u8 {
         .results = .{ .unnamed = .{ .type_idx = run_result_type_idx } },
     } });
 
-    // ── Step 3: core modules (main=0, adapter=1, shim=2, fixup=3) ─────
+    // ── Step 3: core modules (main=0, adapter=1, shim=2, fixup=3, …) ──
     const main_module_idx = try b.addCoreModule(.{ .data = in.embed_bytes });
     const adapter_module_idx = try b.addCoreModule(.{ .data = in.adapter_bytes });
     const shim_module_idx = try b.addCoreModule(.{ .data = in.shim_bytes });
     const fixup_module_idx = try b.addCoreModule(.{ .data = in.fixup_bytes });
+
+    // One core module per secondary adapter, in declaration order.
+    const secondary_module_idxs = try a.alloc(u32, in.secondaries.len);
+    for (in.secondaries, secondary_module_idxs) |sec, *out| {
+        out.* = try b.addCoreModule(.{ .data = sec.bytes });
+    }
 
     // ── Step 4: shim instance ────────────────────────────────────────
     const shim_inst = try b.addCoreInstance(.{ .instantiate = .{
@@ -738,7 +1004,7 @@ fn assemble(in: Inputs) ![]u8 {
         .args = &.{},
     } });
 
-    // ── Step 5: preview1 inline-export instance for embed ────────────
+    // ── Step 5: preview1 inline-export instance for embed (primary) ──
     var preview1_inline = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
     for (in.preview1_slots, 0..) |p1, i| {
         const stub_name = try std.fmt.allocPrint(a, "{d}", .{i});
@@ -754,6 +1020,31 @@ fn assemble(in: Inputs) ![]u8 {
     }
     const preview1_inst = try b.addCoreInstance(.{ .exports = try preview1_inline.toOwnedSlice(a) });
 
+    // ── Step 5a: per-secondary inline-export instance for embed ──────
+    // Each secondary contributes a slice of slots in the combined
+    // shim/fixup table at `[sec.slot_offset, sec.slot_offset + sec.slots.len)`.
+    // We build one inline-export instance per secondary that aliases
+    // those shim slots under the secondary's bare export names; the
+    // embed will be instantiated with each as `<sec.name> = …`.
+    const secondary_preview1_insts = try a.alloc(u32, in.secondaries.len);
+    for (in.secondaries, secondary_preview1_insts) |sec, *out| {
+        var inline_exps = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
+        for (sec.slots, 0..) |s, j| {
+            const slot_total: u32 = sec.slot_offset + @as(u32, @intCast(j));
+            const stub_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
+            const f_idx = try b.addAlias(.{ .instance_export = .{
+                .sort = .{ .core = .func },
+                .instance_idx = shim_inst,
+                .name = stub_name,
+            } });
+            try inline_exps.append(a, .{
+                .name = s.name,
+                .sort_idx = .{ .sort = .func, .idx = f_idx },
+            });
+        }
+        out.* = try b.addCoreInstance(.{ .exports = try inline_exps.toOwnedSlice(a) });
+    }
+
     // ── Step 5b: lift non-WASI embed imports to component imports ─────
     // The embed may import core funcs from namespaces beyond the
     // WASI adapter (e.g. `docs:adder/add@0.1.0` for the calculator
@@ -763,11 +1054,17 @@ fn assemble(in: Inputs) ![]u8 {
     // inline-export instance the embed can consume directly.
     const embed_extra_args = try buildEmbedExtraImports(&b, a, in);
 
-    // ── Step 6: instantiate main with wasi_snapshot_preview1 + extras ─
-    const main_args = try a.alloc(ctypes.CoreInstantiateArg, 1 + embed_extra_args.len);
+    // ── Step 6: instantiate main with primary + secondaries + extras ─
+    const main_args = try a.alloc(
+        ctypes.CoreInstantiateArg,
+        1 + in.secondaries.len + embed_extra_args.len,
+    );
     main_args[0] = .{ .name = in.adapter_name, .instance_idx = preview1_inst };
+    for (in.secondaries, secondary_preview1_insts, 0..) |sec, sec_inst, i| {
+        main_args[1 + i] = .{ .name = sec.name, .instance_idx = sec_inst };
+    }
     for (embed_extra_args, 0..) |ea, i| {
-        main_args[1 + i] = .{ .name = ea.name, .instance_idx = ea.inst_idx };
+        main_args[1 + in.secondaries.len + i] = .{ .name = ea.name, .instance_idx = ea.inst_idx };
     }
     const main_inst = try b.addCoreInstance(.{ .instantiate = .{
         .module_idx = main_module_idx,
@@ -840,6 +1137,28 @@ fn assemble(in: Inputs) ![]u8 {
         break :blk try b.addCoreInstance(.{ .exports = try exps.toOwnedSlice(a) });
     };
 
+    // ── Step 7b: instantiate each secondary core module ──────────────
+    // Secondaries are bare-shim host modules: they import only
+    // `env.<x>` (validated upstream by `validateBareShimSecondary`).
+    // Instantiate each with `env = env_inst` so the embed's
+    // `<sec.name>.<x>` imports — which we already routed through the
+    // shim — can resolve to real funcs once fixup runs.
+    const secondary_insts = try a.alloc(u32, in.secondaries.len);
+    for (secondary_module_idxs, secondary_insts) |mod_idx, *out| {
+        const sec_args = try a.alloc(ctypes.CoreInstantiateArg, 1);
+        sec_args[0] = .{ .name = "env", .instance_idx = env_inst };
+        out.* = try b.addCoreInstance(.{ .instantiate = .{
+            .module_idx = mod_idx,
+            .args = sec_args,
+        } });
+    }
+
+    const total_secondary_slots: u32 = blk: {
+        var sum: u32 = 0;
+        for (in.secondaries) |s| sum += @intCast(s.slots.len);
+        break :blk sum;
+    };
+
     // ── Step 8: per-namespace bundles ────────────────────────────────
     var bucket_inst_idx = try a.alloc(u32, in.buckets.len);
     for (in.buckets, 0..) |*bucket, bi| {
@@ -876,7 +1195,7 @@ fn assemble(in: Inputs) ![]u8 {
         }
 
         for (bucket.indirect_funcs) |idf| {
-            const slot_total: u32 = @as(u32, @intCast(in.preview1_slots.len)) + idf.slot_idx;
+            const slot_total: u32 = @as(u32, @intCast(in.preview1_slots.len)) + total_secondary_slots + idf.slot_idx;
             const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
             const cf_idx = try b.addAlias(.{ .instance_export = .{
                 .sort = .{ .core = .func },
@@ -953,8 +1272,30 @@ fn assemble(in: Inputs) ![]u8 {
         });
     }
 
-    // Funcs P..P+I-1: canon lower(memory, [realloc], [string-encoding])
-    // of each indirect adapter wasi import.
+    // Funcs P..P+ΣS-1: per-secondary bare exports. Each secondary's
+    // `slots` list maps positionally onto its already-instantiated
+    // core instance's exports.
+    for (in.secondaries, secondary_insts) |sec, sec_inst| {
+        for (sec.slots, 0..) |s, j| {
+            if (sec.iface.findExport(s.name) == null) {
+                return error.AdapterMissingPreview1Export;
+            }
+            const f_idx = try b.addAlias(.{ .instance_export = .{
+                .sort = .{ .core = .func },
+                .instance_idx = sec_inst,
+                .name = s.name,
+            } });
+            const slot_total: u32 = sec.slot_offset + @as(u32, @intCast(j));
+            const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
+            try fixup_inline.append(a, .{
+                .name = slot_name,
+                .sort_idx = .{ .sort = .func, .idx = f_idx },
+            });
+        }
+    }
+
+    // Funcs P+ΣS..P+ΣS+I-1: canon lower(memory, [realloc],
+    // [string-encoding]) of each indirect adapter wasi import.
     {
         var indirect_idx: u32 = 0;
         for (in.buckets) |bk| {
@@ -969,7 +1310,7 @@ fn assemble(in: Inputs) ![]u8 {
                     .func_idx = f_idx,
                     .opts = opts,
                 } });
-                const slot_total: u32 = @as(u32, @intCast(in.preview1_slots.len)) + indirect_idx;
+                const slot_total: u32 = @as(u32, @intCast(in.preview1_slots.len)) + total_secondary_slots + indirect_idx;
                 const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
                 try fixup_inline.append(a, .{
                     .name = slot_name,
@@ -1702,4 +2043,116 @@ test "splice: end-to-end on synthetic mock adapter + embed" {
     // the adapter's only `__main_module__` import) so the fallback
     // is omitted.
     try testing.expectEqual(@as(usize, 4), comp.core_modules.len);
+}
+
+test "spliceMany: end-to-end on synthetic primary + bare secondary adapter pair" {
+    const a = testing.allocator;
+
+    const primary_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(primary_bytes);
+    const secondary_bytes = try test_fixtures.buildBareSecondaryAdapter(a);
+    defer a.free(secondary_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithSecondary(a);
+    defer a.free(embed_bytes);
+
+    const adapters = [_]Adapter{
+        .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
+        .{ .name = test_fixtures.SECONDARY_NAME, .bytes = secondary_bytes },
+    };
+    const out = try spliceMany(a, embed_bytes, &adapters);
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Exactly one top-level export — the lifted `wasi:cli/run@…`
+    // instance from the primary. Secondaries don't contribute
+    // top-level exports.
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expect(std.mem.startsWith(u8, comp.exports[0].name, "wasi:cli/run@"));
+
+    // Top-level imports include the primary's live WASI namespace.
+    // Secondaries don't surface a top-level import — they're
+    // wired through inline-export instances under their adapter
+    // name, which the embed binds to internally.
+    var saw_stdout = false;
+    for (comp.imports) |im| {
+        if (std.mem.eql(u8, im.name, test_fixtures.STDOUT_NAMESPACE)) {
+            saw_stdout = true;
+        }
+    }
+    try testing.expect(saw_stdout);
+
+    // Inner core modules: shim + embed + primary + fixup + secondary.
+    // The synthetic embed exports `_start`, matching the primary's
+    // `__main_module__._start` import, so the fallback core module
+    // is not emitted. The secondary's only import is `env.memory`,
+    // which the primary supplies via its env_inst.
+    try testing.expectEqual(@as(usize, 5), comp.core_modules.len);
+}
+
+test "spliceMany: rejects zero adapters declaring wasi:cli/run" {
+    const a = testing.allocator;
+
+    const secondary_bytes = try test_fixtures.buildBareSecondaryAdapter(a);
+    defer a.free(secondary_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithSecondary(a);
+    defer a.free(embed_bytes);
+
+    const adapters = [_]Adapter{
+        .{ .name = test_fixtures.SECONDARY_NAME, .bytes = secondary_bytes },
+        .{ .name = "another", .bytes = secondary_bytes },
+    };
+    try testing.expectError(error.MissingRunAdapter, spliceMany(a, embed_bytes, &adapters));
+}
+
+test "spliceMany: rejects two adapters declaring wasi:cli/run" {
+    const a = testing.allocator;
+
+    const primary_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(primary_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithSecondary(a);
+    defer a.free(embed_bytes);
+
+    const adapters = [_]Adapter{
+        .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
+        .{ .name = "second_run", .bytes = primary_bytes },
+    };
+    try testing.expectError(error.AmbiguousRunAdapter, spliceMany(a, embed_bytes, &adapters));
+}
+
+test "spliceMany: rejects a secondary adapter with non-env imports" {
+    const a = testing.allocator;
+
+    const primary_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(primary_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithSecondary(a);
+    defer a.free(embed_bytes);
+
+    // Hand-roll a tiny "bad secondary": no `#` export (so it
+    // doesn't claim to be primary) but imports `__main_module__.x`
+    // — bare-shim contract requires every import to be `env.<x>`.
+    const bad = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // Type section: () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // Import section: __main_module__.x — func type 0
+        0x02, 0x15, 0x01,
+        15, '_', '_', 'm', 'a', 'i', 'n', '_', 'm', 'o', 'd', 'u', 'l', 'e', '_', '_',
+        1,  'x',
+        0x00, 0x00,
+        // Function section: 1 defined func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // Export section: bare-name "thing" -> func 1
+        0x07, 0x09, 0x01, 5, 't', 'h', 'i', 'n', 'g', 0x00, 0x01,
+        // Code section: empty body (just end)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const adapters = [_]Adapter{
+        .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
+        .{ .name = test_fixtures.SECONDARY_NAME, .bytes = &bad },
+    };
+    try testing.expectError(error.SecondaryAdapterUnsupported, spliceMany(a, embed_bytes, &adapters));
 }

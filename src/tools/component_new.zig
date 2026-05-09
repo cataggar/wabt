@@ -51,8 +51,10 @@ pub const usage =
     \\Options:
     \\  -o, --output <file>     Output file (default: <input>.component.wasm)
     \\      --skip-validation   Skip post-encoding component validation
-    \\      --adapt <n>=<file>  Splice in a wasi-preview1 adapter (e.g.
-    \\                          --adapt wasi_snapshot_preview1=path/to/adapter.wasm)
+    \\      --adapt <n>=<file>  Splice in an adapter (may repeat). The first
+    \\                          adapter declaring `wasi:cli/run` is the
+    \\                          primary; remaining adapters must import only
+    \\                          `env.<x>` (bare host-shim restriction).
     \\  -h, --help              Show this help
     \\
 ;
@@ -63,8 +65,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var output_file: ?[]const u8 = null;
     var skip_validation: bool = false;
     var input_path: ?[]const u8 = null;
-    var adapt_name: ?[]const u8 = null;
-    var adapt_file: ?[]const u8 = null;
+    var adapts = std.ArrayListUnmanaged(struct { name: []const u8, file: []const u8 }).empty;
+    defer adapts.deinit(alloc);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -92,12 +94,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 std.debug.print("error: --adapt expects <name>=<file>, got '{s}'\n", .{spec});
                 std.process.exit(1);
             };
-            if (adapt_name != null) {
-                std.debug.print("error: only one --adapt is supported\n", .{});
-                std.process.exit(1);
-            }
-            adapt_name = spec[0..eq];
-            adapt_file = spec[eq + 1 ..];
+            try adapts.append(alloc, .{ .name = spec[0..eq], .file = spec[eq + 1 ..] });
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown option '{s}'. Use `wabt help component`.\n", .{arg});
             std.process.exit(1);
@@ -135,20 +132,27 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     };
 
     const out_bytes = blk: {
-        if (adapt_name) |aname| {
-            const adp_path = adapt_file.?;
-            const adp_bytes = std.Io.Dir.cwd().readFileAlloc(
-                init.io,
-                adp_path,
-                alloc,
-                std.Io.Limit.limited(wabt.max_input_file_size),
-            ) catch |err| {
-                std.debug.print("error: cannot read adapter '{s}': {any}\n", .{ adp_path, err });
-                std.process.exit(1);
-            };
-            defer alloc.free(adp_bytes);
-            break :blk wabt.component.adapter.adapter.splice(alloc, core_bytes, adp_bytes, aname) catch |err| {
-                std.debug.print("error: splicing adapter '{s}': {s}\n", .{ aname, @errorName(err) });
+        if (adapts.items.len > 0) {
+            const Adapter = wabt.component.adapter.adapter.Adapter;
+            const adapter_list = alloc.alloc(Adapter, adapts.items.len) catch unreachable;
+            defer {
+                for (adapter_list) |ad| alloc.free(ad.bytes);
+                alloc.free(adapter_list);
+            }
+            for (adapts.items, 0..) |spec, idx| {
+                const adp_bytes = std.Io.Dir.cwd().readFileAlloc(
+                    init.io,
+                    spec.file,
+                    alloc,
+                    std.Io.Limit.limited(wabt.max_input_file_size),
+                ) catch |err| {
+                    std.debug.print("error: cannot read adapter '{s}': {any}\n", .{ spec.file, err });
+                    std.process.exit(1);
+                };
+                adapter_list[idx] = .{ .name = spec.name, .bytes = adp_bytes };
+            }
+            break :blk wabt.component.adapter.adapter.spliceMany(alloc, core_bytes, adapter_list) catch |err| {
+                std.debug.print("error: splicing adapters: {s}\n", .{@errorName(err)});
                 std.process.exit(1);
             };
         }
