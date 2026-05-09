@@ -144,7 +144,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     // the slot is consumed by an import (`.type`-bound) or alias whose
     // target type def we don't materialize. Required to resolve real
     // wasm32-wasip2 components where types and aliases interleave.
-    var type_indexspace: std.ArrayListUnmanaged(?u32) = .empty;
+    var type_indexspace: std.ArrayListUnmanaged(ctypes.TypeContributor) = .empty;
     // Core-func index space contributors in binary declaration order.
     // Each canon that produces a core func and each `core(.func)` alias
     // appends one entry as it is parsed.
@@ -222,7 +222,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                         .instance_export => |ie| ie.sort,
                         .outer => |o| o.sort,
                     };
-                    if (sort == .type) try type_indexspace.append(allocator, null);
+                    if (sort == .type) try type_indexspace.append(allocator, .{ .alias = local_idx });
                     // Aliases of sort .core(.func) contribute to the
                     // core-func indexspace.
                     const is_core_func = switch (sort) {
@@ -243,7 +243,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 while (i < count) : (i += 1) {
                     const local_idx: u32 = @intCast(type_defs.items.len);
                     try type_defs.append(allocator, try parseTypeDef(&reader, allocator));
-                    try type_indexspace.append(allocator, local_idx);
+                    try type_indexspace.append(allocator, .{ .type_def = local_idx });
                 }
             },
             .canon => {
@@ -272,7 +272,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     const local_idx: u32 = @intCast(imports.items.len);
                     const imp = try parseImport(&reader);
                     try imports.append(allocator, imp);
-                    if (imp.desc == .type) try type_indexspace.append(allocator, null);
+                    if (imp.desc == .type) try type_indexspace.append(allocator, .{ .import = local_idx });
                     // Instance-typed imports contribute to the
                     // component-instance index space (issue #355).
                     if (imp.desc == .instance) {

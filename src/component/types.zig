@@ -489,13 +489,18 @@ pub const Component = struct {
     aliases: []const Alias,
     /// Component-level type definitions.
     types: []const TypeDef,
-    /// Type index-space → local `types[]` mapping. Each entry is the
-    /// local idx into `types` for slots produced by a `(type ...)` def,
-    /// or null for slots produced by a `(import ... (type ...))` /
-    /// `(alias ... (type ...))` whose target def isn't materialized
-    /// in `types`. When empty (hand-authored fixtures), callers fall
-    /// back to direct indexing of `types`.
-    type_indexspace: []const ?u32 = &.{},
+    /// Type index-space contributors in binary declaration order.
+    /// Each entry records whether the slot was contributed by a
+    /// `(type ...)` def, a `(import ... (type ...))` import, or an
+    /// `(alias ... (type ...))` alias, along with the index into the
+    /// corresponding per-section array. Empty when the component was
+    /// constructed without a loader (e.g. hand-authored test
+    /// fixtures); callers in that case fall back to direct indexing of
+    /// `types`. The contributor metadata is required by
+    /// `wabt component compose`'s wrapper-types builder so it can
+    /// faithfully replicate alias-of-instance-export decls that bring
+    /// resources into the consumer's outer type indexspace (#129).
+    type_indexspace: []const TypeContributor = &.{},
     /// Canonical function definitions.
     canons: []const Canon,
     /// Start function.
@@ -570,6 +575,22 @@ pub const CompInstanceContributor = union(enum) {
     instance: u32,
     /// Index into `component.aliases` (must be `instance_export` of
     /// sort `.instance`).
+    alias: u32,
+};
+
+/// A single contributor to the type index space, in the order it
+/// appeared in the binary. Real wasm32-wasip2 components interleave
+/// `(type)`, `(import (type))`, and `(alias (type))` decls, so a slot
+/// is not always backed by a `types[]` entry — alias slots in
+/// particular carry resource-binding identity that
+/// `wabt component compose` must replicate at the wrapper level
+/// (#129).
+pub const TypeContributor = union(enum) {
+    /// Index into `component.types`.
+    type_def: u32,
+    /// Index into `component.imports` (must be `.type` desc).
+    import: u32,
+    /// Index into `component.aliases` (must be of sort `.type`).
     alias: u32,
 };
 
