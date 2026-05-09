@@ -285,6 +285,179 @@ pub fn buildSyntheticEmbed(allocator: Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+pub const SECONDARY_NAME = "mock_host";
+pub const SECONDARY_EXPORT = "do_thing";
+
+/// Build a synthetic bare-shim secondary adapter core wasm.
+///
+/// Imports:
+///   * `env.memory`                          (memory 0)
+///
+/// Exports:
+///   * `do_thing`                            (func, () -> i32)
+///
+/// No `wasi:cli/run` export, no encoded-world custom section, and
+/// no `__main_module__` or WASI namespace imports — exactly the
+/// "bare host-shim" shape `spliceN` accepts as a secondary adapter
+/// in #114. Caller frees with the same allocator.
+pub fn buildBareSecondaryAdapter(allocator: Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try writeMagic(allocator, &out);
+
+    // Type section: 1 type — () -> i32
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    // Import section: env.memory (memory 0)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try writeName(allocator, &b, "env");
+        try writeName(allocator, &b, "memory");
+        try b.append(allocator, 0x02); // memory
+        try b.append(allocator, 0x00); // limits flag
+        try b.append(allocator, 0x00); // min
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // Function section: 1 defined func, type 0
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x00); // typeidx 0
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+
+    // Export section: do_thing (func 0)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try writeName(allocator, &b, SECONDARY_EXPORT);
+        try b.appendSlice(allocator, &.{ 0x00, 0x00 }); // func, idx 0
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // Code section: do_thing body is `i32.const 0; end`
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x04); // body size
+        try b.append(allocator, 0x00); // 0 locals
+        try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x0b }); // i32.const 0; end
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a synthetic embed core wasm that imports BOTH preview1
+/// and a bare-shim secondary's host function — exercises
+/// `spliceMany` on N=2.
+///
+/// Imports:
+///   * `wasi_snapshot_preview1.fd_write`     (func, () -> i32)
+///   * `mock_host.do_thing`                  (func, () -> i32)
+///
+/// Exports:
+///   * `_start`                              (func, () -> ())
+///   * `memory`                              (memory 0)
+///
+/// `_start` calls both imports (drops their results) so the
+/// adapter GC keeps both imports live across `spliceMany`.
+pub fn buildSyntheticEmbedWithSecondary(allocator: Allocator) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try writeMagic(allocator, &out);
+
+    // Type section: () -> i32 and () -> ()
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 });
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    // Import section: preview1.fd_write, mock_host.do_thing
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        // wasi_snapshot_preview1.fd_write — type 0
+        try writeName(allocator, &b, "wasi_snapshot_preview1");
+        try writeName(allocator, &b, PREVIEW1_EXPORT);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        // mock_host.do_thing — type 0
+        try writeName(allocator, &b, SECONDARY_NAME);
+        try writeName(allocator, &b, SECONDARY_EXPORT);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // Function section: 1 defined func (_start, type 1)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x01);
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+
+    // Memory section: 1 memory
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        try writeSection(allocator, &out, 0x05, b.items);
+    }
+
+    // Export section: _start (func 2 — imports take 0,1), memory (0)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try writeName(allocator, &b, "_start");
+        try b.appendSlice(allocator, &.{ 0x00, 0x02 });
+        try writeName(allocator, &b, "memory");
+        try b.appendSlice(allocator, &.{ 0x02, 0x00 });
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // Code section: _start = call $0; drop; call $1; drop; end
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x08); // body size: 1 (locals) + 7 (code) = 8
+        try b.append(allocator, 0x00); // 0 locals
+        try b.appendSlice(allocator, &.{
+            0x10, 0x00, 0x1a, // call $0; drop
+            0x10, 0x01, 0x1a, // call $1; drop
+            0x0b, // end
+        });
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
 // ── byte-stream helpers ──────────────────────────────────────────────────
 
 fn writeMagic(allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -394,5 +567,44 @@ test "buildSyntheticEmbed: parses through reader and matches preview1 contract" 
         }
     }
     try testing.expect(saw_p1);
+    try testing.expect(owned.interface.findExport("_start") != null);
+}
+
+test "buildBareSecondaryAdapter: parses and exposes do_thing export with env.memory only" {
+    const sec_bytes = try buildBareSecondaryAdapter(testing.allocator);
+    defer testing.allocator.free(sec_bytes);
+
+    var owned = try core_imports.extract(testing.allocator, sec_bytes);
+    defer owned.deinit();
+
+    // do_thing must be exported.
+    try testing.expect(owned.interface.findExport(SECONDARY_EXPORT) != null);
+    // No `wasi:cli/run` export — secondary is bare.
+    for (owned.interface.exports) |ex| {
+        try testing.expect(std.mem.indexOfScalar(u8, ex.name, '#') == null);
+    }
+    // Every import is `env.<x>` — bare-shim contract.
+    for (owned.interface.imports) |im| {
+        try testing.expectEqualStrings("env", im.module_name);
+    }
+}
+
+test "buildSyntheticEmbedWithSecondary: imports both preview1 and mock_host" {
+    const embed_bytes = try buildSyntheticEmbedWithSecondary(testing.allocator);
+    defer testing.allocator.free(embed_bytes);
+
+    var owned = try core_imports.extract(testing.allocator, embed_bytes);
+    defer owned.deinit();
+
+    var saw_p1 = false;
+    var saw_sec = false;
+    for (owned.interface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, "wasi_snapshot_preview1") and
+            std.mem.eql(u8, im.field_name, PREVIEW1_EXPORT)) saw_p1 = true;
+        if (std.mem.eql(u8, im.module_name, SECONDARY_NAME) and
+            std.mem.eql(u8, im.field_name, SECONDARY_EXPORT)) saw_sec = true;
+    }
+    try testing.expect(saw_p1);
+    try testing.expect(saw_sec);
     try testing.expect(owned.interface.findExport("_start") != null);
 }
