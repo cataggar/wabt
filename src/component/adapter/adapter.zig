@@ -40,6 +40,7 @@ const shim = @import("shim.zig");
 const fixup = @import("fixup.zig");
 const abi = @import("abi.zig");
 const gc = @import("gc.zig");
+const world_gc = @import("world_gc.zig");
 
 pub const SpliceError = error{
     OutOfMemory,
@@ -91,34 +92,40 @@ pub fn splice(
     // call graph from the preview1 exports the embed actually
     // imports plus the adapter's `wasi:cli/run` entry point, drop
     // every func/global/table/elem/data/import that's unreachable.
-    // This shrinks the embedded adapter core wasm dramatically and
-    // is the prerequisite for any future top-level WASI import
-    // pruning (bug #2's full fix). For now we still hoist the
-    // adapter's full encoded-world body — top-level import filtering
-    // requires a follow-up that re-encodes the encoded world to keep
-    // alias instance-index references valid; see TODO below.
+    // This shrinks the embedded adapter core wasm dramatically.
     const required_exports = try computeRequiredAdapterExports(a, embed_bytes, adapter_bytes, adapter_name);
-    const gc_bytes = try gc.run(gpa, adapter_bytes, required_exports);
-    defer gpa.free(gc_bytes);
+    const gc_bytes_initial = try gc.run(gpa, adapter_bytes, required_exports);
+    defer gpa.free(gc_bytes_initial);
+
+    // ── Phase A.1: GC the encoded-world AST ────────────────────────────────
+    //
+    // The core-wasm GC drops dead functions but the wrapping
+    // component's top-level imports come from the adapter's encoded
+    // world body, which still type-declares every WASI namespace the
+    // adapter ships. Compute the live namespace set from the GC'd
+    // adapter's actual core imports, prune the encoded-world AST to
+    // match (renumbering instance / type indices for the surviving
+    // subset), then splice the pruned encoded-world bytes back into
+    // the adapter core wasm so the embedded module advertises only
+    // what it imports.
+    const pristine_world = try decode.parseFromAdapterCore(a, gc_bytes_initial);
+    var pristine_iface = try core_imports.extract(gpa, gc_bytes_initial);
+    defer pristine_iface.deinit();
+
+    const live_namespaces = try collectLiveNamespaces(a, pristine_iface.interface);
+    const live_export_names = try collectLiveExportNames(a, pristine_world);
+
+    const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_export_names);
+    const gc_bytes = try world_gc.replaceEncodedWorldSection(a, gc_bytes_initial, gc_world_result.payload_bytes);
 
     // ── Phase A: decode + classify ─────────────────────────────────────────
-    const world = try decode.parseFromAdapterCore(a, gc_bytes);
+    const world = gc_world_result.world;
 
     var adapter_owned = try core_imports.extract(gpa, gc_bytes);
     defer adapter_owned.deinit();
     var embed_owned = try core_imports.extract(gpa, embed_bytes);
     defer embed_owned.deinit();
 
-    // TODO (bug #2 follow-up): once the encoded-world AST can be
-    // re-emitted with a renumbered instance index space, filter the
-    // hoisted body to only the namespaces actually imported by the
-    // GC'd adapter (`adapter_owned.interface.imports`). Right now we
-    // hoist verbatim, so the wrapping component still advertises
-    // every WASI namespace the adapter type-declares. The core wasm
-    // is GC'd correctly, so runtime trapping due to spurious WASI
-    // imports the host doesn't wire is mitigated for embeds whose
-    // preview1 surface is small, but unused namespaces still leak as
-    // top-level imports.
     const hoisted = try types_import.hoist(a, world);
 
     // The embed may carry its own `component-type` custom section
@@ -152,7 +159,7 @@ pub fn splice(
         .gpa = gpa,
         .arena = a,
         .embed_bytes = try stripComponentTypeSections(a, embed_bytes),
-        .adapter_bytes = try arenaDup(a, gc_bytes),
+        .adapter_bytes = gc_bytes,
         .shim_bytes = shim_bytes,
         .fixup_bytes = fixup_bytes,
         .adapter_name = adapter_name,
@@ -164,6 +171,39 @@ pub fn splice(
         .preview1_slots = preview1_slots,
         .buckets = buckets,
     });
+}
+
+/// Collect the set of unique component-instance import names from the
+/// GC'd adapter's actual core wasm imports. These are the WASI
+/// namespaces (e.g. `wasi:cli/environment@0.2.6`) the adapter still
+/// uses after core-wasm GC; everything else can be pruned from the
+/// encoded world. Excludes the synthetic `env` and `__main_module__`
+/// modules which are wired separately in `assemble`.
+fn collectLiveNamespaces(
+    arena: Allocator,
+    adapter_iface: core_imports.CoreInterface,
+) SpliceError![]const []const u8 {
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(arena);
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    for (adapter_iface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, "env")) continue;
+        if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
+        const gop = try seen.getOrPut(arena, im.module_name);
+        if (!gop.found_existing) try out.append(arena, im.module_name);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// All world body exports are live by construction — the splicer
+/// always lifts them at the wrapping component's top level.
+fn collectLiveExportNames(
+    arena: Allocator,
+    world: decode.AdapterWorld,
+) SpliceError![]const []const u8 {
+    const out = try arena.alloc([]const u8, world.exports.len);
+    for (world.exports, out) |e, *o| o.* = e.name;
+    return out;
 }
 
 /// Compute the export-name set the adapter must keep alive for the

@@ -405,9 +405,13 @@ const Reader = struct {
                 const limits = try self.readLimits();
                 var init_bytes: []const u8 = &.{};
                 if (has_init) {
-                    const init_start = self.pos;
-                    try self.skipInitExpr();
-                    init_bytes = self.data[init_start..self.pos];
+                    const expr_with_end = try self.readInitExprBytes();
+                    // Writer appends its own trailing 0x0b — match the
+                    // global init-expr convention and strip it here.
+                    init_bytes = if (expr_with_end.len > 0)
+                        expr_with_end[0 .. expr_with_end.len - 1]
+                    else
+                        expr_with_end;
                 }
                 try self.module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
@@ -497,7 +501,11 @@ const Reader = struct {
 
             if (!is_passive) {
                 if (has_explicit_index) seg.table_var = .{ .index = try self.readU32() };
-                seg.offset_expr_bytes = try self.readInitExprBytes();
+                const expr_with_end = try self.readInitExprBytes();
+                seg.offset_expr_bytes = if (expr_with_end.len > 0)
+                    expr_with_end[0 .. expr_with_end.len - 1]
+                else
+                    expr_with_end;
             }
 
             if (is_passive or has_explicit_index) {
@@ -574,7 +582,11 @@ const Reader = struct {
             } else {
                 seg.kind = .active;
                 if (flags & 2 != 0) seg.memory_var = .{ .index = try self.readU32() };
-                seg.offset_expr_bytes = try self.readInitExprBytes();
+                const expr_with_end = try self.readInitExprBytes();
+                seg.offset_expr_bytes = if (expr_with_end.len > 0)
+                    expr_with_end[0 .. expr_with_end.len - 1]
+                else
+                    expr_with_end;
             }
 
             const data_len = try self.readU32();

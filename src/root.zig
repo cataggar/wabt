@@ -52,6 +52,7 @@ pub const component = struct {
         pub const abi = @import("component/adapter/abi.zig");
         pub const adapter = @import("component/adapter/adapter.zig");
         pub const gc = @import("component/adapter/gc.zig");
+        pub const world_gc = @import("component/adapter/world_gc.zig");
     };
 };
 
@@ -81,6 +82,7 @@ test {
     _ = @import("component/adapter/abi.zig");
     _ = @import("component/adapter/adapter.zig");
     _ = @import("component/adapter/gc.zig");
+    _ = @import("component/adapter/world_gc.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }
