@@ -39,6 +39,7 @@ const core_imports = @import("core_imports.zig");
 const shim = @import("shim.zig");
 const fixup = @import("fixup.zig");
 const abi = @import("abi.zig");
+const gc = @import("gc.zig");
 
 pub const SpliceError = error{
     OutOfMemory,
@@ -56,6 +57,20 @@ pub const SpliceError = error{
     ValueTooLarge,
     LebOverflow,
     LebTruncated,
+    // Reader/GC errors that can surface during the new GC pass.
+    InvalidMagic,
+    InvalidVersion,
+    UnexpectedEof,
+    InvalidSection,
+    InvalidType,
+    InvalidLimits,
+    TooManyLocals,
+    SectionTooLarge,
+    FunctionCodeMismatch,
+    UnsupportedOpcode,
+    InvalidBody,
+    MissingRequiredExport,
+    InvalidIndex,
 } || writer.EncodeError;
 
 /// Splice a preview1 embed and an adapter into a wrapping component.
@@ -70,14 +85,41 @@ pub fn splice(
     defer arena.deinit();
     const a = arena.allocator();
 
-    // ── Phase A: decode + classify ─────────────────────────────────────────
-    const world = try decode.parseFromAdapterCore(a, adapter_bytes);
-    const hoisted = try types_import.hoist(a, world);
+    // ── Phase A.0: GC the adapter core wasm ────────────────────────────────
+    //
+    // Mirror `wit-component/src/gc.rs`: parse the adapter, walk the
+    // call graph from the preview1 exports the embed actually
+    // imports plus the adapter's `wasi:cli/run` entry point, drop
+    // every func/global/table/elem/data/import that's unreachable.
+    // This shrinks the embedded adapter core wasm dramatically and
+    // is the prerequisite for any future top-level WASI import
+    // pruning (bug #2's full fix). For now we still hoist the
+    // adapter's full encoded-world body — top-level import filtering
+    // requires a follow-up that re-encodes the encoded world to keep
+    // alias instance-index references valid; see TODO below.
+    const required_exports = try computeRequiredAdapterExports(a, embed_bytes, adapter_bytes, adapter_name);
+    const gc_bytes = try gc.run(gpa, adapter_bytes, required_exports);
+    defer gpa.free(gc_bytes);
 
-    var adapter_owned = try core_imports.extract(gpa, adapter_bytes);
+    // ── Phase A: decode + classify ─────────────────────────────────────────
+    const world = try decode.parseFromAdapterCore(a, gc_bytes);
+
+    var adapter_owned = try core_imports.extract(gpa, gc_bytes);
     defer adapter_owned.deinit();
     var embed_owned = try core_imports.extract(gpa, embed_bytes);
     defer embed_owned.deinit();
+
+    // TODO (bug #2 follow-up): once the encoded-world AST can be
+    // re-emitted with a renumbered instance index space, filter the
+    // hoisted body to only the namespaces actually imported by the
+    // GC'd adapter (`adapter_owned.interface.imports`). Right now we
+    // hoist verbatim, so the wrapping component still advertises
+    // every WASI namespace the adapter type-declares. The core wasm
+    // is GC'd correctly, so runtime trapping due to spurious WASI
+    // imports the host doesn't wire is mitigated for embeds whose
+    // preview1 surface is small, but unused namespaces still leak as
+    // top-level imports.
+    const hoisted = try types_import.hoist(a, world);
 
     // The embed may carry its own `component-type` custom section
     // (produced by `wasm-tools component embed --world …`). When
@@ -110,7 +152,7 @@ pub fn splice(
         .gpa = gpa,
         .arena = a,
         .embed_bytes = try stripComponentTypeSections(a, embed_bytes),
-        .adapter_bytes = try arenaDup(a, adapter_bytes),
+        .adapter_bytes = try arenaDup(a, gc_bytes),
         .shim_bytes = shim_bytes,
         .fixup_bytes = fixup_bytes,
         .adapter_name = adapter_name,
@@ -122,6 +164,55 @@ pub fn splice(
         .preview1_slots = preview1_slots,
         .buckets = buckets,
     });
+}
+
+/// Compute the export-name set the adapter must keep alive for the
+/// embed to function. Pre-conditions:
+///
+///   * Every embed import whose `module_name == adapter_name` (e.g.
+///     `wasi_snapshot_preview1`) must be matched by an adapter
+///     export of the same field name.
+///   * The adapter's `wasi:cli/run@<ver>#run` export — the entry
+///     point the wrapping component lifts — must survive.
+///   * `cabi_import_realloc` is preserved opportunistically by
+///     `gc.run` if exported.
+fn computeRequiredAdapterExports(
+    arena: Allocator,
+    embed_bytes: []const u8,
+    adapter_bytes: []const u8,
+    adapter_name: []const u8,
+) SpliceError![]const []const u8 {
+    // `core_imports.extract` allocates via `gpa` (its first arg). We
+    // pass the splice arena so deinit is a no-op; the underlying
+    // `Module` and its byte-slice strings stay alive for the rest of
+    // the splice.
+    const owned_embed = try core_imports.extract(arena, embed_bytes);
+    const owned_adapter = try core_imports.extract(arena, adapter_bytes);
+
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+
+    // Embed → adapter preview1 imports. The adapter exports each
+    // preview1 syscall under its bare field name (e.g. `fd_write`),
+    // not the qualified `wasi_snapshot_preview1.fd_write` import
+    // notation, so we strip the module name.
+    for (owned_embed.interface.imports) |im| {
+        if (im.kind != .func) continue;
+        if (!std.mem.eql(u8, im.module_name, adapter_name)) continue;
+        const name = try arena.dupe(u8, im.field_name);
+        try out.append(arena, name);
+    }
+
+    // The adapter's `wasi:cli/run@<ver>#run` (or any other instance
+    // member export). Adapter exports use the syntax
+    // `<iface>#<name>` for instance member exports — pick those so
+    // the adapter's lifted entry point survives GC.
+    for (owned_adapter.interface.exports) |ex| {
+        if (std.mem.indexOfScalar(u8, ex.name, '#') == null) continue;
+        const dup = try arena.dupe(u8, ex.name);
+        try out.append(arena, dup);
+    }
+
+    return out.toOwnedSlice(arena);
 }
 
 // ── Slot / bucket collection ──────────────────────────────────────────────
