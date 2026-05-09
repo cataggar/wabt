@@ -1653,3 +1653,53 @@ test "coreToCompValType: maps numeric wasm types to component analogues" {
     try testing.expectEqual(ctypes.ValType.f32, coreToCompValType(.f32));
     try testing.expectEqual(ctypes.ValType.f64, coreToCompValType(.f64));
 }
+
+// ── End-to-end synthetic splice ──────────────────────────────────────────
+
+const test_fixtures = @import("test_fixtures.zig");
+const loader = @import("../loader.zig");
+
+test "splice: end-to-end on synthetic mock adapter + embed" {
+    const a = testing.allocator;
+
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbed(a);
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // The wrapping component lifts exactly one top-level export — the
+    // `wasi:cli/run@…` instance — regardless of what the adapter
+    // declared internally.
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expect(std.mem.startsWith(u8, comp.exports[0].name, "wasi:cli/run@"));
+    try testing.expect(comp.exports[0].desc == .instance);
+
+    // Top-level imports surface every live WASI namespace post-GC.
+    // The fixture's adapter imports exactly one
+    // (`wasi:cli/stdout@0.1.0`); every other namespace declared by
+    // the encoded world should have been pruned because no canon-lower
+    // import in the GC'd adapter references it.
+    var saw_stdout = false;
+    for (comp.imports) |im| {
+        if (std.mem.eql(u8, im.name, test_fixtures.STDOUT_NAMESPACE)) {
+            saw_stdout = true;
+            try testing.expect(im.desc == .instance);
+        }
+    }
+    try testing.expect(saw_stdout);
+
+    // Inner core modules: shim + embed + adapter + fixup. The
+    // optional `__main_module__` fallback is only emitted when the
+    // adapter imports something from `__main_module__` that the embed
+    // does not export. Our synthetic embed exports `_start` (matching
+    // the adapter's only `__main_module__` import) so the fallback
+    // is omitted.
+    try testing.expectEqual(@as(usize, 4), comp.core_modules.len);
+}
