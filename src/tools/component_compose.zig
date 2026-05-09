@@ -30,6 +30,7 @@ const ctypes = wabt.component.types;
 const writer = wabt.component.writer;
 const loader = wabt.component.loader;
 const compose = wabt.component.compose;
+const type_walk = wabt.component.type_walk;
 
 pub const usage =
     \\Usage: wabt component compose [options] <consumer.wasm>
@@ -195,46 +196,44 @@ pub fn composeBinaries(
     const num_bindings: u32 = @intCast(link.bindings.len);
 
     // ── Wrapper types: copy each unresolved import's referenced type
-    //    from the consumer into our local types[] so the bubbled-up
-    //    import can reference it by a wrapper-local idx.
+    //    (and its transitive deps) from the consumer into our local
+    //    types[] so the bubbled-up imports + every nested outer-alias
+    //    inside their bodies still resolves to a wrapper-local idx.
     //
-    //    Pre-fix bug: the wrapper used to emit an `import` section
-    //    with `desc.instance(N)` referencing the *consumer's* type
-    //    idx N — but the wrapper had no types[] section at all,
-    //    producing a malformed component (id 0x0a precedes id 0x07
-    //    on every emission). Building a `types[]` here, plus the
-    //    explicit `section_order` below, ensures the writer emits
-    //    type-before-import. ──
-    var types_list = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
-    var type_remap = std.AutoHashMapUnmanaged(u32, u32).empty;
-    for (link.unresolved) |u_idx| {
-        const imp = consumer.imports[u_idx];
-        if (imp.desc != .instance) continue;
-        const old_t_idx = imp.desc.instance;
-        const gop = try type_remap.getOrPut(ar, old_t_idx);
-        if (gop.found_existing) continue;
-        gop.value_ptr.* = @intCast(types_list.items.len);
-        if (lookupConsumerType(&consumer, old_t_idx)) |td| {
-            try types_list.append(ar, td);
-        } else {
-            // Hand-built fixtures occasionally declare imports that
-            // reference type indices not materialized in `types[]`
-            // (e.g. tests with `types: &.{}`). Fall back to an empty
-            // instance type — keeps the wrapper structurally valid;
-            // real compose inputs always supply the type.
-            try types_list.append(ar, .{ .instance = .{ .decls = &.{} } });
-        }
-    }
+    //    Pre-fix bug 1 (#115/#118, fixed in #119): the wrapper used
+    //    to emit an `import` section with `desc.instance(N)`
+    //    referencing the *consumer's* type idx N — but the wrapper
+    //    had no types[] section at all, producing a malformed
+    //    component (id 0x0a precedes id 0x07 on every emission).
+    //
+    //    Pre-fix bug 2 (#121): the wrapper copied only the import's
+    //    immediately-referenced TypeDef, leaving its body's outer
+    //    aliases (`(alias outer 1 X)`) and depth-0 valtype refs
+    //    pointing at consumer-typespace idxs that were never
+    //    materialised in the wrapper. wasm-tools rejected the result
+    //    with "type index out of bounds".
+    //
+    //    Fix: BFS the transitive consumer-typespace-idx closure from
+    //    each unresolved import's desc, topologically sort it so each
+    //    emitted type's body only references strictly smaller
+    //    wrapper indices, then deep-clone every TypeDef through a
+    //    consumer→wrapper remap so all depth-0 operands (including
+    //    body-level outer aliases inside instance types) hit the
+    //    wrapper's renumbered indexspace. ──
+    const wrapper_types = try buildWrapperTypes(ar, &consumer, link.unresolved);
+    const types_list_items = wrapper_types.types;
+    const type_remap_table = wrapper_types.remap;
 
-    // ── Wrapper imports: rewrite each bubbled-up desc.instance to
-    //    point at our wrapper-local type idx. Names are preserved so
-    //    downstream callers see the same import set the consumer had. ──
+    // ── Wrapper imports: rewrite each bubbled-up desc to point at
+    //    wrapper-local type idxs via the same remap table. Names are
+    //    preserved so downstream callers see the same import set the
+    //    consumer had. ──
     const imports_arr = try ar.alloc(ctypes.ImportDecl, num_unresolved);
     for (link.unresolved, 0..) |u_idx, i| {
         const imp = consumer.imports[u_idx];
         imports_arr[i] = .{
             .name = imp.name,
-            .desc = remapImportDesc(imp.desc, &type_remap),
+            .desc = try type_walk.cloneExternDesc(ar, imp.desc, type_remap_table, 0),
         };
     }
 
@@ -325,7 +324,7 @@ pub fn composeBinaries(
     var instance_counter: u32 = consumer_inst_idx + 1;
     var func_counter: u32 = 0;
     var component_counter: u32 = 0;
-    var type_counter: u32 = @intCast(types_list.items.len);
+    var type_counter: u32 = @intCast(types_list_items.len);
     var value_counter: u32 = 0;
     var core_func_counter: u32 = 0;
     var core_module_counter: u32 = 0;
@@ -394,10 +393,10 @@ pub fn composeBinaries(
     //   The component-instance indexspace fills forward-only — each
     //   section only references slots produced by earlier sections. ──
     var section_order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
-    if (types_list.items.len > 0) try section_order.append(ar, .{
+    if (types_list_items.len > 0) try section_order.append(ar, .{
         .kind = .type,
         .start = 0,
-        .count = @intCast(types_list.items.len),
+        .count = @intCast(types_list_items.len),
     });
     if (imports_arr.len > 0) try section_order.append(ar, .{
         .kind = .import,
@@ -442,7 +441,7 @@ pub fn composeBinaries(
         .components = components_arr,
         .instances = instances_list.items,
         .aliases = aliases_list.items,
-        .types = types_list.items,
+        .types = types_list_items,
         .canons = &.{},
         .imports = imports_arr,
         .exports = exports_list.items,
@@ -488,18 +487,159 @@ fn passthroughComponent(bytes: []const u8) ctypes.Component {
     };
 }
 
-/// Rewrite a bubbled-up consumer import's desc so any type-idx
-/// references point at the wrapper-local types[] slot instead of the
-/// consumer-local one. Only `.instance` carries a type idx that needs
-/// remapping in practice; other descs are passed through unchanged.
-fn remapImportDesc(
-    desc: ctypes.ExternDesc,
-    m: *const std.AutoHashMapUnmanaged(u32, u32),
-) ctypes.ExternDesc {
-    return switch (desc) {
-        .instance => |idx| .{ .instance = m.get(idx) orelse 0 },
-        else => desc,
-    };
+/// Result of building the wrapping component's `types[]` section
+/// from the unresolved imports' transitive type-dependency closure.
+const WrapperTypes = struct {
+    /// Topologically-ordered TypeDefs ready to assign to
+    /// `Component.types`. Each TypeDef's body has been deep-cloned
+    /// with all depth-0 operands renumbered through `remap`.
+    types: []const ctypes.TypeDef,
+    /// Mapping `consumer.type_indexspace[X]` → wrapper-types[]-idx.
+    /// Slots not in the closure remain `SENTINEL` (max u32). The
+    /// table is sized to fit any legal idx the cloner might encounter
+    /// (max of consumer.type_indexspace.len and consumer.types.len).
+    remap: []const u32,
+};
+
+const SENTINEL_TYPE_IDX: u32 = std.math.maxInt(u32);
+
+/// Build the wrapping component's `types[]` from the closure of
+/// consumer-typespace idxs reachable from `unresolved`'s imports.
+///
+/// Algorithm:
+///
+///   1. **Seed.** For every unresolved import, collect every type-idx
+///      operand its `ExternDesc` carries (via `type_walk`).
+///   2. **BFS expand.** For each idx in the queue, resolve to its
+///      consumer TypeDef (`lookupConsumerType`), walk it at depth 0
+///      to gather every type-idx the body references at depth 0,
+///      enqueue any new ones.
+///   3. **Topo sort.** DFS post-order over the closure: emit a node
+///      after all its in-closure deps are emitted. Cycles cannot
+///      occur in well-formed components but we detect and bail with
+///      a stable order if one slips through (tolerant — the
+///      validator will catch it downstream anyway).
+///   4. **Clone + remap.** For each closure idx in topo order, build
+///      the consumer→wrapper remap entry, then clone its TypeDef
+///      via `type_walk.cloneTypeDef(td, remap, depth=0)`. Slots
+///      whose `lookupConsumerType` returns null fall back to an
+///      empty instance type — same behaviour the pre-fix code had,
+///      kept so hand-built fixtures with `types: &.{}` still round-
+///      trip.
+fn buildWrapperTypes(
+    arena: std.mem.Allocator,
+    consumer: *const ctypes.Component,
+    unresolved: []const u32,
+) !WrapperTypes {
+    // ── Step 1+2: BFS the closure of consumer-typespace idxs ───────
+    var queue = std.ArrayListUnmanaged(u32).empty;
+    var in_closure = std.AutoHashMapUnmanaged(u32, void).empty;
+    var max_idx: u32 = 0;
+
+    for (unresolved) |u_idx| {
+        const imp = consumer.imports[u_idx];
+        var seeds = std.ArrayListUnmanaged(u32).empty;
+        try type_walk.collectExternDescRefs(arena, imp.desc, &seeds);
+        for (seeds.items) |s| {
+            if ((try in_closure.fetchPut(arena, s, {})) == null) {
+                try queue.append(arena, s);
+                if (s > max_idx) max_idx = s;
+            }
+        }
+    }
+
+    var head: usize = 0;
+    while (head < queue.items.len) : (head += 1) {
+        const cur = queue.items[head];
+        const td = lookupConsumerType(consumer, cur) orelse continue;
+        var refs = std.ArrayListUnmanaged(u32).empty;
+        try type_walk.collectTypeDefRefs(arena, td, &refs, 0);
+        for (refs.items) |r| {
+            if ((try in_closure.fetchPut(arena, r, {})) == null) {
+                try queue.append(arena, r);
+                if (r > max_idx) max_idx = r;
+            }
+        }
+    }
+
+    // remap covers every consumer-typespace idx that could be
+    // operand to a depth-0 ref in any cloned body. Size it to
+    // accommodate the consumer's indexspace, its types[], and the
+    // highest BFS-encountered idx (which may sit *past* the
+    // indexspace for hand-built fixtures with `types: &.{}` whose
+    // imports still cite a numeric type idx).
+    var remap_len: usize = consumer.type_indexspace.len;
+    if (consumer.types.len > remap_len) remap_len = consumer.types.len;
+    if (in_closure.count() > 0 and @as(usize, max_idx) + 1 > remap_len) {
+        remap_len = @as(usize, max_idx) + 1;
+    }
+    const remap = try arena.alloc(u32, remap_len);
+    @memset(remap, SENTINEL_TYPE_IDX);
+
+    // ── Step 3: DFS post-order topo sort ──────────────────────────
+    const order = try arena.alloc(u32, queue.items.len);
+    var order_len: usize = 0;
+    var visiting = std.AutoHashMapUnmanaged(u32, void).empty;
+    var visited = std.AutoHashMapUnmanaged(u32, void).empty;
+
+    for (queue.items) |seed| {
+        try topoVisit(arena, consumer, seed, &visiting, &visited, order, &order_len);
+    }
+
+    // ── Step 4: clone + remap in topo order ───────────────────────
+    const types = try arena.alloc(ctypes.TypeDef, order_len);
+    // First pass: assign wrapper-idxs so refs from later types
+    // resolve. (DFS post-order already guarantees deps come first,
+    // so we can also fill remap in a single pass — done up-front
+    // here for symmetry with the cycle-tolerance bail-out path.)
+    for (order[0..order_len], 0..) |consumer_idx, wrapper_idx| {
+        if (consumer_idx < remap.len) remap[consumer_idx] = @intCast(wrapper_idx);
+    }
+    // Second pass: clone bodies through the now-complete remap.
+    for (order[0..order_len], 0..) |consumer_idx, wrapper_idx| {
+        const td = lookupConsumerType(consumer, consumer_idx) orelse blk: {
+            // Hand-built fixtures (e.g. tests with `types: &.{}`)
+            // declare imports referencing slots not materialised in
+            // `types[]`. Substitute an empty instance type — keeps
+            // the wrapper structurally valid; real compose inputs
+            // always supply the type.
+            break :blk ctypes.TypeDef{ .instance = .{ .decls = &.{} } };
+        };
+        types[wrapper_idx] = try type_walk.cloneTypeDef(arena, td, remap, 0);
+    }
+
+    return .{ .types = types, .remap = remap };
+}
+
+/// DFS post-order visit. Skips already-visited nodes and tolerates
+/// cycles by bailing on back-edges (the cyclic node is dropped from
+/// the order; downstream validators will catch any resulting
+/// invalidity).
+fn topoVisit(
+    arena: std.mem.Allocator,
+    consumer: *const ctypes.Component,
+    node: u32,
+    visiting: *std.AutoHashMapUnmanaged(u32, void),
+    visited: *std.AutoHashMapUnmanaged(u32, void),
+    order: []u32,
+    order_len: *usize,
+) !void {
+    if (visited.contains(node)) return;
+    if (visiting.contains(node)) return; // back-edge — break the cycle
+    try visiting.put(arena, node, {});
+
+    if (lookupConsumerType(consumer, node)) |td| {
+        var refs = std.ArrayListUnmanaged(u32).empty;
+        try type_walk.collectTypeDefRefs(arena, td, &refs, 0);
+        for (refs.items) |r| {
+            try topoVisit(arena, consumer, r, visiting, visited, order, order_len);
+        }
+    }
+
+    _ = visiting.remove(node);
+    try visited.put(arena, node, {});
+    order[order_len.*] = node;
+    order_len.* += 1;
 }
 
 fn synthSortFromExport(exp: ctypes.ExportDecl) ctypes.SortIdx {
@@ -713,4 +853,168 @@ test "composeBinaries: multi-package consumer + provider end-to-end" {
     try testing.expectEqual(@as(usize, 2), loaded.components.len);
     try testing.expectEqual(@as(usize, 2), loaded.instances.len);
     try testing.expectEqual(@as(usize, 1), loaded.aliases.len);
+}
+
+test "composeBinaries: copies transitive type deps when bubbling up instance import" {
+    // Consumer with two top-level types:
+    //   types[0] = func(x: u32) -> u32         (the underlying "add")
+    //   types[1] = instance {
+    //                (alias outer 1 0)         ; pull func from outer
+    //                (export "add" (func (type 0)))
+    //              }
+    // imports[0].desc = .instance(1)
+    //
+    // Pre-fix bug (#121): only types[1] would be copied into the
+    // wrapper, leaving its body's outer-alias-1-0 pointing at a
+    // wrapper-type-0 that didn't exist. Post-fix: BFS pulls in
+    // types[0] too, topo-sort puts it first, and the body's outer
+    // alias is remapped to the wrapper's renumbered idx.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const params = [_]ctypes.NamedValType{.{ .name = "x", .type = .u32 }};
+    const func_type = ctypes.TypeDef{ .func = .{
+        .params = &params,
+        .results = .{ .unnamed = .u32 },
+    } };
+
+    const inst_decls = [_]ctypes.Decl{
+        .{ .alias = .{ .outer = .{
+            .sort = .type,
+            .outer_count = 1,
+            .idx = 0,
+        } } },
+        .{ .@"export" = .{
+            .name = "add",
+            .desc = .{ .func = 0 },
+        } },
+    };
+    const inst_type = ctypes.TypeDef{ .instance = .{ .decls = &inst_decls } };
+
+    const types = [_]ctypes.TypeDef{ func_type, inst_type };
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 1 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &types, .canons = &.{},
+        .imports = &imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const empty_providers: []const []u8 = &.{};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, empty_providers);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Both types must be present in the wrapper (transitive closure).
+    try testing.expect(loaded.types.len >= 2);
+
+    // The bubbled-up import must reference an instance type slot
+    // that exists in the wrapper.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expect(loaded.imports[0].desc == .instance);
+    const inst_idx = loaded.imports[0].desc.instance;
+    try testing.expect(inst_idx < loaded.types.len);
+
+    // The instance's body must contain an outer-alias whose `idx` is
+    // strictly less than `inst_idx` — so the alias resolves to a
+    // wrapper type already declared at that point (the spec's
+    // forward-only-references rule).
+    try testing.expect(loaded.types[inst_idx] == .instance);
+    const body = loaded.types[inst_idx].instance.decls;
+    var found_outer_alias = false;
+    for (body) |d| {
+        if (d != .alias) continue;
+        if (d.alias != .outer) continue;
+        if (d.alias.outer.sort != .type) continue;
+        if (d.alias.outer.outer_count != 1) continue;
+        try testing.expect(d.alias.outer.idx < inst_idx);
+        found_outer_alias = true;
+    }
+    try testing.expect(found_outer_alias);
+}
+
+test "composeBinaries: emits types in topological order" {
+    // Same shape as the previous test but consumer declares the
+    // instance type FIRST (idx 0) and the func dep SECOND (idx 1).
+    // The wrapper must topologically reorder them so each emitted
+    // type's body only references strictly smaller wrapper indices.
+    // The bubbled-up import's desc must follow the renumbering.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const params = [_]ctypes.NamedValType{.{ .name = "x", .type = .u32 }};
+    const func_type = ctypes.TypeDef{ .func = .{
+        .params = &params,
+        .results = .{ .unnamed = .u32 },
+    } };
+
+    // Body refs outer-1-1 → consumer-typespace-1 (the func, declared
+    // *after* the instance in source order).
+    const inst_decls = [_]ctypes.Decl{
+        .{ .alias = .{ .outer = .{
+            .sort = .type,
+            .outer_count = 1,
+            .idx = 1,
+        } } },
+        .{ .@"export" = .{
+            .name = "add",
+            .desc = .{ .func = 0 },
+        } },
+    };
+    const inst_type = ctypes.TypeDef{ .instance = .{ .decls = &inst_decls } };
+
+    // Instance at idx 0, func at idx 1 — reverse of dep order.
+    const types = [_]ctypes.TypeDef{ inst_type, func_type };
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &types, .canons = &.{},
+        .imports = &imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const empty_providers: []const []u8 = &.{};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, empty_providers);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    try testing.expectEqual(@as(usize, 2), loaded.types.len);
+    // Topo sort must hoist the func dep ahead of the instance so the
+    // instance's outer alias resolves to a strictly smaller idx.
+    try testing.expect(loaded.types[0] == .func);
+    try testing.expect(loaded.types[1] == .instance);
+
+    // The bubbled-up import desc must follow the renumbering: the
+    // instance now lives at wrapper-idx 1, not consumer-idx 0.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expect(loaded.imports[0].desc == .instance);
+    try testing.expectEqual(@as(u32, 1), loaded.imports[0].desc.instance);
+
+    // The instance body's outer alias must point at wrapper-idx 0
+    // (the func), reflecting the renumber.
+    const body = loaded.types[1].instance.decls;
+    var found_alias = false;
+    for (body) |d| {
+        if (d != .alias) continue;
+        if (d.alias != .outer) continue;
+        if (d.alias.outer.sort != .type) continue;
+        try testing.expectEqual(@as(u32, 1), d.alias.outer.outer_count);
+        try testing.expectEqual(@as(u32, 0), d.alias.outer.idx);
+        found_alias = true;
+    }
+    try testing.expect(found_alias);
 }

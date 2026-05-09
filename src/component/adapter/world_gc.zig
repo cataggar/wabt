@@ -56,6 +56,7 @@ const decode = @import("decode.zig");
 const loader = @import("../loader.zig");
 const writer = @import("../writer.zig");
 const leb128 = @import("../../leb128.zig");
+const type_walk = @import("../type_walk.zig");
 
 pub const Error = error{
     OutOfMemory,
@@ -236,7 +237,7 @@ pub fn gcWorld(
     var new_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
     for (pruned_body_decls, 0..) |d, i| {
         if (!live_decls.isSet(i)) continue;
-        const cloned = try cloneDecl(arena, d, type_remap, inst_remap);
+        const cloned = try type_walk.cloneDecl(arena, d, type_remap, inst_remap);
         try new_decls.append(arena, cloned);
     }
     const new_body_decls = try new_decls.toOwnedSlice(arena);
@@ -273,7 +274,7 @@ fn buildDeclMeta(arena: Allocator, decls: []const ctypes.Decl) Error![]const Dec
             .type => |td| {
                 type_slot = type_cursor;
                 type_cursor += 1;
-                try collectTypeDefRefs(arena, td, &trefs, 0);
+                try type_walk.collectTypeDefRefs(arena, td, &trefs, 0);
             },
             .alias => |a| {
                 switch (a) {
@@ -305,10 +306,10 @@ fn buildDeclMeta(arena: Allocator, decls: []const ctypes.Decl) Error![]const Dec
             .import => |im| {
                 inst_slot = inst_cursor;
                 inst_cursor += 1;
-                try collectExternDescRefs(arena, im.desc, &trefs);
+                try type_walk.collectExternDescRefs(arena, im.desc, &trefs);
             },
             .@"export" => |e| {
-                try collectExternDescRefs(arena, e.desc, &trefs);
+                try type_walk.collectExternDescRefs(arena, e.desc, &trefs);
             },
         }
 
@@ -541,7 +542,7 @@ fn gcInstanceBody(
                 // the call site. Treating the body as view-depth-0
                 // makes its own typespace the "world body" in this
                 // helper's eyes.
-                try collectTypeDefRefs(arena, td, &refs, 0);
+                try type_walk.collectTypeDefRefs(arena, td, &refs, 0);
             },
             .alias => |a| switch (a) {
                 .instance_export => |ie| {
@@ -579,7 +580,7 @@ fn gcInstanceBody(
                 },
                 else => {
                     kind = .method;
-                    try collectExternDescRefsAtDepth(arena, e.desc, &refs, 0);
+                    try type_walk.collectExternDescRefsAtDepth(arena, e.desc, &refs, 0);
                 },
             },
         }
@@ -670,368 +671,17 @@ fn cloneInstBodyDeclLocal(
 ) Error!ctypes.Decl {
     return switch (d) {
         .core_type => error.UnsupportedAdapterShape,
-        .type => |td| .{ .type = try cloneTypeDef(arena, td, local_remap, 0) },
-        .alias => |a| .{ .alias = try cloneInstanceBodyAlias(arena, a, local_remap, 0) },
+        .type => |td| .{ .type = try type_walk.cloneTypeDef(arena, td, local_remap, 0) },
+        .alias => |a| .{ .alias = try type_walk.cloneInstanceBodyAlias(arena, a, local_remap, 0) },
         .import => error.UnsupportedAdapterShape,
         .@"export" => |e| .{ .@"export" = .{
             .name = try arena.dupe(u8, e.name),
-            .desc = try cloneExternDesc(arena, e.desc, local_remap, 0),
+            .desc = try type_walk.cloneExternDesc(arena, e.desc, local_remap, 0),
             .sort_idx = e.sort_idx,
         } },
     };
 }
 
-/// Collect type-idx refs from a type def. `depth` is the nesting
-/// depth — 0 for the world body, 1 inside an instance type body, etc.
-/// Refs with `outer_count == depth` and sort=type bubble up to the
-/// world body's type indexspace and are added to `out`. Refs to local
-/// (same-depth) types stay local and are ignored at body level.
-fn collectTypeDefRefs(
-    arena: Allocator,
-    td: ctypes.TypeDef,
-    out: *std.ArrayListUnmanaged(u32),
-    depth: u32,
-) Error!void {
-    switch (td) {
-        .val => |vt| try collectValTypeRefs(arena, vt, out, depth),
-        .record => |r| for (r.fields) |f| try collectValTypeRefs(arena, f.type, out, depth),
-        .variant => |v| for (v.cases) |c| {
-            if (c.type) |vt| try collectValTypeRefs(arena, vt, out, depth);
-        },
-        .list => |l| try collectValTypeRefs(arena, l.element, out, depth),
-        .tuple => |t| for (t.fields) |f| try collectValTypeRefs(arena, f, out, depth),
-        .flags, .enum_ => {},
-        .option => |o| try collectValTypeRefs(arena, o.inner, out, depth),
-        .result => |r| {
-            if (r.ok) |vt| try collectValTypeRefs(arena, vt, out, depth);
-            if (r.err) |vt| try collectValTypeRefs(arena, vt, out, depth);
-        },
-        .resource => {},
-        .func => |f| {
-            for (f.params) |p| try collectValTypeRefs(arena, p.type, out, depth);
-            switch (f.results) {
-                .none => {},
-                .unnamed => |vt| try collectValTypeRefs(arena, vt, out, depth),
-                .named => |list| for (list) |nv| try collectValTypeRefs(arena, nv.type, out, depth),
-            }
-        },
-        .component => return error.UnsupportedAdapterShape,
-        .instance => |i| try collectInstanceBodyRefs(arena, i.decls, out, depth + 1),
-    }
-}
-
-/// Collect type-idx refs from valtype operands. ValTypes at depth>0
-/// reference the local type indexspace at THAT depth — not the world
-/// body's. So they don't contribute body-level refs.
-fn collectValTypeRefs(
-    arena: Allocator,
-    vt: ctypes.ValType,
-    out: *std.ArrayListUnmanaged(u32),
-    depth: u32,
-) Error!void {
-    if (depth != 0) return; // local-typespace refs at depth>0 are local
-    switch (vt) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .string => {},
-        .own => |idx| try out.append(arena, idx),
-        .borrow => |idx| try out.append(arena, idx),
-        .type_idx => |idx| try out.append(arena, idx),
-        .record => |idx| try out.append(arena, idx),
-        .variant => |idx| try out.append(arena, idx),
-        .list => |idx| try out.append(arena, idx),
-        .tuple => |idx| try out.append(arena, idx),
-        .flags => |idx| try out.append(arena, idx),
-        .enum_ => |idx| try out.append(arena, idx),
-        .option => |idx| try out.append(arena, idx),
-        .result => |idx| try out.append(arena, idx),
-    }
-}
-
-fn collectInstanceBodyRefs(
-    arena: Allocator,
-    decls: []const ctypes.Decl,
-    out: *std.ArrayListUnmanaged(u32),
-    depth: u32,
-) Error!void {
-    for (decls) |d| {
-        switch (d) {
-            .core_type => {},
-            .type => |td| try collectTypeDefRefs(arena, td, out, depth),
-            .alias => |a| switch (a) {
-                .instance_export => {},
-                .outer => |o| {
-                    // Outer-alias whose chain reaches depth 0 (the
-                    // world body) — its `idx` reads the world body's
-                    // type indexspace.
-                    if (o.outer_count == depth and o.sort == .type) {
-                        try out.append(arena, o.idx);
-                    }
-                },
-            },
-            .import => |im| {
-                // Imports inside an instance type are unusual; instance
-                // bodies normally only have type defs, aliases, and
-                // exports. Treat opaquely (still walk the desc).
-                try collectExternDescRefsAtDepth(arena, im.desc, out, depth);
-            },
-            .@"export" => |e| try collectExternDescRefsAtDepth(arena, e.desc, out, depth),
-        }
-    }
-}
-
-fn collectExternDescRefs(
-    arena: Allocator,
-    desc: ctypes.ExternDesc,
-    out: *std.ArrayListUnmanaged(u32),
-) Error!void {
-    return collectExternDescRefsAtDepth(arena, desc, out, 0);
-}
-
-fn collectExternDescRefsAtDepth(
-    arena: Allocator,
-    desc: ctypes.ExternDesc,
-    out: *std.ArrayListUnmanaged(u32),
-    depth: u32,
-) Error!void {
-    if (depth != 0) return; // descs at depth>0 reference local typespace
-    switch (desc) {
-        .module => {},
-        .func => |idx| try out.append(arena, idx),
-        .value => |vt| try collectValTypeRefs(arena, vt, out, 0),
-        .type => |tb| switch (tb) {
-            .eq => |idx| try out.append(arena, idx),
-            .sub_resource => {},
-        },
-        .component => |idx| try out.append(arena, idx),
-        .instance => |idx| try out.append(arena, idx),
-    }
-}
-
-// ── Clone with operand renumbering ─────────────────────────────────────────
-
-fn cloneDecl(
-    arena: Allocator,
-    d: ctypes.Decl,
-    type_remap: []const u32,
-    inst_remap: []const u32,
-) Error!ctypes.Decl {
-    return switch (d) {
-        .core_type => error.UnsupportedAdapterShape,
-        .type => |td| .{ .type = try cloneTypeDef(arena, td, type_remap, 0) },
-        .alias => |a| .{ .alias = try cloneAlias(arena, a, type_remap, inst_remap) },
-        .import => |im| .{ .import = .{
-            .name = try arena.dupe(u8, im.name),
-            .desc = try cloneExternDesc(arena, im.desc, type_remap, 0),
-        } },
-        .@"export" => |e| .{ .@"export" = .{
-            .name = try arena.dupe(u8, e.name),
-            .desc = try cloneExternDesc(arena, e.desc, type_remap, 0),
-            .sort_idx = e.sort_idx,
-        } },
-    };
-}
-
-fn cloneAlias(
-    arena: Allocator,
-    a: ctypes.Alias,
-    type_remap: []const u32,
-    inst_remap: []const u32,
-) Error!ctypes.Alias {
-    _ = type_remap;
-    return switch (a) {
-        .instance_export => |ie| .{ .instance_export = .{
-            .sort = ie.sort,
-            .instance_idx = remap(inst_remap, ie.instance_idx),
-            .name = try arena.dupe(u8, ie.name),
-        } },
-        .outer => |o| .{ .outer = .{
-            .sort = o.sort,
-            .outer_count = o.outer_count,
-            // depth-0 outer alias references wrapper type indexspace
-            // (boilerplate, idx 0); leave verbatim.
-            .idx = o.idx,
-        } },
-    };
-}
-
-fn cloneTypeDef(
-    arena: Allocator,
-    td: ctypes.TypeDef,
-    type_remap: []const u32,
-    depth: u32,
-) Error!ctypes.TypeDef {
-    return switch (td) {
-        .val => |vt| .{ .val = try cloneValType(arena, vt, type_remap, depth) },
-        .record => |r| blk: {
-            const fields = try arena.alloc(ctypes.Field, r.fields.len);
-            for (r.fields, fields) |src, *dst| {
-                dst.* = .{
-                    .name = try arena.dupe(u8, src.name),
-                    .type = try cloneValType(arena, src.type, type_remap, depth),
-                };
-            }
-            break :blk .{ .record = .{ .fields = fields } };
-        },
-        .variant => |v| blk: {
-            const cases = try arena.alloc(ctypes.Case, v.cases.len);
-            for (v.cases, cases) |src, *dst| {
-                dst.* = .{
-                    .name = try arena.dupe(u8, src.name),
-                    .type = if (src.type) |t| try cloneValType(arena, t, type_remap, depth) else null,
-                    .refines = src.refines,
-                };
-            }
-            break :blk .{ .variant = .{ .cases = cases } };
-        },
-        .list => |l| .{ .list = .{ .element = try cloneValType(arena, l.element, type_remap, depth) } },
-        .tuple => |t| blk: {
-            const fields = try arena.alloc(ctypes.ValType, t.fields.len);
-            for (t.fields, fields) |src, *dst| dst.* = try cloneValType(arena, src, type_remap, depth);
-            break :blk .{ .tuple = .{ .fields = fields } };
-        },
-        .flags => |f| blk: {
-            const names = try arena.alloc([]const u8, f.names.len);
-            for (f.names, names) |src, *dst| dst.* = try arena.dupe(u8, src);
-            break :blk .{ .flags = .{ .names = names } };
-        },
-        .enum_ => |e| blk: {
-            const names = try arena.alloc([]const u8, e.names.len);
-            for (e.names, names) |src, *dst| dst.* = try arena.dupe(u8, src);
-            break :blk .{ .enum_ = .{ .names = names } };
-        },
-        .option => |o| .{ .option = .{ .inner = try cloneValType(arena, o.inner, type_remap, depth) } },
-        .result => |r| .{ .result = .{
-            .ok = if (r.ok) |t| try cloneValType(arena, t, type_remap, depth) else null,
-            .err = if (r.err) |t| try cloneValType(arena, t, type_remap, depth) else null,
-        } },
-        .resource => |r| .{ .resource = r },
-        .func => |f| blk: {
-            const params = try arena.alloc(ctypes.NamedValType, f.params.len);
-            for (f.params, params) |src, *dst| dst.* = .{
-                .name = try arena.dupe(u8, src.name),
-                .type = try cloneValType(arena, src.type, type_remap, depth),
-            };
-            const results: ctypes.FuncType.ResultList = switch (f.results) {
-                .none => .none,
-                .unnamed => |vt| .{ .unnamed = try cloneValType(arena, vt, type_remap, depth) },
-                .named => |list| named: {
-                    const dst = try arena.alloc(ctypes.NamedValType, list.len);
-                    for (list, dst) |src, *d| d.* = .{
-                        .name = try arena.dupe(u8, src.name),
-                        .type = try cloneValType(arena, src.type, type_remap, depth),
-                    };
-                    break :named .{ .named = dst };
-                },
-            };
-            break :blk .{ .func = .{ .params = params, .results = results } };
-        },
-        .component => return error.UnsupportedAdapterShape,
-        .instance => |i| .{ .instance = .{ .decls = try cloneInstanceBody(arena, i.decls, type_remap, depth + 1) } },
-    };
-}
-
-fn cloneInstanceBody(
-    arena: Allocator,
-    decls: []const ctypes.Decl,
-    type_remap: []const u32,
-    depth: u32,
-) Error![]const ctypes.Decl {
-    const out = try arena.alloc(ctypes.Decl, decls.len);
-    for (decls, out) |src, *dst| {
-        dst.* = switch (src) {
-            .core_type => return error.UnsupportedAdapterShape,
-            .type => |td| .{ .type = try cloneTypeDef(arena, td, type_remap, depth) },
-            .alias => |a| .{ .alias = try cloneInstanceBodyAlias(arena, a, type_remap, depth) },
-            .import => |im| .{ .import = .{
-                .name = try arena.dupe(u8, im.name),
-                .desc = try cloneExternDesc(arena, im.desc, type_remap, depth),
-            } },
-            .@"export" => |e| .{ .@"export" = .{
-                .name = try arena.dupe(u8, e.name),
-                .desc = try cloneExternDesc(arena, e.desc, type_remap, depth),
-                .sort_idx = e.sort_idx,
-            } },
-        };
-    }
-    return out;
-}
-
-/// Clone an alias inside an instance type body. Outer aliases whose
-/// chain reaches the world body (`outer_count == depth`) have their
-/// `idx` rewritten through `type_remap` so the alias target survives
-/// the prune.
-fn cloneInstanceBodyAlias(
-    arena: Allocator,
-    a: ctypes.Alias,
-    type_remap: []const u32,
-    depth: u32,
-) Error!ctypes.Alias {
-    return switch (a) {
-        .instance_export => |ie| .{ .instance_export = .{
-            .sort = ie.sort,
-            .instance_idx = ie.instance_idx,
-            .name = try arena.dupe(u8, ie.name),
-        } },
-        .outer => |o| blk: {
-            const new_idx = if (o.outer_count == depth and o.sort == .type)
-                remap(type_remap, o.idx)
-            else
-                o.idx;
-            break :blk .{ .outer = .{
-                .sort = o.sort,
-                .outer_count = o.outer_count,
-                .idx = new_idx,
-            } };
-        },
-    };
-}
-
-fn cloneExternDesc(
-    arena: Allocator,
-    desc: ctypes.ExternDesc,
-    type_remap: []const u32,
-    depth: u32,
-) Error!ctypes.ExternDesc {
-    return switch (desc) {
-        .module => |idx| .{ .module = idx },
-        .func => |idx| .{ .func = if (depth == 0) remap(type_remap, idx) else idx },
-        .value => |vt| .{ .value = try cloneValType(arena, vt, type_remap, depth) },
-        .type => |tb| .{ .type = switch (tb) {
-            .eq => |idx| .{ .eq = if (depth == 0) remap(type_remap, idx) else idx },
-            .sub_resource => .sub_resource,
-        } },
-        .component => |idx| .{ .component = if (depth == 0) remap(type_remap, idx) else idx },
-        .instance => |idx| .{ .instance = if (depth == 0) remap(type_remap, idx) else idx },
-    };
-}
-
-fn cloneValType(
-    arena: Allocator,
-    vt: ctypes.ValType,
-    type_remap: []const u32,
-    depth: u32,
-) Error!ctypes.ValType {
-    _ = arena;
-    if (depth != 0) return vt; // local-typespace refs at depth>0 unchanged
-    return switch (vt) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .string => vt,
-        .own => |idx| .{ .own = remap(type_remap, idx) },
-        .borrow => |idx| .{ .borrow = remap(type_remap, idx) },
-        .type_idx => |idx| .{ .type_idx = remap(type_remap, idx) },
-        .record => |idx| .{ .record = remap(type_remap, idx) },
-        .variant => |idx| .{ .variant = remap(type_remap, idx) },
-        .list => |idx| .{ .list = remap(type_remap, idx) },
-        .tuple => |idx| .{ .tuple = remap(type_remap, idx) },
-        .flags => |idx| .{ .flags = remap(type_remap, idx) },
-        .enum_ => |idx| .{ .enum_ = remap(type_remap, idx) },
-        .option => |idx| .{ .option = remap(type_remap, idx) },
-        .result => |idx| .{ .result = remap(type_remap, idx) },
-    };
-}
-
-fn remap(table: []const u32, idx: u32) u32 {
-    if (idx >= table.len) return idx;
-    return table[idx];
-}
 
 // ── Encode the rebuilt encoded-world payload ──────────────────────────────
 
