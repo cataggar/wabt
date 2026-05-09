@@ -16,32 +16,28 @@ See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip) and 
 
 All tools are exposed as subcommands of a single `wabt` binary, in the
 style of [wasm-tools](https://github.com/bytecodealliance/wasm-tools)
-and `zig`:
+and `zig`, organized by conceptual subject:
 
 ```console
 $ wabt help
 wabt - WebAssembly Binary Toolkit
 
-Usage: wabt <subcommand> [args...]
+Usage: wabt <subject> <verb> [args...]
 
-Subcommands:
-  parse           Translate WebAssembly text format to binary (was wat2wasm)
-  print           Print a wasm binary as WebAssembly text format (was wasm2wat)
-  validate        Validate a WebAssembly binary
-  objdump         Dump information about a WebAssembly binary
-  strip           Strip custom sections from a WebAssembly binary
-  json-from-wast  Convert a .wast spec test to JSON + .wasm files (was wast2json)
-  decompile       Decompile a wasm binary into readable pseudo-code
-  stats           Print module statistics
-  desugar         Parse and re-emit WebAssembly text format
-  spectest        Run a WebAssembly spec test (.wast)
-  shrink          Minimize a wasm binary while preserving a property
-  component       Component-model subcommands (embed, new, compose)
-  version         Print the wabt version and exit
-  help            Print this help; `wabt help <subcommand>` for details
+Subjects:
+  text       Text format (.wat) work — parse, print, desugar
+  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+  component  Component-model work — new, embed, compose
+  interface  WIT IDL work — (planned; see #137)
+  compose    WAC composition work — (deferred; see #137)
+  spec       Spec testing (.wast) work — run, to-json
+
+Global:
+  version    Print the wabt version and exit
+  help       Print this help; `wabt help <subject>` for details
 ```
 
-Run `wabt help <subcommand>` for details on any subcommand.
+Run `wabt help <subject>` for the verbs in that subject.
 
 ## Building
 
@@ -85,7 +81,7 @@ $ python3 scripts/check_spec_baseline.py
 To run a single file:
 
 ```console
-$ ./zig-out/bin/wabt spectest third_party/testsuite/i32.wast
+$ ./zig-out/bin/wabt spec run third_party/testsuite/i32.wast
 ```
 
 ## License

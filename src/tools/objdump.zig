@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt objdump [options] <file.wasm>
+    \\Usage: wabt module objdump [options] <file.wasm>
     \\
     \\Dump information about sections in a WebAssembly binary.
     \\

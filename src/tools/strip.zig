@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt strip [options] <file.wasm>
+    \\Usage: wabt module strip [options] <file.wasm>
     \\
     \\Strip custom sections from a WebAssembly binary.
     \\

@@ -1,4 +1,4 @@
-//! `wabt shrink` — shrink a wasm file while maintaining a property of
+//! `wabt module shrink` — shrink a wasm file while maintaining a property of
 //! interest.
 //!
 //! Drop-in replacement for `wasm-tools shrink` (see issue #104). The
@@ -22,14 +22,14 @@
 //!
 //! Every candidate is re-encoded and re-validated via
 //! `wabt.Validator` before being shown to the predicate, so the
-//! output always round-trips through `wabt validate` (issue #104
+//! output always round-trips through `wabt module validate` (issue #104
 //! acceptance).
 
 const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt shrink [options] <predicate> <input.wasm>
+    \\Usage: wabt module shrink [options] <predicate> <input.wasm>
     \\
     \\Shrink a wasm file while maintaining a property of interest.
     \\

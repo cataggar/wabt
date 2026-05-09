@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt desugar [options] <file.wat>
+    \\Usage: wabt text desugar [options] <file.wat>
     \\
     \\Parse and re-emit WebAssembly text format (removes syntactic sugar).
     \\

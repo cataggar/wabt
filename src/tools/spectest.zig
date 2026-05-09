@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt spectest [options] <file.wast>
+    \\Usage: wabt spec run [options] <file.wast>
     \\
     \\Run a WebAssembly spec test (.wast file).
     \\

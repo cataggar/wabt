@@ -4,8 +4,9 @@ Provides a helper to locate the `wabt` binary installed via the
 data/scripts/ wheel layout. The binary is placed directly in the scripts
 directory by pip and does not require Python at runtime.
 
-Invoke subcommands as `wabt parse`, `wabt validate`, `wabt spectest`, etc.
-Run `wabt help` for a full list.
+Invoke subcommands as `wabt text parse`, `wabt module validate`,
+`wabt spec run`, etc. Run `wabt help` for a full list of subjects
+and `wabt help <subject>` for the verbs in that subject.
 """
 
 from __future__ import annotations

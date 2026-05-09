@@ -72,9 +72,9 @@ class Counts:
 
 
 def run_one(wabt: Path, wast: Path) -> Counts:
-    """Run `wabt spectest <wast>` and return parsed counts, or Counts.err()."""
+    """Run `wabt spec run <wast>` and return parsed counts, or Counts.err()."""
     proc = subprocess.run(
-        [str(wabt), "spectest", str(wast)],
+        [str(wabt), "spec", "run", str(wast)],
         capture_output=True,
         text=True,
         check=False,
