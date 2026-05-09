@@ -125,16 +125,20 @@ pub fn extractEncodedWorld(adapter_core_bytes: []const u8) DecodeError!?[]const 
         const name_len = n.value;
         if (n.bytes_read + name_len > body.len) return error.InvalidAdapterCore;
         const sec_name = body[n.bytes_read .. n.bytes_read + name_len];
-        // Match either the wit-bindgen-style `:encoded world`
-        // suffix (used by adapters) or the bare `component-type`
-        // name (used by `wasm-tools component embed --world …`).
-        const suffix = ":encoded world";
+        // Recognized section-name forms:
+        //   * `component-type:wit-bindgen:<ver>:<pkg>:<world>:encoded world`
+        //     — wit-bindgen-style adapters.
+        //   * `component-type:<world>` — `wasm-tools component embed
+        //     --world <world>` and `wabt component embed --world
+        //     <world>`. The colon-suffix is the bare world name.
+        //   * `component-type` (no suffix) — defensively accepted.
+        // Anything that starts with `component-type:` is treated as
+        // an encoded-world payload — this catches wit-bindgen's
+        // `:encoded world` form *and* the colon-bare-world form.
         const prefix = "component-type:";
-        const is_encoded_world = sec_name.len >= suffix.len and
-            std.mem.eql(u8, sec_name[sec_name.len - suffix.len ..], suffix) and
-            std.mem.startsWith(u8, sec_name, prefix);
+        const is_prefixed = std.mem.startsWith(u8, sec_name, prefix);
         const is_bare = std.mem.eql(u8, sec_name, "component-type");
-        if (!is_encoded_world and !is_bare) continue;
+        if (!is_prefixed and !is_bare) continue;
         return body[n.bytes_read + name_len ..];
     }
     return null;
@@ -267,8 +271,15 @@ fn buildMockEncodedWorld(allocator: Allocator) ![]u8 {
 /// world` custom section appended to a minimal core wasm preamble —
 /// produces a freestanding "adapter-shaped" core wasm for tests.
 fn wrapAsAdapterCore(allocator: Allocator, ct_payload: []const u8) ![]u8 {
+    return wrapAsAdapterCoreNamed(allocator, ct_payload, "component-type:mock:encoded world");
+}
+
+/// Like `wrapAsAdapterCore` but parameterized over the custom-section
+/// name. Used to exercise both the wit-bindgen `:encoded world`
+/// suffix form and the `wasm-tools component embed`-style
+/// `component-type:<world>` form.
+fn wrapAsAdapterCoreNamed(allocator: Allocator, ct_payload: []const u8, sec_name: []const u8) ![]u8 {
     const preamble = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
-    const sec_name = "component-type:mock:encoded world";
     var name_leb: [leb128.max_u32_bytes]u8 = undefined;
     const name_leb_n = leb128.writeU32Leb128(&name_leb, @intCast(sec_name.len));
     const body_len = name_leb_n + sec_name.len + ct_payload.len;
@@ -294,6 +305,27 @@ test "extractEncodedWorld: matches by suffix and prefix" {
     const found = try extractEncodedWorld(core);
     try testing.expect(found != null);
     try testing.expectEqualSlices(u8, ct, found.?);
+}
+
+// Issue #131: `wasm-tools component embed --world <w>` (and our own
+// `wabt component embed`) emit the encoded-world section as
+// `component-type:<world>` (no `:encoded world` suffix). Confirm we
+// recognize it and return the payload unchanged.
+test "extractEncodedWorld: matches wasm-tools embed `component-type:<world>` form" {
+    const ct = try buildMockEncodedWorld(testing.allocator);
+    defer testing.allocator.free(ct);
+
+    inline for (.{
+        "component-type:app",
+        "component-type:command",
+        "component-type:wt",
+    }) |sec_name| {
+        const core = try wrapAsAdapterCoreNamed(testing.allocator, ct, sec_name);
+        defer testing.allocator.free(core);
+        const found = try extractEncodedWorld(core);
+        try testing.expect(found != null);
+        try testing.expectEqualSlices(u8, ct, found.?);
+    }
 }
 
 test "extractEncodedWorld: rejects non-adapter custom sections" {
