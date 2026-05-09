@@ -441,9 +441,18 @@ const Reader = struct {
             const mut_byte = try self.readByte();
             if (mut_byte > 1) return error.InvalidType;
             const mutability: types.Mutability = if (mut_byte != 0) .mutable else .immutable;
-            try self.skipInitExpr();
+            // Capture the init expression bytes so the global can
+            // round-trip through the writer. The writer appends its
+            // own trailing 0x0b, so we strip the terminator here.
+            const expr_with_end = try self.readInitExprBytes();
+            const expr_body: []const u8 = if (expr_with_end.len > 0)
+                expr_with_end[0 .. expr_with_end.len - 1]
+            else
+                expr_with_end;
             try self.module.globals.append(self.allocator, .{
                 .type = .{ .val_type = val_type, .mutability = mutability },
+                .init_expr_bytes = expr_body,
+                .owns_init_expr_bytes = false,
             });
         }
     }
