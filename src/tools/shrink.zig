@@ -87,7 +87,14 @@ pub const PredicateRunner = struct {
             .io = io,
             .predicate = predicate,
             .tmp_dir = tmp,
-            .pid = std.os.linux.getpid(),
+            // wasm32-wasi has no PID concept and `std.os.linux.getpid()`
+            // fails to compile there (no `syscall0`). Since `pid` is only
+            // a tmp-filename uniqueness hint within one process, fall
+            // back to a constant on wasi. Fixes #135.
+            .pid = if (@import("builtin").os.tag == .wasi)
+                1
+            else
+                std.os.linux.getpid(),
         };
     }
 
