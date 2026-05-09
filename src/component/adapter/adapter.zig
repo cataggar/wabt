@@ -113,9 +113,10 @@ pub fn splice(
     defer pristine_iface.deinit();
 
     const live_namespaces = try collectLiveNamespaces(a, pristine_iface.interface);
+    const live_methods_by_namespace = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
     const live_export_names = try collectLiveExportNames(a, pristine_world);
 
-    const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_export_names);
+    const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_methods_by_namespace, live_export_names);
     const gc_bytes = try world_gc.replaceEncodedWorldSection(a, gc_bytes_initial, gc_world_result.payload_bytes);
 
     // ── Phase A: decode + classify ─────────────────────────────────────────
@@ -193,6 +194,94 @@ fn collectLiveNamespaces(
         if (!gop.found_existing) try out.append(arena, im.module_name);
     }
     return out.toOwnedSlice(arena);
+}
+
+/// For each live WASI namespace, collect the set of canon-ABI lowered
+/// names the GC'd adapter still imports from it. Each name is one of:
+///
+///   * `[method]<resource>.<name>`
+///   * `[static]<resource>.<name>`
+///   * `[constructor]<resource>`
+///   * `[resource-drop]<resource>` / `[resource-new]<resource>` /
+///     `[resource-rep]<resource>`
+///   * a bare iface-level function name (no `[…]` prefix).
+///
+/// These match the corresponding `.@"export" '<name>'` decls inside
+/// each namespace's instance-type body in the encoded world. Any
+/// `[*]<resource>*` form contributes `<resource>` to the per-namespace
+/// resource set so that resource-only dependencies (e.g. an embed
+/// that only `resource-drop`s a handle without calling any method) are
+/// still anchored.
+fn collectLiveMethodsByNamespace(
+    arena: Allocator,
+    adapter_iface: core_imports.CoreInterface,
+) SpliceError![]const world_gc.LiveMethodSet {
+    const NamespaceBuilder = struct {
+        namespace: []const u8,
+        methods: std.ArrayListUnmanaged([]const u8),
+        method_seen: std.StringHashMapUnmanaged(void),
+        type_exports: std.ArrayListUnmanaged([]const u8),
+        type_export_seen: std.StringHashMapUnmanaged(void),
+    };
+
+    var by_ns = std.StringArrayHashMapUnmanaged(NamespaceBuilder).empty;
+    defer by_ns.deinit(arena);
+
+    for (adapter_iface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, "env")) continue;
+        if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
+
+        const gop = try by_ns.getOrPut(arena, im.module_name);
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .namespace = im.module_name,
+            .methods = .empty,
+            .method_seen = .empty,
+            .type_exports = .empty,
+            .type_export_seen = .empty,
+        };
+        const b = gop.value_ptr;
+
+        const method_gop = try b.method_seen.getOrPut(arena, im.field_name);
+        if (!method_gop.found_existing) try b.methods.append(arena, im.field_name);
+
+        if (extractResourceName(im.field_name)) |rname| {
+            const t_gop = try b.type_export_seen.getOrPut(arena, rname);
+            if (!t_gop.found_existing) try b.type_exports.append(arena, rname);
+        }
+    }
+
+    var out = try arena.alloc(world_gc.LiveMethodSet, by_ns.count());
+    var i: usize = 0;
+    var it = by_ns.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{
+            .namespace = entry.value_ptr.namespace,
+            .methods = try entry.value_ptr.methods.toOwnedSlice(arena),
+            .type_exports = try entry.value_ptr.type_exports.toOwnedSlice(arena),
+        };
+    }
+    return out;
+}
+
+/// Recover the resource name from a canon-ABI lowered field name.
+/// Returns null for bare iface-level functions (no `[<tag>]` prefix).
+fn extractResourceName(field_name: []const u8) ?[]const u8 {
+    if (field_name.len == 0 or field_name[0] != '[') return null;
+    const close = std.mem.indexOfScalar(u8, field_name, ']') orelse return null;
+    const tag = field_name[1..close];
+    const rest = field_name[close + 1 ..];
+    if (std.mem.eql(u8, tag, "method") or std.mem.eql(u8, tag, "static")) {
+        const dot = std.mem.indexOfScalar(u8, rest, '.') orelse return null;
+        return rest[0..dot];
+    }
+    if (std.mem.eql(u8, tag, "constructor") or
+        std.mem.eql(u8, tag, "resource-drop") or
+        std.mem.eql(u8, tag, "resource-new") or
+        std.mem.eql(u8, tag, "resource-rep"))
+    {
+        return rest;
+    }
+    return null;
 }
 
 /// All world body exports are live by construction — the splicer
