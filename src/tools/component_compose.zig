@@ -382,7 +382,7 @@ pub fn composeBinaries(
 
         try exports_list.append(ar, .{
             .name = exp.name,
-            .desc = exp.desc,
+            .desc = unascribedReexportDesc(sort_idx_in.sort, slot_idx, exp.desc),
             .sort_idx = .{ .sort = sort_idx_in.sort, .idx = slot_idx },
         });
     }
@@ -816,6 +816,41 @@ fn synthSortFromExport(exp: ctypes.ExportDecl) ctypes.SortIdx {
         .type => .{ .sort = .type, .idx = 0 },
         .component => .{ .sort = .component, .idx = 0 },
         .instance => .{ .sort = .instance, .idx = 0 },
+    };
+}
+
+/// Re-export from the wrapper's outer indexspace. The consumer's
+/// `desc` carries a type bound that references the consumer's type
+/// indexspace (e.g. `(instance N)` where N is a consumer-side type
+/// idx). The wrapper's type space holds only the BFS closure of types
+/// reachable from unresolved **imports** — consumer export type
+/// bounds are never materialised, so emitting `desc` verbatim
+/// produces an out-of-bounds type reference at the wrapper's export
+/// section (#132).
+///
+/// `wasm-tools compose` solves this by emitting the un-ascribed
+/// (`ty: None`) form: the export's type is re-derived at validation
+/// time from the alias target's sort+name. This matches.
+///
+/// `writer.descMatchesSort` returns true — and the writer takes the
+/// 0x00 un-ascribed path — exactly when:
+///   * sort=.instance / .func / .component AND desc is `.X(0)`, or
+///   * sort=.type AND desc is `.type(.eq(slot_idx))`.
+///
+/// For sorts without an un-ascribed encoding (`.value`, `.core.*`,
+/// `.module`) we keep the original desc — those paths don't trigger
+/// #132 in any embed shape we produce.
+fn unascribedReexportDesc(
+    sort: ctypes.Sort,
+    slot_idx: u32,
+    original: ctypes.ExternDesc,
+) ctypes.ExternDesc {
+    return switch (sort) {
+        .instance => .{ .instance = 0 },
+        .func => .{ .func = 0 },
+        .component => .{ .component = 0 },
+        .type => .{ .type = .{ .eq = slot_idx } },
+        .value, .core => original,
     };
 }
 
@@ -1291,4 +1326,60 @@ test "composeBinaries: replicates alias-of-instance-export resource binding (#12
     }
     try testing.expect(found_error_imp);
     try testing.expect(found_streams_imp);
+}
+
+test "composeBinaries: re-export desc is un-ascribed (#132)" {
+    // Regression for #132: the wrapper used to copy each consumer
+    // export's `desc` verbatim into the wrapper's export decl. The
+    // desc carries a type bound (e.g. `(instance N)`) referencing
+    // the consumer's type indexspace — but the wrapper only
+    // materialises types reachable from unresolved **imports**, so
+    // the desc's idx dangled past the wrapper's type space. Validators
+    // rejected the result with "unknown type N: type index out of
+    // bounds" at the export section.
+    //
+    // Fix: substitute a sort-matched un-ascribed desc placeholder so
+    // the writer's `descMatchesSort` returns true and emits the 0x00
+    // form (`ty: None` in `wasm-tools dump`).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer: no imports, one instance export whose desc references
+    // a high consumer-side type idx (99) — far past the wrapper's
+    // (empty) type space. The export's sort_idx is the consumer's
+    // own instance idx (synthesized by the writer's loader).
+    const cons_instances = [_]ctypes.InstanceExpr{.{ .exports = &.{} }};
+    const cons_exports = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:cli/run@0.2.6",
+            .desc = .{ .instance = 99 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &cons_instances, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &.{}, .exports = &cons_exports,
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const empty_providers: []const []u8 = &.{};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, empty_providers);
+    defer testing.allocator.free(composed);
+
+    // Round-trips through our own loader.
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+    try testing.expectEqual(@as(usize, 1), loaded.exports.len);
+    try testing.expectEqualStrings("wasi:cli/run@0.2.6", loaded.exports[0].name);
+    try testing.expect(loaded.exports[0].desc == .instance);
+    // Un-ascribed form (0x00 after sort_idx) is the only path through
+    // the loader that yields `desc.instance == 0` here — the consumer
+    // had stamped the original desc with idx 99, so any round-trip
+    // through the explicit (0x01) form would surface that 99 in the
+    // loaded desc. Seeing 0 proves the writer took the 0x00 path,
+    // which is exactly what wasm-tools-compose does (`ty: None`).
+    try testing.expectEqual(@as(u32, 0), loaded.exports[0].desc.instance);
 }
