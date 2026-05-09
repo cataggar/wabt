@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt print [options] <file.wasm>
+    \\Usage: wabt text print [options] <file.wasm>
     \\
     \\Print a WebAssembly binary as WebAssembly text format.
     \\

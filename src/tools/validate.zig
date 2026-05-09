@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt validate [options] <file.wasm>
+    \\Usage: wabt module validate [options] <file.wasm>
     \\
     \\Validate a WebAssembly binary.  Both core modules
     \\(preamble \0asm 01 00 00 00) and components

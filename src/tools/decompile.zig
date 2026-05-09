@@ -2,7 +2,7 @@ const std = @import("std");
 const wabt = @import("wabt");
 
 pub const usage =
-    \\Usage: wabt decompile [options] <file.wasm>
+    \\Usage: wabt module decompile [options] <file.wasm>
     \\
     \\Decompile a WebAssembly binary into readable C-like pseudo-code.
     \\

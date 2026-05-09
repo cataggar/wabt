@@ -5,7 +5,7 @@ const Parser = wabt.text.Parser;
 const writer = wabt.binary.writer;
 
 pub const usage =
-    \\Usage: wabt json-from-wast [options] <file.wast>
+    \\Usage: wabt spec to-json [options] <file.wast>
     \\
     \\Convert a `*.wast` WebAssembly spec test into a `*.json` file
     \\and associated `*.wasm` binaries.
