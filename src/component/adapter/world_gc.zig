@@ -75,11 +75,51 @@ pub const Result = struct {
     payload_bytes: []const u8,
 };
 
+/// Per-namespace live-method/type-export information used to prune
+/// instance-type bodies inside the encoded world.
+///
+/// `methods` is the set of method/value `.@"export"` names in the
+/// instance body that must survive — using the same canon-ABI naming
+/// convention the adapter's core wasm imports use
+/// (`[method]<resource>.<name>`, `[constructor]<resource>`,
+/// `[static]<resource>.<name>`, or a bare iface-level function name).
+///
+/// `type_exports` is the set of type-kind export names that must
+/// survive — both resource exports (`'X' desc=type=sub_resource`) and
+/// type-aliases (`'X' desc=type=eq(N)` for record/variant/etc.). The
+/// caller derives these from:
+///
+///   * resource names referenced via the canon-ABI hooks
+///     (`[resource-drop]X`, `[constructor]X`, `[method]X.*`,
+///     `[static]X.*`, `[resource-new]X`, `[resource-rep]X`);
+///   * cross-body `inst_export` aliases at world-body level — any
+///     `.alias inst_export inst=K name='Y'` where instance K imports
+///     this namespace anchors `Y` so that consumers of the type
+///     (e.g. `wasi:filesystem/types`'s outer alias to
+///     `wasi:clocks/wall-clock`'s `datetime`) keep working after
+///     methods drop.
+pub const LiveMethodSet = struct {
+    namespace: []const u8,
+    methods: []const []const u8,
+    type_exports: []const []const u8,
+};
+
 /// GC the world.
 ///
 /// `live_namespaces` is the set of import names that must survive
 /// (e.g. `wasi:cli/environment@0.2.6`) — usually computed from the
 /// GC'd adapter core wasm's actual `module_name`s.
+///
+/// `live_methods_by_namespace` is the per-namespace function-level
+/// liveness — the set of `(method, resource)` names that must
+/// survive inside each surviving namespace's instance type body.
+/// Pass an empty slice to keep all methods of every surviving
+/// namespace (the legacy behaviour). When provided, the function
+/// runs an instance-body GC pre-pass that drops dead methods plus
+/// their type-deps and resource exports, which in turn lets the
+/// world-body fixed-point drop any imports that were only kept
+/// alive by transitive references from the now-dead methods (e.g.
+/// `wasi:io/poll` once `subscribe` is dropped from `wasi:io/streams`).
 ///
 /// `live_export_names` is the set of body-level export names that
 /// must survive (e.g. `wasi:cli/run@0.2.6`). For the wasi-preview1
@@ -92,23 +132,34 @@ pub fn gcWorld(
     arena: Allocator,
     world: decode.AdapterWorld,
     live_namespaces: []const []const u8,
+    live_methods_by_namespace: []const LiveMethodSet,
     live_export_names: []const []const u8,
 ) Error!Result {
+    // ── Step 0: instance-body GC pre-pass ─────────────────────────────────
+    //
+    // Replace each `.type = .{ .instance = … }` body decl whose
+    // matching import is in `live_namespaces` with a pruned variant
+    // that only retains methods (and type-deps) listed in
+    // `live_methods_by_namespace`. The world-body fixed-point below
+    // then sees the smaller outer-alias set and naturally drops any
+    // imports that have become unreferenced.
+    const pruned_body_decls = try pruneInstanceBodies(arena, world.body_decls, live_methods_by_namespace);
+
     // ── Step 1: per-decl metadata pre-pass ────────────────────────────────
-    const meta = try buildDeclMeta(arena, world.body_decls);
+    const meta = try buildDeclMeta(arena, pruned_body_decls);
 
     // ── Step 2: liveness ──────────────────────────────────────────────────
-    var live_decls = try std.DynamicBitSetUnmanaged.initEmpty(arena, world.body_decls.len);
+    var live_decls = try std.DynamicBitSetUnmanaged.initEmpty(arena, pruned_body_decls.len);
     var live_types = try std.DynamicBitSetUnmanaged.initEmpty(arena, world.body_type_count);
     // Instance count: number of imports (matching decode's bookkeeping).
     var inst_count: u32 = 0;
-    for (world.body_decls) |d| if (d == .import) {
+    for (pruned_body_decls) |d| if (d == .import) {
         inst_count += 1;
     };
     var live_inst = try std.DynamicBitSetUnmanaged.initEmpty(arena, inst_count);
 
     // Seed: imports/exports matching the live name sets.
-    for (world.body_decls, 0..) |d, i| {
+    for (pruned_body_decls, 0..) |d, i| {
         switch (d) {
             .import => |im| {
                 if (containsName(live_namespaces, im.name)) live_decls.set(i);
@@ -128,7 +179,7 @@ pub fn gcWorld(
         changed = false;
 
         // Propagate refs of live decls.
-        for (world.body_decls, 0..) |_, i| {
+        for (pruned_body_decls, 0..) |_, i| {
             if (!live_decls.isSet(i)) continue;
             for (meta[i].type_refs) |t| {
                 if (t < live_types.bit_length and !live_types.isSet(t)) {
@@ -145,7 +196,7 @@ pub fn gcWorld(
         }
 
         // Live indexspace slots → mark the producing decl live.
-        for (world.body_decls, 0..) |_, i| {
+        for (pruned_body_decls, 0..) |_, i| {
             if (live_decls.isSet(i)) continue;
             const m = meta[i];
             const become_live = blk: {
@@ -168,7 +219,7 @@ pub fn gcWorld(
 
     var new_type_cursor: u32 = 0;
     var new_inst_cursor: u32 = 0;
-    for (world.body_decls, 0..) |_, i| {
+    for (pruned_body_decls, 0..) |_, i| {
         if (!live_decls.isSet(i)) continue;
         const m = meta[i];
         if (m.type_slot) |t| {
@@ -183,7 +234,7 @@ pub fn gcWorld(
 
     // ── Step 4: deep-clone surviving decls with rewritten operands ────────
     var new_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
-    for (world.body_decls, 0..) |d, i| {
+    for (pruned_body_decls, 0..) |d, i| {
         if (!live_decls.isSet(i)) continue;
         const cloned = try cloneDecl(arena, d, type_remap, inst_remap);
         try new_decls.append(arena, cloned);
@@ -270,6 +321,364 @@ fn buildDeclMeta(arena: Allocator, decls: []const ctypes.Decl) Error![]const Dec
     }
 
     return out;
+}
+
+// ── Instance-body GC pre-pass ──────────────────────────────────────────────
+
+/// Walk the world body and replace each `.type = .{ .instance = … }`
+/// decl whose matching `.import` is in `live_methods_by_namespace`
+/// with a pruned variant that only retains the listed methods (and
+/// their type-deps + resource exports).
+///
+/// Returns `body_decls` unchanged when the live-methods set is empty
+/// or no namespace matches. Otherwise allocates and returns a new
+/// slice of decls; nested unmodified decls are aliased verbatim.
+fn pruneInstanceBodies(
+    arena: Allocator,
+    body_decls: []const ctypes.Decl,
+    live_methods_by_namespace: []const LiveMethodSet,
+) Error![]const ctypes.Decl {
+    // No live-methods provided ⇒ legacy mode: skip the pre-pass
+    // entirely. Once the caller opts in by providing any entry the
+    // prune runs over every namespace's body.
+    if (live_methods_by_namespace.len == 0) return body_decls;
+
+    // Map world-body type slot → idx of decl that produces it. Only
+    // type-producing decls (`.type`, `.alias` of sort=type) populate
+    // the world-body type indexspace — match `buildDeclMeta`.
+    var type_cursor: u32 = 0;
+    var slot_count: u32 = 0;
+    for (body_decls) |d| if (allocatesWorldBodyTypeSlot(d)) {
+        slot_count += 1;
+    };
+    var slot_to_decl = try arena.alloc(usize, slot_count);
+    for (body_decls, 0..) |d, i| {
+        if (allocatesWorldBodyTypeSlot(d)) {
+            slot_to_decl[type_cursor] = i;
+            type_cursor += 1;
+        }
+    }
+
+    // Build the import-instance → namespace map (instance idxspace
+    // is populated in import-decl order).
+    var inst_to_namespace = std.ArrayListUnmanaged([]const u8).empty;
+    for (body_decls) |d| if (d == .import) {
+        try inst_to_namespace.append(arena, d.import.name);
+    };
+
+    // Augment the caller's live-set with cross-body `inst_export`
+    // anchors: any world-body `.alias inst_export inst=K name='Y'`
+    // means a consumer outside instance K's body references export
+    // 'Y' by name. We must keep that export alive inside the body
+    // for the alias to resolve. Aliases of `sort=type` anchor
+    // `type_exports`; aliases of any other sort anchor `methods`.
+    const Builder = struct {
+        namespace: []const u8,
+        methods: std.ArrayListUnmanaged([]const u8),
+        method_seen: std.StringHashMapUnmanaged(void),
+        type_exports: std.ArrayListUnmanaged([]const u8),
+        type_export_seen: std.StringHashMapUnmanaged(void),
+    };
+    var by_ns = std.StringArrayHashMapUnmanaged(Builder).empty;
+    defer by_ns.deinit(arena);
+
+    for (live_methods_by_namespace) |s| {
+        const gop = try by_ns.getOrPut(arena, s.namespace);
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .namespace = s.namespace,
+            .methods = .empty,
+            .method_seen = .empty,
+            .type_exports = .empty,
+            .type_export_seen = .empty,
+        };
+        const b = gop.value_ptr;
+        for (s.methods) |m| {
+            const m_gop = try b.method_seen.getOrPut(arena, m);
+            if (!m_gop.found_existing) try b.methods.append(arena, m);
+        }
+        for (s.type_exports) |t| {
+            const t_gop = try b.type_export_seen.getOrPut(arena, t);
+            if (!t_gop.found_existing) try b.type_exports.append(arena, t);
+        }
+    }
+
+    for (body_decls) |d| {
+        if (d != .alias) continue;
+        const a = d.alias;
+        if (a != .instance_export) continue;
+        const ie = a.instance_export;
+        if (ie.instance_idx >= inst_to_namespace.items.len) continue;
+        const ns = inst_to_namespace.items[ie.instance_idx];
+        const gop = try by_ns.getOrPut(arena, ns);
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .namespace = ns,
+            .methods = .empty,
+            .method_seen = .empty,
+            .type_exports = .empty,
+            .type_export_seen = .empty,
+        };
+        const b = gop.value_ptr;
+        switch (ie.sort) {
+            .type => {
+                const t_gop = try b.type_export_seen.getOrPut(arena, ie.name);
+                if (!t_gop.found_existing) try b.type_exports.append(arena, ie.name);
+            },
+            else => {
+                const m_gop = try b.method_seen.getOrPut(arena, ie.name);
+                if (!m_gop.found_existing) try b.methods.append(arena, ie.name);
+            },
+        }
+    }
+
+    var augmented = try arena.alloc(LiveMethodSet, by_ns.count());
+    {
+        var idx: usize = 0;
+        var it = by_ns.iterator();
+        while (it.next()) |entry| : (idx += 1) {
+            augmented[idx] = .{
+                .namespace = entry.value_ptr.namespace,
+                .methods = entry.value_ptr.methods.items,
+                .type_exports = entry.value_ptr.type_exports.items,
+            };
+        }
+    }
+
+    // For each .import decl in the body, queue its instance-type def
+    // for pruning. Namespaces present in the augmented set get their
+    // explicit method/type-export anchors; namespaces with no live
+    // anchors get an empty set — every method drops, only
+    // transitively-referenced types survive the body fixed-point.
+    // The world-body GC then drops imports whose body became fully
+    // unused.
+    var prune_targets = std.AutoHashMapUnmanaged(usize, LiveMethodSet).empty;
+    defer prune_targets.deinit(arena);
+    for (body_decls) |d| {
+        if (d != .import) continue;
+        const im = d.import;
+        const inst_type_idx = switch (im.desc) {
+            .instance => |idx| idx,
+            else => continue,
+        };
+        if (inst_type_idx >= slot_to_decl.len) continue;
+        const set = findLiveMethodSet(augmented, im.name) orelse
+            LiveMethodSet{ .namespace = im.name, .methods = &.{}, .type_exports = &.{} };
+        try prune_targets.put(arena, slot_to_decl[inst_type_idx], set);
+    }
+
+    if (prune_targets.count() == 0) return body_decls;
+
+    const out = try arena.alloc(ctypes.Decl, body_decls.len);
+    for (body_decls, out, 0..) |d, *dst, i| {
+        if (prune_targets.get(i)) |set| {
+            const old_inst = switch (d) {
+                .type => |td| switch (td) {
+                    .instance => |ii| ii,
+                    else => return error.UnsupportedAdapterShape,
+                },
+                else => return error.UnsupportedAdapterShape,
+            };
+            const new_decls = try gcInstanceBody(arena, old_inst.decls, set.methods, set.type_exports);
+            dst.* = .{ .type = .{ .instance = .{ .decls = new_decls } } };
+        } else {
+            dst.* = d;
+        }
+    }
+    return out;
+}
+
+fn allocatesWorldBodyTypeSlot(d: ctypes.Decl) bool {
+    return switch (d) {
+        .type => true,
+        .alias => |a| switch (a) {
+            .instance_export => |ie| ie.sort == .type,
+            .outer => |o| o.sort == .type,
+        },
+        else => false,
+    };
+}
+
+fn findLiveMethodSet(sets: []const LiveMethodSet, namespace: []const u8) ?LiveMethodSet {
+    for (sets) |s| {
+        if (std.mem.eql(u8, s.namespace, namespace)) return s;
+    }
+    return null;
+}
+
+const InstBodyMeta = struct {
+    /// Local type slot allocated by this decl in the body's type
+    /// indexspace, or null if the decl doesn't produce a slot.
+    local_type_slot: ?u32 = null,
+    /// References into the local type indexspace (depth-1).
+    local_refs: []const u32 = &.{},
+    /// What kind of `.@"export"` decl this is (for liveness seeding).
+    name_kind: NameKind = .none,
+
+    const NameKind = enum { none, method, type_export };
+};
+
+/// GC the body of a single instance type. Mirrors `gcWorld` but at
+/// depth 1 with a local type indexspace.
+fn gcInstanceBody(
+    arena: Allocator,
+    decls: []const ctypes.Decl,
+    live_methods: []const []const u8,
+    live_type_exports: []const []const u8,
+) Error![]const ctypes.Decl {
+    // ── Pass 1: per-decl meta ─────────────────────────────────────────────
+    const meta = try arena.alloc(InstBodyMeta, decls.len);
+    var type_cursor: u32 = 0;
+    for (decls, 0..) |d, i| {
+        var refs = std.ArrayListUnmanaged(u32).empty;
+        var slot: ?u32 = null;
+        var kind: InstBodyMeta.NameKind = .none;
+        switch (d) {
+            .core_type => return error.UnsupportedAdapterShape,
+            .type => |td| {
+                slot = type_cursor;
+                type_cursor += 1;
+                // Local refs: collectTypeDefRefs at depth=0 returns
+                // refs into the type indexspace at the same depth as
+                // the call site. Treating the body as view-depth-0
+                // makes its own typespace the "world body" in this
+                // helper's eyes.
+                try collectTypeDefRefs(arena, td, &refs, 0);
+            },
+            .alias => |a| switch (a) {
+                .instance_export => |ie| {
+                    if (ie.sort == .type) {
+                        slot = type_cursor;
+                        type_cursor += 1;
+                    }
+                },
+                .outer => |o| {
+                    if (o.sort == .type) {
+                        slot = type_cursor;
+                        type_cursor += 1;
+                    }
+                    // outer_count=1 (depth=1 → world body) refs the
+                    // world body — NOT local to this body. Only
+                    // outer_count=0 (rare; refers back to this body)
+                    // contributes a local ref.
+                    if (o.outer_count == 0 and o.sort == .type) {
+                        try refs.append(arena, o.idx);
+                    }
+                },
+            },
+            // Imports inside an instance-type body are not part of
+            // the WASI adapter shape; bail rather than guess.
+            .import => return error.UnsupportedAdapterShape,
+            .@"export" => |e| switch (e.desc) {
+                .type => |tb| {
+                    slot = type_cursor;
+                    type_cursor += 1;
+                    kind = .type_export;
+                    switch (tb) {
+                        .eq => |idx| try refs.append(arena, idx),
+                        .sub_resource => {},
+                    }
+                },
+                else => {
+                    kind = .method;
+                    try collectExternDescRefsAtDepth(arena, e.desc, &refs, 0);
+                },
+            },
+        }
+        meta[i] = .{
+            .local_type_slot = slot,
+            .local_refs = try refs.toOwnedSlice(arena),
+            .name_kind = kind,
+        };
+    }
+    const total_slots = type_cursor;
+
+    // ── Pass 2: seed liveness ─────────────────────────────────────────────
+    var live_decls = try std.DynamicBitSetUnmanaged.initEmpty(arena, decls.len);
+    var live_slots = try std.DynamicBitSetUnmanaged.initEmpty(arena, total_slots);
+    for (decls, 0..) |d, i| {
+        if (d != .@"export") continue;
+        const e = d.@"export";
+        switch (meta[i].name_kind) {
+            .method => {
+                if (containsName(live_methods, e.name)) live_decls.set(i);
+            },
+            .type_export => {
+                // Both resource and eq type exports are anchored
+                // when they appear in `live_type_exports` (typically
+                // populated from `[*]<resource>*` adapter imports
+                // and from cross-body `inst_export` aliases).
+                if (containsName(live_type_exports, e.name)) live_decls.set(i);
+            },
+            .none => {},
+        }
+    }
+
+    // ── Pass 3: fixed-point ───────────────────────────────────────────────
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (decls, 0..) |_, i| {
+            if (!live_decls.isSet(i)) continue;
+            for (meta[i].local_refs) |r| {
+                if (r < live_slots.bit_length and !live_slots.isSet(r)) {
+                    live_slots.set(r);
+                    changed = true;
+                }
+            }
+        }
+        for (decls, 0..) |_, i| {
+            if (live_decls.isSet(i)) continue;
+            const m = meta[i];
+            if (m.local_type_slot) |s| {
+                if (s < live_slots.bit_length and live_slots.isSet(s)) {
+                    live_decls.set(i);
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    // ── Pass 4: build local remap and emit new decls ─────────────────────
+    const local_remap = try arena.alloc(u32, total_slots);
+    @memset(local_remap, SENTINEL);
+    var new_cursor: u32 = 0;
+    for (decls, 0..) |_, i| {
+        if (!live_decls.isSet(i)) continue;
+        if (meta[i].local_type_slot) |s| {
+            local_remap[s] = new_cursor;
+            new_cursor += 1;
+        }
+    }
+
+    var out = std.ArrayListUnmanaged(ctypes.Decl).empty;
+    try out.ensureUnusedCapacity(arena, decls.len);
+    for (decls, 0..) |d, i| {
+        if (!live_decls.isSet(i)) continue;
+        try out.append(arena, try cloneInstBodyDeclLocal(arena, d, local_remap));
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Clone a single decl at view-depth-0 with a local type remap. Used
+/// by `gcInstanceBody` to renumber the body-local type indexspace.
+/// Outer aliases at `outer_count == 1` (the world body) are left
+/// verbatim — the outer world-body GC pass will rewrite their `idx`
+/// operand later if the world body itself is renumbered.
+fn cloneInstBodyDeclLocal(
+    arena: Allocator,
+    d: ctypes.Decl,
+    local_remap: []const u32,
+) Error!ctypes.Decl {
+    return switch (d) {
+        .core_type => error.UnsupportedAdapterShape,
+        .type => |td| .{ .type = try cloneTypeDef(arena, td, local_remap, 0) },
+        .alias => |a| .{ .alias = try cloneInstanceBodyAlias(arena, a, local_remap, 0) },
+        .import => error.UnsupportedAdapterShape,
+        .@"export" => |e| .{ .@"export" = .{
+            .name = try arena.dupe(u8, e.name),
+            .desc = try cloneExternDesc(arena, e.desc, local_remap, 0),
+            .sort_idx = e.sort_idx,
+        } },
+    };
 }
 
 /// Collect type-idx refs from a type def. `depth` is the nesting
@@ -818,7 +1227,7 @@ test "gcWorld: drops unused imports, keeps live ones" {
     const live_ns: []const []const u8 = &.{"mock:adapter/in2@0.1.0"};
     const live_ex: []const []const u8 = &.{"mock:adapter/out@0.1.0"};
 
-    const result = try gcWorld(a, world, live_ns, live_ex);
+    const result = try gcWorld(a, world, live_ns, &.{}, live_ex);
 
     // Imports: only in2 should remain.
     try testing.expectEqual(@as(usize, 1), result.world.imports.len);
@@ -847,7 +1256,7 @@ test "gcWorld: empty live-namespace set yields export-only world" {
 
     const world = try decode.parse(a, ct);
 
-    const result = try gcWorld(a, world, &.{}, &.{"mock:adapter/out@0.1.0"});
+    const result = try gcWorld(a, world, &.{}, &.{}, &.{"mock:adapter/out@0.1.0"});
 
     try testing.expectEqual(@as(usize, 0), result.world.imports.len);
     try testing.expectEqual(@as(usize, 1), result.world.exports.len);
@@ -867,6 +1276,7 @@ test "gcWorld: bogus live name (not in world) is silently ignored" {
         a,
         world,
         &.{ "mock:adapter/in1@0.1.0", "wasi:does-not-exist@9.9.9" },
+        &.{},
         &.{"mock:adapter/out@0.1.0"},
     );
 
@@ -888,6 +1298,7 @@ test "gcWorld: keeps all imports when all are live" {
         a,
         world,
         &.{ "mock:adapter/in1@0.1.0", "mock:adapter/in2@0.1.0", "mock:adapter/in3@0.1.0" },
+        &.{},
         &.{"mock:adapter/out@0.1.0"},
     );
 
@@ -914,6 +1325,7 @@ test "gcWorld: renumbers instance and type idx in surviving imports" {
         a,
         world,
         &.{"mock:adapter/in2@0.1.0"},
+        &.{},
         &.{"mock:adapter/out@0.1.0"},
     );
 
@@ -939,7 +1351,7 @@ test "gcWorld: payload bytes round-trip through replaceEncodedWorldSection" {
     const adapter_core = try wrapAsAdapterCore(a, ct);
 
     const world = try decode.parse(a, ct);
-    const result = try gcWorld(a, world, &.{"mock:adapter/in2@0.1.0"}, &.{"mock:adapter/out@0.1.0"});
+    const result = try gcWorld(a, world, &.{"mock:adapter/in2@0.1.0"}, &.{}, &.{"mock:adapter/out@0.1.0"});
 
     const new_core = try replaceEncodedWorldSection(a, adapter_core, result.payload_bytes);
     // The new core should still parse cleanly and yield the GC'd world.
@@ -965,4 +1377,189 @@ fn wrapAsAdapterCore(arena: Allocator, ct_payload: []const u8) ![]u8 {
     out.appendSliceAssumeCapacity(sec_name);
     out.appendSliceAssumeCapacity(ct_payload);
     return out.toOwnedSlice(arena);
+}
+
+const multi_method_world =
+    \\package mock:adapter@0.1.0;
+    \\
+    \\interface multi {
+    \\    alpha: func() -> u32;
+    \\    beta: func() -> u32;
+    \\    gamma: func() -> u32;
+    \\}
+    \\interface out { run: func() -> u32; }
+    \\
+    \\world adapter-multi {
+    \\    import multi;
+    \\    export out;
+    \\}
+;
+
+fn countMethodsInImportedInstance(world: decode.AdapterWorld, import_name: []const u8) ?usize {
+    for (world.imports) |im| {
+        if (!std.mem.eql(u8, im.name, import_name)) continue;
+        // Walk forward to find the instance type def whose slot
+        // matches im.body_type_idx.
+        var cursor: u32 = 0;
+        for (world.body_decls) |d| {
+            const allocates = switch (d) {
+                .type => true,
+                .alias => |a| switch (a) {
+                    .instance_export => |ie| ie.sort == .type,
+                    .outer => |o| o.sort == .type,
+                },
+                else => false,
+            };
+            if (allocates) {
+                if (cursor == im.body_type_idx) {
+                    if (d != .type) return null;
+                    if (d.type != .instance) return null;
+                    var n: usize = 0;
+                    for (d.type.instance.decls) |bd| if (bd == .@"export") {
+                        n += 1;
+                    };
+                    return n;
+                }
+                cursor += 1;
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+test "gcWorld: prunes per-method liveness inside a kept-alive interface" {
+    const ct = try buildMockEncodedWorld(testing.allocator, multi_method_world, "adapter-multi");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const world = try decode.parse(a, ct);
+
+    // Sanity: pristine body has all three methods.
+    try testing.expectEqual(@as(?usize, 3), countMethodsInImportedInstance(world, "mock:adapter/multi@0.1.0"));
+
+    // Live methods: only `alpha` inside `mock:adapter/multi`.
+    const live_methods: []const LiveMethodSet = &.{.{
+        .namespace = "mock:adapter/multi@0.1.0",
+        .methods = &.{"alpha"},
+        .type_exports = &.{},
+    }};
+
+    const result = try gcWorld(
+        a,
+        world,
+        &.{"mock:adapter/multi@0.1.0"},
+        live_methods,
+        &.{"mock:adapter/out@0.1.0"},
+    );
+
+    // Body still has the multi import.
+    try testing.expectEqual(@as(usize, 1), result.world.imports.len);
+    try testing.expectEqualStrings("mock:adapter/multi@0.1.0", result.world.imports[0].name);
+
+    // But its instance type body now has only `alpha`.
+    try testing.expectEqual(
+        @as(?usize, 1),
+        countMethodsInImportedInstance(result.world, "mock:adapter/multi@0.1.0"),
+    );
+}
+
+test "gcWorld: empty live-methods set drops every method while keeping the import" {
+    const ct = try buildMockEncodedWorld(testing.allocator, multi_method_world, "adapter-multi");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const world = try decode.parse(a, ct);
+
+    // Empty live_methods for the namespace: every method should drop.
+    const live_methods: []const LiveMethodSet = &.{.{
+        .namespace = "mock:adapter/multi@0.1.0",
+        .methods = &.{},
+        .type_exports = &.{},
+    }};
+
+    const result = try gcWorld(
+        a,
+        world,
+        &.{"mock:adapter/multi@0.1.0"},
+        live_methods,
+        &.{"mock:adapter/out@0.1.0"},
+    );
+
+    try testing.expectEqual(@as(usize, 1), result.world.imports.len);
+    try testing.expectEqual(
+        @as(?usize, 0),
+        countMethodsInImportedInstance(result.world, "mock:adapter/multi@0.1.0"),
+    );
+}
+
+test "gcWorld: omitted namespace still gets methods pruned (transitive default)" {
+    // No live-methods entry for `mock:adapter/multi` at all — the
+    // pre-pass should still walk its body and drop every method
+    // (defaulting to the empty live-set).
+    const ct = try buildMockEncodedWorld(testing.allocator, multi_method_world, "adapter-multi");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const world = try decode.parse(a, ct);
+
+    // We pass a non-empty `live_methods_by_namespace` for an unrelated
+    // namespace so the pre-pass actually runs. The lack of an entry
+    // for `mock:adapter/multi` means it gets the empty default.
+    const live_methods: []const LiveMethodSet = &.{.{
+        .namespace = "mock:adapter/something-else@0.1.0",
+        .methods = &.{"x"},
+        .type_exports = &.{},
+    }};
+
+    const result = try gcWorld(
+        a,
+        world,
+        &.{"mock:adapter/multi@0.1.0"},
+        live_methods,
+        &.{"mock:adapter/out@0.1.0"},
+    );
+
+    try testing.expectEqual(@as(usize, 1), result.world.imports.len);
+    try testing.expectEqual(
+        @as(?usize, 0),
+        countMethodsInImportedInstance(result.world, "mock:adapter/multi@0.1.0"),
+    );
+}
+
+test "gcWorld: live_methods is a no-op when empty" {
+    // Verifies the legacy behaviour: passing an empty
+    // `live_methods_by_namespace` keeps every method intact (no
+    // body-level prune runs at all).
+    const ct = try buildMockEncodedWorld(testing.allocator, multi_method_world, "adapter-multi");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const world = try decode.parse(a, ct);
+
+    const result = try gcWorld(
+        a,
+        world,
+        &.{"mock:adapter/multi@0.1.0"},
+        &.{},
+        &.{"mock:adapter/out@0.1.0"},
+    );
+
+    try testing.expectEqual(@as(usize, 1), result.world.imports.len);
+    try testing.expectEqual(
+        @as(?usize, 3),
+        countMethodsInImportedInstance(result.world, "mock:adapter/multi@0.1.0"),
+    );
 }
