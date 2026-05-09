@@ -195,10 +195,10 @@ pub fn composeBinaries(
     const num_providers: u32 = @intCast(provider_bytes.len);
     const num_bindings: u32 = @intCast(link.bindings.len);
 
-    // ── Wrapper types: copy each unresolved import's referenced type
-    //    (and its transitive deps) from the consumer into our local
-    //    types[] so the bubbled-up imports + every nested outer-alias
-    //    inside their bodies still resolves to a wrapper-local idx.
+    // ── Wrapper prologue: build the interleaved type / alias / import
+    //    section sequence that establishes the wrapper's outer type
+    //    indexspace before the consumer/provider components are
+    //    declared.
     //
     //    Pre-fix bug 1 (#115/#118, fixed in #119): the wrapper used
     //    to emit an `import` section with `desc.instance(N)`
@@ -213,29 +213,28 @@ pub fn composeBinaries(
     //    materialised in the wrapper. wasm-tools rejected the result
     //    with "type index out of bounds".
     //
-    //    Fix: BFS the transitive consumer-typespace-idx closure from
-    //    each unresolved import's desc, topologically sort it so each
-    //    emitted type's body only references strictly smaller
-    //    wrapper indices, then deep-clone every TypeDef through a
-    //    consumer→wrapper remap so all depth-0 operands (including
-    //    body-level outer aliases inside instance types) hit the
-    //    wrapper's renumbered indexspace. ──
-    const wrapper_types = try buildWrapperTypes(ar, &consumer, link.unresolved);
-    const types_list_items = wrapper_types.types;
-    const type_remap_table = wrapper_types.remap;
-
-    // ── Wrapper imports: rewrite each bubbled-up desc to point at
-    //    wrapper-local type idxs via the same remap table. Names are
-    //    preserved so downstream callers see the same import set the
-    //    consumer had. ──
-    const imports_arr = try ar.alloc(ctypes.ImportDecl, num_unresolved);
-    for (link.unresolved, 0..) |u_idx, i| {
-        const imp = consumer.imports[u_idx];
-        imports_arr[i] = .{
-            .name = imp.name,
-            .desc = try type_walk.cloneExternDesc(ar, imp.desc, type_remap_table, 0),
-        };
-    }
+    //    Pre-fix bug 3 (#129): the wrapper substituted an empty
+    //    instance type for every consumer type-indexspace slot whose
+    //    contributor was an outer-level alias decl, so depth-1 outer
+    //    aliases inside cloned instance-type bodies (`(alias outer 1
+    //    N)`) lost their resource binding. wasm-tools rejected the
+    //    result with "type index N is not a resource type".
+    //
+    //    Fix: walk the consumer's `type_indexspace` in encounter
+    //    order, restricted to slots reachable from unresolved
+    //    imports, and emit each closure slot as a *cloned type def*
+    //    (for `.type_def` contributors) or a *replicated alias decl*
+    //    (for `.alias` contributors). After each emitted type def,
+    //    bubble up any unresolved instance-typed import whose desc
+    //    references that exact slot — this preserves the consumer's
+    //    `type N → import (instance (type N)) → alias …` interleaving
+    //    pattern that wt-component output relies on. ──
+    const prologue = try buildWrapperPrologue(ar, &consumer, link);
+    const types_list_items = prologue.types;
+    const aliases_prologue = prologue.aliases;
+    const imports_arr = prologue.imports;
+    const prologue_section_entries = prologue.section_entries;
+    const num_prologue_aliases: u32 = @intCast(aliases_prologue.len);
 
     // ── Nested components: consumer at idx 0, providers at idx 1..N.
     //    Each is wrapped in a passthrough Component AST whose
@@ -300,9 +299,12 @@ pub fn composeBinaries(
     } });
     const consumer_inst_idx: u32 = num_unresolved + num_providers + num_bindings;
 
-    // ── Aliases. Two alias sections: bindings (resolve providers)
+    // ── Aliases. Prologue aliases (resource bindings replicated from
+    //    the consumer) come first so prologue section_entries can
+    //    address them by raw idx. Then bindings (resolve providers),
     //    then export-aliases (re-export consumer outputs). ──
     var aliases_list = std.ArrayListUnmanaged(ctypes.Alias).empty;
+    try aliases_list.appendSlice(ar, aliases_prologue);
     for (link.bindings) |b| {
         // Provider was instantiated at instance idx
         // num_unresolved + b.provider_idx (imports come before
@@ -386,23 +388,20 @@ pub fn composeBinaries(
     }
 
     // ── Section emission order:
-    //     type, import, component×(N+1),
-    //     instance #1 (providers), alias #1 (bindings),
-    //     instance #2 (consumer), alias #2 (export aliases),
+    //     prologue (interleaved type / alias / import per the
+    //       consumer's encounter order, restricted to the closure of
+    //       slots reachable from unresolved imports),
+    //     component×(N+1),
+    //     instance #1 (providers), alias (bindings),
+    //     instance #2 (consumer), alias (export aliases),
     //     export.
     //   The component-instance indexspace fills forward-only — each
-    //   section only references slots produced by earlier sections. ──
+    //   section only references slots produced by earlier sections.
+    //   The wrapper's outer type indexspace is filled by the prologue
+    //   chunks; everything from `.component` onward leaves it
+    //   untouched. ──
     var section_order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
-    if (types_list_items.len > 0) try section_order.append(ar, .{
-        .kind = .type,
-        .start = 0,
-        .count = @intCast(types_list_items.len),
-    });
-    if (imports_arr.len > 0) try section_order.append(ar, .{
-        .kind = .import,
-        .start = 0,
-        .count = @intCast(imports_arr.len),
-    });
+    try section_order.appendSlice(ar, prologue_section_entries);
     try section_order.append(ar, .{
         .kind = .component,
         .start = 0,
@@ -415,7 +414,7 @@ pub fn composeBinaries(
     });
     if (num_bindings > 0) try section_order.append(ar, .{
         .kind = .alias,
-        .start = 0,
+        .start = num_prologue_aliases,
         .count = num_bindings,
     });
     try section_order.append(ar, .{
@@ -425,7 +424,7 @@ pub fn composeBinaries(
     });
     if (consumer.exports.len > 0) try section_order.append(ar, .{
         .kind = .alias,
-        .start = num_bindings,
+        .start = num_prologue_aliases + num_bindings,
         .count = @intCast(consumer.exports.len),
     });
     if (exports_list.items.len > 0) try section_order.append(ar, .{
@@ -454,12 +453,16 @@ pub fn composeBinaries(
 /// Look up the TypeDef the consumer's type-indexspace slot `type_idx`
 /// resolves to, falling back through several materialization shapes.
 /// Returns null if the slot exists only as an import/alias contribution
-/// (in which case the caller can substitute an empty instance type as
-/// a structurally-valid placeholder).
+/// (in which case the caller must replicate the contributor decl in the
+/// wrapper rather than substituting an empty instance type — see #129).
 fn lookupConsumerType(c: *const ctypes.Component, type_idx: u32) ?ctypes.TypeDef {
     if (c.type_indexspace.len > 0) {
         if (type_idx >= c.type_indexspace.len) return null;
-        const local = c.type_indexspace[type_idx] orelse return null;
+        const contributor = c.type_indexspace[type_idx];
+        const local = switch (contributor) {
+            .type_def => |idx| idx,
+            .import, .alias => return null,
+        };
         if (local >= c.types.len) return null;
         return c.types[local];
     }
@@ -487,56 +490,100 @@ fn passthroughComponent(bytes: []const u8) ctypes.Component {
     };
 }
 
-/// Result of building the wrapping component's `types[]` section
-/// from the unresolved imports' transitive type-dependency closure.
-const WrapperTypes = struct {
-    /// Topologically-ordered TypeDefs ready to assign to
-    /// `Component.types`. Each TypeDef's body has been deep-cloned
-    /// with all depth-0 operands renumbered through `remap`.
+/// Result of building the wrapping component's prologue — the
+/// interleaved type / alias / import section sequence that
+/// establishes the wrapper's outer type indexspace before the
+/// consumer/provider components are declared.
+const Prologue = struct {
+    /// Cloned consumer TypeDefs in encounter order, ready to assign
+    /// to `Component.types`. Each TypeDef's body has been deep-cloned
+    /// with all depth-0 operands renumbered through `type_remap`.
     types: []const ctypes.TypeDef,
-    /// Mapping `consumer.type_indexspace[X]` → wrapper-types[]-idx.
-    /// Slots not in the closure remain `SENTINEL` (max u32). The
-    /// table is sized to fit any legal idx the cloner might encounter
-    /// (max of consumer.type_indexspace.len and consumer.types.len).
-    remap: []const u32,
+    /// Replicated consumer alias decls (sort `.type`,
+    /// `instance_export` form) in encounter order, ready to be the
+    /// *prefix* of `Component.aliases` — bindings + export-aliases
+    /// follow.
+    aliases: []const ctypes.Alias,
+    /// Bubbled-up unresolved consumer imports in the order they should
+    /// appear in `Component.imports`. Each desc has been deep-cloned
+    /// with its type-idx operands renumbered through `type_remap`.
+    imports: []const ctypes.ImportDecl,
+    /// Section-emission entries for the prologue, interleaving
+    /// `.type` / `.alias` / `.import` sections in the consumer's
+    /// encounter order. Concatenated into the wrapper's overall
+    /// `section_order`.
+    section_entries: []const ctypes.SectionEntry,
+    /// Mapping `consumer.type_indexspace[X]` → wrapper outer type
+    /// indexspace idx. Slots not in the closure remain `SENTINEL`
+    /// (max u32). Sized to fit any legal idx the cloner might
+    /// encounter (max of `consumer.type_indexspace.len`,
+    /// `consumer.types.len`, and the highest BFS-encountered idx).
+    type_remap: []const u32,
 };
 
 const SENTINEL_TYPE_IDX: u32 = std.math.maxInt(u32);
 
-/// Build the wrapping component's `types[]` from the closure of
-/// consumer-typespace idxs reachable from `unresolved`'s imports.
+/// Build the wrapping component's prologue: walk the consumer's
+/// `type_indexspace` in encounter order, restricted to slots
+/// reachable from `link.unresolved` imports, and emit each closure
+/// slot as a cloned type def (`.type_def` contributors) or a
+/// replicated alias decl (`.alias` contributors). After each emitted
+/// slot, bubble up any unresolved instance-typed import whose desc
+/// references that exact slot — preserving the consumer's
+/// `type N → import (instance (type N)) → alias …` interleaving
+/// pattern that wt-component output relies on.
 ///
-/// Algorithm:
-///
-///   1. **Seed.** For every unresolved import, collect every type-idx
-///      operand its `ExternDesc` carries (via `type_walk`).
-///   2. **BFS expand.** For each idx in the queue, resolve to its
-///      consumer TypeDef (`lookupConsumerType`), walk it at depth 0
-///      to gather every type-idx the body references at depth 0,
-///      enqueue any new ones.
-///   3. **Topo sort.** DFS post-order over the closure: emit a node
-///      after all its in-closure deps are emitted. Cycles cannot
-///      occur in well-formed components but we detect and bail with
-///      a stable order if one slips through (tolerant — the
-///      validator will catch it downstream anyway).
-///   4. **Clone + remap.** For each closure idx in topo order, build
-///      the consumer→wrapper remap entry, then clone its TypeDef
-///      via `type_walk.cloneTypeDef(td, remap, depth=0)`. Slots
-///      whose `lookupConsumerType` returns null fall back to an
-///      empty instance type — same behaviour the pre-fix code had,
-///      kept so hand-built fixtures with `types: &.{}` still round-
-///      trip.
-fn buildWrapperTypes(
+/// Forward-only references hold by virtue of walking the consumer in
+/// encounter order: a well-formed component only has type-def bodies
+/// referencing earlier type-indexspace slots, only has imports'
+/// descs referencing earlier type-indexspace slots, and only has
+/// aliases' instance-idx operands referencing earlier
+/// instance-indexspace slots.
+fn buildWrapperPrologue(
     arena: std.mem.Allocator,
     consumer: *const ctypes.Component,
-    unresolved: []const u32,
-) !WrapperTypes {
-    // ── Step 1+2: BFS the closure of consumer-typespace idxs ───────
+    link: compose.Plan,
+) !Prologue {
+    // Map: consumer.imports idx → position within `link.unresolved`.
+    // Aliases of sort `.type` whose source instance is an unresolved
+    // consumer instance import remap their `instance_idx` through
+    // this table to the wrapper-instance idx the bubbled-up import
+    // occupies. Only `.instance`-desc imports contribute to the
+    // wrapper's instance indexspace, but we record all entries so the
+    // caller can detect non-instance unresolved imports.
+    var unres_pos = std.AutoHashMapUnmanaged(u32, u32).empty;
+    var inst_slot_for_unres_imp = std.AutoHashMapUnmanaged(u32, u32).empty;
+    var inst_count: u32 = 0;
+    for (link.unresolved, 0..) |imp_idx, k| {
+        try unres_pos.put(arena, imp_idx, @intCast(k));
+        const imp = consumer.imports[imp_idx];
+        if (imp.desc == .instance) {
+            try inst_slot_for_unres_imp.put(arena, imp_idx, inst_count);
+            inst_count += 1;
+        }
+    }
+
+    // Map: consumer type-indexspace idx → unresolved consumer.imports
+    // idx whose `.instance` desc references that slot. Used to bubble
+    // up each unresolved instance import right after its referenced
+    // type slot, preserving the consumer's interleaving.
+    var imp_for_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
+    for (link.unresolved) |imp_idx| {
+        const imp = consumer.imports[imp_idx];
+        if (imp.desc == .instance) {
+            try imp_for_type_idx.put(arena, imp.desc.instance, imp_idx);
+        }
+    }
+
+    // ── BFS the closure of consumer-typespace idxs reachable from
+    //    every unresolved import's desc. Only `.type_def` contributor
+    //    slots have a body to walk; `.alias` and `.import` slots are
+    //    terminal at this level. ──
     var queue = std.ArrayListUnmanaged(u32).empty;
     var in_closure = std.AutoHashMapUnmanaged(u32, void).empty;
     var max_idx: u32 = 0;
 
-    for (unresolved) |u_idx| {
+    for (link.unresolved) |u_idx| {
         const imp = consumer.imports[u_idx];
         var seeds = std.ArrayListUnmanaged(u32).empty;
         try type_walk.collectExternDescRefs(arena, imp.desc, &seeds);
@@ -576,70 +623,189 @@ fn buildWrapperTypes(
     const remap = try arena.alloc(u32, remap_len);
     @memset(remap, SENTINEL_TYPE_IDX);
 
-    // ── Step 3: DFS post-order topo sort ──────────────────────────
-    const order = try arena.alloc(u32, queue.items.len);
-    var order_len: usize = 0;
-    var visiting = std.AutoHashMapUnmanaged(u32, void).empty;
-    var visited = std.AutoHashMapUnmanaged(u32, void).empty;
+    // ── Walk the consumer type-indexspace in encounter order. For
+    //    each closure slot, emit either a cloned type def or a
+    //    replicated alias. After each slot, bubble up any unresolved
+    //    instance-typed import whose desc references it. Adjacent
+    //    same-kind emissions chunk into a single SectionEntry. ──
+    var types_out = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    var aliases_out = std.ArrayListUnmanaged(ctypes.Alias).empty;
+    var imports_out = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
+    var section_entries = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+    var emitted_imp = std.AutoHashMapUnmanaged(u32, void).empty;
 
-    for (queue.items) |seed| {
-        try topoVisit(arena, consumer, seed, &visiting, &visited, order, &order_len);
-    }
+    var emitter: PrologueEmitter = .{
+        .entries = &section_entries,
+        .arena = arena,
+    };
 
-    // ── Step 4: clone + remap in topo order ───────────────────────
-    const types = try arena.alloc(ctypes.TypeDef, order_len);
-    // First pass: assign wrapper-idxs so refs from later types
-    // resolve. (DFS post-order already guarantees deps come first,
-    // so we can also fill remap in a single pass — done up-front
-    // here for symmetry with the cycle-tolerance bail-out path.)
-    for (order[0..order_len], 0..) |consumer_idx, wrapper_idx| {
-        if (consumer_idx < remap.len) remap[consumer_idx] = @intCast(wrapper_idx);
-    }
-    // Second pass: clone bodies through the now-complete remap.
-    for (order[0..order_len], 0..) |consumer_idx, wrapper_idx| {
-        const td = lookupConsumerType(consumer, consumer_idx) orelse blk: {
-            // Hand-built fixtures (e.g. tests with `types: &.{}`)
-            // declare imports referencing slots not materialised in
-            // `types[]`. Substitute an empty instance type — keeps
-            // the wrapper structurally valid; real compose inputs
-            // always supply the type.
-            break :blk ctypes.TypeDef{ .instance = .{ .decls = &.{} } };
-        };
-        types[wrapper_idx] = try type_walk.cloneTypeDef(arena, td, remap, 0);
-    }
+    // Walk every slot up to the highest referenced one — that covers
+    // the consumer's full type-indexspace plus any out-of-bounds idxs
+    // (hand-built fixtures whose imports cite a numeric slot not
+    // backed by an actual contributor).
+    const N: usize = blk: {
+        var n: usize = consumer.type_indexspace.len;
+        if (consumer.types.len > n) n = consumer.types.len;
+        if (in_closure.count() > 0 and @as(usize, max_idx) + 1 > n) {
+            n = @as(usize, max_idx) + 1;
+        }
+        break :blk n;
+    };
 
-    return .{ .types = types, .remap = remap };
-}
+    for (0..N) |k_usize| {
+        const k: u32 = @intCast(k_usize);
+        if (in_closure.contains(k)) {
+            // Pick the contributor: real loaded components have a
+            // populated `type_indexspace`; hand-built fixtures
+            // synthesize a `.type_def(k)` mapping straight into
+            // `consumer.types[]` (or fall back to an empty instance
+            // type if even that's out of range).
+            const contrib: ctypes.TypeContributor = if (k < consumer.type_indexspace.len)
+                consumer.type_indexspace[k]
+            else
+                .{ .type_def = k };
 
-/// DFS post-order visit. Skips already-visited nodes and tolerates
-/// cycles by bailing on back-edges (the cyclic node is dropped from
-/// the order; downstream validators will catch any resulting
-/// invalidity).
-fn topoVisit(
-    arena: std.mem.Allocator,
-    consumer: *const ctypes.Component,
-    node: u32,
-    visiting: *std.AutoHashMapUnmanaged(u32, void),
-    visited: *std.AutoHashMapUnmanaged(u32, void),
-    order: []u32,
-    order_len: *usize,
-) !void {
-    if (visited.contains(node)) return;
-    if (visiting.contains(node)) return; // back-edge — break the cycle
-    try visiting.put(arena, node, {});
+            switch (contrib) {
+                .type_def => |local| {
+                    const td: ctypes.TypeDef = if (local < consumer.types.len)
+                        consumer.types[local]
+                    else
+                        // Hand-built fixtures (e.g. tests with
+                        // `types: &.{}`) declare imports referencing
+                        // slots not materialised in `types[]`.
+                        // Substitute an empty instance type — keeps
+                        // the wrapper structurally valid; real
+                        // compose inputs always supply the type.
+                        .{ .instance = .{ .decls = &.{} } };
+                    if (k < remap.len) remap[k] = @intCast(types_out.items.len + aliases_out.items.len);
+                    try emitter.note(.type, @intCast(types_out.items.len));
+                    try types_out.append(arena, try type_walk.cloneTypeDef(arena, td, remap, 0));
+                },
+                .alias => |alias_idx| {
+                    if (alias_idx >= consumer.aliases.len) return error.UnsupportedComposeShape;
+                    const orig = consumer.aliases[alias_idx];
+                    const remapped = try remapAliasToWrapper(arena, orig, &inst_slot_for_unres_imp, consumer);
+                    if (k < remap.len) remap[k] = @intCast(types_out.items.len + aliases_out.items.len);
+                    try emitter.note(.alias, @intCast(aliases_out.items.len));
+                    try aliases_out.append(arena, remapped);
+                },
+                .import => return error.UnsupportedComposeShape,
+            }
+        }
 
-    if (lookupConsumerType(consumer, node)) |td| {
-        var refs = std.ArrayListUnmanaged(u32).empty;
-        try type_walk.collectTypeDefRefs(arena, td, &refs, 0);
-        for (refs.items) |r| {
-            try topoVisit(arena, consumer, r, visiting, visited, order, order_len);
+        // After the type slot, bubble up any unresolved instance
+        // import whose desc references this exact slot. The wrapper
+        // import's desc references the wrapper-side idx that the
+        // closure slot just emitted — which `remap[k]` resolves to.
+        if (imp_for_type_idx.get(k)) |imp_idx| {
+            const orig_imp = consumer.imports[imp_idx];
+            try emitter.note(.import, @intCast(imports_out.items.len));
+            try imports_out.append(arena, .{
+                .name = try arena.dupe(u8, orig_imp.name),
+                .desc = try type_walk.cloneExternDesc(arena, orig_imp.desc, remap, 0),
+            });
+            try emitted_imp.put(arena, imp_idx, {});
         }
     }
 
-    _ = visiting.remove(node);
-    try visited.put(arena, node, {});
-    order[order_len.*] = node;
-    order_len.* += 1;
+    // Bubble up any remaining unresolved imports the interleaved walk
+    // didn't already emit — non-instance descs (e.g. `.func`), or
+    // `.instance` descs whose referenced slot is past `N` (shouldn't
+    // happen in well-formed inputs, defensive).
+    for (link.unresolved) |imp_idx| {
+        if (emitted_imp.contains(imp_idx)) continue;
+        const orig_imp = consumer.imports[imp_idx];
+        try emitter.note(.import, @intCast(imports_out.items.len));
+        try imports_out.append(arena, .{
+            .name = try arena.dupe(u8, orig_imp.name),
+            .desc = try type_walk.cloneExternDesc(arena, orig_imp.desc, remap, 0),
+        });
+    }
+
+    try emitter.flush();
+
+    return .{
+        .types = types_out.items,
+        .aliases = aliases_out.items,
+        .imports = imports_out.items,
+        .section_entries = section_entries.items,
+        .type_remap = remap,
+    };
+}
+
+/// Run-length-encodes a sequence of single-element section emissions
+/// into `SectionEntry` chunks (adjacent same-kind emissions merge
+/// into one entry, so the writer emits one physical section per
+/// chunk rather than one per element).
+const PrologueEmitter = struct {
+    entries: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+    arena: std.mem.Allocator,
+    cur_kind: ?ctypes.SectionKind = null,
+    cur_start: u32 = 0,
+    cur_count: u32 = 0,
+
+    fn note(self: *PrologueEmitter, kind: ctypes.SectionKind, start: u32) !void {
+        if (self.cur_kind) |k| {
+            if (k == kind) {
+                self.cur_count += 1;
+                return;
+            }
+            try self.flush();
+        }
+        self.cur_kind = kind;
+        self.cur_start = start;
+        self.cur_count = 1;
+    }
+
+    fn flush(self: *PrologueEmitter) !void {
+        if (self.cur_count > 0) {
+            try self.entries.append(self.arena, .{
+                .kind = self.cur_kind.?,
+                .start = self.cur_start,
+                .count = self.cur_count,
+            });
+        }
+        self.cur_kind = null;
+        self.cur_count = 0;
+    }
+};
+
+/// Replicate a consumer alias decl at the wrapper level. Currently
+/// only handles `.instance_export` aliases of sort `.type` whose
+/// source instance is an unresolved consumer instance import —
+/// those are the only shape wt-component output emits at the outer
+/// level (resource bindings into the type indexspace). Anything
+/// else fails closed with `error.UnsupportedComposeShape`.
+fn remapAliasToWrapper(
+    arena: std.mem.Allocator,
+    orig: ctypes.Alias,
+    inst_slot_for_unres_imp: *const std.AutoHashMapUnmanaged(u32, u32),
+    consumer: *const ctypes.Component,
+) !ctypes.Alias {
+    return switch (orig) {
+        .instance_export => |ie| blk: {
+            if (ie.sort != .type) return error.UnsupportedComposeShape;
+            // The alias references a consumer instance idx. Walk
+            // comp_instance_indexspace to find the source — must be
+            // an unresolved consumer instance import we've bubbled
+            // up; anything else (resolved import / consumer-internal
+            // instance / nested alias chain) isn't supported here.
+            if (ie.instance_idx >= consumer.comp_instance_indexspace.len) return error.UnsupportedComposeShape;
+            const contrib = consumer.comp_instance_indexspace[ie.instance_idx];
+            const wrap_inst = switch (contrib) {
+                .import => |imp_idx| inst_slot_for_unres_imp.get(imp_idx) orelse return error.UnsupportedComposeShape,
+                .instance, .alias => return error.UnsupportedComposeShape,
+            };
+            break :blk .{ .instance_export = .{
+                .sort = ie.sort,
+                .instance_idx = wrap_inst,
+                .name = try arena.dupe(u8, ie.name),
+            } };
+        },
+        // Top-level outer aliases reach an enclosing scope above the
+        // wrapper component — a shape wabt's compose doesn't model.
+        .outer => return error.UnsupportedComposeShape,
+    };
 }
 
 fn synthSortFromExport(exp: ctypes.ExportDecl) ctypes.SortIdx {
@@ -940,12 +1106,12 @@ test "composeBinaries: copies transitive type deps when bubbling up instance imp
     try testing.expect(found_outer_alias);
 }
 
-test "composeBinaries: emits types in topological order" {
-    // Same shape as the previous test but consumer declares the
-    // instance type FIRST (idx 0) and the func dep SECOND (idx 1).
-    // The wrapper must topologically reorder them so each emitted
-    // type's body only references strictly smaller wrapper indices.
-    // The bubbled-up import's desc must follow the renumbering.
+test "composeBinaries: emits closure types in encounter order with remap" {
+    // Consumer declares the func dep FIRST (idx 0) and the instance
+    // SECOND (idx 1) — well-formed forward-only encoding, identical
+    // to what real component encoders produce. The wrapper must
+    // preserve encounter order *and* remap the instance body's
+    // outer-alias to the func's wrapper slot.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -956,13 +1122,13 @@ test "composeBinaries: emits types in topological order" {
         .results = .{ .unnamed = .u32 },
     } };
 
-    // Body refs outer-1-1 → consumer-typespace-1 (the func, declared
-    // *after* the instance in source order).
+    // Body refs outer-1-0 → consumer-typespace-0 (the func, declared
+    // *before* the instance in source order — forward-only).
     const inst_decls = [_]ctypes.Decl{
         .{ .alias = .{ .outer = .{
             .sort = .type,
             .outer_count = 1,
-            .idx = 1,
+            .idx = 0,
         } } },
         .{ .@"export" = .{
             .name = "add",
@@ -971,10 +1137,10 @@ test "composeBinaries: emits types in topological order" {
     };
     const inst_type = ctypes.TypeDef{ .instance = .{ .decls = &inst_decls } };
 
-    // Instance at idx 0, func at idx 1 — reverse of dep order.
-    const types = [_]ctypes.TypeDef{ inst_type, func_type };
+    // Func at idx 0, instance at idx 1 — forward-only dep order.
+    const types = [_]ctypes.TypeDef{ func_type, inst_type };
     const imports = [_]ctypes.ImportDecl{
-        .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 0 } },
+        .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 1 } },
     };
     const consumer: ctypes.Component = .{
         .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
@@ -993,19 +1159,19 @@ test "composeBinaries: emits types in topological order" {
     const loaded = try loader.load(composed, arena2.allocator());
 
     try testing.expectEqual(@as(usize, 2), loaded.types.len);
-    // Topo sort must hoist the func dep ahead of the instance so the
-    // instance's outer alias resolves to a strictly smaller idx.
+    // Encounter order: func at wrapper-idx 0, instance at wrapper-idx 1.
     try testing.expect(loaded.types[0] == .func);
     try testing.expect(loaded.types[1] == .instance);
 
     // The bubbled-up import desc must follow the renumbering: the
-    // instance now lives at wrapper-idx 1, not consumer-idx 0.
+    // instance lives at wrapper-idx 1.
     try testing.expectEqual(@as(usize, 1), loaded.imports.len);
     try testing.expect(loaded.imports[0].desc == .instance);
     try testing.expectEqual(@as(u32, 1), loaded.imports[0].desc.instance);
 
     // The instance body's outer alias must point at wrapper-idx 0
-    // (the func), reflecting the renumber.
+    // (the func), reflecting the remap (consumer-idx 0 → wrapper-idx 0
+    // is identity here, but the cloner still has to walk it).
     const body = loaded.types[1].instance.decls;
     var found_alias = false;
     for (body) |d| {
@@ -1017,4 +1183,112 @@ test "composeBinaries: emits types in topological order" {
         found_alias = true;
     }
     try testing.expect(found_alias);
+}
+
+test "composeBinaries: replicates alias-of-instance-export resource binding (#129)" {
+    // Consumer shape that mirrors wt-component output for
+    // `wasi:io/streams`: a resource declared inside an imported
+    // instance type, then aliased into the consumer's outer type
+    // indexspace, then referenced by a *later* instance-type body's
+    // outer-alias decl. The wrapper's prologue must replicate the
+    // alias decl rather than substituting an empty placeholder, or
+    // the cloned body's `(alias outer 1 N)` will resolve to a
+    // non-resource type and fail validation.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // type 0 = instance { export "error" (type (sub resource)) }
+    const error_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{
+            .name = "error",
+            .desc = .{ .type = .sub_resource },
+        } },
+    };
+    const error_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &error_decls } };
+
+    // type 2 = instance whose body refs outer 1 1 — that's the alias
+    // slot we replicate (the resource pulled into the outer
+    // typespace).
+    const streams_decls = [_]ctypes.Decl{
+        .{ .alias = .{ .outer = .{
+            .sort = .type,
+            .outer_count = 1,
+            .idx = 1, // the alias-of-instance-export resource binding
+        } } },
+        .{ .@"export" = .{
+            .name = "with-error",
+            .desc = .{ .type = .{ .eq = 0 } }, // local idx 0 inside the instance body == the aliased resource
+        } },
+    };
+    const streams_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &streams_decls } };
+
+    // Consumer: types[0] = error-instance-type; types[1] = streams-instance-type.
+    // type_indexspace shape (binary-encoded order):
+    //   0 → .type_def(0)  = error-instance-type
+    //   1 → .alias(0)     = "alias export <error-import-instance> 'error' (type)"
+    //   2 → .type_def(1)  = streams-instance-type
+    // imports: 0 = wasi:io/error (instance (type 0)), 1 = wasi:io/streams (instance (type 2)).
+    const types = [_]ctypes.TypeDef{ error_inst_type, streams_inst_type };
+    const aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = 0, // wasi:io/error import (consumer comp_instance_indexspace[0])
+            .name = "error",
+        } },
+    };
+    const imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.0", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.0", .desc = .{ .instance = 2 } },
+    };
+    const section_order = [_]ctypes.SectionEntry{
+        .{ .kind = .type, .start = 0, .count = 1 }, // type 0 (error)
+        .{ .kind = .import, .start = 0, .count = 1 }, // import error
+        .{ .kind = .alias, .start = 0, .count = 1 }, // alias error → outer typespace
+        .{ .kind = .type, .start = 1, .count = 1 }, // type 1 (streams)
+        .{ .kind = .import, .start = 1, .count = 1 }, // import streams
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &aliases,
+        .types = &types, .canons = &.{},
+        .imports = &imports, .exports = &.{},
+        .section_order = &section_order,
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const empty_providers: []const []u8 = &.{};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, empty_providers);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper must have replicated the alias as an outer-level alias
+    // decl with sort `.type` and instance_idx pointing at the bubbled
+    // import for wasi:io/error (wrapper-instance idx 0).
+    var found_alias_decl = false;
+    for (loaded.aliases) |a| {
+        switch (a) {
+            .instance_export => |ie| {
+                if (ie.sort != .type) continue;
+                if (!std.mem.eql(u8, ie.name, "error")) continue;
+                try testing.expectEqual(@as(u32, 0), ie.instance_idx);
+                found_alias_decl = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(found_alias_decl);
+
+    // Wrapper must have bubbled up both unresolved imports.
+    var found_error_imp = false;
+    var found_streams_imp = false;
+    for (loaded.imports) |imp| {
+        if (std.mem.eql(u8, imp.name, "wasi:io/error@0.2.0")) found_error_imp = true;
+        if (std.mem.eql(u8, imp.name, "wasi:io/streams@0.2.0")) found_streams_imp = true;
+    }
+    try testing.expect(found_error_imp);
+    try testing.expect(found_streams_imp);
 }
