@@ -51,6 +51,7 @@ pub const component = struct {
         pub const types_import = @import("component/adapter/types_import.zig");
         pub const abi = @import("component/adapter/abi.zig");
         pub const adapter = @import("component/adapter/adapter.zig");
+        pub const gc = @import("component/adapter/gc.zig");
     };
 };
 
@@ -79,6 +80,7 @@ test {
     _ = @import("component/adapter/types_import.zig");
     _ = @import("component/adapter/abi.zig");
     _ = @import("component/adapter/adapter.zig");
+    _ = @import("component/adapter/gc.zig");
     _ = @import("integration_tests.zig");
     _ = @import("spec_tests.zig");
 }

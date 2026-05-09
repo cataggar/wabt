@@ -190,248 +190,316 @@ pub fn composeBinaries(
 
     const link = try compose.plan(ar, &consumer, provider_ptrs);
 
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    // Preamble.
-    try out.appendSlice(alloc, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
-
-    // ── Bubble up unmet imports first. ──
-    if (link.unresolved.len > 0) {
-        var imp_body = std.ArrayListUnmanaged(u8).empty;
-        defer imp_body.deinit(alloc);
-        try writeU32Leb(alloc, &imp_body, @intCast(link.unresolved.len));
-        for (link.unresolved) |idx| {
-            const imp = consumer.imports[idx];
-            try writeExternName(alloc, &imp_body, imp.name);
-            try writeExternDesc(alloc, &imp_body, imp.desc);
-        }
-        try emitSection(alloc, &out, 0x0a, imp_body.items);
-    }
-
-    // ── Nested components: consumer at idx 0, providers at idx 1..N. ──
-    try emitSection(alloc, &out, 0x04, consumer_bytes);
-    for (provider_bytes) |p| try emitSection(alloc, &out, 0x04, p);
-
+    const num_unresolved: u32 = @intCast(link.unresolved.len);
     const num_providers: u32 = @intCast(provider_bytes.len);
+    const num_bindings: u32 = @intCast(link.bindings.len);
 
-    // ── Instance section #1: instantiate each provider with no args. ──
-    if (num_providers > 0) {
-        var inst_body = std.ArrayListUnmanaged(u8).empty;
-        defer inst_body.deinit(alloc);
-        try writeU32Leb(alloc, &inst_body, num_providers);
-        for (0..num_providers) |p_local| {
-            const comp_idx: u32 = @intCast(p_local + 1); // consumer is at 0
-            try inst_body.append(alloc, 0x00); // tag: instantiate
-            try writeU32Leb(alloc, &inst_body, comp_idx);
-            try writeU32Leb(alloc, &inst_body, 0); // 0 args
+    // ── Wrapper types: copy each unresolved import's referenced type
+    //    from the consumer into our local types[] so the bubbled-up
+    //    import can reference it by a wrapper-local idx.
+    //
+    //    Pre-fix bug: the wrapper used to emit an `import` section
+    //    with `desc.instance(N)` referencing the *consumer's* type
+    //    idx N — but the wrapper had no types[] section at all,
+    //    producing a malformed component (id 0x0a precedes id 0x07
+    //    on every emission). Building a `types[]` here, plus the
+    //    explicit `section_order` below, ensures the writer emits
+    //    type-before-import. ──
+    var types_list = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    var type_remap = std.AutoHashMapUnmanaged(u32, u32).empty;
+    for (link.unresolved) |u_idx| {
+        const imp = consumer.imports[u_idx];
+        if (imp.desc != .instance) continue;
+        const old_t_idx = imp.desc.instance;
+        const gop = try type_remap.getOrPut(ar, old_t_idx);
+        if (gop.found_existing) continue;
+        gop.value_ptr.* = @intCast(types_list.items.len);
+        if (lookupConsumerType(&consumer, old_t_idx)) |td| {
+            try types_list.append(ar, td);
+        } else {
+            // Hand-built fixtures occasionally declare imports that
+            // reference type indices not materialized in `types[]`
+            // (e.g. tests with `types: &.{}`). Fall back to an empty
+            // instance type — keeps the wrapper structurally valid;
+            // real compose inputs always supply the type.
+            try types_list.append(ar, .{ .instance = .{ .decls = &.{} } });
         }
-        try emitSection(alloc, &out, 0x05, inst_body.items);
     }
 
-    // ── Alias section #1: per binding, alias provider-instance.<name>. ──
-    var binding_alias_idxs = std.ArrayListUnmanaged(u32).empty;
-    if (link.bindings.len > 0) {
-        var alias_body = std.ArrayListUnmanaged(u8).empty;
-        defer alias_body.deinit(alloc);
-        try writeU32Leb(alloc, &alias_body, @intCast(link.bindings.len));
-        for (link.bindings) |b| {
-            // alias = sort=instance(0x05) tag=instance_export(0x00) instance_idx name
-            try alias_body.append(alloc, 0x05); // sort = instance
-            try alias_body.append(alloc, 0x00); // tag: instance export
-            try writeU32Leb(alloc, &alias_body, b.provider_idx);
-            try writeU32Leb(alloc, &alias_body, @intCast(b.name.len));
-            try alias_body.appendSlice(alloc, b.name);
-            try binding_alias_idxs.append(ar, b.provider_idx); // alias idx == its position
-        }
-        try emitSection(alloc, &out, 0x06, alias_body.items);
+    // ── Wrapper imports: rewrite each bubbled-up desc.instance to
+    //    point at our wrapper-local type idx. Names are preserved so
+    //    downstream callers see the same import set the consumer had. ──
+    const imports_arr = try ar.alloc(ctypes.ImportDecl, num_unresolved);
+    for (link.unresolved, 0..) |u_idx, i| {
+        const imp = consumer.imports[u_idx];
+        imports_arr[i] = .{
+            .name = imp.name,
+            .desc = remapImportDesc(imp.desc, &type_remap),
+        };
     }
 
-    // The component-instance index space now contains:
-    //   0..N-1     = provider instances (from instance section #1)
-    //   N..N+K-1   = aliased provider exports (from alias section #1)
-    // The consumer is the next instance we declare (idx N+K).
-    const consumer_inst_idx: u32 = num_providers + @as(u32, @intCast(link.bindings.len));
-
-    // ── Instance section #2: instantiate consumer with bindings as args. ──
+    // ── Nested components: consumer at idx 0, providers at idx 1..N.
+    //    Each is wrapped in a passthrough Component AST whose
+    //    `raw_bytes` field carries the original encoding, which the
+    //    writer emits verbatim. ──
+    const components_arr = try ar.alloc(*ctypes.Component, 1 + provider_bytes.len);
     {
-        var inst_body = std.ArrayListUnmanaged(u8).empty;
-        defer inst_body.deinit(alloc);
-        try writeU32Leb(alloc, &inst_body, 1); // 1 instance entry
-        try inst_body.append(alloc, 0x00); // tag: instantiate
-        try writeU32Leb(alloc, &inst_body, 0); // component idx 0 (consumer)
-        try writeU32Leb(alloc, &inst_body, @intCast(link.bindings.len)); // arg count
-        for (link.bindings, 0..) |b, i| {
-            const alias_inst_idx: u32 = num_providers + @as(u32, @intCast(i));
-            try writeU32Leb(alloc, &inst_body, @intCast(b.name.len));
-            try inst_body.appendSlice(alloc, b.name);
-            // sortidx for arg: instance sort + alias_inst_idx
-            try inst_body.append(alloc, 0x05); // instance
-            try writeU32Leb(alloc, &inst_body, alias_inst_idx);
-        }
-        try emitSection(alloc, &out, 0x05, inst_body.items);
+        const cons_ptr = try ar.create(ctypes.Component);
+        cons_ptr.* = passthroughComponent(consumer_bytes);
+        components_arr[0] = cons_ptr;
+    }
+    for (provider_bytes, 0..) |pb, i| {
+        const p_ptr = try ar.create(ctypes.Component);
+        p_ptr.* = passthroughComponent(pb);
+        components_arr[i + 1] = p_ptr;
     }
 
-    // ── Alias section #2 + Export section: re-export consumer's exports. ──
-    if (consumer.exports.len > 0) {
-        var alias_body = std.ArrayListUnmanaged(u8).empty;
-        defer alias_body.deinit(alloc);
-        try writeU32Leb(alloc, &alias_body, @intCast(consumer.exports.len));
+    // ── Instances. We emit two instance sections (providers, then
+    //    consumer); the slice below holds them in declaration order
+    //    and `section_order` slices them apart. ──
+    var instances_list = std.ArrayListUnmanaged(ctypes.InstanceExpr).empty;
+    for (0..num_providers) |p_local| {
+        const comp_idx: u32 = @intCast(p_local + 1);
+        try instances_list.append(ar, .{ .instantiate = .{
+            .component_idx = comp_idx,
+            .args = &.{},
+        } });
+    }
 
-        var exp_body = std.ArrayListUnmanaged(u8).empty;
-        defer exp_body.deinit(alloc);
-        try writeU32Leb(alloc, &exp_body, @intCast(consumer.exports.len));
+    // After the import section + component sections + instance #1 +
+    // alias #1, the component-instance indexspace is:
+    //   imports[0..num_unresolved-1]               idxs 0..num_unresolved-1
+    //   provider instances (instance section #1)   idxs num_unresolved..num_unresolved+num_providers-1
+    //   binding aliases    (alias    section #1)   idxs num_unresolved+num_providers..
+    //                                                   num_unresolved+num_providers+num_bindings-1
+    //
+    // Consumer args: pass each binding by its alias idx, plus pass
+    // each bubbled-up unresolved import through under its original
+    // name so the consumer is fully satisfied at instantiation time.
+    // (The pre-fix code only passed bindings, leaving any bubbled
+    // import unsupplied — a separate latent bug in the same path.)
+    const consumer_args = try ar.alloc(
+        ctypes.InstantiateArg,
+        link.bindings.len + link.unresolved.len,
+    );
+    for (link.bindings, 0..) |b, i| {
+        const alias_inst_idx: u32 = num_unresolved + num_providers + @as(u32, @intCast(i));
+        consumer_args[i] = .{
+            .name = b.name,
+            .sort_idx = .{ .sort = .instance, .idx = alias_inst_idx },
+        };
+    }
+    for (link.unresolved, 0..) |u_idx, i| {
+        consumer_args[link.bindings.len + i] = .{
+            .name = consumer.imports[u_idx].name,
+            .sort_idx = .{ .sort = .instance, .idx = @as(u32, @intCast(i)) },
+        };
+    }
+    try instances_list.append(ar, .{ .instantiate = .{
+        .component_idx = 0,
+        .args = consumer_args,
+    } });
+    const consumer_inst_idx: u32 = num_unresolved + num_providers + num_bindings;
 
-        // Per-sort index counters for the slots produced by the
-        // export-side aliases. The consumer-instance and the K
-        // binding-alias slots already populated the instance space:
-        //   instances: [provider 0..N-1, binding 0..K-1, consumer N+K]
-        //   funcs/components/types/values: empty (so far in this wrapper).
-        var instance_counter: u32 = num_providers + @as(u32, @intCast(link.bindings.len)) + 1;
-        var func_counter: u32 = 0;
-        var component_counter: u32 = 0;
-        var type_counter: u32 = 0;
-        var value_counter: u32 = 0;
-        var core_func_counter: u32 = 0;
-        var core_module_counter: u32 = 0;
+    // ── Aliases. Two alias sections: bindings (resolve providers)
+    //    then export-aliases (re-export consumer outputs). ──
+    var aliases_list = std.ArrayListUnmanaged(ctypes.Alias).empty;
+    for (link.bindings) |b| {
+        // Provider was instantiated at instance idx
+        // num_unresolved + b.provider_idx (imports come before
+        // instances in the indexspace; the pre-fix code didn't
+        // account for that contribution and was off-by-N when any
+        // import bubbled up alongside a binding).
+        const provider_inst_idx: u32 = num_unresolved + b.provider_idx;
+        try aliases_list.append(ar, .{ .instance_export = .{
+            .sort = .instance,
+            .instance_idx = provider_inst_idx,
+            .name = b.name,
+        } });
+    }
 
-        for (consumer.exports) |exp| {
-            const sort_idx = exp.sort_idx orelse synthSortFromExport(exp);
-            const sort_byte = sortToByte(sort_idx.sort);
-            try alias_body.append(alloc, sort_byte);
-            try alias_body.append(alloc, 0x00); // tag: instance export
-            try writeU32Leb(alloc, &alias_body, consumer_inst_idx);
-            try writeU32Leb(alloc, &alias_body, @intCast(exp.name.len));
-            try alias_body.appendSlice(alloc, exp.name);
+    // ── Re-export consumer's exports. Each export needs (a) an
+    //    alias from the consumer instance to a wrapper-local slot,
+    //    and (b) an `export` decl referencing that slot. ──
+    var exports_list = std.ArrayListUnmanaged(ctypes.ExportDecl).empty;
+    var instance_counter: u32 = consumer_inst_idx + 1;
+    var func_counter: u32 = 0;
+    var component_counter: u32 = 0;
+    var type_counter: u32 = @intCast(types_list.items.len);
+    var value_counter: u32 = 0;
+    var core_func_counter: u32 = 0;
+    var core_module_counter: u32 = 0;
 
-            const slot_idx: u32 = switch (sort_idx.sort) {
-                .instance => blk: {
-                    const v = instance_counter;
-                    instance_counter += 1;
-                    break :blk v;
-                },
+    for (consumer.exports) |exp| {
+        const sort_idx_in = exp.sort_idx orelse synthSortFromExport(exp);
+        try aliases_list.append(ar, .{ .instance_export = .{
+            .sort = sort_idx_in.sort,
+            .instance_idx = consumer_inst_idx,
+            .name = exp.name,
+        } });
+
+        const slot_idx: u32 = switch (sort_idx_in.sort) {
+            .instance => blk: {
+                const v = instance_counter;
+                instance_counter += 1;
+                break :blk v;
+            },
+            .func => blk: {
+                const v = func_counter;
+                func_counter += 1;
+                break :blk v;
+            },
+            .component => blk: {
+                const v = component_counter;
+                component_counter += 1;
+                break :blk v;
+            },
+            .type => blk: {
+                const v = type_counter;
+                type_counter += 1;
+                break :blk v;
+            },
+            .value => blk: {
+                const v = value_counter;
+                value_counter += 1;
+                break :blk v;
+            },
+            .core => |cs| switch (cs) {
                 .func => blk: {
-                    const v = func_counter;
-                    func_counter += 1;
+                    const v = core_func_counter;
+                    core_func_counter += 1;
                     break :blk v;
                 },
-                .component => blk: {
-                    const v = component_counter;
-                    component_counter += 1;
+                .module => blk: {
+                    const v = core_module_counter;
+                    core_module_counter += 1;
                     break :blk v;
                 },
-                .type => blk: {
-                    const v = type_counter;
-                    type_counter += 1;
-                    break :blk v;
-                },
-                .value => blk: {
-                    const v = value_counter;
-                    value_counter += 1;
-                    break :blk v;
-                },
-                .core => blk: {
-                    // Core sub-sorts live in their own spaces; the
-                    // alias contributes to the matching one.
-                    if (sort_idx.sort.core == .func) {
-                        const v = core_func_counter;
-                        core_func_counter += 1;
-                        break :blk v;
-                    } else if (sort_idx.sort.core == .module) {
-                        const v = core_module_counter;
-                        core_module_counter += 1;
-                        break :blk v;
-                    } else {
-                        break :blk 0;
-                    }
-                },
-            };
+                else => 0,
+            },
+        };
 
-            try writeExternName(alloc, &exp_body, exp.name);
-            try exp_body.append(alloc, sort_byte);
-            try writeU32Leb(alloc, &exp_body, slot_idx);
-            try exp_body.append(alloc, 0x00); // un-ascribed desc
-        }
-        try emitSection(alloc, &out, 0x06, alias_body.items);
-        try emitSection(alloc, &out, 0x0b, exp_body.items);
+        try exports_list.append(ar, .{
+            .name = exp.name,
+            .desc = exp.desc,
+            .sort_idx = .{ .sort = sort_idx_in.sort, .idx = slot_idx },
+        });
     }
 
-    return out.toOwnedSlice(alloc);
+    // ── Section emission order:
+    //     type, import, component×(N+1),
+    //     instance #1 (providers), alias #1 (bindings),
+    //     instance #2 (consumer), alias #2 (export aliases),
+    //     export.
+    //   The component-instance indexspace fills forward-only — each
+    //   section only references slots produced by earlier sections. ──
+    var section_order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+    if (types_list.items.len > 0) try section_order.append(ar, .{
+        .kind = .type,
+        .start = 0,
+        .count = @intCast(types_list.items.len),
+    });
+    if (imports_arr.len > 0) try section_order.append(ar, .{
+        .kind = .import,
+        .start = 0,
+        .count = @intCast(imports_arr.len),
+    });
+    try section_order.append(ar, .{
+        .kind = .component,
+        .start = 0,
+        .count = @intCast(components_arr.len),
+    });
+    if (num_providers > 0) try section_order.append(ar, .{
+        .kind = .instance,
+        .start = 0,
+        .count = num_providers,
+    });
+    if (num_bindings > 0) try section_order.append(ar, .{
+        .kind = .alias,
+        .start = 0,
+        .count = num_bindings,
+    });
+    try section_order.append(ar, .{
+        .kind = .instance,
+        .start = num_providers,
+        .count = 1,
+    });
+    if (consumer.exports.len > 0) try section_order.append(ar, .{
+        .kind = .alias,
+        .start = num_bindings,
+        .count = @intCast(consumer.exports.len),
+    });
+    if (exports_list.items.len > 0) try section_order.append(ar, .{
+        .kind = .@"export",
+        .start = 0,
+        .count = @intCast(exports_list.items.len),
+    });
+
+    const wrapper: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = components_arr,
+        .instances = instances_list.items,
+        .aliases = aliases_list.items,
+        .types = types_list.items,
+        .canons = &.{},
+        .imports = imports_arr,
+        .exports = exports_list.items,
+        .section_order = section_order.items,
+    };
+
+    return writer.encode(alloc, &wrapper);
 }
 
-fn sortToByte(s: ctypes.Sort) u8 {
-    return switch (s) {
-        .core => 0x00,
-        .func => 0x01,
-        .value => 0x02,
-        .type => 0x03,
-        .component => 0x04,
-        .instance => 0x05,
+/// Look up the TypeDef the consumer's type-indexspace slot `type_idx`
+/// resolves to, falling back through several materialization shapes.
+/// Returns null if the slot exists only as an import/alias contribution
+/// (in which case the caller can substitute an empty instance type as
+/// a structurally-valid placeholder).
+fn lookupConsumerType(c: *const ctypes.Component, type_idx: u32) ?ctypes.TypeDef {
+    if (c.type_indexspace.len > 0) {
+        if (type_idx >= c.type_indexspace.len) return null;
+        const local = c.type_indexspace[type_idx] orelse return null;
+        if (local >= c.types.len) return null;
+        return c.types[local];
+    }
+    if (type_idx >= c.types.len) return null;
+    return c.types[type_idx];
+}
+
+/// Build a stub `Component` whose `raw_bytes` carry the original
+/// encoding. The writer skips re-serialization for this shape and
+/// emits the bytes verbatim — the only way to faithfully preserve
+/// the inner component's section interleaving.
+fn passthroughComponent(bytes: []const u8) ctypes.Component {
+    return .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+        .raw_bytes = bytes,
     };
 }
 
-fn writeExternName(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), name: []const u8) !void {
-    try out.append(alloc, 0x00); // plain-name prefix
-    try writeU32Leb(alloc, out, @intCast(name.len));
-    try out.appendSlice(alloc, name);
-}
-
-fn writeExternDesc(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), desc: ctypes.ExternDesc) !void {
-    switch (desc) {
-        .module => |idx| {
-            try out.append(alloc, 0x00);
-            try writeU32Leb(alloc, out, idx);
-        },
-        .func => |idx| {
-            try out.append(alloc, 0x01);
-            try writeU32Leb(alloc, out, idx);
-        },
-        .value => |v| {
-            try out.append(alloc, 0x02);
-            try writeU32Leb(alloc, out, v.type_idx);
-        },
-        .type => |bound| switch (bound) {
-            .eq => |idx| {
-                try out.append(alloc, 0x03);
-                try out.append(alloc, 0x00);
-                try writeU32Leb(alloc, out, idx);
-            },
-            .sub_resource => {
-                try out.append(alloc, 0x03);
-                try out.append(alloc, 0x01);
-            },
-        },
-        .component => |idx| {
-            try out.append(alloc, 0x04);
-            try writeU32Leb(alloc, out, idx);
-        },
-        .instance => |idx| {
-            try out.append(alloc, 0x05);
-            try writeU32Leb(alloc, out, idx);
-        },
-    }
-}
-
-fn emitSection(
-    alloc: std.mem.Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    id: u8,
-    body: []const u8,
-) !void {
-    try out.append(alloc, id);
-    try writeU32Leb(alloc, out, @intCast(body.len));
-    try out.appendSlice(alloc, body);
-}
-
-fn writeU32Leb(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) !void {
-    var x = v;
-    while (true) {
-        var b: u8 = @intCast(x & 0x7f);
-        x >>= 7;
-        if (x != 0) b |= 0x80;
-        try out.append(alloc, b);
-        if (x == 0) break;
-    }
+/// Rewrite a bubbled-up consumer import's desc so any type-idx
+/// references point at the wrapper-local types[] slot instead of the
+/// consumer-local one. Only `.instance` carries a type idx that needs
+/// remapping in practice; other descs are passed through unchanged.
+fn remapImportDesc(
+    desc: ctypes.ExternDesc,
+    m: *const std.AutoHashMapUnmanaged(u32, u32),
+) ctypes.ExternDesc {
+    return switch (desc) {
+        .instance => |idx| .{ .instance = m.get(idx) orelse 0 },
+        else => desc,
+    };
 }
 
 fn synthSortFromExport(exp: ctypes.ExportDecl) ctypes.SortIdx {
@@ -527,6 +595,65 @@ test "composeBinaries: bubbles up unmet imports" {
     const loaded = try loader.load(composed, arena2.allocator());
     try testing.expectEqual(@as(usize, 1), loaded.imports.len);
     try testing.expectEqualStrings("wasi:cli/environment@0.2.0", loaded.imports[0].name);
+    // Bug 1 regression: the wrapper used to emit `import` (id 0x0a)
+    // before any `type` (id 0x07) section, so the import's
+    // `.instance(0)` desc referenced a type idx that didn't exist in
+    // the wrapper. The fix copies the consumer's referenced type
+    // into the wrapper's `types[]` and emits type-before-import.
+    try testing.expect(loaded.types.len >= 1);
+    try testing.expectEqual(ctypes.ExternDesc{ .instance = 0 }, loaded.imports[0].desc);
+    // Direct byte-level check: section 0x07 must precede section
+    // 0x0a in the encoded output.
+    const ty_pos = std.mem.indexOfScalar(u8, composed[8..], 0x07) orelse
+        return error.MissingTypeSection;
+    const im_pos = std.mem.indexOfScalar(u8, composed[8..], 0x0a) orelse
+        return error.MissingImportSection;
+    try testing.expect(ty_pos < im_pos);
+}
+
+test "composeBinaries: bubbled import passes through to consumer instantiation" {
+    // Regression for the related "consumer instantiated with unmet
+    // imports left unsupplied" bug: the wrapper must pass each
+    // bubbled-up import through as an `(arg)` to the consumer's
+    // instantiation. Without this the inner consumer would fail to
+    // resolve its imports at runtime even though the wrapping
+    // component validates structurally.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const empty_providers: []const []u8 = &.{};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, empty_providers);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper has 1 instance section entry (the consumer
+    // instantiation). The provider count is zero so there's no
+    // separate provider-instantiation section.
+    try testing.expectEqual(@as(usize, 1), loaded.instances.len);
+    const inst = loaded.instances[0];
+    try testing.expect(inst == .instantiate);
+    try testing.expectEqual(@as(u32, 0), inst.instantiate.component_idx);
+    // The consumer expected 1 instance arg ("wasi:cli/stdout@0.2.6"),
+    // sourced from the wrapper's bubbled-up import (instance idx 0
+    // in the wrapper's component-instance indexspace).
+    try testing.expectEqual(@as(usize, 1), inst.instantiate.args.len);
+    try testing.expectEqualStrings("wasi:cli/stdout@0.2.6", inst.instantiate.args[0].name);
+    try testing.expect(inst.instantiate.args[0].sort_idx.sort == .instance);
+    try testing.expectEqual(@as(u32, 0), inst.instantiate.args[0].sort_idx.idx);
 }
 
 test "composeBinaries: multi-package consumer + provider end-to-end" {
