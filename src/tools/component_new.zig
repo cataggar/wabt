@@ -25,11 +25,25 @@
 //!    delegate to `wabt.component.adapter.adapter.splice`, which
 //!    composes the embed core with the given preview1→component
 //!    adapter into a four- or five-core-module component (shim,
-//!    embed, adapter, fixup, optional `__main_module__` fallback)
-//!    and lifts `wasi:cli/run` for top-level export. Mirrors
-//!    `wasm-tools component new --adapt …` and unblocks the
-//!    `zig-hello`, `zig-calculator-cmd`, and `mixed-zig-rust-calc`
-//!    wamr command-component fixtures.
+//!    embed, adapter, fixup, optional `__main_module__` fallback).
+//!
+//!    Two adapter shapes are supported transparently — `splice`
+//!    classifies via `detectShape`:
+//!      * **command** (the wamr `zig-hello` / `zig-calculator-cmd`
+//!        / `mixed-zig-rust-calc` fixtures): the adapter declares
+//!        `wasi:cli/run@…` and the wrapping component lifts a
+//!        single `wasi:cli/run` top-level export.
+//!      * **reactor**: the adapter has no `<iface>#name` exports
+//!        and no `__main_module__` imports; the wrapping component
+//!        emits one top-level export per `<iface>#<func>` export
+//!        the embed declares.
+//!
+//!    Multi-adapter splicing (`--adapt` repeated): the **primary**
+//!    is the unique adapter with at least one non-`env` core
+//!    import. Remaining adapters are treated as bare host-shim
+//!    secondaries (every import must be `env.<x>`).
+//!
+//!    Mirrors `wasm-tools component new --adapt …`.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -51,10 +65,15 @@ pub const usage =
     \\Options:
     \\  -o, --output <file>     Output file (default: <input>.component.wasm)
     \\      --skip-validation   Skip post-encoding component validation
-    \\      --adapt <n>=<file>  Splice in an adapter (may repeat). The first
-    \\                          adapter declaring `wasi:cli/run` is the
-    \\                          primary; remaining adapters must import only
+    \\      --adapt <n>=<file>  Splice in an adapter (may repeat). The
+    \\                          primary is the unique adapter with at
+    \\                          least one non-`env` core import; the
+    \\                          remaining adapters must import only
     \\                          `env.<x>` (bare host-shim restriction).
+    \\                          Both command-shape (lifts wasi:cli/run)
+    \\                          and reactor-shape (lifts each
+    \\                          <iface>#<func>) primaries are supported
+    \\                          and detected automatically.
     \\  -h, --help              Show this help
     \\
 ;

@@ -41,6 +41,8 @@ const fixup = @import("fixup.zig");
 const abi = @import("abi.zig");
 const gc = @import("gc.zig");
 const world_gc = @import("world_gc.zig");
+const metadata_decode = @import("../wit/metadata_decode.zig");
+const leb = @import("../../leb128.zig");
 
 pub const SpliceError = error{
     OutOfMemory,
@@ -74,10 +76,13 @@ pub const SpliceError = error{
     InvalidIndex,
     // Multi-adapter errors.
     NoAdapters,
-    MissingRunAdapter,
-    AmbiguousRunAdapter,
+    MissingPrimaryAdapter,
+    AmbiguousPrimaryAdapter,
     AdapterNamespaceCollision,
     SecondaryAdapterUnsupported,
+    // Reactor-shape errors.
+    MissingEmbedMetadata,
+    InvalidComponentType,
 } || writer.EncodeError;
 
 /// One preview1-style adapter to splice in. `name` is the core
@@ -171,6 +176,15 @@ pub fn splice(
         break :blk decode.parse(a, payload) catch null;
     };
 
+    // Reactor mode needs per-export-interface FuncTypes for canon-lift,
+    // which `metadata_decode.decode` produces. Decode once here while
+    // the embed's component-type section is still attached.
+    const embed_metadata: ?metadata_decode.DecodedWorld = blk: {
+        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
+        const payload = ct orelse break :blk null;
+        break :blk metadata_decode.decode(a, payload) catch null;
+    };
+
     const preview1_slots = try collectPreview1Slots(a, embed_owned.interface, adapter_name);
     const buckets = try classifyAdapterImports(a, adapter_owned.interface, world, hoisted);
     const indirect_slots = try collectIndirectSlots(a, buckets);
@@ -201,6 +215,8 @@ pub fn splice(
         .adapter_iface = adapter_owned.interface,
         .preview1_slots = preview1_slots,
         .buckets = buckets,
+        .shape = detectShape(adapter_owned.interface),
+        .embed_metadata = embed_metadata,
     });
 }
 
@@ -262,6 +278,12 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
         const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
         const payload = ct orelse break :blk null;
         break :blk decode.parse(a, payload) catch null;
+    };
+
+    const embed_metadata: ?metadata_decode.DecodedWorld = blk: {
+        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
+        const payload = ct orelse break :blk null;
+        break :blk metadata_decode.decode(a, payload) catch null;
     };
 
     const preview1_slots = try collectPreview1Slots(a, embed_owned.interface, primary.name);
@@ -352,29 +374,44 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
         .adapter_iface = primary_owned.interface,
         .preview1_slots = preview1_slots,
         .buckets = buckets,
+        .shape = detectShape(primary_owned.interface),
         .secondaries = secondary_inputs,
+        .embed_metadata = embed_metadata,
     });
 }
 
-/// Find the primary adapter — the unique one declaring an export
-/// whose name contains `#` (the canonical splice run-export shape,
-/// e.g. `wasi:cli/run@0.1.0#run`). Reject if none or > 1.
+/// Find the primary adapter — the unique one with at least one
+/// non-`env` core import. Bare-shim secondaries import only
+/// `env.<x>` (validated separately by `validateBareShimSecondary`),
+/// so the primary is the **complement** of the secondary partition.
+///
+/// This signal works for both shapes:
+///   * **command** primary — imports `__main_module__.<x>` and a
+///     WASI namespace (e.g. `wasi:cli/stdout@…`);
+///   * **reactor** primary — imports a WASI namespace but no
+///     `__main_module__`.
+///
+/// Returns:
+///   * `MissingPrimaryAdapter` if every adapter is `env`-only;
+///   * `AmbiguousPrimaryAdapter` if more than one has non-`env`
+///     imports.
 fn findPrimaryAdapter(arena: Allocator, adapters: []const Adapter) SpliceError!usize {
     var primary_idx: ?usize = null;
     for (adapters, 0..) |ad, i| {
         const owned = try core_imports.extract(arena, ad.bytes);
-        const has_run = blk: {
-            for (owned.interface.exports) |ex| {
-                if (std.mem.indexOfScalar(u8, ex.name, '#') != null) break :blk true;
+        var has_non_env = false;
+        for (owned.interface.imports) |im| {
+            if (!std.mem.eql(u8, im.module_name, "env")) {
+                has_non_env = true;
+                break;
             }
-            break :blk false;
-        };
-        if (has_run) {
-            if (primary_idx != null) return error.AmbiguousRunAdapter;
+        }
+        if (has_non_env) {
+            if (primary_idx != null) return error.AmbiguousPrimaryAdapter;
             primary_idx = i;
         }
     }
-    return primary_idx orelse error.MissingRunAdapter;
+    return primary_idx orelse error.MissingPrimaryAdapter;
 }
 
 /// Validate that an adapter is a bare-shim secondary: every core
@@ -748,6 +785,19 @@ const Inputs = struct {
     adapter_iface: core_imports.CoreInterface,
     preview1_slots: []const Preview1Slot,
     buckets: []NamespaceBucket,
+    /// Adapter shape — drives whether `assemble()` emits the
+    /// command-style `__main_module__` plumbing + run sub-component
+    /// (`.command`) or the reactor per-export-interface lift loop
+    /// (`.reactor`). Defaults to `.command` for backward compatibility
+    /// with tests that don't set it explicitly.
+    shape: Shape = .command,
+    /// Pre-decoded embed metadata for the reactor branch. Populated
+    /// by `splice`/`spliceN` from the embed's `component-type:*`
+    /// custom section before that section is stripped from
+    /// `embed_bytes`. Required only when `shape == .reactor`; the
+    /// reactor branch reads it to recover per-export-interface
+    /// FuncTypes for canon-lift.
+    embed_metadata: ?metadata_decode.DecodedWorld = null,
     /// Optional secondary "bare-shim" adapters layered alongside the
     /// primary. Each secondary contributes additional slots to the
     /// shim/fixup table (located at
@@ -756,6 +806,31 @@ const Inputs = struct {
     /// component. Empty for the single-adapter case.
     secondaries: []const SecondaryInputs = &.{},
 };
+
+/// Adapter shape, mirroring the wit-component reference encoder's
+/// `command` / `reactor` distinction. `library` is deferred to #127.
+///
+///   * `.command`  — the adapter declares `wasi:cli/run@…` and
+///     drives the embed via `__main_module__._start`. The
+///     wrapping component lifts a single `wasi:cli/run` export.
+///   * `.reactor`  — the adapter has no `<iface>#name` exports and
+///     no `__main_module__.<x>` imports. The wrapping component
+///     lifts each `<iface>#<func>` export the **embed** declares
+///     into one top-level instance per export interface.
+pub const Shape = enum { command, reactor };
+
+/// Classify an adapter's core wasm shape from its exports. The
+/// presence of any `<iface>#<name>`-shaped export means the
+/// adapter implements a `wasi:cli/run`-style lifted entry —
+/// command shape. Their absence means the adapter is a passive
+/// preview1→component bridge whose entry points live in the
+/// embed — reactor shape.
+pub fn detectShape(iface: core_imports.CoreInterface) Shape {
+    for (iface.exports) |ex| {
+        if (std.mem.indexOfScalar(u8, ex.name, '#') != null) return .command;
+    }
+    return .reactor;
+}
 
 /// Per-secondary data needed by `assemble`. Built by `spliceN`.
 pub const SecondaryInputs = struct {
@@ -1090,7 +1165,14 @@ fn assemble(in: Inputs) ![]u8 {
     // single `_start` symbol. If your embed uses a different name,
     // expose all exports we can recognize; the adapter ignores
     // anything it doesn't import.
-    const main_module_inst = blk: {
+    //
+    // Reactor adapters have no `__main_module__.<x>` imports — they
+    // wrap long-lived embeds whose entry points come from the
+    // wrapping component's lifted exports, not `_start`. Skip the
+    // entire `__main_module__` plumbing in that case; assert the
+    // adapter has no such imports to surface a clean error if our
+    // shape detector misclassified.
+    const main_module_inst: ?u32 = if (in.shape == .command) blk: {
         // Mirror the wasm-tools reference: alias every __main_module__
         // import the adapter requires. If the embed has a matching
         // export, alias the embed. Otherwise alias the fallback module.
@@ -1135,6 +1217,13 @@ fn assemble(in: Inputs) ![]u8 {
             });
         }
         break :blk try b.addCoreInstance(.{ .exports = try exps.toOwnedSlice(a) });
+    } else blk: {
+        for (in.adapter_iface.imports) |im| {
+            if (std.mem.eql(u8, im.module_name, "__main_module__")) {
+                return error.UnsupportedAdapterShape;
+            }
+        }
+        break :blk null;
     };
 
     // ── Step 7b: instantiate each secondary core module ──────────────
@@ -1214,7 +1303,9 @@ fn assemble(in: Inputs) ![]u8 {
     // ── Step 9: instantiate adapter ──────────────────────────────────
     var adapter_args = std.ArrayListUnmanaged(ctypes.CoreInstantiateArg).empty;
     try adapter_args.append(a, .{ .name = "env", .instance_idx = env_inst });
-    try adapter_args.append(a, .{ .name = "__main_module__", .instance_idx = main_module_inst });
+    if (main_module_inst) |mmi| {
+        try adapter_args.append(a, .{ .name = "__main_module__", .instance_idx = mmi });
+    }
     for (in.buckets, 0..) |bk, bi| {
         try adapter_args.append(a, .{ .name = bk.name, .instance_idx = bucket_inst_idx[bi] });
     }
@@ -1331,42 +1422,115 @@ fn assemble(in: Inputs) ![]u8 {
         .args = fixup_args,
     } });
 
-    // ── Step 11: canon lift of wasi:cli/run@<ver>#run ────────────────
-    const run_ie = try findRunInstanceExport(in.hoisted, a);
-    if (in.adapter_iface.findExport(run_ie.core_export_name) == null) {
-        return error.AdapterMissingRunExport;
+    // ── Step 11: top-level lift + export ─────────────────────────────
+    //
+    // Command shape: canon-lift the adapter's `wasi:cli/run@<ver>#run`
+    // export, wrap it in an inline sub-component re-exporting it as
+    // `run`, and emit a single top-level `(export "wasi:cli/run@…"
+    // instance N)`.
+    //
+    // Reactor shape: lift each `<iface>#<func>` export the embed
+    // declares from the embed core instance, bundle per-interface
+    // into a component instance, emit one `(export "<iface>"
+    // instance N)` per interface.
+    if (in.shape == .command) {
+        const run_ie = try findRunInstanceExport(in.hoisted, a);
+        if (in.adapter_iface.findExport(run_ie.core_export_name) == null) {
+            return error.AdapterMissingRunExport;
+        }
+        const run_core_func_idx = try b.addAlias(.{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = adapter_inst,
+            .name = run_ie.core_export_name,
+        } });
+        const lifted_run_func_idx = try b.addCanon(.{ .lift = .{
+            .core_func_idx = run_core_func_idx,
+            .type_idx = run_func_type_idx,
+            .opts = &.{},
+        } });
+
+        const sub = try buildRunSubComponent(a);
+        const sub_idx = try b.addNestedComponent(sub);
+
+        const sub_args = try a.alloc(ctypes.InstantiateArg, 1);
+        sub_args[0] = .{
+            .name = "import-func-run",
+            .sort_idx = .{ .sort = .func, .idx = lifted_run_func_idx },
+        };
+        const wrap_inst_idx = try b.addInstance(.{ .instantiate = .{
+            .component_idx = sub_idx,
+            .args = sub_args,
+        } });
+
+        try b.addExport(.{
+            .name = run_ie.qualified_name,
+            .desc = .{ .instance = run_ie.body_type_idx },
+            .sort_idx = .{ .sort = .instance, .idx = wrap_inst_idx },
+        });
+    } else {
+        // Reactor needs the embed's `component-type:*` custom section
+        // for the export interface signatures — without it we can't
+        // produce a typed top-level export. The section is stripped
+        // from `in.embed_bytes` before assemble runs, so callers
+        // pre-decode and supply via `in.embed_metadata`.
+        const decoded = in.embed_metadata orelse return error.MissingEmbedMetadata;
+
+        // Ensure there's at least one export — a reactor with no
+        // exports is degenerate (would produce a wrapping component
+        // with no top-level export, equivalent to a library shape
+        // tracked in #127).
+        var any_export = false;
+        for (decoded.externs) |ext| if (ext.is_export) {
+            any_export = true;
+            break;
+        };
+        if (!any_export) return error.UnsupportedAdapterShape;
+
+        for (decoded.externs) |ext| {
+            if (!ext.is_export) continue;
+
+            // Per-func: alias `<iface>#<func>` from the embed core
+            // instance, build the component func type, canon-lift,
+            // append to the per-interface inline-export bundle.
+            var inline_exports = std.ArrayListUnmanaged(ctypes.InlineExport).empty;
+            for (ext.funcs) |fn_ref| {
+                const core_export_name = try std.fmt.allocPrint(a, "{s}#{s}", .{ ext.qualified_name, fn_ref.name });
+                if (in.embed_iface.findExport(core_export_name) == null) {
+                    return error.EmbedMissingRequiredExport;
+                }
+                const core_func_idx = try b.addAlias(.{ .instance_export = .{
+                    .sort = .{ .core = .func },
+                    .instance_idx = main_inst,
+                    .name = core_export_name,
+                } });
+                const ftype_idx = try b.addType(.{ .func = fn_ref.sig });
+                const lifted_idx = try b.addCanon(.{ .lift = .{
+                    .core_func_idx = core_func_idx,
+                    .type_idx = ftype_idx,
+                    .opts = &.{},
+                } });
+                try inline_exports.append(a, .{
+                    .name = fn_ref.name,
+                    .sort_idx = .{ .sort = .func, .idx = lifted_idx },
+                });
+            }
+            const iface_inst_idx = try b.addInstance(.{ .exports = try inline_exports.toOwnedSlice(a) });
+
+            // The wrapping component's `(export …)` is emitted in
+            // un-ascribed form (`desc = .instance = 0`) so the
+            // loader re-derives the instance type from the
+            // sort_idx-pointed instance — matches the
+            // `component_new.zig::buildComponent` (no-adapter) path
+            // and round-trips through `loader.load`. A proper
+            // instance-type ascription falls out of #127's
+            // world-merge work.
+            try b.addExport(.{
+                .name = ext.qualified_name,
+                .desc = .{ .instance = 0 },
+                .sort_idx = .{ .sort = .instance, .idx = iface_inst_idx },
+            });
+        }
     }
-    const run_core_func_idx = try b.addAlias(.{ .instance_export = .{
-        .sort = .{ .core = .func },
-        .instance_idx = adapter_inst,
-        .name = run_ie.core_export_name,
-    } });
-    const lifted_run_func_idx = try b.addCanon(.{ .lift = .{
-        .core_func_idx = run_core_func_idx,
-        .type_idx = run_func_type_idx,
-        .opts = &.{},
-    } });
-
-    // ── Step 12: inline sub-component wrapping `run` ────────────────
-    const sub = try buildRunSubComponent(a);
-    const sub_idx = try b.addNestedComponent(sub);
-
-    const sub_args = try a.alloc(ctypes.InstantiateArg, 1);
-    sub_args[0] = .{
-        .name = "import-func-run",
-        .sort_idx = .{ .sort = .func, .idx = lifted_run_func_idx },
-    };
-    const wrap_inst_idx = try b.addInstance(.{ .instantiate = .{
-        .component_idx = sub_idx,
-        .args = sub_args,
-    } });
-
-    // ── Step 13: top-level export ────────────────────────────────────
-    try b.addExport(.{
-        .name = run_ie.qualified_name,
-        .desc = .{ .instance = run_ie.body_type_idx },
-        .sort_idx = .{ .sort = .instance, .idx = wrap_inst_idx },
-    });
 
     // ── Encode ───────────────────────────────────────────────────────
     const comp = ctypes.Component{
@@ -2092,7 +2256,177 @@ test "spliceMany: end-to-end on synthetic primary + bare secondary adapter pair"
     try testing.expectEqual(@as(usize, 5), comp.core_modules.len);
 }
 
-test "spliceMany: rejects zero adapters declaring wasi:cli/run" {
+test "splice: end-to-end on synthetic reactor adapter + reactor embed" {
+    const a = testing.allocator;
+
+    const adapter_bytes = try test_fixtures.buildSyntheticReactorAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticReactorEmbed(a);
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Reactor: one top-level export per embed export interface.
+    // Our synthetic embed exports the single `docs:counter/api@…`
+    // interface, so exactly one instance export and NO
+    // `wasi:cli/run@…` (this is the visible reactor signature).
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expectEqualStrings(test_fixtures.REACTOR_API_NAMESPACE, comp.exports[0].name);
+    try testing.expect(comp.exports[0].desc == .instance);
+    for (comp.exports) |ex| {
+        try testing.expect(!std.mem.startsWith(u8, ex.name, "wasi:cli/run@"));
+    }
+
+    // Top-level imports surface live WASI namespaces post-GC. The
+    // reactor adapter imports exactly one (`wasi:cli/stdout@…`).
+    var saw_stdout = false;
+    for (comp.imports) |im| {
+        if (std.mem.eql(u8, im.name, test_fixtures.STDOUT_NAMESPACE)) {
+            saw_stdout = true;
+            try testing.expect(im.desc == .instance);
+        }
+    }
+    try testing.expect(saw_stdout);
+
+    // Inner core modules: shim + embed + adapter + fixup. NO
+    // `__main_module__` fallback module — the reactor adapter has
+    // zero `__main_module__.<x>` imports, so Step 7's fallback
+    // path is skipped entirely.
+    try testing.expectEqual(@as(usize, 4), comp.core_modules.len);
+}
+
+test "spliceMany: end-to-end on reactor primary + bare secondary adapter pair" {
+    const a = testing.allocator;
+
+    const primary_bytes = try test_fixtures.buildSyntheticReactorAdapter(a);
+    defer a.free(primary_bytes);
+    const secondary_bytes = try test_fixtures.buildBareSecondaryAdapter(a);
+    defer a.free(secondary_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticReactorEmbedWithSecondary(a);
+    defer a.free(embed_bytes);
+
+    const adapters = [_]Adapter{
+        .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
+        .{ .name = test_fixtures.SECONDARY_NAME, .bytes = secondary_bytes },
+    };
+    const out = try spliceMany(a, embed_bytes, &adapters);
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Reactor primary + secondary: exactly one top-level export
+    // (the embed's single export interface) — no `wasi:cli/run@…`.
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expectEqualStrings(test_fixtures.REACTOR_API_NAMESPACE, comp.exports[0].name);
+
+    // Inner core modules: shim + embed + primary + fixup + secondary.
+    try testing.expectEqual(@as(usize, 5), comp.core_modules.len);
+}
+
+test "splice: rejects a reactor-shaped adapter that imports __main_module__" {
+    const a = testing.allocator;
+
+    // Hand-roll a "fake reactor" adapter: no `<iface>#name` exports
+    // (so `detectShape` classifies it `.reactor`) but it imports
+    // `__main_module__._start` — illegal for a reactor. The
+    // assemble() Step 7 reactor branch must catch this and surface
+    // `error.UnsupportedAdapterShape`.
+    //
+    // The fixture is otherwise structurally valid: env.memory +
+    // wasi:cli/stdout.flush imports keep the GC happy, fd_write +
+    // cabi_import_realloc satisfy the embed's preview1 import.
+    var ad = std.ArrayListUnmanaged(u8).empty;
+    defer ad.deinit(a);
+    try ad.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+
+    // Type section: () -> i32, () -> ()
+    try ad.appendSlice(a, &.{ 0x01, 0x08, 0x02, 0x60, 0x00, 0x01, 0x7f, 0x60, 0x00, 0x00 });
+
+    // Import section: env.memory, __main_module__._start, wasi:cli/stdout.flush
+    {
+        var imp = std.ArrayListUnmanaged(u8).empty;
+        defer imp.deinit(a);
+        try imp.append(a, 0x03);
+        // env.memory
+        try imp.appendSlice(a, &.{ 3, 'e', 'n', 'v', 6, 'm', 'e', 'm', 'o', 'r', 'y', 0x02, 0x00, 0x00 });
+        // __main_module__._start (typeidx 1)
+        try imp.appendSlice(a, &.{ 15, '_', '_', 'm', 'a', 'i', 'n', '_', 'm', 'o', 'd', 'u', 'l', 'e', '_', '_', 6, '_', 's', 't', 'a', 'r', 't', 0x00, 0x01 });
+        // wasi:cli/stdout@0.1.0.flush (typeidx 0)
+        const ns = "wasi:cli/stdout@0.1.0";
+        try imp.append(a, @intCast(ns.len));
+        try imp.appendSlice(a, ns);
+        try imp.appendSlice(a, &.{ 5, 'f', 'l', 'u', 's', 'h', 0x00, 0x00 });
+        try ad.append(a, 0x02);
+        var len_buf: [5]u8 = undefined;
+        const n = leb.writeU32Leb128(&len_buf, @intCast(imp.items.len));
+        try ad.appendSlice(a, len_buf[0..n]);
+        try ad.appendSlice(a, imp.items);
+    }
+    // Function section: 2 funcs, type 0
+    try ad.appendSlice(a, &.{ 0x03, 0x03, 0x02, 0x00, 0x00 });
+    // Export section: fd_write (func 2), cabi_import_realloc (func 3)
+    // Imported funcs: _start (idx 0), stdout.flush (idx 1).
+    {
+        var exp = std.ArrayListUnmanaged(u8).empty;
+        defer exp.deinit(a);
+        try exp.append(a, 0x02);
+        try exp.appendSlice(a, &.{ 8, 'f', 'd', '_', 'w', 'r', 'i', 't', 'e', 0x00, 0x02 });
+        try exp.appendSlice(a, &.{ 19, 'c', 'a', 'b', 'i', '_', 'i', 'm', 'p', 'o', 'r', 't', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c', 0x00, 0x03 });
+        try ad.append(a, 0x07);
+        var len_buf: [5]u8 = undefined;
+        const n = leb.writeU32Leb128(&len_buf, @intCast(exp.items.len));
+        try ad.appendSlice(a, len_buf[0..n]);
+        try ad.appendSlice(a, exp.items);
+    }
+    // Code section: 2 bodies
+    // body 0 (fd_write): call $0 (_start); call $1 (stdout.flush); drop; i32.const 0; end
+    //   — calls both imports so neither gets GC'd.
+    // body 1 (cabi_import_realloc): i32.const 0; end
+    try ad.appendSlice(a, &.{
+        0x0a, 0x10, 0x02,
+        0x09, 0x00, 0x10, 0x00, 0x10, 0x01, 0x1a, 0x41, 0x00, 0x0b,
+        0x04, 0x00, 0x41, 0x00, 0x0b,
+    });
+
+    // Encoded-world custom section — splice() parses this early, so
+    // we must supply one even though the test will reject the shape
+    // before it's used.
+    const metadata_encode = @import("../wit/metadata_encode.zig");
+    const ct = try metadata_encode.encodeWorldFromSource(a,
+        "package wasi:cli@0.1.0;\ninterface stdout { flush: func() -> u32; }\nworld reactor { import stdout; }",
+        "reactor");
+    defer a.free(ct);
+
+    const sec_name = "component-type:wasi:cli@0.1.0:reactor:encoded world";
+    var name_leb_buf: [5]u8 = undefined;
+    const name_leb_n = leb.writeU32Leb128(&name_leb_buf, @intCast(sec_name.len));
+    const body_len = name_leb_n + sec_name.len + ct.len;
+
+    try ad.append(a, 0x00);
+    var size_leb_buf: [5]u8 = undefined;
+    const size_leb_n = leb.writeU32Leb128(&size_leb_buf, @intCast(body_len));
+    try ad.appendSlice(a, size_leb_buf[0..size_leb_n]);
+    try ad.appendSlice(a, name_leb_buf[0..name_leb_n]);
+    try ad.appendSlice(a, sec_name);
+    try ad.appendSlice(a, ct);
+
+    const embed_bytes = try test_fixtures.buildSyntheticReactorEmbed(a);
+    defer a.free(embed_bytes);
+
+    try testing.expectError(
+        error.UnsupportedAdapterShape,
+        splice(a, embed_bytes, ad.items, "wasi_snapshot_preview1"),
+    );
+}
+
+test "spliceMany: rejects zero non-env-import adapters" {
     const a = testing.allocator;
 
     const secondary_bytes = try test_fixtures.buildBareSecondaryAdapter(a);
@@ -2104,10 +2438,10 @@ test "spliceMany: rejects zero adapters declaring wasi:cli/run" {
         .{ .name = test_fixtures.SECONDARY_NAME, .bytes = secondary_bytes },
         .{ .name = "another", .bytes = secondary_bytes },
     };
-    try testing.expectError(error.MissingRunAdapter, spliceMany(a, embed_bytes, &adapters));
+    try testing.expectError(error.MissingPrimaryAdapter, spliceMany(a, embed_bytes, &adapters));
 }
 
-test "spliceMany: rejects two adapters declaring wasi:cli/run" {
+test "spliceMany: rejects two non-env-import adapters" {
     const a = testing.allocator;
 
     const primary_bytes = try test_fixtures.buildSyntheticAdapter(a);
@@ -2119,10 +2453,10 @@ test "spliceMany: rejects two adapters declaring wasi:cli/run" {
         .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
         .{ .name = "second_run", .bytes = primary_bytes },
     };
-    try testing.expectError(error.AmbiguousRunAdapter, spliceMany(a, embed_bytes, &adapters));
+    try testing.expectError(error.AmbiguousPrimaryAdapter, spliceMany(a, embed_bytes, &adapters));
 }
 
-test "spliceMany: rejects a secondary adapter with non-env imports" {
+test "spliceMany: rejects two adapters with non-env imports" {
     const a = testing.allocator;
 
     const primary_bytes = try test_fixtures.buildSyntheticAdapter(a);
@@ -2130,9 +2464,10 @@ test "spliceMany: rejects a secondary adapter with non-env imports" {
     const embed_bytes = try test_fixtures.buildSyntheticEmbedWithSecondary(a);
     defer a.free(embed_bytes);
 
-    // Hand-roll a tiny "bad secondary": no `#` export (so it
-    // doesn't claim to be primary) but imports `__main_module__.x`
-    // — bare-shim contract requires every import to be `env.<x>`.
+    // Hand-roll a tiny adapter that imports `__main_module__.x`
+    // — under the post-#116 partition, ANY non-`env` import makes
+    // an adapter a primary candidate, so this collides with the
+    // synthetic primary and surfaces `AmbiguousPrimaryAdapter`.
     const bad = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // Type section: () -> ()
@@ -2154,5 +2489,5 @@ test "spliceMany: rejects a secondary adapter with non-env imports" {
         .{ .name = "wasi_snapshot_preview1", .bytes = primary_bytes },
         .{ .name = test_fixtures.SECONDARY_NAME, .bytes = &bad },
     };
-    try testing.expectError(error.SecondaryAdapterUnsupported, spliceMany(a, embed_bytes, &adapters));
+    try testing.expectError(error.AmbiguousPrimaryAdapter, spliceMany(a, embed_bytes, &adapters));
 }
