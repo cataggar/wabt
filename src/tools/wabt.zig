@@ -1,20 +1,20 @@
 //! wabt — WebAssembly Binary Toolkit (single-binary CLI).
 //!
-//! All wabt tools are exposed as bare-word subcommands of one `wabt`
-//! executable, mirroring the `wasm-tools` and `zig` style:
+//! Commands are organized under six conceptual-subject roots:
 //!
-//!   wabt parse <file.wat>           Translate WAT text to wasm binary
-//!   wabt print <file.wasm>          Print wasm binary as WAT text
-//!   wabt validate <file.wasm>       Validate a wasm binary
-//!   wabt objdump <file.wasm>        Dump wasm section info
-//!   wabt strip <file.wasm>          Strip custom sections
-//!   wabt json-from-wast <file.wast> Convert .wast to JSON + wasm
-//!   wabt decompile <file.wasm>      Decompile to readable pseudo-code
-//!   wabt stats <file.wasm>          Show module statistics
-//!   wabt desugar <file.wat>         Round-trip .wat through the parser
-//!   wabt spectest <file.wast>       Run a WebAssembly spec test
-//!   wabt version                    Print version
-//!   wabt help [subcommand]          Print help
+//!   wabt text <verb>        Text format (.wat) work
+//!   wabt module <verb>      Core wasm (.wasm) work
+//!   wabt component <verb>   Component-model (.wasm) work
+//!   wabt interface <verb>   WIT IDL (.wit) work
+//!   wabt compose <verb>     WAC composition (.wac) work
+//!   wabt spec <verb>        Spec testing (.wast) work
+//!   wabt version            Print version
+//!   wabt help [topic]       Print help
+//!
+//! During the migration the old flat verbs (`wabt parse`, `wabt
+//! validate`, …) continue to dispatch to the same underlying
+//! modules. They are transparent passthroughs and will be marked
+//! deprecated, then removed, in later phases of #137.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -31,8 +31,25 @@ const desugar_cmd = @import("desugar.zig");
 const spectest_cmd = @import("spectest.zig");
 const shrink_cmd = @import("shrink.zig");
 const component_cmd = @import("component.zig");
+const text_cmd = @import("text.zig");
+const module_cmd = @import("module.zig");
+const interface_cmd = @import("interface.zig");
+const compose_cmd = @import("compose.zig");
+const spec_cmd = @import("spec.zig");
 
 pub const Subcommand = enum {
+    // Subject roots (canonical):
+    text,
+    module,
+    component,
+    interface,
+    compose,
+    spec,
+    // Global:
+    version,
+    help,
+    // Flat verbs (transparent passthrough during migration; will be
+    // deprecated then removed per #137):
     parse,
     print,
     validate,
@@ -44,12 +61,20 @@ pub const Subcommand = enum {
     desugar,
     spectest,
     shrink,
-    component,
-    version,
-    help,
 };
 
 pub fn parseSubcommand(s: []const u8) ?Subcommand {
+    // Subject roots first (the canonical entry points).
+    if (std.mem.eql(u8, s, "text")) return .text;
+    if (std.mem.eql(u8, s, "module")) return .module;
+    if (std.mem.eql(u8, s, "component")) return .component;
+    if (std.mem.eql(u8, s, "interface")) return .interface;
+    if (std.mem.eql(u8, s, "compose")) return .compose;
+    if (std.mem.eql(u8, s, "spec")) return .spec;
+    // Global.
+    if (std.mem.eql(u8, s, "version")) return .version;
+    if (std.mem.eql(u8, s, "help")) return .help;
+    // Flat passthroughs (migration aids).
     if (std.mem.eql(u8, s, "parse")) return .parse;
     if (std.mem.eql(u8, s, "print")) return .print;
     if (std.mem.eql(u8, s, "validate")) return .validate;
@@ -61,9 +86,6 @@ pub fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "desugar")) return .desugar;
     if (std.mem.eql(u8, s, "spectest")) return .spectest;
     if (std.mem.eql(u8, s, "shrink")) return .shrink;
-    if (std.mem.eql(u8, s, "component")) return .component;
-    if (std.mem.eql(u8, s, "version")) return .version;
-    if (std.mem.eql(u8, s, "help")) return .help;
     return null;
 }
 
@@ -93,6 +115,14 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         .help => runHelp(init.io, sub_args),
+        // Subject dispatchers.
+        .text => try text_cmd.run(init, sub_args),
+        .module => try module_cmd.run(init, sub_args),
+        .component => try component_cmd.run(init, sub_args),
+        .interface => try interface_cmd.run(init, sub_args),
+        .compose => try compose_cmd.run(init, sub_args),
+        .spec => try spec_cmd.run(init, sub_args),
+        // Flat passthroughs.
         .parse => try parse_cmd.run(init, sub_args),
         .print => try print_cmd.run(init, sub_args),
         .validate => try validate_cmd.run(init, sub_args),
@@ -104,30 +134,32 @@ pub fn main(init: std.process.Init) !void {
         .desugar => try desugar_cmd.run(init, sub_args),
         .spectest => try spectest_cmd.run(init, sub_args),
         .shrink => try shrink_cmd.run(init, sub_args),
-        .component => try component_cmd.run(init, sub_args),
     }
 }
 
 const top_usage =
     \\wabt - WebAssembly Binary Toolkit
     \\
-    \\Usage: wabt <subcommand> [args...]
+    \\Usage: wabt <subject> <verb> [args...]
     \\
-    \\Subcommands:
-    \\  parse           Translate WebAssembly text format to binary (was wat2wasm)
-    \\  print           Print a wasm binary as WebAssembly text format (was wasm2wat)
-    \\  validate        Validate a WebAssembly binary
-    \\  objdump         Dump information about a WebAssembly binary
-    \\  strip           Strip custom sections from a WebAssembly binary
-    \\  json-from-wast  Convert a .wast spec test to JSON + .wasm files (was wast2json)
-    \\  decompile       Decompile a wasm binary into readable pseudo-code
-    \\  stats           Print module statistics
-    \\  desugar         Parse and re-emit WebAssembly text format
-    \\  spectest        Run a WebAssembly spec test (.wast)
-    \\  shrink          Minimize a wasm binary while preserving a property
-    \\  component       Component-model subcommands (embed)
-    \\  version         Print the wabt version and exit
-    \\  help            Print this help; `wabt help <subcommand>` for details
+    \\Subjects:
+    \\  text       Text format (.wat) work — parse, print, desugar
+    \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+    \\  component  Component-model work — new, embed, compose
+    \\  interface  WIT IDL work — (planned; see #137)
+    \\  compose    WAC composition work — (deferred; see #137)
+    \\  spec       Spec testing (.wast) work — run, to-json
+    \\
+    \\Global:
+    \\  version    Print the wabt version and exit
+    \\  help       Print this help; `wabt help <subject>` for details
+    \\
+    \\Run `wabt help <subject>` for the verbs in that subject.
+    \\
+    \\During migration the old flat verb names (parse, print,
+    \\validate, objdump, strip, json-from-wast, decompile, stats,
+    \\desugar, spectest, shrink) still work as transparent
+    \\passthroughs. They will be deprecated and removed per #137.
     \\
 ;
 
@@ -139,9 +171,14 @@ const version_usage =
 ;
 
 const help_usage =
-    \\Usage: wabt help [subcommand]
+    \\Usage: wabt help [topic]
     \\
-    \\Print top-level help, or help for a specific subcommand.
+    \\Print top-level help, or help for a specific subject or flat verb.
+    \\Examples:
+    \\  wabt help              top-level overview
+    \\  wabt help text         verbs in the `text` subject
+    \\  wabt help text parse   help for `wabt text parse`
+    \\  wabt help validate     help for the (deprecated) flat `wabt validate`
     \\
 ;
 
@@ -151,28 +188,45 @@ fn runHelp(io: std.Io, args: []const []const u8) void {
         return;
     }
     const sub = parseSubcommand(args[0]) orelse {
-        std.debug.print("error: unknown subcommand '{s}' — try `wabt help`\n", .{args[0]});
+        std.debug.print("error: unknown topic '{s}' — try `wabt help`\n", .{args[0]});
         std.process.exit(1);
     };
-    writeStdout(io, switch (sub) {
-        .parse => parse_cmd.usage,
-        .print => print_cmd.usage,
-        .validate => validate_cmd.usage,
-        .objdump => objdump_cmd.usage,
-        .strip => strip_cmd.usage,
-        .json_from_wast => json_from_wast_cmd.usage,
-        .decompile => decompile_cmd.usage,
-        .stats => stats_cmd.usage,
-        .desugar => desugar_cmd.usage,
-        .spectest => spectest_cmd.usage,
-        .shrink => shrink_cmd.usage,
-        .component => component_cmd.usage,
-        .version => version_usage,
-        .help => help_usage,
-    });
+    switch (sub) {
+        // Subject roots: print the subject overview. For verb-specific
+        // help, run `wabt <subject> help <verb>` directly.
+        .text => writeStdout(io, text_cmd.usage),
+        .module => writeStdout(io, module_cmd.usage),
+        .component => writeStdout(io, component_cmd.usage),
+        .interface => writeStdout(io, interface_cmd.usage),
+        .compose => writeStdout(io, compose_cmd.usage),
+        .spec => writeStdout(io, spec_cmd.usage),
+        // Flat passthroughs.
+        .parse => writeStdout(io, parse_cmd.usage),
+        .print => writeStdout(io, print_cmd.usage),
+        .validate => writeStdout(io, validate_cmd.usage),
+        .objdump => writeStdout(io, objdump_cmd.usage),
+        .strip => writeStdout(io, strip_cmd.usage),
+        .json_from_wast => writeStdout(io, json_from_wast_cmd.usage),
+        .decompile => writeStdout(io, decompile_cmd.usage),
+        .stats => writeStdout(io, stats_cmd.usage),
+        .desugar => writeStdout(io, desugar_cmd.usage),
+        .spectest => writeStdout(io, spectest_cmd.usage),
+        .shrink => writeStdout(io, shrink_cmd.usage),
+        .version => writeStdout(io, version_usage),
+        .help => writeStdout(io, help_usage),
+    }
 }
 
-test "parseSubcommand recognizes all subcommands" {
+test "parseSubcommand recognizes subject roots" {
+    try std.testing.expectEqual(@as(?Subcommand, .text), parseSubcommand("text"));
+    try std.testing.expectEqual(@as(?Subcommand, .module), parseSubcommand("module"));
+    try std.testing.expectEqual(@as(?Subcommand, .component), parseSubcommand("component"));
+    try std.testing.expectEqual(@as(?Subcommand, .interface), parseSubcommand("interface"));
+    try std.testing.expectEqual(@as(?Subcommand, .compose), parseSubcommand("compose"));
+    try std.testing.expectEqual(@as(?Subcommand, .spec), parseSubcommand("spec"));
+}
+
+test "parseSubcommand recognizes flat passthroughs (migration aids)" {
     try std.testing.expectEqual(@as(?Subcommand, .parse), parseSubcommand("parse"));
     try std.testing.expectEqual(@as(?Subcommand, .print), parseSubcommand("print"));
     try std.testing.expectEqual(@as(?Subcommand, .validate), parseSubcommand("validate"));
@@ -200,4 +254,13 @@ test "parseSubcommand rejects unknown and old names" {
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("spectest-interp"));
     // json_from_wast uses hyphens externally, not snake_case.
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("json_from_wast"));
+    // No aliases: `c` is not `component`, `wit` is not `interface`.
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("c"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wit"));
+    // No top-level `wat` / `wasm` / `wast` / `wac` either — those are
+    // file extensions, not subjects (per #137 naming conventions).
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wat"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wasm"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wast"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wac"));
 }

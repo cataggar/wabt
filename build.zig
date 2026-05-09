@@ -49,6 +49,12 @@ pub fn build(b: *std.Build) void {
         "src/tools/component_embed.zig",
         "src/tools/component_new.zig",
         "src/tools/component_compose.zig",
+        // Subject dispatchers (added by #137 — six conceptual roots).
+        "src/tools/text.zig",
+        "src/tools/module.zig",
+        "src/tools/interface.zig",
+        "src/tools/compose.zig",
+        "src/tools/spec.zig",
     };
 
     // Single wabt CLI exe — dispatches to subcommand modules at runtime.
