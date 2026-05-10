@@ -6,12 +6,17 @@ Unit tests live alongside the code; run them with:
 $ zig build test
 ```
 
-Spec-test baseline (full WebAssembly/testsuite, 257 `.wast` files,
-65k+ assertions) is checked against [`spec-baseline.tsv`](spec-baseline.tsv):
+Wasm 3.0 spec tests — run the full [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) (257 `.wast` files, 65k+ assertions) and compare against the pinned baseline at [`spec-baseline.tsv`](spec-baseline.tsv):
 
 ```console
 $ zig build -Doptimize=ReleaseSafe
 $ python3 scripts/check_spec_baseline.py
+```
+
+To run a single file:
+
+```console
+$ ./zig-out/bin/wabt spec run third_party/testsuite/i32.wast
 ```
 
 ## Legacy C++-era test corpus
