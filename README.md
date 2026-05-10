@@ -7,7 +7,7 @@ A fork of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) ported from C+
 Install pre-built binaries from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-$ ghr install cataggar/wabt@v3.0.0-dev.1
+$ ghr install cataggar/wabt@v3.0.0-dev.4
 ```
 
 See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip) and detailed instructions.
@@ -28,8 +28,6 @@ Subjects:
   text       Text format (.wat) work — parse, print, desugar
   module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
   component  Component-model work — new, embed, compose
-  interface  WIT IDL work — (planned; see #137)
-  compose    WAC composition work — (deferred; see #137)
   spec       Spec testing (.wast) work — run, to-json
 
 Global:
@@ -61,27 +59,6 @@ Cross-compilation works out of the box:
 $ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
 $ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
 $ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
-```
-
-## Running tests
-
-Unit tests:
-
-```console
-$ zig build test
-```
-
-Wasm 3.0 spec tests — run the full [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) (257 `.wast` files, 65k+ assertions) and compare against the pinned baseline at [`test/spec-baseline.tsv`](test/spec-baseline.tsv):
-
-```console
-$ zig build -Doptimize=ReleaseSafe
-$ python3 scripts/check_spec_baseline.py
-```
-
-To run a single file:
-
-```console
-$ ./zig-out/bin/wabt spec run third_party/testsuite/i32.wast
 ```
 
 ## License

@@ -92,8 +92,6 @@ const top_usage =
     \\  text       Text format (.wat) work — parse, print, desugar
     \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
     \\  component  Component-model work — new, embed, compose
-    \\  interface  WIT IDL work — (planned; see #137)
-    \\  compose    WAC composition work — (deferred; see #137)
     \\  spec       Spec testing (.wast) work — run, to-json
     \\
     \\Global:
