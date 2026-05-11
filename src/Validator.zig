@@ -684,6 +684,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
         .height = 0,
         .unreachable_flag = false,
         .else_seen = false,
+        .saved_init = packInitState(local_inited),
     }) catch return error.OutOfMemory;
 
     var pos: usize = 0;
@@ -703,6 +704,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (bt.params.len > 0)
                     try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x02, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                ctrl_stack.items[ctrl_stack.items.len - 1].saved_init = packInitState(local_inited);
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x03 => { // loop
@@ -710,6 +712,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (bt.params.len > 0)
                     try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x03, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                ctrl_stack.items[ctrl_stack.items.len - 1].saved_init = packInitState(local_inited);
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x04 => { // if
@@ -745,10 +748,11 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     if (!std.mem.eql(types.ValType, frame.start_types, frame.end_types))
                         return error.TypeMismatch;
                 }
-                // Restore init state from frame entry (conservative merge)
-                if (frame.opcode == 0x04 or frame.opcode == 0x02) {
-                    unpackInitState(frame.saved_init, local_inited);
-                }
+                // Roll back local-init state to frame entry. Per the
+                // function-references spec, any local.set inside a
+                // block/loop/if body does not propagate past `end` (an
+                // early `br` could have skipped the set).
+                unpackInitState(frame.saved_init, local_inited);
                 _ = ctrl_stack.pop();
                 pushVals(&val_stack, frame.end_types, gpa(m)) catch return error.OutOfMemory;
             },
@@ -1293,26 +1297,31 @@ fn checkBinary(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFra
     val_stack.append(alloc, result) catch return error.OutOfMemory;
 }
 
-fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), result_type: ValTypeOrUnknown, alloc: std.mem.Allocator, opcode: u8) Error!void {
-    const mem_idx = readU32(bytes, pos);
-    const align_val = readU32(bytes, pos);
+fn readMemArg(bytes: []const u8, pos: *usize) struct { align_val: u32, mem_idx: u32 } {
+    const align_raw = readU32(bytes, pos);
+    const has_explicit_memidx = (align_raw & 0x40) != 0;
+    const align_val = align_raw & ~@as(u32, 0x40);
+    const mem_idx: u32 = if (has_explicit_memidx) readU32(bytes, pos) else 0;
     _ = readU32(bytes, pos); // offset
+    return .{ .align_val = align_val, .mem_idx = mem_idx };
+}
+
+fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), result_type: ValTypeOrUnknown, alloc: std.mem.Allocator, opcode: u8) Error!void {
+    const memarg = readMemArg(bytes, pos);
     if (maxAlignmentForOpcode(opcode)) |max_align| {
-        if (align_val > max_align) return error.InvalidAlignment;
+        if (memarg.align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, .i32);
     val_stack.append(alloc, result_type) catch return error.OutOfMemory;
 }
 
 fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), value_type: ValTypeOrUnknown, _: std.mem.Allocator, opcode: u8) Error!void {
-    const mem_idx = readU32(bytes, pos);
-    const align_val = readU32(bytes, pos);
-    _ = readU32(bytes, pos); // offset
+    const memarg = readMemArg(bytes, pos);
     if (maxAlignmentForOpcode(opcode)) |max_align| {
-        if (align_val > max_align) return error.InvalidAlignment;
+        if (memarg.align_val > max_align) return error.InvalidAlignment;
     }
-    if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+    if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, value_type);
     try popExpect(val_stack, ctrl_stack, .i32);
 }
@@ -1466,5 +1475,99 @@ test "br with empty stack in typed block should fail" {
         .decl = .{ .type_var = .{ .index = 0 } },
         .code_bytes = &bytes,
     });
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "memarg read consumes exactly 2 varuints (load)" {
+    // Regression: checkMemLoad used to read 3 varuints (mem_idx, align, offset),
+    // which over-consumed the byte stream and corrupted later instructions.
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (memory 1)
+        \\  (func $f (param $p i32) (result i32)
+        \\    local.get $p
+        \\    i32.load))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+}
+
+test "memarg read consumes exactly 2 varuints (store)" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (memory 1)
+        \\  (func $f (param $p i32) (param $v i32)
+        \\    local.get $p
+        \\    local.get $v
+        \\    i32.store))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+}
+
+test "load with multi-memory bit + explicit mem-idx" {
+    // Hand-roll a memarg with bit 6 set in align byte → mem-idx follows.
+    // (module (memory 0 1) (memory 0 1) (func (param i32) (result i32)
+    //    local.get 0
+    //    i32.load align=4 offset=0 (mem 1)))
+    const alloc = std.testing.allocator;
+    const bytes = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x28, 0x42, 0x01, 0x00, // i32.load align=2|0x40 mem-idx=1 offset=0
+        0x0b, // end
+    };
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{
+        .params = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
+        .results = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
+    } });
+    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
+    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = &bytes,
+    });
+    try validate(&module, .{});
+}
+
+test "block end does not clobber local-init state" {
+    // Regression: a `block ... end` used to restore local_inited from
+    // an unset saved_init (zero-filled), marking every local
+    // uninitialised. This valid program then failed with TypeMismatch
+    // on the subsequent local.get.
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (func $f (param $p i32) (result i32)
+        \\    block
+        \\    end
+        \\    local.get $p))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+}
+
+test "local.set inside block does not escape (spec local_init.wast)" {
+    // Per the function-references local-init rules (spec test
+    // `uninit-after-end` in testsuite/local_init.wast), a non-nullable
+    // ref local that is only ever set inside a `block` body remains
+    // uninitialised after the block ends, because an early `br` could
+    // have skipped the set.
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (func $f (param $p (ref extern))
+        \\    (local $x (ref extern))
+        \\    (block (local.set $x (local.get $p)))
+        \\    (drop (local.get $x))))
+    );
+    defer module.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
 }
