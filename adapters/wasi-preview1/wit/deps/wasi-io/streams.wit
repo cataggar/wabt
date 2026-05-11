@@ -1,0 +1,46 @@
+// Trimmed slice of `wasi:io@0.2.6.streams` that the wabt-built
+// wasi-preview1 adapter needs. Mirrors the canonical
+// `bytecodealliance/wasi-io@v0.2.6` shape but declares only:
+//
+//   * `stream-error` variant — the canonical version's
+//     `last-operation-failed` case carries an `error` resource
+//     payload from `wasi:io/error`. We flatten it to a no-payload
+//     case until the encoder grows `use` clause support; both
+//     forms encode to a `result<_, stream-error>` shape that the
+//     adapter never reads (preview1 `fd_write` only cares about
+//     "succeeded" vs "trap on first error").
+//
+//   * `output-stream` resource with `blocking-write-and-flush` —
+//     the single method the preview1 → preview2 adapter calls in
+//     its `fd_write` body.
+//
+// The wider `streams` surface (subscribe / check-write /
+// non-blocking write / input-stream / forward / splice) lives
+// upstream and is not consumed by the adapter, so it stays out
+// of this trimmed copy to keep `metadata_encode` output minimal.
+
+package wasi:io@0.2.6;
+
+interface streams {
+    /// Failure modes for `output-stream` writes. The canonical
+    /// `last-operation-failed` case carries a `borrow<error>` from
+    /// `wasi:io/error` — we drop the payload here (see top-of-file
+    /// note) so the wire-form is `variant { last-operation-failed,
+    /// closed }`.
+    variant stream-error {
+        last-operation-failed,
+        closed,
+    }
+
+    /// Byte-sink resource. The adapter only needs the
+    /// blocking-and-flushed write path — preview1 `fd_write` is
+    /// itself blocking, so any non-blocking lowering would just be
+    /// extra ceremony.
+    resource output-stream {
+        /// Write `contents` and block until the host has accepted
+        /// every byte. Returns `ok` on full success or
+        /// `err(stream-error)` if the underlying sink closed or
+        /// errored mid-write.
+        blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
+    }
+}
