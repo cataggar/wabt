@@ -11,8 +11,25 @@
 ;; workaround added in #447/#448.
 ;;
 ;; Status: scaffold. Most function bodies are `unreachable` traps.
-;; `proc_exit` and `run` are fully wired; `fd_write` and the rest
-;; of the preview1 surface land in subsequent commits.
+;; `proc_exit` and `run` are fully wired. `fd_write` is still an
+;; ENOSYS stub but the preview2 surface it will call (Phase
+;; 1.c.3c/d) is now declared:
+;;
+;;   * `wasi:cli/stdout@0.2.6.get-stdout` /
+;;     `wasi:cli/stderr@0.2.6.get-stderr` — handle factories;
+;;   * `wasi:io/streams@0.2.6.[method]output-stream.blocking-write-and-flush`
+;;     — single hot path for stdout/stderr writes;
+;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` —
+;;     auto-bound by the splicer for canon `resource.drop` lowering
+;;     (we cache handles and never actually drop them, but the
+;;     splicer expects every `own<>` resource to have its drop
+;;     import declared).
+;;
+;; The new imports are declared here in Phase 1.c.3b so the
+;; encoded-world custom section round-trips through
+;; `build_adapter.zig` → `decode.parseFromAdapterCore` against the
+;; widened preview1 world. Phase 1.c.3c adds globals + helpers
+;; that consume them; Phase 1.c.3d rewires `fd_write`.
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -49,12 +66,22 @@
   ;; component; here they are plain core-wasm function types).
   ;;
   ;; v1 scope (cataggar/wamr#453): only the preview2 imports used
-  ;; by `proc_exit` are declared. The wider set
-  ;; (`wasi:io/streams.[method]output-stream.…`, `wasi:cli/stdout`,
-  ;; `wasi:filesystem/…`, etc.) arrives alongside the real
-  ;; `fd_write` / `args_get` / `clock_time_get` lowering — which
-  ;; also requires `metadata_encode.zig` to grow resource-handle
-  ;; support.
+  ;; by `proc_exit` and the (still-stubbed) stdout/stderr write
+  ;; path are declared. The wider set (`wasi:filesystem/…`,
+  ;; `wasi:cli/environment`, etc.) arrives alongside the real
+  ;; `args_get` / `clock_time_get` lowering in a later sub-phase.
+
+  ;; `wasi:cli/{stdout,stderr}.get-{stdout,stderr}: () -> own<output-stream>`
+  ;;   canon-lower'd to `(func (result i32))` — returns an opaque
+  ;;   handle index in the per-instance resource table.
+  (type $get_stream_sig (func (result i32)))
+
+  ;; `[method]output-stream.blocking-write-and-flush(self,
+  ;;     contents: list<u8>) -> result<_, stream-error>`
+  ;;   canon-lower'd to `(func (param i32 i32 i32 i32))` — the
+  ;;   params are (self, buf_ptr, buf_len, ret_area_ptr) where
+  ;;   the ret_area is canon-lifted from the embed's `env.memory`.
+  (type $blocking_write_sig (func (param i32 i32 i32 i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -74,6 +101,32 @@
   ;; preserves the numeric proc_exit code end-to-end.
   (import "wasi:cli/exit@0.2.6" "exit-with-code"
     (func $exit_with_code (type $i32_void)))
+
+  ;; Owned-handle factories for stdout / stderr. Each call yields a
+  ;; fresh `own<output-stream>` we *should* drop on teardown — in
+  ;; practice we cache one per process (Phase 1.c.3c) and let the
+  ;; instance teardown reclaim the table slot.
+  (import "wasi:cli/stdout@0.2.6" "get-stdout"
+    (func $get_stdout (type $get_stream_sig)))
+  (import "wasi:cli/stderr@0.2.6" "get-stderr"
+    (func $get_stderr (type $get_stream_sig)))
+
+  ;; The single hot-path output-stream method we'll lower against
+  ;; in fd_write. `blocking-` is the right choice for the preview1
+  ;; `fd_write` contract (caller expects all bytes drained or a
+  ;; non-zero errno).
+  (import "wasi:io/streams@0.2.6" "[method]output-stream.blocking-write-and-flush"
+    (func $blocking_write_and_flush (type $blocking_write_sig)))
+
+  ;; `[resource-drop]output-stream` — the splicer detects this
+  ;; import name and synthesizes the canon `resource.drop` call
+  ;; for us (see `src/component/adapter/adapter.zig:706`). Even
+  ;; though we never call it directly today (cached handles are
+  ;; not dropped), declaring it now keeps the resource-handle
+  ;; type surface symmetrical and exercises the encoder's
+  ;; `[resource-drop]` import path.
+  (import "wasi:io/streams@0.2.6" "[resource-drop]output-stream"
+    (func $output_stream_drop (type $i32_void)))
 
   ;; ── preview1 surface ─────────────────────────────────────────
   ;;
