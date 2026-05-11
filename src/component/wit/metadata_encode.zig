@@ -42,17 +42,16 @@
 //!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
-//!   * record / variant / enum / flags / use clause / resource decl
-//!     in interface bodies (the wamr fixtures don't use them).
-//!   * `own<R>` / `borrow<R>` handle types.
+//!   * `resource` decls and `own<R>` / `borrow<R>` handle types.
+//!   * `use` clauses (cross-interface type imports).
 //!   * stream / future / async / error-context.
 //!
-//! Supported: `type <name> = <Type>;` aliases plus `Type.name`
-//! references that resolve to a prior alias in the same interface
-//! body. The alias binds the name to the underlying `ValType`
-//! without consuming a fresh slot; references inline the bound
-//! `ValType`. Compound RHSes (`list<T>`, `result<…>`, …) still emit
-//! their own `TypeDef` decls via `appendCompound`.
+//! Supported: `type <name> = <Type>;` aliases, plus nominal typedefs
+//! (`record`, `variant`, `enum`, `flags`) — each emits one slot in
+//! the body's type-index space and is referenced from later funcs /
+//! aliases via `Type.name`. Compound RHSes (`list<T>`, `result<…>`,
+//! `tuple<…>`, `option<…>`) still hoist via `appendCompound`; named
+//! refs are resolved against `BodyBuilder.name_map`.
 //!
 //! Lifting these is incremental: each remaining WIT type maps to a
 //! `TypeDef` declarator before the func that references it.
@@ -304,7 +303,35 @@ fn buildInterfaceBody(
                     const vt = try builder.lowerType(inner);
                     try builder.bindName(td.name, vt);
                 },
-                else => return error.UnsupportedWitFeature,
+                .record => |fields| {
+                    const lowered = try ar.alloc(ctypes.Field, fields.len);
+                    for (fields, 0..) |f, i| {
+                        lowered[i] = .{ .name = f.name, .type = try builder.lowerType(f.type) };
+                    }
+                    const vt = try builder.appendCompound(.{ .record = .{ .fields = lowered } });
+                    try builder.bindName(td.name, vt);
+                },
+                .variant => |cases| {
+                    const lowered = try ar.alloc(ctypes.Case, cases.len);
+                    for (cases, 0..) |c, i| {
+                        const payload: ?ctypes.ValType = if (c.type) |ty|
+                            try builder.lowerType(ty)
+                        else
+                            null;
+                        lowered[i] = .{ .name = c.name, .type = payload };
+                    }
+                    const vt = try builder.appendCompound(.{ .variant = .{ .cases = lowered } });
+                    try builder.bindName(td.name, vt);
+                },
+                .@"enum" => |names| {
+                    const vt = try builder.appendCompound(.{ .enum_ = .{ .names = names } });
+                    try builder.bindName(td.name, vt);
+                },
+                .flags => |names| {
+                    const vt = try builder.appendCompound(.{ .flags = .{ .names = names } });
+                    try builder.bindName(td.name, vt);
+                },
+                .resource => return error.UnsupportedWitFeature,
             },
             .use => return error.UnsupportedWitFeature,
         }
@@ -761,19 +788,144 @@ test "metadata_encode: unresolved name reports InvalidWit" {
     try testing.expectError(error.InvalidWit, r);
 }
 
-test "metadata_encode: still rejects record / variant / enum / flags / use / resource" {
-    // Chunk 2 keeps the compound-typedef block deferred. The encoder
-    // must continue to surface `UnsupportedWitFeature` for these.
-    const rec =
+test "metadata_encode: record typedef emits TypeDef.record + name binding" {
+    const source =
         \\package docs:demo@0.1.0;
         \\interface ops {
         \\    record point { x: u32, y: u32 }
-        \\    f: func(p: point);
+        \\    move-by: func(p: point, dx: s32) -> point;
         \\}
         \\world demo { export ops; }
     ;
-    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, rec, "demo"));
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
 
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [record TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .record);
+    const rec = iface.decls[0].type.record;
+    try testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try testing.expectEqualStrings("x", rec.fields[0].name);
+    try testing.expect(rec.fields[0].type == .u32);
+    try testing.expectEqualStrings("y", rec.fields[1].name);
+    try testing.expect(rec.fields[1].type == .u32);
+
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(func.params[1].type == .s32);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: variant typedef with mixed payloads" {
+    // Mirrors `wasi:io/streams.stream-error`: a no-payload `closed`
+    // case plus a payload-carrying case. Both forms must encode and
+    // round-trip cleanly.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    variant stream-error {
+        \\        closed,
+        \\        last-operation-failed(string),
+        \\    }
+        \\    drain: func() -> result<u32, stream-error>;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [variant (0), result (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .variant);
+    const v = iface.decls[0].type.variant;
+    try testing.expectEqual(@as(usize, 2), v.cases.len);
+    try testing.expectEqualStrings("closed", v.cases[0].name);
+    try testing.expect(v.cases[0].type == null);
+    try testing.expectEqualStrings("last-operation-failed", v.cases[1].name);
+    try testing.expect(v.cases[1].type != null);
+    try testing.expect(v.cases[1].type.? == .string);
+
+    try testing.expect(iface.decls[1].type == .result);
+    const res = iface.decls[1].type.result;
+    try testing.expect(res.ok != null and res.ok.? == .u32);
+    try testing.expect(res.err != null);
+    try testing.expectEqual(@as(u32, 0), res.err.?.type_idx);
+
+    try testing.expect(iface.decls[2].type == .func);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: enum typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    enum color { red, green, blue }
+        \\    pick: func() -> color;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .enum_);
+    const e = iface.decls[0].type.enum_;
+    try testing.expectEqual(@as(usize, 3), e.names.len);
+    try testing.expectEqualStrings("red", e.names[0]);
+    try testing.expectEqualStrings("green", e.names[1]);
+    try testing.expectEqualStrings("blue", e.names[2]);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: flags typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    flags perms { read, write, exec }
+        \\    check: func(p: perms) -> bool;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .flags);
+    const f = iface.decls[0].type.flags;
+    try testing.expectEqual(@as(usize, 3), f.names.len);
+    try testing.expectEqualStrings("read", f.names[0]);
+    try testing.expectEqualStrings("write", f.names[1]);
+    try testing.expectEqualStrings("exec", f.names[2]);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
+}
+
+test "metadata_encode: still rejects resource and use clauses" {
+    // Chunks 4 / future will lift these. Until then, surface a clean
+    // `UnsupportedWitFeature` rather than silently mis-encoding.
     const res =
         \\package docs:demo@0.1.0;
         \\interface ops {
@@ -782,4 +934,15 @@ test "metadata_encode: still rejects record / variant / enum / flags / use / res
         \\world demo { export ops; }
     ;
     try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, res, "demo"));
+
+    const use_src =
+        \\package docs:demo@0.1.0;
+        \\interface a { type x = u32; }
+        \\interface b {
+        \\    use a.{x};
+        \\    f: func(v: x);
+        \\}
+        \\world demo { export b; }
+    ;
+    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, use_src, "demo"));
 }
