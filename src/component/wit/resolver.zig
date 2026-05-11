@@ -55,24 +55,42 @@ pub const Resolver = struct {
     ///   * `ref.package != null`  → search `self.main` then `self.deps`
     ///     for a doc whose `package` declaration matches `ref.package`.
     pub fn findInterface(self: Resolver, ref: ast.InterfaceRef) ?ast.Interface {
+        if (self.findInterfaceWithPkg(ref)) |hit| return hit.iface;
+        return null;
+    }
+
+    /// Like `findInterface` but also returns the package the interface
+    /// was found in. Needed by `metadata_encode` to compute qualified
+    /// names for short in-package references — e.g. a `use foo.{T};`
+    /// inside an interface located in `wasi:cli` must resolve `foo` as
+    /// `wasi:cli/foo`, not as a ref into the world's main package.
+    pub fn findInterfaceWithPkg(self: Resolver, ref: ast.InterfaceRef) ?Lookup {
         const target_pkg = ref.package orelse {
-            return findInterfaceInDoc(self.main, ref.name);
+            if (findInterfaceInDoc(self.main, ref.name)) |i| {
+                return .{ .iface = i, .pkg = self.main.package orelse return null };
+            }
+            return null;
         };
 
         if (self.main.package) |mp| {
             if (packageMatches(mp, target_pkg)) {
-                if (findInterfaceInDoc(self.main, ref.name)) |i| return i;
+                if (findInterfaceInDoc(self.main, ref.name)) |i| return .{ .iface = i, .pkg = mp };
             }
         }
         for (self.deps) |dep| {
             if (dep.package) |dp| {
                 if (packageMatches(dp, target_pkg)) {
-                    if (findInterfaceInDoc(dep, ref.name)) |i| return i;
+                    if (findInterfaceInDoc(dep, ref.name)) |i| return .{ .iface = i, .pkg = dp };
                 }
             }
         }
         return null;
     }
+
+    pub const Lookup = struct {
+        iface: ast.Interface,
+        pkg: ast.PackageId,
+    };
 };
 
 fn findInterfaceInDoc(doc: ast.Document, name: []const u8) ?ast.Interface {
