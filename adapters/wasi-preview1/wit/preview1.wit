@@ -1,21 +1,18 @@
 // wasi-preview1 → preview2 adapter world.
 //
-// Authored against the canonical wasi:cli@0.2.6 component-model
-// surface (see `wit/deps/wasi-cli/world.wit` for the trimmed slice
-// of `wasi:cli` this adapter actually canon-lowers).
+// Authored against the canonical wasi:cli@0.2.6 + wasi:io@0.2.6
+// component-model surfaces (see `wit/deps/{wasi-cli,wasi-io}/` for
+// the trimmed slices this adapter consumes).
 //
-// Scope cut for cataggar/wamr#453's initial sub-phase: the adapter
-// only canon-lowers `wasi:cli/exit.exit-with-code(u8)` — the
-// `proc_exit` path — and exports the canon-lifted `wasi:cli/run.run`
-// command entry. Every other preview1 import is an ENOSYS stub in
-// `src/adapter.wat`, and the wabt adapter splicer's
-// core-wasm GC pass drops the unused exports at splice time.
-//
-// The wider import set (`wasi:io/streams`, `wasi:filesystem/…`, etc.)
-// arrives in a later sub-phase alongside the real fd_write /
-// args_get / clock_time_get lowering. Adding it now would require
-// `metadata_encode.zig` to grow resource-handle support, which is a
-// non-trivial parallel work item.
+// Current scope (cataggar/wamr#453 Phase 1.c.2): the WIT declares
+// the wider preview2 surface the adapter will lower against
+// (`wasi:cli/exit` + `wasi:io/streams`), exercising the encoder's
+// resource-handle paths end-to-end. The `adapter.wat` core wasm
+// still only references `wasi:cli/exit.exit-with-code` directly;
+// the `wasi:io/streams.output-stream.blocking-write-and-flush`
+// lowering lands in Phase 1.c.3 alongside the real `fd_write` body.
+// Until then, the splicer's GC pass will drop the unused
+// `wasi:io/streams` instance from the spliced component.
 
 package wabt:wasi-preview1@0.0.0;
 
@@ -27,6 +24,15 @@ world command {
     /// through `wasi:cli/exit.exit(result<_, _>)` and collapses every
     /// non-zero code to host exit code 1.
     import wasi:cli/exit@0.2.6;
+
+    /// Byte-sink resource + `blocking-write-and-flush` method. The
+    /// preview1 `fd_write` iterates the iovec list, copies into a
+    /// canon-realloc'd buffer, and calls `blocking-write-and-flush`
+    /// against the stdout/stderr handle. The handle itself is
+    /// obtained via host trampoline in Phase 1.c.3 — declaring it
+    /// here so the encoded world advertises the imported resource
+    /// shape now.
+    import wasi:io/streams@0.2.6;
 
     /// Canon-lift'd `run()` entry. The adapter calls
     /// `__main_module__._start` and returns `ok` on normal return;
