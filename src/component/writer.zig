@@ -457,9 +457,14 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
             }
         },
         .resource => |r| {
+            // `(sub resource)` is encoded as `0x3F` followed by an
+            // optional destructor:
+            //   `0x00`                  → no destructor
+            //   `0x01 <funcidx-u32leb>` → destructor at that idx
+            // The representation type is always `i32` per spec and
+            // is not emitted on the wire — `ResourceType.rep` is
+            // descriptive only.
             try w.appendByte(0x3F);
-            // Representation byte (always i32 per spec).
-            try w.appendByte(@intFromEnum(r.rep));
             if (r.destructor) |d| {
                 try w.appendByte(0x01);
                 try w.writeU32Leb(d);

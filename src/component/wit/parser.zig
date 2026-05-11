@@ -296,7 +296,11 @@ const Parser = struct {
                 const td = try self.parseFlags(docs);
                 return .{ .type = td };
             },
-            .kw_resource, .kw_stream, .kw_future, .kw_error_context, .kw_async, .kw_constructor => {
+            .kw_resource => {
+                const td = try self.parseResource(docs);
+                return .{ .type = td };
+            },
+            .kw_stream, .kw_future, .kw_error_context, .kw_async, .kw_constructor => {
                 return self.fail(head.span, "feature not yet supported");
             },
             .id, .explicit_id => {
@@ -406,6 +410,58 @@ const Parser = struct {
         };
     }
 
+    /// `resource <name> { (constructor(...) | <id>: [static] func(...) [-> T];)* }`
+    fn parseResource(self: *Parser, docs: []const u8) ParseError!ast.TypeDef {
+        const name = try self.parseId();
+        _ = try self.expect(.lbrace);
+        var methods = std.ArrayListUnmanaged(ast.ResourceMethod).empty;
+        while (true) {
+            const t = try self.nextNonDoc();
+            if (t.tag == .rbrace) break;
+            const m_docs = self.takeDocs();
+            switch (t.tag) {
+                .kw_constructor => {
+                    const f = try self.parseFuncSignature();
+                    _ = try self.expect(.semicolon);
+                    try methods.append(self.allocator, .{
+                        .docs = m_docs,
+                        .kind = .constructor,
+                        .name = "",
+                        .func = f,
+                    });
+                },
+                .id, .explicit_id => {
+                    const m_name = try self.identText(t);
+                    _ = try self.expect(.colon);
+                    // Optional `static` modifier before `func`.
+                    var kind: ast.ResourceMethodKind = .method;
+                    var head = try self.nextNonDoc();
+                    if (head.tag == .kw_static) {
+                        kind = .static;
+                        head = try self.nextNonDoc();
+                    }
+                    if (head.tag != .kw_func) {
+                        return self.fail(head.span, "expected `func`");
+                    }
+                    const f = try self.parseFuncSignature();
+                    _ = try self.expect(.semicolon);
+                    try methods.append(self.allocator, .{
+                        .docs = m_docs,
+                        .kind = kind,
+                        .name = m_name,
+                        .func = f,
+                    });
+                },
+                else => return self.fail(t.span, "expected `constructor` or method declaration"),
+            }
+        }
+        return .{
+            .docs = docs,
+            .name = name,
+            .kind = .{ .resource = try methods.toOwnedSlice(self.allocator) },
+        };
+    }
+
     fn parseFuncSignature(self: *Parser) ParseError!ast.Func {
         _ = try self.expect(.lparen);
         var params = std.ArrayListUnmanaged(ast.Param).empty;
@@ -500,7 +556,17 @@ const Parser = struct {
                 }
                 break :blk ast.Type{ .tuple = try fields.toOwnedSlice(self.allocator) };
             },
-            .kw_own, .kw_borrow, .kw_stream, .kw_future, .kw_error_context => return self.fail(t.span, "feature not yet supported"),
+            .kw_own, .kw_borrow => blk: {
+                _ = try self.expect(.lt);
+                const name_tok = try self.nextNonDoc();
+                if (name_tok.tag != .id and name_tok.tag != .explicit_id) {
+                    return self.fail(name_tok.span, "expected resource name");
+                }
+                const name = try self.identText(name_tok);
+                _ = try self.expect(.gt);
+                break :blk if (t.tag == .kw_own) ast.Type{ .own = name } else ast.Type{ .borrow = name };
+            },
+            .kw_stream, .kw_future, .kw_error_context => return self.fail(t.span, "feature not yet supported"),
             .id, .explicit_id => .{ .name = try self.identText(t) },
             else => return self.fail(t.span, "expected a type"),
         };
@@ -956,13 +1022,55 @@ test "parse: explicit-id keyword as name" {
     try testing.expectEqualStrings("record", f.name);
 }
 
-test "parse: rejects resource with helpful error" {
+test "parse: empty resource decl" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
-    const r = parseInto(&arena,
+    const doc = try parseInto(&arena,
         \\interface i {
         \\    resource file { }
         \\}
     );
-    try testing.expectError(error.UnexpectedToken, r);
+    const td = doc.items[0].interface.items[0].type;
+    try testing.expectEqualStrings("file", td.name);
+    try testing.expectEqual(@as(usize, 0), td.kind.resource.len);
+}
+
+test "parse: resource with method, static, constructor" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    resource output-stream {
+        \\        constructor(seed: u32);
+        \\        blocking-write-and-flush: func(contents: list<u8>) -> result;
+        \\        check-write: static func() -> u64;
+        \\    }
+        \\}
+    );
+    const methods = doc.items[0].interface.items[0].type.kind.resource;
+    try testing.expectEqual(@as(usize, 3), methods.len);
+    try testing.expectEqual(ast.ResourceMethodKind.constructor, methods[0].kind);
+    try testing.expectEqual(@as(usize, 1), methods[0].func.params.len);
+    try testing.expectEqual(ast.ResourceMethodKind.method, methods[1].kind);
+    try testing.expectEqualStrings("blocking-write-and-flush", methods[1].name);
+    try testing.expectEqual(ast.ResourceMethodKind.static, methods[2].kind);
+    try testing.expectEqualStrings("check-write", methods[2].name);
+}
+
+test "parse: borrow<R> and own<R> type syntax" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    drop-it: func(s: own<output-stream>);
+        \\    write: func(s: borrow<output-stream>, data: list<u8>);
+        \\}
+    );
+    const items = doc.items[0].interface.items;
+    const own_ty = items[0].func.func.params[0].type;
+    const borrow_ty = items[1].func.func.params[0].type;
+    try testing.expect(own_ty == .own);
+    try testing.expectEqualStrings("output-stream", own_ty.own);
+    try testing.expect(borrow_ty == .borrow);
+    try testing.expectEqualStrings("output-stream", borrow_ty.borrow);
 }

@@ -42,10 +42,24 @@
 //!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
-//!   * record / variant / enum / flags / type-alias / use clause
-//!     in interface bodies (the wamr fixtures don't use them).
-//!   * resource / handle / stream / future / async / error-context.
-//!   * named-type references inside func sigs (`name` is rejected).
+//!   * `use` clauses (cross-interface type imports).
+//!   * stream / future / async / error-context.
+//!
+//! Supported: `type <name> = <Type>;` aliases, nominal typedefs
+//! (`record`, `variant`, `enum`, `flags`), and `resource R { … }`
+//! decls with constructor / method / static members.
+//!
+//! Resource encoding follows the canonical wit-component shape: a
+//! `TypeDef.resource` decl is followed by an `exportname'` decl
+//! binding the resource's external name to that slot
+//! (`(type (eq <idx>))`). Members are emitted as ordinary func
+//! exports with their canonical-ABI names (`[constructor]R`,
+//! `[method]R.M`, `[static]R.M`); methods get an implicit
+//! `self: borrow<R>` prepended, constructors get `-> own<R>`
+//! appended. `[resource-drop]R` is *not* written into the encoded
+//! section — the consuming canon stage synthesizes it implicitly.
+//! `borrow<R>` / `own<R>` ValTypes resolve via the in-body
+//! `name_map` and lower directly to `ValType.borrow` / `own`.
 //!
 //! Lifting these is incremental: each remaining WIT type maps to a
 //! `TypeDef` declarator before the func that references it.
@@ -255,39 +269,117 @@ fn buildInterfaceBody(
     // `BodyBuilder` tracks the type-index space inside this
     // instance-type body. Every appended `.type` decl bumps
     // `type_idx`; compound valtypes lower to a fresh `.type` decl
-    // and a `ValType.type_idx` reference to its slot.
-    var builder: BodyBuilder = .{ .ar = ar, .decls = .empty, .type_idx = 0 };
+    // and a `ValType.type_idx` reference to its slot. Named-type
+    // refs (e.g. `Type.name`) resolve against `name_map`, which is
+    // populated as `type <name> = T;` aliases are encountered in
+    // declaration order.
+    var builder: BodyBuilder = .{
+        .ar = ar,
+        .decls = .empty,
+        .type_idx = 0,
+        .name_map = .empty,
+    };
     for (iface_body.items) |it| {
         switch (it) {
-            .func => |f| {
-                // Lower param/result types first — this may emit
-                // `.type` decls for compound types, bumping
-                // `type_idx`. The `.func` `.type` itself goes last.
-                const params = try ar.alloc(ctypes.NamedValType, f.func.params.len);
-                for (f.func.params, 0..) |p, i| {
-                    params[i] = .{ .name = p.name, .type = try builder.lowerType(p.type) };
-                }
-                const results: ctypes.FuncType.ResultList = if (f.func.result) |t|
-                    .{ .unnamed = try builder.lowerType(t) }
-                else
-                    .none;
+            .func => |f| try builder.emitFuncExport(f.name, f.func, null),
+            .type => |td| switch (td.kind) {
+                .alias => |inner| {
+                    const vt = try builder.lowerType(inner);
+                    try builder.bindName(td.name, vt);
+                },
+                .record => |fields| {
+                    const lowered = try ar.alloc(ctypes.Field, fields.len);
+                    for (fields, 0..) |f, i| {
+                        lowered[i] = .{ .name = f.name, .type = try builder.lowerType(f.type) };
+                    }
+                    const vt = try builder.appendCompound(.{ .record = .{ .fields = lowered } });
+                    try builder.bindName(td.name, vt);
+                },
+                .variant => |cases| {
+                    const lowered = try ar.alloc(ctypes.Case, cases.len);
+                    for (cases, 0..) |c, i| {
+                        const payload: ?ctypes.ValType = if (c.type) |ty|
+                            try builder.lowerType(ty)
+                        else
+                            null;
+                        lowered[i] = .{ .name = c.name, .type = payload };
+                    }
+                    const vt = try builder.appendCompound(.{ .variant = .{ .cases = lowered } });
+                    try builder.bindName(td.name, vt);
+                },
+                .@"enum" => |names| {
+                    const vt = try builder.appendCompound(.{ .enum_ = .{ .names = names } });
+                    try builder.bindName(td.name, vt);
+                },
+                .flags => |names| {
+                    const vt = try builder.appendCompound(.{ .flags = .{ .names = names } });
+                    try builder.bindName(td.name, vt);
+                },
+                .resource => |methods| {
+                    // Resource decl: `TypeDef.resource { destructor: null }`
+                    // consumes one slot; the resource's external name is
+                    // then bound via an `exportname'` decl with a
+                    // `type (eq <idx>)` descriptor — matching the wire
+                    // shape wamr's loader test fixture at
+                    // `loader.zig:897` expects from canonical
+                    // wit-component output.
+                    const resource_idx = builder.type_idx;
+                    try builder.decls.append(ar, .{ .type = .{ .resource = .{ .destructor = null } } });
+                    builder.type_idx += 1;
+                    try builder.decls.append(ar, .{ .@"export" = .{
+                        .name = td.name,
+                        .desc = .{ .type = .{ .eq = resource_idx } },
+                    } });
+                    try builder.bindName(td.name, .{ .type_idx = resource_idx });
 
-                const func_type_idx = builder.type_idx;
-                try builder.decls.append(ar, .{ .type = .{ .func = .{
-                    .params = params,
-                    .results = results,
-                } } });
-                builder.type_idx += 1;
-
-                try builder.decls.append(ar, .{ .@"export" = .{
-                    .name = f.name,
-                    .desc = .{ .func = func_type_idx },
-                } });
+                    // Methods / statics / constructors synthesize their
+                    // canonical-ABI external names (`[method]R.M`,
+                    // `[static]R.M`, `[constructor]R`) and the implicit
+                    // `self: borrow<R>` / `-> own<R>` insertions. The
+                    // `[resource-drop]R` intrinsic is *not* declared in
+                    // the encoded section — the consuming canon stage
+                    // synthesizes it implicitly for every resource.
+                    for (methods) |m| {
+                        const ext_name = try formatResourceMemberName(ar, m.kind, td.name, m.name);
+                        const self_param: ?ctypes.NamedValType = switch (m.kind) {
+                            .method => .{ .name = "self", .type = .{ .borrow = resource_idx } },
+                            .static, .constructor => null,
+                        };
+                        const constructor_result: ?ctypes.ValType = switch (m.kind) {
+                            .constructor => .{ .own = resource_idx },
+                            .method, .static => null,
+                        };
+                        try builder.emitFuncExport(
+                            ext_name,
+                            m.func,
+                            BodyBuilder.FuncInjection{
+                                .self_param = self_param,
+                                .forced_result = constructor_result,
+                            },
+                        );
+                    }
+                },
             },
-            .type, .use => return error.UnsupportedWitFeature,
+            .use => return error.UnsupportedWitFeature,
         }
     }
     return try builder.decls.toOwnedSlice(ar);
+}
+
+/// Canonical-ABI external name for a resource member. Constructor
+/// uses just the resource name; method / static prefix the bracketed
+/// tag and qualify with `R.M`.
+fn formatResourceMemberName(
+    ar: Allocator,
+    kind: ast.ResourceMethodKind,
+    resource: []const u8,
+    member: []const u8,
+) ![]const u8 {
+    return switch (kind) {
+        .constructor => try std.fmt.allocPrint(ar, "[constructor]{s}", .{resource}),
+        .method => try std.fmt.allocPrint(ar, "[method]{s}.{s}", .{ resource, member }),
+        .static => try std.fmt.allocPrint(ar, "[static]{s}.{s}", .{ resource, member }),
+    };
 }
 
 /// Stateful helper that builds the body of an instance-type while
@@ -301,6 +393,13 @@ const BodyBuilder = struct {
     /// equivalently, the next free slot in the instance-type body's
     /// type-index space.
     type_idx: u32,
+    /// Maps `type <name> = T;` aliases (and, in later chunks,
+    /// nominal typedefs) to the `ValType` to substitute when a
+    /// `Type.name` reference points at them. Aliases to primitives
+    /// map directly to the primitive `ValType` without consuming a
+    /// fresh slot; aliases whose RHS is a compound type map to the
+    /// `type_idx` produced by the compound's lowering.
+    name_map: std.StringHashMapUnmanaged(ctypes.ValType),
 
     fn lowerType(self: *BodyBuilder, t: ast.Type) EncodeError!ctypes.ValType {
         return switch (t) {
@@ -341,8 +440,75 @@ const BodyBuilder = struct {
                 for (fields, 0..) |f, i| inner[i] = try self.lowerType(f);
                 break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
             },
-            .name => error.UnsupportedWitFeature,
+            .name => |n| self.name_map.get(n) orelse error.InvalidWit,
+            .borrow => |n| try self.handleValType(n, .borrow),
+            .own => |n| try self.handleValType(n, .own),
         };
+    }
+
+    /// Resolve `borrow<R>` / `own<R>` to a handle ValType. The named
+    /// resource must already be bound in `name_map`, and that
+    /// binding must be a `type_idx` — borrowing or owning a
+    /// non-resource named type (e.g. an alias to `u32`) is malformed.
+    fn handleValType(
+        self: *BodyBuilder,
+        resource_name: []const u8,
+        kind: enum { borrow, own },
+    ) EncodeError!ctypes.ValType {
+        const bound = self.name_map.get(resource_name) orelse return error.InvalidWit;
+        if (bound != .type_idx) return error.InvalidWit;
+        return switch (kind) {
+            .borrow => .{ .borrow = bound.type_idx },
+            .own => .{ .own = bound.type_idx },
+        };
+    }
+
+    /// Injection hooks for resource-method synthesis: `self_param`
+    /// is prepended to the canonical param list; `forced_result`
+    /// overrides any AST result (used for `-> own<R>` on
+    /// constructors).
+    const FuncInjection = struct {
+        self_param: ?ctypes.NamedValType = null,
+        forced_result: ?ctypes.ValType = null,
+    };
+
+    /// Lower an AST `Func` to a component-type `FuncType` and append
+    /// it to `decls`, then export it under `export_name`. When
+    /// `injection` is non-null, methods get an implicit
+    /// `self: borrow<R>` prepended and constructors get
+    /// `-> own<R>` appended.
+    fn emitFuncExport(
+        self: *BodyBuilder,
+        export_name: []const u8,
+        func: ast.Func,
+        injection: ?FuncInjection,
+    ) EncodeError!void {
+        const inj: FuncInjection = injection orelse .{};
+        const extra: usize = if (inj.self_param != null) 1 else 0;
+        const params = try self.ar.alloc(ctypes.NamedValType, func.params.len + extra);
+        if (inj.self_param) |sp| params[0] = sp;
+        for (func.params, 0..) |p, i| {
+            params[i + extra] = .{ .name = p.name, .type = try self.lowerType(p.type) };
+        }
+
+        const results: ctypes.FuncType.ResultList = if (inj.forced_result) |fr|
+            .{ .unnamed = fr }
+        else if (func.result) |t|
+            .{ .unnamed = try self.lowerType(t) }
+        else
+            .none;
+
+        const func_type_idx = self.type_idx;
+        try self.decls.append(self.ar, .{ .type = .{ .func = .{
+            .params = params,
+            .results = results,
+        } } });
+        self.type_idx += 1;
+
+        try self.decls.append(self.ar, .{ .@"export" = .{
+            .name = export_name,
+            .desc = .{ .func = func_type_idx },
+        } });
     }
 
     fn appendCompound(self: *BodyBuilder, td: ctypes.TypeDef) EncodeError!ctypes.ValType {
@@ -350,6 +516,12 @@ const BodyBuilder = struct {
         try self.decls.append(self.ar, .{ .type = td });
         self.type_idx += 1;
         return .{ .type_idx = idx };
+    }
+
+    fn bindName(self: *BodyBuilder, name: []const u8, vt: ctypes.ValType) EncodeError!void {
+        const gop = try self.name_map.getOrPut(self.ar, name);
+        if (gop.found_existing) return error.InvalidWit;
+        gop.value_ptr.* = vt;
     }
 };
 
@@ -614,4 +786,389 @@ test "metadata_encode: `list<u8>` param hoists to a TypeDef.list" {
     try testing.expect(iface.decls[1].type.func.params[0].type == .type_idx);
     try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
     try testing.expect(iface.decls[1].type.func.results.unnamed == .u32);
+}
+
+test "metadata_encode: primitive type alias resolves via name_map without a fresh slot" {
+    // `type my-u32 = u32;` is a pure rename — aliasing a primitive
+    // produces no new slot in the body's type-index space. A func
+    // referencing `my-u32` should inline the underlying primitive
+    // ValType.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type my-u32 = u32;
+        \\    inc: func(x: my-u32) -> my-u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Just [func TypeDef, export(func=0)] — no slot for the alias.
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .func);
+    const func = iface.decls[0].type.func;
+    try testing.expectEqual(@as(usize, 1), func.params.len);
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: compound alias is hoisted once, named refs reuse the slot" {
+    // `type bytes = list<u8>;` should emit exactly one TypeDef.list
+    // and bind `bytes` to that slot. A func using `bytes` twice
+    // (param + result) must reference the same `type_idx`, not
+    // re-hoist the list each time.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type bytes = list<u8>;
+        \\    roundtrip: func(b: bytes) -> bytes;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes_out = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes_out);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes_out, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [list TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .list);
+    try testing.expect(iface.decls[0].type.list.element == .u8);
+    try testing.expect(iface.decls[1].type == .func);
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(func.results == .unnamed);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: alias chain (a -> u32, b -> a) resolves transitively" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type a = u32;
+        \\    type b = a;
+        \\    f: func(x: b) -> b;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    const func = iface.decls[0].type.func;
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: unresolved name reports InvalidWit" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    f: func(x: nonexistent) -> u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "demo");
+    try testing.expectError(error.InvalidWit, r);
+}
+
+test "metadata_encode: record typedef emits TypeDef.record + name binding" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    record point { x: u32, y: u32 }
+        \\    move-by: func(p: point, dx: s32) -> point;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [record TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .record);
+    const rec = iface.decls[0].type.record;
+    try testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try testing.expectEqualStrings("x", rec.fields[0].name);
+    try testing.expect(rec.fields[0].type == .u32);
+    try testing.expectEqualStrings("y", rec.fields[1].name);
+    try testing.expect(rec.fields[1].type == .u32);
+
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(func.params[1].type == .s32);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: variant typedef with mixed payloads" {
+    // Mirrors `wasi:io/streams.stream-error`: a no-payload `closed`
+    // case plus a payload-carrying case. Both forms must encode and
+    // round-trip cleanly.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    variant stream-error {
+        \\        closed,
+        \\        last-operation-failed(string),
+        \\    }
+        \\    drain: func() -> result<u32, stream-error>;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [variant (0), result (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .variant);
+    const v = iface.decls[0].type.variant;
+    try testing.expectEqual(@as(usize, 2), v.cases.len);
+    try testing.expectEqualStrings("closed", v.cases[0].name);
+    try testing.expect(v.cases[0].type == null);
+    try testing.expectEqualStrings("last-operation-failed", v.cases[1].name);
+    try testing.expect(v.cases[1].type != null);
+    try testing.expect(v.cases[1].type.? == .string);
+
+    try testing.expect(iface.decls[1].type == .result);
+    const res = iface.decls[1].type.result;
+    try testing.expect(res.ok != null and res.ok.? == .u32);
+    try testing.expect(res.err != null);
+    try testing.expectEqual(@as(u32, 0), res.err.?.type_idx);
+
+    try testing.expect(iface.decls[2].type == .func);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: enum typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    enum color { red, green, blue }
+        \\    pick: func() -> color;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .enum_);
+    const e = iface.decls[0].type.enum_;
+    try testing.expectEqual(@as(usize, 3), e.names.len);
+    try testing.expectEqualStrings("red", e.names[0]);
+    try testing.expectEqualStrings("green", e.names[1]);
+    try testing.expectEqualStrings("blue", e.names[2]);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: flags typedef" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    flags perms { read, write, exec }
+        \\    check: func(p: perms) -> bool;
+        \\}
+        \\world demo { export ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .flags);
+    const f = iface.decls[0].type.flags;
+    try testing.expectEqual(@as(usize, 3), f.names.len);
+    try testing.expectEqualStrings("read", f.names[0]);
+    try testing.expectEqualStrings("write", f.names[1]);
+    try testing.expectEqualStrings("exec", f.names[2]);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
+}
+
+test "metadata_encode: resource with constructor + method + static" {
+    // Mirrors `wasi:io/streams.output-stream` style: a constructor, a
+    // method (gets implicit `self: borrow<R>`), and a static. The
+    // encoder must synthesize the canonical-ABI external names and
+    // the implicit `self` / `-> own<R>` insertions. The resource name
+    // is `output-stream` to mirror the canonical WIT identifier
+    // (kebab-case) rather than triggering a reserved `kw_stream`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams {
+        \\    resource output-stream {
+        \\        constructor(seed: u32);
+        \\        write: func(byte: u8) -> u32;
+        \\        check: static func() -> u32;
+        \\    }
+        \\}
+        \\world demo { export streams; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: TypeDef.resource
+    //   1: ExportDecl "output-stream" (type (eq 0))
+    //   2: TypeDef.func  (constructor: (seed:u32) -> own<0>)
+    //   3: ExportDecl "[constructor]output-stream" (func 2)
+    //   4: TypeDef.func  ([method]: (self:borrow<0>, byte:u8) -> u32)
+    //   5: ExportDecl "[method]output-stream.write" (func 4)
+    //   6: TypeDef.func  ([static]: () -> u32)
+    //   7: ExportDecl "[static]output-stream.check" (func 6)
+    try testing.expectEqual(@as(usize, 8), iface.decls.len);
+
+    // Resource decl + name binding.
+    try testing.expect(iface.decls[0].type == .resource);
+    try testing.expect(iface.decls[0].type.resource.destructor == null);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("output-stream", iface.decls[1].@"export".name);
+    try testing.expect(iface.decls[1].@"export".desc == .type);
+    try testing.expect(iface.decls[1].@"export".desc.type == .eq);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].@"export".desc.type.eq);
+
+    // Constructor: synthesized `-> own<0>` result, no implicit self.
+    try testing.expect(iface.decls[2].type == .func);
+    const ctor = iface.decls[2].type.func;
+    try testing.expectEqual(@as(usize, 1), ctor.params.len);
+    try testing.expectEqualStrings("seed", ctor.params[0].name);
+    try testing.expect(ctor.params[0].type == .u32);
+    try testing.expect(ctor.results == .unnamed);
+    try testing.expect(ctor.results.unnamed == .own);
+    try testing.expectEqual(@as(u32, 0), ctor.results.unnamed.own);
+    try testing.expectEqualStrings("[constructor]output-stream", iface.decls[3].@"export".name);
+
+    // Method: implicit `self: borrow<0>` prepended.
+    try testing.expect(iface.decls[4].type == .func);
+    const method = iface.decls[4].type.func;
+    try testing.expectEqual(@as(usize, 2), method.params.len);
+    try testing.expectEqualStrings("self", method.params[0].name);
+    try testing.expect(method.params[0].type == .borrow);
+    try testing.expectEqual(@as(u32, 0), method.params[0].type.borrow);
+    try testing.expectEqualStrings("byte", method.params[1].name);
+    try testing.expect(method.params[1].type == .u8);
+    try testing.expect(method.results.unnamed == .u32);
+    try testing.expectEqualStrings("[method]output-stream.write", iface.decls[5].@"export".name);
+
+    // Static: no implicit self, no forced result.
+    try testing.expect(iface.decls[6].type == .func);
+    const stat = iface.decls[6].type.func;
+    try testing.expectEqual(@as(usize, 0), stat.params.len);
+    try testing.expect(stat.results.unnamed == .u32);
+    try testing.expectEqualStrings("[static]output-stream.check", iface.decls[7].@"export".name);
+}
+
+test "metadata_encode: explicit `borrow<R>` / `own<R>` in func sigs" {
+    // A function that takes a borrow and returns an own — exercises
+    // `lowerType` for both handle forms via the post-resource
+    // `name_map` binding.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams {
+        \\    resource output-stream { }
+        \\    clone: func(s: borrow<output-stream>) -> own<output-stream>;
+        \\}
+        \\world demo { export streams; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [resource (0), export "output-stream" eq=0, func (1), export "clone" func=1].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[2].type == .func);
+    const f = iface.decls[2].type.func;
+    try testing.expect(f.params[0].type == .borrow);
+    try testing.expectEqual(@as(u32, 0), f.params[0].type.borrow);
+    try testing.expect(f.results.unnamed == .own);
+    try testing.expectEqual(@as(u32, 0), f.results.unnamed.own);
+    try testing.expectEqualStrings("clone", iface.decls[3].@"export".name);
+}
+
+test "metadata_encode: borrow<non-resource> reports InvalidWit" {
+    // `borrow<R>` where `R` is bound to a primitive alias (not a
+    // resource) is malformed. The encoder must catch it.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type r = u32;
+        \\    f: func(x: borrow<r>);
+        \\}
+        \\world demo { export ops; }
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "demo");
+    try testing.expectError(error.InvalidWit, r);
+}
+
+test "metadata_encode: still rejects use clauses" {
+    // `use` (cross-interface type imports) remains deferred. Mirrors
+    // the resource-only-but-no-`use` chunk-3 test, narrowed to the
+    // one feature still surfaced as `UnsupportedWitFeature`.
+    const use_src =
+        \\package docs:demo@0.1.0;
+        \\interface a { type x = u32; }
+        \\interface b {
+        \\    use a.{x};
+        \\    f: func(v: x);
+        \\}
+        \\world demo { export b; }
+    ;
+    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, use_src, "demo"));
 }
