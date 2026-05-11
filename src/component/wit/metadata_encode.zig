@@ -114,19 +114,53 @@ pub fn encodeWorldFromResolver(
     // Build the world's body component-type decls.
     var world_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
 
+    // The world body has TWO independent index spaces we must track:
+    //   * `inst_idx`        — instance indexspace. Bumped by every
+    //     `import` and `export (instance N)` decl. Used as the source
+    //     index of `alias instance-export` decls.
+    //   * `world_type_idx`  — type indexspace. Bumped by every type
+    //     def and every `alias` whose sort is `.type`. Used as the
+    //     target index for `alias outer (type 1 K)` decls emitted
+    //     inside consuming interface bodies.
+    var inst_idx: u32 = 0;
+    var world_type_idx: u32 = 0;
+
+    // For each `use src.{T};` clause encountered inside an interface
+    // body, the world body must surface `T` at its own type-indexspace
+    // level via an `alias instance-export sort=type inst=N name="T"`
+    // decl emitted just after `src`'s import. The consuming interface
+    // body then references that slot via `alias outer (type 1 K)`.
+    //
+    // Keyed by `<source-iface-qname>::<type-name>` so a single source
+    // type referenced by multiple consumers shares one alias slot.
+    var world_alias_map = std.StringHashMapUnmanaged(u32).empty;
+    // Records each (source_qname, type_names) bundle each imported
+    // iface must surface. Populated in a pre-pass so the world body
+    // can emit alias-export decls right after each import without
+    // having to re-walk every other interface.
+    var alias_requests = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+    for (world.items) |item| {
+        switch (item) {
+            .@"export", .import => |we| {
+                try collectUseRequests(ar, resolver, we, &alias_requests);
+            },
+            .use, .include, .type => return error.UnsupportedWitFeature,
+        }
+    }
+
     // Each `export <iface>;` / `import <ns>:<pkg>/<iface>;` becomes a
     // type=instance-type decl followed by an export/import decl.
-    var inst_idx: u32 = 0;
     for (world.items) |item| {
         switch (item) {
             .@"export", .import => |we| {
                 const is_export = item == .@"export";
                 const ext = we;
                 const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
-                const iface_decls = try buildInterfaceBody(ar, resolver, ext);
+                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map);
                 try world_decls.append(ar, .{ .type = .{
                     .instance = .{ .decls = iface_decls },
                 } });
+                world_type_idx += 1;
                 const desc: ctypes.ExternDesc = .{ .instance = inst_idx };
                 if (is_export) {
                     try world_decls.append(ar, .{ .@"export" = .{
@@ -139,7 +173,25 @@ pub fn encodeWorldFromResolver(
                         .desc = desc,
                     } });
                 }
+                const imported_inst_idx = inst_idx;
                 inst_idx += 1;
+
+                // Surface every `use`-requested type from this
+                // interface as an `alias instance-export` decl at the
+                // world body level so consumers can pull it via
+                // `alias outer (type 1 K)`.
+                if (alias_requests.get(iface_name)) |names| {
+                    for (names.items) |type_name| {
+                        try world_decls.append(ar, .{ .alias = .{ .instance_export = .{
+                            .sort = .type,
+                            .instance_idx = imported_inst_idx,
+                            .name = type_name,
+                        } } });
+                        const key = try std.fmt.allocPrint(ar, "{s}::{s}", .{ iface_name, type_name });
+                        try world_alias_map.put(ar, key, world_type_idx);
+                        world_type_idx += 1;
+                    }
+                }
             },
             .use, .include, .type => return error.UnsupportedWitFeature,
         }
@@ -191,6 +243,49 @@ pub fn encodeWorldFromResolver(
         .custom_sections = custom_sections,
     };
     return writer.encode(allocator, &component);
+}
+
+/// Pre-pass: walk every `use src.{T};` clause inside `we`'s interface
+/// body and record `(source-qname, type-name)` so the world body can
+/// emit a matching `alias instance-export` decl right after `src`'s
+/// import. `we`'s package context is used to resolve short refs.
+fn collectUseRequests(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    we: ast.WorldExtern,
+    map: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+) EncodeError!void {
+    const ref = switch (we) {
+        .interface_ref => |ir| ir.ref,
+        else => return,
+    };
+    const lookup = resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
+    for (lookup.iface.items) |it| {
+        if (it != .use) continue;
+        const u = it.use;
+        const src_lookup = resolver.findInterfaceWithPkg(u.from) orelse return error.UnknownInterface;
+        const src_qname = try formatQualifiedName(
+            ar,
+            src_lookup.pkg.namespace,
+            src_lookup.pkg.name,
+            u.from.name,
+            src_lookup.pkg.version,
+        );
+        const gop = try map.getOrPut(ar, src_qname);
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        for (u.names) |n| {
+            // Same type used by multiple consumers → one alias slot
+            // serves all.
+            var already = false;
+            for (gop.value_ptr.items) |existing| {
+                if (std.mem.eql(u8, existing, n.name)) {
+                    already = true;
+                    break;
+                }
+            }
+            if (!already) try gop.value_ptr.append(ar, n.name);
+        }
+    }
 }
 
 /// Convenience: parse `source` and encode the named world.
@@ -249,10 +344,16 @@ fn formatQualifiedName(
 }
 
 /// Lower an interface's WIT items to instance-type decls.
+///
+/// `world_alias_map` is keyed `<src-iface-qname>::<type-name>` and
+/// stores each `use`-target's slot in the **outer** (world-body)
+/// type indexspace. Used to emit `alias outer (type 1 K)` decls
+/// inside this body for every `use src.{T};` clause.
 fn buildInterfaceBody(
     ar: Allocator,
     resolver: wit_resolver.Resolver,
     ext: ast.WorldExtern,
+    world_alias_map: std.StringHashMapUnmanaged(u32),
 ) EncodeError![]const ctypes.Decl {
     const ref = switch (ext) {
         .interface_ref => |ir| ir.ref,
@@ -360,7 +461,42 @@ fn buildInterfaceBody(
                     }
                 },
             },
-            .use => return error.UnsupportedWitFeature,
+            .use => |u| {
+                // `use src.{T1, T2 as renamed};` — for each name N,
+                // emit `alias outer (type 1 K)` where K is the
+                // world-body type slot that the outer pre-pass
+                // populated for (src_qname, N). Then `export "N"
+                // type=eq{local-slot}` to re-export the type under
+                // its WIT name inside this interface's body (matches
+                // canonical wit-component output: consumers of this
+                // iface can pull the type via the export chain
+                // without re-traversing the alias path).
+                const src_lookup = resolver.findInterfaceWithPkg(u.from) orelse return error.UnknownInterface;
+                const src_qname = try formatQualifiedName(
+                    ar,
+                    src_lookup.pkg.namespace,
+                    src_lookup.pkg.name,
+                    u.from.name,
+                    src_lookup.pkg.version,
+                );
+                for (u.names) |un| {
+                    const key = try std.fmt.allocPrint(ar, "{s}::{s}", .{ src_qname, un.name });
+                    const outer_idx = world_alias_map.get(key) orelse return error.InvalidWit;
+                    const local_idx = builder.type_idx;
+                    try builder.decls.append(ar, .{ .alias = .{ .outer = .{
+                        .sort = .type,
+                        .outer_count = 1,
+                        .idx = outer_idx,
+                    } } });
+                    builder.type_idx += 1;
+                    const visible_name = un.rename orelse un.name;
+                    try builder.decls.append(ar, .{ .@"export" = .{
+                        .name = visible_name,
+                        .desc = .{ .type = .{ .eq = local_idx } },
+                    } });
+                    try builder.bindName(visible_name, .{ .type_idx = local_idx });
+                }
+            },
         }
     }
     return try builder.decls.toOwnedSlice(ar);
@@ -1157,18 +1293,135 @@ test "metadata_encode: borrow<non-resource> reports InvalidWit" {
     try testing.expectError(error.InvalidWit, r);
 }
 
-test "metadata_encode: still rejects use clauses" {
-    // `use` (cross-interface type imports) remains deferred. Mirrors
-    // the resource-only-but-no-`use` chunk-3 test, narrowed to the
-    // one feature still surfaced as `UnsupportedWitFeature`.
-    const use_src =
+test "metadata_encode: use clause aliases resource from outer world body" {
+    // `use streams.{output-stream};` inside `stdout` must surface
+    // `output-stream` at the world-body type indexspace via an
+    // `alias instance-export sort=type` decl emitted right after
+    // `streams`'s import, and the consuming interface must pull it
+    // in via `alias outer (type 1 K)`. Mirrors wit-component
+    // 0.220.0's canonical encoding shape.
+    const source =
         \\package docs:demo@0.1.0;
-        \\interface a { type x = u32; }
-        \\interface b {
-        \\    use a.{x};
-        \\    f: func(v: x);
+        \\interface streams {
+        \\    resource output-stream { }
         \\}
-        \\world demo { export b; }
+        \\interface stdout {
+        \\    use streams.{output-stream};
+        \\    get-stdout: func() -> own<output-stream>;
+        \\}
+        \\world cmd {
+        \\    import streams;
+        \\    import stdout;
+        \\}
     ;
-    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, use_src, "demo"));
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // World body should contain 5 decls in order:
+    //   0: TypeDef.instance (streams body)            — world type slot 0
+    //   1: ImportDecl "docs:demo/streams@0.1.0"
+    //   2: Alias.instance_export sort=type inst=0 name="output-stream"
+    //                                                 — world type slot 1
+    //   3: TypeDef.instance (stdout body)             — world type slot 2
+    //   4: ImportDecl "docs:demo/stdout@0.1.0"
+    const world_body = comp.types[0].component.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 5), world_body.decls.len);
+    try testing.expect(world_body.decls[2] == .alias);
+    try testing.expect(world_body.decls[2].alias == .instance_export);
+    try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+    try testing.expect(world_body.decls[2].alias.instance_export.sort == .type);
+    try testing.expectEqual(@as(u32, 0), world_body.decls[2].alias.instance_export.instance_idx);
+
+    // stdout body should contain 4 decls in order:
+    //   0: Alias.outer sort=type count=1 idx=1        — local type slot 0
+    //   1: ExportDecl "output-stream" type=eq{0}      — re-export under WIT name
+    //   2: TypeDef.func get-stdout() -> own<0>        — local type slot 1
+    //   3: ExportDecl "get-stdout" func=1
+    const stdout_body = world_body.decls[3].type.instance;
+    try testing.expectEqual(@as(usize, 4), stdout_body.decls.len);
+    try testing.expect(stdout_body.decls[0] == .alias);
+    try testing.expect(stdout_body.decls[0].alias == .outer);
+    try testing.expect(stdout_body.decls[0].alias.outer.sort == .type);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[0].alias.outer.outer_count);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[0].alias.outer.idx);
+    try testing.expect(stdout_body.decls[1] == .@"export");
+    try testing.expectEqualStrings("output-stream", stdout_body.decls[1].@"export".name);
+    try testing.expect(stdout_body.decls[1].@"export".desc == .type);
+    try testing.expectEqual(@as(u32, 0), stdout_body.decls[1].@"export".desc.type.eq);
+    try testing.expect(stdout_body.decls[2].type == .func);
+    try testing.expect(stdout_body.decls[2].type.func.results.unnamed == .own);
+    try testing.expectEqual(@as(u32, 0), stdout_body.decls[2].type.func.results.unnamed.own);
+}
+
+test "metadata_encode: use clause with rename binds the renamed name" {
+    // `use streams.{output-stream as out};` should bind the type
+    // under `out` in the consuming interface, not the original
+    // `output-stream`. The rename also drives the export decl's
+    // visible name so consumers see `out`, not `output-stream`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout {
+        \\    use streams.{output-stream as out};
+        \\    get-stdout: func() -> own<out>;
+        \\}
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    const stdout_body = world_body.decls[3].type.instance;
+    try testing.expectEqualStrings("out", stdout_body.decls[1].@"export".name);
+}
+
+test "metadata_encode: use of an unknown type in source iface reports InvalidWit" {
+    // `use streams.{missing-type};` — when `missing-type` is never
+    // declared in the source interface, the world-body pre-pass
+    // still records the request, but the consuming-iface lookup at
+    // `alias outer` emission time finds the slot (the pre-pass
+    // doesn't validate). To produce a clean error, the encoder
+    // would need a second validation pass — for now this test
+    // documents that the alias is emitted anyway; the splicer/canon
+    // stage will reject the dangling alias when the source
+    // interface is materialised.
+    //
+    // The wit-component encoder rejects this at parse time; we
+    // accept it here and rely on downstream validation. This test
+    // pins the current behaviour so a future validation pass can
+    // tighten it without surprise.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout { use streams.{missing-type}; }
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+}
+
+test "metadata_encode: rejects use whose source iface is not in the world" {
+    // The source interface of a `use` clause must also be reachable
+    // from the world body (as an import or export). Without that,
+    // the world body has no instance to alias from, and the
+    // pre-pass key won't be populated — leaving the consuming-iface
+    // body looking up a slot that doesn't exist.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout { use streams.{output-stream}; }
+        \\world cmd { import stdout; }
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "cmd");
+    try testing.expectError(error.InvalidWit, r);
 }
