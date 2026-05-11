@@ -1,0 +1,36 @@
+// wasi-preview1 → preview2 adapter world.
+//
+// Authored against the canonical wasi:cli@0.2.6 component-model
+// surface (see `wit/deps/wasi-cli/world.wit` for the trimmed slice
+// of `wasi:cli` this adapter actually canon-lowers).
+//
+// Scope cut for cataggar/wamr#453's initial sub-phase: the adapter
+// only canon-lowers `wasi:cli/exit.exit-with-code(u8)` — the
+// `proc_exit` path — and exports the canon-lifted `wasi:cli/run.run`
+// command entry. Every other preview1 import is an ENOSYS stub in
+// `src/adapter.wat`, and the wabt adapter splicer's
+// core-wasm GC pass drops the unused exports at splice time.
+//
+// The wider import set (`wasi:io/streams`, `wasi:filesystem/…`, etc.)
+// arrives in a later sub-phase alongside the real fd_write /
+// args_get / clock_time_get lowering. Adding it now would require
+// `metadata_encode.zig` to grow resource-handle support, which is a
+// non-trivial parallel work item.
+
+package wabt:wasi-preview1@0.0.0;
+
+world command {
+    /// Lossless `proc_exit` lowering. The adapter's `proc_exit(code: i32)`
+    /// truncates to `u8` and calls `exit-with-code` directly,
+    /// preserving the numeric code end-to-end. This is the single
+    /// deliberate divergence from the wasmtime adapter, which routes
+    /// through `wasi:cli/exit.exit(result<_, _>)` and collapses every
+    /// non-zero code to host exit code 1.
+    import wasi:cli/exit@0.2.6;
+
+    /// Canon-lift'd `run()` entry. The adapter calls
+    /// `__main_module__._start` and returns `ok` on normal return;
+    /// `proc_exit` traps out of `_start` so this tail is unreachable
+    /// when the guest exits with a code.
+    export wasi:cli/run@0.2.6;
+}

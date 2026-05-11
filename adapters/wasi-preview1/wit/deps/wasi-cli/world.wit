@@ -1,0 +1,29 @@
+// Slice of `wasi:cli@0.2.6` that the wabt-built wasi-preview1
+// adapter consumes. Mirrors the canonical interface bodies but
+// includes only the funcs the adapter actually canon-lowers; the
+// host (wamr `WasiCliAdapter`) provides the full preview2 surface
+// so the wrapping component is free to satisfy a wider import.
+//
+// The signatures here are pinned against
+// `cataggar/wamr:src/component/wasi_cli_adapter.zig` and the
+// `wasi:cli@0.2.6` upstream WIT in
+// `bytecodealliance/wasi-cli@v0.2.6`.
+
+package wasi:cli@0.2.6;
+
+interface exit {
+    /// Exit the program with an explicit numeric status code. The
+    /// preserves-numeric-code variant of `exit(result<_, _>)`.
+    /// `wasi:cli@0.2.6` defines both; we declare only the one the
+    /// preview1 adapter uses.
+    exit-with-code: func(status-code: u8);
+}
+
+interface run {
+    /// Run the program. Returns `ok` on success, `err` otherwise.
+    /// In the adapter's lowering, `proc_exit(code)` traps out of
+    /// `_start` (after `exit-with-code` has landed the code at the
+    /// host), so the explicit `ok` tail is reached only by guests
+    /// that return normally from `main()`.
+    run: func() -> result;
+}

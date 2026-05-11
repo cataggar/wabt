@@ -18,7 +18,6 @@
   ;; ── func types ────────────────────────────────────────────────
   (type $void          (func))
   (type $i32_void      (func (param i32)))
-  (type $get_handle    (func (result i32)))
   (type $run_sig       (func (result i32)))
   (type $cabi_realloc  (func (param i32 i32 i32 i32) (result i32)))
 
@@ -49,13 +48,13 @@
   ;; preview2 import signatures (canon-lower'd by the wrapping
   ;; component; here they are plain core-wasm function types).
   ;;
-  ;; `[method]output-stream.blocking-write-and-flush(self, contents)
-  ;; -> result<_, stream-error>` canon-lowers to:
-  ;;   (self: i32 handle, ptr: i32, len: i32, retptr: i32) -> ()
-  ;; The retptr is a 12-byte return-area in linear memory; the
-  ;; first byte is the result tag (0 = ok, 1 = err), followed by
-  ;; the (variant-tagged) stream-error payload on the err branch.
-  (type $stream_write_sig (func (param i32 i32 i32 i32)))
+  ;; v1 scope (cataggar/wamr#453): only the preview2 imports used
+  ;; by `proc_exit` are declared. The wider set
+  ;; (`wasi:io/streams.[method]output-stream.…`, `wasi:cli/stdout`,
+  ;; `wasi:filesystem/…`, etc.) arrives alongside the real
+  ;; `fd_write` / `args_get` / `clock_time_get` lowering — which
+  ;; also requires `metadata_encode.zig` to grow resource-handle
+  ;; support.
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -69,22 +68,12 @@
   (import "__main_module__" "cabi_realloc"
     (func $main_cabi_realloc (type $cabi_realloc)))
 
-  ;; preview2 instances we lower into. Initial scope per
-  ;; cataggar/wamr#453 — fd_write / fd_read / stdio + exit-with-code.
+  ;; preview2 instance imports actually consumed by the v1 adapter.
+  ;; `wasi:cli/exit@0.2.6.exit-with-code(u8)` is the lossless
+  ;; replacement for the wasmtime adapter's `exit(result<_, _>)` —
+  ;; preserves the numeric proc_exit code end-to-end.
   (import "wasi:cli/exit@0.2.6" "exit-with-code"
     (func $exit_with_code (type $i32_void)))
-  (import "wasi:cli/stdout@0.2.6" "get-stdout"
-    (func $get_stdout (type $get_handle)))
-  (import "wasi:cli/stderr@0.2.6" "get-stderr"
-    (func $get_stderr (type $get_handle)))
-  (import "wasi:cli/stdin@0.2.6" "get-stdin"
-    (func $get_stdin (type $get_handle)))
-  (import "wasi:io/streams@0.2.6" "[method]output-stream.blocking-write-and-flush"
-    (func $owrite_flush (type $stream_write_sig)))
-  (import "wasi:io/streams@0.2.6" "[resource-drop]output-stream"
-    (func $ostream_drop (type $i32_void)))
-  (import "wasi:io/streams@0.2.6" "[resource-drop]input-stream"
-    (func $istream_drop (type $i32_void)))
 
   ;; ── preview1 surface ─────────────────────────────────────────
   ;;

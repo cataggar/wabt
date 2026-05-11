@@ -15,33 +15,42 @@ is documented in that issue.
 
 [issue]: https://github.com/cataggar/wamr/issues/453
 
-## Status: in-progress, not yet wired into `wabt component new`
+## Status: encoded-world section wired, awaiting real preview1 lowering
 
-This directory ships the **scaffolding** for the adapter — a WAT
-source with the correct import / export shape and stubbed function
-bodies, plus a Zig build tool that drives the wabt library to parse
-and emit the artifact. Subsequent commits fill in:
+This directory ships:
 
-  1. the `wit/preview1.wit` world declaration and a
-     `metadata_encode.encodeWorldFromSource` call from
-     `tools/build_adapter.zig` that appends the
-     `component-type:…:command:encoded world` custom section to the
-     emitted wasm (today the artifact is *shape only* — it parses,
-     validates and has the right imports/exports, but the splicer
-     in `src/component/adapter/decode.zig` rejects it with
-     `MissingEncodedWorld` because the world section is absent;
-     gated on `metadata_encode.zig` gaining support for resource
-     handles — the real `wasi:io/streams` interface uses
-     `[method]output-stream.blocking-write-and-flush(borrow<…>,
-     …)`),
-  2. real preview1 → preview2 semantics in `src/adapter.wat`
+  * **WAT source** (`src/adapter.wat`) — correct preview1 export shape,
+    `proc_exit` fully lowered through `wasi:cli/exit.exit-with-code`,
+    every other preview1 function returns `errno=ENOSYS` (52).
+  * **WIT world** (`wit/preview1.wit` + `wit/deps/wasi-cli/world.wit`)
+    — `world command { import wasi:cli/exit@0.2.6; export wasi:cli/run@0.2.6; }`.
+    Only declares the preview2 imports actually canon-lowered by the
+    current adapter body. The wider surface (streams / filesystem /
+    clocks / random) arrives alongside the corresponding preview1
+    lowerings, which also need `metadata_encode.zig` to grow
+    resource-handle support (deferred).
+  * **`zig build adapter`** — runs `tools/build_adapter.zig` to parse
+    the WAT, validate it, encode the WIT world via wabt's
+    `metadata_encode.encodeWorldFromResolver`, attach the
+    `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
+    custom section, and self-check the result through the splicer's
+    `adapter/decode.parseFromAdapterCore`. Output:
+    `zig-out/adapter/wasi_snapshot_preview1.command.wasm`.
+
+Subsequent commits fill in:
+
+  1. Real preview1 → preview2 semantics in `src/adapter.wat`
      replacing the current ENOSYS stubs (`fd_write` iterates the
      iovec list and calls `output-stream.blocking-write-and-flush`,
-     `args_get` lowers `wasi:cli/environment.get-arguments`, etc.),
-  3. embedding the artifact into the wabt CLI via `@embedFile` and
+     `args_get` lowers `wasi:cli/environment.get-arguments`, etc.).
+     This re-adds the `wasi:io/streams` / `wasi:cli/{stdout,stderr,stdin}`
+     imports — at which point `metadata_encode.zig` must grow
+     resource-handle support.
+  2. Embedding the artifact into the wabt CLI via `@embedFile` and
      wiring it as the default `--adapt` source in
      `src/tools/component_new.zig` when the embed declares
-     preview1 imports and `--adapt` is not passed.
+     preview1 imports and `--adapt` is not passed. (Phase 2 of
+     cataggar/wamr#453.)
 
 The `proc_exit` lowering is the one piece that's fully wired
 end-to-end already, because it's just a single canon-lower of `u8`
@@ -83,24 +92,15 @@ adapters/wasi-preview1/
       canon-lift'd preview2 return values that need a return area in
       embed memory. Absent embeds get a `buildMainModuleFallback`
       stub from the splicer.
-    * One preview2 instance import per WASI namespace the adapter
-      lowers into. Initial scope:
-        * `wasi:cli/exit@0.2.6.exit-with-code` — replaces the lossy
-          `exit(result)` that the wasmtime adapter routes through.
-        * `wasi:cli/stdout@0.2.6.get-stdout`,
-          `wasi:cli/stderr@0.2.6.get-stderr`,
-          `wasi:cli/stdin@0.2.6.get-stdin`.
-        * `wasi:io/streams@0.2.6.[method]output-stream.blocking-
-          write-and-flush`,
-          `[method]output-stream.blocking-flush`,
-          `[method]input-stream.blocking-read`,
-          `[resource-drop]output-stream`,
-          `[resource-drop]input-stream`.
-        * `wasi:cli/environment@0.2.6.get-arguments`,
-          `get-environment`.
-        * `wasi:clocks/wall-clock@0.2.6.now`,
-          `wasi:clocks/monotonic-clock@0.2.6.now`.
-        * `wasi:random/random@0.2.6.get-random-bytes`.
+    * `wasi:cli/exit@0.2.6.exit-with-code` — replaces the lossy
+      `exit(result)` that the wasmtime adapter routes through.
+      This is the *only* preview2 import in the v1 surface; the
+      wider set (`wasi:cli/stdout|stderr|stdin@0.2.6`,
+      `wasi:io/streams@0.2.6`, `wasi:cli/environment@0.2.6`,
+      `wasi:clocks/wall-clock@0.2.6`, `wasi:clocks/monotonic-clock@0.2.6`,
+      `wasi:random/random@0.2.6`, `wasi:filesystem/preopens@0.2.6`,
+      `wasi:filesystem/types@0.2.6`) arrives alongside the real
+      preview1 lowerings in the next sub-phase.
 
 * **Core wasm exports** (flat names, no
   `wasi_snapshot_preview1.` prefix — the splicer maps them to
@@ -131,12 +131,13 @@ adapters/wasi-preview1/
         drops the unused ones at splice time.
 
 * **`component-type:…:command:encoded world` custom section**:
-  produced by `wabt component embed` (or directly by
-  [`metadata_encode.encodeWorldFromSource`](../../src/component/wit/metadata_encode.zig))
-  from `wit/preview1.wit`. The splicer decodes this in
+  produced by `tools/build_adapter.zig` invoking
+  [`metadata_encode.encodeWorldFromResolver`](../../src/component/wit/metadata_encode.zig)
+  on `wit/preview1.wit` + `wit/deps/wasi-cli/world.wit`. The splicer
+  decodes this in
   [`src/component/adapter/decode.zig`](../../src/component/adapter/decode.zig)
-  to drive `types-import.hoist`. Section name format used here:
-  `component-type:wabt:0.0.0:wasi:cli@0.2.6:command:encoded world`
+  to drive `types-import.hoist`. Section name used here:
+  `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
   (any `component-type:*` prefix is accepted by `decode.zig`).
 
 ## Why hand-authored WAT instead of compiled Zig?

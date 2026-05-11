@@ -107,6 +107,11 @@ pub fn build(b: *std.Build) void {
 
         const run_adapter_tool = b.addRunArtifact(adapter_tool_exe);
         run_adapter_tool.addFileArg(b.path("adapters/wasi-preview1/src/adapter.wat"));
+        // The WIT layout — `wit/preview1.wit` + `wit/deps/wasi-cli/world.wit`.
+        // The tool calls `resolver.parseLayout` and then
+        // `metadata_encode.encodeWorldFromResolver` to produce the
+        // `component-type:…:encoded world` custom-section payload.
+        run_adapter_tool.addDirectoryArg(b.path("adapters/wasi-preview1/wit"));
         const adapter_wasm = run_adapter_tool.addOutputFileArg(
             "wasi_snapshot_preview1.command.wasm",
         );
@@ -118,7 +123,7 @@ pub fn build(b: *std.Build) void {
         );
         const adapter_step = b.step(
             "adapter",
-            "Build the wasi-preview1 → preview2 adapter (scaffold; see adapters/wasi-preview1/README.md)",
+            "Build the wasi-preview1 → preview2 adapter (preview1 surface + encoded-world section; see adapters/wasi-preview1/README.md)",
         );
         adapter_step.dependOn(&adapter_install.step);
     }
