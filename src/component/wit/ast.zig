@@ -51,6 +51,15 @@ pub const Type = union(enum) {
         err: ?*const Type,
     },
     tuple: []const Type,
+    /// `borrow<R>` handle type — R is a resource declared elsewhere
+    /// in scope. Resolved by the encoder when emitting the body.
+    borrow: []const u8,
+    /// `own<R>` handle type — explicit ownership transfer. Bare
+    /// references to a resource by name (`R` without `own<>` /
+    /// `borrow<>`) also lower to own-handles; the encoder is
+    /// responsible for that distinction based on the resolution of
+    /// `name`.
+    own: []const u8,
     /// Reference to a type defined elsewhere in the same scope by
     /// name. Resolved by `resolve.zig`.
     name: []const u8,
@@ -92,6 +101,29 @@ pub const TypeDefKind = union(enum) {
     @"enum": []const []const u8,
     /// `flags foo { read, write }`.
     flags: []const []const u8,
+    /// `resource foo { method-decls }`.
+    ///
+    /// The body lists methods, static methods, and an optional
+    /// constructor. The encoder synthesizes the canonical
+    /// `[method]R.M`, `[static]R.M`, `[constructor]R`, and
+    /// `[resource-drop]R` external names; the implicit
+    /// `self: borrow<R>` (methods) and `-> own<R>` (constructor)
+    /// are not present in the AST.
+    resource: []const ResourceMethod,
+};
+
+pub const ResourceMethodKind = enum {
+    method,
+    static,
+    constructor,
+};
+
+pub const ResourceMethod = struct {
+    docs: []const u8 = "",
+    kind: ResourceMethodKind,
+    /// Method-local name. Empty for `constructor`.
+    name: []const u8 = "",
+    func: Func,
 };
 
 pub const TypeDef = struct {

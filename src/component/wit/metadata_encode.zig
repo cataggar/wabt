@@ -42,9 +42,11 @@
 //!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
-//!   * record / variant / enum / flags / type-alias / use clause
-//!     in interface bodies (the wamr fixtures don't use them).
-//!   * resource / handle / stream / future / async / error-context.
+//!   * record / variant / enum / flags / type-alias / use clause /
+//!     resource decl in interface bodies (the wamr fixtures don't
+//!     use them).
+//!   * `own<R>` / `borrow<R>` handle types.
+//!   * stream / future / async / error-context.
 //!   * named-type references inside func sigs (`name` is rejected).
 //!
 //! Lifting these is incremental: each remaining WIT type maps to a
@@ -342,6 +344,7 @@ const BodyBuilder = struct {
                 break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
             },
             .name => error.UnsupportedWitFeature,
+            .borrow, .own => error.UnsupportedWitFeature,
         };
     }
 
