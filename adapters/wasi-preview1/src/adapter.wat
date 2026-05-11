@@ -29,7 +29,10 @@
 ;; encoded-world custom section round-trips through
 ;; `build_adapter.zig` → `decode.parseFromAdapterCore` against the
 ;; widened preview1 world. Phase 1.c.3c adds globals + helpers
-;; that consume them; Phase 1.c.3d rewires `fd_write`.
+;; that consume them; Phase 1.c.3d rewires `fd_write` to dispatch
+;; on fd=1/2 → stdout/stderr handle and stream the iovec list
+;; via `blocking-write-and-flush`. All other preview1 imports
+;; remain ENOSYS until later sub-phases.
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -128,6 +131,38 @@
   (import "wasi:io/streams@0.2.6" "[resource-drop]output-stream"
     (func $output_stream_drop (type $i32_void)))
 
+  ;; ── adapter state ────────────────────────────────────────────
+  ;;
+  ;; Lazy handle cache for stdout / stderr. Initialised to -1
+  ;; (sentinel for "uncached"); populated on first access via
+  ;; `wasi:cli/{stdout,stderr}.get-{stdout,stderr}`. wasi-preview1
+  ;; is single-threaded (no atomics, no shared memory) so a plain
+  ;; mut i32 is safe. We never drop these handles — preview1
+  ;; doesn't surface `fd_close` for fd 1 / 2 — so the
+  ;; `[resource-drop]output-stream` import is declared for the
+  ;; splicer's GC anchor but never invoked from here.
+  (global $stdout_handle (mut i32) (i32.const -1))
+  (global $stderr_handle (mut i32) (i32.const -1))
+
+  ;; Scratch return-area for canon-lower'd preview2 calls whose
+  ;; result type doesn't fit in flat parameters
+  ;; (`blocking-write-and-flush` returns `result<_, stream-error>`
+  ;; which is lowered into a 4th `ret_area: i32` param). 16 bytes
+  ;; is plenty — the largest result we read back is the result
+  ;; outer discriminant (i32) + the inner stream-error
+  ;; discriminant (i32) = 8 bytes.
+  ;;
+  ;; The area is allocated lazily on first fd_write call via the
+  ;; embed's `cabi_realloc` and stashed here for re-use. We never
+  ;; free it; the embed instance teardown reclaims everything.
+  (global $ret_area (mut i32) (i32.const 0))
+
+  ;; ── preview1 errno constants ─────────────────────────────────
+  ;; Mirrors wasi-libc `<wasi/api.h>`:
+  ;;   EBADF  = 8   bad file descriptor
+  ;;   EIO    = 29  I/O error (used for stream-error mapping)
+  ;;   ENOSYS = 52  unsupported preview1 function
+
   ;; ── preview1 surface ─────────────────────────────────────────
   ;;
   ;; proc_exit(code: i32) -> ! :  preview1 declares no return, but
@@ -162,10 +197,181 @@
     i32.const 0)
 
   ;; ── fd_* (mostly ENOSYS stubs until subsequent commits) ──────
+
+  ;; Helper: return cached stdout handle, populating it on first
+  ;; call via `wasi:cli/stdout.get-stdout`.
+  (func $get_stdout_cached (result i32)
+    global.get $stdout_handle
+    i32.const -1
+    i32.ne
+    if (result i32)
+      global.get $stdout_handle
+    else
+      call $get_stdout
+      global.set $stdout_handle
+      global.get $stdout_handle
+    end)
+
+  ;; Helper: return cached stderr handle, populating it on first
+  ;; call via `wasi:cli/stderr.get-stderr`.
+  (func $get_stderr_cached (result i32)
+    global.get $stderr_handle
+    i32.const -1
+    i32.ne
+    if (result i32)
+      global.get $stderr_handle
+    else
+      call $get_stderr
+      global.set $stderr_handle
+      global.get $stderr_handle
+    end)
+
+  ;; Helper: ensure `$ret_area` points at a 16-byte block in
+  ;; env.memory. Allocates once via the embed's cabi_realloc.
+  ;; Returns the cached pointer.
+  (func $ensure_ret_area (result i32)
+    global.get $ret_area
+    i32.eqz
+    if
+      i32.const 0     ;; old_ptr
+      i32.const 0     ;; old_size
+      i32.const 4     ;; align
+      i32.const 16    ;; new_size
+      call $main_cabi_realloc
+      global.set $ret_area
+    end
+    global.get $ret_area)
+
+  ;; Helper: write `buf[0..len]` to `handle` via
+  ;; `blocking-write-and-flush`. Maps `stream-error` to EIO; an
+  ;; ok result returns 0. Skips zero-length writes (the canon
+  ;; ABI accepts them, but preview2 hosts may surface a spurious
+  ;; `closed` for an empty contents list).
+  (func $write_one
+    (param $handle i32) (param $buf i32) (param $len i32)
+    (result i32)
+    (local $ra i32)
+    local.get $len
+    i32.eqz
+    if
+      i32.const 0
+      return
+    end
+    call $ensure_ret_area
+    local.set $ra
+    local.get $handle
+    local.get $buf
+    local.get $len
+    local.get $ra
+    call $blocking_write_and_flush
+    ;; result outer discriminant is one byte at offset 0:
+    ;;   0 = ok, 1 = err(stream-error)
+    local.get $ra
+    i32.load8_u
+    if (result i32)
+      i32.const 29 ;; EIO
+    else
+      i32.const 0
+    end)
+
+  ;; Helper: stream every iovec in `iovs[0..iovs_len]` through
+  ;; `$write_one(handle, …)`, accumulating the byte count at
+  ;; `*nwritten_ptr`. Bails on the first non-zero errno but
+  ;; still publishes the partial count so wasi-libc can resume.
+  ;;
+  ;; iovec layout (preview1):
+  ;;   struct iovec_t { uint8_t *buf; size_t buf_len; }
+  ;; canon-lowered to 8 bytes per record in env.memory
+  ;; (offset 0: buf_ptr i32, offset 4: buf_len i32).
+  (func $write_iovecs
+    (param $handle i32) (param $iovs i32) (param $iovs_len i32)
+    (param $nwritten_ptr i32)
+    (result i32)
+    (local $i i32) (local $total i32) (local $rec i32)
+    (local $buf i32) (local $len i32) (local $ret i32)
+    i32.const 0
+    local.set $i
+    i32.const 0
+    local.set $total
+    block $done
+      loop $next
+        local.get $i
+        local.get $iovs_len
+        i32.ge_u
+        br_if $done
+        ;; rec = iovs + (i << 3)
+        local.get $iovs
+        local.get $i
+        i32.const 3
+        i32.shl
+        i32.add
+        local.tee $rec
+        i32.load        ;; buf
+        local.set $buf
+        local.get $rec
+        i32.load offset=4 ;; len
+        local.set $len
+        local.get $handle
+        local.get $buf
+        local.get $len
+        call $write_one
+        local.tee $ret
+        if
+          ;; stream-error: publish partial count + bail.
+          local.get $nwritten_ptr
+          local.get $total
+          i32.store
+          local.get $ret
+          return
+        end
+        local.get $total
+        local.get $len
+        i32.add
+        local.set $total
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $next
+      end
+    end
+    local.get $nwritten_ptr
+    local.get $total
+    i32.store
+    i32.const 0)
+
+  ;; preview1 `fd_write(fd, iovs, iovs_len, nwritten_ptr) -> errno`.
+  ;; Routes fd 1 → cached stdout handle, fd 2 → cached stderr
+  ;; handle, anything else → EBADF (8). The actual byte
+  ;; streaming lives in `$write_iovecs`.
   (func $fd_write (type $fd_write_sig)
-    ;; TODO: iterate iovec list, call $owrite_flush against
-    ;; stdout/stderr handle. For now: ENOSYS.
-    i32.const 52)
+    (local $handle i32)
+    block $bad_fd
+      local.get 0   ;; fd
+      i32.const 1
+      i32.eq
+      if
+        call $get_stdout_cached
+        local.set $handle
+      else
+        local.get 0
+        i32.const 2
+        i32.eq
+        if
+          call $get_stderr_cached
+          local.set $handle
+        else
+          br $bad_fd
+        end
+      end
+      local.get $handle
+      local.get 1   ;; iovs
+      local.get 2   ;; iovs_len
+      local.get 3   ;; nwritten_ptr
+      call $write_iovecs
+      return
+    end
+    i32.const 8) ;; EBADF
 
   (func $fd_read (type $fd_read_sig)         i32.const 52)
   (func $fd_close (type $fd_close_sig)       i32.const 52)
