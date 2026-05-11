@@ -42,12 +42,17 @@
 //!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
-//!   * record / variant / enum / flags / type-alias / use clause /
-//!     resource decl in interface bodies (the wamr fixtures don't
-//!     use them).
+//!   * record / variant / enum / flags / use clause / resource decl
+//!     in interface bodies (the wamr fixtures don't use them).
 //!   * `own<R>` / `borrow<R>` handle types.
 //!   * stream / future / async / error-context.
-//!   * named-type references inside func sigs (`name` is rejected).
+//!
+//! Supported: `type <name> = <Type>;` aliases plus `Type.name`
+//! references that resolve to a prior alias in the same interface
+//! body. The alias binds the name to the underlying `ValType`
+//! without consuming a fresh slot; references inline the bound
+//! `ValType`. Compound RHSes (`list<T>`, `result<…>`, …) still emit
+//! their own `TypeDef` decls via `appendCompound`.
 //!
 //! Lifting these is incremental: each remaining WIT type maps to a
 //! `TypeDef` declarator before the func that references it.
@@ -257,8 +262,16 @@ fn buildInterfaceBody(
     // `BodyBuilder` tracks the type-index space inside this
     // instance-type body. Every appended `.type` decl bumps
     // `type_idx`; compound valtypes lower to a fresh `.type` decl
-    // and a `ValType.type_idx` reference to its slot.
-    var builder: BodyBuilder = .{ .ar = ar, .decls = .empty, .type_idx = 0 };
+    // and a `ValType.type_idx` reference to its slot. Named-type
+    // refs (e.g. `Type.name`) resolve against `name_map`, which is
+    // populated as `type <name> = T;` aliases are encountered in
+    // declaration order.
+    var builder: BodyBuilder = .{
+        .ar = ar,
+        .decls = .empty,
+        .type_idx = 0,
+        .name_map = .empty,
+    };
     for (iface_body.items) |it| {
         switch (it) {
             .func => |f| {
@@ -286,7 +299,14 @@ fn buildInterfaceBody(
                     .desc = .{ .func = func_type_idx },
                 } });
             },
-            .type, .use => return error.UnsupportedWitFeature,
+            .type => |td| switch (td.kind) {
+                .alias => |inner| {
+                    const vt = try builder.lowerType(inner);
+                    try builder.bindName(td.name, vt);
+                },
+                else => return error.UnsupportedWitFeature,
+            },
+            .use => return error.UnsupportedWitFeature,
         }
     }
     return try builder.decls.toOwnedSlice(ar);
@@ -303,6 +323,13 @@ const BodyBuilder = struct {
     /// equivalently, the next free slot in the instance-type body's
     /// type-index space.
     type_idx: u32,
+    /// Maps `type <name> = T;` aliases (and, in later chunks,
+    /// nominal typedefs) to the `ValType` to substitute when a
+    /// `Type.name` reference points at them. Aliases to primitives
+    /// map directly to the primitive `ValType` without consuming a
+    /// fresh slot; aliases whose RHS is a compound type map to the
+    /// `type_idx` produced by the compound's lowering.
+    name_map: std.StringHashMapUnmanaged(ctypes.ValType),
 
     fn lowerType(self: *BodyBuilder, t: ast.Type) EncodeError!ctypes.ValType {
         return switch (t) {
@@ -343,7 +370,7 @@ const BodyBuilder = struct {
                 for (fields, 0..) |f, i| inner[i] = try self.lowerType(f);
                 break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
             },
-            .name => error.UnsupportedWitFeature,
+            .name => |n| self.name_map.get(n) orelse error.InvalidWit,
             .borrow, .own => error.UnsupportedWitFeature,
         };
     }
@@ -353,6 +380,12 @@ const BodyBuilder = struct {
         try self.decls.append(self.ar, .{ .type = td });
         self.type_idx += 1;
         return .{ .type_idx = idx };
+    }
+
+    fn bindName(self: *BodyBuilder, name: []const u8, vt: ctypes.ValType) EncodeError!void {
+        const gop = try self.name_map.getOrPut(self.ar, name);
+        if (gop.found_existing) return error.InvalidWit;
+        gop.value_ptr.* = vt;
     }
 };
 
@@ -617,4 +650,136 @@ test "metadata_encode: `list<u8>` param hoists to a TypeDef.list" {
     try testing.expect(iface.decls[1].type.func.params[0].type == .type_idx);
     try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
     try testing.expect(iface.decls[1].type.func.results.unnamed == .u32);
+}
+
+test "metadata_encode: primitive type alias resolves via name_map without a fresh slot" {
+    // `type my-u32 = u32;` is a pure rename — aliasing a primitive
+    // produces no new slot in the body's type-index space. A func
+    // referencing `my-u32` should inline the underlying primitive
+    // ValType.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type my-u32 = u32;
+        \\    inc: func(x: my-u32) -> my-u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Just [func TypeDef, export(func=0)] — no slot for the alias.
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .func);
+    const func = iface.decls[0].type.func;
+    try testing.expectEqual(@as(usize, 1), func.params.len);
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: compound alias is hoisted once, named refs reuse the slot" {
+    // `type bytes = list<u8>;` should emit exactly one TypeDef.list
+    // and bind `bytes` to that slot. A func using `bytes` twice
+    // (param + result) must reference the same `type_idx`, not
+    // re-hoist the list each time.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type bytes = list<u8>;
+        \\    roundtrip: func(b: bytes) -> bytes;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes_out = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes_out);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes_out, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [list TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .list);
+    try testing.expect(iface.decls[0].type.list.element == .u8);
+    try testing.expect(iface.decls[1].type == .func);
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(func.results == .unnamed);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+}
+
+test "metadata_encode: alias chain (a -> u32, b -> a) resolves transitively" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    type a = u32;
+        \\    type b = a;
+        \\    f: func(x: b) -> b;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    const func = iface.decls[0].type.func;
+    try testing.expect(func.params[0].type == .u32);
+    try testing.expect(func.results.unnamed == .u32);
+}
+
+test "metadata_encode: unresolved name reports InvalidWit" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    f: func(x: nonexistent) -> u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "demo");
+    try testing.expectError(error.InvalidWit, r);
+}
+
+test "metadata_encode: still rejects record / variant / enum / flags / use / resource" {
+    // Chunk 2 keeps the compound-typedef block deferred. The encoder
+    // must continue to surface `UnsupportedWitFeature` for these.
+    const rec =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    record point { x: u32, y: u32 }
+        \\    f: func(p: point);
+        \\}
+        \\world demo { export ops; }
+    ;
+    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, rec, "demo"));
+
+    const res =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    resource handle { }
+        \\}
+        \\world demo { export ops; }
+    ;
+    try testing.expectError(error.UnsupportedWitFeature, encodeWorldFromSource(testing.allocator, res, "demo"));
 }
