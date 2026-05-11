@@ -27,23 +27,28 @@
 //! ```
 //!
 //! MVP scope — sufficient for all three wamr fixtures (`zig-adder`,
-//! `zig-calculator-cmd`, `mixed-zig-rust-calc`):
+//! `zig-calculator-cmd`, `mixed-zig-rust-calc`) plus the wabt-built
+//! `wasi-preview1` adapter world (`cataggar/wamr#453`):
 //!
 //!   * Worlds with `export <iface>;` (in-package) and
 //!     `import <ns>:<pkg>/<iface>[@<ver>];` (qualified) extern refs.
 //!   * Interfaces containing only func defs.
 //!   * Func signatures over primitive WIT types and `list<T>` /
-//!     `option<T>` / `result<T,E>` / `tuple<T...>` of primitives.
+//!     `option<T>` / `result<T,E>` / `tuple<T...>` of primitives,
+//!     including bare `result` (no payloads). Compound types are
+//!     hoisted into `TypeDef` decls before the func that references
+//!     them; the func params/results then carry `ValType.type_idx`
+//!     references to those slots.
 //!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
 //!   * record / variant / enum / flags / type-alias / use clause
 //!     in interface bodies (the wamr fixtures don't use them).
 //!   * resource / handle / stream / future / async / error-context.
+//!   * named-type references inside func sigs (`name` is rejected).
 //!
-//! Lifting these is incremental: each compound WIT type maps to a
-//! `TypeDef` declarator before the func that references it, and the
-//! func params/results switch from inline `ValType` to type-idx refs.
+//! Lifting these is incremental: each remaining WIT type maps to a
+//! `TypeDef` declarator before the func that references it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -247,59 +252,106 @@ fn buildInterfaceBody(
     // either way.
     const iface_body = resolver.findInterface(ref) orelse return error.UnknownInterface;
 
-    var decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
-    var func_idx: u32 = 0;
+    // `BodyBuilder` tracks the type-index space inside this
+    // instance-type body. Every appended `.type` decl bumps
+    // `type_idx`; compound valtypes lower to a fresh `.type` decl
+    // and a `ValType.type_idx` reference to its slot.
+    var builder: BodyBuilder = .{ .ar = ar, .decls = .empty, .type_idx = 0 };
     for (iface_body.items) |it| {
         switch (it) {
             .func => |f| {
-                const ft = try lowerFuncSig(ar, f.func);
-                try decls.append(ar, .{ .type = .{ .func = ft } });
-                try decls.append(ar, .{ .@"export" = .{
+                // Lower param/result types first — this may emit
+                // `.type` decls for compound types, bumping
+                // `type_idx`. The `.func` `.type` itself goes last.
+                const params = try ar.alloc(ctypes.NamedValType, f.func.params.len);
+                for (f.func.params, 0..) |p, i| {
+                    params[i] = .{ .name = p.name, .type = try builder.lowerType(p.type) };
+                }
+                const results: ctypes.FuncType.ResultList = if (f.func.result) |t|
+                    .{ .unnamed = try builder.lowerType(t) }
+                else
+                    .none;
+
+                const func_type_idx = builder.type_idx;
+                try builder.decls.append(ar, .{ .type = .{ .func = .{
+                    .params = params,
+                    .results = results,
+                } } });
+                builder.type_idx += 1;
+
+                try builder.decls.append(ar, .{ .@"export" = .{
                     .name = f.name,
-                    .desc = .{ .func = func_idx },
+                    .desc = .{ .func = func_type_idx },
                 } });
-                func_idx += 1;
             },
             .type, .use => return error.UnsupportedWitFeature,
         }
     }
-    return try decls.toOwnedSlice(ar);
+    return try builder.decls.toOwnedSlice(ar);
 }
 
-fn lowerFuncSig(ar: Allocator, sig: ast.Func) EncodeError!ctypes.FuncType {
-    var params = try ar.alloc(ctypes.NamedValType, sig.params.len);
-    for (sig.params, 0..) |p, i| {
-        params[i] = .{ .name = p.name, .type = try lowerType(ar, p.type) };
+/// Stateful helper that builds the body of an instance-type while
+/// tracking the type-index space. Compound types (`list`, `option`,
+/// `result`, `tuple`) appear as standalone `TypeDef` decls and are
+/// then referenced from func params/results via `ValType.type_idx`.
+const BodyBuilder = struct {
+    ar: Allocator,
+    decls: std.ArrayListUnmanaged(ctypes.Decl),
+    /// Current count of `.type` decls already appended to `decls` —
+    /// equivalently, the next free slot in the instance-type body's
+    /// type-index space.
+    type_idx: u32,
+
+    fn lowerType(self: *BodyBuilder, t: ast.Type) EncodeError!ctypes.ValType {
+        return switch (t) {
+            .bool => .bool,
+            .s8 => .s8,
+            .u8 => .u8,
+            .s16 => .s16,
+            .u16 => .u16,
+            .s32 => .s32,
+            .u32 => .u32,
+            .s64 => .s64,
+            .u64 => .u64,
+            .f32 => .f32,
+            .f64 => .f64,
+            .char => .char,
+            .string => .string,
+            .list => |inner| blk: {
+                const elem = try self.lowerType(inner.*);
+                break :blk try self.appendCompound(.{ .list = .{ .element = elem } });
+            },
+            .option => |inner| blk: {
+                const inner_vt = try self.lowerType(inner.*);
+                break :blk try self.appendCompound(.{ .option = .{ .inner = inner_vt } });
+            },
+            .result => |r| blk: {
+                const ok_vt: ?ctypes.ValType = if (r.ok) |ok_ty|
+                    try self.lowerType(ok_ty.*)
+                else
+                    null;
+                const err_vt: ?ctypes.ValType = if (r.err) |err_ty|
+                    try self.lowerType(err_ty.*)
+                else
+                    null;
+                break :blk try self.appendCompound(.{ .result = .{ .ok = ok_vt, .err = err_vt } });
+            },
+            .tuple => |fields| blk: {
+                const inner = try self.ar.alloc(ctypes.ValType, fields.len);
+                for (fields, 0..) |f, i| inner[i] = try self.lowerType(f);
+                break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
+            },
+            .name => error.UnsupportedWitFeature,
+        };
     }
-    const results: ctypes.FuncType.ResultList = if (sig.result) |t|
-        .{ .unnamed = try lowerType(ar, t) }
-    else
-        .none;
-    return .{ .params = params, .results = results };
-}
 
-fn lowerType(ar: Allocator, t: ast.Type) EncodeError!ctypes.ValType {
-    _ = ar;
-    return switch (t) {
-        .bool => .bool,
-        .s8 => .s8,
-        .u8 => .u8,
-        .s16 => .s16,
-        .u16 => .u16,
-        .s32 => .s32,
-        .u32 => .u32,
-        .s64 => .s64,
-        .u64 => .u64,
-        .f32 => .f32,
-        .f64 => .f64,
-        .char => .char,
-        .string => .string,
-        // Compound + named types require an outer TypeDef and
-        // reference-by-index. The MVP omits this; widening it is the
-        // next-todo.
-        .list, .option, .result, .tuple, .name => return error.UnsupportedWitFeature,
-    };
-}
+    fn appendCompound(self: *BodyBuilder, td: ctypes.TypeDef) EncodeError!ctypes.ValType {
+        const idx = self.type_idx;
+        try self.decls.append(self.ar, .{ .type = td });
+        self.type_idx += 1;
+        return .{ .type_idx = idx };
+    }
+};
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
@@ -457,4 +509,109 @@ test "metadata_encode: multi-package resolver — cross-package import" {
     try testing.expect(iface.decls[0].type == .func);
     try testing.expect(iface.decls[1] == .@"export");
     try testing.expectEqualStrings("add", iface.decls[1].@"export".name);
+}
+
+test "metadata_encode: bare `result` return is hoisted into a TypeDef + idx ref" {
+    // wasi-preview1 adapter's `wasi:cli/run.run` returns bare
+    // `result` (no `ok` or `err` payloads). The encoder must hoist
+    // the `result` valtype into a `TypeDef.result` decl and reference
+    // it from the func via `ValType.type_idx` — compound types
+    // cannot appear inline in func param/result positions.
+    const source =
+        \\package wasi:cli@0.2.6;
+        \\interface run {
+        \\    run: func() -> result;
+        \\}
+        \\world cmd {
+        \\    export run;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    const iface = world.decls[0].type.instance;
+
+    // Body must be: [result TypeDef, func TypeDef, export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .result);
+    try testing.expect(iface.decls[0].type.result.ok == null);
+    try testing.expect(iface.decls[0].type.result.err == null);
+
+    try testing.expect(iface.decls[1] == .type);
+    try testing.expect(iface.decls[1].type == .func);
+    const func = iface.decls[1].type.func;
+    try testing.expectEqual(@as(usize, 0), func.params.len);
+    try testing.expect(func.results == .unnamed);
+    try testing.expect(func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+
+    try testing.expect(iface.decls[2] == .@"export");
+    try testing.expectEqualStrings("run", iface.decls[2].@"export".name);
+    try testing.expect(iface.decls[2].@"export".desc == .func);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].@"export".desc.func);
+}
+
+test "metadata_encode: `result<u32, string>` payloads hoist correctly" {
+    // Exercise both ok and err payloads on a parameterized result.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    parse: func(s: string) -> result<u32, string>;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body: [result TypeDef, func TypeDef, export(func=1)].
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type.result.ok != null);
+    try testing.expect(iface.decls[0].type.result.err != null);
+    try testing.expect(iface.decls[0].type.result.ok.? == .u32);
+    try testing.expect(iface.decls[0].type.result.err.? == .string);
+    try testing.expect(iface.decls[1].type.func.results.unnamed.type_idx == 0);
+    try testing.expect(iface.decls[2].@"export".desc.func == 1);
+}
+
+test "metadata_encode: `list<u8>` param hoists to a TypeDef.list" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface ops {
+        \\    write: func(bytes: list<u8>) -> u32;
+        \\}
+        \\world demo {
+        \\    export ops;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .list);
+    try testing.expect(iface.decls[0].type.list.element == .u8);
+    try testing.expect(iface.decls[1].type.func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
+    try testing.expect(iface.decls[1].type.func.results.unnamed == .u32);
 }

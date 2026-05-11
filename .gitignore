@@ -1,5 +1,6 @@
 # Build artifacts
 /.zig-cache/
+/.zig-global-cache/
 /zig-out/
 /out/
 
