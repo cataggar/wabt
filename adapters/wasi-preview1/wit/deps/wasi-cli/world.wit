@@ -8,8 +8,12 @@
 // `cataggar/wamr:src/component/wasi_cli_adapter.zig` and the
 // `wasi:cli@0.2.6` upstream WIT in
 // `bytecodealliance/wasi-cli@v0.2.6`.
-
-package wasi:cli@0.2.6;
+//
+// NOTE: the package declaration for this directory's multi-file
+// slice lives in `stdio.wit` (which sorts first alphabetically).
+// `resolver.readWitDir` concatenates files in order, so the
+// `package wasi:cli@0.2.6;` directive must appear in the file
+// that's parsed first.
 
 interface exit {
     /// Exit the program with an explicit numeric status code. The

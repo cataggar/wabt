@@ -1425,3 +1425,33 @@ test "metadata_encode: rejects use whose source iface is not in the world" {
     const r = encodeWorldFromSource(testing.allocator, source, "cmd");
     try testing.expectError(error.InvalidWit, r);
 }
+
+test "metadata_encode: use clause from qualified versioned source ref" {
+    // `use wasi:io/streams@0.2.6.{output-stream};` exercises
+    // `parseSemverText`'s lookahead so the `.` before `{` is not
+    // greedily swallowed as a semver continuation. Regression
+    // pin for the bug discovered while wiring Phase 1.c.3a
+    // (preview1.wit declaring `wasi:cli/stdout` + `wasi:cli/stderr`).
+    const source =
+        \\package wabt:demo@0.0.0;
+        \\interface streams { resource output-stream { } }
+        \\interface stdout {
+        \\    use wabt:demo/streams@0.0.0.{output-stream};
+        \\    get-stdout: func() -> own<output-stream>;
+        \\}
+        \\world cmd { import streams; import stdout; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // Same shape as the short-ref version: 5 world-body decls, with
+    // the alias-instance-export decl between `streams` and `stdout`.
+    try testing.expectEqual(@as(usize, 5), world_body.decls.len);
+    try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+}

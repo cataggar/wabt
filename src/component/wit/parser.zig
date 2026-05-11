@@ -226,24 +226,34 @@ const Parser = struct {
     /// We don't validate the structure — the encoder treats it as
     /// opaque text. Just consume tokens that could appear inside a
     /// semver string until we hit a delimiter (`;` or `/` or `.`+id).
+    ///
+    /// `.`, `-`, `+` are only consumed when followed by an id or
+    /// integer; otherwise they're left for the caller. This matters
+    /// for `use wasi:io/streams@0.2.6.{output-stream};` where the
+    /// `.` between the version and `{` is a use-clause delimiter,
+    /// not a semver continuation. We save and restore lexer/lookahead
+    /// state so we can speculatively peek past the separator.
     fn parseSemverText(self: *Parser) ParseError![]const u8 {
         const first = try self.expect(.integer);
         const start = first.span.start;
         var end = first.span.end;
-        // Greedily consume `.<n>` and `-<id-or-int>` and `+<id-or-int>`
-        // sequences.
         while (true) {
             const t = try self.peekTok();
             switch (t.tag) {
                 .period, .minus, .plus => {
-                    _ = try self.nextTok();
-                    end = t.span.end;
+                    const saved_pos = self.lex.pos;
+                    const saved_lookahead = self.lookahead;
+                    _ = try self.nextTok(); // consume sep
                     const after = try self.nextTok();
-                    end = after.span.end;
-                    // `after` should be an id or integer; accept both.
                     if (after.tag != .id and after.tag != .integer) {
-                        return self.fail(after.span, "invalid semver token");
+                        // Not a semver continuation — rewind so the
+                        // caller sees `t` (the separator) as the
+                        // next token.
+                        self.lex.pos = saved_pos;
+                        self.lookahead = saved_lookahead;
+                        break;
                     }
+                    end = after.span.end;
                 },
                 else => break,
             }

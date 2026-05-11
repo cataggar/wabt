@@ -4,15 +4,18 @@
 // component-model surfaces (see `wit/deps/{wasi-cli,wasi-io}/` for
 // the trimmed slices this adapter consumes).
 //
-// Current scope (cataggar/wamr#453 Phase 1.c.2): the WIT declares
+// Current scope (cataggar/wamr#453 Phase 1.c.3a): the WIT declares
 // the wider preview2 surface the adapter will lower against
-// (`wasi:cli/exit` + `wasi:io/streams`), exercising the encoder's
-// resource-handle paths end-to-end. The `adapter.wat` core wasm
-// still only references `wasi:cli/exit.exit-with-code` directly;
-// the `wasi:io/streams.output-stream.blocking-write-and-flush`
-// lowering lands in Phase 1.c.3 alongside the real `fd_write` body.
+// (`wasi:cli/exit` + `wasi:io/streams` + `wasi:cli/stdout` +
+// `wasi:cli/stderr`), exercising the encoder's resource-handle +
+// `use`-clause paths end-to-end. The `adapter.wat` core wasm still
+// only references `wasi:cli/exit.exit-with-code` directly; the
+// `wasi:cli/stdout.get-stdout` / `wasi:cli/stderr.get-stderr` and
+// `wasi:io/streams.output-stream.blocking-write-and-flush`
+// lowerings land in Phase 1.c.3 alongside the real `fd_write` body.
 // Until then, the splicer's GC pass will drop the unused
-// `wasi:io/streams` instance from the spliced component.
+// `wasi:io/streams` + `wasi:cli/stdout` + `wasi:cli/stderr`
+// instances from the spliced component.
 
 package wabt:wasi-preview1@0.0.0;
 
@@ -29,10 +32,19 @@ world command {
     /// preview1 `fd_write` iterates the iovec list, copies into a
     /// canon-realloc'd buffer, and calls `blocking-write-and-flush`
     /// against the stdout/stderr handle. The handle itself is
-    /// obtained via host trampoline in Phase 1.c.3 — declaring it
-    /// here so the encoded world advertises the imported resource
-    /// shape now.
+    /// obtained via `wasi:cli/stdout.get-stdout` /
+    /// `wasi:cli/stderr.get-stderr` in Phase 1.c.3 — declared here
+    /// so the encoded world advertises the imported resource shape
+    /// now.
     import wasi:io/streams@0.2.6;
+
+    /// Owned `output-stream` handle factories. The two interfaces
+    /// re-export `output-stream` from `wasi:io/streams@0.2.6` via
+    /// `use` clauses, so the world body's encoded section gains
+    /// alias-instance-export decls that surface the type at the
+    /// world level. Preview1 fds 1 and 2 map to these handles.
+    import wasi:cli/stdout@0.2.6;
+    import wasi:cli/stderr@0.2.6;
 
     /// Canon-lift'd `run()` entry. The adapter calls
     /// `__main_module__._start` and returns `ok` on normal return;
