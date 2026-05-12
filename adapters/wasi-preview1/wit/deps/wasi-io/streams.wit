@@ -49,5 +49,19 @@ interface streams {
         /// errored mid-write.
         blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
     }
+
+    /// Byte-source resource. Used by the preview1 `fd_read` path
+    /// via `wasi:filesystem/types.descriptor.read-via-stream`. The
+    /// adapter installs a one-shot `cabi_import_realloc` override
+    /// pointing at the caller's preview1 iov buffer so the host's
+    /// canon-lifted `list<u8>` lands directly there (zero copy).
+    resource input-stream {
+        /// Read up to `len` bytes and block until at least one
+        /// byte is available, the underlying source signals EOF
+        /// (`stream-error.closed`), or an error occurs. Returns
+        /// the bytes read (which may be shorter than `len` on a
+        /// short read, but is never zero on success).
+        blocking-read: func(len: u64) -> result<list<u8>, stream-error>;
+    }
 }
 

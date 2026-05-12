@@ -25,12 +25,19 @@
 // file that's parsed first.
 
 interface types {
+    /// Pull in `input-stream` from `wasi:io/streams` — the
+    /// `descriptor.read-via-stream` method below returns one. The
+    /// encoder requires the source interface to also be imported
+    /// at the world level, which the preview1 world already does
+    /// (`wasi:io/streams@0.2.6` is on the import list for the
+    /// stdout/stderr write path).
+    use wasi:io/streams@0.2.6.{input-stream};
+
     /// Modifiers for `descriptor.open-at` path lookup. Bit 0
     /// (`symlink-follow`) matches preview1 `LOOKUPFLAGS_SYMLINK_FOLLOW`.
     flags path-flags {
         symlink-follow,
     }
-
     /// `O_*`-style modifiers for `descriptor.open-at`. Bit positions
     /// match preview1 `OFLAGS_*` (CREAT=0, DIRECTORY=1, EXCL=2,
     /// TRUNC=3), so the adapter passes `oflags & 0xF` through
@@ -115,6 +122,14 @@ interface types {
             open-flags: open-flags,
             %flags: descriptor-flags
         ) -> result<own<descriptor>, error-code>;
+
+        /// Open an `input-stream` reading from `offset`. Backs
+        /// preview1 `fd_read` for regular files. The adapter opens
+        /// one stream per `fd_read` call (starting at the
+        /// adapter-tracked file position), reads via
+        /// `input-stream.blocking-read`, drops the stream, and
+        /// advances its tracked position by the bytes returned.
+        read-via-stream: func(offset: u64) -> result<own<input-stream>, error-code>;
     }
 }
 
