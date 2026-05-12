@@ -1,0 +1,35 @@
+// Trimmed slice of `wasi:clocks@0.2.6.wall-clock`. Mirrors the canonical
+// `bytecodealliance/wasi-clocks@v0.2.6/wit/wall.wit` shape but declares
+// only `now` + `resolution` (the only two funcs the preview1
+// → preview2 adapter calls). `subscribe-duration` and the rest of the
+// canonical interface stay out of this trimmed copy to keep
+// `metadata_encode` output minimal.
+//
+// Backs the preview1 `clock_time_get(REALTIME, …)` /
+// `clock_res_get(REALTIME, …)` imports. Zig `std.time.timestamp()`,
+// Rust `std::time::SystemTime::now()`, Go `time.Now()` and C's
+// `clock_gettime(CLOCK_REALTIME, …)` all route through here.
+//
+// NOTE: the package declaration for this multi-file slice lives in
+// `monotonic-clock.wit` (which sorts before `wall-clock.wit`
+// alphabetically — `m` < `w`). `resolver.readWitDir` concatenates
+// files in order, so the `package wasi:clocks@0.2.6;` directive
+// must appear in the file parsed first.
+
+interface wall-clock {
+    /// Wall-clock instant — POSIX-style split into integral seconds
+    /// since UTC midnight 1970-01-01 plus a sub-second nanoseconds
+    /// component (0..999_999_999).
+    record datetime {
+        seconds: u64,
+        nanoseconds: u32,
+    }
+
+    /// Current wall-clock time. Used by preview1
+    /// `clock_time_get(REALTIME, …)`.
+    now: func() -> datetime;
+
+    /// Wall-clock resolution. Used by preview1
+    /// `clock_res_get(REALTIME, …)`.
+    resolution: func() -> datetime;
+}

@@ -1,0 +1,35 @@
+// Trimmed slice of `wasi:clocks@0.2.6.monotonic-clock`. Mirrors the
+// canonical `bytecodealliance/wasi-clocks@v0.2.6/wit/monotonic.wit`
+// shape but declares only `now` + `resolution` (the two funcs the
+// preview1 → preview2 adapter calls). `subscribe-instant` /
+// `subscribe-duration` and the pollable resource stay out of this
+// trimmed copy to keep `metadata_encode` output minimal.
+//
+// Backs the preview1 `clock_time_get(MONOTONIC, …)` /
+// `clock_res_get(MONOTONIC, …)` imports. Zig's `std.time.Instant`,
+// Rust's `std::time::Instant::now()`, Go's runtime monotonic source
+// and C's `clock_gettime(CLOCK_MONOTONIC, …)` all route through
+// here.
+//
+// `monotonic-clock.wit` sorts before `wall-clock.wit` alphabetically
+// ('m' < 'w'), so `resolver.readWitDir` parses this file first and
+// the `package wasi:clocks@0.2.6;` directive must appear here.
+
+package wasi:clocks@0.2.6;
+
+interface monotonic-clock {
+    /// A measurement of the monotonic clock — preview1 expects u64
+    /// nanoseconds, matching the canonical alias.
+    type instant = u64;
+
+    /// A monotonic duration — also u64 nanoseconds.
+    type duration = u64;
+
+    /// Current monotonic-clock value (nanoseconds since an unspecified
+    /// epoch). Used by preview1 `clock_time_get(MONOTONIC, …)`.
+    now: func() -> instant;
+
+    /// Monotonic-clock resolution. Used by preview1
+    /// `clock_res_get(MONOTONIC, …)`.
+    resolution: func() -> duration;
+}

@@ -33,6 +33,12 @@
 ;;     bytes` against the caller's `buf` via a one-shot
 ;;     `cabi_import_realloc` override so the host writes random
 ;;     bytes directly into preview1 memory (zero copy).
+;;   * `clock_time_get` / `clock_res_get` — REALTIME (0) routes
+;;     through `wasi:clocks/wall-clock.{now,resolution}` (datetime
+;;     record → u64 ns with overflow check), MONOTONIC (1) routes
+;;     through `wasi:clocks/monotonic-clock.{now,resolution}`
+;;     (already u64 ns), PROCESS/THREAD CPUTIME + unknown clockids
+;;     return `EBADF` (matching wasmtime).
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
@@ -50,7 +56,10 @@
 ;;     `stream-error.last-operation-failed(own<error>)` payload
 ;;     references;
 ;;   * `wasi:random/random@0.2.6.get-random-bytes` — backing for the
-;;     preview1 `random_get` import.
+;;     preview1 `random_get` import;
+;;   * `wasi:clocks/wall-clock@0.2.6.{now, resolution}` +
+;;     `wasi:clocks/monotonic-clock@0.2.6.{now, resolution}` —
+;;     backing for the preview1 `clock_*_get` imports.
 ;;
 ;; Still ENOSYS (tracked under cataggar/wabt#168):
 ;;
@@ -60,9 +69,7 @@
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
 ;;     preview1 cares about;
 ;;   * `args_get` / `args_sizes_get` / `environ_get` /
-;;     `environ_sizes_get` — wait for `wasi:cli/environment` (#161);
-;;   * `clock_time_get` / `clock_res_get` — wait for
-;;     `wasi:clocks/{wall-clock, monotonic-clock}` (#162).
+;;     `environ_sizes_get` — wait for `wasi:cli/environment` (#161).
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -122,6 +129,22 @@
   ;;   into the ret_area on return; the backing buffer itself is
   ;;   allocated via the adapter's `cabi_import_realloc` import.
   (type $get_random_bytes_sig (func (param i64 i32)))
+
+  ;; `wasi:clocks/wall-clock.{now, resolution}() -> datetime`
+  ;;   `datetime` is `record { seconds: u64, nanoseconds: u32 }`
+  ;;   (size 16, align 8). 2 scalars exceed max-flat-results=1 so
+  ;;   the lowered shape is `(func (param i32))` where the i32 is a
+  ;;   caller-provided ret_area ptr. The host writes:
+  ;;     offset 0: u64 seconds
+  ;;     offset 8: u32 nanoseconds
+  ;;     offset 12: pad to 16
+  (type $wall_clock_sig (func (param i32)))
+
+  ;; `wasi:clocks/monotonic-clock.{now, resolution}() -> u64`
+  ;;   `instant` / `duration` are u64 aliases; a single primitive
+  ;;   result fits in flat results, so the lowered shape is
+  ;;   `(func (result i64))` — no ret_area.
+  (type $monotonic_clock_sig (func (result i64)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -198,6 +221,28 @@
   ;;   preview1 `buf` — zero copy.
   (import "wasi:random/random@0.2.6" "get-random-bytes"
     (func $get_random_bytes (type $get_random_bytes_sig)))
+
+  ;; `wasi:clocks/wall-clock.{now, resolution}() -> datetime` backing
+  ;; the preview1 `clock_time_get(REALTIME, …)` /
+  ;; `clock_res_get(REALTIME, …)` paths. Each call writes a
+  ;; `datetime` record (16 bytes) into the ret_area; the adapter
+  ;; then collapses `seconds * 1e9 + nanoseconds` into a u64 ns
+  ;; value via `$datetime_to_ns` and stores it at the caller's
+  ;; `time_ptr` / `res_ptr`.
+  (import "wasi:clocks/wall-clock@0.2.6" "now"
+    (func $wall_now (type $wall_clock_sig)))
+  (import "wasi:clocks/wall-clock@0.2.6" "resolution"
+    (func $wall_resolution (type $wall_clock_sig)))
+
+  ;; `wasi:clocks/monotonic-clock.{now, resolution}() -> u64` backing
+  ;; the preview1 `clock_time_get(MONOTONIC, …)` /
+  ;; `clock_res_get(MONOTONIC, …)` paths. Returns a u64 nanosecond
+  ;; count directly, so the adapter just stores it at the caller's
+  ;; output pointer — no ret_area, no conversion.
+  (import "wasi:clocks/monotonic-clock@0.2.6" "now"
+    (func $monotonic_now (type $monotonic_clock_sig)))
+  (import "wasi:clocks/monotonic-clock@0.2.6" "resolution"
+    (func $monotonic_resolution (type $monotonic_clock_sig)))
 
   ;; ── adapter state ────────────────────────────────────────────
   ;;
@@ -603,9 +648,133 @@
   (func $environ_sizes_get (type $environ_sizes_get_sig) i32.const 52)
 
   ;; ── clocks / random ──────────────────────────────────────────
-  ;; clocks still ENOSYS — wait for cataggar/wabt#162.
-  (func $clock_time_get (type $clock_time_get_sig) i32.const 52)
-  (func $clock_res_get (type $clock_res_get_sig)   i32.const 52)
+
+  ;; Helper: collapse a wall-clock `datetime { seconds: u64,
+  ;; nanoseconds: u32 }` into a u64 nanosecond count, storing the
+  ;; result at `*out_ptr` on success.
+  ;;
+  ;; Returns errno on the data stack:
+  ;;   0  → `*out_ptr` holds `s * 1_000_000_000 + ns_u32`.
+  ;;   61 → overflow; `*out_ptr` is untouched. (EOVERFLOW; matches
+  ;;        the wasmtime reference adapter.)
+  ;;
+  ;; Overflow happens when `seconds > floor(u64::MAX / 1e9) =
+  ;; 18_446_744_073` (year ~2554-AD), or when the final add of `ns`
+  ;; would wrap u64. The helper writes a single u64 via the
+  ;; `out_ptr` param to keep the function signature single-result
+  ;; — the wabt validator currently rejects multi-result function
+  ;; types, though it accepts multi-result block types fine.
+  (func $datetime_to_ns
+    (param $s i64) (param $ns_u32 i32) (param $out_ptr i32)
+    (result i32)
+    (local $s_e9 i64) (local $total i64)
+    local.get $s
+    i64.const 18446744073   ;; floor(u64::MAX / 1_000_000_000)
+    i64.gt_u
+    if
+      i32.const 61          ;; EOVERFLOW
+      return
+    end
+    local.get $s
+    i64.const 1000000000
+    i64.mul
+    local.tee $s_e9
+    local.get $ns_u32
+    i64.extend_i32_u
+    i64.add
+    local.tee $total
+    local.get $s_e9
+    i64.lt_u                ;; total < s_e9 → unsigned add wrapped
+    if
+      i32.const 61
+      return
+    end
+    local.get $out_ptr
+    local.get $total
+    i64.store
+    i32.const 0)
+
+  ;; preview1 `clock_time_get(clockid, precision, time_ptr) -> errno`.
+  ;; Dispatch on clockid:
+  ;;   REALTIME (0)  → `wasi:clocks/wall-clock.now()` → datetime →
+  ;;                   collapse `s*1e9 + ns` into u64 ns → store.
+  ;;   MONOTONIC (1) → `wasi:clocks/monotonic-clock.now()` → u64 →
+  ;;                   store directly (already in nanoseconds).
+  ;;   2, 3, other   → `EBADF=8`. PROCESS_CPUTIME / THREAD_CPUTIME
+  ;;                   have no preview2 equivalent in 0.2.6. We
+  ;;                   follow the wasmtime reference adapter
+  ;;                   (`crates/wasi-preview1-component-adapter/
+  ;;                   src/lib.rs:clock_time_get` returns `ERRNO_BADF`
+  ;;                   for unknown clockids) rather than POSIX's
+  ;;                   `EINVAL` so wasi-libc / language stdlibs see
+  ;;                   the same errno they've been tested against.
+  ;;
+  ;; `precision` is ignored — advisory; wasmtime and wasi-libc both
+  ;; treat it as informational only.
+  ;;
+  ;; Overflow: if `s*1e9 + ns` exceeds u64 (year ~2554-AD), returns
+  ;; `EOVERFLOW=61`, matching wasmtime's `ERRNO_OVERFLOW` branch.
+  (func $clock_time_get (type $clock_time_get_sig)
+    (local $ra i32)
+    ;; MONOTONIC (1) → direct u64 nanoseconds.
+    local.get 0
+    i32.const 1
+    i32.eq
+    if
+      local.get 2          ;; time_ptr
+      call $monotonic_now
+      i64.store
+      i32.const 0
+      return
+    end
+    ;; REALTIME (0) → datetime → ns conversion.
+    local.get 0
+    i32.eqz
+    if
+      call $ensure_ret_area
+      local.tee $ra
+      call $wall_now
+      local.get $ra
+      i64.load offset=0    ;; seconds
+      local.get $ra
+      i32.load offset=8    ;; nanoseconds (u32)
+      local.get 2          ;; time_ptr (out)
+      call $datetime_to_ns
+      return               ;; 0 on success, 61 on overflow
+    end
+    ;; PROCESS_CPUTIME (2), THREAD_CPUTIME (3), or unknown.
+    i32.const 8)           ;; EBADF
+
+  ;; preview1 `clock_res_get(clockid, res_ptr) -> errno`. Same
+  ;; dispatch as `$clock_time_get` but calls the preview2 host's
+  ;; `resolution()` flavours instead of `now()`.
+  (func $clock_res_get (type $clock_res_get_sig)
+    (local $ra i32)
+    local.get 0
+    i32.const 1
+    i32.eq
+    if
+      local.get 1          ;; res_ptr
+      call $monotonic_resolution
+      i64.store
+      i32.const 0
+      return
+    end
+    local.get 0
+    i32.eqz
+    if
+      call $ensure_ret_area
+      local.tee $ra
+      call $wall_resolution
+      local.get $ra
+      i64.load offset=0
+      local.get $ra
+      i32.load offset=8
+      local.get 1          ;; res_ptr (out)
+      call $datetime_to_ns
+      return
+    end
+    i32.const 8)           ;; EBADF
 
   ;; preview1 `random_get(buf, len) -> errno`.
   ;;
