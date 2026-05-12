@@ -29,6 +29,10 @@
 ;;     `fdstat` with `fs_filetype = character_device` and the
 ;;     matching `FD_READ` / `FD_WRITE` rights so Zig's stdlib and
 ;;     Rust's `is_terminal()` enter their TTY codepaths.
+;;   * `random_get` — canon-lowers `wasi:random/random.get-random-
+;;     bytes` against the caller's `buf` via a one-shot
+;;     `cabi_import_realloc` override so the host writes random
+;;     bytes directly into preview1 memory (zero copy).
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
@@ -44,7 +48,9 @@
 ;;     import declared);
 ;;   * `wasi:io/error@0.2.6` — the resource the streams interface's
 ;;     `stream-error.last-operation-failed(own<error>)` payload
-;;     references.
+;;     references;
+;;   * `wasi:random/random@0.2.6.get-random-bytes` — backing for the
+;;     preview1 `random_get` import.
 ;;
 ;; Still ENOSYS (tracked under cataggar/wabt#168):
 ;;
@@ -56,8 +62,7 @@
 ;;   * `args_get` / `args_sizes_get` / `environ_get` /
 ;;     `environ_sizes_get` — wait for `wasi:cli/environment` (#161);
 ;;   * `clock_time_get` / `clock_res_get` — wait for
-;;     `wasi:clocks/{wall-clock, monotonic-clock}` (#162);
-;;   * `random_get` — wait for `wasi:random/random` (#163).
+;;     `wasi:clocks/{wall-clock, monotonic-clock}` (#162).
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -110,6 +115,13 @@
   ;;   params are (self, buf_ptr, buf_len, ret_area_ptr) where
   ;;   the ret_area is canon-lifted from the embed's `env.memory`.
   (type $blocking_write_sig (func (param i32 i32 i32 i32)))
+
+  ;; `wasi:random/random.get-random-bytes(len: u64) -> list<u8>`
+  ;;   canon-lower'd to `(func (param i64 i32))` — params are
+  ;;   `(len, ret_area_ptr)`. The host writes `(buf_ptr, buf_len)`
+  ;;   into the ret_area on return; the backing buffer itself is
+  ;;   allocated via the adapter's `cabi_import_realloc` import.
+  (type $get_random_bytes_sig (func (param i64 i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -176,6 +188,17 @@
   (import "wasi:io/streams@0.2.6" "[resource-drop]output-stream"
     (func $output_stream_drop (type $i32_void)))
 
+  ;; `wasi:random/random.get-random-bytes(len: u64) -> list<u8>`
+  ;;   canon-lower'd to `(func (param i64 i32))` — params are
+  ;;   `(len, ret_area_ptr)`. After the call the host has written
+  ;;   `(buf_ptr: i32, buf_len: i32)` at `ret_area_ptr`, with
+  ;;   `buf_ptr` pointing at the backing buffer the host allocated
+  ;;   via our `cabi_import_realloc`. `$random_get` installs a
+  ;;   one-shot override so that backing buffer is the caller's
+  ;;   preview1 `buf` — zero copy.
+  (import "wasi:random/random@0.2.6" "get-random-bytes"
+    (func $get_random_bytes (type $get_random_bytes_sig)))
+
   ;; ── adapter state ────────────────────────────────────────────
   ;;
   ;; Lazy handle cache for stdout / stderr. Initialised to -1
@@ -201,6 +224,23 @@
   ;; embed's `cabi_realloc` and stashed here for re-use. We never
   ;; free it; the embed instance teardown reclaims everything.
   (global $ret_area (mut i32) (i32.const 0))
+
+  ;; One-shot redirect for `$cabi_import_realloc`. When non-zero,
+  ;; the next call to `$cabi_import_realloc` returns this pointer
+  ;; (and clears the slot) instead of delegating to
+  ;; `$main_cabi_realloc`. Used by `$random_get` to make the host's
+  ;; canon-lifted `get-random-bytes` write its `list<u8>` backing
+  ;; buffer directly into the caller's preview1 `buf` — zero copy,
+  ;; no leaked allocation per call. Mirrors the wasmtime reference
+  ;; adapter's `with_one_import_alloc` (`crates/wasi-preview1-
+  ;; component-adapter/src/lib.rs`) without the ImportAlloc enum
+  ;; state machine — we only need one redirect mode.
+  ;;
+  ;; Single-threaded (preview1 has no atomics / shared memory), so
+  ;; a plain mut i32 is safe. Future list<T>-returning imports
+  ;; (e.g. cataggar/wabt#161's `args_get`) can reuse the same slot
+  ;; by setting it before the canon call.
+  (global $import_alloc_override (mut i32) (i32.const 0))
 
   ;; ── preview1 errno constants ─────────────────────────────────
   ;; Mirrors wasi-libc `<wasi/api.h>`:
@@ -562,10 +602,50 @@
   (func $environ_get (type $environ_get_sig)       i32.const 52)
   (func $environ_sizes_get (type $environ_sizes_get_sig) i32.const 52)
 
-  ;; ── clocks / random (ENOSYS for now) ─────────────────────────
+  ;; ── clocks / random ──────────────────────────────────────────
+  ;; clocks still ENOSYS — wait for cataggar/wabt#162.
   (func $clock_time_get (type $clock_time_get_sig) i32.const 52)
   (func $clock_res_get (type $clock_res_get_sig)   i32.const 52)
-  (func $random_get (type $random_get_sig)         i32.const 52)
+
+  ;; preview1 `random_get(buf, len) -> errno`.
+  ;;
+  ;; Canon-lowers `wasi:random/random.get-random-bytes(len) ->
+  ;; list<u8>` against the caller's `buf` via the one-shot
+  ;; `$import_alloc_override` trick. The host's canon-lift'd
+  ;; binding allocates the `list<u8>` backing buffer by calling
+  ;; our `$cabi_import_realloc`; with the override installed that
+  ;; call returns `buf` directly, so the random bytes land where
+  ;; preview1 wants them with no extra memcpy and no leaked
+  ;; allocation.
+  ;;
+  ;; The returned `(ptr, len)` pair in the ret-area is therefore
+  ;; redundant — `ptr == buf` and `len == requested_len` by
+  ;; construction — so we don't even read it.
+  ;;
+  ;; len == 0 fast-paths to SUCCESS without invoking the host;
+  ;; some preview2 hosts trap on zero-length allocations.
+  (func $random_get (type $random_get_sig)
+    (local $ra i32)
+    local.get 1
+    i32.eqz
+    if
+      i32.const 0
+      return
+    end
+    ;; Arm the one-shot import-alloc override: the next call into
+    ;; `$cabi_import_realloc` returns `buf` and clears the slot.
+    local.get 0
+    global.set $import_alloc_override
+    ;; Return-area for the canon-lifted `(ptr, len)` tuple; we
+    ;; ignore the stored values after the call.
+    call $ensure_ret_area
+    local.set $ra
+    ;; get-random-bytes(len: u64, ret_area: i32)
+    local.get 1
+    i64.extend_i32_u
+    local.get $ra
+    call $get_random_bytes
+    i32.const 0)
 
   ;; ── run entry ────────────────────────────────────────────────
   ;;
@@ -580,16 +660,33 @@
     call $main_start
     i32.const 0)
 
-  ;; canon-lower realloc helper — delegate to the embed's
-  ;; cabi_realloc. None of the preview1 imports we currently
-  ;; implement route a list / string return back through realloc,
-  ;; so this is a defensive delegation rather than a hot path.
+  ;; canon-lower realloc helper. Default behaviour: delegate to the
+  ;; embed's `cabi_realloc`. When `$import_alloc_override` is
+  ;; non-zero (set by `$random_get` and any future list<T>-returning
+  ;; preview1 import), instead return that pointer and clear the
+  ;; slot — the host's next canon-lift'd allocation lands directly
+  ;; in the caller's preview1 buffer with no extra memcpy.
+  ;;
+  ;; The override is single-shot: each `$cabi_import_realloc` call
+  ;; either consumes-and-clears the override or falls through to
+  ;; `$main_cabi_realloc`. The canon ABI for `list<u8>` makes
+  ;; exactly one realloc call per return, so a single-shot slot
+  ;; is sufficient; a stray second realloc inside the same import
+  ;; falls through to the embed's heap allocator (correct but
+  ;; defeats the zero-copy claim).
   (func $cabi_import_realloc (type $cabi_realloc)
-    local.get 0
-    local.get 1
-    local.get 2
-    local.get 3
-    call $main_cabi_realloc)
+    global.get $import_alloc_override
+    if (result i32)
+      global.get $import_alloc_override
+      i32.const 0
+      global.set $import_alloc_override
+    else
+      local.get 0
+      local.get 1
+      local.get 2
+      local.get 3
+      call $main_cabi_realloc
+    end)
 
   ;; ── exports ──────────────────────────────────────────────────
   ;;
