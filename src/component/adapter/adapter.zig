@@ -1195,9 +1195,14 @@ fn assemble(in: Inputs) ![]u8 {
         if (needs_fallback) {
             const fallback_bytes = try buildMainModuleFallback(a, in.adapter_iface);
             const fallback_module_idx = try b.addCoreModule(.{ .data = fallback_bytes });
+            // The fallback imports `env.memory` when it has to provide
+            // a working `cabi_realloc`. Always pass `env = env_inst`
+            // — modules that don't import env simply ignore the arg.
+            const fb_args = try a.alloc(ctypes.CoreInstantiateArg, 1);
+            fb_args[0] = .{ .name = "env", .instance_idx = env_inst };
             fallback_inst = try b.addCoreInstance(.{ .instantiate = .{
                 .module_idx = fallback_module_idx,
-                .args = &.{},
+                .args = fb_args,
             } });
         }
 
@@ -1899,6 +1904,20 @@ fn buildMainModuleFallback(arena: Allocator, adapter_iface: core_imports.CoreInt
         return out.toOwnedSlice(arena);
     }
 
+    // Detect whether any export is `cabi_realloc`. When present we
+    // emit a working `realloc_via_memory_grow` body (using an
+    // imported `env.memory`) so that adapter code paths which
+    // legitimately call `cabi_realloc` (e.g. canon-lifting list-typed
+    // returns from wasi:io APIs) get a real allocation instead of
+    // trapping. Mirrors `wit-component/src/gc.rs:realloc_via_memory_grow`.
+    const cabi_realloc_idx: ?u32 = blk: {
+        for (sig_for_export.items, 0..) |se, i| {
+            if (std.mem.eql(u8, se.name, "cabi_realloc")) break :blk @intCast(i);
+        }
+        break :blk null;
+    };
+    const needs_memory = cabi_realloc_idx != null;
+
     // type section
     {
         var body = std.ArrayListUnmanaged(u8).empty;
@@ -1911,6 +1930,23 @@ fn buildMainModuleFallback(arena: Allocator, adapter_iface: core_imports.CoreInt
             for (s.results) |r| try body.append(arena, valTypeByte(r));
         }
         try writeSection(arena, &out, 0x01, body.items);
+    }
+
+    // import section: env.memory (only when a working cabi_realloc
+    // is being emitted).
+    if (needs_memory) {
+        var body = std.ArrayListUnmanaged(u8).empty;
+        try writeU32Leb(arena, &body, 1); // one import
+        const mod_name = "env";
+        try writeU32Leb(arena, &body, @intCast(mod_name.len));
+        try body.appendSlice(arena, mod_name);
+        const field_name = "memory";
+        try writeU32Leb(arena, &body, @intCast(field_name.len));
+        try body.appendSlice(arena, field_name);
+        try body.append(arena, 0x02); // memory desc
+        try body.append(arena, 0x00); // limits: min only
+        try writeU32Leb(arena, &body, 0); // initial pages
+        try writeSection(arena, &out, 0x02, body.items);
     }
 
     // function section: one func per export, all using its sig idx
@@ -1934,15 +1970,22 @@ fn buildMainModuleFallback(arena: Allocator, adapter_iface: core_imports.CoreInt
         try writeSection(arena, &out, 0x07, body.items);
     }
 
-    // code section: each body = `unreachable; end`
+    // code section: trap stub for everything except cabi_realloc,
+    // which gets a working `realloc_via_memory_grow` body.
     {
         var body = std.ArrayListUnmanaged(u8).empty;
         try writeU32Leb(arena, &body, @intCast(sig_for_export.items.len));
-        for (sig_for_export.items) |_| {
-            // body: locals_count=0 (LEB 0), unreachable (0x00), end (0x0b)
-            const fb = [_]u8{ 0x00, 0x00, 0x0b };
-            try writeU32Leb(arena, &body, @intCast(fb.len));
-            try body.appendSlice(arena, &fb);
+        for (sig_for_export.items, 0..) |_, i| {
+            if (cabi_realloc_idx != null and i == cabi_realloc_idx.?) {
+                const fb = reallocViaMemoryGrowBody();
+                try writeU32Leb(arena, &body, @intCast(fb.len));
+                try body.appendSlice(arena, &fb);
+            } else {
+                // body: locals_count=0 (LEB 0), unreachable (0x00), end (0x0b)
+                const fb = [_]u8{ 0x00, 0x00, 0x0b };
+                try writeU32Leb(arena, &body, @intCast(fb.len));
+                try body.appendSlice(arena, &fb);
+            }
         }
         try writeSection(arena, &out, 0x0a, body.items);
     }
@@ -1953,6 +1996,33 @@ fn buildMainModuleFallback(arena: Allocator, adapter_iface: core_imports.CoreInt
 fn sigEql(a: core_imports.FuncSig, b: core_imports.FuncSig) bool {
     return std.mem.eql(wtypes.ValType, a.params, b.params) and
         std.mem.eql(wtypes.ValType, a.results, b.results);
+}
+
+/// Body bytes for a `cabi_realloc(i32, i32, i32, i32) -> i32` that
+/// only honors fresh page-sized allocations (panics otherwise).
+/// Mirrors `wit-component/src/gc.rs::realloc_via_memory_grow`.
+///
+/// One i32 local is declared to hold the `memory.grow` result before
+/// the bounds-check trap branch (params 0-3 are old_ptr, old_len,
+/// align, new_len; local 4 is the grow result).
+fn reallocViaMemoryGrowBody() [51]u8 {
+    return [_]u8{
+        // locals: 1 group of 1 i32
+        0x01, 0x01, 0x7f,
+        // assert old_ptr (local 0) == 0
+        0x41, 0x00, 0x20, 0x00, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        // assert old_len (local 1) == 0
+        0x41, 0x00, 0x20, 0x01, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        // assert new_len (local 3) == 65536
+        0x41, 0x80, 0x80, 0x04, 0x20, 0x03, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        // memory.grow 0 → local.tee 4
+        0x41, 0x01, 0x40, 0x00, 0x22, 0x04,
+        // check grow result == -1 → unreachable
+        0x41, 0x7f, 0x46, 0x04, 0x40, 0x00, 0x0b,
+        // return local.get 4 << 16
+        0x20, 0x04, 0x41, 0x10, 0x74,
+        0x0b, // function end
+    };
 }
 
 fn valTypeByte(v: wtypes.ValType) u8 {

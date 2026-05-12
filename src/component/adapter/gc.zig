@@ -41,6 +41,7 @@ const writer = @import("../../binary/writer.zig");
 const Mod = @import("../../Module.zig");
 const wtypes = @import("../../types.zig");
 const leb128 = @import("../../leb128.zig");
+const stack_init = @import("stack_init.zig");
 
 pub const Error = error{
     UnsupportedOpcode,
@@ -117,6 +118,15 @@ pub fn run(
     var out_mod = Mod.Module.init(gpa);
     errdefer out_mod.deinit();
     try emitLive(gpa, &out_mod, &module, &live, &remaps);
+
+    // Synthesize the adapter's shadow-stack init function so that
+    // `__stack_pointer` is initialized before any export runs. No-op
+    // when the adapter has no `__stack_pointer` global. Mirrors
+    // `wit-component/src/gc.rs` lines 640-778.
+    stack_init.augment(gpa, &out_mod) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidNameSection => return error.InvalidSection,
+    };
 
     const bytes = try writer.writeModule(gpa, &out_mod);
     out_mod.deinit();
