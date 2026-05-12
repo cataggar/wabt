@@ -13,19 +13,26 @@
 //!
 //! Two paths:
 //!
-//! 1. **Plain wrap** (no `--adapt`): for each export interface in the
-//!    world, build a core-instance alias for the matching
-//!    `<iface>#<func>` export, a component-level func type matching
-//!    the interface's signature, a `(canon lift)`, an instance
-//!    bundling the lifted funcs, and a top-level export under the
-//!    qualified interface name. Suitable for plain reactor-style
-//!    cores like the wamr `zig-adder` fixture.
+//! 1. **Plain wrap** (no `--adapt` and no preview1 imports): for each
+//!    export interface in the world, build a core-instance alias for
+//!    the matching `<iface>#<func>` export, a component-level func
+//!    type matching the interface's signature, a `(canon lift)`, an
+//!    instance bundling the lifted funcs, and a top-level export
+//!    under the qualified interface name. Suitable for plain
+//!    reactor-style cores like the wamr `zig-adder` fixture.
 //!
 //! 2. **Adapter splice** (`--adapt wasi_snapshot_preview1=<a.wasm>`):
 //!    delegate to `wabt.component.adapter.adapter.splice`, which
 //!    composes the embed core with the given preview1→component
 //!    adapter into a four- or five-core-module component (shim,
 //!    embed, adapter, fixup, optional `__main_module__` fallback).
+//!
+//!    The wabt CLI also bakes in its own wasi-preview1 → preview2
+//!    adapter. If the core module declares any
+//!    `wasi_snapshot_preview1.*` import and the user did NOT pass a
+//!    matching `--adapt wasi_snapshot_preview1=<file>`, the splice
+//!    path is used automatically with the built-in adapter bytes.
+//!    Pass `--no-builtin-adapter` to disable this auto-attach.
 //!
 //!    Two adapter shapes are supported transparently — `splice`
 //!    classifies via `detectShape`:
@@ -47,10 +54,12 @@
 
 const std = @import("std");
 const wabt = @import("wabt");
+const builtin_adapter = @import("builtin_adapter");
 
 const ctypes = wabt.component.types;
 const writer = wabt.component.writer;
 const metadata_decode = wabt.component.wit.metadata_decode;
+const core_imports = wabt.component.adapter.core_imports;
 
 pub const usage =
     \\Usage: wabt component new [options] <input.wasm>
@@ -74,17 +83,28 @@ pub const usage =
     \\                          and reactor-shape (lifts each
     \\                          <iface>#<func>) primaries are supported
     \\                          and detected automatically.
+    \\      --no-builtin-adapter
+    \\                          Disable the auto-attached built-in
+    \\                          wasi-preview1 → preview2 adapter. By
+    \\                          default, if the input core imports any
+    \\                          `wasi_snapshot_preview1.*` symbol and
+    \\                          no `--adapt wasi_snapshot_preview1=...`
+    \\                          was supplied, the CLI's embedded
+    \\                          adapter is spliced in transparently.
     \\  -h, --help              Show this help
     \\
 ;
+
+const AdapterSpec = struct { name: []const u8, file: []const u8 };
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
 
     var output_file: ?[]const u8 = null;
     var skip_validation: bool = false;
+    var no_builtin_adapter: bool = false;
     var input_path: ?[]const u8 = null;
-    var adapts = std.ArrayListUnmanaged(struct { name: []const u8, file: []const u8 }).empty;
+    var adapts = std.ArrayListUnmanaged(AdapterSpec).empty;
     defer adapts.deinit(alloc);
 
     var i: usize = 0;
@@ -102,6 +122,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             output_file = sub_args[i];
         } else if (std.mem.eql(u8, arg, "--skip-validation")) {
             skip_validation = true;
+        } else if (std.mem.eql(u8, arg, "--no-builtin-adapter")) {
+            no_builtin_adapter = true;
         } else if (std.mem.eql(u8, arg, "--adapt")) {
             i += 1;
             if (i >= sub_args.len) {
@@ -150,15 +172,35 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         break :blk std.fmt.allocPrint(alloc, "{s}.component.wasm", .{in_path}) catch in_path;
     };
 
+    // Auto-attach the built-in wasi-preview1 → preview2 adapter when
+    // the core imports preview1 and the user didn't already supply
+    // one. Treated as a synthetic `--adapt wasi_snapshot_preview1=...`
+    // prepended to the user's list so the existing splice path runs
+    // unchanged.
+    const auto_attach_builtin = !no_builtin_adapter and
+        !userSuppliedAdapter(adapts.items, "wasi_snapshot_preview1") and
+        coreImportsModule(alloc, core_bytes, "wasi_snapshot_preview1");
+
     const out_bytes = blk: {
-        if (adapts.items.len > 0) {
+        if (adapts.items.len > 0 or auto_attach_builtin) {
             const Adapter = wabt.component.adapter.adapter.Adapter;
-            const adapter_list = alloc.alloc(Adapter, adapts.items.len) catch unreachable;
+            const total = adapts.items.len + @intFromBool(auto_attach_builtin);
+            const adapter_list = alloc.alloc(Adapter, total) catch unreachable;
             defer {
                 for (adapter_list) |ad| alloc.free(ad.bytes);
                 alloc.free(adapter_list);
             }
-            for (adapts.items, 0..) |spec, idx| {
+            var slot: usize = 0;
+            if (auto_attach_builtin) {
+                // Dupe so the existing free-loop in `defer` can
+                // uniformly release every adapter's bytes.
+                adapter_list[slot] = .{
+                    .name = "wasi_snapshot_preview1",
+                    .bytes = alloc.dupe(u8, builtin_adapter.wasi_preview1_command_wasm) catch unreachable,
+                };
+                slot += 1;
+            }
+            for (adapts.items) |spec| {
                 const adp_bytes = std.Io.Dir.cwd().readFileAlloc(
                     init.io,
                     spec.file,
@@ -168,7 +210,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                     std.debug.print("error: cannot read adapter '{s}': {any}\n", .{ spec.file, err });
                     std.process.exit(1);
                 };
-                adapter_list[idx] = .{ .name = spec.name, .bytes = adp_bytes };
+                adapter_list[slot] = .{ .name = spec.name, .bytes = adp_bytes };
+                slot += 1;
             }
             break :blk wabt.component.adapter.adapter.spliceMany(alloc, core_bytes, adapter_list) catch |err| {
                 std.debug.print("error: splicing adapters: {s}\n", .{@errorName(err)});
@@ -206,6 +249,32 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 fn writeStdout(io: std.Io, text: []const u8) void {
     var stdout_file = std.Io.File.stdout();
     stdout_file.writeStreamingAll(io, text) catch {};
+}
+
+fn userSuppliedAdapter(adapts: []const AdapterSpec, needle: []const u8) bool {
+    for (adapts) |spec| {
+        if (std.mem.eql(u8, spec.name, needle)) return true;
+    }
+    return false;
+}
+
+/// Returns true iff `core_bytes` is a core wasm module declaring at
+/// least one import whose module name equals `module_name`. Returns
+/// false on parse failure so a malformed input still falls through to
+/// the existing splice / buildComponent error path with a clearer
+/// message.
+fn coreImportsModule(
+    alloc: std.mem.Allocator,
+    core_bytes: []const u8,
+    module_name: []const u8,
+) bool {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = core_imports.extract(arena.allocator(), core_bytes) catch return false;
+    for (owned.interface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, module_name)) return true;
+    }
+    return false;
 }
 
 /// Construct the wrapping component bytes from a core module that
@@ -444,4 +513,57 @@ test "buildComponent: rejects core wasm without component-type section" {
         0x01, 0x00, 0x00, 0x00,
     };
     try testing.expectError(error.MissingComponentTypeSection, buildComponent(testing.allocator, &bare));
+}
+
+test "coreImportsModule: detects wasi_snapshot_preview1 import" {
+    // Hand-rolled core wasm: 1 type `(func)`, 1 import
+    // `wasi_snapshot_preview1.fd_write` of that type. Import section
+    // body is: count(1) + LEB(22)+"wasi_snapshot_preview1"(22) +
+    // LEB(8)+"fd_write"(8) + kind(1) + typeidx(1) = 35 bytes = 0x23.
+    const core = [_]u8{
+        // preamble
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        // type section: 1 type — (func)
+        0x01, 0x04,
+        0x01,
+        0x60, 0x00, 0x00,
+        // import section: 1 import — wasi_snapshot_preview1.fd_write (func type 0)
+        0x02, 0x23,
+        0x01,
+        22, 'w', 'a', 's', 'i', '_', 's', 'n', 'a', 'p', 's', 'h', 'o', 't', '_', 'p', 'r', 'e', 'v', 'i', 'e', 'w', '1',
+        8, 'f', 'd', '_', 'w', 'r', 'i', 't', 'e',
+        0x00, 0x00,
+    };
+    try testing.expect(coreImportsModule(testing.allocator, &core, "wasi_snapshot_preview1"));
+    try testing.expect(!coreImportsModule(testing.allocator, &core, "env"));
+}
+
+test "coreImportsModule: bare core with no imports returns false" {
+    const bare = [_]u8{
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+    };
+    try testing.expect(!coreImportsModule(testing.allocator, &bare, "wasi_snapshot_preview1"));
+}
+
+test "coreImportsModule: malformed input returns false (no crash)" {
+    const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    try testing.expect(!coreImportsModule(testing.allocator, &garbage, "wasi_snapshot_preview1"));
+}
+
+test "userSuppliedAdapter: detects matching name" {
+    const adapts = [_]AdapterSpec{
+        .{ .name = "other", .file = "x.wasm" },
+        .{ .name = "wasi_snapshot_preview1", .file = "y.wasm" },
+    };
+    try testing.expect(userSuppliedAdapter(&adapts, "wasi_snapshot_preview1"));
+    try testing.expect(!userSuppliedAdapter(&adapts, "missing"));
+    try testing.expect(!userSuppliedAdapter(&[_]AdapterSpec{}, "wasi_snapshot_preview1"));
+}
+
+test "builtin_adapter: embedded adapter wasm is a valid wasm preamble" {
+    const bytes = builtin_adapter.wasi_preview1_command_wasm;
+    try testing.expect(bytes.len > 8);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
 }
