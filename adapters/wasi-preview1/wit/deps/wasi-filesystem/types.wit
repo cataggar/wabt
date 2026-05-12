@@ -1,0 +1,34 @@
+// Trimmed slice of `wasi:filesystem@0.2.6.types`. The canonical
+// `bytecodealliance/wasi-filesystem@v0.2.6/wit/types.wit` declares
+// the full `descriptor` surface (~30 methods) plus many auxiliary
+// types (`descriptor-type`, `descriptor-flags`, `open-flags`,
+// `path-flags`, `error-code`, `stat`, `new-timestamp`, …). For
+// subphase (a1) — preopens-only — we only need the opaque
+// `descriptor` resource itself so the encoded-world section can
+// carry `own<descriptor>` in `preopens.get-directories`' return
+// type.
+//
+// The wider surface arrives in subsequent subphases:
+//   * (a2) `path_open` + `fd_close` → `descriptor.open-at`,
+//     `[resource-drop]descriptor`, `descriptor-flags`,
+//     `open-flags`, `path-flags`, `error-code`.
+//   * (b)  `fd_read` + `fd_seek` → `descriptor.read-via-stream`,
+//     `descriptor.seek`, descriptor-type and a few flags.
+//   * (c)  `fd_filestat_get` / `path_filestat_get` / `fd_readdir`
+//     → `descriptor.stat`, `descriptor.stat-at`,
+//     `descriptor.read-directory`, plus the relevant record types.
+//
+// NOTE: the package declaration for this multi-file slice lives in
+// `preopens.wit` (which sorts before `types.wit` — `p` < `t`).
+// `resolver.readWitDir` concatenates files in order, so the
+// `package wasi:filesystem@0.2.6;` directive must appear in the
+// file that's parsed first.
+
+interface types {
+    /// Opaque handle to a filesystem object — directory, regular
+    /// file, symlink, character/block device, etc. The preview1
+    /// adapter only treats these as opaque indices into the host's
+    /// resource table; descriptor type / flag inspection arrives
+    /// in subphases (a2)/(b)/(c).
+    resource descriptor { }
+}
