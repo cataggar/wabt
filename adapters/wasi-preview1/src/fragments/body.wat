@@ -242,6 +242,28 @@
     "[method]descriptor.get-flags"
     (func $descriptor_get_flags (type $descriptor_void_sig)))
 
+  ;; `[method]descriptor.advise(self, offset: u64, length: u64,
+  ;; advice: advice) -> result<_, error-code>` backing preview1
+  ;; `fd_advise` (cataggar/wabt#180). 8-byte ret-area for the
+  ;; result; preview1's `__wasi_advice_t` ordinals align byte-for-
+  ;; byte with the preview2 `advice` enum so the adapter forwards
+  ;; the value unchanged after a `> 5` bounds check.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.advise"
+    (func $descriptor_advise (type $descriptor_advise_sig)))
+
+  ;; `[method]descriptor.readlink-at(self, path: string) ->
+  ;; result<string, error-code>` backing preview1 `path_readlink`
+  ;; (cataggar/wabt#180). 12-byte ret-area: tag u8 + 3 pad + payload
+  ;; (string {ptr i32, len i32} on ok; error-code u8 on err). The
+  ;; canon-lifted string lands in the adapter's bump arena via
+  ;; the import-alloc state machine (mode 2); the adapter then
+  ;; memcpy's `min(returned-len, buf_len)` bytes into the caller's
+  ;; preview1 `buf`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.readlink-at"
+    (func $descriptor_readlink_at (type $descriptor_path_only_sig)))
+
   ;; `[method]descriptor.stat-at(self, path-flags: u8, path: string)
   ;; -> result<descriptor-stat, error-code>` backing preview1
   ;; `path_filestat_get`. Same payload layout as `stat`.
@@ -2044,6 +2066,353 @@
   ;; Decided as part of cataggar/wabt#179; revisit if preview2
   ;; grows mutator support for descriptor-flags.
   (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags_sig) i32.const 52)
+
+  ;; ── #180 out-of-v3-scope preview1 funcs ───────────────────────
+  ;;
+  ;; Six preview1 funcs that the v3.0.0-dev.5 cut deliberately
+  ;; left out. Adding them as exports satisfies wasi-libc's
+  ;; startup imports (otherwise the splicer reports
+  ;; `AdapterMissingPreview1Export`); functional behaviour is real
+  ;; lifts where preview2 has a counterpart, permanent ENOSYS=52
+  ;; otherwise.
+  ;;
+  ;;   * `fd_pread`       → `descriptor.read-via-stream(offset)`
+  ;;                        (clone of `$fd_read` with explicit
+  ;;                        offset and no position advance)
+  ;;   * `fd_advise`      → `descriptor.advise(offset, length, advice)`
+  ;;   * `fd_tell`        → read adapter-tracked position from the
+  ;;                        descriptor table slot
+  ;;   * `path_readlink`  → `descriptor.readlink-at(path)` with
+  ;;                        truncation to the caller's `buf_len`
+  ;;   * `fd_allocate`    → permanent ENOSYS (no preview2 analog)
+  ;;   * `fd_renumber`    → permanent ENOSYS (component-model
+  ;;                        owns descriptor identity)
+  ;;
+  ;; Tracked under cataggar/wabt#180.
+
+  ;; preview1 `fd_pread(fd, iovs, iovs_len, offset, nread_ptr) -> errno`.
+  ;;
+  ;; Direct clone of `$fd_read` with two semantic differences:
+  ;;
+  ;;   * uses the caller's explicit `offset` (preview1 `pread`
+  ;;     semantics) instead of the per-fd tracked position;
+  ;;   * does NOT advance the tracked position after the read —
+  ;;     POSIX `pread(2)` is explicitly position-preserving.
+  ;;
+  ;; Stdio (fd<3) returns ESPIPE (29) — preview2 has no
+  ;; pread-on-stream and a stream socket has no seekable position
+  ;; anyway. Preopens (no `read-via-stream` on dirs) → EBADF.
+  (func $fd_pread (type $fd_pwrite_sig)
+    (local $iovs i32) (local $iovs_len i32)
+    (local $buf i32) (local $buf_len i32)
+    (local $ra i32) (local $handle i32) (local $slot_addr i32)
+    (local $stream i32) (local $tag i32) (local $bytes_read i32)
+    (local $err i32)
+    ;; 1. Skip leading empty iovs.
+    local.get 1
+    local.set $iovs
+    local.get 2
+    local.set $iovs_len
+    block $found_non_empty
+      loop $skip
+        local.get $iovs_len
+        i32.eqz
+        if
+          local.get 4                       ;; nread_ptr
+          i32.const 0
+          i32.store
+          i32.const 0
+          return
+        end
+        local.get $iovs
+        i32.load offset=4                   ;; iov.buf_len
+        local.tee $buf_len
+        br_if $found_non_empty
+        local.get $iovs
+        i32.const 8
+        i32.add
+        local.set $iovs
+        local.get $iovs_len
+        i32.const 1
+        i32.sub
+        local.set $iovs_len
+        br $skip
+      end
+    end
+    local.get $iovs
+    i32.load offset=0
+    local.set $buf
+    ;; 2. Resolve fd → (handle, slot_addr).
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0
+    local.get $ra                           ;; out_handle
+    local.get $ra  i32.const 4  i32.add     ;; out_n_preopens (ignored)
+    local.get $ra  i32.const 8  i32.add     ;; out_slot_addr
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.load offset=0
+    local.set $handle
+    local.get $ra
+    i32.load offset=8
+    local.set $slot_addr
+    local.get $slot_addr
+    i32.eqz
+    if
+      ;; Preopen (directory) — pread on a dir is EBADF.
+      i32.const 8
+      return
+    end
+    ;; 3. Open input-stream at the explicit caller-supplied offset.
+    local.get $handle
+    local.get 3                             ;; offset (preview1 i64)
+    local.get $ra
+    call $descriptor_read_via_stream
+    local.get $ra
+    i32.load8_u offset=0
+    local.set $tag
+    local.get $tag
+    if
+      local.get $ra
+      i32.load offset=4
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra
+    i32.load offset=4
+    local.set $stream
+    ;; 4. blocking-read with the one-shot override targeting buf.
+    local.get $buf
+    global.set $oneshot_ptr
+    i32.const 1
+    global.set $import_alloc_mode
+    local.get $stream
+    local.get $buf_len
+    i64.extend_i32_u
+    local.get $ra
+    call $input_stream_blocking_read
+    i32.const 0  global.set $import_alloc_mode
+    i32.const 0  global.set $oneshot_ptr
+    ;; 5. Drop the stream regardless of outcome.
+    local.get $stream
+    call $input_stream_drop
+    ;; 6. Decode result.
+    local.get $ra
+    i32.load8_u offset=0
+    local.set $tag
+    local.get $tag
+    if
+      ;; stream-error: inner tag 0 = last-operation-failed (EIO);
+      ;; 1 = closed (EOF → 0 bytes).
+      local.get $ra
+      i32.load8_u offset=4
+      i32.eqz
+      if
+        i32.const 29
+        return
+      end
+      local.get 4                           ;; nread_ptr
+      i32.const 0
+      i32.store
+      i32.const 0
+      return
+    end
+    ;; ok: payload at ra+4 is (ptr, len). Mode 1 → ptr == buf.
+    local.get $ra
+    i32.load offset=8
+    local.set $bytes_read
+    ;; 7. *nread_ptr = bytes_read. Position is NOT advanced — the
+    ;; whole point of `pread` is that the caller-supplied offset
+    ;; doesn't disturb the underlying descriptor's position.
+    local.get 4
+    local.get $bytes_read
+    i32.store
+    i32.const 0)
+
+  ;; preview1 `fd_advise(fd, offset, length, advice) -> errno` →
+  ;; `descriptor.advise(handle, offset, length, advice) ->
+  ;; result<_, error-code>`.
+  ;;
+  ;; preview1 `__wasi_advice_t` ordinals (NORMAL=0…NOREUSE=5)
+  ;; align byte-for-byte with the preview2 `advice` enum, so the
+  ;; adapter passes `advice` through unchanged after a `> 5`
+  ;; bounds check (out-of-range → EINVAL=28, matching wasmtime).
+  ;; Stdio / unknown fds → EBADF via `$resolve_fd_handle`.
+  (func $fd_advise (type $fd_filestat_set_times_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    ;; Bounds check on advice.
+    local.get 3
+    i32.const 5
+    i32.gt_u
+    if
+      i32.const 28                          ;; EINVAL
+      return
+    end
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add     ;; reserve 0..12 for $resolve_fd_handle
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    ;; Issue descriptor.advise(handle, offset, length, advice, ret_area).
+    local.get $handle
+    local.get 1                             ;; offset
+    local.get 2                             ;; length
+    local.get 3                             ;; advice
+    local.get $ra
+    call $descriptor_advise
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `fd_tell(fd, offset_ptr) -> errno`.
+  ;;
+  ;; Reads the adapter-tracked file position from the descriptor
+  ;; table slot. Stdio + preopens have no tracked position and
+  ;; return EBADF — POSIX `lseek(fd, 0, SEEK_CUR)` on an
+  ;; unseekable fd returns ESPIPE, but wasi-libc's
+  ;; `__wasi_fd_tell` wrapper translates EBADF to "no position",
+  ;; which is what we want here.
+  (func $fd_tell (type $fd_fdstat_get_sig)
+    (local $ra i32) (local $err i32) (local $slot_addr i32)
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0                             ;; fd
+    local.get $ra                           ;; out_handle (offset 0, ignored)
+    local.get $ra  i32.const 4 i32.add      ;; out_n_preopens (offset 4, ignored)
+    local.get $ra  i32.const 8 i32.add      ;; out_slot_addr (offset 8)
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.load offset=8
+    local.tee $slot_addr
+    i32.eqz
+    if
+      i32.const 8                           ;; EBADF (preopen, no position)
+      return
+    end
+    ;; Publish the tracked position to the caller.
+    local.get 1                             ;; offset_ptr
+    local.get $slot_addr
+    i64.load offset=8
+    i64.store
+    i32.const 0)
+
+  ;; preview1 `path_readlink(fd, path_ptr, path_len, buf_ptr,
+  ;; buf_len, bufused_ptr) -> errno`.
+  ;;
+  ;; → `descriptor.readlink-at(handle, path) -> result<string,
+  ;; error-code>`. The canon-lifted string lands in the adapter's
+  ;; bump arena via mode-2 of the import-alloc state machine; the
+  ;; adapter then `memcpy`'s `min(returned-len, buf_len)` bytes
+  ;; into the caller's `buf_ptr` and reports the truncated length
+  ;; in `*bufused_ptr` (matches POSIX `readlink(3)` and the
+  ;; wasmtime reference adapter — wasi-libc detects truncation by
+  ;; re-issuing with a larger buf when `bufused == buf_len`).
+  ;;
+  ;; ret-area layout for `result<string, error-code>` (12 bytes):
+  ;;   offset 0..4  outer tag (u8 + 3 pad)
+  ;;   offset 4..12 ok payload `(ptr i32, len i32)`; on err the
+  ;;                error-code byte sits at offset 4.
+  (func $path_readlink (type $path_rename_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $tag i32) (local $src_ptr i32) (local $src_len i32)
+    (local $copy_len i32)
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0                             ;; fd
+    local.get $ra  i32.const 16 i32.add     ;; out_handle (scratch)
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.const 16
+    i32.add
+    i32.load
+    local.set $handle
+    ;; Reset import-alloc, switch to mode 2 (count/separate); the
+    ;; canon-lifted `string` payload's backing list lands in the
+    ;; bump arena.
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    local.get $handle
+    local.get 1                             ;; path_ptr
+    local.get 2                             ;; path_len
+    local.get $ra
+    call $descriptor_readlink_at
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load8_u offset=0
+    local.tee $tag
+    if
+      ;; err: byte at offset 4 is the error-code ordinal.
+      local.get $ra
+      i32.load8_u offset=4
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra
+    i32.load offset=4
+    local.set $src_ptr
+    local.get $ra
+    i32.load offset=8
+    local.set $src_len
+    ;; Truncate to the caller's buf_len.
+    local.get $src_len
+    local.get 4                             ;; buf_len
+    i32.lt_u
+    if (result i32)
+      local.get $src_len
+    else
+      local.get 4
+    end
+    local.set $copy_len
+    ;; memcpy.
+    local.get 3                             ;; buf_ptr (dst)
+    local.get $src_ptr                      ;; src
+    local.get $copy_len                     ;; n
+    memory.copy
+    ;; *bufused_ptr = copy_len.
+    local.get 5                             ;; bufused_ptr
+    local.get $copy_len
+    i32.store
+    i32.const 0)
+
+  ;; preview1 `fd_allocate(fd, offset, length) -> errno`.
+  ;;
+  ;; **Permanent ENOSYS** — preview2 0.2.6 has no
+  ;; `posix_fallocate` analog. `descriptor.set-size(size)`
+  ;; truncates or extends the file but doesn't pre-allocate
+  ;; storage; emulating `fallocate(2)` semantics on top of
+  ;; set-size would silently change observable behaviour
+  ;; (subsequent writes on a thinly-provisioned filesystem still
+  ;; succeed-then-fail-with-ENOSPC). Returning ENOSYS is the
+  ;; principled choice: wasi-libc routes it to `fcntl`'s errno
+  ;; and the program decides what to do.
+  ;;
+  ;; Decided as part of cataggar/wabt#180; revisit if preview2
+  ;; grows a real `descriptor.allocate` operation.
+  (func $fd_allocate (type $fd_allocate_sig) i32.const 52)
+
+  ;; preview1 `fd_renumber(fd_from, fd_to) -> errno`.
+  ;;
+  ;; **Permanent ENOSYS** — the component-model resource table
+  ;; owns descriptor handle identity; there is no "swap fd
+  ;; numbers" or "duplicate-onto-fd" primitive in preview2 0.2.6
+  ;; (and neither wasi-cli nor wasi-filesystem advertise one).
+  ;; Emulating `dup2`-style semantics on top of the adapter's
+  ;; descriptor table would re-shape the host's resource ownership
+  ;; tracking in ways the canon ABI doesn't support.
+  ;;
+  ;; Decided as part of cataggar/wabt#180.
+  (func $fd_renumber (type $fd_fdstat_get_sig) i32.const 52)
 
   ;; Helper: resolve a preview1 fd to a descriptor handle, ignoring
   ;; whether it's a preopen or a user-fd. Returns 0 on success +

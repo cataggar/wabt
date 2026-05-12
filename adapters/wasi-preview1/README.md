@@ -59,12 +59,39 @@ This directory ships:
       `descriptor.{get-type, get-flags}` and synthesises
       `fs_rights_*` from the resolved preview1 filetype
       (cataggar/wabt#179);
+    * `fd_pread` → `descriptor.read-via-stream(offset)` (clone of
+      `fd_read`'s body with explicit caller offset and no
+      position advance, matching POSIX `pread(2)`); stdio →
+      `ESPIPE`, preopens → `EBADF` (cataggar/wabt#180);
+    * `fd_advise` → `descriptor.advise(offset, length, advice)`;
+      preview1 `__wasi_advice_t` ordinals align byte-for-byte
+      with preview2 `advice`, so the value passes through
+      after a `> 5` bounds check (`EINVAL` otherwise)
+      (cataggar/wabt#180);
+    * `fd_tell` → reads the adapter-tracked position from the
+      descriptor table slot (no preview2 round-trip; stdio +
+      preopens → `EBADF`) (cataggar/wabt#180);
+    * `path_readlink` → `descriptor.readlink-at(path)`; the
+      canon-lifted string lands in the bump arena via mode-2
+      import-alloc, then `memcpy`'d truncated to `min(len,
+      buf_len)` into the caller's buf (matches POSIX
+      `readlink(3)`; wasi-libc detects truncation by re-issuing
+      with a larger buf when `bufused == buf_len`)
+      (cataggar/wabt#180);
     * `random_get` → `wasi:random/random.get-random-bytes`;
     * `sched_yield` → trivial success;
     * `proc_raise` → `ENOSYS=52` (advisory; no preview2 equivalent);
     * `fd_fdstat_set_flags` → `ENOSYS=52` permanently: preview2
       0.2.6 has no descriptor-flags mutator and re-opening would
       lose fd identity (cataggar/wabt#179, closed);
+    * `fd_allocate` → `ENOSYS=52` permanently: preview2 0.2.6
+      has no `posix_fallocate` analog; `descriptor.set-size`
+      truncates rather than pre-allocates (cataggar/wabt#180,
+      closed);
+    * `fd_renumber` → `ENOSYS=52` permanently: the component-
+      model resource table owns descriptor handle identity so
+      no fd-swap primitive exists in preview2 0.2.6
+      (cataggar/wabt#180, closed);
     * `sock_*` → `ENOSYS=52` permanently: preview1 v3 has no
       socket-creation primitives so the lift would be moot
       (cataggar/wabt#178, closed as won't-implement).
@@ -172,8 +199,10 @@ adapters/wasi-preview1/
       pass `(ptr, len)` slices directly out of embed memory).
     * preview1 surface (full v3 cut, per [#165 + #166][issue]):
         `proc_exit`, `proc_raise`, `sched_yield`,
-        `fd_write`, `fd_pwrite`, `fd_read`,
-        `fd_close`, `fd_seek`, `fd_sync`, `fd_datasync`,
+        `fd_write`, `fd_pwrite`, `fd_read`, `fd_pread`,
+        `fd_close`, `fd_seek`, `fd_tell`,
+        `fd_advise`, `fd_allocate`, `fd_renumber`,
+        `fd_sync`, `fd_datasync`,
         `fd_fdstat_get`, `fd_fdstat_set_flags`,
         `fd_filestat_get`, `fd_filestat_set_size`,
         `fd_filestat_set_times`,
@@ -181,6 +210,7 @@ adapters/wasi-preview1/
         `path_open`, `path_create_directory`,
         `path_remove_directory`, `path_unlink_file`,
         `path_symlink`, `path_rename`, `path_link`,
+        `path_readlink`,
         `path_filestat_get`, `path_filestat_set_times`,
         `args_get`, `args_sizes_get`,
         `environ_get`, `environ_sizes_get`,
