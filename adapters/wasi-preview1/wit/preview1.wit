@@ -1,21 +1,24 @@
 // wasi-preview1 → preview2 adapter world.
 //
-// Authored against the canonical wasi:cli@0.2.6 + wasi:io@0.2.6
-// component-model surfaces (see `wit/deps/{wasi-cli,wasi-io}/` for
-// the trimmed slices this adapter consumes).
+// Authored against the canonical wasi:cli@0.2.6 + wasi:io@0.2.6 +
+// wasi:filesystem@0.2.6 + wasi:clocks@0.2.6 + wasi:random@0.2.6
+// component-model surfaces (see `wit/deps/` for the trimmed slices
+// this adapter consumes).
 //
-// Current scope (cataggar/wamr#453 Phase 1.c.3a): the WIT declares
-// the wider preview2 surface the adapter will lower against
-// (`wasi:cli/exit` + `wasi:io/streams` + `wasi:cli/stdout` +
-// `wasi:cli/stderr`), exercising the encoder's resource-handle +
-// `use`-clause paths end-to-end. The `adapter.wat` core wasm still
-// only references `wasi:cli/exit.exit-with-code` directly; the
-// `wasi:cli/stdout.get-stdout` / `wasi:cli/stderr.get-stderr` and
-// `wasi:io/streams.output-stream.blocking-write-and-flush`
-// lowerings land in Phase 1.c.3 alongside the real `fd_write` body.
-// Until then, the splicer's GC pass will drop the unused
-// `wasi:io/streams` + `wasi:cli/stdout` + `wasi:cli/stderr`
-// instances from the spliced component.
+// Scope (cataggar/wabt#165 read-side + #166 write-side / sockets /
+// remaining filestat-readdir leftovers): the WIT declares the full
+// preview2 surface the `adapter.wat` body lowers preview1 calls
+// against. `metadata_encode.encodeWorldFromResolver` produces a
+// `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
+// custom section; the splicer in `src/component/adapter/decode.zig`
+// re-parses that section to discover the imports the adapter
+// brings into the wrapping component.
+//
+// Import-order matters here: any iface whose body has
+// `use other.{T}` MUST appear AFTER `other` in this file. The
+// encoder builds `world_alias_map` import-by-import and resolves
+// `use` clauses against the running map (see
+// `src/component/wit/metadata_encode.zig:155`).
 
 package wabt:wasi-preview1@0.0.0;
 
@@ -36,14 +39,10 @@ world command {
     /// reference adapter shape.
     import wasi:io/error@0.2.6;
 
-    /// Byte-sink resource + `blocking-write-and-flush` method. The
-    /// preview1 `fd_write` iterates the iovec list, copies into a
-    /// canon-realloc'd buffer, and calls `blocking-write-and-flush`
-    /// against the stdout/stderr handle. The handle itself is
-    /// obtained via `wasi:cli/stdout.get-stdout` /
-    /// `wasi:cli/stderr.get-stderr` in Phase 1.c.3 — declared here
-    /// so the encoded world advertises the imported resource shape
-    /// now.
+    /// Stream resources + hot-path methods. Backs preview1 `fd_write`
+    /// / `fd_pwrite` (output-stream + `blocking-write-and-flush`),
+    /// `fd_read` (input-stream + `blocking-read`), and the
+    /// `[resource-drop]` for both shapes.
     import wasi:io/streams@0.2.6;
 
     /// Owned `output-stream` handle factories. The two interfaces
@@ -62,24 +61,45 @@ world command {
     /// (no extra memcpy, no leaked main-heap allocation).
     import wasi:cli/environment@0.2.6;
 
-    /// Filesystem preopen list backing the preview1 `fd_prestat_get`
-    /// / `fd_prestat_dir_name` imports. wasi-libc walks the
-    /// preopen set at startup; each call routes through
-    /// `preopens.get-directories` on the host side. The
-    /// `descriptor` resource that `get-directories` returns is
-    /// declared in `wasi:filesystem/types`, which the
-    /// `metadata_encode` encoder requires to be imported by the
-    /// world even though the adapter doesn't call any of its
-    /// methods directly yet (see
-    /// `src/component/wit/metadata_encode.zig:1525` — "the source
-    /// interface of a `use` clause must also be reachable from the
-    /// world body").
+    /// Clocks backing the preview1 `clock_time_get` /
+    /// `clock_res_get` imports. Preview1 clockids dispatch:
+    ///   REALTIME (0)  → `wasi:clocks/wall-clock`
+    ///   MONOTONIC (1) → `wasi:clocks/monotonic-clock`
+    /// The two CPUTIME clockids (PROCESS, THREAD) have no preview2
+    /// equivalent in 0.2.6; the adapter returns `EBADF` (matching
+    /// the wasmtime reference adapter) for those and any other
+    /// unknown clockid.
     ///
-    /// The wider `wasi:filesystem` surface (path_open, fd_read,
-    /// stat, readdir) arrives in subphases (a2)/(b)/(c) of
-    /// cataggar/wabt#165; this PR ships only the preopens lookup
-    /// path.
+    /// Imported BEFORE `wasi:filesystem/types` because the latter's
+    /// `descriptor-stat` record + `new-timestamp` variant
+    /// `use wasi:clocks/wall-clock@0.2.6.{datetime};`. The encoder
+    /// resolves `use` clauses against the running `world_alias_map`,
+    /// which only gains the source interface's exported types when
+    /// the source import has been processed — so source must
+    /// precede consumer in declaration order.
+    import wasi:clocks/wall-clock@0.2.6;
+    import wasi:clocks/monotonic-clock@0.2.6;
+
+    /// Filesystem types interface. Provides the `descriptor` +
+    /// `directory-entry-stream` resources and every method backing
+    /// preview1 `path_open`, `fd_read`, `fd_write`, `fd_pwrite`,
+    /// `fd_seek`, `fd_close`, `fd_sync`, `fd_datasync`,
+    /// `fd_filestat_get`, `fd_filestat_set_size`,
+    /// `fd_filestat_set_times`, `fd_readdir`, `path_filestat_get`,
+    /// `path_filestat_set_times`, `path_create_directory`,
+    /// `path_remove_directory`, `path_unlink_file`, `path_rename`,
+    /// `path_symlink`, `path_link` (cataggar/wabt#165 + #166).
+    ///
+    /// Must be imported AFTER `wasi:io/streams` (for
+    /// `input-stream`/`output-stream`) and `wasi:clocks/wall-clock`
+    /// (for `datetime`) since the trimmed types slice `use`s those.
     import wasi:filesystem/types@0.2.6;
+
+    /// Filesystem preopen list backing the preview1 `fd_prestat_get`
+    /// / `fd_prestat_dir_name` imports + dirfd resolution in every
+    /// `path_*` / `fd_*` call. Routes through
+    /// `preopens.get-directories` on the host side; the result lives
+    /// in the bump arena per call (no permanent cache).
     import wasi:filesystem/preopens@0.2.6;
 
     /// Cryptographically-secure RNG backing the preview1 `random_get`
@@ -89,17 +109,6 @@ world command {
     /// canon-lowers `get-random-bytes` against the caller's buf via
     /// a one-shot `cabi_import_realloc` override (zero copy).
     import wasi:random/random@0.2.6;
-
-    /// Clocks backing the preview1 `clock_time_get` /
-    /// `clock_res_get` imports. Preview1 clockids dispatch:
-    ///   REALTIME (0)  → `wasi:clocks/wall-clock`
-    ///   MONOTONIC (1) → `wasi:clocks/monotonic-clock`
-    /// The two CPUTIME clockids (PROCESS, THREAD) have no preview2
-    /// equivalent in 0.2.6; the adapter returns `EBADF` (matching
-    /// the wasmtime reference adapter) for those and any other
-    /// unknown clockid.
-    import wasi:clocks/wall-clock@0.2.6;
-    import wasi:clocks/monotonic-clock@0.2.6;
 
     /// Canon-lift'd `run()` entry. The adapter calls
     /// `__main_module__._start` and returns `ok` on normal return;

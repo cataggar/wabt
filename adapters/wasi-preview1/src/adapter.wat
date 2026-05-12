@@ -10,25 +10,73 @@
 ;; code end-to-end and lets wamr drop the `exit_code_sink`
 ;; workaround added in #447/#448.
 ;;
-;; Status: working v3.0.0-dev.5 surface — sufficient for the four
-;; cataggar/wamr component-examples (`zig-hello`, `zig-exit`,
-;; `zig-calculator-cmd`, `mixed-zig-rust-calc`). What's wired:
+;; Status: full preview1 surface wired through the v3 scope
+;; (cataggar/wabt#165 read-side + #166 write-side / sockets /
+;; remaining filestat-readdir leftovers). What's wired:
 ;;
 ;;   * `proc_exit` — `wasi:cli/exit.exit-with-code(u8)` with a
 ;;     stable-`exit(result)` fallback;
 ;;   * `sched_yield` — trivial success;
 ;;   * `proc_raise` — ENOSYS (no preview2 equivalent; advisory);
-;;   * `fd_write` (stdio only, fd 1/2) — iterates the iovec list
-;;     and streams via `wasi:io/streams.[method]output-stream.
-;;     blocking-write-and-flush` against cached
-;;     `wasi:cli/{stdout,stderr}.get-{stdout,stderr}` handles;
-;;   * `fd_seek` (stdio only) — returns `ESPIPE=70` so wasi-libc's
-;;     `isatty` probe and Rust's `Stdout` line-buffering codepaths
-;;     see "this is a pipe" rather than a hard `ENOSYS`;
+;;   * `fd_write` — stdio (fd 1/2) routes through cached
+;;     `wasi:cli/{stdout,stderr}.get-{stdout,stderr}` handles +
+;;     `[method]output-stream.blocking-write-and-flush`. User-fds
+;;     (fd ≥ 3) open a fresh `output-stream` via
+;;     `descriptor.write-via-stream(position)`, stream every iovec,
+;;     drop the stream, and advance the per-fd tracked position.
+;;   * `fd_pwrite` — same as user-fd `fd_write` but with explicit
+;;     `offset` arg; does NOT advance the tracked position.
+;;     Stdio → ESPIPE, preopens → EBADF.
+;;   * `fd_read` — for user-opened files, opens a fresh
+;;     `descriptor.read-via-stream(position)` and routes the
+;;     canon-lifted `list<u8>` from `input-stream.blocking-read`
+;;     directly into the caller's iov buffer via the one-shot
+;;     import-alloc override (mode 1). Stdio currently → EBADF.
+;;   * `fd_close` — for stdio + preopens, no-op (matches wasmtime);
+;;     for user-opened fds, drops the descriptor handle via
+;;     `[resource-drop]descriptor` and frees the slot.
+;;   * `fd_seek` (user fds) — SET/CUR update the adapter-tracked
+;;     position in-place (no host call). END returns `ENOTSUP`
+;;     pending `descriptor.stat`-based size lookup. Stdio still
+;;     returns ESPIPE per the original wasmtime behaviour.
+;;   * `fd_sync` / `fd_datasync` — pass-through to
+;;     `descriptor.sync` / `descriptor.sync-data`.
 ;;   * `fd_fdstat_get` (stdio only) — fills a 24-byte preview1
 ;;     `fdstat` with `fs_filetype = character_device` and the
 ;;     matching `FD_READ` / `FD_WRITE` rights so Zig's stdlib and
-;;     Rust's `is_terminal()` enter their TTY codepaths.
+;;     Rust's `is_terminal()` enter their TTY codepaths. fd ≥ 3 is
+;;     ENOSYS (deferred — needs `descriptor.get-flags` +
+;;     `.get-type`).
+;;   * `fd_filestat_get` / `path_filestat_get` — call
+;;     `descriptor.stat` / `.stat-at`, project the returned
+;;     `descriptor-stat` (with optional<datetime> timestamps) into
+;;     the 64-byte preview1 `filestat` layout. dev / ino are 0
+;;     (preview2 hides them); option::none timestamps → 0 ns.
+;;   * `fd_filestat_set_size` — pass-through to `descriptor.set-size`.
+;;   * `fd_filestat_set_times` / `path_filestat_set_times` —
+;;     translate preview1 fstflags bits + raw u64 ns timestamps
+;;     into 2 × `new-timestamp` variant args; conflicting
+;;     (ATIM | ATIM_NOW) → EINVAL.
+;;   * `fd_readdir` — opens a fresh
+;;     `directory-entry-stream` per call, pumps
+;;     `read-directory-entry()` packing each entry into the caller's
+;;     buf, drops the stream. Cookie ignored (re-reads from start
+;;     each call, matching the wasmtime reference adapter for
+;;     non-resumable preview2 streams).
+;;   * `path_open` — resolves the dirfd to a preview2 descriptor,
+;;     translates preview1 `dirflags` / `oflags` / `fdflags` /
+;;     `fs_rights_base` into the preview2 `path-flags` /
+;;     `open-flags` / `descriptor-flags` triple, calls
+;;     `wasi:filesystem/types.descriptor.open-at`, allocates a slot
+;;     in the user-fd descriptor table for the new handle.
+;;   * `path_create_directory` / `path_remove_directory` /
+;;     `path_unlink_file` — single-string mutations, pass-through
+;;     to `descriptor.{create,remove}-directory-at` /
+;;     `descriptor.unlink-file-at`.
+;;   * `path_symlink` / `path_rename` / `path_link` — multi-arg
+;;     mutations; `rename-at` and `link-at` resolve both fds to
+;;     descriptor handles and pass the new-fd as
+;;     `borrow<descriptor>`.
 ;;   * `random_get` — canon-lowers `wasi:random/random.get-random-
 ;;     bytes` against the caller's `buf` via a one-shot
 ;;     `cabi_import_realloc` override so the host writes random
@@ -50,41 +98,22 @@
 ;;     `wasi:filesystem/preopens.get-directories` once per call into
 ;;     the bump arena (no permanent cache) and reads the i-th
 ;;     preopen out for `wasi-libc`'s startup walk.
-;;   * `path_open` — resolves the dirfd to a preview2 descriptor,
-;;     translates preview1 `dirflags` / `oflags` / `fdflags` /
-;;     `fs_rights_base` into the preview2 `path-flags` /
-;;     `open-flags` / `descriptor-flags` triple, calls
-;;     `wasi:filesystem/types.descriptor.open-at`, allocates a slot
-;;     in the user-fd descriptor table for the new handle.
-;;   * `fd_close` — for stdio + preopens, no-op (matches wasmtime);
-;;     for user-opened fds, drops the descriptor handle via
-;;     `[resource-drop]descriptor` and frees the slot.
-;;   * `fd_read` — for user-opened files, opens a fresh
-;;     `wasi:filesystem/types.descriptor.read-via-stream(position)`
-;;     and routes the canon-lifted `list<u8>` from
-;;     `input-stream.blocking-read` directly into the caller's iov
-;;     buffer via the one-shot import-alloc override (mode 1). The
-;;     stream is dropped per call; the adapter-tracked file position
-;;     advances by the bytes consumed. Preopens / stdio currently
-;;     return EBADF.
-;;   * `fd_seek` (user fds) — SET/CUR update the adapter-tracked
-;;     position in-place (no host call). END returns `ENOTSUP`
-;;     pending `descriptor.stat` in subphase (c). Stdio still
-;;     returns ESPIPE per the original wasmtime behaviour.
+;;   * `sock_accept` / `sock_recv` / `sock_send` / `sock_shutdown`
+;;     — exported as ENOSYS=52 stubs so wasi-libc embeds that pull
+;;     these in via the C runtime startup splice cleanly. Programs
+;;     that actually call socket(2) get a well-defined errno
+;;     (deferred preview2 sockets → cataggar/wabt#168).
 ;;
-;; Declared preview2 imports the adapter consumes today:
+;; Declared preview2 imports the adapter consumes:
 ;;
 ;;   * `wasi:cli/exit@0.2.6` — `exit-with-code(u8)` + `exit(result)`;
 ;;   * `wasi:cli/stdout@0.2.6` / `wasi:cli/stderr@0.2.6` — handle
 ;;     factories for stdout / stderr;
 ;;   * `wasi:cli/environment@0.2.6` — `get-arguments` +
 ;;     `get-environment`;
-;;   * `wasi:io/streams@0.2.6.[method]output-stream.blocking-write-and-flush`
-;;     — the single hot path for stdout/stderr writes;
-;;   * `wasi:io/streams@0.2.6.[method]input-stream.blocking-read` —
-;;     hot path for `fd_read`;
-;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` +
-;;     `[resource-drop]input-stream` — splicer-bound drops;
+;;   * `wasi:io/streams@0.2.6` — `[method]output-stream.blocking-
+;;     write-and-flush`, `[method]input-stream.blocking-read`,
+;;     `[resource-drop]{output,input}-stream`;
 ;;   * `wasi:io/error@0.2.6` — the resource the streams interface's
 ;;     `stream-error.last-operation-failed(own<error>)` payload
 ;;     references;
@@ -94,19 +123,25 @@
 ;;     `wasi:clocks/monotonic-clock@0.2.6.{now, resolution}` —
 ;;     backing for the preview1 `clock_*_get` imports;
 ;;   * `wasi:filesystem/preopens@0.2.6.get-directories` — backing
-;;     for the preview1 `fd_prestat_*` walk and `dirfd` resolution
-;;     in `path_open` / `fd_close` / `fd_read` / `fd_seek`;
-;;   * `wasi:filesystem/types@0.2.6.[method]descriptor.open-at` +
-;;     `.read-via-stream` + `[resource-drop]descriptor` — backing
-;;     for `path_open` / `fd_close` / `fd_read`.
+;;     for `fd_prestat_*` and dirfd resolution in every path_* /
+;;     fd_* call;
+;;   * `wasi:filesystem/types@0.2.6.[method]descriptor.{open-at,
+;;     read-via-stream, write-via-stream, append-via-stream,
+;;     set-size, set-times, set-times-at, stat, stat-at,
+;;     create-directory-at, remove-directory-at, unlink-file-at,
+;;     symlink-at, rename-at, link-at, sync, sync-data,
+;;     read-directory}`, `[resource-drop]descriptor`, plus
+;;     `[method]directory-entry-stream.read-directory-entry` +
+;;     `[resource-drop]directory-entry-stream`.
 ;;
-;; Still ENOSYS (tracked under cataggar/wabt#168):
+;; Still ENOSYS / not lifted (tracked under cataggar/wabt#168):
 ;;
-;;   * `fd_filestat_get`, `path_filestat_get`, `fd_readdir` plus
-;;     the `path_*` write-side and sockets — wait for subphase (c)
-;;     of #165 and #166;
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
 ;;     preview1 cares about.
+;;   * `fd_pread`, `fd_advise`, `fd_allocate`, `fd_renumber`,
+;;     `fd_tell`, `path_readlink` — out of v3 scope.
+;;   * `sock_*` — ENOSYS stubs only; preview2 `wasi:sockets/*`
+;;     surface deferred.
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -117,13 +152,20 @@
 
   ;; preview1 fd_* signatures (i32 errno return)
   (type $fd_write_sig         (func (param i32 i32 i32 i32) (result i32)))
+  (type $fd_pwrite_sig        (func (param i32 i32 i32 i64 i32) (result i32)))
   (type $fd_read_sig          (func (param i32 i32 i32 i32) (result i32)))
   (type $fd_close_sig         (func (param i32) (result i32)))
   (type $fd_seek_sig          (func (param i32 i64 i32 i32) (result i32)))
   (type $fd_fdstat_get_sig    (func (param i32 i32) (result i32)))
   (type $fd_fdstat_set_flags_sig (func (param i32 i32) (result i32)))
+  (type $fd_filestat_get_sig  (func (param i32 i32) (result i32)))
+  (type $fd_filestat_set_size_sig (func (param i32 i64) (result i32)))
+  (type $fd_filestat_set_times_sig (func (param i32 i64 i64 i32) (result i32)))
   (type $fd_prestat_get_sig   (func (param i32 i32) (result i32)))
   (type $fd_prestat_dir_name_sig (func (param i32 i32 i32) (result i32)))
+  (type $fd_readdir_sig       (func (param i32 i32 i32 i64 i32) (result i32)))
+  (type $fd_sync_sig          (func (param i32) (result i32)))
+  (type $fd_datasync_sig      (func (param i32) (result i32)))
 
   ;; preview1 path_* signature. `path_open` takes 9 params:
   ;;   (dirfd: i32, dirflags: u32, path_ptr: i32, path_len: i32,
@@ -132,6 +174,52 @@
   ;; The u16 flags are passed as i32 in core wasm.
   (type $path_open_sig
     (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+
+  ;; preview1 path_* mutators. Single-string mutations
+  ;; (`path_create_directory`, `path_remove_directory`,
+  ;; `path_unlink_file`) take (dirfd, path_ptr, path_len) → errno.
+  (type $path_only_sig        (func (param i32 i32 i32) (result i32)))
+
+  ;; `path_filestat_get(dirfd, lookupflags, path_ptr, path_len,
+  ;;   filestat_ptr) -> errno` — same shape as
+  ;; `path_filestat_set_times` minus the trailing (atim, mtim,
+  ;; fstflags) triple. Matches the wasi-libc canonical signature.
+  (type $path_filestat_get_sig
+    (func (param i32 i32 i32 i32 i32) (result i32)))
+
+  ;; `path_filestat_set_times(dirfd, lookupflags, path_ptr,
+  ;;   path_len, atim, mtim, fstflags) -> errno`.
+  (type $path_filestat_set_times_sig
+    (func (param i32 i32 i32 i32 i64 i64 i32) (result i32)))
+
+  ;; `path_symlink(old_path_ptr, old_path_len, dirfd, new_path_ptr,
+  ;;   new_path_len) -> errno`. Argument order is preview1's
+  ;; `(target, dirfd, linkpath)` (matches POSIX `symlinkat`).
+  (type $path_symlink_sig     (func (param i32 i32 i32 i32 i32) (result i32)))
+
+  ;; `path_rename(old_dirfd, old_path_ptr, old_path_len,
+  ;;   new_dirfd, new_path_ptr, new_path_len) -> errno`.
+  (type $path_rename_sig
+    (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+
+  ;; `path_link(old_dirfd, old_lookupflags, old_path_ptr,
+  ;;   old_path_len, new_dirfd, new_path_ptr, new_path_len) -> errno`.
+  (type $path_link_sig
+    (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+
+  ;; preview1 sock_* signatures. The current adapter keeps these as
+  ;; ENOSYS=52 stubs (cataggar/wabt#166's "either resolve cleanly
+  ;; or are explicitly elided" branch); declaring exports lets the
+  ;; splicer match wasi-libc's startup imports without
+  ;; `error.AdapterMissingPreview1Export`. Programs that actually
+  ;; invoke a `sock_*` get the errno back through wasi-libc's
+  ;; standard fallback path.
+  (type $sock_accept_sig      (func (param i32 i32 i32) (result i32)))
+  (type $sock_recv_sig
+    (func (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (type $sock_send_sig
+    (func (param i32 i32 i32 i32 i32) (result i32)))
+  (type $sock_shutdown_sig    (func (param i32 i32) (result i32)))
 
   ;; preview1 args / environ / clock / random signatures
   (type $args_get_sig         (func (param i32 i32) (result i32)))
@@ -148,13 +236,12 @@
   (type $sched_yield_sig      (func (result i32)))
 
   ;; preview2 import signatures (canon-lower'd by the wrapping
-  ;; component; here they are plain core-wasm function types).
-  ;;
-  ;; v1 scope (cataggar/wamr#453): only the preview2 imports used
-  ;; by `proc_exit` and the (still-stubbed) stdout/stderr write
-  ;; path are declared. The wider set (`wasi:filesystem/…`,
-  ;; `wasi:cli/environment`, etc.) arrives alongside the real
-  ;; `args_get` / `clock_time_get` lowering in a later sub-phase.
+  ;; component; here they are plain core-wasm function types). The
+  ;; full set covers exit, stdout/stderr handle factories,
+  ;; output/input streams (write + read hot paths), random/clocks,
+  ;; environment, filesystem preopens, and the broad
+  ;; `wasi:filesystem/types` surface (open/read/write/seek/close
+  ;; plus stat / set-times / readdir / mutations).
 
   ;; `wasi:cli/{stdout,stderr}.get-{stdout,stderr}: () -> own<output-stream>`
   ;;   canon-lower'd to `(func (result i32))` — returns an opaque
@@ -224,8 +311,87 @@
   ;;   layout as `open-at`: ret_area `{ tag: u8 (+3 pad), payload:
   ;;   i32 }` where the i32 payload is either an input-stream
   ;;   handle (tag=0) or an `error-code` ordinal (tag=1).
+  ;;
+  ;; Re-used by `write-via-stream(self, offset: u64) ->
+  ;; result<own<output-stream>, error-code>` (same flat shape) and
+  ;; `set-size(self, size: u64) -> result<_, error-code>` (same flat
+  ;; shape; result payload is unused on tag=0, holds error ordinal
+  ;; on tag=1).
   (type $read_via_stream_sig
     (func (param i32 i64 i32)))
+
+  ;; Generic `(self, ret_area)` shape covering every descriptor /
+  ;; directory-entry-stream method whose only argument is the
+  ;; implicit `self` handle and whose result spills to a ret_area:
+  ;;
+  ;;   * `descriptor.append-via-stream() ->
+  ;;     result<own<output-stream>, error-code>`
+  ;;   * `descriptor.stat() -> result<descriptor-stat, error-code>`
+  ;;   * `descriptor.sync() -> result<_, error-code>`
+  ;;   * `descriptor.sync-data() -> result<_, error-code>`
+  ;;   * `descriptor.read-directory() ->
+  ;;     result<own<directory-entry-stream>, error-code>`
+  ;;   * `directory-entry-stream.read-directory-entry() ->
+  ;;     result<option<directory-entry>, error-code>`
+  ;;
+  ;; The ret-area layout differs per method (8 bytes for the
+  ;; handle/empty payload variants, 104 bytes for `descriptor-stat`,
+  ;; 20 bytes for `option<directory-entry>`); the function type only
+  ;; cares that there's a single trailing i32 pointer.
+  (type $descriptor_void_sig
+    (func (param i32 i32)))
+
+  ;; `descriptor.<X>-at(self, path: string) -> result<_, error-code>`
+  ;; — single-string mutators: `create-directory-at`,
+  ;; `remove-directory-at`, `unlink-file-at`. Params are
+  ;; (self, path_ptr, path_len, ret_area).
+  (type $descriptor_path_only_sig
+    (func (param i32 i32 i32 i32)))
+
+  ;; `descriptor.stat-at(self, path-flags: u8, path: string) ->
+  ;; result<descriptor-stat, error-code>` — params (self,
+  ;; path_flags, path_ptr, path_len, ret_area). Shape happens to
+  ;; match `path_*` calls that take a single string + path-flags
+  ;; prefix.
+  (type $descriptor_stat_at_sig
+    (func (param i32 i32 i32 i32 i32)))
+
+  ;; `descriptor.symlink-at(self, old-path: string, new-path: string)
+  ;; -> result<_, error-code>` — params (self, old_ptr, old_len,
+  ;; new_ptr, new_len, ret_area).
+  (type $descriptor_symlink_at_sig
+    (func (param i32 i32 i32 i32 i32 i32)))
+
+  ;; `descriptor.rename-at(self, old-path: string,
+  ;; new-descriptor: borrow<descriptor>, new-path: string) ->
+  ;; result<_, error-code>` — params (self, old_ptr, old_len,
+  ;; new_desc, new_ptr, new_len, ret_area). Note `borrow<descriptor>`
+  ;; canon-lowers to a plain i32 handle slot; the host borrows the
+  ;; same resource the adapter owns in its fd table.
+  (type $descriptor_rename_at_sig
+    (func (param i32 i32 i32 i32 i32 i32 i32)))
+
+  ;; `descriptor.link-at(self, old-path-flags: u8, old-path: string,
+  ;; new-descriptor: borrow<descriptor>, new-path: string) ->
+  ;; result<_, error-code>` — params (self, old_path_flags, old_ptr,
+  ;; old_len, new_desc, new_ptr, new_len, ret_area).
+  (type $descriptor_link_at_sig
+    (func (param i32 i32 i32 i32 i32 i32 i32 i32)))
+
+  ;; `descriptor.set-times(self, atime: new-timestamp,
+  ;; mtime: new-timestamp) -> result<_, error-code>` — `new-timestamp`
+  ;; is a 3-case variant {no-change, now, timestamp(datetime)} that
+  ;; flattens to (tag i32, seconds i64, nanoseconds i32). Two
+  ;; variants in args + (self, ret_area) → 8 flat slots.
+  (type $descriptor_set_times_sig
+    (func (param i32 i32 i64 i32 i32 i64 i32 i32)))
+
+  ;; `descriptor.set-times-at(self, path-flags: u8, path: string,
+  ;; atime: new-timestamp, mtime: new-timestamp) ->
+  ;; result<_, error-code>` — same as `set-times` plus the
+  ;; (path_flags, path_ptr, path_len) prefix → 11 flat slots.
+  (type $descriptor_set_times_at_sig
+    (func (param i32 i32 i32 i32 i32 i64 i32 i32 i64 i32 i32)))
 
   ;; `wasi:io/streams.[method]input-stream.blocking-read(self,
   ;;   len: u64) -> result<list<u8>, stream-error>` — canon-lowered
@@ -389,6 +555,153 @@
   (import "wasi:filesystem/types@0.2.6"
     "[method]descriptor.read-via-stream"
     (func $descriptor_read_via_stream (type $read_via_stream_sig)))
+
+  ;; `[method]descriptor.write-via-stream(self, offset: u64) ->
+  ;; result<own<output-stream>, error-code>` backing preview1
+  ;; `fd_write` (fd ≥ 3) and `fd_pwrite`. Same flat shape as
+  ;; `read-via-stream`; the adapter opens one stream per call,
+  ;; iterates iovecs through `output-stream.blocking-write-and-flush`,
+  ;; drops the stream, and (for `fd_write` only) advances the
+  ;; per-fd tracked position.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.write-via-stream"
+    (func $descriptor_write_via_stream (type $read_via_stream_sig)))
+
+  ;; `[method]descriptor.append-via-stream(self) ->
+  ;; result<own<output-stream>, error-code>`. Declared for completeness
+  ;; (the encoded WIT world advertises it) but the current adapter
+  ;; routes all writes through `write-via-stream`; preview1
+  ;; `FDFLAGS_APPEND` semantics are deferred — wasi-libc emulates
+  ;; them by tracking offset on the guest side anyway.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.append-via-stream"
+    (func $descriptor_append_via_stream (type $descriptor_void_sig)))
+
+  ;; `[method]descriptor.set-size(self, size: u64) ->
+  ;; result<_, error-code>` backing preview1 `fd_filestat_set_size`.
+  ;; Same flat shape as `read-via-stream` (i32, i64, i32) — the
+  ;; result payload word is unused on tag=0 and holds the
+  ;; `error-code` ordinal on tag=1.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.set-size"
+    (func $descriptor_set_size (type $read_via_stream_sig)))
+
+  ;; `[method]descriptor.set-times(self, atime: new-timestamp,
+  ;; mtime: new-timestamp) -> result<_, error-code>` backing preview1
+  ;; `fd_filestat_set_times`. Each `new-timestamp` flat-lowers to
+  ;; (tag i32, seconds i64, nanoseconds i32); the adapter assembles
+  ;; both from the preview1 fstflags bits + raw u64 ns inputs.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.set-times"
+    (func $descriptor_set_times (type $descriptor_set_times_sig)))
+
+  ;; `[method]descriptor.set-times-at(self, path-flags: u8,
+  ;; path: string, atime: new-timestamp, mtime: new-timestamp) ->
+  ;; result<_, error-code>` backing preview1
+  ;; `path_filestat_set_times`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.set-times-at"
+    (func $descriptor_set_times_at (type $descriptor_set_times_at_sig)))
+
+  ;; `[method]descriptor.stat(self) -> result<descriptor-stat,
+  ;; error-code>` backing preview1 `fd_filestat_get`. The 104-byte
+  ;; ret-area is the variant `{ tag: u8 (+7 pad), payload: ... }`
+  ;; where payload is either a `descriptor-stat` record (96B,
+  ;; align 8) or a single `error-code` byte. Decoded by
+  ;; `$write_preview1_filestat`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.stat"
+    (func $descriptor_stat (type $descriptor_void_sig)))
+
+  ;; `[method]descriptor.stat-at(self, path-flags: u8, path: string)
+  ;; -> result<descriptor-stat, error-code>` backing preview1
+  ;; `path_filestat_get`. Same payload layout as `stat`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.stat-at"
+    (func $descriptor_stat_at (type $descriptor_stat_at_sig)))
+
+  ;; `[method]descriptor.create-directory-at(self, path: string)`
+  ;; backing preview1 `path_create_directory`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.create-directory-at"
+    (func $descriptor_create_directory_at (type $descriptor_path_only_sig)))
+
+  ;; `[method]descriptor.remove-directory-at(self, path: string)`
+  ;; backing preview1 `path_remove_directory`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.remove-directory-at"
+    (func $descriptor_remove_directory_at (type $descriptor_path_only_sig)))
+
+  ;; `[method]descriptor.unlink-file-at(self, path: string)`
+  ;; backing preview1 `path_unlink_file`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.unlink-file-at"
+    (func $descriptor_unlink_file_at (type $descriptor_path_only_sig)))
+
+  ;; `[method]descriptor.symlink-at(self, old-path: string,
+  ;; new-path: string)` backing preview1 `path_symlink`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.symlink-at"
+    (func $descriptor_symlink_at (type $descriptor_symlink_at_sig)))
+
+  ;; `[method]descriptor.rename-at(self, old-path: string,
+  ;; new-descriptor: borrow<descriptor>, new-path: string)` backing
+  ;; preview1 `path_rename`. The borrow handle is the same i32 the
+  ;; adapter stores in its fd table (the host's resource borrow
+  ;; check accepts it because the adapter still owns the underlying
+  ;; resource).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.rename-at"
+    (func $descriptor_rename_at (type $descriptor_rename_at_sig)))
+
+  ;; `[method]descriptor.link-at(self, old-path-flags: u8,
+  ;; old-path: string, new-descriptor: borrow<descriptor>,
+  ;; new-path: string)` backing preview1 `path_link`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.link-at"
+    (func $descriptor_link_at (type $descriptor_link_at_sig)))
+
+  ;; `[method]descriptor.sync(self)` backing preview1 `fd_sync`
+  ;; (file-integrity sync — flushes data + metadata).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.sync"
+    (func $descriptor_sync (type $descriptor_void_sig)))
+
+  ;; `[method]descriptor.sync-data(self)` backing preview1
+  ;; `fd_datasync` (data-integrity sync — flushes data only).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.sync-data"
+    (func $descriptor_sync_data (type $descriptor_void_sig)))
+
+  ;; `[method]descriptor.read-directory(self) ->
+  ;; result<own<directory-entry-stream>, error-code>` backing
+  ;; preview1 `fd_readdir`. Returns a fresh stream cursor on each
+  ;; call; adapter ignores the preview1 `cookie` arg and
+  ;; re-iterates from the start (matches the wasmtime reference
+  ;; adapter's behaviour for non-resumable preview2 streams).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.read-directory"
+    (func $descriptor_read_directory (type $descriptor_void_sig)))
+
+  ;; `[method]directory-entry-stream.read-directory-entry(self) ->
+  ;; result<option<directory-entry>, error-code>`. Called by
+  ;; `$fd_readdir` in a loop until the option flips to `none` or
+  ;; the caller's preview1 buffer fills.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]directory-entry-stream.read-directory-entry"
+    (func $directory_entry_stream_read (type $descriptor_void_sig)))
+
+  ;; `[resource-drop]directory-entry-stream` — splicer auto-bound,
+  ;; same pattern as `[resource-drop]descriptor`. Called at the end
+  ;; of every `$fd_readdir` to release the per-call stream.
+  (import "wasi:filesystem/types@0.2.6"
+    "[resource-drop]directory-entry-stream"
+    (func $directory_entry_stream_drop (type $i32_void)))
+
+  ;; `wasi:io/streams.[method]output-stream.blocking-write-and-flush`
+  ;; is already declared above for the stdio write path; reused
+  ;; verbatim by the user-fd write path on top of
+  ;; `descriptor.write-via-stream`.
 
   ;; `wasi:io/streams.[method]input-stream.blocking-read` — the
   ;; single hot-path read method called by `$fd_read`. Returns
@@ -941,6 +1254,31 @@
     i32.store
     i32.const 0)
 
+  ;; Helper: decode the ret-area produced by a canon-lower'd
+  ;; `result<_, error-code>` call into a preview1 errno. The
+  ;; canonical layout is 8 bytes:
+  ;;   offset 0: u8 outer tag (0 = ok, 1 = err) + 3 pad bytes
+  ;;   offset 4: i32 payload — unused on tag=0, holds the
+  ;;             `error-code` ordinal on tag=1
+  ;; ok → 0, err → `$errno_from_error_code(<ordinal>)`.
+  ;;
+  ;; Used by every wired filesystem mutation that returns a bare
+  ;; `result<_, error-code>` (sync, sync-data, set-size,
+  ;; set-times, set-times-at, create-directory-at,
+  ;; remove-directory-at, unlink-file-at, symlink-at, rename-at,
+  ;; link-at). The caller must have already initialised $ra via
+  ;; `$ensure_ret_area` and invoked the host method.
+  (func $descriptor_error_only_result (param $ra i32) (result i32)
+    local.get $ra
+    i32.load8_u
+    if (result i32)
+      local.get $ra
+      i32.load offset=4
+      call $errno_from_error_code
+    else
+      i32.const 0
+    end)
+
   ;; Helper: write `buf[0..len]` to `handle` via
   ;; `blocking-write-and-flush`. Maps `stream-error` to EIO; an
   ;; ok result returns 0. Skips zero-length writes (the canon
@@ -1039,12 +1377,85 @@
     i32.store
     i32.const 0)
 
+  ;; Helper: write iovecs to a regular-file fd at byte offset
+  ;; `$position`. Returns a preview1 errno (0 on success). On
+  ;; success, `*nwritten_ptr` holds the total bytes written; on
+  ;; partial-failure (`stream-error` mid-stream), `*nwritten_ptr`
+  ;; holds the bytes successfully streamed before the error.
+  ;;
+  ;; Sequence:
+  ;;
+  ;;   1. Open a fresh `output-stream` via
+  ;;      `descriptor.write-via-stream(handle, position)`. On
+  ;;      `error-code`, map to errno and return.
+  ;;   2. Iterate iovecs through `$write_iovecs(stream, …)`.
+  ;;   3. Drop the stream via `[resource-drop]output-stream` so the
+  ;;      host releases its per-call buffering — important when the
+  ;;      caller does many small writes back-to-back.
+  ;;   4. Return the iovec write's errno.
+  ;;
+  ;; The caller (`$fd_write` user-fd branch / `$fd_pwrite`) is
+  ;; responsible for advancing the per-fd tracked position in the
+  ;; `$descriptor_table` slot — this helper deliberately doesn't
+  ;; touch slot state so it works for both `fd_write` (advances)
+  ;; and `fd_pwrite` (doesn't).
+  (func $write_at_position
+    (param $handle i32) (param $position i64)
+    (param $iovs i32) (param $iovs_len i32) (param $nwritten_ptr i32)
+    (result i32)
+    (local $ra i32) (local $stream i32) (local $err i32)
+    call $ensure_ret_area
+    local.set $ra
+    local.get $handle
+    local.get $position
+    local.get $ra
+    call $descriptor_write_via_stream
+    ;; ret-area: tag(u8) at 0, payload(i32) at 4. tag=0 → ok with
+    ;; output-stream handle in payload; tag=1 → err with error-code
+    ;; ordinal in payload.
+    local.get $ra
+    i32.load8_u
+    if
+      ;; Open failed: publish 0 bytes written + return mapped errno.
+      local.get $nwritten_ptr
+      i32.const 0
+      i32.store
+      local.get $ra
+      i32.load offset=4
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra
+    i32.load offset=4
+    local.set $stream
+    local.get $stream
+    local.get $iovs
+    local.get $iovs_len
+    local.get $nwritten_ptr
+    call $write_iovecs
+    local.set $err
+    local.get $stream
+    call $output_stream_drop
+    local.get $err)
+
   ;; preview1 `fd_write(fd, iovs, iovs_len, nwritten_ptr) -> errno`.
-  ;; Routes fd 1 → cached stdout handle, fd 2 → cached stderr
-  ;; handle, anything else → EBADF (8). The actual byte
-  ;; streaming lives in `$write_iovecs`.
+  ;;
+  ;; Stdio (fd 1 / 2): route through the cached
+  ;; `wasi:cli/{stdout,stderr}.get-{stdout,stderr}` handles +
+  ;; `$write_iovecs`.
+  ;;
+  ;; User-opened files (fd ≥ 3): `$resolve_fd` to a descriptor
+  ;; handle + slot_addr, open a fresh `output-stream` via
+  ;; `descriptor.write-via-stream(position)`, stream every iovec
+  ;; through `output-stream.blocking-write-and-flush`, drop the
+  ;; stream, and advance the slot's tracked position by total
+  ;; bytes written. Mirrors `$fd_read`'s shape (one stream churn
+  ;; per preview1 call). Preopens are not writeable → EBADF.
+  ;;
+  ;; fd 0 (stdin) and any unmatched fd return EBADF.
   (func $fd_write (type $fd_write_sig)
-    (local $handle i32)
+    (local $handle i32) (local $ra i32) (local $slot_addr i32)
+    (local $position i64) (local $err i32) (local $written i32)
     block $bad_fd
       local.get 0   ;; fd
       i32.const 1
@@ -1060,7 +1471,56 @@
           call $get_stderr_cached
           local.set $handle
         else
-          br $bad_fd
+          local.get 0
+          i32.const 3
+          i32.lt_u
+          if
+            br $bad_fd               ;; fd 0 (stdin) — not writeable
+          end
+          ;; User-opened fd path. Resolve to (handle, slot_addr);
+          ;; preopens (slot_addr == 0) → EBADF since they're
+          ;; directories, not writeable streams.
+          call $ensure_ret_area
+          local.set $ra
+          local.get 0
+          local.get $ra                      ;; out_handle_ptr
+          local.get $ra  i32.const 4 i32.add ;; out_n_preopens_ptr
+          local.get $ra  i32.const 8 i32.add ;; out_slot_addr_ptr
+          call $resolve_fd
+          local.tee $err
+          if  local.get $err  return  end
+          local.get $ra
+          i32.load offset=8
+          local.tee $slot_addr
+          i32.eqz
+          if  br $bad_fd  end
+          local.get $ra
+          i32.load offset=0
+          local.set $handle
+          local.get $slot_addr
+          i64.load offset=8
+          local.set $position
+          local.get $handle
+          local.get $position
+          local.get 1   ;; iovs
+          local.get 2   ;; iovs_len
+          local.get 3   ;; nwritten_ptr
+          call $write_at_position
+          local.set $err
+          ;; Advance the per-fd tracked position by the bytes
+          ;; actually written (read back from *nwritten_ptr — set
+          ;; on both success and partial-failure paths).
+          local.get 3
+          i32.load
+          local.set $written
+          local.get $slot_addr
+          local.get $position
+          local.get $written
+          i64.extend_i32_u
+          i64.add
+          i64.store offset=8
+          local.get $err
+          return
         end
       end
       local.get $handle
@@ -1071,6 +1531,48 @@
       return
     end
     i32.const 8) ;; EBADF
+
+  ;; preview1 `fd_pwrite(fd, iovs, iovs_len, offset, nwritten_ptr)
+  ;; -> errno`. POSIX `pwrite` semantics — writes at the explicit
+  ;; `offset` without touching the per-fd position. Stdio returns
+  ;; ESPIPE (matches `fd_seek` stdio behaviour); preopens / unknown
+  ;; user fds return EBADF.
+  (func $fd_pwrite (type $fd_pwrite_sig)
+    (local $ra i32) (local $handle i32) (local $slot_addr i32)
+    (local $err i32)
+    local.get 0
+    i32.const 3
+    i32.lt_u
+    if
+      i32.const 70                       ;; ESPIPE for stdio
+      return
+    end
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0
+    local.get $ra                        ;; out_handle_ptr
+    local.get $ra  i32.const 4 i32.add   ;; out_n_preopens_ptr
+    local.get $ra  i32.const 8 i32.add   ;; out_slot_addr_ptr
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.load offset=8
+    local.tee $slot_addr
+    i32.eqz
+    if
+      i32.const 8                        ;; EBADF — preopens not writeable
+      return
+    end
+    local.get $ra
+    i32.load offset=0
+    local.set $handle
+    local.get $handle
+    local.get 3                          ;; explicit offset (i64)
+    local.get 1                          ;; iovs
+    local.get 2                          ;; iovs_len
+    local.get 4                          ;; nwritten_ptr
+    call $write_at_position)
 
   ;; preview1 `fd_read(fd, iovs, iovs_len, nread_ptr) -> errno`.
   ;;
@@ -1638,8 +2140,10 @@
   ;;   offset 8:  u64 fs_rights_base       (= FD_READ / FD_WRITE)
   ;;   offset 16: u64 fs_rights_inheriting (= 0)
   ;;
-  ;; fd >= 3 keeps the ENOSYS=52 stub until cataggar/wabt#165 wires
-  ;; real descriptors.
+  ;; fd >= 3 keeps the ENOSYS=52 stub — preview2 has
+  ;; `descriptor.{get-flags, get-type}` we could lift here, but the
+  ;; preview1 `fdstat` also needs `fs_rights_*` which has no
+  ;; preview2 equivalent. Tracked under cataggar/wabt#168.
   (func $fd_fdstat_get (type $fd_fdstat_get_sig)
     (local $rights i64)
     local.get 0
@@ -1676,6 +2180,863 @@
     i32.const 0)             ;; SUCCESS
 
   (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags_sig) i32.const 52)
+
+  ;; Helper: resolve a preview1 fd to a descriptor handle, ignoring
+  ;; whether it's a preopen or a user-fd. Returns 0 on success +
+  ;; writes the handle at `*out_handle_ptr`; returns EBADF on
+  ;; stdio / unknown fd. Used by every fd_* mutator that doesn't
+  ;; care about the slot_addr (sync, datasync, set-size, set-times,
+  ;; stat). Wraps `$resolve_fd` and discards the slot pointer.
+  (func $resolve_fd_handle (param $fd i32) (param $out_handle_ptr i32)
+    (result i32)
+    (local $ra i32) (local $err i32)
+    call $ensure_ret_area
+    local.set $ra
+    local.get $fd
+    local.get $ra                          ;; out_handle_ptr (scratch)
+    local.get $ra  i32.const 4 i32.add     ;; out_n_preopens_ptr (ignored)
+    local.get $ra  i32.const 8 i32.add     ;; out_slot_addr_ptr (ignored)
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $out_handle_ptr
+    local.get $ra
+    i32.load
+    i32.store
+    i32.const 0)
+
+  ;; preview1 `fd_sync(fd) -> errno` →
+  ;; `wasi:filesystem/types.descriptor.sync(handle) -> result<_, error-code>`.
+  ;; Stdio (fd<3) returns EBADF (matches preview1 semantics — `fsync`
+  ;; on a tty is a no-op success on POSIX, but wasmtime's reference
+  ;; adapter doesn't bother with that nuance and neither do we).
+  (func $fd_sync (type $fd_sync_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add    ;; reserve 0..12 for $resolve_fd_handle
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get $ra
+    call $descriptor_sync
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `fd_datasync(fd) -> errno` →
+  ;; `descriptor.sync-data(handle) -> result<_, error-code>`. Same
+  ;; shape as `$fd_sync`.
+  (func $fd_datasync (type $fd_datasync_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get $ra
+    call $descriptor_sync_data
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `fd_filestat_set_size(fd, size: u64) -> errno` →
+  ;; `descriptor.set-size(handle, size) -> result<_, error-code>`.
+  (func $fd_filestat_set_size (type $fd_filestat_set_size_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get 1                            ;; size (u64)
+    local.get $ra
+    call $descriptor_set_size
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; Helper: project a preview1 fstflags pair (atim_bit,
+  ;; atim_now_bit) + raw u64 ns timestamp into a 24-byte
+  ;; `new-timestamp` flat-ABI tuple at `*out_ptr`. Layout written:
+  ;;
+  ;;   offset 0: u8 tag (0=no-change, 1=now, 2=timestamp)
+  ;;   offset 4: u32 — only used when tag=2 (lower bits unused
+  ;;                 here; canon ABI passes the variant via flat
+  ;;                 params, not memory, but we use this layout
+  ;;                 internally to assemble call args).
+  ;;
+  ;; The `set-times` / `set-times-at` host calls take the variant
+  ;; flat-lowered into 3 i32/i64 slots: (tag i32, seconds i64,
+  ;; nanoseconds i32). This helper writes those three slots into
+  ;; the caller's local frame area (`out_ptr` is a 16-byte slab).
+  ;;
+  ;;   offset 0: i32 tag
+  ;;   offset 4: pad (alignment)
+  ;;   offset 8: i64 seconds
+  ;;   offset 16: i32 nanoseconds
+  ;;
+  ;; Returns 0 on success, EINVAL if both `atim` and `atim_now`
+  ;; bits are set (preview1 rejects this).
+  (func $build_new_timestamp
+    (param $bit_set i32)              ;; e.g. ATIM (0x01) or MTIM (0x04)
+    (param $bit_now i32)              ;; e.g. ATIM_NOW (0x02) or MTIM_NOW (0x08)
+    (param $fst_flags i32)
+    (param $ns i64)
+    (param $out_ptr i32)              ;; 24-byte slot
+    (result i32)
+    (local $set i32) (local $now i32)
+    local.get $fst_flags
+    local.get $bit_set
+    i32.and
+    i32.const 0
+    i32.ne
+    local.set $set
+    local.get $fst_flags
+    local.get $bit_now
+    i32.and
+    i32.const 0
+    i32.ne
+    local.set $now
+    ;; Reject conflicting (set + now) bits.
+    local.get $set
+    local.get $now
+    i32.and
+    if
+      i32.const 28                         ;; EINVAL
+      return
+    end
+    local.get $now
+    if
+      ;; tag=1 (now); seconds + nanoseconds slots are unread but
+      ;; flat-ABI requires them — zero for cleanliness.
+      local.get $out_ptr  i32.const 1  i32.store offset=0
+      local.get $out_ptr  i64.const 0  i64.store offset=8
+      local.get $out_ptr  i32.const 0  i32.store offset=16
+      i32.const 0
+      return
+    end
+    local.get $set
+    if
+      ;; tag=2 (timestamp(datetime)); split ns into (seconds u64,
+      ;; nanoseconds u32). seconds = ns / 1_000_000_000, nanoseconds
+      ;; = ns % 1_000_000_000.
+      local.get $out_ptr
+      i32.const 2
+      i32.store offset=0
+      local.get $out_ptr
+      local.get $ns
+      i64.const 1000000000
+      i64.div_u
+      i64.store offset=8
+      local.get $out_ptr
+      local.get $ns
+      i64.const 1000000000
+      i64.rem_u
+      i32.wrap_i64
+      i32.store offset=16
+      i32.const 0
+      return
+    end
+    ;; Neither bit set → tag=0 (no-change).
+    local.get $out_ptr  i32.const 0  i32.store offset=0
+    local.get $out_ptr  i64.const 0  i64.store offset=8
+    local.get $out_ptr  i32.const 0  i32.store offset=16
+    i32.const 0)
+
+  ;; preview1 `fd_filestat_set_times(fd, atim: u64, mtim: u64,
+  ;;   fstflags: u16) -> errno` →
+  ;; `descriptor.set-times(handle, atime: new-timestamp,
+  ;;   mtime: new-timestamp) -> result<_, error-code>`.
+  ;;
+  ;; preview1 fstflags bits:
+  ;;   ATIM     = 0x01 → set atim from `atim` arg
+  ;;   ATIM_NOW = 0x02 → set atim to host clock
+  ;;   MTIM     = 0x04 → set mtim from `mtim` arg
+  ;;   MTIM_NOW = 0x08 → set mtim to host clock
+  ;; Conflicting (ATIM | ATIM_NOW or MTIM | MTIM_NOW) → EINVAL.
+  ;; Unset → no-change (preserve existing timestamp).
+  (func $fd_filestat_set_times (type $fd_filestat_set_times_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $atime_slot i32) (local $mtime_slot i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    ;; ret-area layout:
+    ;;   0..12   $resolve_fd_handle out (handle + n_preopens + slot_addr)
+    ;;   16..40  atime new-timestamp slot (24 bytes)
+    ;;   40..64  mtime new-timestamp slot (24 bytes)
+    ;;   64..72  set-times result ret-area (8 bytes)
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $ra  i32.const 16 i32.add
+    local.set $atime_slot
+    local.get $ra  i32.const 40 i32.add
+    local.set $mtime_slot
+    i32.const 0x01                         ;; ATIM
+    i32.const 0x02                         ;; ATIM_NOW
+    local.get 3                            ;; fstflags
+    local.get 1                            ;; atim ns
+    local.get $atime_slot
+    call $build_new_timestamp
+    local.tee $err
+    if  local.get $err  return  end
+    i32.const 0x04                         ;; MTIM
+    i32.const 0x08                         ;; MTIM_NOW
+    local.get 3                            ;; fstflags
+    local.get 2                            ;; mtim ns
+    local.get $mtime_slot
+    call $build_new_timestamp
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $handle
+    local.get $atime_slot  i32.load offset=0
+    local.get $atime_slot  i64.load offset=8
+    local.get $atime_slot  i32.load offset=16
+    local.get $mtime_slot  i32.load offset=0
+    local.get $mtime_slot  i64.load offset=8
+    local.get $mtime_slot  i32.load offset=16
+    local.get $ra  i32.const 64 i32.add
+    call $descriptor_set_times
+    local.get $ra  i32.const 64 i32.add
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_create_directory(dirfd, path_ptr, path_len)
+  ;; -> errno` → `descriptor.create-directory-at(handle, path)`.
+  (func $path_create_directory (type $path_only_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get 1
+    local.get 2
+    local.get $ra
+    call $descriptor_create_directory_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_remove_directory(dirfd, path_ptr, path_len)
+  ;; -> errno` → `descriptor.remove-directory-at(handle, path)`.
+  (func $path_remove_directory (type $path_only_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get 1
+    local.get 2
+    local.get $ra
+    call $descriptor_remove_directory_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_unlink_file(dirfd, path_ptr, path_len) -> errno`
+  ;; → `descriptor.unlink-file-at(handle, path)`.
+  (func $path_unlink_file (type $path_only_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get 1
+    local.get 2
+    local.get $ra
+    call $descriptor_unlink_file_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_symlink(old_path_ptr, old_path_len, dirfd,
+  ;;   new_path_ptr, new_path_len) -> errno` →
+  ;; `descriptor.symlink-at(handle, old-path, new-path)`. Note the
+  ;; preview1 arg order has `dirfd` between the two paths but the
+  ;; preview2 method has both paths after `self`.
+  (func $path_symlink (type $path_symlink_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    local.get 2                            ;; dirfd
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $handle
+    local.get 0                            ;; old_path_ptr
+    local.get 1                            ;; old_path_len
+    local.get 3                            ;; new_path_ptr
+    local.get 4                            ;; new_path_len
+    local.get $ra
+    call $descriptor_symlink_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_rename(old_dirfd, old_path_ptr, old_path_len,
+  ;;   new_dirfd, new_path_ptr, new_path_len) -> errno` →
+  ;; `descriptor.rename-at(self=old_handle, old-path,
+  ;;   new-descriptor=borrow<new_handle>, new-path)`. Both fds are
+  ;; resolved via `$resolve_fd_handle`; the new-fd handle is passed
+  ;; as a `borrow<descriptor>` (canon-lowered to the same i32
+  ;; resource index).
+  (func $path_rename (type $path_rename_sig)
+    (local $ra i32) (local $err i32)
+    (local $old_handle i32) (local $new_handle i32)
+    local.get 0                            ;; old_dirfd
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add    ;; out slot @ +12
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $old_handle
+    local.get 3                            ;; new_dirfd
+    local.get $ra  i32.const 16 i32.add    ;; out slot @ +16
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 16 i32.add
+    i32.load
+    local.set $new_handle
+    local.get $old_handle
+    local.get 1                            ;; old_path_ptr
+    local.get 2                            ;; old_path_len
+    local.get $new_handle                  ;; borrow<descriptor>
+    local.get 4                            ;; new_path_ptr
+    local.get 5                            ;; new_path_len
+    local.get $ra
+    call $descriptor_rename_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_link(old_dirfd, old_lookupflags, old_path_ptr,
+  ;;   old_path_len, new_dirfd, new_path_ptr, new_path_len)
+  ;; -> errno` → `descriptor.link-at(self=old_handle,
+  ;;   old-path-flags, old-path, new-descriptor, new-path)`.
+  (func $path_link (type $path_link_sig)
+    (local $ra i32) (local $err i32)
+    (local $old_handle i32) (local $new_handle i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $old_handle
+    local.get 4                            ;; new_dirfd
+    local.get $ra  i32.const 16 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 16 i32.add
+    i32.load
+    local.set $new_handle
+    local.get $old_handle
+    local.get 1                            ;; old_lookupflags
+    local.get 2                            ;; old_path_ptr
+    local.get 3                            ;; old_path_len
+    local.get $new_handle
+    local.get 5                            ;; new_path_ptr
+    local.get 6                            ;; new_path_len
+    local.get $ra
+    call $descriptor_link_at
+    local.get $ra
+    call $descriptor_error_only_result)
+
+  ;; preview1 `path_filestat_set_times(dirfd, lookupflags,
+  ;;   path_ptr, path_len, atim, mtim, fstflags) -> errno` →
+  ;; `descriptor.set-times-at(handle, path-flags, path,
+  ;;   atime: new-timestamp, mtime: new-timestamp)`.
+  (func $path_filestat_set_times (type $path_filestat_set_times_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $atime_slot i32) (local $mtime_slot i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    ;; ret-area layout:
+    ;;   0..12   $resolve_fd_handle out
+    ;;   16..40  atime new-timestamp slot
+    ;;   40..64  mtime new-timestamp slot
+    ;;   64..72  set-times-at result ret-area
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $ra  i32.const 16 i32.add
+    local.set $atime_slot
+    local.get $ra  i32.const 40 i32.add
+    local.set $mtime_slot
+    i32.const 0x01
+    i32.const 0x02
+    local.get 6                            ;; fstflags
+    local.get 4                            ;; atim ns
+    local.get $atime_slot
+    call $build_new_timestamp
+    local.tee $err
+    if  local.get $err  return  end
+    i32.const 0x04
+    i32.const 0x08
+    local.get 6
+    local.get 5                            ;; mtim ns
+    local.get $mtime_slot
+    call $build_new_timestamp
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $handle
+    local.get 1                            ;; lookupflags / path-flags
+    local.get 2                            ;; path_ptr
+    local.get 3                            ;; path_len
+    local.get $atime_slot  i32.load offset=0
+    local.get $atime_slot  i64.load offset=8
+    local.get $atime_slot  i32.load offset=16
+    local.get $mtime_slot  i32.load offset=0
+    local.get $mtime_slot  i64.load offset=8
+    local.get $mtime_slot  i32.load offset=16
+    local.get $ra  i32.const 64 i32.add
+    call $descriptor_set_times_at
+    local.get $ra  i32.const 64 i32.add
+    call $descriptor_error_only_result)
+
+  ;; preview1 sock_* — ENOSYS=52 stubs. The adapter doesn't lift
+  ;; the preview2 `wasi:sockets/*` surface (see cataggar/wabt#166's
+  ;; "either resolve cleanly or are explicitly elided" branch);
+  ;; declaring exports here satisfies the splicer's
+  ;; `findExport(p1.name)` check for wasi-libc embeds that pull
+  ;; the symbols in via the C runtime startup code, while programs
+  ;; that actually `socket()` get a clean ENOSYS through wasi-libc's
+  ;; `errno` fallback rather than a splice-time error.
+  (func $sock_accept (type $sock_accept_sig) i32.const 52)
+  (func $sock_recv (type $sock_recv_sig) i32.const 52)
+  (func $sock_send (type $sock_send_sig) i32.const 52)
+  (func $sock_shutdown (type $sock_shutdown_sig) i32.const 52)
+
+  ;; Helper: convert a preview2 `descriptor-type` enum ordinal to
+  ;; the closest preview1 `__wasi_filetype_t` ordinal. Mappings:
+  ;;
+  ;;   preview2 → preview1
+  ;;   ────────────────────
+  ;;   0 unknown          → 0  UNKNOWN
+  ;;   1 block-device     → 1  BLOCK_DEVICE
+  ;;   2 character-device → 2  CHARACTER_DEVICE
+  ;;   3 directory        → 3  DIRECTORY
+  ;;   4 fifo             → 6  SOCKET_STREAM (preview1 has no FIFO)
+  ;;   5 symbolic-link    → 7  SYMBOLIC_LINK
+  ;;   6 regular-file     → 4  REGULAR_FILE
+  ;;   7 socket           → 5  SOCKET_DGRAM
+  ;;   anything else      → 0  UNKNOWN (defensive)
+  (func $preview1_filetype_from_descriptor_type
+    (param $dt i32) (result i32)
+    local.get $dt  i32.eqz                      if i32.const 0 return end
+    local.get $dt  i32.const 1  i32.eq          if i32.const 1 return end
+    local.get $dt  i32.const 2  i32.eq          if i32.const 2 return end
+    local.get $dt  i32.const 3  i32.eq          if i32.const 3 return end
+    local.get $dt  i32.const 4  i32.eq          if i32.const 6 return end
+    local.get $dt  i32.const 5  i32.eq          if i32.const 7 return end
+    local.get $dt  i32.const 6  i32.eq          if i32.const 4 return end
+    local.get $dt  i32.const 7  i32.eq          if i32.const 5 return end
+    i32.const 0)
+
+  ;; Helper: read an `option<datetime>` slot at `$opt_ptr` (24
+  ;; bytes: tag at 0, datetime{seconds u64, nanoseconds u32} at 8)
+  ;; and collapse it to a u64 nanosecond count. Returns 0 when the
+  ;; option is `none` (preview1 reports "no timestamp" as 0 ns).
+  ;; Saturates on overflow — `seconds * 1e9 + nanoseconds` of a
+  ;; well-formed datetime fits in u64 for ~584 years past epoch.
+  (func $option_datetime_to_ns (param $opt_ptr i32) (result i64)
+    local.get $opt_ptr
+    i32.load8_u offset=0
+    i32.eqz
+    if  i64.const 0  return  end
+    local.get $opt_ptr
+    i64.load offset=8                          ;; seconds
+    i64.const 1000000000
+    i64.mul
+    local.get $opt_ptr
+    i32.load offset=16                         ;; nanoseconds
+    i64.extend_i32_u
+    i64.add)
+
+  ;; Helper: project a `descriptor-stat` record (96 bytes at
+  ;; `$src`) into the 64-byte preview1 `filestat` layout at `$dst`.
+  ;;
+  ;; preview2 descriptor-stat layout (align 8):
+  ;;   offset 0:  u8  type (+7 pad)
+  ;;   offset 8:  u64 link-count
+  ;;   offset 16: u64 size
+  ;;   offset 24: option<datetime> data-access-timestamp (24 bytes)
+  ;;   offset 48: option<datetime> data-modification-timestamp (24)
+  ;;   offset 72: option<datetime> status-change-timestamp (24)
+  ;;
+  ;; preview1 filestat layout (align 8):
+  ;;   offset 0:  u64 dev (always 0)
+  ;;   offset 8:  u64 ino (always 0)
+  ;;   offset 16: u8  filetype + 7 pad
+  ;;   offset 24: u64 nlink
+  ;;   offset 32: u64 size
+  ;;   offset 40: u64 atim_ns
+  ;;   offset 48: u64 mtim_ns
+  ;;   offset 56: u64 ctim_ns
+  (func $write_preview1_filestat (param $src i32) (param $dst i32)
+    local.get $dst
+    i64.const 0
+    i64.store offset=0                         ;; dev
+    local.get $dst
+    i64.const 0
+    i64.store offset=8                         ;; ino
+    ;; filetype (preview2 → preview1) + zero the 7 pad bytes via
+    ;; an i64 store at offset 16 first.
+    local.get $dst
+    i64.const 0
+    i64.store offset=16
+    local.get $dst
+    local.get $src  i32.load8_u offset=0
+    call $preview1_filetype_from_descriptor_type
+    i32.store8 offset=16
+    local.get $dst
+    local.get $src  i64.load offset=8
+    i64.store offset=24                        ;; nlink
+    local.get $dst
+    local.get $src  i64.load offset=16
+    i64.store offset=32                        ;; size
+    local.get $dst
+    local.get $src  i32.const 24 i32.add
+    call $option_datetime_to_ns
+    i64.store offset=40                        ;; atim
+    local.get $dst
+    local.get $src  i32.const 48 i32.add
+    call $option_datetime_to_ns
+    i64.store offset=48                        ;; mtim
+    local.get $dst
+    local.get $src  i32.const 72 i32.add
+    call $option_datetime_to_ns
+    i64.store offset=56)                       ;; ctim
+
+  ;; preview1 `fd_filestat_get(fd, filestat_ptr) -> errno` →
+  ;; `descriptor.stat(handle) -> result<descriptor-stat, error-code>`.
+  ;; The 104-byte stat ret-area lives in the bump arena (need 104,
+  ;; the 65536-byte arena easily fits).
+  (func $fd_filestat_get (type $fd_filestat_get_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $stat_area i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    ;; Allocate the 104-byte stat ret-area inside the same scratch
+    ;; ret-area block ($ra is 64 KiB, stat-area 16 bytes deep into
+    ;; it — well clear of the 32-byte tail used by other helpers).
+    local.get $ra  i32.const 32 i32.add
+    local.set $stat_area
+    local.get $handle
+    local.get $stat_area
+    call $descriptor_stat
+    local.get $stat_area
+    i32.load8_u offset=0
+    if (result i32)
+      local.get $stat_area
+      i32.load8_u offset=8                     ;; payload byte 0 = error-code ordinal
+      call $errno_from_error_code
+    else
+      ;; ok: descriptor-stat record starts at $stat_area + 8.
+      local.get $stat_area  i32.const 8 i32.add
+      local.get 1                              ;; preview1 filestat_ptr
+      call $write_preview1_filestat
+      i32.const 0
+    end)
+
+  ;; preview1 `path_filestat_get(dirfd, lookupflags, path_ptr,
+  ;;   path_len, filestat_ptr) -> errno` →
+  ;; `descriptor.stat-at(handle, path-flags, path)`.
+  (func $path_filestat_get (type $path_filestat_get_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $stat_area i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get $ra  i32.const 32 i32.add
+    local.set $stat_area
+    local.get $handle
+    local.get 1                                ;; lookupflags
+    local.get 2                                ;; path_ptr
+    local.get 3                                ;; path_len
+    local.get $stat_area
+    call $descriptor_stat_at
+    local.get $stat_area
+    i32.load8_u offset=0
+    if (result i32)
+      local.get $stat_area
+      i32.load8_u offset=8
+      call $errno_from_error_code
+    else
+      local.get $stat_area  i32.const 8 i32.add
+      local.get 4                              ;; preview1 filestat_ptr
+      call $write_preview1_filestat
+      i32.const 0
+    end)
+
+  ;; preview1 `fd_readdir(fd, buf, buf_len, cookie, used_ptr)
+  ;; -> errno`.
+  ;;
+  ;; Strategy: open a fresh `directory-entry-stream` via
+  ;; `descriptor.read-directory(handle)`, pump
+  ;; `read-directory-entry()` in a loop and pack each entry
+  ;; (24-byte preview1 dirent + name bytes) into the caller's buf
+  ;; until the next entry would no longer fit OR the stream
+  ;; returns `option::none` (end-of-stream). Drop the stream.
+  ;;
+  ;; The input `cookie` is ignored — preview2's stream cursor isn't
+  ;; resumable, so we restart from the beginning every call. wasi-
+  ;; libc handles this by re-reading the whole listing on each
+  ;; `readdir(3)`-batch, which is acceptable for v1 (wasmtime's
+  ;; reference adapter behaves identically).
+  ;;
+  ;; preview1 dirent layout (24 bytes, align 8):
+  ;;   offset 0:  u64 d_next   (cookie — adapter writes 1-based
+  ;;                            counter so wasi-libc's resume
+  ;;                            heuristic sees monotonic values)
+  ;;   offset 8:  u64 d_ino    (always 0 — preview2 hides ino)
+  ;;   offset 16: u32 d_namlen
+  ;;   offset 20: u8  d_type   (preview1 filetype)
+  ;;   offset 21..24: pad
+  ;;
+  ;; read-directory-entry ret-area (20 bytes): outer tag (u8 + 3
+  ;; pad) at 0, payload at 4. Payload for ok is option<directory-
+  ;; entry>: option_tag at 4 (u8 + 3 pad), directory-entry at 8
+  ;; (12 bytes: type u8 at 8 + 3 pad, name string ptr at 12, name
+  ;; string len at 16). Payload for err is error-code at 4.
+  (func $fd_readdir (type $fd_readdir_sig)
+    (local $ra i32) (local $err i32) (local $handle i32)
+    (local $stream i32) (local $stream_ra i32)
+    (local $cur i32) (local $end i32) (local $cookie i64)
+    (local $name_ptr i32) (local $name_len i32) (local $needed i32)
+    (local $dt i32)
+    local.get 0
+    call $ensure_ret_area
+    local.set $ra
+    local.get $ra  i32.const 12 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra  i32.const 12 i32.add
+    i32.load
+    local.set $handle
+    local.get 1
+    local.set $cur
+    local.get 1
+    local.get 2
+    i32.add
+    local.set $end
+    ;; Open the directory-entry-stream. Reuse the bump arena ret-
+    ;; area at $ra (8 bytes for read-directory, 20 bytes for each
+    ;; subsequent read-directory-entry).
+    local.get $handle
+    local.get $ra
+    call $descriptor_read_directory
+    local.get $ra
+    i32.load8_u offset=0
+    if
+      ;; Open failed → publish 0 used + return mapped errno.
+      local.get 4
+      i32.const 0
+      i32.store
+      local.get $ra
+      i32.load offset=4
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra
+    i32.load offset=4
+    local.set $stream
+    ;; Use a separate slot for read-directory-entry's ret-area so
+    ;; the read-directory result above stays valid for debugging.
+    local.get $ra  i32.const 16 i32.add
+    local.set $stream_ra
+    i64.const 1
+    local.set $cookie
+    block $stop
+      loop $next
+        ;; Install one-shot import-alloc for the directory-entry's
+        ;; `string name` so the canon-lifted bytes land directly in
+        ;; the bump arena (mode 2 = count). Reset the arena cursor
+        ;; per iteration so each entry's name has dedicated space.
+        i32.const 0  global.set $arena_cur
+        i32.const 0  global.set $strings_sz
+        i32.const 2  global.set $import_alloc_mode
+        local.get $stream
+        local.get $stream_ra
+        call $directory_entry_stream_read
+        i32.const 0  global.set $import_alloc_mode
+        local.get $stream_ra
+        i32.load8_u offset=0
+        if
+          ;; Outer err: stop iteration, drop the stream, return
+          ;; mapped errno (with bytes already published).
+          local.get 4
+          local.get $cur
+          local.get 1
+          i32.sub
+          i32.store
+          local.get $stream
+          call $directory_entry_stream_drop
+          local.get $stream_ra
+          i32.load offset=4
+          call $errno_from_error_code
+          return
+        end
+        ;; Inner option: tag at +4. 0 = none → end-of-stream.
+        local.get $stream_ra
+        i32.load8_u offset=4
+        i32.eqz
+        if  br $stop  end
+        ;; some(directory-entry): %type at +8, name string at +12.
+        local.get $stream_ra
+        i32.load8_u offset=8
+        local.set $dt
+        local.get $stream_ra
+        i32.load offset=12
+        local.set $name_ptr
+        local.get $stream_ra
+        i32.load offset=16
+        local.set $name_len
+        ;; needed = 24 (dirent header) + name_len
+        local.get $name_len
+        i32.const 24
+        i32.add
+        local.set $needed
+        ;; If we don't have room for the next dirent header, stop
+        ;; iterating. Note we DO write a header even if the name
+        ;; bytes are truncated — wasi-libc's `readdir(3)` treats
+        ;; (used < buf_len) as end-of-batch and re-issues with the
+        ;; cookie advanced.
+        local.get $end
+        local.get $cur
+        i32.sub
+        i32.const 24
+        i32.lt_u
+        if  br $stop  end
+        ;; Write the dirent header.
+        local.get $cur  local.get $cookie  i64.store offset=0
+        local.get $cur  i64.const 0  i64.store offset=8        ;; ino
+        local.get $cur  local.get $name_len  i32.store offset=16
+        local.get $cur
+        local.get $dt
+        call $preview1_filetype_from_descriptor_type
+        i32.store8 offset=20
+        ;; Pad bytes 21..24 are uninitialised — wasi-libc ignores.
+        local.get $cur  i32.const 24  i32.add
+        local.set $cur
+        ;; Copy the name (bounded by the remaining buf space).
+        block $name_done
+          local.get $name_len
+          i32.eqz
+          br_if $name_done
+          local.get $end
+          local.get $cur
+          i32.sub
+          local.tee $needed                    ;; reuse $needed for "remaining"
+          local.get $name_len
+          i32.lt_u
+          if
+            ;; Truncated name: copy what fits then stop.
+            local.get $cur
+            local.get $name_ptr
+            local.get $needed
+            memory.copy
+            local.get $cur
+            local.get $needed
+            i32.add
+            local.set $cur
+            br $stop
+          end
+          local.get $cur
+          local.get $name_ptr
+          local.get $name_len
+          memory.copy
+          local.get $cur
+          local.get $name_len
+          i32.add
+          local.set $cur
+        end
+        local.get $cookie
+        i64.const 1
+        i64.add
+        local.set $cookie
+        br $next
+      end
+    end
+    ;; Stream exhausted (or buf full mid-iteration).
+    local.get $stream
+    call $directory_entry_stream_drop
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    local.get 4
+    local.get $cur
+    local.get 1
+    i32.sub
+    i32.store
+    i32.const 0)
 
   ;; preview1 `fd_prestat_get(fd, prestat_ptr) -> errno`.
   ;;
@@ -2354,25 +3715,44 @@
   ;; the splicer matches by name against whichever `--adapt
   ;; name=…` module the user specified, defaulting to
   ;; `wasi_snapshot_preview1`).
-  (export "proc_exit"            (func $proc_exit))
-  (export "proc_raise"           (func $proc_raise))
-  (export "sched_yield"          (func $sched_yield))
-  (export "fd_write"             (func $fd_write))
-  (export "fd_read"              (func $fd_read))
-  (export "fd_close"             (func $fd_close))
-  (export "fd_seek"              (func $fd_seek))
-  (export "fd_fdstat_get"        (func $fd_fdstat_get))
-  (export "fd_fdstat_set_flags"  (func $fd_fdstat_set_flags))
-  (export "fd_prestat_get"       (func $fd_prestat_get))
-  (export "fd_prestat_dir_name"  (func $fd_prestat_dir_name))
-  (export "path_open"            (func $path_open))
-  (export "args_get"             (func $args_get))
-  (export "args_sizes_get"       (func $args_sizes_get))
-  (export "environ_get"          (func $environ_get))
-  (export "environ_sizes_get"    (func $environ_sizes_get))
-  (export "clock_time_get"       (func $clock_time_get))
-  (export "clock_res_get"        (func $clock_res_get))
-  (export "random_get"           (func $random_get))
+  (export "proc_exit"                  (func $proc_exit))
+  (export "proc_raise"                 (func $proc_raise))
+  (export "sched_yield"                (func $sched_yield))
+  (export "fd_write"                   (func $fd_write))
+  (export "fd_pwrite"                  (func $fd_pwrite))
+  (export "fd_read"                    (func $fd_read))
+  (export "fd_close"                   (func $fd_close))
+  (export "fd_seek"                    (func $fd_seek))
+  (export "fd_sync"                    (func $fd_sync))
+  (export "fd_datasync"                (func $fd_datasync))
+  (export "fd_fdstat_get"              (func $fd_fdstat_get))
+  (export "fd_fdstat_set_flags"       (func $fd_fdstat_set_flags))
+  (export "fd_filestat_get"            (func $fd_filestat_get))
+  (export "fd_filestat_set_size"       (func $fd_filestat_set_size))
+  (export "fd_filestat_set_times"      (func $fd_filestat_set_times))
+  (export "fd_prestat_get"             (func $fd_prestat_get))
+  (export "fd_prestat_dir_name"        (func $fd_prestat_dir_name))
+  (export "fd_readdir"                 (func $fd_readdir))
+  (export "path_open"                  (func $path_open))
+  (export "path_create_directory"      (func $path_create_directory))
+  (export "path_remove_directory"      (func $path_remove_directory))
+  (export "path_unlink_file"           (func $path_unlink_file))
+  (export "path_symlink"               (func $path_symlink))
+  (export "path_rename"                (func $path_rename))
+  (export "path_link"                  (func $path_link))
+  (export "path_filestat_get"          (func $path_filestat_get))
+  (export "path_filestat_set_times"    (func $path_filestat_set_times))
+  (export "args_get"                   (func $args_get))
+  (export "args_sizes_get"             (func $args_sizes_get))
+  (export "environ_get"                (func $environ_get))
+  (export "environ_sizes_get"          (func $environ_sizes_get))
+  (export "clock_time_get"             (func $clock_time_get))
+  (export "clock_res_get"              (func $clock_res_get))
+  (export "random_get"                 (func $random_get))
+  (export "sock_accept"                (func $sock_accept))
+  (export "sock_recv"                  (func $sock_recv))
+  (export "sock_send"                  (func $sock_send))
+  (export "sock_shutdown"              (func $sock_shutdown))
 
   ;; Component-level run entry + canon-lower realloc helper.
   (export "wasi:cli/run@0.2.6#run" (func $run))
