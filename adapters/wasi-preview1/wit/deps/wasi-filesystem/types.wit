@@ -1,19 +1,19 @@
 // Trimmed slice of `wasi:filesystem@0.2.6.types`. The canonical
 // `bytecodealliance/wasi-filesystem@v0.2.6/wit/types.wit` declares
 // the full `descriptor` surface (~30 methods) plus many auxiliary
-// types (`descriptor-type`, `descriptor-flags`, `open-flags`,
-// `path-flags`, `error-code`, `stat`, `new-timestamp`, …). For
-// subphase (a1) — preopens-only — we only need the opaque
-// `descriptor` resource itself so the encoded-world section can
-// carry `own<descriptor>` in `preopens.get-directories`' return
-// type.
+// types. This slice declares only the subset the preview1 → preview2
+// adapter consumes so far:
 //
-// The wider surface arrives in subsequent subphases:
-//   * (a2) `path_open` + `fd_close` → `descriptor.open-at`,
-//     `[resource-drop]descriptor`, `descriptor-flags`,
-//     `open-flags`, `path-flags`, `error-code`.
+//   * `path-flags`, `open-flags`, `descriptor-flags`, `error-code`
+//     — the flag/enum types referenced by `descriptor.open-at`.
+//   * `descriptor` resource with the `open-at` method backing
+//     preview1 `path_open`. `[resource-drop]descriptor` is
+//     auto-bound by the splicer (same pattern as
+//     `[resource-drop]output-stream` in `wasi:io/streams`).
+//
+// The wider surface arrives in subsequent subphases of #165:
 //   * (b)  `fd_read` + `fd_seek` → `descriptor.read-via-stream`,
-//     `descriptor.seek`, descriptor-type and a few flags.
+//     `descriptor.seek`, descriptor-type.
 //   * (c)  `fd_filestat_get` / `path_filestat_get` / `fd_readdir`
 //     → `descriptor.stat`, `descriptor.stat-at`,
 //     `descriptor.read-directory`, plus the relevant record types.
@@ -25,10 +25,96 @@
 // file that's parsed first.
 
 interface types {
+    /// Modifiers for `descriptor.open-at` path lookup. Bit 0
+    /// (`symlink-follow`) matches preview1 `LOOKUPFLAGS_SYMLINK_FOLLOW`.
+    flags path-flags {
+        symlink-follow,
+    }
+
+    /// `O_*`-style modifiers for `descriptor.open-at`. Bit positions
+    /// match preview1 `OFLAGS_*` (CREAT=0, DIRECTORY=1, EXCL=2,
+    /// TRUNC=3), so the adapter passes `oflags & 0xF` through
+    /// unchanged.
+    flags open-flags {
+        create,
+        directory,
+        exclusive,
+        truncate,
+    }
+
+    /// Capabilities + sync modes for a descriptor. Bits do NOT
+    /// match preview1 fdflags/rights one-to-one; the adapter
+    /// constructs this from `fs_rights_base` + `fdflags` (see
+    /// `descriptor_flags_from_flags` in
+    /// wasi-preview1-component-adapter/src/lib.rs).
+    flags descriptor-flags {
+        read,
+        write,
+        file-integrity-sync,
+        data-integrity-sync,
+        requested-write-sync,
+        mutate-directory,
+    }
+
+    /// Error surface for filesystem operations. Ordinals (0..36)
+    /// are mapped to preview1 errno values via the adapter's
+    /// `$errno_from_error_code` helper.
+    enum error-code {
+        access,
+        would-block,
+        already,
+        bad-descriptor,
+        busy,
+        deadlock,
+        quota,
+        exist,
+        file-too-large,
+        illegal-byte-sequence,
+        in-progress,
+        interrupted,
+        invalid,
+        io,
+        is-directory,
+        loop,
+        too-many-links,
+        message-size,
+        name-too-long,
+        no-device,
+        no-entry,
+        no-lock,
+        insufficient-memory,
+        insufficient-space,
+        not-directory,
+        not-empty,
+        not-recoverable,
+        unsupported,
+        no-tty,
+        no-such-device,
+        overflow,
+        not-permitted,
+        pipe,
+        read-only,
+        invalid-seek,
+        text-file-busy,
+        cross-device,
+    }
+
     /// Opaque handle to a filesystem object — directory, regular
     /// file, symlink, character/block device, etc. The preview1
-    /// adapter only treats these as opaque indices into the host's
+    /// adapter treats these as opaque indices into the host's
     /// resource table; descriptor type / flag inspection arrives
-    /// in subphases (a2)/(b)/(c).
-    resource descriptor { }
+    /// in subphases (b)/(c) of #165.
+    resource descriptor {
+        /// Open a file or directory relative to this descriptor.
+        /// Backs preview1 `path_open`. The adapter translates
+        /// preview1 `dirflags` / `oflags` / `fdflags` /
+        /// `fs_rights_base` into the preview2 flag bundle below.
+        open-at: func(
+            path-flags: path-flags,
+            path: string,
+            open-flags: open-flags,
+            %flags: descriptor-flags
+        ) -> result<own<descriptor>, error-code>;
+    }
 }
+
