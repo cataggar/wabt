@@ -42,11 +42,14 @@ pub const usage =
     \\  -d, --define <file>     Provider component (repeatable)
     \\  -o, --output <file>     Output file (default: <input>.composed.wasm)
     \\      --skip-validation   Skip post-encoding component validation
-    \\  -h, --help              Show this help
     \\
 ;
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
+    if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, usage);
+        return;
+    }
     const alloc = init.gpa;
 
     var providers_paths = std.ArrayListUnmanaged([]const u8).empty;
@@ -58,10 +61,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            writeStdout(init.io, usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--define")) {
+        if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--define")) {
             i += 1;
             if (i >= sub_args.len) {
                 std.debug.print("error: {s} requires a path argument\n", .{arg});
@@ -78,7 +78,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--skip-validation")) {
             skip_validation = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("error: unknown option '{s}'. Use `wabt help component`.\n", .{arg});
+            std.debug.print("error: unknown option '{s}'. Use `wabt component compose help`.\n", .{arg});
             std.process.exit(1);
         } else {
             if (consumer_path != null) {
@@ -90,7 +90,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     }
 
     const cons_path = consumer_path orelse {
-        std.debug.print("error: component compose requires <consumer.wasm>. Use `wabt help component`.\n", .{});
+        std.debug.print("error: component compose requires <consumer.wasm>. Use `wabt component compose help`.\n", .{});
         std.process.exit(1);
     };
 

@@ -41,11 +41,14 @@ pub const usage =
     \\  -w, --world <name>      World to embed (required if the WIT defines
     \\                          more than one world)
     \\  -o, --output <file>     Output file (default: <input>.embed.wasm)
-    \\  -h, --help              Show this help
     \\
 ;
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
+    if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, usage);
+        return;
+    }
     const alloc = init.gpa;
 
     var world_arg: ?[]const u8 = null;
@@ -56,10 +59,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            writeStdout(init.io, usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--world")) {
+        if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--world")) {
             i += 1;
             if (i >= sub_args.len) {
                 std.debug.print("error: {s} requires an argument\n", .{arg});
@@ -74,11 +74,11 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             }
             output_file = sub_args[i];
         } else if (std.mem.startsWith(u8, arg, "-")) {
-            std.debug.print("error: unknown option '{s}'. Use `wabt help component`.\n", .{arg});
+            std.debug.print("error: unknown option '{s}'. Use `wabt component embed help`.\n", .{arg});
             std.process.exit(1);
         } else {
             if (pos_count >= positionals.len) {
-                std.debug.print("error: unexpected positional argument '{s}'. Use `wabt help component`.\n", .{arg});
+                std.debug.print("error: unexpected positional argument '{s}'. Use `wabt component embed help`.\n", .{arg});
                 std.process.exit(1);
             }
             positionals[pos_count] = arg;
@@ -87,7 +87,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     }
 
     if (pos_count < 2) {
-        std.debug.print("error: component embed requires <wit-path> and <core.wasm>. Use `wabt help component`.\n", .{});
+        std.debug.print("error: component embed requires <wit-path> and <core.wasm>. Use `wabt component embed help`.\n", .{});
         std.process.exit(1);
     }
 
