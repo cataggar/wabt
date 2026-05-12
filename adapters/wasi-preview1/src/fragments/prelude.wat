@@ -130,8 +130,9 @@
 ;;     set-size, set-times, set-times-at, stat, stat-at, get-type,
 ;;     get-flags, create-directory-at, remove-directory-at,
 ;;     unlink-file-at, symlink-at, rename-at, link-at, sync,
-;;     sync-data, read-directory}`, `[resource-drop]descriptor`,
-;;     plus `[method]directory-entry-stream.read-directory-entry`
+;;     sync-data, read-directory, advise, readlink-at}`,
+;;     `[resource-drop]descriptor`, plus
+;;     `[method]directory-entry-stream.read-directory-entry`
 ;;     + `[resource-drop]directory-entry-stream`.
 ;;   * `wasi:cli/terminal-{input,output,stdin,stdout,stderr}@0.2.6`
 ;;     — declares the `terminal-input` / `terminal-output`
@@ -146,9 +147,14 @@
 ;;     has no descriptor-flags mutator and a re-open workaround
 ;;     would lose fd identity. Decided as part of
 ;;     cataggar/wabt#179.
-;;   * `fd_pread`, `fd_advise`, `fd_allocate`, `fd_renumber`,
-;;     `fd_tell`, `path_readlink` — out of v3 scope
-;;     (cataggar/wabt#180).
+;;   * `fd_allocate` — **permanent ENOSYS**: preview2 0.2.6 has no
+;;     `posix_fallocate` analog; `descriptor.set-size` truncates
+;;     rather than pre-allocating. Decided as part of
+;;     cataggar/wabt#180.
+;;   * `fd_renumber` — **permanent ENOSYS**: the component-model
+;;     resource table owns descriptor handle identity; there's no
+;;     "swap fd-numbers" primitive in preview2. Decided as part
+;;     of cataggar/wabt#180.
 ;;   * `sock_*` — ENOSYS stubs only; preview2 `wasi:sockets/*`
 ;;     lift not pursued — preview1 v3 has no socket-creation
 ;;     primitives, so the lift would be functionally moot
@@ -177,6 +183,14 @@
   (type $fd_readdir_sig       (func (param i32 i32 i32 i64 i32) (result i32)))
   (type $fd_sync_sig          (func (param i32) (result i32)))
   (type $fd_datasync_sig      (func (param i32) (result i32)))
+
+  ;; preview1 fd_pread / fd_advise / fd_allocate signatures
+  ;; (cataggar/wabt#180). fd_pread shape is identical to fd_pwrite
+  ;; (fd, iovs, iovs_len, offset, retval_ptr); fd_advise matches
+  ;; fd_filestat_set_times (fd, offset, length, advice — last arg
+  ;; is preview1 advice byte zero-extended to i32); fd_allocate is
+  ;; (fd, offset, length).
+  (type $fd_allocate_sig      (func (param i32 i64 i64) (result i32)))
 
   ;; preview1 path_* signature. `path_open` takes 9 params:
   ;;   (dirfd: i32, dirflags: u32, path_ptr: i32, path_len: i32,
@@ -355,9 +369,19 @@
   ;; `descriptor.<X>-at(self, path: string) -> result<_, error-code>`
   ;; — single-string mutators: `create-directory-at`,
   ;; `remove-directory-at`, `unlink-file-at`. Params are
-  ;; (self, path_ptr, path_len, ret_area).
+  ;; (self, path_ptr, path_len, ret_area). Same shape used by
+  ;; `descriptor.readlink-at` even though its return type is
+  ;; `result<string, error-code>` (12-byte ret-area instead of 8) —
+  ;; the WAT signature only sees the trailing i32 pointer.
   (type $descriptor_path_only_sig
     (func (param i32 i32 i32 i32)))
+
+  ;; `descriptor.advise(self, offset: u64, length: u64,
+  ;; advice: advice) -> result<_, error-code>` backing preview1
+  ;; `fd_advise` (cataggar/wabt#180). 8-byte ret-area for the
+  ;; result.
+  (type $descriptor_advise_sig
+    (func (param i32 i64 i64 i32 i32)))
 
   ;; `descriptor.stat-at(self, path-flags: u8, path: string) ->
   ;; result<descriptor-stat, error-code>` — params (self,

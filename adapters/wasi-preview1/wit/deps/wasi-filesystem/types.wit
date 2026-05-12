@@ -21,9 +21,9 @@
 //     splicer-synthesised.
 //
 // Out of scope for now (still ENOSYS or not exposed at all):
-// `advise`, `read`, `write`, `readlink-at`, `is-same-object`,
-// `metadata-hash`, `metadata-hash-at` — none of these correspond
-// to preview1 imports we need to satisfy in this scope.
+// `read`, `write`, `is-same-object`, `metadata-hash`,
+// `metadata-hash-at` — none of these correspond to preview1
+// imports we need to satisfy in this scope.
 //
 // NOTE: the package declaration for this multi-file slice lives in
 // `preopens.wit` (which sorts before `types.wit` — `p` < `t`).
@@ -101,6 +101,20 @@ interface types {
         symbolic-link,
         regular-file,
         socket,
+    }
+
+    /// Hint passed to `descriptor.advise(offset, length, advice)`
+    /// to inform the host of the caller's intended access pattern.
+    /// Ordinals (0..5) align byte-for-byte with preview1's
+    /// `__wasi_advice_t`, so the adapter forwards the value
+    /// unchanged after a `> 5` bounds check (cataggar/wabt#180).
+    enum advice {
+        normal,
+        sequential,
+        random,
+        will-need,
+        dont-need,
+        no-reuse,
     }
 
     /// Error surface for filesystem operations. Ordinals (0..36)
@@ -281,6 +295,27 @@ interface types {
         /// preview1 fdflags (APPEND / NONBLOCK / RSYNC) have no
         /// preview2 source and stay 0 (cataggar/wabt#179).
         get-flags: func() -> result<descriptor-flags, error-code>;
+
+        /// Backs preview1 `fd_advise(fd, offset, length, advice)`.
+        /// preview1's `__wasi_advice_t` ordinals (NORMAL=0…NOREUSE=5)
+        /// align byte-for-byte with the preview2 `advice` enum, so
+        /// the adapter forwards the value unchanged after a `> 5`
+        /// bounds check (cataggar/wabt#180).
+        advise: func(
+            offset: u64,
+            length: u64,
+            advice: advice
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `path_readlink(fd, path, buf, buf_len,
+        /// bufused)`. Returns the link target as a string; the
+        /// adapter memcpy's `min(returned-len, buf_len)` bytes into
+        /// the caller's `buf` and reports the truncated length in
+        /// `*bufused_ptr` (matches the wasmtime reference adapter
+        /// and POSIX `readlink(3)` semantics — wasi-libc detects
+        /// truncation by re-issuing with a larger buf when
+        /// `bufused == buf_len`). Tracked under cataggar/wabt#180.
+        readlink-at: func(path: string) -> result<string, error-code>;
 
         /// Backs preview1 `path_filestat_get`. Same return shape as
         /// `stat` plus the `(path-flags, path)` lookup arguments.
