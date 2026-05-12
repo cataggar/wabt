@@ -8,8 +8,10 @@
 // calling `fd_prestat_get(fd)` for `fd = 3, 4, 5, …` until
 // `EBADF`, then `fd_prestat_dir_name(fd, buf, buf_len)` to read
 // each name. Both route through `get-directories` on the host
-// side, which returns a `list<tuple<own<descriptor>, string>>` of
-// all preopened directories.
+// side, which returns a `list<tuple<descriptor, string>>` of all
+// preopened directories. The bare `descriptor` tuple element
+// auto-wraps as `own<descriptor>` in the encoder per the
+// component-model spec (cataggar/wabt#182).
 //
 // `use wasi:filesystem/types.{descriptor};` references the
 // `descriptor` resource declared in `types.wit`. The
@@ -19,18 +21,6 @@
 // `src/component/wit/metadata_encode.zig:1525`), so the
 // preview1 world body imports both `wasi:filesystem/types@0.2.6`
 // and `wasi:filesystem/preopens@0.2.6`.
-//
-// NOTE: the tuple element is written as the explicit `own<descriptor>`
-// form rather than canonical bare `descriptor`. The canonical
-// WIT semantics auto-wrap a bare resource ref with `own<>` when
-// it appears in a value-type position (tuple, list, record), but
-// wabt's `metadata_encode` does not yet apply that sugar — so
-// bare `descriptor` inside `tuple<…>` would lower to a
-// `Defined(Tuple([Type(N), String]))` whose first element is a
-// type alias rather than `Defined(Own(N))`. Wasmtime rejects that
-// component with `type index 1 is not a defined type` at parse
-// time. Explicit `own<>` produces the wire bytes wit-component
-// emits canonically. Tracked as a wabt-side encoder follow-up.
 //
 // This file holds the package declaration for the multi-file
 // `wasi:filesystem@0.2.6` slice — `resolver.readWitDir`
@@ -48,5 +38,5 @@ interface preopens {
     /// the guest. Each entry is `(handle, name)` where `handle`
     /// is the preview2 `descriptor` for the directory and `name`
     /// is the path the guest sees the directory mounted under.
-    get-directories: func() -> list<tuple<own<descriptor>, string>>;
+    get-directories: func() -> list<tuple<descriptor, string>>;
 }
