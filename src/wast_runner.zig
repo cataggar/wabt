@@ -23,10 +23,26 @@ pub const Result = struct {
     passed: u32 = 0,
     failed: u32 = 0,
     skipped: u32 = 0,
+    /// When false, the runner suppresses `std.debug.print` lines for
+    /// individual assertion failures. The aggregate `passed` /
+    /// `failed` / `skipped` counts are unaffected. Set this to
+    /// `false` from unit tests that intentionally exercise failing
+    /// assertions (and assert on `result.failed`); leave it `true`
+    /// for `wabt spec run` so a real test failure surfaces a
+    /// per-assertion message on stderr.
+    print_failures: bool = true,
 
     pub fn total(self: Result) u32 {
         return self.passed + self.failed + self.skipped;
     }
+};
+
+/// Knobs for `runWithOptions`. The bare `run(allocator, source)`
+/// helper keeps the previous default (failure prints on).
+pub const Options = struct {
+    /// When false, the runner does not emit per-assertion FAIL
+    /// lines on stderr. See `Result.print_failures`.
+    print_failures: bool = true,
 };
 
 /// A module/instance/interpreter triple.
@@ -693,7 +709,14 @@ const RunState = struct {
 
 /// Run all WAST commands in `source` and return aggregate results.
 pub fn run(allocator: std.mem.Allocator, source: []const u8) Result {
-    var result = Result{};
+    return runWithOptions(allocator, source, .{});
+}
+
+/// Like `run` but with configurable knobs (currently just opt-out
+/// for per-assertion FAIL prints). Used by unit tests that assert
+/// on `result.failed` and don't want the runner's stderr noise.
+pub fn runWithOptions(allocator: std.mem.Allocator, source: []const u8, options: Options) Result {
+    var result = Result{ .print_failures = options.print_failures };
     var pos: usize = 0;
     var state = RunState{ .allocator = allocator };
     defer state.deinit();
@@ -1110,7 +1133,7 @@ fn processAssertInvalid(allocator: std.mem.Allocator, sexpr: []const u8, result:
     };
 
     // Validation unexpectedly succeeded.
-    if (result.failed <= 20) {
+    if (result.print_failures and result.failed <= 20) {
         std.debug.print("  FAIL assert_invalid: validation should have failed: module[0..120]=\"{s}\"\n", .{inner[0..@min(120, inner.len)]});
     }
     result.failed += 1;
@@ -1155,7 +1178,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1; // validation failure = malformed = pass
             return;
         };
-        if (result.failed <= 20)
+        if (result.print_failures and result.failed <= 20)
             std.debug.print("  FAIL assert_malformed(quote): should have been malformed: text[0..120]=\"{s}\"\n", .{wat_text[0..@min(120, wat_text.len)]});
         result.failed += 1; // parsed OK but should have been malformed
         return;
@@ -1178,7 +1201,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
             result.passed += 1;
             return;
         };
-        if (result.failed <= 20) {
+        if (result.print_failures and result.failed <= 20) {
             // Extract expected error message from sexpr
             const expected_msg = extractExpectedMessage(sexpr) orelse "?";
             std.debug.print("  FAIL assert_malformed(binary): parsed OK, expected malformed, {d} bytes, expected=\"{s}\"\n", .{ wasm_bytes.len, expected_msg });
@@ -1216,7 +1239,7 @@ fn processAssertMalformed(allocator: std.mem.Allocator, sexpr: []const u8, resul
         return;
     };
 
-    if (result.failed <= 20)
+    if (result.print_failures and result.failed <= 20)
         std.debug.print("  FAIL assert_malformed(text): should have been malformed: module[0..120]=\"{s}\"\n", .{inner[0..@min(120, inner.len)]});
     result.failed += 1;
 }
@@ -1258,7 +1281,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
     const actuals = interp.callExportMulti(func_name, args, &results_buf) catch |err| {
         interp.thrown_exception = null; // Clear stale exception state
         result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
+        if (result.print_failures and result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): trap {any}\n", .{ func_name, err });
         return;
     };
 
@@ -1279,7 +1302,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
             result.passed += 1;
         } else {
             result.failed += 1;
-            if (result.failed <= 20) {
+            if (result.print_failures and result.failed <= 20) {
                 if (expected.len == 1) {
                     const actual_v = if (actuals.len > 0) actuals[0] else Interp.Value{ .i32 = 0 };
                     std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {any} expected {any}\n", .{ func_name, actual_v, expected[0] });
@@ -1290,7 +1313,7 @@ fn processAssertReturn(allocator: std.mem.Allocator, sexpr: []const u8, state: *
         }
     } else {
         result.failed += 1;
-        if (result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {d} results expected {d}\n", .{ func_name, actuals.len, expected.len });
+        if (result.print_failures and result.failed <= 20) std.debug.print("  FAIL assert_return(invoke \"{s}\"): got {d} results expected {d}\n", .{ func_name, actuals.len, expected.len });
     }
 }
 
@@ -1646,7 +1669,7 @@ fn processAssertReturnGet(get_expr: []const u8, outer: []const u8, state: *RunSt
         result.passed += 1;
     } else {
         result.failed += 1;
-        if (result.failed <= 20) {
+        if (result.print_failures and result.failed <= 20) {
             const name = extractStringLiteral(get_expr) orelse "?";
             std.debug.print("  FAIL assert_return(get \"{s}\"): got {any} expected {any}\n", .{ name, actual, expected[0] });
         }
@@ -2871,7 +2894,11 @@ test "run: mixed commands" {
         \\)
         \\(assert_return (invoke "a") (i32.const 0))
     ;
-    const result = run(std.testing.allocator, wast);
+    // The last assert_return is deliberately expected to fail (no
+    // export `a` in the current module). Use `runWithOptions` with
+    // `print_failures = false` to keep that intentional failure
+    // silent in the test runner's stderr.
+    const result = runWithOptions(std.testing.allocator, wast, .{ .print_failures = false });
     // 1 module (passed) + 1 assert_invalid (passed) + 1 assert_return (failed — no export "a" in current module)
     try std.testing.expectEqual(@as(u32, 3), result.total());
     try std.testing.expectEqual(@as(u32, 2), result.passed);

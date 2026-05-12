@@ -116,3 +116,32 @@ world command {
     /// when the guest exits with a code.
     export wasi:cli/run@0.2.6;
 }
+
+/// Reactor-shape variant of `world command`. Imports the same
+/// preview2 surface but omits the `export wasi:cli/run@0.2.6;`
+/// decl. The wrapping component lifts the embed's own exports
+/// (e.g. `wasi:http/incoming-handler.handle`) directly; the
+/// reactor adapter is a passive preview1 → preview2 bridge with no
+/// entry-point of its own.
+///
+/// Selected at `wabt component new` time by inspecting the embed
+/// core wasm for a `_start` export — present ⇒ `world command`,
+/// absent ⇒ `world reactor`. Tracked under cataggar/wabt#167.
+///
+/// Import block is byte-identical to `world command` above. Keep
+/// the two lists in sync; the encoder's `world_alias_map` ordering
+/// invariant (`src/component/wit/metadata_encode.zig:155`) applies
+/// independently inside each world body.
+world reactor {
+    import wasi:cli/exit@0.2.6;
+    import wasi:io/error@0.2.6;
+    import wasi:io/streams@0.2.6;
+    import wasi:cli/stdout@0.2.6;
+    import wasi:cli/stderr@0.2.6;
+    import wasi:cli/environment@0.2.6;
+    import wasi:clocks/wall-clock@0.2.6;
+    import wasi:clocks/monotonic-clock@0.2.6;
+    import wasi:filesystem/types@0.2.6;
+    import wasi:filesystem/preopens@0.2.6;
+    import wasi:random/random@0.2.6;
+}

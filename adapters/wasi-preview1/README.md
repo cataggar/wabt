@@ -19,7 +19,8 @@ is documented in that issue.
 
 This directory ships:
 
-  * **WAT source** (`src/adapter.wat`) — preview1 surface lowered
+  * **WAT source** (`src/fragments/`, concatenated by
+    `tools/build_adapter.zig`) — preview1 surface lowered
     through preview2:
     * `proc_exit` → `wasi:cli/exit.exit-with-code(u8)` (lossless,
       with `exit(result)` fallback for strict-0.2.0 hosts);
@@ -62,15 +63,27 @@ This directory ships:
     Import order matters: any iface whose body has `use other.{T}`
     must follow `other`; the encoder builds `world_alias_map`
     import-by-import.
-  * **`zig build adapter`** — runs `tools/build_adapter.zig` to
-    parse the WAT, validate it, encode the WIT world via wabt's
-    `metadata_encode.encodeWorldFromResolver`, attach the
-    `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
-    custom section, and self-check the result through the
-    splicer's `adapter/decode.parseFromAdapterCore`. Output:
-    `zig-out/adapter/wasi_snapshot_preview1.command.wasm`. The
-    artifact is also `@embedFile`d into the `wabt` CLI binary as
-    the default `--adapt` source for `wabt component new`.
+
+    The same `wit/preview1.wit` file also declares `world reactor`
+    — same preview2 import list as `command`, but with no
+    `export wasi:cli/run@0.2.6;` decl. See "Reactor variant" below.
+  * **`zig build adapter`** — builds **both** shapes
+    (`wasi_snapshot_preview1.{command,reactor}.wasm`).
+    `tools/build_adapter.zig` concatenates the per-shape WAT
+    fragments from `src/fragments/` (single source of truth for
+    the preview1→preview2 lowering bodies — see
+    `src/fragments/README.md` for the cut rationale), parses +
+    validates the result, encodes the named WIT world via
+    `metadata_encode.encodeWorldFromResolver`, attaches the
+    `component-type:wabt:wasi-preview1@0.0.0:<world>:encoded world`
+    custom section, and self-checks via the splicer's
+    `adapter/decode.parseFromAdapterCore`. Outputs land under
+    `zig-out/adapter/`. Both artifacts are also `@embedFile`d
+    into the `wabt` CLI binary; `wabt component new` auto-picks
+    between them based on whether the embed core exports
+    `_start` (see `src/tools/component_new.zig:pickBuiltinAdapter`).
+    Per-shape steps `zig build adapter-command` /
+    `zig build adapter-reactor` build a single variant.
 
 The `proc_exit` lowering remains the one deliberate divergence
 from the wasmtime reference adapter: `proc_exit(code)` traps with
@@ -84,19 +97,30 @@ host-exit-code 1 through `wasi:cli/exit.exit(result<_, _>)`.
 adapters/wasi-preview1/
 ├── README.md            (this file)
 ├── src/
-│   └── adapter.wat      WAT source — imports preview2, exports preview1
+│   └── fragments/       Per-shape and shared WAT fragments;
+│                        concatenated by `tools/build_adapter.zig`
+│                        into the command-shape and reactor-shape
+│                        artifacts. See `fragments/README.md` for
+│                        the concatenation order and the cut
+│                        points.
 ├── wit/
-│   └── preview1.wit     `world preview1-command`: imports the
-│                        preview2 instances we use, exports
-│                        `wasi:cli/run`
+│   └── preview1.wit     Declares `world command` (exports
+│                        `wasi:cli/run`) AND `world reactor`
+│                        (same imports, no `wasi:cli/run` export).
+│                        Both worlds share the trimmed
+│                        `wit/deps/{wasi-cli, wasi-clocks,
+│                        wasi-filesystem, wasi-io, wasi-random}/`
+│                        slices that declare the preview2 surface.
 └── tools/
     └── build_adapter.zig
-                         small Zig program invoked from build.zig
-                         to: parse WAT → wasm bytes, encode WIT
-                         world → encoded-world bytes, append the
-                         encoded-world as a `component-type:…`
-                         custom section, write the final
-                         `wasi_snapshot_preview1.command.wasm`.
+                         Small Zig program invoked from `build.zig`
+                         to: concatenate the per-shape WAT
+                         fragments → parse → wasm bytes; encode
+                         the named WIT world → encoded-world
+                         bytes; append the encoded-world as a
+                         `component-type:…` custom section; write
+                         the final
+                         `wasi_snapshot_preview1.<shape>.wasm`.
 ```
 
 ## Adapter shape (command shape, per `detectShape` at
@@ -118,8 +142,8 @@ adapters/wasi-preview1/
       `wasi:clocks/{wall-clock, monotonic-clock}@0.2.6`,
       `wasi:random/random@0.2.6`,
       `wasi:filesystem/{preopens, types}@0.2.6`) is enumerated in
-      the `import` block of `src/adapter.wat` and surfaced in the
-      encoded WIT world.
+      the shared body fragment (`src/fragments/body.wat`) and
+      surfaced in the encoded WIT world.
 
 * **Core wasm exports** (flat names, no
   `wasi_snapshot_preview1.` prefix — the splicer maps them to
@@ -158,15 +182,80 @@ adapters/wasi-preview1/
         ([`src/component/adapter/gc.zig`](../../src/component/adapter/gc.zig))
         drops any unused exports at splice time.
 
-* **`component-type:…:command:encoded world` custom section**:
+* **`component-type:…:<world>:encoded world` custom section**:
   produced by `tools/build_adapter.zig` invoking
   [`metadata_encode.encodeWorldFromResolver`](../../src/component/wit/metadata_encode.zig)
-  on `wit/preview1.wit` + `wit/deps/wasi-cli/world.wit`. The splicer
-  decodes this in
+  on `wit/preview1.wit` (`world command` or `world reactor`) +
+  `wit/deps/wasi-cli/world.wit`. The splicer decodes this in
   [`src/component/adapter/decode.zig`](../../src/component/adapter/decode.zig)
   to drive `types-import.hoist`. Section name used here:
-  `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
+  `component-type:wabt:wasi-preview1@0.0.0:<world>:encoded world`
   (any `component-type:*` prefix is accepted by `decode.zig`).
+
+## Reactor variant
+
+A reactor-shape variant of the adapter ships alongside the
+command-shape artifact, tracked under
+[cataggar/wabt#167](https://github.com/cataggar/wabt/issues/167).
+Both artifacts are built by `zig build adapter` and embedded into
+the `wabt` CLI binary; `wabt component new` picks the right one
+automatically.
+
+Differences from the command shape:
+
+* **No `wasi:cli/run@0.2.6#run` export**. The wrapping component
+  lifts the embed's own exports (e.g.
+  `wasi:http/incoming-handler.handle`) directly instead of
+  routing through a `run` entry. The reactor adapter is a
+  passive preview1 → preview2 bridge with no entry point of its
+  own.
+* **No `__main_module__.*` imports**. The splicer's reactor
+  branch (`src/component/adapter/adapter.zig:1226`) explicitly
+  rejects any such import for reactor shape. The shared body
+  still references `$main_start` / `$main_cabi_realloc` — both
+  are supplied as **trap-stub local funcs** by
+  `src/fragments/reactor-impl.wat` so the body parses without
+  dangling references and links into a valid wasm binary.
+* **`world reactor` instead of `world command`** in the encoded
+  WIT custom section — same preview2 import surface, no
+  `wasi:cli/run` export decl. Lives in the same
+  `wit/preview1.wit` file as the command world.
+
+### Auto-selection rule
+
+`wabt component new` (in `src/tools/component_new.zig`) inspects
+the embed core wasm's exports via
+`core_imports.extract(...).interface.findExport("_start")`:
+
+* `_start` exported as a function ⇒ pick
+  `wasi_preview1_command_wasm` (command-shape adapter; `$run`
+  calls `__main_module__._start`).
+* `_start` absent (cleanly-parsing core) ⇒ pick
+  `wasi_preview1_reactor_wasm` (reactor-shape adapter; the
+  wrapping component lifts the embed's own exports directly).
+* Malformed core ⇒ fall back to the command-shape adapter for
+  backwards compatibility with the pre-#167 default.
+
+`--adapt wasi_snapshot_preview1=<file>` and
+`--no-builtin-adapter` continue to override this auto-selection
+exactly as before.
+
+### Functional caveat (deferred)
+
+Until a real reactor fixture motivates the design, the reactor
+adapter has **no source of preview2 scratch memory**: the shared
+`$ensure_ret_area` helper calls `$main_cabi_realloc`, which the
+reactor variant defines as a trap-stub. Every preview1 entry that
+materialises a result through the ret-area scratch page
+(essentially every `fd_*`, `path_*`, `clock_*`, `args_*`,
+`environ_*`) traps deterministically inside `$ensure_ret_area`.
+
+Composing a reactor embed that never calls a preview1 import from
+its lifted entry points still works (no preview1 call ⇒ no ret-
+area allocation ⇒ no trap). Real validation requires a
+`wasi:http/incoming-handler` fixture (or equivalent) — see
+[cataggar/wamr#453][issue]'s "Reactor-shape adapter — deferred"
+open question.
 
 ## Why hand-authored WAT instead of compiled Zig?
 
@@ -201,10 +290,21 @@ record (with three `option<datetime>` slots) into preview1's
 $ zig build adapter
 $ ls zig-out/adapter/
 wasi_snapshot_preview1.command.wasm
+wasi_snapshot_preview1.reactor.wasm
 ```
 
-The artifact is also embedded into the `wabt` CLI binary so that
-`wabt component new` uses it by default when the embed declares
-`wasi_snapshot_preview1.*` imports and `--adapt` is not passed.
-Override the builtin with `--adapt
-wasi_snapshot_preview1=<file.wasm>` (existing flag, unchanged).
+Per-shape build steps:
+
+```console
+$ zig build adapter-command    # only the command-shape artifact
+$ zig build adapter-reactor    # only the reactor-shape artifact
+```
+
+Both artifacts are also embedded into the `wabt` CLI binary so
+that `wabt component new` uses them by default when the embed
+declares `wasi_snapshot_preview1.*` imports and `--adapt` is not
+passed.  `wabt component new` picks command vs reactor based on
+whether the embed core exports `_start` (see "Reactor variant"
+above). Override the builtin with `--adapt
+wasi_snapshot_preview1=<file.wasm>` (existing flag, unchanged) or
+disable the auto-attach entirely with `--no-builtin-adapter`.
