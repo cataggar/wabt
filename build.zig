@@ -85,17 +85,31 @@ pub fn build(b: *std.Build) void {
     // `adapters/wasi-preview1/README.md` for the surface coverage, the
     // current scaffold status, and the roadmap up to the embedded-default
     // adapter for `wabt component new` (tracked under cataggar/wamr#453).
+    // Build the tool for the actual host machine (NOT the user's
+    // `-Dtarget`): the tool runs at build time on the build platform
+    // to produce the adapter wasm. `b.graph.host` in Zig 0.16 returns
+    // the user-selected `-Dtarget` when one is set (verified failing
+    // on the `wasi`/`riscv64` release matrix entries), so we resolve
+    // the native query explicitly here.
+    const native_host = b.resolveTargetQuery(.{});
+
+    // The wabt module itself is compiled for the user's target; the
+    // tool needs a separate copy compiled for the host so the
+    // build-time `build-wasi-preview1-adapter` exe is executable on
+    // the CI runner.
+    const wabt_host_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = native_host,
+        .optimize = optimize,
+    });
+    wabt_host_mod.addOptions("build_options", options);
+
     const adapter_tool_mod = b.createModule(.{
         .root_source_file = b.path("adapters/wasi-preview1/tools/build_adapter.zig"),
-        // Build the tool for the host so we can run it; the adapter
-        // artifact it emits is the wasm target itself.
-        .target = b.graph.host,
+        .target = native_host,
         .optimize = optimize,
-        .strip = if (strip) true else null,
-        .stack_protector = if (stack_protector) true else null,
-        .link_libc = if (link_libc) true else null,
         .imports = &.{
-            .{ .name = "wabt", .module = wabt_mod },
+            .{ .name = "wabt", .module = wabt_host_mod },
         },
     });
     const adapter_tool_exe = b.addExecutable(.{
