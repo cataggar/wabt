@@ -56,7 +56,8 @@ This directory ships:
     * `sched_yield` → trivial success;
     * `proc_raise`, `fd_fdstat_set_flags`, `sock_*` → `ENOSYS=52`
       (no preview2 equivalent in 0.2.6 / deferred to
-      cataggar/wabt#168).
+      cataggar/wabt#178 [sockets] +
+      cataggar/wabt#179 [fdstat]).
   * **WIT world** (`wit/preview1.wit` + `wit/deps/{wasi-cli,
     wasi-clocks, wasi-filesystem, wasi-io, wasi-random}/`) —
     declares the full preview2 surface the adapter consumes.
@@ -177,7 +178,7 @@ adapters/wasi-preview1/
         `random_get`,
         `sock_accept`, `sock_recv`, `sock_send`, `sock_shutdown`
         (sockets are inline `ENOSYS=52` stubs; the preview2
-        `wasi:sockets/*` lift is deferred to cataggar/wabt#168).
+        `wasi:sockets/*` lift is deferred to cataggar/wabt#178).
         wabt's adapter-core-wasm GC pass
         ([`src/component/adapter/gc.zig`](../../src/component/adapter/gc.zig))
         drops any unused exports at splice time.
