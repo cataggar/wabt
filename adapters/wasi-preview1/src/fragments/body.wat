@@ -34,6 +34,34 @@
   (import "wasi:cli/stderr@0.2.6" "get-stderr"
     (func $get_stderr (type $get_stream_sig)))
 
+  ;; `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-<n>() ->
+  ;; option<own<terminal-{input,output}>>` backing the preview1
+  ;; `fd_fdstat_get` stdio terminal probe (cataggar/wabt#179). The
+  ;; canon-ABI lowers `option<own<R>>` to an 8-byte ret-area:
+  ;;   offset 0: u8 tag (0 = None, 1 = Some) + 3 bytes pad
+  ;;   offset 4: u32 resource-handle index (defined when tag == 1)
+  ;; The flat lowering of the *call* is therefore a single
+  ;; ret-area pointer arg (`$i32_void`); the actual flat results
+  ;; (the 2 i32s the option occupies in registers) exceed
+  ;; max-flat-results=1 and force the ret-area path.
+  (import "wasi:cli/terminal-stdin@0.2.6" "get-terminal-stdin"
+    (func $get_terminal_stdin (type $i32_void)))
+  (import "wasi:cli/terminal-stdout@0.2.6" "get-terminal-stdout"
+    (func $get_terminal_stdout (type $i32_void)))
+  (import "wasi:cli/terminal-stderr@0.2.6" "get-terminal-stderr"
+    (func $get_terminal_stderr (type $i32_void)))
+
+  ;; `[resource-drop]terminal-input` / `[resource-drop]terminal-output`
+  ;; — the splicer detects these import names and synthesizes the
+  ;; canon `resource.drop` for us. Called from the
+  ;; `$probe_<n>_tty` helpers right after reading the tag byte:
+  ;; we don't need to keep the handle alive, only the boolean
+  ;; "is fd N a tty?" gets cached.
+  (import "wasi:cli/terminal-input@0.2.6" "[resource-drop]terminal-input"
+    (func $terminal_input_drop (type $i32_void)))
+  (import "wasi:cli/terminal-output@0.2.6" "[resource-drop]terminal-output"
+    (func $terminal_output_drop (type $i32_void)))
+
   ;; The single hot-path output-stream method we'll lower against
   ;; in fd_write. `blocking-` is the right choice for the preview1
   ;; `fd_write` contract (caller expects all bytes drained or a
@@ -192,6 +220,28 @@
     "[method]descriptor.stat"
     (func $descriptor_stat (type $descriptor_void_sig)))
 
+  ;; `[method]descriptor.get-type(self) -> result<descriptor-type,
+  ;; error-code>` backing preview1 `fd_fdstat_get` (fd ≥ 3 branch).
+  ;; ret-area is 2 bytes, align 1: tag u8 at offset 0, payload u8
+  ;; at offset 1 (preview2 `descriptor-type` enum ordinal on
+  ;; tag=0, `error-code` enum ordinal on tag=1). The adapter
+  ;; converts the OK payload via `$preview1_filetype_from_descriptor_type`
+  ;; (cataggar/wabt#179).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.get-type"
+    (func $descriptor_get_type (type $descriptor_void_sig)))
+
+  ;; `[method]descriptor.get-flags(self) -> result<descriptor-flags,
+  ;; error-code>` backing preview1 `fd_fdstat_get` (fd ≥ 3 branch).
+  ;; ret-area shape identical to `get-type`: tag u8 at 0, payload
+  ;; u8 at 1 (preview2 `descriptor-flags` bitmap on tag=0; the
+  ;; flag set has 6 bits so packs into a single byte). The
+  ;; adapter extracts preview1 `fs_flags` via
+  ;; `$preview1_fs_flags_from_descriptor_flags` (cataggar/wabt#179).
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.get-flags"
+    (func $descriptor_get_flags (type $descriptor_void_sig)))
+
   ;; `[method]descriptor.stat-at(self, path-flags: u8, path: string)
   ;; -> result<descriptor-stat, error-code>` backing preview1
   ;; `path_filestat_get`. Same payload layout as `stat`.
@@ -310,6 +360,22 @@
   ;; splicer's GC anchor but never invoked from here.
   (global $stdout_handle (mut i32) (i32.const -1))
   (global $stderr_handle (mut i32) (i32.const -1))
+
+  ;; Stdio tty-probe cache for `fd_fdstat_get` (cataggar/wabt#179).
+  ;; Each fd 0 / 1 / 2 gets a pair:
+  ;;   `<fd>_is_tty_cached` — 0 until the first probe, then 1.
+  ;;   `<fd>_is_tty`        — populated by the probe, 1 if Some, 0
+  ;;                          if None.
+  ;; The probe queries `wasi:cli/terminal-<n>.get-terminal-<n>()`
+  ;; once per process, drops the returned handle immediately
+  ;; (we only need the boolean), and stashes the result.
+  ;; preview1 is single-threaded so a plain mut i32 is safe.
+  (global $stdin_is_tty_cached  (mut i32) (i32.const 0))
+  (global $stdin_is_tty         (mut i32) (i32.const 0))
+  (global $stdout_is_tty_cached (mut i32) (i32.const 0))
+  (global $stdout_is_tty        (mut i32) (i32.const 0))
+  (global $stderr_is_tty_cached (mut i32) (i32.const 0))
+  (global $stderr_is_tty        (mut i32) (i32.const 0))
 
   ;; Scratch return-area for canon-lower'd preview2 calls whose
   ;; result type doesn't fit in flat parameters. Reused for:
@@ -507,6 +573,114 @@
       call $get_stderr
       global.set $stderr_handle
       global.get $stderr_handle
+    end)
+
+  ;; Helper: probe whether preview1 fd 0 (stdin) is connected to a
+  ;; terminal. Caches the boolean across calls so the first
+  ;; `fd_fdstat_get(0, …)` pays the host round-trip and every
+  ;; subsequent call is a pure read. Used by `$fd_fdstat_get` to
+  ;; report `__WASI_FILETYPE_CHARACTER_DEVICE` for tty stdin
+  ;; vs `__WASI_FILETYPE_UNKNOWN` for redirected stdin
+  ;; (cataggar/wabt#179).
+  ;;
+  ;; ret-area layout for `option<own<terminal-input>>` (8 bytes,
+  ;; align 4):
+  ;;   offset 0: u8 tag (0 = None, 1 = Some) + 3 pad
+  ;;   offset 4: u32 handle (defined when tag == 1)
+  ;;
+  ;; We use the short-lived ret-slot at offset 0 of the 64 KiB
+  ;; scratch page (the same 32-byte slot every other 8-byte
+  ;; canon-ABI result uses).
+  (func $probe_stdin_tty (result i32)
+    (local $ra i32)
+    global.get $stdin_is_tty_cached
+    if (result i32)
+      global.get $stdin_is_tty
+      return
+    else
+      call $ensure_ret_area
+      local.set $ra
+      local.get $ra
+      call $get_terminal_stdin
+      local.get $ra
+      i32.load8_u offset=0
+      if
+        ;; Some: drop the returned handle and cache true.
+        local.get $ra
+        i32.load offset=4
+        call $terminal_input_drop
+        i32.const 1
+        global.set $stdin_is_tty
+      else
+        i32.const 0
+        global.set $stdin_is_tty
+      end
+      i32.const 1
+      global.set $stdin_is_tty_cached
+      global.get $stdin_is_tty
+    end)
+
+  ;; Helper: probe whether preview1 fd 1 (stdout) is connected to a
+  ;; terminal. Same shape as `$probe_stdin_tty` but against
+  ;; `terminal-stdout.get-terminal-stdout()`; the returned handle
+  ;; is `own<terminal-output>` so we use the matching drop.
+  (func $probe_stdout_tty (result i32)
+    (local $ra i32)
+    global.get $stdout_is_tty_cached
+    if (result i32)
+      global.get $stdout_is_tty
+      return
+    else
+      call $ensure_ret_area
+      local.set $ra
+      local.get $ra
+      call $get_terminal_stdout
+      local.get $ra
+      i32.load8_u offset=0
+      if
+        local.get $ra
+        i32.load offset=4
+        call $terminal_output_drop
+        i32.const 1
+        global.set $stdout_is_tty
+      else
+        i32.const 0
+        global.set $stdout_is_tty
+      end
+      i32.const 1
+      global.set $stdout_is_tty_cached
+      global.get $stdout_is_tty
+    end)
+
+  ;; Helper: probe whether preview1 fd 2 (stderr) is connected to a
+  ;; terminal. Mirrors `$probe_stdout_tty` against
+  ;; `terminal-stderr.get-terminal-stderr()`.
+  (func $probe_stderr_tty (result i32)
+    (local $ra i32)
+    global.get $stderr_is_tty_cached
+    if (result i32)
+      global.get $stderr_is_tty
+      return
+    else
+      call $ensure_ret_area
+      local.set $ra
+      local.get $ra
+      call $get_terminal_stderr
+      local.get $ra
+      i32.load8_u offset=0
+      if
+        local.get $ra
+        i32.load offset=4
+        call $terminal_output_drop
+        i32.const 1
+        global.set $stderr_is_tty
+      else
+        i32.const 0
+        global.set $stderr_is_tty
+      end
+      i32.const 1
+      global.set $stderr_is_tty_cached
+      global.get $stderr_is_tty
     end)
 
   ;; Helper: ensure `$ret_area` points at the 64 KiB scratch page
@@ -1694,70 +1868,181 @@
     i32.const 0)
 
   ;; preview1 `fd_fdstat_get(fd, statbuf_ptr) -> errno`.
-  ;; Stdio (fd 0/1/2) writes a 24-byte `fdstat` reporting
-  ;; `fs_filetype = character_device (2)` so Zig's stdlib and
-  ;; Rust's `is_terminal()` enter their TTY / line-buffered
-  ;; codepaths. Rights bits mirror the wasmtime reference
-  ;; adapter's stdio branch: `FD_READ` (bit 1 → 0x02) for fd 0,
-  ;; `FD_WRITE` (bit 6 → 0x40) for fd 1/2.
   ;;
-  ;; Deliberate divergence from the wasmtime adapter: that adapter
-  ;; calls `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-*`
-  ;; and falls back to `FILETYPE_UNKNOWN` when stdio isn't actually
-  ;; a tty. We unconditionally report `character_device` to keep
-  ;; this change in the "no new preview2 imports" bucket of
-  ;; cataggar/wabt#179. The trade-off is that a guest redirected to
-  ;; a file/pipe still believes it's writing to a tty — acceptable
-  ;; for the v3 scope (CLI fixtures); revisit alongside the
-  ;; terminal-* imports if a fixture surfaces the mismatch.
+  ;; Writes a 24-byte `fdstat` record at `statbuf_ptr`. Layout
+  ;; (align 8, matches wasi-libc's `__wasi_fdstat_t`):
   ;;
-  ;; preview1 fdstat layout (24 bytes, align 8):
-  ;;   offset 0:  u8  fs_filetype          (= 2, character_device)
-  ;;   offset 1:  pad
-  ;;   offset 2:  u16 fs_flags             (= 0; no FDFLAGS for stdio)
-  ;;   offset 4:  pad (4 bytes)
-  ;;   offset 8:  u64 fs_rights_base       (= FD_READ / FD_WRITE)
-  ;;   offset 16: u64 fs_rights_inheriting (= 0)
+  ;;   offset 0:  u8  fs_filetype          (character_device / regular_file / …)
+  ;;   offset 1:  u8  pad
+  ;;   offset 2:  u16 fs_flags             (APPEND / DSYNC / NONBLOCK / RSYNC / SYNC)
+  ;;   offset 4:  u32 pad
+  ;;   offset 8:  u64 fs_rights_base       (FD_READ / FD_WRITE / …)
+  ;;   offset 16: u64 fs_rights_inheriting (sub-fd rights mask)
   ;;
-  ;; fd >= 3 keeps the ENOSYS=52 stub — preview2 has
-  ;; `descriptor.{get-flags, get-type}` we could lift here, but the
-  ;; preview1 `fdstat` also needs `fs_rights_*` which has no
-  ;; preview2 equivalent. Tracked under cataggar/wabt#179.
+  ;; Two dispatch branches:
+  ;;
+  ;;   fd 0 / 1 / 2 (stdio) — probe
+  ;;     `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-<n>`
+  ;;     once per process (cached) and report
+  ;;     `__WASI_FILETYPE_CHARACTER_DEVICE` (2) when the option is
+  ;;     `Some` or `__WASI_FILETYPE_UNKNOWN` (0) when stdio is
+  ;;     redirected to a file/pipe. Rights are
+  ;;     `FD_READ`/`FD_WRITE` regardless of tty-ness (wasi-libc
+  ;;     gates `read()` / `write()` on the rights bits even on
+  ;;     redirected stdio). Matches wasmtime reference adapter
+  ;;     behavior. Tracked under cataggar/wabt#179.
+  ;;
+  ;;   fd ≥ 3 (user fd) — resolve fd → descriptor handle via
+  ;;     `$resolve_fd_handle`; call
+  ;;     `wasi:filesystem/types.descriptor.get-type` and
+  ;;     `…descriptor.get-flags`; map preview2 enum → preview1
+  ;;     filetype byte via `$preview1_filetype_from_descriptor_type`;
+  ;;     map preview2 descriptor-flags bitmap → preview1 fs_flags via
+  ;;     `$preview1_fs_flags_from_descriptor_flags`; synthesise
+  ;;     rights from the filetype via
+  ;;     `$preview1_rights_{base,inheriting}_from_filetype`.
+  ;;     Errors from either preview2 call map to preview1 errno
+  ;;     via `$errno_from_error_code`.
   (func $fd_fdstat_get (type $fd_fdstat_get_sig)
-    (local $rights i64)
-    local.get 0
-    i32.const 3
-    i32.ge_u
+    (local $ra i32) (local $handle i32) (local $err i32)
+    (local $filetype i32) (local $fs_flags i32)
+    ;; ── Stdio branch (fd 0 / 1 / 2) ──
+    local.get 0  i32.const 3  i32.lt_u
     if
-      i32.const 52   ;; ENOSYS for non-stdio fds
+      ;; Probe terminal-ness via the cached helper for this fd.
+      local.get 0  i32.eqz
+      if
+        call $probe_stdin_tty
+        local.set $filetype
+      else
+        local.get 0  i32.const 1  i32.eq
+        if
+          call $probe_stdout_tty
+          local.set $filetype
+        else
+          call $probe_stderr_tty
+          local.set $filetype
+        end
+      end
+      ;; Map boolean → preview1 filetype: tty → CHARACTER_DEVICE
+      ;; (2), non-tty → UNKNOWN (0).
+      local.get $filetype
+      if (result i32) i32.const 2 else i32.const 0 end
+      local.set $filetype
+      ;; Zero bytes 0..8 then overlay filetype at offset 0.
+      ;; statbuf_ptr is guaranteed 8-aligned by the canon ABI
+      ;; (fdstat has _Alignof == 8 in wasi-libc).
+      local.get 1
+      i64.const 0
+      i64.store offset=0       ;; clears filetype + pad + fs_flags + pad
+      local.get 1
+      local.get $filetype
+      i32.store8 offset=0      ;; overlay fs_filetype
+      ;; rights: fd == 0 → FD_READ (0x02); fd ∈ {1,2} → FD_WRITE (0x40)
+      local.get 1
+      local.get 0  i32.eqz
+      if (result i64) i64.const 0x02 else i64.const 0x40 end
+      i64.store offset=8       ;; fs_rights_base
+      local.get 1
+      i64.const 0
+      i64.store offset=16      ;; fs_rights_inheriting
+      i32.const 0              ;; SUCCESS
       return
     end
-    ;; rights: fd == 0 → FD_READ (0x02); fd ∈ {1,2} → FD_WRITE (0x40)
+    ;; ── User-fd branch (fd ≥ 3) ──
+    call $ensure_ret_area
+    local.set $ra
+    ;; Reserve $ra + 12 for $resolve_fd_handle's scratch (it uses
+    ;; 0..12 of its own ret-area arg). Pass $ra + 16 as the
+    ;; out_handle_ptr; $ra + 20 onward is free for the preview2
+    ;; call ret-area.
     local.get 0
-    i32.eqz
-    if (result i64)
-      i64.const 0x02
-    else
-      i64.const 0x40
+    local.get $ra  i32.const 16 i32.add
+    call $resolve_fd_handle
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.const 16
+    i32.add
+    i32.load
+    local.set $handle
+    ;; descriptor.get-type → result<descriptor-type, error-code>
+    ;; ret-area is 2 bytes at $ra+20: tag u8 at 0, payload u8 at 1.
+    local.get $handle
+    local.get $ra  i32.const 20 i32.add
+    call $descriptor_get_type
+    local.get $ra  i32.const 20 i32.add
+    i32.load8_u offset=0
+    if
+      ;; err: payload u8 at offset 1 is the error-code ordinal.
+      local.get $ra  i32.const 20 i32.add
+      i32.load8_u offset=1
+      call $errno_from_error_code
+      return
     end
-    local.set $rights
-    ;; Zero bytes 0..8 then overlay filetype at offset 0.
-    ;; statbuf_ptr is guaranteed 8-aligned by the canon ABI
-    ;; (fdstat has _Alignof == 8 in wasi-libc).
+    local.get $ra  i32.const 20 i32.add
+    i32.load8_u offset=1
+    call $preview1_filetype_from_descriptor_type
+    local.set $filetype
+    ;; descriptor.get-flags → result<descriptor-flags, error-code>
+    ;; Same shape as get-type. Reuse $ra+20.
+    local.get $handle
+    local.get $ra  i32.const 20 i32.add
+    call $descriptor_get_flags
+    local.get $ra  i32.const 20 i32.add
+    i32.load8_u offset=0
+    if
+      local.get $ra  i32.const 20 i32.add
+      i32.load8_u offset=1
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra  i32.const 20 i32.add
+    i32.load8_u offset=1
+    call $preview1_fs_flags_from_descriptor_flags
+    local.set $fs_flags
+    ;; Write the fdstat record. Zero the first 8 bytes (filetype +
+    ;; pad + fs_flags + pad) then overlay filetype + fs_flags.
     local.get 1
     i64.const 0
-    i64.store offset=0       ;; clears filetype + pad + fs_flags + pad
+    i64.store offset=0
     local.get 1
-    i32.const 2              ;; character_device
-    i32.store8 offset=0      ;; overlay fs_filetype
+    local.get $filetype
+    i32.store8 offset=0
     local.get 1
-    local.get $rights
-    i64.store offset=8       ;; fs_rights_base
+    local.get $fs_flags
+    i32.store16 offset=2
+    ;; rights_base = synthesised from filetype.
     local.get 1
-    i64.const 0
-    i64.store offset=16      ;; fs_rights_inheriting
+    local.get $filetype
+    call $preview1_rights_base_from_filetype
+    i64.store offset=8
+    ;; rights_inheriting = directory inheriting mask (else 0).
+    local.get 1
+    local.get $filetype
+    call $preview1_rights_inheriting_from_filetype
+    i64.store offset=16
     i32.const 0)             ;; SUCCESS
 
+  ;; preview1 `fd_fdstat_set_flags(fd, fdflags) -> errno`.
+  ;;
+  ;; **Permanent ENOSYS** — preview2 `wasi:filesystem/types@0.2.6`
+  ;; doesn't expose a "set descriptor-flags after open" operation.
+  ;; The flag bag (`descriptor-flags`) is consumed by
+  ;; `descriptor.open-at` and is fixed for the lifetime of the
+  ;; resulting handle.
+  ;;
+  ;; A "re-open via `open-at` with the new flag set" workaround
+  ;; would let us preserve the flag bits, but at the cost of
+  ;; minting a new descriptor handle while the preview1 caller
+  ;; expects `fd` to keep pointing at the same underlying file
+  ;; (matters for POSIX semantics around `flock`, `seek`,
+  ;; truncation, etc.). Failing deterministically with `ENOSYS`
+  ;; is the principled choice: wasi-libc routes the error to
+  ;; `fcntl(F_SETFL)`'s errno and the program decides what to do.
+  ;;
+  ;; Decided as part of cataggar/wabt#179; revisit if preview2
+  ;; grows mutator support for descriptor-flags.
   (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags_sig) i32.const 52)
 
   ;; Helper: resolve a preview1 fd to a descriptor handle, ignoring
@@ -2263,6 +2548,67 @@
     local.get $dt  i32.const 6  i32.eq          if i32.const 4 return end
     local.get $dt  i32.const 7  i32.eq          if i32.const 5 return end
     i32.const 0)
+
+  ;; Helper: project preview2 `descriptor-flags` (u8 bitmap) into the
+  ;; preview1 `fs_flags` (u16 field of the fdstat record). Mapping:
+  ;;
+  ;;   preview2 bit                  → preview1 bit
+  ;;   ────────────────────────────────────────────
+  ;;   0  read                       → (no preview1 fdflags)
+  ;;   1  write                      → (no preview1 fdflags)
+  ;;   2  file-integrity-sync (0x04) → SYNC (0x10)
+  ;;   3  data-integrity-sync (0x08) → DSYNC (0x02)
+  ;;   4  requested-write-sync       → (no preview1 fdflags)
+  ;;   5  mutate-directory           → (no preview1 fdflags)
+  ;;
+  ;; preview1 APPEND / NONBLOCK / RSYNC have no preview2 source in
+  ;; 0.2.6 (the open-time `descriptor-flags` set drops them), so
+  ;; the returned bits never include those. Wasi-libc emulates
+  ;; APPEND on the guest side anyway (see the comment on
+  ;; `$descriptor_append_via_stream`). Tracked under cataggar/wabt#179.
+  (func $preview1_fs_flags_from_descriptor_flags
+    (param $df i32) (result i32)
+    (local $out i32)
+    ;; preview2 file-integrity-sync (bit 2) → preview1 SYNC (bit 4).
+    local.get $df  i32.const 0x04  i32.and
+    if  local.get $out  i32.const 0x10  i32.or  local.set $out  end
+    ;; preview2 data-integrity-sync (bit 3) → preview1 DSYNC (bit 1).
+    local.get $df  i32.const 0x08  i32.and
+    if  local.get $out  i32.const 0x02  i32.or  local.set $out  end
+    local.get $out)
+
+  ;; Helper: synthesize preview1 `fs_rights_base` (u64) from a
+  ;; preview1 filetype byte. The wasi-libc handle layer inspects
+  ;; this field to gate syscalls before they reach the host, so the
+  ;; values must align with the wasmtime reference adapter's
+  ;; bitmaps (otherwise wasi-libc may refuse to issue `read(fd, …)`
+  ;; on a regular-file fd we wired through `$fd_read`).
+  ;;
+  ;;   Directory (3):    `RIGHTS_DIRECTORY_BASE`   = 0x0fbffe00
+  ;;   Regular file (4): `RIGHTS_REGULAR_FILE_BASE`= 0x008e001ff
+  ;;   Everything else:  `RIGHTS_FD_FILESTAT_GET` only (bit 21).
+  ;;
+  ;; Tracked under cataggar/wabt#179.
+  (func $preview1_rights_base_from_filetype
+    (param $ft i32) (result i64)
+    local.get $ft  i32.const 3  i32.eq
+    if i64.const 0x0fbffe00 return end
+    local.get $ft  i32.const 4  i32.eq
+    if i64.const 0x08e001ff return end
+    ;; Default: FD_FILESTAT_GET only.
+    i64.const 0x200000)
+
+  ;; Helper: synthesize preview1 `fs_rights_inheriting` (u64). Only
+  ;; meaningful for directories: a sub-fd opened via `path_open`
+  ;; inherits both the directory's own rights AND the full file
+  ;; rights set (0xfbffe00 | 0x8e001ff = 0xfffffff). For regular
+  ;; files and other non-directory filetypes there's nothing to
+  ;; inherit — the field is 0.
+  (func $preview1_rights_inheriting_from_filetype
+    (param $ft i32) (result i64)
+    local.get $ft  i32.const 3  i32.eq
+    if i64.const 0xfffffff return end
+    i64.const 0)
 
   ;; Helper: read an `option<datetime>` slot at `$opt_ptr` (24
   ;; bytes: tag at 0, datetime{seconds u64, nanoseconds u32} at 8)

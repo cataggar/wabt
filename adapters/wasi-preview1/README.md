@@ -52,12 +52,22 @@ This directory ships:
       get-environment}`;
     * `clock_time_get` / `clock_res_get` →
       `wasi:clocks/{wall-clock, monotonic-clock}`;
+    * `fd_fdstat_get` → stdio probes
+      `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-<n>`
+      (cached per-fd) to report `CHARACTER_DEVICE` for tty stdio
+      vs `UNKNOWN` for redirected stdio; user-fd branch lifts
+      `descriptor.{get-type, get-flags}` and synthesises
+      `fs_rights_*` from the resolved preview1 filetype
+      (cataggar/wabt#179);
     * `random_get` → `wasi:random/random.get-random-bytes`;
     * `sched_yield` → trivial success;
-    * `proc_raise`, `fd_fdstat_set_flags`, `sock_*` → `ENOSYS=52`
-      (no preview2 equivalent in 0.2.6 / deferred to
-      cataggar/wabt#178 [sockets] +
-      cataggar/wabt#179 [fdstat]).
+    * `proc_raise` → `ENOSYS=52` (advisory; no preview2 equivalent);
+    * `fd_fdstat_set_flags` → `ENOSYS=52` permanently: preview2
+      0.2.6 has no descriptor-flags mutator and re-opening would
+      lose fd identity (cataggar/wabt#179, closed);
+    * `sock_*` → `ENOSYS=52` permanently: preview1 v3 has no
+      socket-creation primitives so the lift would be moot
+      (cataggar/wabt#178, closed as won't-implement).
   * **WIT world** (`wit/preview1.wit` + `wit/deps/{wasi-cli,
     wasi-clocks, wasi-filesystem, wasi-io, wasi-random}/`) —
     declares the full preview2 surface the adapter consumes.
