@@ -157,11 +157,18 @@ pub fn encodeWorldFromResolver(
                 const ext = we;
                 const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
                 const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map);
+                const iface_type_idx = world_type_idx;
                 try world_decls.append(ar, .{ .type = .{
                     .instance = .{ .decls = iface_decls },
                 } });
                 world_type_idx += 1;
-                const desc: ctypes.ExternDesc = .{ .instance = inst_idx };
+                // ExternDesc.instance carries the TYPE index of the
+                // just-allocated instance-type slot — NOT the
+                // instance index. The two diverge as soon as a `use`
+                // clause surfaces an `alias instance-export` decl
+                // between imports, since aliases bump
+                // `world_type_idx` without bumping `inst_idx`.
+                const desc: ctypes.ExternDesc = .{ .instance = iface_type_idx };
                 if (is_export) {
                     try world_decls.append(ar, .{ .@"export" = .{
                         .name = iface_name,
@@ -393,8 +400,8 @@ fn buildInterfaceBody(
                     for (fields, 0..) |f, i| {
                         lowered[i] = .{ .name = f.name, .type = try builder.lowerType(f.type) };
                     }
-                    const vt = try builder.appendCompound(.{ .record = .{ .fields = lowered } });
-                    try builder.bindName(td.name, vt);
+                    const body_vt = try builder.appendCompound(.{ .record = .{ .fields = lowered } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
                 },
                 .variant => |cases| {
                     const lowered = try ar.alloc(ctypes.Case, cases.len);
@@ -405,32 +412,34 @@ fn buildInterfaceBody(
                             null;
                         lowered[i] = .{ .name = c.name, .type = payload };
                     }
-                    const vt = try builder.appendCompound(.{ .variant = .{ .cases = lowered } });
-                    try builder.bindName(td.name, vt);
+                    const body_vt = try builder.appendCompound(.{ .variant = .{ .cases = lowered } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
                 },
                 .@"enum" => |names| {
-                    const vt = try builder.appendCompound(.{ .enum_ = .{ .names = names } });
-                    try builder.bindName(td.name, vt);
+                    const body_vt = try builder.appendCompound(.{ .enum_ = .{ .names = names } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
                 },
                 .flags => |names| {
-                    const vt = try builder.appendCompound(.{ .flags = .{ .names = names } });
-                    try builder.bindName(td.name, vt);
+                    const body_vt = try builder.appendCompound(.{ .flags = .{ .names = names } });
+                    try builder.exportNamedType(td.name, body_vt.type_idx);
                 },
                 .resource => |methods| {
-                    // Resource decl: `TypeDef.resource { destructor: null }`
-                    // consumes one slot; the resource's external name is
-                    // then bound via an `exportname'` decl with a
-                    // `type (eq <idx>)` descriptor — matching the wire
-                    // shape wamr's loader test fixture at
-                    // `loader.zig:897` expects from canonical
-                    // wit-component output.
+                    // Per the component-model spec, resources cannot
+                    // be *defined* with `(sub resource)` as a typedef
+                    // body decl inside a component-TYPE (only inside
+                    // a concrete component). Within a `(type
+                    // (instance ...))` decl inside a
+                    // `(type (component ...))`, the resource is
+                    // introduced via an `export` decl whose extern
+                    // desc carries the `(sub resource)` bound; that
+                    // export allocates a fresh slot in the
+                    // surrounding type space.
                     const resource_idx = builder.type_idx;
-                    try builder.decls.append(ar, .{ .type = .{ .resource = .{ .destructor = null } } });
-                    builder.type_idx += 1;
                     try builder.decls.append(ar, .{ .@"export" = .{
                         .name = td.name,
-                        .desc = .{ .type = .{ .eq = resource_idx } },
+                        .desc = .{ .type = .sub_resource },
                     } });
+                    builder.type_idx += 1;
                     try builder.bindName(td.name, .{ .type_idx = resource_idx });
 
                     // Methods / statics / constructors synthesize their
@@ -443,11 +452,11 @@ fn buildInterfaceBody(
                     for (methods) |m| {
                         const ext_name = try formatResourceMemberName(ar, m.kind, td.name, m.name);
                         const self_param: ?ctypes.NamedValType = switch (m.kind) {
-                            .method => .{ .name = "self", .type = .{ .borrow = resource_idx } },
+                            .method => .{ .name = "self", .type = try builder.handleSlot(resource_idx, .borrow) },
                             .static, .constructor => null,
                         };
                         const constructor_result: ?ctypes.ValType = switch (m.kind) {
-                            .constructor => .{ .own = resource_idx },
+                            .constructor => try builder.handleSlot(resource_idx, .own),
                             .method, .static => null,
                         };
                         try builder.emitFuncExport(
@@ -490,11 +499,19 @@ fn buildInterfaceBody(
                     } } });
                     builder.type_idx += 1;
                     const visible_name = un.rename orelse un.name;
+                    // The Export Eq itself allocates a fresh slot in
+                    // wasm-tools' type-index view; bump our counter
+                    // and bind the name to that export slot so
+                    // downstream `borrow<R>` / `own<R>` references
+                    // resolve through the named export id (required
+                    // by wasm-tools' `validate_and_register_named_types`).
                     try builder.decls.append(ar, .{ .@"export" = .{
                         .name = visible_name,
                         .desc = .{ .type = .{ .eq = local_idx } },
                     } });
-                    try builder.bindName(visible_name, .{ .type_idx = local_idx });
+                    const export_slot = builder.type_idx;
+                    builder.type_idx += 1;
+                    try builder.bindName(visible_name, .{ .type_idx = export_slot });
                 }
             },
         }
@@ -582,21 +599,43 @@ const BodyBuilder = struct {
         };
     }
 
+    const HandleKind = enum { borrow, own };
+
     /// Resolve `borrow<R>` / `own<R>` to a handle ValType. The named
     /// resource must already be bound in `name_map`, and that
     /// binding must be a `type_idx` — borrowing or owning a
     /// non-resource named type (e.g. an alias to `u32`) is malformed.
+    ///
+    /// Per the component-model spec, handle types (`borrow<R>`,
+    /// `own<R>`) are *defined* types — they must occupy their own
+    /// typedef slot in the surrounding type space; the func-param
+    /// position then references that slot via its typeidx. We
+    /// allocate a fresh slot per use (no interning); external
+    /// tooling (wasm-tools / wasmtime) accepts duplicate slots and
+    /// the encoded section size cost is one byte per handle.
     fn handleValType(
         self: *BodyBuilder,
         resource_name: []const u8,
-        kind: enum { borrow, own },
+        kind: HandleKind,
     ) EncodeError!ctypes.ValType {
         const bound = self.name_map.get(resource_name) orelse return error.InvalidWit;
         if (bound != .type_idx) return error.InvalidWit;
-        return switch (kind) {
-            .borrow => .{ .borrow = bound.type_idx },
-            .own => .{ .own = bound.type_idx },
+        return self.handleSlot(bound.type_idx, kind);
+    }
+
+    /// Append a typedef slot containing `borrow<resource_idx>` or
+    /// `own<resource_idx>` and return a `ValType.type_idx`
+    /// reference to that slot.
+    fn handleSlot(
+        self: *BodyBuilder,
+        resource_idx: u32,
+        kind: HandleKind,
+    ) EncodeError!ctypes.ValType {
+        const handle_vt: ctypes.ValType = switch (kind) {
+            .borrow => .{ .borrow = resource_idx },
+            .own => .{ .own = resource_idx },
         };
+        return self.appendCompound(.{ .val = handle_vt });
     }
 
     /// Injection hooks for resource-method synthesis: `self_param`
@@ -658,6 +697,23 @@ const BodyBuilder = struct {
         const gop = try self.name_map.getOrPut(self.ar, name);
         if (gop.found_existing) return error.InvalidWit;
         gop.value_ptr.* = vt;
+    }
+
+    /// Emit an `export <name> (type (eq <body_slot>))` decl and bind
+    /// `name` to the EXPORT'S slot (not the underlying typedef
+    /// slot). Per the component-model spec, exports of types
+    /// allocate a fresh slot in the surrounding type space; consumers
+    /// that reference the named type must use that export slot so
+    /// wasm-tools' "all referenced types must be named" validator
+    /// finds the type id in the import/export name set.
+    fn exportNamedType(self: *BodyBuilder, name: []const u8, body_slot: u32) EncodeError!void {
+        try self.decls.append(self.ar, .{ .@"export" = .{
+            .name = name,
+            .desc = .{ .type = .{ .eq = body_slot } },
+        } });
+        const export_slot = self.type_idx;
+        self.type_idx += 1;
+        try self.bindName(name, .{ .type_idx = export_slot });
     }
 };
 
@@ -1051,8 +1107,8 @@ test "metadata_encode: record typedef emits TypeDef.record + name binding" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    // Body: [record TypeDef (idx 0), func TypeDef (idx 1), export(func=1)].
-    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    // Body: [record TypeDef (idx 0), Export "point" Eq 0 (idx 1), func TypeDef (idx 2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
     try testing.expect(iface.decls[0].type == .record);
     const rec = iface.decls[0].type.record;
     try testing.expectEqual(@as(usize, 2), rec.fields.len);
@@ -1061,10 +1117,16 @@ test "metadata_encode: record typedef emits TypeDef.record + name binding" {
     try testing.expectEqualStrings("y", rec.fields[1].name);
     try testing.expect(rec.fields[1].type == .u32);
 
-    const func = iface.decls[1].type.func;
-    try testing.expectEqual(@as(u32, 0), func.params[0].type.type_idx);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("point", iface.decls[1].@"export".name);
+    try testing.expect(iface.decls[1].@"export".desc == .type);
+    try testing.expect(iface.decls[1].@"export".desc.type == .eq);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].@"export".desc.type.eq);
+
+    const func = iface.decls[2].type.func;
+    try testing.expectEqual(@as(u32, 1), func.params[0].type.type_idx);
     try testing.expect(func.params[1].type == .s32);
-    try testing.expectEqual(@as(u32, 0), func.results.unnamed.type_idx);
+    try testing.expectEqual(@as(u32, 1), func.results.unnamed.type_idx);
 }
 
 test "metadata_encode: variant typedef with mixed payloads" {
@@ -1091,8 +1153,8 @@ test "metadata_encode: variant typedef with mixed payloads" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    // Body: [variant (0), result (1), func (2), export(func=2)].
-    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    // Body: [variant (0), Export "stream-error" Eq 0 (1), result (2), func (3), export(func=3)].
+    try testing.expectEqual(@as(usize, 5), iface.decls.len);
     try testing.expect(iface.decls[0].type == .variant);
     const v = iface.decls[0].type.variant;
     try testing.expectEqual(@as(usize, 2), v.cases.len);
@@ -1102,14 +1164,17 @@ test "metadata_encode: variant typedef with mixed payloads" {
     try testing.expect(v.cases[1].type != null);
     try testing.expect(v.cases[1].type.? == .string);
 
-    try testing.expect(iface.decls[1].type == .result);
-    const res = iface.decls[1].type.result;
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("stream-error", iface.decls[1].@"export".name);
+
+    try testing.expect(iface.decls[2].type == .result);
+    const res = iface.decls[2].type.result;
     try testing.expect(res.ok != null and res.ok.? == .u32);
     try testing.expect(res.err != null);
-    try testing.expectEqual(@as(u32, 0), res.err.?.type_idx);
+    try testing.expectEqual(@as(u32, 1), res.err.?.type_idx);
 
-    try testing.expect(iface.decls[2].type == .func);
-    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+    try testing.expect(iface.decls[3].type == .func);
+    try testing.expectEqual(@as(u32, 2), iface.decls[3].type.func.results.unnamed.type_idx);
 }
 
 test "metadata_encode: enum typedef" {
@@ -1130,14 +1195,17 @@ test "metadata_encode: enum typedef" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    // Body: [enum (0), Export "color" Eq 0 (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
     try testing.expect(iface.decls[0].type == .enum_);
     const e = iface.decls[0].type.enum_;
     try testing.expectEqual(@as(usize, 3), e.names.len);
     try testing.expectEqualStrings("red", e.names[0]);
     try testing.expectEqualStrings("green", e.names[1]);
     try testing.expectEqualStrings("blue", e.names[2]);
-    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.results.unnamed.type_idx);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("color", iface.decls[1].@"export".name);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
 }
 
 test "metadata_encode: flags typedef" {
@@ -1158,14 +1226,17 @@ test "metadata_encode: flags typedef" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    try testing.expectEqual(@as(usize, 3), iface.decls.len);
+    // Body: [flags (0), Export "perms" Eq 0 (1), func (2), export(func=2)].
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
     try testing.expect(iface.decls[0].type == .flags);
     const f = iface.decls[0].type.flags;
     try testing.expectEqual(@as(usize, 3), f.names.len);
     try testing.expectEqualStrings("read", f.names[0]);
     try testing.expectEqualStrings("write", f.names[1]);
     try testing.expectEqualStrings("exec", f.names[2]);
-    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.func.params[0].type.type_idx);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("perms", iface.decls[1].@"export".name);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.params[0].type.type_idx);
 }
 
 test "metadata_encode: resource with constructor + method + static" {
@@ -1195,61 +1266,70 @@ test "metadata_encode: resource with constructor + method + static" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    // Body shape:
-    //   0: TypeDef.resource
-    //   1: ExportDecl "output-stream" (type (eq 0))
-    //   2: TypeDef.func  (constructor: (seed:u32) -> own<0>)
-    //   3: ExportDecl "[constructor]output-stream" (func 2)
-    //   4: TypeDef.func  ([method]: (self:borrow<0>, byte:u8) -> u32)
-    //   5: ExportDecl "[method]output-stream.write" (func 4)
-    //   6: TypeDef.func  ([static]: () -> u32)
-    //   7: ExportDecl "[static]output-stream.check" (func 6)
-    try testing.expectEqual(@as(usize, 8), iface.decls.len);
+    // Body shape (handle types `borrow<R>` / `own<R>` must occupy
+    // their own typedef slot per the component-model spec):
+    //   0: ExportDecl "output-stream" (type sub-resource)   — slot 0
+    //   1: TypeDef.val .own=0          (ctor return slot)   — slot 1
+    //   2: TypeDef.func (seed:u32) -> type_idx=1            — slot 2
+    //   3: ExportDecl "[constructor]output-stream" func=2
+    //   4: TypeDef.val .borrow=0       (method self slot)   — slot 3
+    //   5: TypeDef.func (self:type_idx=3, byte:u8) -> u32   — slot 4
+    //   6: ExportDecl "[method]output-stream.write" func=4
+    //   7: TypeDef.func () -> u32                           — slot 5
+    //   8: ExportDecl "[static]output-stream.check" func=5
+    try testing.expectEqual(@as(usize, 9), iface.decls.len);
 
-    // Resource decl + name binding.
-    try testing.expect(iface.decls[0].type == .resource);
-    try testing.expect(iface.decls[0].type.resource.destructor == null);
-    try testing.expect(iface.decls[1] == .@"export");
-    try testing.expectEqualStrings("output-stream", iface.decls[1].@"export".name);
-    try testing.expect(iface.decls[1].@"export".desc == .type);
-    try testing.expect(iface.decls[1].@"export".desc.type == .eq);
-    try testing.expectEqual(@as(u32, 0), iface.decls[1].@"export".desc.type.eq);
+    // Resource: introduced via export with `sub_resource` bound; no
+    // separate body type decl (component-types cannot *define* a
+    // resource as a body typedef, only export-by-name).
+    try testing.expect(iface.decls[0] == .@"export");
+    try testing.expectEqualStrings("output-stream", iface.decls[0].@"export".name);
+    try testing.expect(iface.decls[0].@"export".desc == .type);
+    try testing.expect(iface.decls[0].@"export".desc.type == .sub_resource);
 
-    // Constructor: synthesized `-> own<0>` result, no implicit self.
+    // Constructor: own slot then func slot then export.
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
     try testing.expect(iface.decls[2].type == .func);
     const ctor = iface.decls[2].type.func;
     try testing.expectEqual(@as(usize, 1), ctor.params.len);
     try testing.expectEqualStrings("seed", ctor.params[0].name);
     try testing.expect(ctor.params[0].type == .u32);
     try testing.expect(ctor.results == .unnamed);
-    try testing.expect(ctor.results.unnamed == .own);
-    try testing.expectEqual(@as(u32, 0), ctor.results.unnamed.own);
+    try testing.expect(ctor.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 1), ctor.results.unnamed.type_idx);
     try testing.expectEqualStrings("[constructor]output-stream", iface.decls[3].@"export".name);
 
-    // Method: implicit `self: borrow<0>` prepended.
-    try testing.expect(iface.decls[4].type == .func);
-    const method = iface.decls[4].type.func;
+    // Method: implicit `self: borrow<0>` prepended (via its own
+    // typedef slot at index 3).
+    try testing.expect(iface.decls[4].type == .val);
+    try testing.expect(iface.decls[4].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 0), iface.decls[4].type.val.borrow);
+    try testing.expect(iface.decls[5].type == .func);
+    const method = iface.decls[5].type.func;
     try testing.expectEqual(@as(usize, 2), method.params.len);
     try testing.expectEqualStrings("self", method.params[0].name);
-    try testing.expect(method.params[0].type == .borrow);
-    try testing.expectEqual(@as(u32, 0), method.params[0].type.borrow);
+    try testing.expect(method.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 3), method.params[0].type.type_idx);
     try testing.expectEqualStrings("byte", method.params[1].name);
     try testing.expect(method.params[1].type == .u8);
     try testing.expect(method.results.unnamed == .u32);
-    try testing.expectEqualStrings("[method]output-stream.write", iface.decls[5].@"export".name);
+    try testing.expectEqualStrings("[method]output-stream.write", iface.decls[6].@"export".name);
 
     // Static: no implicit self, no forced result.
-    try testing.expect(iface.decls[6].type == .func);
-    const stat = iface.decls[6].type.func;
+    try testing.expect(iface.decls[7].type == .func);
+    const stat = iface.decls[7].type.func;
     try testing.expectEqual(@as(usize, 0), stat.params.len);
     try testing.expect(stat.results.unnamed == .u32);
-    try testing.expectEqualStrings("[static]output-stream.check", iface.decls[7].@"export".name);
+    try testing.expectEqualStrings("[static]output-stream.check", iface.decls[8].@"export".name);
 }
 
 test "metadata_encode: explicit `borrow<R>` / `own<R>` in func sigs" {
     // A function that takes a borrow and returns an own — exercises
     // `lowerType` for both handle forms via the post-resource
-    // `name_map` binding.
+    // `name_map` binding. Each handle gets its own typedef slot per
+    // the component-model spec (handle types are *defined* types).
     const source =
         \\package docs:demo@0.1.0;
         \\interface streams {
@@ -1267,15 +1347,26 @@ test "metadata_encode: explicit `borrow<R>` / `own<R>` in func sigs" {
     const comp = try loader.load(bytes, arena_loaded.allocator());
 
     const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
-    // Body: [resource (0), export "output-stream" eq=0, func (1), export "clone" func=1].
-    try testing.expectEqual(@as(usize, 4), iface.decls.len);
-    try testing.expect(iface.decls[2].type == .func);
-    const f = iface.decls[2].type.func;
-    try testing.expect(f.params[0].type == .borrow);
-    try testing.expectEqual(@as(u32, 0), f.params[0].type.borrow);
-    try testing.expect(f.results.unnamed == .own);
-    try testing.expectEqual(@as(u32, 0), f.results.unnamed.own);
-    try testing.expectEqualStrings("clone", iface.decls[3].@"export".name);
+    // Body shape:
+    //   0: ExportDecl "output-stream" (type sub-resource)  — slot 0
+    //   1: TypeDef.val .borrow=0                            — slot 1
+    //   2: TypeDef.val .own=0                               — slot 2
+    //   3: TypeDef.func (s: type_idx=1) -> type_idx=2       — slot 3
+    //   4: ExportDecl "clone" func=3
+    try testing.expectEqual(@as(usize, 5), iface.decls.len);
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.borrow);
+    try testing.expect(iface.decls[2].type == .val);
+    try testing.expect(iface.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[2].type.val.own);
+    try testing.expect(iface.decls[3].type == .func);
+    const f = iface.decls[3].type.func;
+    try testing.expect(f.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), f.params[0].type.type_idx);
+    try testing.expect(f.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 2), f.results.unnamed.type_idx);
+    try testing.expectEqualStrings("clone", iface.decls[4].@"export".name);
 }
 
 test "metadata_encode: borrow<non-resource> reports InvalidWit" {
@@ -1337,13 +1428,24 @@ test "metadata_encode: use clause aliases resource from outer world body" {
     try testing.expect(world_body.decls[2].alias.instance_export.sort == .type);
     try testing.expectEqual(@as(u32, 0), world_body.decls[2].alias.instance_export.instance_idx);
 
-    // stdout body should contain 4 decls in order:
+    // stdout body should contain 5 decls in order:
     //   0: Alias.outer sort=type count=1 idx=1        — local type slot 0
-    //   1: ExportDecl "output-stream" type=eq{0}      — re-export under WIT name
-    //   2: TypeDef.func get-stdout() -> own<0>        — local type slot 1
-    //   3: ExportDecl "get-stdout" func=1
+    //   1: ExportDecl "output-stream" type=eq{0}      — local type slot 1
+    //                                                  (binds `output-stream`
+    //                                                   here so `own<R>` /
+    //                                                   `borrow<R>` resolve
+    //                                                   through the named
+    //                                                   export id, per
+    //                                                   wasm-tools'
+    //                                                   `validate_and_register_named_types`)
+    //   2: TypeDef.val .own=1                          — local type slot 2
+    //                                                   (references the
+    //                                                   export slot, NOT the
+    //                                                   raw alias slot)
+    //   3: TypeDef.func get-stdout() -> type_idx=2     — local type slot 3
+    //   4: ExportDecl "get-stdout" func=3
     const stdout_body = world_body.decls[3].type.instance;
-    try testing.expectEqual(@as(usize, 4), stdout_body.decls.len);
+    try testing.expectEqual(@as(usize, 5), stdout_body.decls.len);
     try testing.expect(stdout_body.decls[0] == .alias);
     try testing.expect(stdout_body.decls[0].alias == .outer);
     try testing.expect(stdout_body.decls[0].alias.outer.sort == .type);
@@ -1353,9 +1455,12 @@ test "metadata_encode: use clause aliases resource from outer world body" {
     try testing.expectEqualStrings("output-stream", stdout_body.decls[1].@"export".name);
     try testing.expect(stdout_body.decls[1].@"export".desc == .type);
     try testing.expectEqual(@as(u32, 0), stdout_body.decls[1].@"export".desc.type.eq);
-    try testing.expect(stdout_body.decls[2].type == .func);
-    try testing.expect(stdout_body.decls[2].type.func.results.unnamed == .own);
-    try testing.expectEqual(@as(u32, 0), stdout_body.decls[2].type.func.results.unnamed.own);
+    try testing.expect(stdout_body.decls[2].type == .val);
+    try testing.expect(stdout_body.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 1), stdout_body.decls[2].type.val.own);
+    try testing.expect(stdout_body.decls[3].type == .func);
+    try testing.expect(stdout_body.decls[3].type.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 2), stdout_body.decls[3].type.func.results.unnamed.type_idx);
 }
 
 test "metadata_encode: use clause with rename binds the renamed name" {

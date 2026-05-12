@@ -559,10 +559,15 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             break :blk .{ .result = .{ .ok = ok, .err = err } };
         },
         0x3F => blk: {
-            // resource
+            // resource: `<rep:CoreValType> <dtor-opt>`. See
+            // writer.zig for the symmetric write side; `rep` is
+            // always `i32` (0x7F) for current component-model
+            // resources but the byte must round-trip through the
+            // wire.
+            const rep = try readCoreValType(reader);
             const has_dtor = try reader.readByte();
             const dtor = if (has_dtor != 0) try reader.readU32() else null;
-            break :blk .{ .resource = .{ .destructor = dtor } };
+            break :blk .{ .resource = .{ .destructor = dtor, .rep = rep } };
         },
         0x40 => blk: {
             // func type
@@ -897,14 +902,14 @@ test "readValType: rejects unknown negative code" {
 test "parseTypeDef: instance type with `sub resource` type decl" {
     // Mirrors the first type definition in every Rust wasm32-wasip2 component:
     //   (type (instance
-    //     (type $p (sub resource))            ; decl 0x01, type, resource with no dtor
+    //     (type $p (sub resource))            ; decl 0x01, type, resource with rep=i32 no dtor
     //     (export "pollable" (type (eq $p)))  ; decl 0x04, export, type bound eq 0
     //   ))
     // Binary form:
     //   0x42              ; instance-type tag
     //   0x02              ; 2 decls
     //   0x01              ; decl 1: type
-    //     0x3F 0x00       ; resource with no destructor
+    //     0x3F 0x7F 0x00  ; resource, rep=i32, no destructor
     //   0x04              ; decl 2: export
     //     0x00            ; exportname' prefix
     //     0x08 "pollable" ; name (len=8)
@@ -912,7 +917,7 @@ test "parseTypeDef: instance type with `sub resource` type decl" {
     //     0x00 0x00       ; bound: eq, typeidx 0
     const data = [_]u8{
         0x42, 0x02,
-        0x01, 0x3F, 0x00,
+        0x01, 0x3F, 0x7F, 0x00,
         0x04, 0x00, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
         0x03, 0x00, 0x00,
     };
