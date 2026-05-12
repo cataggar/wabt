@@ -1,22 +1,30 @@
 // Trimmed slice of `wasi:filesystem@0.2.6.types`. The canonical
 // `bytecodealliance/wasi-filesystem@v0.2.6/wit/types.wit` declares
 // the full `descriptor` surface (~30 methods) plus many auxiliary
-// types. This slice declares only the subset the preview1 → preview2
-// adapter consumes so far:
+// types. This slice declares the subset the preview1 → preview2
+// adapter consumes after cataggar/wabt#165 (read-side) and
+// cataggar/wabt#166 (write-side + filestat/readdir):
 //
-//   * `path-flags`, `open-flags`, `descriptor-flags`, `error-code`
-//     — the flag/enum types referenced by `descriptor.open-at`.
-//   * `descriptor` resource with the `open-at` method backing
-//     preview1 `path_open`. `[resource-drop]descriptor` is
-//     auto-bound by the splicer (same pattern as
-//     `[resource-drop]output-stream` in `wasi:io/streams`).
+//   * `path-flags`, `open-flags`, `descriptor-flags`,
+//     `descriptor-type`, `error-code` — the flag/enum types.
+//   * `descriptor-stat`, `directory-entry`, `new-timestamp` —
+//     the record/variant types passed by stat/set-times/readdir.
+//   * `descriptor` resource with the methods backing every preview1
+//     fd_* / path_* the adapter wires (open-at, read-via-stream,
+//     write-via-stream, append-via-stream, sync, sync-data, set-size,
+//     set-times, set-times-at, stat, stat-at, create-directory-at,
+//     remove-directory-at, unlink-file-at, rename-at, symlink-at,
+//     link-at, read-directory). `[resource-drop]descriptor` is
+//     auto-bound by the splicer.
+//   * `directory-entry-stream` resource with `read-directory-entry`
+//     backing preview1 `fd_readdir`. `[resource-drop]…` likewise
+//     splicer-synthesised.
 //
-// The wider surface arrives in subsequent subphases of #165:
-//   * (b)  `fd_read` + `fd_seek` → `descriptor.read-via-stream`,
-//     `descriptor.seek`, descriptor-type.
-//   * (c)  `fd_filestat_get` / `path_filestat_get` / `fd_readdir`
-//     → `descriptor.stat`, `descriptor.stat-at`,
-//     `descriptor.read-directory`, plus the relevant record types.
+// Out of scope for now (still ENOSYS or not exposed at all):
+// `advise`, `get-flags`, `get-type`, `read`, `write`, `readlink-at`,
+// `is-same-object`, `metadata-hash`, `metadata-hash-at` — none of
+// these correspond to preview1 imports we need to satisfy in this
+// scope.
 //
 // NOTE: the package declaration for this multi-file slice lives in
 // `preopens.wit` (which sorts before `types.wit` — `p` < `t`).
@@ -25,13 +33,23 @@
 // file that's parsed first.
 
 interface types {
-    /// Pull in `input-stream` from `wasi:io/streams` — the
-    /// `descriptor.read-via-stream` method below returns one. The
+    /// Pull in `input-stream` + `output-stream` from
+    /// `wasi:io/streams` — `read-via-stream` returns the former,
+    /// `write-via-stream` / `append-via-stream` the latter. The
     /// encoder requires the source interface to also be imported
     /// at the world level, which the preview1 world already does
     /// (`wasi:io/streams@0.2.6` is on the import list for the
     /// stdout/stderr write path).
-    use wasi:io/streams@0.2.6.{input-stream};
+    use wasi:io/streams@0.2.6.{input-stream, output-stream};
+
+    /// Pull in `datetime` from `wasi:clocks/wall-clock` — the
+    /// `descriptor-stat` record fields and the `new-timestamp`
+    /// variant payload both reference it. The preview1 world
+    /// already imports `wasi:clocks/wall-clock@0.2.6` for the
+    /// REALTIME clockid path, so the encoder's "source interface
+    /// must also be reachable from the world body" requirement is
+    /// already satisfied.
+    use wasi:clocks/wall-clock@0.2.6.{datetime};
 
     /// Modifiers for `descriptor.open-at` path lookup. Bit 0
     /// (`symlink-follow`) matches preview1 `LOOKUPFLAGS_SYMLINK_FOLLOW`.
@@ -61,6 +79,29 @@ interface types {
         data-integrity-sync,
         requested-write-sync,
         mutate-directory,
+    }
+
+    /// Type of a filesystem object referenced by a descriptor.
+    /// Ordinals (0..7) feed the adapter's
+    /// `$preview1_filetype_from_descriptor_type` helper. Preview1
+    /// `__wasi_filetype_t` mapping:
+    ///   unknown          → 0  UNKNOWN
+    ///   block-device     → 1  BLOCK_DEVICE
+    ///   character-device → 2  CHARACTER_DEVICE
+    ///   directory        → 3  DIRECTORY
+    ///   fifo             → 6  SOCKET_STREAM (preview1 has no FIFO ord)
+    ///   symbolic-link    → 7  SYMBOLIC_LINK
+    ///   regular-file     → 4  REGULAR_FILE
+    ///   socket           → 5  SOCKET_DGRAM (closest preview1 ord)
+    enum descriptor-type {
+        unknown,
+        block-device,
+        character-device,
+        directory,
+        fifo,
+        symbolic-link,
+        regular-file,
+        socket,
     }
 
     /// Error surface for filesystem operations. Ordinals (0..36)
@@ -106,11 +147,75 @@ interface types {
         cross-device,
     }
 
+    /// File attributes returned by `descriptor.stat` /
+    /// `descriptor.stat-at`. The adapter translates this into a
+    /// 64-byte preview1 `__wasi_filestat_t` record:
+    ///   offset  0:  u64 dev   (always 0 — preview2 hides it)
+    ///   offset  8:  u64 ino   (always 0 — preview2 hides it)
+    ///   offset 16:  u8  filetype (+ 7 pad)
+    ///   offset 24:  u64 nlink
+    ///   offset 32:  u64 size
+    ///   offset 40:  u64 atim_ns (0 if option::none)
+    ///   offset 48:  u64 mtim_ns (0 if option::none)
+    ///   offset 56:  u64 ctim_ns (0 if option::none)
+    record descriptor-stat {
+        %type: descriptor-type,
+        link-count: u64,
+        size: u64,
+        data-access-timestamp: option<datetime>,
+        data-modification-timestamp: option<datetime>,
+        status-change-timestamp: option<datetime>,
+    }
+
+    /// New value passed to `set-times` / `set-times-at`. The adapter
+    /// builds one of these per timestamp from the preview1 fstflags
+    /// bits:
+    ///   ATIM     (0x01) → timestamp(datetime { atim_ns / 1e9, atim_ns % 1e9 })
+    ///   ATIM_NOW (0x02) → now
+    ///   MTIM     (0x04) → timestamp(datetime { mtim_ns / 1e9, mtim_ns % 1e9 })
+    ///   MTIM_NOW (0x08) → now
+    ///   none of the above → no-change
+    /// Preview1 rejects ATIM | ATIM_NOW (and MTIM | MTIM_NOW) as
+    /// EINVAL — the adapter checks before constructing the variant.
+    variant new-timestamp {
+        no-change,
+        now,
+        timestamp(datetime),
+    }
+
+    /// One entry returned by `directory-entry-stream.read-directory-entry`.
+    /// The adapter packs each entry into a preview1 `__wasi_dirent_t` +
+    /// trailing `name` bytes:
+    ///   offset 0:  u64 d_next       (cookie — adapter uses 1-based counter)
+    ///   offset 8:  u64 d_ino        (always 0 — preview2 hides ino)
+    ///   offset 16: u32 d_namlen     (= name.len)
+    ///   offset 20: u8  d_type       (preview1 filetype)
+    ///   offset 21: u8 × 3 pad
+    ///   offset 24: u8 × d_namlen    (name bytes, no trailing NUL)
+    record directory-entry {
+        %type: descriptor-type,
+        name: string,
+    }
+
+    /// Cursor over a directory's entries opened by
+    /// `descriptor.read-directory`. Each `read-directory-entry` call
+    /// returns one entry (or `option::none` at end-of-stream); the
+    /// adapter loops until the caller's preview1 buffer is full or
+    /// the stream is exhausted, then drops the stream via the
+    /// splicer-synthesised `[resource-drop]directory-entry-stream`.
+    ///
+    /// Declared BEFORE `descriptor` because `descriptor.read-directory`
+    /// references `own<directory-entry-stream>` in its return type;
+    /// the encoder binds resource names lazily as it walks the
+    /// interface body, so the referent must precede the reference.
+    resource directory-entry-stream {
+        read-directory-entry: func() -> result<option<directory-entry>, error-code>;
+    }
+
     /// Opaque handle to a filesystem object — directory, regular
-    /// file, symlink, character/block device, etc. The preview1
-    /// adapter treats these as opaque indices into the host's
-    /// resource table; descriptor type / flag inspection arrives
-    /// in subphases (b)/(c) of #165.
+    /// file, symlink, character/block device, etc. Preview2 hands
+    /// the adapter back an opaque resource handle; the adapter
+    /// stashes it in the per-fd descriptor table.
     resource descriptor {
         /// Open a file or directory relative to this descriptor.
         /// Backs preview1 `path_open`. The adapter translates
@@ -130,6 +235,109 @@ interface types {
         /// `input-stream.blocking-read`, drops the stream, and
         /// advances its tracked position by the bytes returned.
         read-via-stream: func(offset: u64) -> result<own<input-stream>, error-code>;
+
+        /// Open an `output-stream` writing at `offset`. Backs
+        /// preview1 `fd_write` for fd ≥ 3 and `fd_pwrite`. The
+        /// adapter opens one stream per call and drops it after
+        /// `blocking-write-and-flush` returns; for `fd_write` the
+        /// tracked position is advanced by total bytes written, for
+        /// `fd_pwrite` it is left untouched (POSIX semantics).
+        write-via-stream: func(offset: u64) -> result<own<output-stream>, error-code>;
+
+        /// Open an append-mode `output-stream`. Used by the adapter
+        /// only when `descriptor-flags::append` was requested at
+        /// open time; preview1 doesn't surface this directly — the
+        /// adapter routes ordinary `fd_write` through this when the
+        /// fd was opened with `FDFLAGS_APPEND` (deferred — current
+        /// adapter always uses `write-via-stream`).
+        append-via-stream: func() -> result<own<output-stream>, error-code>;
+
+        /// Backs preview1 `fd_filestat_set_size`.
+        set-size: func(size: u64) -> result<_, error-code>;
+
+        /// Backs preview1 `fd_filestat_set_times`. Both timestamps
+        /// take a `new-timestamp` variant; the adapter constructs
+        /// each from the preview1 fstflags bits + raw u64 ns values.
+        set-times: func(
+            data-access-timestamp: new-timestamp,
+            data-modification-timestamp: new-timestamp
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `fd_filestat_get`. The adapter unpacks the
+        /// returned `descriptor-stat` into the 64-byte preview1
+        /// `filestat` layout described on `descriptor-stat`.
+        stat: func() -> result<descriptor-stat, error-code>;
+
+        /// Backs preview1 `path_filestat_get`. Same return shape as
+        /// `stat` plus the `(path-flags, path)` lookup arguments.
+        stat-at: func(
+            path-flags: path-flags,
+            path: string
+        ) -> result<descriptor-stat, error-code>;
+
+        /// Backs preview1 `path_filestat_set_times`.
+        set-times-at: func(
+            path-flags: path-flags,
+            path: string,
+            data-access-timestamp: new-timestamp,
+            data-modification-timestamp: new-timestamp
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `path_create_directory`.
+        create-directory-at: func(path: string) -> result<_, error-code>;
+
+        /// Backs preview1 `path_remove_directory`.
+        remove-directory-at: func(path: string) -> result<_, error-code>;
+
+        /// Backs preview1 `path_unlink_file`.
+        unlink-file-at: func(path: string) -> result<_, error-code>;
+
+        /// Backs preview1 `path_symlink`. Note the argument order:
+        /// `old-path` (the symlink target) first, `new-path` (the
+        /// symlink path itself, relative to `self`) second. Matches
+        /// POSIX `symlinkat(target, dirfd, linkpath)`.
+        symlink-at: func(
+            old-path: string,
+            new-path: string
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `path_rename`. `self` is the source
+        /// directory; `new-descriptor` is the destination directory
+        /// (passed as `borrow<descriptor>` to avoid double-owning
+        /// the handle the adapter is also tracking in its fd table).
+        rename-at: func(
+            old-path: string,
+            new-descriptor: borrow<descriptor>,
+            new-path: string
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `path_link`. Hard-link from `(self,
+        /// old-path)` to `(new-descriptor, new-path)`.
+        link-at: func(
+            old-path-flags: path-flags,
+            old-path: string,
+            new-descriptor: borrow<descriptor>,
+            new-path: string
+        ) -> result<_, error-code>;
+
+        /// Backs preview1 `fd_sync` (file-integrity sync — flushes
+        /// data + metadata).
+        sync: func() -> result<_, error-code>;
+
+        /// Backs preview1 `fd_datasync` (data-integrity sync —
+        /// flushes data only).
+        sync-data: func() -> result<_, error-code>;
+
+        /// Open a fresh `directory-entry-stream` reading from the
+        /// start of this directory. Backs preview1 `fd_readdir`. The
+        /// adapter opens one stream per call, iterates
+        /// `read-directory-entry()` filling the caller's buffer, and
+        /// drops the stream. Resumable cookies are not modelled —
+        /// the adapter ignores the input cookie and emits a fresh
+        /// listing each call (wasi-libc's `readdir(3)` then
+        /// continues by re-reading from the start, matching the
+        /// behaviour of the wasmtime reference adapter).
+        read-directory: func() -> result<own<directory-entry-stream>, error-code>;
     }
 }
 

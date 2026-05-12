@@ -15,49 +15,68 @@ is documented in that issue.
 
 [issue]: https://github.com/cataggar/wamr/issues/453
 
-## Status: encoded-world section wired, awaiting real preview1 lowering
+## Status: full v3 preview1 surface wired
 
 This directory ships:
 
-  * **WAT source** (`src/adapter.wat`) — correct preview1 export shape,
-    `proc_exit` fully lowered through `wasi:cli/exit.exit-with-code`,
-    every other preview1 function returns `errno=ENOSYS` (52).
-  * **WIT world** (`wit/preview1.wit` + `wit/deps/wasi-cli/world.wit`)
-    — `world command { import wasi:cli/exit@0.2.6; export wasi:cli/run@0.2.6; }`.
-    Only declares the preview2 imports actually canon-lowered by the
-    current adapter body. The wider surface (streams / filesystem /
-    clocks / random) arrives alongside the corresponding preview1
-    lowerings, which also need `metadata_encode.zig` to grow
-    resource-handle support (deferred).
-  * **`zig build adapter`** — runs `tools/build_adapter.zig` to parse
-    the WAT, validate it, encode the WIT world via wabt's
+  * **WAT source** (`src/adapter.wat`) — preview1 surface lowered
+    through preview2:
+    * `proc_exit` → `wasi:cli/exit.exit-with-code(u8)` (lossless,
+      with `exit(result)` fallback for strict-0.2.0 hosts);
+    * `fd_write`, `fd_pwrite`, `fd_read` →
+      `wasi:filesystem/types.descriptor.{write,read}-via-stream` +
+      `wasi:io/streams.[method]{output,input}-stream.blocking-…`;
+    * `fd_close` → `[resource-drop]descriptor`;
+    * `fd_seek` (user-fd) → adapter-tracked position update;
+      stdio → `ESPIPE`;
+    * `fd_sync` / `fd_datasync` → `descriptor.{sync, sync-data}`;
+    * `fd_filestat_get` / `path_filestat_get` →
+      `descriptor.{stat, stat-at}` projected into preview1's
+      64-byte `filestat` layout;
+    * `fd_filestat_set_size` → `descriptor.set-size`;
+    * `fd_filestat_set_times` / `path_filestat_set_times` →
+      `descriptor.{set-times, set-times-at}` with preview1
+      fstflags bits translated into `new-timestamp` variants;
+    * `fd_readdir` → `descriptor.read-directory` +
+      `directory-entry-stream.read-directory-entry` packed into
+      preview1 `dirent` records;
+    * `fd_prestat_get` / `fd_prestat_dir_name` →
+      `wasi:filesystem/preopens.get-directories`;
+    * `path_open` → `descriptor.open-at`;
+    * `path_create_directory`, `path_remove_directory`,
+      `path_unlink_file`, `path_symlink`, `path_rename`,
+      `path_link` → matching `descriptor.*-at` mutations;
+    * `args_get` / `args_sizes_get` / `environ_get` /
+      `environ_sizes_get` → `wasi:cli/environment.{get-arguments,
+      get-environment}`;
+    * `clock_time_get` / `clock_res_get` →
+      `wasi:clocks/{wall-clock, monotonic-clock}`;
+    * `random_get` → `wasi:random/random.get-random-bytes`;
+    * `sched_yield` → trivial success;
+    * `proc_raise`, `fd_fdstat_set_flags`, `sock_*` → `ENOSYS=52`
+      (no preview2 equivalent in 0.2.6 / deferred to
+      cataggar/wabt#168).
+  * **WIT world** (`wit/preview1.wit` + `wit/deps/{wasi-cli,
+    wasi-clocks, wasi-filesystem, wasi-io, wasi-random}/`) —
+    declares the full preview2 surface the adapter consumes.
+    Import order matters: any iface whose body has `use other.{T}`
+    must follow `other`; the encoder builds `world_alias_map`
+    import-by-import.
+  * **`zig build adapter`** — runs `tools/build_adapter.zig` to
+    parse the WAT, validate it, encode the WIT world via wabt's
     `metadata_encode.encodeWorldFromResolver`, attach the
     `component-type:wabt:wasi-preview1@0.0.0:command:encoded world`
-    custom section, and self-check the result through the splicer's
-    `adapter/decode.parseFromAdapterCore`. Output:
-    `zig-out/adapter/wasi_snapshot_preview1.command.wasm`.
+    custom section, and self-check the result through the
+    splicer's `adapter/decode.parseFromAdapterCore`. Output:
+    `zig-out/adapter/wasi_snapshot_preview1.command.wasm`. The
+    artifact is also `@embedFile`d into the `wabt` CLI binary as
+    the default `--adapt` source for `wabt component new`.
 
-Subsequent commits fill in:
-
-  1. Real preview1 → preview2 semantics in `src/adapter.wat`
-     replacing the current ENOSYS stubs (`fd_write` iterates the
-     iovec list and calls `output-stream.blocking-write-and-flush`,
-     `args_get` lowers `wasi:cli/environment.get-arguments`, etc.).
-     This re-adds the `wasi:io/streams` / `wasi:cli/{stdout,stderr,stdin}`
-     imports — at which point `metadata_encode.zig` must grow
-     resource-handle support.
-  2. Embedding the artifact into the wabt CLI via `@embedFile` and
-     wiring it as the default `--adapt` source in
-     `src/tools/component_new.zig` when the embed declares
-     preview1 imports and `--adapt` is not passed. (Phase 2 of
-     cataggar/wamr#453.)
-
-The `proc_exit` lowering is the one piece that's fully wired
-end-to-end already, because it's just a single canon-lower of `u8`
-through `wasi:cli/exit.exit-with-code` — see the body of `$proc_exit`
-in `src/adapter.wat`. That's the key win over the wasmtime
-adapter, which routes through the lossy `exit(result<_,_>)` and
-collapses every non-zero `proc_exit(code)` to host exit code 1.
+The `proc_exit` lowering remains the one deliberate divergence
+from the wasmtime reference adapter: `proc_exit(code)` traps with
+the original numeric `code` end-to-end via
+`wasi:cli/exit.exit-with-code(u8)` rather than collapsing to
+host-exit-code 1 through `wasi:cli/exit.exit(result<_, _>)`.
 
 ## Layout
 
@@ -94,13 +113,13 @@ adapters/wasi-preview1/
       stub from the splicer.
     * `wasi:cli/exit@0.2.6.exit-with-code` — replaces the lossy
       `exit(result)` that the wasmtime adapter routes through.
-      This is the *only* preview2 import in the v1 surface; the
-      wider set (`wasi:cli/stdout|stderr|stdin@0.2.6`,
-      `wasi:io/streams@0.2.6`, `wasi:cli/environment@0.2.6`,
-      `wasi:clocks/wall-clock@0.2.6`, `wasi:clocks/monotonic-clock@0.2.6`,
-      `wasi:random/random@0.2.6`, `wasi:filesystem/preopens@0.2.6`,
-      `wasi:filesystem/types@0.2.6`) arrives alongside the real
-      preview1 lowerings in the next sub-phase.
+      The full preview2 import list (`wasi:cli/{exit, stdout,
+      stderr, environment}@0.2.6`, `wasi:io/{streams, error}@0.2.6`,
+      `wasi:clocks/{wall-clock, monotonic-clock}@0.2.6`,
+      `wasi:random/random@0.2.6`,
+      `wasi:filesystem/{preopens, types}@0.2.6`) is enumerated in
+      the `import` block of `src/adapter.wat` and surfaced in the
+      encoded WIT world.
 
 * **Core wasm exports** (flat names, no
   `wasi_snapshot_preview1.` prefix — the splicer maps them to
@@ -116,19 +135,28 @@ adapters/wasi-preview1/
       or trap (none of our supported preview1 imports actually
       route a list / string back through realloc — `fd_write` etc.
       pass `(ptr, len)` slices directly out of embed memory).
-    * preview1 surface (initial cut, per [#453][issue] scope cut):
+    * preview1 surface (full v3 cut, per [#165 + #166][issue]):
         `proc_exit`, `proc_raise`, `sched_yield`,
-        `fd_write`, `fd_read`, `fd_close`, `fd_seek`,
+        `fd_write`, `fd_pwrite`, `fd_read`,
+        `fd_close`, `fd_seek`, `fd_sync`, `fd_datasync`,
         `fd_fdstat_get`, `fd_fdstat_set_flags`,
-        `fd_prestat_get`, `fd_prestat_dir_name`,
+        `fd_filestat_get`, `fd_filestat_set_size`,
+        `fd_filestat_set_times`,
+        `fd_prestat_get`, `fd_prestat_dir_name`, `fd_readdir`,
+        `path_open`, `path_create_directory`,
+        `path_remove_directory`, `path_unlink_file`,
+        `path_symlink`, `path_rename`, `path_link`,
+        `path_filestat_get`, `path_filestat_set_times`,
         `args_get`, `args_sizes_get`,
         `environ_get`, `environ_sizes_get`,
         `clock_time_get`, `clock_res_get`,
-        `random_get`.
-        All other preview1 imports trap with `errno=ENOSYS`. wabt's
-        adapter-core-wasm GC pass
+        `random_get`,
+        `sock_accept`, `sock_recv`, `sock_send`, `sock_shutdown`
+        (sockets are inline `ENOSYS=52` stubs; the preview2
+        `wasi:sockets/*` lift is deferred to cataggar/wabt#168).
+        wabt's adapter-core-wasm GC pass
         ([`src/component/adapter/gc.zig`](../../src/component/adapter/gc.zig))
-        drops the unused ones at splice time.
+        drops any unused exports at splice time.
 
 * **`component-type:…:command:encoded world` custom section**:
   produced by `tools/build_adapter.zig` invoking
@@ -157,12 +185,15 @@ keeps the adapter:
   + custom-section append. No new dependency.
 
 The downside is that the canonical-ABI lowering of compound
-preview2 types (`list<u8>`, `result<_, e>`, resource handles) has
-to be hand-coded in WAT. That's tractable for our initial scope —
-the preview2 calls we make either take primitive `(handle, ptr,
-len)` triples (`blocking-write-and-flush`) or single `u8` /
-`u64` scalars (`exit-with-code`, `clock.now`); none require
-canon-lower'd realloc.
+preview2 types (`list<u8>`, `result<_, e>`, `option<datetime>`,
+`new-timestamp` variant, resource handles) has to be hand-coded in
+WAT. The adapter's helper bank covers the recurring patterns:
+`$descriptor_error_only_result` decodes the 8-byte
+`result<_, error-code>` ret-area; `$build_new_timestamp` projects
+preview1 fstflags into a flat-ABI `new-timestamp` variant;
+`$write_preview1_filestat` projects a 96-byte `descriptor-stat`
+record (with three `option<datetime>` slots) into preview1's
+64-byte `filestat` layout.
 
 ## Building locally
 
