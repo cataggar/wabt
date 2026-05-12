@@ -270,7 +270,11 @@ fn collectUseRequests(
     for (lookup.iface.items) |it| {
         if (it != .use) continue;
         const u = it.use;
-        const src_lookup = resolver.findInterfaceWithPkg(u.from) orelse return error.UnknownInterface;
+        // The consuming interface's package is the context for
+        // resolving short `use` refs — `use error.{error};` inside
+        // `wasi:io/streams` resolves against `wasi:io`, not the
+        // world's main package.
+        const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse return error.UnknownInterface;
         const src_qname = try formatQualifiedName(
             ar,
             src_lookup.pkg.namespace,
@@ -371,8 +375,11 @@ fn buildInterfaceBody(
     // (no `pkg/` qualifier) hit the main doc; `<ns>:<pkg>/<iface>[@<ver>]`
     // refs traverse the deps (populated by `parseLayout` walking
     // `<root>/deps/<pkg>/`). The resolver returns the same shape
-    // either way.
-    const iface_body = resolver.findInterface(ref) orelse return error.UnknownInterface;
+    // either way. The returned `pkg` is the consuming interface's
+    // own package — used below as fallback context when resolving
+    // short `use src.{T};` refs against the dep's sibling files.
+    const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
+    const iface_body = iface_lookup.iface;
 
     // `BodyBuilder` tracks the type-index space inside this
     // instance-type body. Every appended `.type` decl bumps
@@ -480,7 +487,7 @@ fn buildInterfaceBody(
                 // canonical wit-component output: consumers of this
                 // iface can pull the type via the export chain
                 // without re-traversing the alias path).
-                const src_lookup = resolver.findInterfaceWithPkg(u.from) orelse return error.UnknownInterface;
+                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, iface_lookup.pkg) orelse return error.UnknownInterface;
                 const src_qname = try formatQualifiedName(
                     ar,
                     src_lookup.pkg.namespace,

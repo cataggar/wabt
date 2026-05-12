@@ -1,0 +1,25 @@
+// Trimmed slice of `wasi:io@0.2.6.error`. Mirrors the canonical
+// `bytecodealliance/wasi-io@v0.2.6/wit/error.wit` shape but
+// declares only the bare `error` resource type:
+//
+//   * `to-debug-string` (the only method on the canonical resource)
+//     is not referenced from the preview1 → preview2 adapter; the
+//     resource is only ever propagated through the
+//     `stream-error.last-operation-failed(own<error>)` variant case
+//     that `fd_write` discards on the first error.
+//
+// `streams.wit` imports the resource via
+// `use error.{error};` so the world body emits the canonical
+// `alias instance-export sort=type` decl right after the
+// `wasi:io/error@0.2.6` import — exactly matching wasmtime's
+// reference adapter's component-type custom section.
+
+package wasi:io@0.2.6;
+
+interface error {
+    /// Opaque host error. Only used as a payload of
+    /// `wasi:io/streams.stream-error::last-operation-failed`.
+    /// The adapter never lifts an `error` itself; it propagates
+    /// the borrow it receives back into the runtime as a trap.
+    resource error { }
+}

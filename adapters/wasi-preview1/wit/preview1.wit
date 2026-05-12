@@ -28,6 +28,14 @@ world command {
     /// non-zero code to host exit code 1.
     import wasi:cli/exit@0.2.6;
 
+    /// Opaque resource referenced by `wasi:io/streams.stream-error`'s
+    /// `last-operation-failed(own<error>)` payload. The adapter
+    /// never lifts an `error` itself but the world must declare the
+    /// resource so `streams`'s `use error.{error};` resolves against
+    /// the world-level type indexspace — matching wasmtime's
+    /// reference adapter shape.
+    import wasi:io/error@0.2.6;
+
     /// Byte-sink resource + `blocking-write-and-flush` method. The
     /// preview1 `fd_write` iterates the iovec list, copies into a
     /// canon-realloc'd buffer, and calls `blocking-write-and-flush`
