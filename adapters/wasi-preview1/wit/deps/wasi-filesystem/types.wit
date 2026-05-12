@@ -21,10 +21,9 @@
 //     splicer-synthesised.
 //
 // Out of scope for now (still ENOSYS or not exposed at all):
-// `advise`, `get-flags`, `get-type`, `read`, `write`, `readlink-at`,
-// `is-same-object`, `metadata-hash`, `metadata-hash-at` — none of
-// these correspond to preview1 imports we need to satisfy in this
-// scope.
+// `advise`, `read`, `write`, `readlink-at`, `is-same-object`,
+// `metadata-hash`, `metadata-hash-at` — none of these correspond
+// to preview1 imports we need to satisfy in this scope.
 //
 // NOTE: the package declaration for this multi-file slice lives in
 // `preopens.wit` (which sorts before `types.wit` — `p` < `t`).
@@ -267,6 +266,21 @@ interface types {
         /// returned `descriptor-stat` into the 64-byte preview1
         /// `filestat` layout described on `descriptor-stat`.
         stat: func() -> result<descriptor-stat, error-code>;
+
+        /// Backs preview1 `fd_fdstat_get` (fd ≥ 3 branch) — returns
+        /// the preview2 `descriptor-type` enum which the adapter
+        /// maps to a preview1 `__wasi_filetype_t` byte via
+        /// `$preview1_filetype_from_descriptor_type` in
+        /// `fragments/body.wat`. Tracked under cataggar/wabt#179.
+        get-type: func() -> result<descriptor-type, error-code>;
+
+        /// Backs preview1 `fd_fdstat_get` (fd ≥ 3 branch) — returns
+        /// the preview2 `descriptor-flags` bitmap. The adapter
+        /// extracts preview1 `fs_flags` bits (DSYNC / SYNC) via
+        /// `$preview1_fs_flags_from_descriptor_flags`; the remaining
+        /// preview1 fdflags (APPEND / NONBLOCK / RSYNC) have no
+        /// preview2 source and stay 0 (cataggar/wabt#179).
+        get-flags: func() -> result<descriptor-flags, error-code>;
 
         /// Backs preview1 `path_filestat_get`. Same return shape as
         /// `stat` plus the `(path-flags, path)` lookup arguments.

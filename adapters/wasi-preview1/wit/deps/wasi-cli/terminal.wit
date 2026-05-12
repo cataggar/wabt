@@ -1,0 +1,59 @@
+// Trimmed slice of `wasi:cli@0.2.6.{terminal-input, terminal-output,
+// terminal-stdin, terminal-stdout, terminal-stderr}`. Mirrors the
+// canonical `bytecodealliance/wasi-cli@v0.2.6/wit/terminal.wit`.
+//
+// Backs preview1 `fd_fdstat_get` stdio terminal detection: the
+// adapter probes each of fd 0 / 1 / 2 via the corresponding
+// `get-terminal-<n>` getter at first access, caches the resulting
+// boolean, and reports `__WASI_FILETYPE_CHARACTER_DEVICE` when the
+// option is `Some` (drop the handle immediately — we only need to
+// know whether stdio is a tty) or `__WASI_FILETYPE_UNKNOWN`
+// otherwise. Tracked under cataggar/wabt#179.
+//
+// `terminal-stdin` / `terminal-stdout` / `terminal-stderr` each
+// `use` from their respective `terminal-input` / `terminal-output`
+// interfaces, so the encoder needs both the source resource
+// interfaces AND the getter interfaces declared in the world.
+//
+// Bare-resource positions (`-> option<terminal-input>` and `->
+// option<terminal-output>`) auto-wrap as `option<own<...>>` per the
+// component-model spec (cataggar/wabt#182). The canonical bare form
+// below produces the same wire bytes wit-component emits.
+//
+// This file is a package-less continuation of `wasi:cli@0.2.6`; the
+// package declaration lives in `environment.wit` (which sorts before
+// this file — `e` < `t`).
+
+interface terminal-input {
+    /// The input side of a terminal.
+    resource terminal-input { }
+}
+
+interface terminal-output {
+    /// The output side of a terminal.
+    resource terminal-output { }
+}
+
+interface terminal-stdin {
+    use terminal-input.{terminal-input};
+
+    /// If stdin is connected to a terminal, return a `terminal-input`
+    /// handle allowing further interaction with it.
+    get-terminal-stdin: func() -> option<terminal-input>;
+}
+
+interface terminal-stdout {
+    use terminal-output.{terminal-output};
+
+    /// If stdout is connected to a terminal, return a `terminal-output`
+    /// handle allowing further interaction with it.
+    get-terminal-stdout: func() -> option<terminal-output>;
+}
+
+interface terminal-stderr {
+    use terminal-output.{terminal-output};
+
+    /// If stderr is connected to a terminal, return a `terminal-output`
+    /// handle allowing further interaction with it.
+    get-terminal-stderr: func() -> option<terminal-output>;
+}

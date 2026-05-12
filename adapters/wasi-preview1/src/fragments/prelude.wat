@@ -127,22 +127,32 @@
 ;;     fd_* call;
 ;;   * `wasi:filesystem/types@0.2.6.[method]descriptor.{open-at,
 ;;     read-via-stream, write-via-stream, append-via-stream,
-;;     set-size, set-times, set-times-at, stat, stat-at,
-;;     create-directory-at, remove-directory-at, unlink-file-at,
-;;     symlink-at, rename-at, link-at, sync, sync-data,
-;;     read-directory}`, `[resource-drop]descriptor`, plus
-;;     `[method]directory-entry-stream.read-directory-entry` +
-;;     `[resource-drop]directory-entry-stream`.
+;;     set-size, set-times, set-times-at, stat, stat-at, get-type,
+;;     get-flags, create-directory-at, remove-directory-at,
+;;     unlink-file-at, symlink-at, rename-at, link-at, sync,
+;;     sync-data, read-directory}`, `[resource-drop]descriptor`,
+;;     plus `[method]directory-entry-stream.read-directory-entry`
+;;     + `[resource-drop]directory-entry-stream`.
+;;   * `wasi:cli/terminal-{input,output,stdin,stdout,stderr}@0.2.6`
+;;     — declares the `terminal-input` / `terminal-output`
+;;     resources and the three `get-terminal-<n>` getters backing
+;;     stdio tty-detection in `fd_fdstat_get`. The probe is cached
+;;     per-fd; the returned handle (if Some) is dropped
+;;     immediately — we only need the boolean (cataggar/wabt#179).
 ;;
-;; Still ENOSYS / not lifted (sub-issues split out of #168):
+;; Still ENOSYS / not lifted:
 ;;
-;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
-;;     preview1 cares about (cataggar/wabt#179).
+;;   * `fd_fdstat_set_flags` — **permanent ENOSYS**: preview2 0.2.6
+;;     has no descriptor-flags mutator and a re-open workaround
+;;     would lose fd identity. Decided as part of
+;;     cataggar/wabt#179.
 ;;   * `fd_pread`, `fd_advise`, `fd_allocate`, `fd_renumber`,
 ;;     `fd_tell`, `path_readlink` — out of v3 scope
 ;;     (cataggar/wabt#180).
 ;;   * `sock_*` — ENOSYS stubs only; preview2 `wasi:sockets/*`
-;;     surface deferred (cataggar/wabt#178).
+;;     lift not pursued — preview1 v3 has no socket-creation
+;;     primitives, so the lift would be functionally moot
+;;     (cataggar/wabt#178 closed as won't-implement).
 
 (module
   ;; ── func types ────────────────────────────────────────────────

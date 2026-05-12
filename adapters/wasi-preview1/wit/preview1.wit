@@ -53,6 +53,24 @@ world command {
     import wasi:cli/stdout@0.2.6;
     import wasi:cli/stderr@0.2.6;
 
+    /// Stdio terminal-detection. `fd_fdstat_get` for fd 0/1/2 probes
+    /// `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-<n>`
+    /// once per process (cached) and reports
+    /// `__WASI_FILETYPE_CHARACTER_DEVICE` when the option is `Some`
+    /// or `__WASI_FILETYPE_UNKNOWN` when the host stdio is
+    /// redirected to a file/pipe (cataggar/wabt#179).
+    ///
+    /// `terminal-input` / `terminal-output` declare the resources;
+    /// `terminal-stdin` `use`s `terminal-input` and the two
+    /// `terminal-stdout` / `terminal-stderr` interfaces `use`
+    /// `terminal-output`, so the encoder needs the resource-defining
+    /// interfaces imported BEFORE their consumers.
+    import wasi:cli/terminal-input@0.2.6;
+    import wasi:cli/terminal-output@0.2.6;
+    import wasi:cli/terminal-stdin@0.2.6;
+    import wasi:cli/terminal-stdout@0.2.6;
+    import wasi:cli/terminal-stderr@0.2.6;
+
     /// Process argv + envp backing the preview1 `args_get` /
     /// `args_sizes_get` / `environ_get` / `environ_sizes_get`
     /// imports. The adapter installs a `count` / `separate`
@@ -138,6 +156,11 @@ world reactor {
     import wasi:io/streams@0.2.6;
     import wasi:cli/stdout@0.2.6;
     import wasi:cli/stderr@0.2.6;
+    import wasi:cli/terminal-input@0.2.6;
+    import wasi:cli/terminal-output@0.2.6;
+    import wasi:cli/terminal-stdin@0.2.6;
+    import wasi:cli/terminal-stdout@0.2.6;
+    import wasi:cli/terminal-stderr@0.2.6;
     import wasi:cli/environment@0.2.6;
     import wasi:clocks/wall-clock@0.2.6;
     import wasi:clocks/monotonic-clock@0.2.6;
