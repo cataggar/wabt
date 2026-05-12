@@ -49,9 +49,16 @@
 ;;   * `fd_prestat_get` / `fd_prestat_dir_name` — lifts
 ;;     `wasi:filesystem/preopens.get-directories` once per call into
 ;;     the bump arena (no permanent cache) and reads the i-th
-;;     preopen out for `wasi-libc`'s startup walk. The wider
-;;     filesystem surface (path_open, fd_read, stat, readdir) is
-;;     still pending under subphases (a2)/(b)/(c) of #165.
+;;     preopen out for `wasi-libc`'s startup walk.
+;;   * `path_open` — resolves the dirfd to a preview2 descriptor,
+;;     translates preview1 `dirflags` / `oflags` / `fdflags` /
+;;     `fs_rights_base` into the preview2 `path-flags` /
+;;     `open-flags` / `descriptor-flags` triple, calls
+;;     `wasi:filesystem/types.descriptor.open-at`, allocates a slot
+;;     in the user-fd descriptor table for the new handle.
+;;   * `fd_close` — for stdio + preopens, no-op (matches wasmtime);
+;;     for user-opened fds, drops the descriptor handle via
+;;     `[resource-drop]descriptor` and frees the slot.
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
@@ -76,18 +83,20 @@
 ;;     `wasi:clocks/monotonic-clock@0.2.6.{now, resolution}` —
 ;;     backing for the preview1 `clock_*_get` imports;
 ;;   * `wasi:filesystem/preopens@0.2.6.get-directories` — backing
-;;     for the preview1 `fd_prestat_*` walk;
-;;   * `wasi:filesystem/types@0.2.6` — only the bare `descriptor`
-;;     resource is declared for now (its `own<>` reference is the
-;;     payload of `preopens.get-directories`' return). Methods
-;;     arrive in subphases (a2)/(b)/(c) of #165.
+;;     for the preview1 `fd_prestat_*` walk and `dirfd` resolution
+;;     in `path_open` / `fd_close`;
+;;   * `wasi:filesystem/types@0.2.6.[method]descriptor.open-at` +
+;;     `[resource-drop]descriptor` — backing for `path_open` /
+;;     `fd_close`. The wider descriptor surface (`read-via-stream`,
+;;     `seek`, `stat`, `read-directory`) arrives in subphases (b)/(c)
+;;     of #165.
 ;;
 ;; Still ENOSYS (tracked under cataggar/wabt#168):
 ;;
-;;   * `fd_read`, `fd_close`, `path_open`, plus the rest of the
-;;     filesystem surface (`fd_filestat_get`, `path_filestat_get`,
-;;     `fd_readdir`, the `path_*` write-side, sockets) — wait for
-;;     subphases (a2)/(b)/(c) of #165 and #166;
+;;   * `fd_read`, `fd_seek` (for fd ≥ 3), `fd_filestat_get`,
+;;     `path_filestat_get`, `fd_readdir`, plus the `path_*`
+;;     write-side and sockets — wait for subphases (b)/(c) of #165
+;;     and #166;
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
 ;;     preview1 cares about.
 
@@ -107,6 +116,14 @@
   (type $fd_fdstat_set_flags_sig (func (param i32 i32) (result i32)))
   (type $fd_prestat_get_sig   (func (param i32 i32) (result i32)))
   (type $fd_prestat_dir_name_sig (func (param i32 i32 i32) (result i32)))
+
+  ;; preview1 path_* signature. `path_open` takes 9 params:
+  ;;   (dirfd: i32, dirflags: u32, path_ptr: i32, path_len: i32,
+  ;;    oflags: u16, fs_rights_base: u64, fs_rights_inheriting: u64,
+  ;;    fdflags: u16, opened_fd_ptr: i32) -> errno
+  ;; The u16 flags are passed as i32 in core wasm.
+  (type $path_open_sig
+    (func (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
 
   ;; preview1 args / environ / clock / random signatures
   (type $args_get_sig         (func (param i32 i32) (result i32)))
@@ -181,6 +198,17 @@
   ;;   12-byte tuples of `(descriptor_handle: i32, name_ptr: i32,
   ;;   name_len: i32)`.
   (type $get_directories_sig (func (param i32)))
+
+  ;; `wasi:filesystem/types.[method]descriptor.open-at(self,
+  ;;   path-flags: u8, path: string, open-flags: u8,
+  ;;   flags: descriptor-flags u8) -> result<own<descriptor>,
+  ;;   error-code>` — canon-lowered to 7 i32 params (self, path_flags,
+  ;;   path_ptr, path_len, open_flags, desc_flags, ret_area). The
+  ;;   ret_area holds `{ tag: u8 (+3 pad), payload: i32 }` — payload
+  ;;   is either an owned descriptor handle (tag=0) or an
+  ;;   `error-code` ordinal (tag=1).
+  (type $descriptor_open_at_sig
+    (func (param i32 i32 i32 i32 i32 i32 i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -304,6 +332,23 @@
   (import "wasi:filesystem/preopens@0.2.6" "get-directories"
     (func $get_directories (type $get_directories_sig)))
 
+  ;; `wasi:filesystem/types.[method]descriptor.open-at` backing the
+  ;; preview1 `path_open` import. Returns a new
+  ;; `own<descriptor>` via the ret_area; the adapter allocates a
+  ;; preview1 fd slot for the handle in `$descriptor_table`.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.open-at"
+    (func $descriptor_open_at (type $descriptor_open_at_sig)))
+
+  ;; `[resource-drop]descriptor` — the splicer detects this import
+  ;; name and synthesises the canon `resource.drop` call (see
+  ;; `src/component/adapter/adapter.zig:706`). Invoked by
+  ;; `$fd_close` for user-opened fds; preopens and stdio fds are
+  ;; never dropped (their resource ownership lives with the host).
+  (import "wasi:filesystem/types@0.2.6"
+    "[resource-drop]descriptor"
+    (func $descriptor_drop (type $i32_void)))
+
   ;; ── adapter state ────────────────────────────────────────────
   ;;
   ;; Lazy handle cache for stdout / stderr. Initialised to -1
@@ -322,13 +367,24 @@
   ;;
   ;;   * `blocking-write-and-flush` (8-byte `result<_, stream-error>`)
   ;;   * `get-random-bytes` / `get-arguments` / `get-environment`
-  ;;     (8-byte `(list_ptr, list_len)` tuple)
+  ;;     / `get-directories` (8-byte `(list_ptr, list_len)` tuple)
   ;;   * `wall-clock.{now, resolution}` (16-byte `datetime` record)
+  ;;   * `descriptor.open-at` (8-byte `result<own<descriptor>,
+  ;;     error-code>` discriminated payload)
   ;;
-  ;; Everything in offsets 0..32 is treated as a short-lived
-  ;; per-call return slot. The remaining 65504 bytes (offsets
-  ;; 32..65536) are the import-alloc bump arena (see below). The
-  ;; area is allocated lazily on first preview2 call via the
+  ;; Page layout (64 KiB):
+  ;;
+  ;;   0..32      short-lived ret-slot (above).
+  ;;   32..1056   `$descriptor_table` — 248 × i32 slots for
+  ;;              user-opened fds (each slot holds the preview2
+  ;;              descriptor handle or `-1` for "free"). Mapped to
+  ;;              preview1 fd = `3 + n_preopens + slot`.
+  ;;   1056..65536  Bump arena for `$arena_alloc` (used by mode 2 /
+  ;;              mode 3 of `$cabi_import_realloc`). Cursor resets
+  ;;              to 0 at the end of every preview1 body that
+  ;;              touches the import-alloc state machine.
+  ;;
+  ;; The area is allocated lazily on first preview2 call via the
   ;; embed's `cabi_realloc`; we never free it (the embed instance
   ;; teardown reclaims it).
   ;;
@@ -360,16 +416,17 @@
   ;;             preview1 `buf` (zero copy).
   ;;
   ;;   mode 2 — count. Used by `args_sizes_get` /
-  ;;             `environ_sizes_get`. Every allocation is served
-  ;;             from the bump arena starting at `$ret_area + 32`;
-  ;;             `align == 1` allocs additionally accumulate their
-  ;;             size into `$strings_sz` so the caller can compute
+  ;;             `environ_sizes_get` / `fd_prestat_*`. Every
+  ;;             allocation is served from the bump arena starting
+  ;;             at `$ret_area + 1056` (`$arena_alloc`); `align == 1`
+  ;;             allocs additionally accumulate their size into
+  ;;             `$strings_sz` so the caller can compute
   ;;             `argv_buf_size` / `env_buf_size` without
   ;;             second-guessing the host. The arena cursor resets
   ;;             to 0 at the start of every preview1 body that
   ;;             enters mode 2 or 3, so the same physical bytes
   ;;             are reused across calls — no main-heap allocation
-  ;;             ever happens for args/environ.
+  ;;             ever happens for args/environ/preopens.
   ;;
   ;;   mode 3 — separate. Used by `args_get` / `environ_get`.
   ;;             `align == 1` allocs go to `$strings_dst +
@@ -390,6 +447,20 @@
   (global $strings_dst       (mut i32) (i32.const 0))
   (global $strings_cur       (mut i32) (i32.const 0))
   (global $strings_sz        (mut i32) (i32.const 0))
+
+  ;; ── descriptor table state ───────────────────────────────────
+  ;;
+  ;; `$descriptor_table` lives at `$ret_area + 32 .. $ret_area + 1056`
+  ;; — 248 i32 slots indexed by `slot = fd - 3 - n_preopens` for
+  ;; user-opened fds. Each slot holds either a preview2
+  ;; `own<descriptor>` handle from a successful `descriptor.open-at`
+  ;; or `-1` for "free".
+  ;;
+  ;; Slots are initialised to `-1` lazily on first reference; the
+  ;; `cabi_realloc` allocation that backs `$ret_area` returns
+  ;; uninitialised memory, so a fresh write pass is required.
+  ;; `$descriptor_table_inited` is the sentinel for that pass.
+  (global $descriptor_table_inited (mut i32) (i32.const 0))
 
   ;; ── preview1 errno constants ─────────────────────────────────
   ;; Mirrors wasi-libc `<wasi/api.h>`:
@@ -497,14 +568,18 @@
     global.get $ret_area)
 
   ;; Helper: bump-allocate `size` bytes from the arena at
-  ;; `$ret_area + 32`, aligned up to `align` (which must be a power
+  ;; `$ret_area + 1056`, aligned up to `align` (which must be a power
   ;; of two). Used by `$cabi_import_realloc` modes 2 / 3 to serve
   ;; the list-backing allocation (and, in mode 2, the string
   ;; allocations too) without touching the embed's heap.
   ;;
+  ;; Offset 1056 = 32 (short-lived ret-slot) + 1024
+  ;; (`$descriptor_table`, 248 i32 slots). See the `$ret_area` doc
+  ;; for the full page layout.
+  ;;
   ;; The arena is not bounds-checked: a host that returns
   ;; pathologically many or pathologically long strings could
-  ;; overrun the 65504-byte capacity. For realistic preview1 use
+  ;; overrun the 64480-byte capacity. For realistic preview1 use
   ;; (n_args + n_envvars ≪ 4096, total bytes ≪ 64 KiB), this is
   ;; comfortably safe; the failure mode if violated is corruption
   ;; of the next adjacent page in env.memory, not a wasm trap.
@@ -524,9 +599,9 @@
     i32.xor
     i32.and
     local.tee $cur
-    ;; ret = $ret_area + 32 + aligned
+    ;; ret = $ret_area + 1056 + aligned
     call $ensure_ret_area
-    i32.const 32
+    i32.const 1056
     i32.add
     i32.add
     local.set $ret
@@ -536,6 +611,236 @@
     i32.add
     global.set $arena_cur
     local.get $ret)
+
+  ;; Helper: return the base of the `$descriptor_table`, initialising
+  ;; all 248 slots to `-1` on first call. Subsequent calls are pure
+  ;; reads.
+  (func $ensure_descriptor_table (result i32)
+    (local $base i32) (local $i i32)
+    call $ensure_ret_area
+    i32.const 32
+    i32.add
+    local.set $base
+    global.get $descriptor_table_inited
+    i32.eqz
+    if
+      i32.const 0
+      local.set $i
+      block $done
+        loop $next
+          local.get $i
+          i32.const 248
+          i32.ge_u
+          br_if $done
+          local.get $base
+          local.get $i
+          i32.const 2
+          i32.shl
+          i32.add
+          i32.const -1
+          i32.store
+          local.get $i
+          i32.const 1
+          i32.add
+          local.set $i
+          br $next
+        end
+      end
+      i32.const 1
+      global.set $descriptor_table_inited
+    end
+    local.get $base)
+
+  ;; Helper: find the first free slot in `$descriptor_table`, write
+  ;; `handle` into it, return the slot index. Returns `-1` if the
+  ;; table is full (caller maps to `ENFILE=41` after dropping the
+  ;; handle).
+  (func $alloc_fd_slot (param $handle i32) (result i32)
+    (local $base i32) (local $i i32) (local $entry i32)
+    call $ensure_descriptor_table
+    local.set $base
+    i32.const 0
+    local.set $i
+    block $done
+      loop $next
+        local.get $i
+        i32.const 248
+        i32.ge_u
+        br_if $done
+        local.get $base
+        local.get $i
+        i32.const 2
+        i32.shl
+        i32.add
+        local.tee $entry
+        i32.load
+        i32.const -1
+        i32.eq
+        if
+          local.get $entry
+          local.get $handle
+          i32.store
+          local.get $i
+          return
+        end
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $next
+      end
+    end
+    i32.const -1)
+
+  ;; Helper: map `wasi:filesystem/types.error-code` ordinals (0..36)
+  ;; to preview1 errno values (`<wasi/api.h>`). Ordinals follow the
+  ;; declaration order in `wit/deps/wasi-filesystem/types.wit`'s
+  ;; `error-code` enum. Cherry-picked from the wasmtime reference
+  ;; adapter's `From<filesystem::ErrorCode> for Errno`.
+  (func $errno_from_error_code (param $ec i32) (result i32)
+    local.get $ec  i32.eqz                      if i32.const  2 return end ;; access → EACCES
+    local.get $ec  i32.const  1  i32.eq         if i32.const  6 return end ;; would-block → EAGAIN
+    local.get $ec  i32.const  2  i32.eq         if i32.const  7 return end ;; already
+    local.get $ec  i32.const  3  i32.eq         if i32.const  8 return end ;; bad-descriptor → EBADF
+    local.get $ec  i32.const  4  i32.eq         if i32.const 10 return end ;; busy
+    local.get $ec  i32.const  5  i32.eq         if i32.const 16 return end ;; deadlock
+    local.get $ec  i32.const  6  i32.eq         if i32.const 19 return end ;; quota → EDQUOT
+    local.get $ec  i32.const  7  i32.eq         if i32.const 20 return end ;; exist
+    local.get $ec  i32.const  8  i32.eq         if i32.const 22 return end ;; file-too-large → EFBIG
+    local.get $ec  i32.const  9  i32.eq         if i32.const 25 return end ;; illegal-byte-sequence → EILSEQ
+    local.get $ec  i32.const 10  i32.eq         if i32.const 26 return end ;; in-progress
+    local.get $ec  i32.const 11  i32.eq         if i32.const 27 return end ;; interrupted → EINTR
+    local.get $ec  i32.const 12  i32.eq         if i32.const 28 return end ;; invalid → EINVAL
+    local.get $ec  i32.const 13  i32.eq         if i32.const 29 return end ;; io → EIO
+    local.get $ec  i32.const 14  i32.eq         if i32.const 31 return end ;; is-directory → EISDIR
+    local.get $ec  i32.const 15  i32.eq         if i32.const 32 return end ;; loop → ELOOP
+    local.get $ec  i32.const 16  i32.eq         if i32.const 34 return end ;; too-many-links → EMLINK
+    local.get $ec  i32.const 17  i32.eq         if i32.const 35 return end ;; message-size → EMSGSIZE
+    local.get $ec  i32.const 18  i32.eq         if i32.const 37 return end ;; name-too-long → ENAMETOOLONG
+    local.get $ec  i32.const 19  i32.eq         if i32.const 43 return end ;; no-device → ENODEV
+    local.get $ec  i32.const 20  i32.eq         if i32.const 44 return end ;; no-entry → ENOENT
+    local.get $ec  i32.const 21  i32.eq         if i32.const 46 return end ;; no-lock → ENOLCK
+    local.get $ec  i32.const 22  i32.eq         if i32.const 48 return end ;; insufficient-memory → ENOMEM
+    local.get $ec  i32.const 23  i32.eq         if i32.const 51 return end ;; insufficient-space → ENOSPC
+    local.get $ec  i32.const 24  i32.eq         if i32.const 54 return end ;; not-directory → ENOTDIR
+    local.get $ec  i32.const 25  i32.eq         if i32.const 55 return end ;; not-empty → ENOTEMPTY
+    local.get $ec  i32.const 26  i32.eq         if i32.const 56 return end ;; not-recoverable
+    local.get $ec  i32.const 27  i32.eq         if i32.const 58 return end ;; unsupported → ENOTSUP
+    local.get $ec  i32.const 28  i32.eq         if i32.const 59 return end ;; no-tty → ENOTTY
+    local.get $ec  i32.const 29  i32.eq         if i32.const 60 return end ;; no-such-device → ENXIO
+    local.get $ec  i32.const 30  i32.eq         if i32.const 61 return end ;; overflow → EOVERFLOW
+    local.get $ec  i32.const 31  i32.eq         if i32.const 63 return end ;; not-permitted → EPERM
+    local.get $ec  i32.const 32  i32.eq         if i32.const 64 return end ;; pipe → EPIPE
+    local.get $ec  i32.const 33  i32.eq         if i32.const 69 return end ;; read-only → EROFS
+    local.get $ec  i32.const 34  i32.eq         if i32.const 70 return end ;; invalid-seek → ESPIPE
+    local.get $ec  i32.const 35  i32.eq         if i32.const 74 return end ;; text-file-busy → ETXTBSY
+    local.get $ec  i32.const 36  i32.eq         if i32.const 75 return end ;; cross-device → EXDEV
+    i32.const 29) ;; default → EIO
+
+  ;; Helper: resolve a preview1 `fd` to a preview2 descriptor handle.
+  ;; Writes the handle at `*out_handle_ptr` and the lifted preopen
+  ;; count at `*out_n_preopens_ptr` (used by callers that then need
+  ;; to compose the returned-fd number). Returns 0 on success, the
+  ;; preview1 errno on failure (in which case `*out_handle_ptr` is
+  ;; untouched).
+  ;;
+  ;; Multi-output via out-pointers because wabt's validator
+  ;; currently rejects multi-result function signatures (see the
+  ;; memory note from the #171 clocks work).
+  ;;
+  ;; Lifts preopens via mode 2 of the import-alloc state machine;
+  ;; the arena is reset before returning so the caller can re-use
+  ;; the bump arena for any follow-up host call (e.g. `open-at`).
+  (func $resolve_fd
+    (param $fd i32) (param $out_handle_ptr i32) (param $out_n_preopens_ptr i32)
+    (result i32)
+    (local $ra i32) (local $idx i32) (local $list_ptr i32)
+    (local $list_len i32) (local $entry i32) (local $handle i32)
+    (local $tbl i32) (local $slot i32)
+    local.get $fd
+    i32.const 3
+    i32.sub
+    local.set $idx
+    local.get $idx
+    i32.const 0
+    i32.lt_s
+    if
+      i32.const 8                       ;; EBADF for stdio
+      return
+    end
+    ;; Lift preopens.
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_directories
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=0
+    local.set $list_ptr
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    ;; Publish n_preopens to the caller.
+    local.get $out_n_preopens_ptr
+    local.get $list_len
+    i32.store
+    local.get $idx
+    local.get $list_len
+    i32.lt_u
+    if
+      ;; preopen: handle = list_ptr[idx * 12 + 0]
+      local.get $list_ptr
+      local.get $idx
+      i32.const 12
+      i32.mul
+      i32.add
+      i32.load offset=0
+      local.set $handle
+      i32.const 0  global.set $arena_cur
+      i32.const 0  global.set $strings_sz
+      local.get $out_handle_ptr
+      local.get $handle
+      i32.store
+      i32.const 0
+      return
+    end
+    ;; user fd: slot = idx - list_len; bounds check; table lookup.
+    local.get $idx
+    local.get $list_len
+    i32.sub
+    local.tee $slot
+    i32.const 248
+    i32.ge_u
+    if
+      i32.const 0  global.set $arena_cur
+      i32.const 0  global.set $strings_sz
+      i32.const 8                       ;; EBADF — past max user fds
+      return
+    end
+    call $ensure_descriptor_table
+    local.tee $tbl
+    local.get $slot
+    i32.const 2
+    i32.shl
+    i32.add
+    i32.load
+    local.tee $handle
+    i32.const -1
+    i32.eq
+    if
+      i32.const 0  global.set $arena_cur
+      i32.const 0  global.set $strings_sz
+      i32.const 8                       ;; EBADF — free slot
+      return
+    end
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    local.get $out_handle_ptr
+    local.get $handle
+    i32.store
+    i32.const 0)
 
   ;; Helper: write `buf[0..len]` to `handle` via
   ;; `blocking-write-and-flush`. Maps `stream-error` to EIO; an
@@ -669,7 +974,255 @@
     i32.const 8) ;; EBADF
 
   (func $fd_read (type $fd_read_sig)         i32.const 52)
-  (func $fd_close (type $fd_close_sig)       i32.const 52)
+  ;; preview1 `fd_close(fd) -> errno`.
+  ;;
+  ;;   fd 0..2 (stdio)            → success (close-stdio is a no-op
+  ;;                                in preview1; matches wasmtime).
+  ;;   fd in preopen range         → success (preopens are owned by
+  ;;                                the host and are immortal for the
+  ;;                                process lifetime; closing them is
+  ;;                                a no-op).
+  ;;   fd in user-table range      → drop the descriptor handle via
+  ;;                                `[resource-drop]descriptor`,
+  ;;                                clear the slot, return SUCCESS.
+  ;;   anything else               → EBADF.
+  ;;
+  ;; Lifts preopens via `$resolve_fd` to discover both the
+  ;; descriptor handle and `n_preopens` for the user-fd offset
+  ;; computation in one go.
+  (func $fd_close (type $fd_close_sig)
+    (local $ra i32) (local $idx i32) (local $list_len i32)
+    (local $slot i32) (local $tbl i32) (local $entry i32)
+    (local $handle i32)
+    local.get 0
+    i32.const 3
+    i32.sub
+    local.tee $idx
+    i32.const 0
+    i32.lt_s
+    if
+      i32.const 0                       ;; stdio close: no-op
+      return
+    end
+    ;; Lift preopens to learn n_preopens.
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_directories
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    local.get $idx
+    local.get $list_len
+    i32.lt_u
+    if
+      i32.const 0                       ;; preopen close: no-op
+      return
+    end
+    ;; user fd: slot = idx - list_len; bounds check; drop + clear.
+    local.get $idx
+    local.get $list_len
+    i32.sub
+    local.tee $slot
+    i32.const 248
+    i32.ge_u
+    if
+      i32.const 8                       ;; EBADF
+      return
+    end
+    call $ensure_descriptor_table
+    local.get $slot
+    i32.const 2
+    i32.shl
+    i32.add
+    local.tee $entry
+    i32.load
+    local.tee $handle
+    i32.const -1
+    i32.eq
+    if
+      i32.const 8                       ;; EBADF — slot already free
+      return
+    end
+    local.get $handle
+    call $descriptor_drop
+    local.get $entry
+    i32.const -1
+    i32.store
+    i32.const 0)
+
+  ;; preview1 `path_open(dirfd, dirflags, path_ptr, path_len,
+  ;; oflags, fs_rights_base, fs_rights_inheriting, fdflags,
+  ;; opened_fd_ptr) -> errno`.
+  ;;
+  ;; 1. Resolve dirfd → preview2 descriptor handle via
+  ;;    `$resolve_fd` (which also publishes `n_preopens` so we can
+  ;;    compute the returned fd).
+  ;; 2. Translate preview1 flag bundles into the preview2
+  ;;    `path-flags` / `open-flags` / `descriptor-flags` triple.
+  ;;    The bit assignments for `path-flags.symlink-follow` and
+  ;;    the four `open-flags` happen to coincide with their preview1
+  ;;    counterparts so the translation is a bitmask passthrough.
+  ;;    `descriptor-flags` requires explicit conversion from
+  ;;    `fs_rights_base` + `fdflags`.
+  ;; 3. Call `descriptor.open-at`. On success the return-area holds
+  ;;    `(tag=0, payload=descriptor handle)`; on error
+  ;;    `(tag=1, payload=error-code ordinal)`.
+  ;; 4. Allocate a slot in `$descriptor_table`; if full, drop the
+  ;;    new handle and return `ENFILE=41`.
+  ;; 5. Write the resulting preview1 fd at `*opened_fd_ptr`.
+  ;;
+  ;; `fs_rights_inheriting` is advisory in preview1 with no preview2
+  ;; equivalent; silently ignored, matching wasmtime.
+  ;; `FDFLAGS_APPEND` and `FDFLAGS_NONBLOCK` are deferred to a
+  ;; later subphase (they would require `descriptor.set-flags` and
+  ;; per-call `read` vs `blocking-read` selection).
+  (func $path_open (type $path_open_sig)
+    (local $dir_handle i32) (local $n_preopens i32) (local $err i32)
+    (local $path_flags i32) (local $open_flags i32) (local $desc_flags i32)
+    (local $rights_lo i32) (local $ra i32)
+    (local $tag i32) (local $payload i32) (local $slot i32)
+    ;; 1. Resolve dirfd. Use offsets in the short-lived ret-slot
+    ;;    (0..32) for the two out-pointers — we'll overwrite them
+    ;;    with the open-at result later.
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0                         ;; dirfd
+    local.get $ra                       ;; out_handle_ptr (offset 0)
+    local.get $ra
+    i32.const 4
+    i32.add                              ;; out_n_preopens_ptr (offset 4)
+    call $resolve_fd
+    local.tee $err
+    if
+      local.get $err
+      return
+    end
+    local.get $ra
+    i32.load offset=0
+    local.set $dir_handle
+    local.get $ra
+    i32.load offset=4
+    local.set $n_preopens
+    ;; 2. Flag translation.
+    local.get 1                         ;; dirflags
+    i32.const 1
+    i32.and
+    local.set $path_flags
+    local.get 4                         ;; oflags (i32)
+    i32.const 0xF
+    i32.and
+    local.set $open_flags
+    ;; descriptor-flags from rights + fdflags.
+    ;; rights low 32 bits: FD_READ=0x02, FD_WRITE=0x40, FD_DATASYNC=0x01,
+    ;; FD_SYNC=0x10. fs_rights_base is i64 in the param list.
+    local.get 5                         ;; fs_rights_base (i64)
+    i32.wrap_i64
+    local.set $rights_lo
+    i32.const 0
+    local.set $desc_flags
+    ;; READ
+    local.get $rights_lo
+    i32.const 0x02
+    i32.and
+    if
+      local.get $desc_flags
+      i32.const 1
+      i32.or
+      local.set $desc_flags
+    end
+    ;; WRITE
+    local.get $rights_lo
+    i32.const 0x40
+    i32.and
+    if
+      local.get $desc_flags
+      i32.const 2
+      i32.or
+      local.set $desc_flags
+    end
+    ;; FILE_INTEGRITY_SYNC ← FDFLAGS_SYNC (16)
+    local.get 7                         ;; fdflags
+    i32.const 16
+    i32.and
+    if
+      local.get $desc_flags
+      i32.const 4
+      i32.or
+      local.set $desc_flags
+    end
+    ;; DATA_INTEGRITY_SYNC ← FDFLAGS_DSYNC (2)
+    local.get 7
+    i32.const 2
+    i32.and
+    if
+      local.get $desc_flags
+      i32.const 8
+      i32.or
+      local.set $desc_flags
+    end
+    ;; REQUESTED_WRITE_SYNC ← FDFLAGS_RSYNC (8)
+    local.get 7
+    i32.const 8
+    i32.and
+    if
+      local.get $desc_flags
+      i32.const 16
+      i32.or
+      local.set $desc_flags
+    end
+    ;; 3. Call descriptor.open-at(self, path_flags, path_ptr,
+    ;;    path_len, open_flags, desc_flags, ret_area).
+    local.get $dir_handle
+    local.get $path_flags
+    local.get 2                         ;; path_ptr
+    local.get 3                         ;; path_len
+    local.get $open_flags
+    local.get $desc_flags
+    local.get $ra
+    call $descriptor_open_at
+    ;; 4. Read result.
+    local.get $ra
+    i32.load8_u offset=0
+    local.set $tag
+    local.get $ra
+    i32.load offset=4
+    local.set $payload
+    local.get $tag
+    if
+      ;; err: payload is the error-code ordinal.
+      local.get $payload
+      call $errno_from_error_code
+      return
+    end
+    ;; 5. payload is the new descriptor handle. Allocate a slot.
+    local.get $payload
+    call $alloc_fd_slot
+    local.tee $slot
+    i32.const 0
+    i32.lt_s
+    if
+      ;; Table full: drop the new handle to avoid leaking it host-side,
+      ;; return ENFILE=41 ("too many files open in system").
+      local.get $payload
+      call $descriptor_drop
+      i32.const 41
+      return
+    end
+    ;; 6. *opened_fd_ptr = 3 + n_preopens + slot.
+    local.get 8                         ;; opened_fd_ptr
+    local.get $n_preopens
+    local.get $slot
+    i32.add
+    i32.const 3
+    i32.add
+    i32.store
+    i32.const 0)
 
   ;; preview1 `fd_seek(fd, offset, whence, newoffset_ptr) -> errno`.
   ;; Stdio (fd 0/1/2) cannot seek — return ESPIPE so wasi-libc's
@@ -1454,6 +2007,7 @@
   (export "fd_fdstat_set_flags"  (func $fd_fdstat_set_flags))
   (export "fd_prestat_get"       (func $fd_prestat_get))
   (export "fd_prestat_dir_name"  (func $fd_prestat_dir_name))
+  (export "path_open"            (func $path_open))
   (export "args_get"             (func $args_get))
   (export "args_sizes_get"       (func $args_sizes_get))
   (export "environ_get"          (func $environ_get))
