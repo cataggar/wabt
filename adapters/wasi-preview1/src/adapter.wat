@@ -10,29 +10,54 @@
 ;; code end-to-end and lets wamr drop the `exit_code_sink`
 ;; workaround added in #447/#448.
 ;;
-;; Status: scaffold. Most function bodies are `unreachable` traps.
-;; `proc_exit` and `run` are fully wired. `fd_write` is still an
-;; ENOSYS stub but the preview2 surface it will call (Phase
-;; 1.c.3c/d) is now declared:
+;; Status: working v3.0.0-dev.5 surface — sufficient for the four
+;; cataggar/wamr component-examples (`zig-hello`, `zig-exit`,
+;; `zig-calculator-cmd`, `mixed-zig-rust-calc`). What's wired:
 ;;
-;;   * `wasi:cli/stdout@0.2.6.get-stdout` /
-;;     `wasi:cli/stderr@0.2.6.get-stderr` — handle factories;
+;;   * `proc_exit` — `wasi:cli/exit.exit-with-code(u8)` with a
+;;     stable-`exit(result)` fallback;
+;;   * `sched_yield` — trivial success;
+;;   * `proc_raise` — ENOSYS (no preview2 equivalent; advisory);
+;;   * `fd_write` (stdio only, fd 1/2) — iterates the iovec list
+;;     and streams via `wasi:io/streams.[method]output-stream.
+;;     blocking-write-and-flush` against cached
+;;     `wasi:cli/{stdout,stderr}.get-{stdout,stderr}` handles;
+;;   * `fd_seek` (stdio only) — returns `ESPIPE=70` so wasi-libc's
+;;     `isatty` probe and Rust's `Stdout` line-buffering codepaths
+;;     see "this is a pipe" rather than a hard `ENOSYS`;
+;;   * `fd_fdstat_get` (stdio only) — fills a 24-byte preview1
+;;     `fdstat` with `fs_filetype = character_device` and the
+;;     matching `FD_READ` / `FD_WRITE` rights so Zig's stdlib and
+;;     Rust's `is_terminal()` enter their TTY codepaths.
+;;
+;; Declared preview2 imports the adapter consumes today:
+;;
+;;   * `wasi:cli/exit@0.2.6` — `exit-with-code(u8)` + `exit(result)`;
+;;   * `wasi:cli/stdout@0.2.6` / `wasi:cli/stderr@0.2.6` — handle
+;;     factories for stdout / stderr;
 ;;   * `wasi:io/streams@0.2.6.[method]output-stream.blocking-write-and-flush`
-;;     — single hot path for stdout/stderr writes;
+;;     — the single hot path for stdout/stderr writes;
 ;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` —
 ;;     auto-bound by the splicer for canon `resource.drop` lowering
 ;;     (we cache handles and never actually drop them, but the
 ;;     splicer expects every `own<>` resource to have its drop
-;;     import declared).
+;;     import declared);
+;;   * `wasi:io/error@0.2.6` — the resource the streams interface's
+;;     `stream-error.last-operation-failed(own<error>)` payload
+;;     references.
 ;;
-;; The new imports are declared here in Phase 1.c.3b so the
-;; encoded-world custom section round-trips through
-;; `build_adapter.zig` → `decode.parseFromAdapterCore` against the
-;; widened preview1 world. Phase 1.c.3c adds globals + helpers
-;; that consume them; Phase 1.c.3d rewires `fd_write` to dispatch
-;; on fd=1/2 → stdout/stderr handle and stream the iovec list
-;; via `blocking-write-and-flush`. All other preview1 imports
-;; remain ENOSYS until later sub-phases.
+;; Still ENOSYS (tracked under cataggar/wabt#168):
+;;
+;;   * `fd_read`, `fd_close`, `fd_prestat_get`, `fd_prestat_dir_name`,
+;;     plus the path_* surface — wait for filesystem read-side
+;;     (#165);
+;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
+;;     preview1 cares about;
+;;   * `args_get` / `args_sizes_get` / `environ_get` /
+;;     `environ_sizes_get` — wait for `wasi:cli/environment` (#161);
+;;   * `clock_time_get` / `clock_res_get` — wait for
+;;     `wasi:clocks/{wall-clock, monotonic-clock}` (#162);
+;;   * `random_get` — wait for `wasi:random/random` (#163).
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -425,8 +450,100 @@
 
   (func $fd_read (type $fd_read_sig)         i32.const 52)
   (func $fd_close (type $fd_close_sig)       i32.const 52)
-  (func $fd_seek (type $fd_seek_sig)         i32.const 52)
-  (func $fd_fdstat_get (type $fd_fdstat_get_sig) i32.const 52)
+
+  ;; preview1 `fd_seek(fd, offset, whence, newoffset_ptr) -> errno`.
+  ;; Stdio (fd 0/1/2) cannot seek — return ESPIPE so wasi-libc's
+  ;; `isatty` probe and Rust's `std::io::Stdout` line-buffering
+  ;; codepaths see the "this is a pipe" signal rather than a hard
+  ;; "function not supported" error. Matches the wasmtime reference
+  ;; adapter's stdio branch (`crates/wasi-preview1-component-adapter/
+  ;; src/lib.rs:fd_seek` → `Err(ERRNO_SPIPE)` for non-file streams).
+  ;;
+  ;; `__WASI_ERRNO_SPIPE = 70` per `wasi-libc/.../wasip1.h` — note
+  ;; this is *not* the Linux POSIX `ESPIPE=29` value; WASI preview1
+  ;; defines its own errno numbering and assigns 29 to `IO`. We use
+  ;; the preview1 number because that's what the canon-lift'd
+  ;; `errno` enum at the wasi:cli host expects.
+  ;;
+  ;; offset / whence / newoffset_ptr are ignored on the error path:
+  ;; wasmtime's adapter doesn't write `*newoffset` when returning
+  ;; ESPIPE, and wasi-libc's caller only reads it when errno == 0.
+  ;;
+  ;; fd >= 3 keeps the ENOSYS=52 stub until cataggar/wabt#165
+  ;; (filesystem read-side) wires real seekable descriptors.
+  (func $fd_seek (type $fd_seek_sig)
+    local.get 0
+    i32.const 3
+    i32.lt_u
+    if (result i32)
+      i32.const 70   ;; ESPIPE (preview1)
+    else
+      i32.const 52   ;; ENOSYS
+    end)
+
+  ;; preview1 `fd_fdstat_get(fd, statbuf_ptr) -> errno`.
+  ;; Stdio (fd 0/1/2) writes a 24-byte `fdstat` reporting
+  ;; `fs_filetype = character_device (2)` so Zig's stdlib and
+  ;; Rust's `is_terminal()` enter their TTY / line-buffered
+  ;; codepaths. Rights bits mirror the wasmtime reference
+  ;; adapter's stdio branch: `FD_READ` (bit 1 → 0x02) for fd 0,
+  ;; `FD_WRITE` (bit 6 → 0x40) for fd 1/2.
+  ;;
+  ;; Deliberate divergence from the wasmtime adapter: that adapter
+  ;; calls `wasi:cli/terminal-{stdin,stdout,stderr}.get-terminal-*`
+  ;; and falls back to `FILETYPE_UNKNOWN` when stdio isn't actually
+  ;; a tty. We unconditionally report `character_device` to keep
+  ;; this change in the "no new preview2 imports" bucket of
+  ;; cataggar/wabt#168. The trade-off is that a guest redirected to
+  ;; a file/pipe still believes it's writing to a tty — acceptable
+  ;; for the v3 scope (CLI fixtures); revisit alongside the
+  ;; terminal-* imports if a fixture surfaces the mismatch.
+  ;;
+  ;; preview1 fdstat layout (24 bytes, align 8):
+  ;;   offset 0:  u8  fs_filetype          (= 2, character_device)
+  ;;   offset 1:  pad
+  ;;   offset 2:  u16 fs_flags             (= 0; no FDFLAGS for stdio)
+  ;;   offset 4:  pad (4 bytes)
+  ;;   offset 8:  u64 fs_rights_base       (= FD_READ / FD_WRITE)
+  ;;   offset 16: u64 fs_rights_inheriting (= 0)
+  ;;
+  ;; fd >= 3 keeps the ENOSYS=52 stub until cataggar/wabt#165 wires
+  ;; real descriptors.
+  (func $fd_fdstat_get (type $fd_fdstat_get_sig)
+    (local $rights i64)
+    local.get 0
+    i32.const 3
+    i32.ge_u
+    if
+      i32.const 52   ;; ENOSYS for non-stdio fds
+      return
+    end
+    ;; rights: fd == 0 → FD_READ (0x02); fd ∈ {1,2} → FD_WRITE (0x40)
+    local.get 0
+    i32.eqz
+    if (result i64)
+      i64.const 0x02
+    else
+      i64.const 0x40
+    end
+    local.set $rights
+    ;; Zero bytes 0..8 then overlay filetype at offset 0.
+    ;; statbuf_ptr is guaranteed 8-aligned by the canon ABI
+    ;; (fdstat has _Alignof == 8 in wasi-libc).
+    local.get 1
+    i64.const 0
+    i64.store offset=0       ;; clears filetype + pad + fs_flags + pad
+    local.get 1
+    i32.const 2              ;; character_device
+    i32.store8 offset=0      ;; overlay fs_filetype
+    local.get 1
+    local.get $rights
+    i64.store offset=8       ;; fs_rights_base
+    local.get 1
+    i64.const 0
+    i64.store offset=16      ;; fs_rights_inheriting
+    i32.const 0)             ;; SUCCESS
+
   (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags_sig) i32.const 52)
   (func $fd_prestat_get (type $fd_prestat_get_sig) i32.const 52)
   (func $fd_prestat_dir_name (type $fd_prestat_dir_name_sig) i32.const 52)
