@@ -229,14 +229,26 @@
   ;; Helper: ensure `$ret_area` points at a 16-byte block in
   ;; env.memory. Allocates once via the embed's cabi_realloc.
   ;; Returns the cached pointer.
+  ;;
+  ;; We request a full page (65536 bytes) rather than the 16 bytes
+  ;; we actually need. The reason: when the embed itself doesn't
+  ;; export `cabi_realloc`, the component-new splicer replaces the
+  ;; `__main_module__::cabi_realloc` import with a
+  ;; `realloc_via_memory_grow` body (see
+  ;; `src/component/adapter/adapter.zig:buildMainModuleFallback`)
+  ;; that traps on any allocation request smaller than one page.
+  ;; Matches `wit-component`'s upstream allocate_stack_via_realloc
+  ;; strategy — allocate one page up-front, carve the small scratch
+  ;; area out of its head, ignore the rest. Embeds with real
+  ;; cabi_realloc still satisfy the request fine.
   (func $ensure_ret_area (result i32)
     global.get $ret_area
     i32.eqz
     if
       i32.const 0     ;; old_ptr
       i32.const 0     ;; old_size
-      i32.const 4     ;; align
-      i32.const 16    ;; new_size
+      i32.const 65536 ;; align (page)
+      i32.const 65536 ;; new_size (one page)
       call $main_cabi_realloc
       global.set $ret_area
     end

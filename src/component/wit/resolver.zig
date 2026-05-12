@@ -65,13 +65,44 @@ pub const Resolver = struct {
     /// inside an interface located in `wasi:cli` must resolve `foo` as
     /// `wasi:cli/foo`, not as a ref into the world's main package.
     pub fn findInterfaceWithPkg(self: Resolver, ref: ast.InterfaceRef) ?Lookup {
-        const target_pkg = ref.package orelse {
+        return self.findInterfaceWithPkgCtx(ref, null);
+    }
+
+    /// Variant of `findInterfaceWithPkg` that accepts a `ctx_pkg`
+    /// fallback package id. When `ref.package == null` (a short ref
+    /// like `use error.{error};`) the lookup tries `ctx_pkg` first
+    /// — this is the package the *consuming* interface lives in.
+    /// Falls back to `self.main` if `ctx_pkg` is null or doesn't
+    /// contain the named interface. Same package matched (relaxed
+    /// version compare) as `findInterfaceWithPkg`.
+    pub fn findInterfaceWithPkgCtx(self: Resolver, ref: ast.InterfaceRef, ctx_pkg: ?ast.PackageId) ?Lookup {
+        if (ref.package == null) {
+            if (ctx_pkg) |cp| {
+                if (self.main.package) |mp| {
+                    if (packageMatches(mp, cp)) {
+                        if (findInterfaceInDoc(self.main, ref.name)) |i| {
+                            return .{ .iface = i, .pkg = mp };
+                        }
+                    }
+                }
+                for (self.deps) |dep| {
+                    if (dep.package) |dp| {
+                        if (packageMatches(dp, cp)) {
+                            if (findInterfaceInDoc(dep, ref.name)) |i| {
+                                return .{ .iface = i, .pkg = dp };
+                            }
+                        }
+                    }
+                }
+                // Fall through to the original main-only lookup.
+            }
             if (findInterfaceInDoc(self.main, ref.name)) |i| {
                 return .{ .iface = i, .pkg = self.main.package orelse return null };
             }
             return null;
-        };
+        }
 
+        const target_pkg = ref.package.?;
         if (self.main.package) |mp| {
             if (packageMatches(mp, target_pkg)) {
                 if (findInterfaceInDoc(self.main, ref.name)) |i| return .{ .iface = i, .pkg = mp };
