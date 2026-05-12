@@ -59,6 +59,18 @@
 ;;   * `fd_close` — for stdio + preopens, no-op (matches wasmtime);
 ;;     for user-opened fds, drops the descriptor handle via
 ;;     `[resource-drop]descriptor` and frees the slot.
+;;   * `fd_read` — for user-opened files, opens a fresh
+;;     `wasi:filesystem/types.descriptor.read-via-stream(position)`
+;;     and routes the canon-lifted `list<u8>` from
+;;     `input-stream.blocking-read` directly into the caller's iov
+;;     buffer via the one-shot import-alloc override (mode 1). The
+;;     stream is dropped per call; the adapter-tracked file position
+;;     advances by the bytes consumed. Preopens / stdio currently
+;;     return EBADF.
+;;   * `fd_seek` (user fds) — SET/CUR update the adapter-tracked
+;;     position in-place (no host call). END returns `ENOTSUP`
+;;     pending `descriptor.stat` in subphase (c). Stdio still
+;;     returns ESPIPE per the original wasmtime behaviour.
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
@@ -69,11 +81,10 @@
 ;;     `get-environment`;
 ;;   * `wasi:io/streams@0.2.6.[method]output-stream.blocking-write-and-flush`
 ;;     — the single hot path for stdout/stderr writes;
-;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` —
-;;     auto-bound by the splicer for canon `resource.drop` lowering
-;;     (we cache handles and never actually drop them, but the
-;;     splicer expects every `own<>` resource to have its drop
-;;     import declared);
+;;   * `wasi:io/streams@0.2.6.[method]input-stream.blocking-read` —
+;;     hot path for `fd_read`;
+;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` +
+;;     `[resource-drop]input-stream` — splicer-bound drops;
 ;;   * `wasi:io/error@0.2.6` — the resource the streams interface's
 ;;     `stream-error.last-operation-failed(own<error>)` payload
 ;;     references;
@@ -84,19 +95,16 @@
 ;;     backing for the preview1 `clock_*_get` imports;
 ;;   * `wasi:filesystem/preopens@0.2.6.get-directories` — backing
 ;;     for the preview1 `fd_prestat_*` walk and `dirfd` resolution
-;;     in `path_open` / `fd_close`;
+;;     in `path_open` / `fd_close` / `fd_read` / `fd_seek`;
 ;;   * `wasi:filesystem/types@0.2.6.[method]descriptor.open-at` +
-;;     `[resource-drop]descriptor` — backing for `path_open` /
-;;     `fd_close`. The wider descriptor surface (`read-via-stream`,
-;;     `seek`, `stat`, `read-directory`) arrives in subphases (b)/(c)
-;;     of #165.
+;;     `.read-via-stream` + `[resource-drop]descriptor` — backing
+;;     for `path_open` / `fd_close` / `fd_read`.
 ;;
 ;; Still ENOSYS (tracked under cataggar/wabt#168):
 ;;
-;;   * `fd_read`, `fd_seek` (for fd ≥ 3), `fd_filestat_get`,
-;;     `path_filestat_get`, `fd_readdir`, plus the `path_*`
-;;     write-side and sockets — wait for subphases (b)/(c) of #165
-;;     and #166;
+;;   * `fd_filestat_get`, `path_filestat_get`, `fd_readdir` plus
+;;     the `path_*` write-side and sockets — wait for subphase (c)
+;;     of #165 and #166;
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
 ;;     preview1 cares about.
 
@@ -209,6 +217,29 @@
   ;;   `error-code` ordinal (tag=1).
   (type $descriptor_open_at_sig
     (func (param i32 i32 i32 i32 i32 i32 i32)))
+
+  ;; `wasi:filesystem/types.[method]descriptor.read-via-stream(self,
+  ;;   offset: u64) -> result<own<input-stream>, error-code>` —
+  ;;   canon-lowered to `(func (param i32 i64 i32))`. Same result
+  ;;   layout as `open-at`: ret_area `{ tag: u8 (+3 pad), payload:
+  ;;   i32 }` where the i32 payload is either an input-stream
+  ;;   handle (tag=0) or an `error-code` ordinal (tag=1).
+  (type $read_via_stream_sig
+    (func (param i32 i64 i32)))
+
+  ;; `wasi:io/streams.[method]input-stream.blocking-read(self,
+  ;;   len: u64) -> result<list<u8>, stream-error>` — canon-lowered
+  ;;   to `(func (param i32 i64 i32))`. The ret_area holds:
+  ;;     offset 0: u8 outer tag (0 = ok, 1 = err)
+  ;;     offset 4: payload — for ok this is `(ptr: i32, len: i32)`;
+  ;;              for err it's a `stream-error` variant
+  ;;              `{ inner_tag: u8 (+3 pad), inner_payload: i32 }`
+  ;;              where inner_tag=0 is `last-operation-failed`
+  ;;              (`own<error>` payload, which we discard) and
+  ;;              inner_tag=1 is `closed` (no payload).
+  ;;   Total ret_area size: 12 bytes.
+  (type $input_stream_read_sig
+    (func (param i32 i64 i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -349,6 +380,32 @@
     "[resource-drop]descriptor"
     (func $descriptor_drop (type $i32_void)))
 
+  ;; `wasi:filesystem/types.[method]descriptor.read-via-stream`
+  ;; backing the preview1 `fd_read` import for regular files.
+  ;; Returns an `own<input-stream>` reading from the requested
+  ;; byte offset; the adapter drops the stream at the end of each
+  ;; `fd_read` call and advances its per-fd position by the bytes
+  ;; consumed.
+  (import "wasi:filesystem/types@0.2.6"
+    "[method]descriptor.read-via-stream"
+    (func $descriptor_read_via_stream (type $read_via_stream_sig)))
+
+  ;; `wasi:io/streams.[method]input-stream.blocking-read` — the
+  ;; single hot-path read method called by `$fd_read`. Returns
+  ;; the bytes read via a canon-lifted `list<u8>`; the adapter
+  ;; routes the backing allocation into the caller's preview1
+  ;; iov buffer via the one-shot import-alloc override (mode 1).
+  (import "wasi:io/streams@0.2.6"
+    "[method]input-stream.blocking-read"
+    (func $input_stream_blocking_read (type $input_stream_read_sig)))
+
+  ;; `[resource-drop]input-stream` — auto-bound by the splicer
+  ;; (same pattern as `[resource-drop]output-stream`). Called at
+  ;; the end of every `$fd_read` to release the per-call stream.
+  (import "wasi:io/streams@0.2.6"
+    "[resource-drop]input-stream"
+    (func $input_stream_drop (type $i32_void)))
+
   ;; ── adapter state ────────────────────────────────────────────
   ;;
   ;; Lazy handle cache for stdout / stderr. Initialised to -1
@@ -374,15 +431,18 @@
   ;;
   ;; Page layout (64 KiB):
   ;;
-  ;;   0..32      short-lived ret-slot (above).
-  ;;   32..1056   `$descriptor_table` — 248 × i32 slots for
-  ;;              user-opened fds (each slot holds the preview2
-  ;;              descriptor handle or `-1` for "free"). Mapped to
-  ;;              preview1 fd = `3 + n_preopens + slot`.
-  ;;   1056..65536  Bump arena for `$arena_alloc` (used by mode 2 /
-  ;;              mode 3 of `$cabi_import_realloc`). Cursor resets
-  ;;              to 0 at the end of every preview1 body that
-  ;;              touches the import-alloc state machine.
+  ;;   0..32       short-lived ret-slot (above).
+  ;;   32..2080    `$descriptor_table` — 128 × 16-byte slots for
+  ;;               user-opened fds. Each slot is:
+  ;;                 offset 0  i32 descriptor handle (-1 = free)
+  ;;                 offset 4  pad
+  ;;                 offset 8  u64 file position (advanced by
+  ;;                           `fd_read` / set by `fd_seek`)
+  ;;               Mapped to preview1 fd = `3 + n_preopens + slot`.
+  ;;   2080..65536  Bump arena for `$arena_alloc` (used by mode 2 /
+  ;;               mode 3 of `$cabi_import_realloc`). Cursor resets
+  ;;               to 0 at the end of every preview1 body that
+  ;;               touches the import-alloc state machine.
   ;;
   ;; The area is allocated lazily on first preview2 call via the
   ;; embed's `cabi_realloc`; we never free it (the embed instance
@@ -418,7 +478,7 @@
   ;;   mode 2 — count. Used by `args_sizes_get` /
   ;;             `environ_sizes_get` / `fd_prestat_*`. Every
   ;;             allocation is served from the bump arena starting
-  ;;             at `$ret_area + 1056` (`$arena_alloc`); `align == 1`
+  ;;             at `$ret_area + 2080` (`$arena_alloc`); `align == 1`
   ;;             allocs additionally accumulate their size into
   ;;             `$strings_sz` so the caller can compute
   ;;             `argv_buf_size` / `env_buf_size` without
@@ -450,16 +510,24 @@
 
   ;; ── descriptor table state ───────────────────────────────────
   ;;
-  ;; `$descriptor_table` lives at `$ret_area + 32 .. $ret_area + 1056`
-  ;; — 248 i32 slots indexed by `slot = fd - 3 - n_preopens` for
-  ;; user-opened fds. Each slot holds either a preview2
-  ;; `own<descriptor>` handle from a successful `descriptor.open-at`
-  ;; or `-1` for "free".
+  ;; `$descriptor_table` lives at `$ret_area + 32 .. $ret_area + 2080`
+  ;; — 128 × 16-byte slots indexed by `slot = fd - 3 - n_preopens`
+  ;; for user-opened fds. Each slot:
   ;;
-  ;; Slots are initialised to `-1` lazily on first reference; the
-  ;; `cabi_realloc` allocation that backs `$ret_area` returns
-  ;; uninitialised memory, so a fresh write pass is required.
-  ;; `$descriptor_table_inited` is the sentinel for that pass.
+  ;;   offset 0  i32  descriptor handle (or `-1` = free)
+  ;;   offset 4  i32  pad
+  ;;   offset 8  u64  file position (advanced by `fd_read`,
+  ;;                  written by `fd_seek`; preview2 has no
+  ;;                  `seek` method on descriptor, so the position
+  ;;                  is purely adapter-side state)
+  ;;
+  ;; Slots are initialised lazily — the `cabi_realloc` allocation
+  ;; that backs `$ret_area` returns uninitialised memory, so a
+  ;; fresh write pass is required to install `-1` sentinels in the
+  ;; handle slot of every entry. `$descriptor_table_inited` is the
+  ;; gate for that pass. Position bytes are not pre-cleared; they
+  ;; only matter after a successful `$alloc_fd_slot`, and
+  ;; `$path_open` zeroes them right after allocation.
   (global $descriptor_table_inited (mut i32) (i32.const 0))
 
   ;; ── preview1 errno constants ─────────────────────────────────
@@ -568,18 +636,18 @@
     global.get $ret_area)
 
   ;; Helper: bump-allocate `size` bytes from the arena at
-  ;; `$ret_area + 1056`, aligned up to `align` (which must be a power
+  ;; `$ret_area + 2080`, aligned up to `align` (which must be a power
   ;; of two). Used by `$cabi_import_realloc` modes 2 / 3 to serve
   ;; the list-backing allocation (and, in mode 2, the string
   ;; allocations too) without touching the embed's heap.
   ;;
-  ;; Offset 1056 = 32 (short-lived ret-slot) + 1024
-  ;; (`$descriptor_table`, 248 i32 slots). See the `$ret_area` doc
-  ;; for the full page layout.
+  ;; Offset 2080 = 32 (short-lived ret-slot) + 2048
+  ;; (`$descriptor_table`, 128 × 16-byte slots). See the `$ret_area`
+  ;; doc for the full page layout.
   ;;
   ;; The arena is not bounds-checked: a host that returns
   ;; pathologically many or pathologically long strings could
-  ;; overrun the 64480-byte capacity. For realistic preview1 use
+  ;; overrun the 63456-byte capacity. For realistic preview1 use
   ;; (n_args + n_envvars ≪ 4096, total bytes ≪ 64 KiB), this is
   ;; comfortably safe; the failure mode if violated is corruption
   ;; of the next adjacent page in env.memory, not a wasm trap.
@@ -599,9 +667,9 @@
     i32.xor
     i32.and
     local.tee $cur
-    ;; ret = $ret_area + 1056 + aligned
+    ;; ret = $ret_area + 2080 + aligned
     call $ensure_ret_area
-    i32.const 1056
+    i32.const 2080
     i32.add
     i32.add
     local.set $ret
@@ -613,8 +681,10 @@
     local.get $ret)
 
   ;; Helper: return the base of the `$descriptor_table`, initialising
-  ;; all 248 slots to `-1` on first call. Subsequent calls are pure
-  ;; reads.
+  ;; the handle slot (offset 0) of every entry to `-1` on first
+  ;; call. The position slot (offset 8) is left uninitialised; it
+  ;; only matters after a successful `$alloc_fd_slot`, and
+  ;; `$path_open` zeroes it right after allocation.
   (func $ensure_descriptor_table (result i32)
     (local $base i32) (local $i i32)
     call $ensure_ret_area
@@ -629,16 +699,16 @@
       block $done
         loop $next
           local.get $i
-          i32.const 248
+          i32.const 128
           i32.ge_u
           br_if $done
           local.get $base
           local.get $i
-          i32.const 2
+          i32.const 4              ;; slot stride 16 = 1 << 4
           i32.shl
           i32.add
           i32.const -1
-          i32.store
+          i32.store offset=0       ;; handle ← -1; position bytes left as-is
           local.get $i
           i32.const 1
           i32.add
@@ -652,9 +722,11 @@
     local.get $base)
 
   ;; Helper: find the first free slot in `$descriptor_table`, write
-  ;; `handle` into it, return the slot index. Returns `-1` if the
-  ;; table is full (caller maps to `ENFILE=41` after dropping the
-  ;; handle).
+  ;; `handle` into its handle field, and return the slot index.
+  ;; Returns `-1` if the table is full (caller maps to `ENFILE=41`
+  ;; after dropping the handle). The position field is left
+  ;; untouched; callers (`$path_open`) zero it explicitly after a
+  ;; successful allocation.
   (func $alloc_fd_slot (param $handle i32) (result i32)
     (local $base i32) (local $i i32) (local $entry i32)
     call $ensure_descriptor_table
@@ -664,22 +736,22 @@
     block $done
       loop $next
         local.get $i
-        i32.const 248
+        i32.const 128
         i32.ge_u
         br_if $done
         local.get $base
         local.get $i
-        i32.const 2
+        i32.const 4              ;; slot stride 16 = 1 << 4
         i32.shl
         i32.add
         local.tee $entry
-        i32.load
+        i32.load offset=0
         i32.const -1
         i32.eq
         if
           local.get $entry
           local.get $handle
-          i32.store
+          i32.store offset=0
           local.get $i
           return
         end
@@ -751,12 +823,33 @@
   ;; Lifts preopens via mode 2 of the import-alloc state machine;
   ;; the arena is reset before returning so the caller can re-use
   ;; the bump arena for any follow-up host call (e.g. `open-at`).
+  ;; Helper: resolve a preview1 `fd` to a preview2 descriptor handle.
+  ;; Writes the handle at `*out_handle_ptr`, the lifted preopen
+  ;; count at `*out_n_preopens_ptr`, and (for user-opened fds) the
+  ;; address of the 16-byte `$descriptor_table` slot at
+  ;; `*out_slot_addr_ptr`. For preopens we write `0` to
+  ;; `*out_slot_addr_ptr` (no slot — preopens are not seekable and
+  ;; have no adapter-tracked position). Returns 0 on success, the
+  ;; preview1 errno on failure (in which case the out-pointers are
+  ;; untouched).
+  ;;
+  ;; Multi-output via out-pointers because wabt's validator
+  ;; currently rejects multi-result function signatures (see the
+  ;; memory note from the #171 clocks work).
+  ;;
+  ;; Lifts preopens via mode 2 of the import-alloc state machine;
+  ;; the arena is reset before returning so the caller can re-use
+  ;; the bump arena for any follow-up host call (e.g. `open-at`,
+  ;; `read-via-stream`).
   (func $resolve_fd
-    (param $fd i32) (param $out_handle_ptr i32) (param $out_n_preopens_ptr i32)
+    (param $fd i32)
+    (param $out_handle_ptr i32)
+    (param $out_n_preopens_ptr i32)
+    (param $out_slot_addr_ptr i32)
     (result i32)
     (local $ra i32) (local $idx i32) (local $list_ptr i32)
     (local $list_len i32) (local $entry i32) (local $handle i32)
-    (local $tbl i32) (local $slot i32)
+    (local $tbl i32) (local $slot i32) (local $slot_addr i32)
     local.get $fd
     i32.const 3
     i32.sub
@@ -790,7 +883,7 @@
     local.get $list_len
     i32.lt_u
     if
-      ;; preopen: handle = list_ptr[idx * 12 + 0]
+      ;; preopen: handle = list_ptr[idx * 12 + 0]; slot_addr = 0
       local.get $list_ptr
       local.get $idx
       i32.const 12
@@ -803,6 +896,9 @@
       local.get $out_handle_ptr
       local.get $handle
       i32.store
+      local.get $out_slot_addr_ptr
+      i32.const 0
+      i32.store
       i32.const 0
       return
     end
@@ -811,7 +907,7 @@
     local.get $list_len
     i32.sub
     local.tee $slot
-    i32.const 248
+    i32.const 128
     i32.ge_u
     if
       i32.const 0  global.set $arena_cur
@@ -820,12 +916,12 @@
       return
     end
     call $ensure_descriptor_table
-    local.tee $tbl
     local.get $slot
-    i32.const 2
+    i32.const 4                          ;; slot stride 16 = 1 << 4
     i32.shl
     i32.add
-    i32.load
+    local.tee $slot_addr
+    i32.load offset=0
     local.tee $handle
     i32.const -1
     i32.eq
@@ -839,6 +935,9 @@
     i32.const 0  global.set $strings_sz
     local.get $out_handle_ptr
     local.get $handle
+    i32.store
+    local.get $out_slot_addr_ptr
+    local.get $slot_addr
     i32.store
     i32.const 0)
 
@@ -973,7 +1072,182 @@
     end
     i32.const 8) ;; EBADF
 
-  (func $fd_read (type $fd_read_sig)         i32.const 52)
+  ;; preview1 `fd_read(fd, iovs, iovs_len, nread_ptr) -> errno`.
+  ;;
+  ;; Strategy (mirrors the wasmtime reference adapter):
+  ;;
+  ;;   1. Skip leading empty iovs. If all iovs are empty, succeed
+  ;;      with *nread=0 — wasi-libc treats that as EOF if it asked
+  ;;      for any bytes.
+  ;;   2. Take the first non-empty iov's (buf, len). We don't loop
+  ;;      over remaining iovs — POSIX `readv` allows short reads
+  ;;      and wasi-libc's caller handles continuation. True
+  ;;      scatter-gather would require multiple host calls per
+  ;;      preview1 invocation, with subtle EOF handling.
+  ;;   3. Resolve fd → (handle, slot_addr). Preopens and stdio
+  ;;      return EBADF — preview2 reading from a directory or
+  ;;      stdin descriptor requires extra wiring deferred to a
+  ;;      later subphase.
+  ;;   4. Open a fresh `input-stream` via
+  ;;      `descriptor.read-via-stream(position)`. On error, map
+  ;;      `error-code` → errno and return.
+  ;;   5. Call `input-stream.blocking-read(len)` with the one-shot
+  ;;      import-alloc override (mode 1) pointing at `buf`. The
+  ;;      host's canon-lifted `list<u8>` backing therefore lands
+  ;;      directly inside the caller's preview1 iov — zero copy.
+  ;;   6. Drop the stream (one resource churn per call; a future
+  ;;      optimisation can cache the stream on the fd slot).
+  ;;   7. Decode the result. `stream-error.closed` → return 0
+  ;;      bytes (EOF). `stream-error.last-operation-failed` → EIO.
+  ;;      Success: read `bytes_read` from the ret-area; advance
+  ;;      the slot's position by that many bytes; publish to
+  ;;      *nread_ptr.
+  ;;
+  ;; ret-area layout for `result<list<u8>, stream-error>`:
+  ;;   offset 0..4  outer tag (u8 + 3 pad)
+  ;;   offset 4..12 payload — for ok this is `(ptr i32, len i32)`;
+  ;;                for err it's `stream-error { inner_tag u8
+  ;;                (+3 pad), inner_payload i32 }`.
+  (func $fd_read (type $fd_read_sig)
+    (local $iovs i32) (local $iovs_len i32)
+    (local $buf i32) (local $buf_len i32)
+    (local $ra i32) (local $handle i32) (local $slot_addr i32)
+    (local $stream i32) (local $tag i32) (local $bytes_read i32)
+    (local $position i64) (local $err i32)
+    ;; 1. Skip leading empty iovs.
+    local.get 1
+    local.set $iovs
+    local.get 2
+    local.set $iovs_len
+    block $found_non_empty
+      loop $skip
+        local.get $iovs_len
+        i32.eqz
+        if
+          ;; All iovs empty → *nread = 0, return SUCCESS.
+          local.get 3
+          i32.const 0
+          i32.store
+          i32.const 0
+          return
+        end
+        local.get $iovs
+        i32.load offset=4               ;; iov.buf_len
+        local.tee $buf_len
+        br_if $found_non_empty
+        local.get $iovs
+        i32.const 8
+        i32.add
+        local.set $iovs
+        local.get $iovs_len
+        i32.const 1
+        i32.sub
+        local.set $iovs_len
+        br $skip
+      end
+    end
+    local.get $iovs
+    i32.load offset=0
+    local.set $buf
+    ;; 2. Resolve fd → (handle, slot_addr).
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0
+    local.get $ra                       ;; out_handle (offset 0)
+    local.get $ra  i32.const 4  i32.add ;; out_n_preopens (offset 4, ignored)
+    local.get $ra  i32.const 8  i32.add ;; out_slot_addr (offset 8)
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.load offset=0
+    local.set $handle
+    local.get $ra
+    i32.load offset=8
+    local.set $slot_addr
+    local.get $slot_addr
+    i32.eqz
+    if
+      ;; Preopen / stdin path — not wired here. EBADF for now.
+      i32.const 8
+      return
+    end
+    local.get $slot_addr
+    i64.load offset=8
+    local.set $position
+    ;; 3. Open an input-stream via descriptor.read-via-stream.
+    local.get $handle
+    local.get $position
+    local.get $ra
+    call $descriptor_read_via_stream
+    local.get $ra
+    i32.load8_u offset=0
+    local.set $tag
+    local.get $tag
+    if
+      ;; error opening stream — map error-code → errno
+      local.get $ra
+      i32.load offset=4
+      call $errno_from_error_code
+      return
+    end
+    local.get $ra
+    i32.load offset=4
+    local.set $stream
+    ;; 4. blocking-read with the one-shot override targeting buf.
+    local.get $buf
+    global.set $oneshot_ptr
+    i32.const 1
+    global.set $import_alloc_mode
+    local.get $stream
+    local.get $buf_len
+    i64.extend_i32_u
+    local.get $ra
+    call $input_stream_blocking_read
+    ;; Defensive cleanup of the override slot (should already be 0).
+    i32.const 0  global.set $import_alloc_mode
+    i32.const 0  global.set $oneshot_ptr
+    ;; 5. Drop the stream regardless of outcome.
+    local.get $stream
+    call $input_stream_drop
+    ;; 6. Decode result.
+    local.get $ra
+    i32.load8_u offset=0
+    local.set $tag
+    local.get $tag
+    if
+      ;; stream-error: inner tag at ra+4. 0 = last-operation-failed
+      ;; (→ EIO=29); 1 = closed (→ EOF, return 0 bytes).
+      local.get $ra
+      i32.load8_u offset=4
+      i32.eqz
+      if
+        i32.const 29
+        return
+      end
+      local.get 3                       ;; nread_ptr
+      i32.const 0
+      i32.store
+      i32.const 0
+      return
+    end
+    ;; ok: payload at ra+4 is `(ptr i32, len i32)`. With mode 1 the
+    ;; ptr equals buf; we only need the len.
+    local.get $ra
+    i32.load offset=8
+    local.set $bytes_read
+    ;; 7. Advance position += bytes_read.
+    local.get $slot_addr
+    local.get $position
+    local.get $bytes_read
+    i64.extend_i32_u
+    i64.add
+    i64.store offset=8
+    ;; 8. *nread_ptr = bytes_read.
+    local.get 3
+    local.get $bytes_read
+    i32.store
+    i32.const 0)
   ;; preview1 `fd_close(fd) -> errno`.
   ;;
   ;;   fd 0..2 (stdio)            → success (close-stdio is a no-op
@@ -1029,7 +1303,7 @@
     local.get $list_len
     i32.sub
     local.tee $slot
-    i32.const 248
+    i32.const 128
     i32.ge_u
     if
       i32.const 8                       ;; EBADF
@@ -1037,11 +1311,11 @@
     end
     call $ensure_descriptor_table
     local.get $slot
-    i32.const 2
+    i32.const 4                          ;; slot stride 16 = 1 << 4
     i32.shl
     i32.add
     local.tee $entry
-    i32.load
+    i32.load offset=0
     local.tee $handle
     i32.const -1
     i32.eq
@@ -1053,7 +1327,7 @@
     call $descriptor_drop
     local.get $entry
     i32.const -1
-    i32.store
+    i32.store offset=0
     i32.const 0)
 
   ;; preview1 `path_open(dirfd, dirflags, path_ptr, path_len,
@@ -1088,7 +1362,9 @@
     (local $rights_lo i32) (local $ra i32)
     (local $tag i32) (local $payload i32) (local $slot i32)
     ;; 1. Resolve dirfd. Use offsets in the short-lived ret-slot
-    ;;    (0..32) for the two out-pointers — we'll overwrite them
+    ;;    (0..32) for the three out-pointers (handle, n_preopens,
+    ;;    slot_addr — we ignore slot_addr here but $resolve_fd
+    ;;    needs the param). We'll overwrite ret-slot bytes 0..8
     ;;    with the open-at result later.
     call $ensure_ret_area
     local.set $ra
@@ -1097,6 +1373,9 @@
     local.get $ra
     i32.const 4
     i32.add                              ;; out_n_preopens_ptr (offset 4)
+    local.get $ra
+    i32.const 8
+    i32.add                              ;; out_slot_addr_ptr (offset 8, ignored)
     call $resolve_fd
     local.tee $err
     if
@@ -1214,6 +1493,17 @@
       i32.const 41
       return
     end
+    ;; 5b. Zero the position slot for the new fd. `$alloc_fd_slot`
+    ;;     writes only the handle field; the position bytes carry
+    ;;     stale garbage from a previous fd_close or from the
+    ;;     uninitialised cabi_realloc page.
+    call $ensure_descriptor_table
+    local.get $slot
+    i32.const 4
+    i32.shl
+    i32.add
+    i64.const 0
+    i64.store offset=8
     ;; 6. *opened_fd_ptr = 3 + n_preopens + slot.
     local.get 8                         ;; opened_fd_ptr
     local.get $n_preopens
@@ -1225,34 +1515,102 @@
     i32.const 0)
 
   ;; preview1 `fd_seek(fd, offset, whence, newoffset_ptr) -> errno`.
+  ;;
   ;; Stdio (fd 0/1/2) cannot seek — return ESPIPE so wasi-libc's
   ;; `isatty` probe and Rust's `std::io::Stdout` line-buffering
   ;; codepaths see the "this is a pipe" signal rather than a hard
   ;; "function not supported" error. Matches the wasmtime reference
-  ;; adapter's stdio branch (`crates/wasi-preview1-component-adapter/
-  ;; src/lib.rs:fd_seek` → `Err(ERRNO_SPIPE)` for non-file streams).
+  ;; adapter's stdio branch.
   ;;
-  ;; `__WASI_ERRNO_SPIPE = 70` per `wasi-libc/.../wasip1.h` — note
-  ;; this is *not* the Linux POSIX `ESPIPE=29` value; WASI preview1
-  ;; defines its own errno numbering and assigns 29 to `IO`. We use
-  ;; the preview1 number because that's what the canon-lift'd
-  ;; `errno` enum at the wasi:cli host expects.
+  ;; For fd ≥ 3, preview2 has no `seek` method on `descriptor`;
+  ;; the file position is purely adapter-side state stored in the
+  ;; `$descriptor_table` slot's `position` field. Each `fd_read`
+  ;; opens a fresh `read-via-stream(position)`; `fd_seek` just
+  ;; updates that position.
   ;;
-  ;; offset / whence / newoffset_ptr are ignored on the error path:
-  ;; wasmtime's adapter doesn't write `*newoffset` when returning
-  ;; ESPIPE, and wasi-libc's caller only reads it when errno == 0.
+  ;; Dispatch on whence:
+  ;;   SET (0): new_pos = offset
+  ;;   CUR (1): new_pos = position + offset (i64 add; signed semantics)
+  ;;   END (2): ENOTSUP — needs `descriptor.stat` (subphase c of #165)
+  ;;   other  : EINVAL
   ;;
-  ;; fd >= 3 keeps the ENOSYS=52 stub until cataggar/wabt#165
-  ;; (filesystem read-side) wires real seekable descriptors.
+  ;; Negative new_pos → EINVAL (rejected via i64.lt_s against 0).
+  ;;
+  ;; Preopen-directory fd → ESPIPE (matches wasmtime's directory branch).
+  ;;
+  ;; `__WASI_ERRNO_SPIPE = 70` per `wasi-libc/.../wasip1.h` —
+  ;; preview1's own errno table, NOT the Linux POSIX value (29).
   (func $fd_seek (type $fd_seek_sig)
+    (local $ra i32) (local $slot_addr i32) (local $position i64)
+    (local $new_pos i64) (local $err i32)
     local.get 0
     i32.const 3
     i32.lt_u
-    if (result i32)
-      i32.const 70   ;; ESPIPE (preview1)
+    if
+      i32.const 70   ;; ESPIPE (stdio)
+      return
+    end
+    call $ensure_ret_area
+    local.set $ra
+    local.get 0
+    local.get $ra                       ;; out_handle_ptr   (ignored)
+    local.get $ra  i32.const 4  i32.add ;; out_n_preopens_ptr (ignored)
+    local.get $ra  i32.const 8  i32.add ;; out_slot_addr_ptr (read below)
+    call $resolve_fd
+    local.tee $err
+    if  local.get $err  return  end
+    local.get $ra
+    i32.load offset=8
+    local.set $slot_addr
+    local.get $slot_addr
+    i32.eqz
+    if
+      ;; Preopen directory — not seekable.
+      i32.const 70                       ;; ESPIPE
+      return
+    end
+    local.get $slot_addr
+    i64.load offset=8
+    local.set $position
+    ;; Compute new_pos based on whence.
+    local.get 2                          ;; whence
+    i32.eqz
+    if
+      local.get 1                        ;; SET: new_pos = offset
+      local.set $new_pos
     else
-      i32.const 52   ;; ENOSYS
-    end)
+      local.get 2  i32.const 1  i32.eq
+      if
+        local.get $position              ;; CUR: new_pos = position + offset
+        local.get 1
+        i64.add
+        local.set $new_pos
+      else
+        local.get 2  i32.const 2  i32.eq
+        if
+          i32.const 58                   ;; END: ENOTSUP (needs stat — subphase c)
+          return
+        end
+        i32.const 28                     ;; EINVAL — unknown whence
+        return
+      end
+    end
+    ;; Reject negative resulting positions.
+    local.get $new_pos
+    i64.const 0
+    i64.lt_s
+    if
+      i32.const 28                       ;; EINVAL
+      return
+    end
+    ;; Store new position and publish to caller.
+    local.get $slot_addr
+    local.get $new_pos
+    i64.store offset=8
+    local.get 3                          ;; newoffset_ptr
+    local.get $new_pos
+    i64.store
+    i32.const 0)
 
   ;; preview1 `fd_fdstat_get(fd, statbuf_ptr) -> errno`.
   ;; Stdio (fd 0/1/2) writes a 24-byte `fdstat` reporting
