@@ -54,6 +54,14 @@ world command {
     import wasi:cli/stdout@0.2.6;
     import wasi:cli/stderr@0.2.6;
 
+    /// Process argv + envp backing the preview1 `args_get` /
+    /// `args_sizes_get` / `environ_get` / `environ_sizes_get`
+    /// imports. The adapter installs a `count` / `separate`
+    /// bump-arena state machine around each call so the host
+    /// writes strings directly into the caller's preview1 buffer
+    /// (no extra memcpy, no leaked main-heap allocation).
+    import wasi:cli/environment@0.2.6;
+
     /// Cryptographically-secure RNG backing the preview1 `random_get`
     /// import. wasi-libc's `getentropy`, Zig's `std.crypto.random`,
     /// Rust's `rand` wasi backend and Go's runtime RNG seed all
