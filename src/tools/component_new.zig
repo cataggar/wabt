@@ -192,11 +192,15 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             }
             var slot: usize = 0;
             if (auto_attach_builtin) {
+                // Pick command-shape vs reactor-shape based on whether
+                // the embed core exports `_start`. Matches
+                // wit-component's auto-detection (cataggar/wabt#167).
                 // Dupe so the existing free-loop in `defer` can
                 // uniformly release every adapter's bytes.
+                const builtin_bytes = pickBuiltinAdapter(alloc, core_bytes);
                 adapter_list[slot] = .{
                     .name = "wasi_snapshot_preview1",
-                    .bytes = alloc.dupe(u8, builtin_adapter.wasi_preview1_command_wasm) catch unreachable,
+                    .bytes = alloc.dupe(u8, builtin_bytes) catch unreachable,
                 };
                 slot += 1;
             }
@@ -275,6 +279,37 @@ fn coreImportsModule(
         if (std.mem.eql(u8, im.module_name, module_name)) return true;
     }
     return false;
+}
+
+/// Result of inspecting the embed core for `_start`. `parse_error`
+/// is preserved separately so `pickBuiltinAdapter` can fall back to
+/// the command adapter for malformed cores (matching pre-#167
+/// behavior), while a cleanly-parsing core that simply omits
+/// `_start` selects the reactor adapter.
+const StartExportProbe = enum { yes, no, parse_error };
+
+fn probeStartExport(alloc: std.mem.Allocator, core_bytes: []const u8) StartExportProbe {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const owned = core_imports.extract(arena.allocator(), core_bytes) catch return .parse_error;
+    const ex = owned.interface.findExport("_start") orelse return .no;
+    return if (ex.kind == .func) .yes else .no;
+}
+
+/// Pick the bundled wasi-preview1 → preview2 adapter shape for an
+/// auto-attach. Mirrors wit-component's heuristic: an embed that
+/// exports `_start` is a command-shape program (the adapter's `$run`
+/// calls back into `_start`); a cleanly-parsing embed without
+/// `_start` is treated as reactor-shape, where the wrapping
+/// component lifts the embed's own exports directly. A malformed
+/// core falls back to the command adapter so the downstream splice
+/// produces the same error message it did pre-#167. Tracked under
+/// cataggar/wabt#167.
+fn pickBuiltinAdapter(alloc: std.mem.Allocator, core_bytes: []const u8) []const u8 {
+    return switch (probeStartExport(alloc, core_bytes)) {
+        .yes, .parse_error => builtin_adapter.wasi_preview1_command_wasm,
+        .no => builtin_adapter.wasi_preview1_reactor_wasm,
+    };
 }
 
 /// Construct the wrapping component bytes from a core module that
@@ -566,4 +601,141 @@ test "builtin_adapter: embedded adapter wasm is a valid wasm preamble" {
     const bytes = builtin_adapter.wasi_preview1_command_wasm;
     try testing.expect(bytes.len > 8);
     try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "builtin_adapter: embedded reactor adapter wasm is a valid wasm preamble" {
+    const bytes = builtin_adapter.wasi_preview1_reactor_wasm;
+    try testing.expect(bytes.len > 8);
+    try testing.expectEqualSlices(u8, "\x00asm", bytes[0..4]);
+}
+
+test "builtin_adapter: command artifact's encoded world declares wasi:cli/run export" {
+    const adapter_decode = wabt.component.adapter.decode;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const world = try adapter_decode.parseFromAdapterCore(
+        arena.allocator(),
+        builtin_adapter.wasi_preview1_command_wasm,
+    );
+    // Command shape: exactly one export — `wasi:cli/run@0.2.6` —
+    // since the wrapping component lifts the adapter's `$run` body
+    // into a top-level `wasi:cli/run` instance.
+    try testing.expectEqual(@as(usize, 1), world.exports.len);
+    try testing.expect(std.mem.startsWith(u8, world.exports[0].name, "wasi:cli/run@"));
+}
+
+test "builtin_adapter: reactor artifact's encoded world declares no exports (no wasi:cli/run)" {
+    const adapter_decode = wabt.component.adapter.decode;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const world = try adapter_decode.parseFromAdapterCore(
+        arena.allocator(),
+        builtin_adapter.wasi_preview1_reactor_wasm,
+    );
+    // Reactor shape: the wrapping component lifts the embed's own
+    // exports directly (e.g. `wasi:http/incoming-handler.handle`),
+    // so the adapter declares no `wasi:cli/run` (or any other)
+    // export. Tracked under cataggar/wabt#167.
+    try testing.expectEqual(@as(usize, 0), world.exports.len);
+}
+
+test "builtin_adapter: reactor world imports the same preview2 surface as command (minus the run export)" {
+    const adapter_decode = wabt.component.adapter.decode;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const cmd_world = try adapter_decode.parseFromAdapterCore(
+        arena.allocator(),
+        builtin_adapter.wasi_preview1_command_wasm,
+    );
+    const rx_world = try adapter_decode.parseFromAdapterCore(
+        arena.allocator(),
+        builtin_adapter.wasi_preview1_reactor_wasm,
+    );
+
+    // Same import count + same import names in the same order.
+    // `world reactor` in `preview1.wit` mirrors `world command`
+    // verbatim (minus the trailing `export wasi:cli/run@0.2.6;`),
+    // so the encoded world's import surface must match byte-for-byte.
+    try testing.expectEqual(cmd_world.imports.len, rx_world.imports.len);
+    for (cmd_world.imports, rx_world.imports) |c, r| {
+        try testing.expectEqualStrings(c.name, r.name);
+    }
+}
+
+test "probeStartExport: core with `_start` func export -> .yes" {
+    // Hand-rolled core wasm:
+    //   - type 0: (func)
+    //   - 1 func (typeidx 0)
+    //   - export "_start" func 0
+    //   - code: 1 body, empty (just `end`)
+    const core = [_]u8{
+        // preamble
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: 1 type — (func)
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section: 1 func, type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: 1 export — "_start" func 0
+        0x07, 0x0a, 0x01, 6, '_', 's', 't', 'a', 'r', 't', 0x00, 0x00,
+        // code section: 1 body — `(end)`
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    try testing.expectEqual(StartExportProbe.yes, probeStartExport(testing.allocator, &core));
+}
+
+test "probeStartExport: core without `_start` export -> .no" {
+    // Same shape as above but exports `other` instead of `_start`.
+    const core = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x09, 0x01, 5, 'o', 't', 'h', 'e', 'r', 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    try testing.expectEqual(StartExportProbe.no, probeStartExport(testing.allocator, &core));
+}
+
+test "probeStartExport: bare core wasm preamble -> .no" {
+    const bare = [_]u8{
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+    };
+    try testing.expectEqual(StartExportProbe.no, probeStartExport(testing.allocator, &bare));
+}
+
+test "probeStartExport: malformed input -> .parse_error" {
+    const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    try testing.expectEqual(StartExportProbe.parse_error, probeStartExport(testing.allocator, &garbage));
+}
+
+test "pickBuiltinAdapter: command core selects command-shape adapter" {
+    // Re-use the `_start` export fixture from probeStartExport.
+    const core = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x0a, 0x01, 6, '_', 's', 't', 'a', 'r', 't', 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const picked = pickBuiltinAdapter(testing.allocator, &core);
+    try testing.expectEqual(builtin_adapter.wasi_preview1_command_wasm.ptr, picked.ptr);
+}
+
+test "pickBuiltinAdapter: reactor core (no _start) selects reactor-shape adapter" {
+    const core = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 0x09, 0x01, 5, 'o', 't', 'h', 'e', 'r', 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const picked = pickBuiltinAdapter(testing.allocator, &core);
+    try testing.expectEqual(builtin_adapter.wasi_preview1_reactor_wasm.ptr, picked.ptr);
+}
+
+test "pickBuiltinAdapter: malformed core falls back to command-shape adapter" {
+    const garbage = [_]u8{ 0xde, 0xad, 0xbe, 0xef };
+    const picked = pickBuiltinAdapter(testing.allocator, &garbage);
+    try testing.expectEqual(builtin_adapter.wasi_preview1_command_wasm.ptr, picked.ptr);
 }
