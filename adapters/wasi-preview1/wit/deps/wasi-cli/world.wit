@@ -10,10 +10,10 @@
 // `bytecodealliance/wasi-cli@v0.2.6`.
 //
 // NOTE: the package declaration for this directory's multi-file
-// slice lives in `stdio.wit` (which sorts first alphabetically).
-// `resolver.readWitDir` concatenates files in order, so the
-// `package wasi:cli@0.2.6;` directive must appear in the file
-// that's parsed first.
+// slice lives in `environment.wit` (which sorts first
+// alphabetically — `e` < `s` < `w`). `resolver.readWitDir`
+// concatenates files in order, so the `package wasi:cli@0.2.6;`
+// directive must appear in the file that's parsed first.
 
 interface exit {
     /// Exit the program — stable `@since(version = 0.2.0)` form

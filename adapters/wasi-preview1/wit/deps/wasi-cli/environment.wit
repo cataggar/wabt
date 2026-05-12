@@ -1,0 +1,32 @@
+// Trimmed slice of `wasi:cli@0.2.6.environment`. Mirrors the canonical
+// `bytecodealliance/wasi-cli@v0.2.6/wit/environment.wit` shape but
+// declares only the two getters the preview1 → preview2 adapter
+// calls: `get-arguments` + `get-environment`. The canonical interface
+// also exposes `initial-cwd`, which preview1 doesn't surface; it
+// stays out of this trimmed copy to keep `metadata_encode` output
+// minimal.
+//
+// Backs the preview1 `args_get` / `args_sizes_get` / `environ_get` /
+// `environ_sizes_get` imports. Zig `std.process.argsAlloc` +
+// `std.process.getEnvMap`, Rust `std::env::args` + `std::env::vars`,
+// Go `os.Args` + `os.Environ`, and C `argv` / `getenv` via wasi-libc
+// all route through here.
+//
+// This file holds the package declaration for the multi-file
+// `wasi:cli@0.2.6` slice — `resolver.readWitDir` concatenates `.wit`
+// files in lexicographic order, and `environment.wit` sorts before
+// `stdio.wit` and `world.wit` (`e` < `s` < `w`), so the parser sees
+// this file's `package wasi:cli@0.2.6;` directive first.
+
+package wasi:cli@0.2.6;
+
+interface environment {
+    /// Process command-line arguments. The first entry is conventionally
+    /// the program name. Returned in canonical UTF-8.
+    get-arguments: func() -> list<string>;
+
+    /// Process environment variables as `(key, value)` tuples. The
+    /// preview1 adapter serialises each tuple into the caller's
+    /// `environ_buf` as `key=value\0`.
+    get-environment: func() -> list<tuple<string, string>>;
+}

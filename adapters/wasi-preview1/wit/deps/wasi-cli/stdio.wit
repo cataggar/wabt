@@ -20,13 +20,10 @@
 // body emits a matching `alias instance-export sort=type` decl
 // right after the `wasi:io/streams@0.2.6` import.
 //
-// This file holds the package declaration for the multi-file
-// `wasi:cli@0.2.6` slice — `resolver.readWitDir` concatenates
-// `*.wit` files in alphabetical order, and `stdio.wit` sorts
-// before `world.wit`, so the parser sees this `package` directive
-// first.
-
-package wasi:cli@0.2.6;
+// The package declaration for the multi-file `wasi:cli@0.2.6` slice
+// lives in `environment.wit` (which sorts before this file —
+// `e` < `s`). This file is a package-less continuation parsed
+// after `environment.wit`.
 
 interface stdout {
     use wasi:io/streams@0.2.6.{output-stream};

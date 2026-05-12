@@ -39,12 +39,21 @@
 ;;     through `wasi:clocks/monotonic-clock.{now,resolution}`
 ;;     (already u64 ns), PROCESS/THREAD CPUTIME + unknown clockids
 ;;     return `EBADF` (matching wasmtime).
+;;   * `args_get` / `args_sizes_get` / `environ_get` /
+;;     `environ_sizes_get` — canon-lower
+;;     `wasi:cli/environment.{get-arguments, get-environment}`
+;;     through a `count` / `separate` bump-arena state machine so
+;;     the host writes strings directly into the caller's preview1
+;;     argv_buf / env_buf (no main-heap allocation for any of these
+;;     paths).
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
 ;;   * `wasi:cli/exit@0.2.6` — `exit-with-code(u8)` + `exit(result)`;
 ;;   * `wasi:cli/stdout@0.2.6` / `wasi:cli/stderr@0.2.6` — handle
 ;;     factories for stdout / stderr;
+;;   * `wasi:cli/environment@0.2.6` — `get-arguments` +
+;;     `get-environment`;
 ;;   * `wasi:io/streams@0.2.6.[method]output-stream.blocking-write-and-flush`
 ;;     — the single hot path for stdout/stderr writes;
 ;;   * `wasi:io/streams@0.2.6.[resource-drop]output-stream` —
@@ -67,9 +76,7 @@
 ;;     plus the path_* surface — wait for filesystem read-side
 ;;     (#165);
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
-;;     preview1 cares about;
-;;   * `args_get` / `args_sizes_get` / `environ_get` /
-;;     `environ_sizes_get` — wait for `wasi:cli/environment` (#161).
+;;     preview1 cares about.
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -145,6 +152,14 @@
   ;;   result fits in flat results, so the lowered shape is
   ;;   `(func (result i64))` — no ret_area.
   (type $monotonic_clock_sig (func (result i64)))
+
+  ;; `wasi:cli/environment.{get-arguments, get-environment}` both
+  ;;   canon-lower to `(func (param i32))` — a list return doesn't
+  ;;   fit in flat results, so the i32 is a caller-provided ret_area
+  ;;   into which the host writes `(list_ptr, list_len)` (i32 each)
+  ;;   after running the host-side iteration.
+  (type $get_arguments_sig   (func (param i32)))
+  (type $get_environment_sig (func (param i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -244,6 +259,21 @@
   (import "wasi:clocks/monotonic-clock@0.2.6" "resolution"
     (func $monotonic_resolution (type $monotonic_clock_sig)))
 
+  ;; `wasi:cli/environment.get-arguments() -> list<string>` and
+  ;;   `get-environment() -> list<tuple<string,string>>` backing the
+  ;;   preview1 `args_*` / `environ_*` quartet. Both return a list
+  ;;   that exceeds max-flat-results=1, so the lowered shape is
+  ;;   `(func (param i32))` — the i32 is a caller-provided ret_area
+  ;;   pointer where the host writes `(list_ptr, list_len)`. The
+  ;;   list backing + each string are each separate
+  ;;   `cabi_import_realloc` invocations; the adapter routes them
+  ;;   through a `count` / `separate` state machine so the host
+  ;;   writes strings directly into the caller's preview1 buffer.
+  (import "wasi:cli/environment@0.2.6" "get-arguments"
+    (func $get_arguments (type $get_arguments_sig)))
+  (import "wasi:cli/environment@0.2.6" "get-environment"
+    (func $get_environment (type $get_environment_sig)))
+
   ;; ── adapter state ────────────────────────────────────────────
   ;;
   ;; Lazy handle cache for stdout / stderr. Initialised to -1
@@ -258,34 +288,78 @@
   (global $stderr_handle (mut i32) (i32.const -1))
 
   ;; Scratch return-area for canon-lower'd preview2 calls whose
-  ;; result type doesn't fit in flat parameters
-  ;; (`blocking-write-and-flush` returns `result<_, stream-error>`
-  ;; which is lowered into a 4th `ret_area: i32` param). 16 bytes
-  ;; is plenty — the largest result we read back is the result
-  ;; outer discriminant (i32) + the inner stream-error
-  ;; discriminant (i32) = 8 bytes.
+  ;; result type doesn't fit in flat parameters. Reused for:
   ;;
-  ;; The area is allocated lazily on first fd_write call via the
-  ;; embed's `cabi_realloc` and stashed here for re-use. We never
-  ;; free it; the embed instance teardown reclaims everything.
+  ;;   * `blocking-write-and-flush` (8-byte `result<_, stream-error>`)
+  ;;   * `get-random-bytes` / `get-arguments` / `get-environment`
+  ;;     (8-byte `(list_ptr, list_len)` tuple)
+  ;;   * `wall-clock.{now, resolution}` (16-byte `datetime` record)
+  ;;
+  ;; Everything in offsets 0..32 is treated as a short-lived
+  ;; per-call return slot. The remaining 65504 bytes (offsets
+  ;; 32..65536) are the import-alloc bump arena (see below). The
+  ;; area is allocated lazily on first preview2 call via the
+  ;; embed's `cabi_realloc`; we never free it (the embed instance
+  ;; teardown reclaims it).
+  ;;
+  ;; We request a full page (65536 bytes) rather than the 32 bytes
+  ;; we strictly need for ret-area use because when the embed
+  ;; itself doesn't export `cabi_realloc`, the component-new
+  ;; splicer replaces the `__main_module__::cabi_realloc` import
+  ;; with a `realloc_via_memory_grow` body that traps on any
+  ;; allocation request smaller than one page (see
+  ;; `src/component/adapter/adapter.zig:buildMainModuleFallback`).
+  ;; Matches `wit-component`'s upstream
+  ;; `allocate_stack_via_realloc` strategy.
   (global $ret_area (mut i32) (i32.const 0))
 
-  ;; One-shot redirect for `$cabi_import_realloc`. When non-zero,
-  ;; the next call to `$cabi_import_realloc` returns this pointer
-  ;; (and clears the slot) instead of delegating to
-  ;; `$main_cabi_realloc`. Used by `$random_get` to make the host's
-  ;; canon-lifted `get-random-bytes` write its `list<u8>` backing
-  ;; buffer directly into the caller's preview1 `buf` — zero copy,
-  ;; no leaked allocation per call. Mirrors the wasmtime reference
-  ;; adapter's `with_one_import_alloc` (`crates/wasi-preview1-
-  ;; component-adapter/src/lib.rs`) without the ImportAlloc enum
-  ;; state machine — we only need one redirect mode.
+  ;; ── import-alloc state machine ───────────────────────────────
   ;;
-  ;; Single-threaded (preview1 has no atomics / shared memory), so
-  ;; a plain mut i32 is safe. Future list<T>-returning imports
-  ;; (e.g. cataggar/wabt#161's `args_get`) can reuse the same slot
-  ;; by setting it before the canon call.
-  (global $import_alloc_override (mut i32) (i32.const 0))
+  ;; `$cabi_import_realloc` is invoked by the host for every
+  ;; canon-lift'd allocation made during a preview2 import call.
+  ;; The behaviour switches on `$import_alloc_mode`:
+  ;;
+  ;;   mode 0 — default. Delegate to `$main_cabi_realloc` (the
+  ;;             embed's heap). Used by callers that don't return
+  ;;             allocated data (everything we wired before #163).
+  ;;
+  ;;   mode 1 — one-shot. The next call returns `$oneshot_ptr`
+  ;;             once, then clears the slot and resets mode to 0.
+  ;;             Used by `$random_get` to redirect the single
+  ;;             `list<u8>` backing alloc into the caller's
+  ;;             preview1 `buf` (zero copy).
+  ;;
+  ;;   mode 2 — count. Used by `args_sizes_get` /
+  ;;             `environ_sizes_get`. Every allocation is served
+  ;;             from the bump arena starting at `$ret_area + 32`;
+  ;;             `align == 1` allocs additionally accumulate their
+  ;;             size into `$strings_sz` so the caller can compute
+  ;;             `argv_buf_size` / `env_buf_size` without
+  ;;             second-guessing the host. The arena cursor resets
+  ;;             to 0 at the start of every preview1 body that
+  ;;             enters mode 2 or 3, so the same physical bytes
+  ;;             are reused across calls — no main-heap allocation
+  ;;             ever happens for args/environ.
+  ;;
+  ;;   mode 3 — separate. Used by `args_get` / `environ_get`.
+  ;;             `align == 1` allocs go to `$strings_dst +
+  ;;             $strings_cur` (the caller's preview1 buffer), with
+  ;;             `$strings_cur` advancing by `size + 1` per alloc
+  ;;             so that the gap byte after each string can hold a
+  ;;             `\0` (args) or `=` / `\0` (environ) terminator
+  ;;             written after the host call returns. Non-`align=1`
+  ;;             allocs (the list backing) still come from the bump
+  ;;             arena.
+  ;;
+  ;; Single-threaded preview1 → plain mut globals are safe; we
+  ;; reset every slot back to 0 at the end of each preview1 body
+  ;; so leftover state can't bleed into the next call.
+  (global $import_alloc_mode (mut i32) (i32.const 0))
+  (global $oneshot_ptr       (mut i32) (i32.const 0))
+  (global $arena_cur         (mut i32) (i32.const 0))
+  (global $strings_dst       (mut i32) (i32.const 0))
+  (global $strings_cur       (mut i32) (i32.const 0))
+  (global $strings_sz        (mut i32) (i32.const 0))
 
   ;; ── preview1 errno constants ─────────────────────────────────
   ;; Mirrors wasi-libc `<wasi/api.h>`:
@@ -374,21 +448,11 @@
       global.get $stderr_handle
     end)
 
-  ;; Helper: ensure `$ret_area` points at a 16-byte block in
-  ;; env.memory. Allocates once via the embed's cabi_realloc.
-  ;; Returns the cached pointer.
-  ;;
-  ;; We request a full page (65536 bytes) rather than the 16 bytes
-  ;; we actually need. The reason: when the embed itself doesn't
-  ;; export `cabi_realloc`, the component-new splicer replaces the
-  ;; `__main_module__::cabi_realloc` import with a
-  ;; `realloc_via_memory_grow` body (see
-  ;; `src/component/adapter/adapter.zig:buildMainModuleFallback`)
-  ;; that traps on any allocation request smaller than one page.
-  ;; Matches `wit-component`'s upstream allocate_stack_via_realloc
-  ;; strategy — allocate one page up-front, carve the small scratch
-  ;; area out of its head, ignore the rest. Embeds with real
-  ;; cabi_realloc still satisfy the request fine.
+  ;; Helper: ensure `$ret_area` points at the 64 KiB scratch page
+  ;; described above and return that pointer. Allocates once via
+  ;; the embed's `cabi_realloc`; subsequent calls are pure reads.
+  ;; See the `$ret_area` declaration for the page layout (0..32 =
+  ;; short-lived ret slot, 32..65536 = import-alloc bump arena).
   (func $ensure_ret_area (result i32)
     global.get $ret_area
     i32.eqz
@@ -401,6 +465,47 @@
       global.set $ret_area
     end
     global.get $ret_area)
+
+  ;; Helper: bump-allocate `size` bytes from the arena at
+  ;; `$ret_area + 32`, aligned up to `align` (which must be a power
+  ;; of two). Used by `$cabi_import_realloc` modes 2 / 3 to serve
+  ;; the list-backing allocation (and, in mode 2, the string
+  ;; allocations too) without touching the embed's heap.
+  ;;
+  ;; The arena is not bounds-checked: a host that returns
+  ;; pathologically many or pathologically long strings could
+  ;; overrun the 65504-byte capacity. For realistic preview1 use
+  ;; (n_args + n_envvars ≪ 4096, total bytes ≪ 64 KiB), this is
+  ;; comfortably safe; the failure mode if violated is corruption
+  ;; of the next adjacent page in env.memory, not a wasm trap.
+  ;; A future fixture pushing those limits should grow the arena.
+  (func $arena_alloc (param $align i32) (param $size i32) (result i32)
+    (local $cur i32) (local $ret i32)
+    ;; aligned = (arena_cur + align - 1) & ~(align - 1)
+    global.get $arena_cur
+    local.get $align
+    i32.const 1
+    i32.sub
+    i32.add
+    local.get $align
+    i32.const 1
+    i32.sub
+    i32.const -1
+    i32.xor
+    i32.and
+    local.tee $cur
+    ;; ret = $ret_area + 32 + aligned
+    call $ensure_ret_area
+    i32.const 32
+    i32.add
+    i32.add
+    local.set $ret
+    ;; arena_cur = aligned + size
+    local.get $cur
+    local.get $size
+    i32.add
+    global.set $arena_cur
+    local.get $ret)
 
   ;; Helper: write `buf[0..len]` to `handle` via
   ;; `blocking-write-and-flush`. Maps `stream-error` to EIO; an
@@ -635,17 +740,233 @@
 
   ;; ── args / environ ───────────────────────────────────────────
   ;;
-  ;; ENOSYS until subsequent commits wire these to
-  ;; `wasi:cli/environment.get-arguments` /
-  ;; `get-environment` (both return canon-lift'd `list<string>`
-  ;; which needs a return-area + iterate). The scaffold body is
-  ;; intentionally trivial — wasi-libc treats a non-zero return as
-  ;; "no env / no args available", so the wamr examples that don't
-  ;; consult argv (`zig-hello`, `zig-exit`) still work.
-  (func $args_get (type $args_get_sig)             i32.const 52)
-  (func $args_sizes_get (type $args_sizes_get_sig) i32.const 52)
-  (func $environ_get (type $environ_get_sig)       i32.const 52)
-  (func $environ_sizes_get (type $environ_sizes_get_sig) i32.const 52)
+  ;; All four preview1 entry points lower against
+  ;; `wasi:cli/environment.{get-arguments, get-environment}` via the
+  ;; `count` / `separate` modes of the `$cabi_import_realloc` state
+  ;; machine (see the `$import_alloc_*` globals near the top of the
+  ;; module). Each preview1 body sets up the right mode, calls the
+  ;; host once, then resets the state machine — no main-heap
+  ;; allocations are made on this path and the bump arena (32..65536
+  ;; in $ret_area) is reused across calls.
+  ;;
+  ;; Layout:
+  ;;
+  ;;   args_sizes_get  : mode 2 (count)    — sums args byte sizes.
+  ;;   args_get        : mode 3 (separate) — routes strings into argv_buf.
+  ;;   environ_sizes_get : mode 2          — sums (key + value) bytes.
+  ;;   environ_get     : mode 3            — routes key/value into env_buf.
+
+  ;; preview1 `args_sizes_get(argc_ptr, argv_buf_size_ptr) -> errno`.
+  ;; Invokes the host once in `count` mode; the host's per-string
+  ;; canon-realloc calls accumulate into `$strings_sz`. We then
+  ;; publish list_len at argc_ptr and `strings_sz + list_len` at
+  ;; argv_buf_size_ptr — the `+ list_len` accounts for one NUL
+  ;; terminator per arg, matching wasi-libc's expected layout.
+  (func $args_sizes_get (type $args_sizes_get_sig)
+    (local $ra i32) (local $list_len i32)
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_arguments
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    local.get 0                    ;; argc_ptr
+    local.get $list_len
+    i32.store
+    local.get 1                    ;; argv_buf_size_ptr
+    global.get $strings_sz
+    local.get $list_len
+    i32.add
+    i32.store
+    ;; clean up
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 0)
+
+  ;; preview1 `args_get(argv_ptr_array, argv_buf) -> errno`.
+  ;; Invokes the host once in `separate` mode so each string the
+  ;; host allocates lands directly inside argv_buf (one byte gap
+  ;; after each for the NUL terminator). After the call, walk the
+  ;; canon-lifted list (in the bump arena) and:
+  ;;   * argv_ptr_array[i] = entry.string_ptr  (already in argv_buf)
+  ;;   * *(entry.string_ptr + entry.string_len) = 0  (NUL terminator)
+  (func $args_get (type $args_get_sig)
+    (local $ra i32) (local $list_ptr i32) (local $list_len i32)
+    (local $i i32) (local $entry i32)
+    (local $sp i32) (local $sl i32)
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_cur
+    local.get 1  global.set $strings_dst        ;; argv_buf
+    i32.const 3  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_arguments
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=0
+    local.set $list_ptr
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    i32.const 0  local.set $i
+    block $done
+      loop $next
+        local.get $i
+        local.get $list_len
+        i32.ge_u  br_if $done
+        ;; entry = list_ptr + i*8
+        local.get $list_ptr
+        local.get $i
+        i32.const 3
+        i32.shl
+        i32.add
+        local.tee $entry
+        i32.load offset=0
+        local.set $sp
+        local.get $entry
+        i32.load offset=4
+        local.set $sl
+        ;; argv[i] = sp
+        local.get 0
+        local.get $i
+        i32.const 2
+        i32.shl
+        i32.add
+        local.get $sp
+        i32.store
+        ;; *(sp + sl) = 0
+        local.get $sp
+        local.get $sl
+        i32.add
+        i32.const 0
+        i32.store8
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $next
+      end
+    end
+    ;; clean up
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_cur
+    i32.const 0  global.set $strings_dst
+    i32.const 0)
+
+  ;; preview1 `environ_sizes_get(envc_ptr, env_buf_size_ptr) -> errno`.
+  ;; Same `count` mode as args_sizes_get, but each entry has two
+  ;; align=1 string allocs (key + value). Publishes list_len at
+  ;; envc_ptr and `strings_sz + 2 * list_len` at env_buf_size_ptr
+  ;; — `+ 2 * list_len` for the `=` and `\0` per entry.
+  (func $environ_sizes_get (type $environ_sizes_get_sig)
+    (local $ra i32) (local $list_len i32)
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_environment
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    local.get 0                    ;; envc_ptr
+    local.get $list_len
+    i32.store
+    local.get 1                    ;; env_buf_size_ptr
+    global.get $strings_sz
+    local.get $list_len
+    i32.const 1
+    i32.shl                        ;; * 2
+    i32.add
+    i32.store
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 0)
+
+  ;; preview1 `environ_get(envp_ptr_array, env_buf) -> errno`.
+  ;; `separate` mode routes key+value strings into env_buf (each
+  ;; over-allocated by 1 byte). After the call, walk the canon
+  ;; list (16-byte stride: key_ptr, key_len, val_ptr, val_len) and:
+  ;;   * envp_ptr_array[i] = key_ptr
+  ;;   * *(key_ptr + key_len) = '='
+  ;;   * *(val_ptr + val_len) = 0
+  ;; The byte after the key was over-allocated and currently
+  ;; precedes val_ptr by exactly one position, so writing '=' there
+  ;; preserves preview1's `key=value\0` layout.
+  (func $environ_get (type $environ_get_sig)
+    (local $ra i32) (local $list_ptr i32) (local $list_len i32)
+    (local $i i32) (local $entry i32)
+    (local $kp i32) (local $kl i32) (local $vp i32) (local $vl i32)
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_cur
+    local.get 1  global.set $strings_dst        ;; env_buf
+    i32.const 3  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_environment
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=0
+    local.set $list_ptr
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    i32.const 0  local.set $i
+    block $done
+      loop $next
+        local.get $i
+        local.get $list_len
+        i32.ge_u  br_if $done
+        ;; entry = list_ptr + i*16
+        local.get $list_ptr
+        local.get $i
+        i32.const 4
+        i32.shl
+        i32.add
+        local.tee $entry
+        i32.load offset=0   local.set $kp
+        local.get $entry
+        i32.load offset=4   local.set $kl
+        local.get $entry
+        i32.load offset=8   local.set $vp
+        local.get $entry
+        i32.load offset=12  local.set $vl
+        ;; envp[i] = kp
+        local.get 0
+        local.get $i
+        i32.const 2
+        i32.shl
+        i32.add
+        local.get $kp
+        i32.store
+        ;; *(kp + kl) = '='
+        local.get $kp
+        local.get $kl
+        i32.add
+        i32.const 61                ;; '=' = 0x3D = 61
+        i32.store8
+        ;; *(vp + vl) = '\0'
+        local.get $vp
+        local.get $vl
+        i32.add
+        i32.const 0
+        i32.store8
+        local.get $i
+        i32.const 1
+        i32.add
+        local.set $i
+        br $next
+      end
+    end
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_cur
+    i32.const 0  global.set $strings_dst
+    i32.const 0)
 
   ;; ── clocks / random ──────────────────────────────────────────
 
@@ -779,13 +1100,13 @@
   ;; preview1 `random_get(buf, len) -> errno`.
   ;;
   ;; Canon-lowers `wasi:random/random.get-random-bytes(len) ->
-  ;; list<u8>` against the caller's `buf` via the one-shot
-  ;; `$import_alloc_override` trick. The host's canon-lift'd
-  ;; binding allocates the `list<u8>` backing buffer by calling
-  ;; our `$cabi_import_realloc`; with the override installed that
-  ;; call returns `buf` directly, so the random bytes land where
-  ;; preview1 wants them with no extra memcpy and no leaked
-  ;; allocation.
+  ;; list<u8>` against the caller's `buf` via the import-alloc
+  ;; state machine's one-shot mode (mode 1). The host's
+  ;; canon-lift'd binding allocates the `list<u8>` backing buffer
+  ;; by calling our `$cabi_import_realloc`; with mode=1 and
+  ;; `$oneshot_ptr = buf`, that call returns `buf` directly and
+  ;; clears the slot, so the random bytes land where preview1
+  ;; wants them with no extra memcpy and no leaked allocation.
   ;;
   ;; The returned `(ptr, len)` pair in the ret-area is therefore
   ;; redundant — `ptr == buf` and `len == requested_len` by
@@ -801,10 +1122,12 @@
       i32.const 0
       return
     end
-    ;; Arm the one-shot import-alloc override: the next call into
-    ;; `$cabi_import_realloc` returns `buf` and clears the slot.
+    ;; Arm one-shot mode: the next call into $cabi_import_realloc
+    ;; returns $oneshot_ptr and clears the slot + mode.
     local.get 0
-    global.set $import_alloc_override
+    global.set $oneshot_ptr
+    i32.const 1
+    global.set $import_alloc_mode
     ;; Return-area for the canon-lifted `(ptr, len)` tuple; we
     ;; ignore the stored values after the call.
     call $ensure_ret_area
@@ -814,6 +1137,13 @@
     i64.extend_i32_u
     local.get $ra
     call $get_random_bytes
+    ;; Defensive cleanup: if the host somehow didn't consume the
+    ;; override (e.g. canon ABI changed under us), force-clear it
+    ;; so the next preview2 call doesn't observe stale state.
+    i32.const 0
+    global.set $import_alloc_mode
+    i32.const 0
+    global.set $oneshot_ptr
     i32.const 0)
 
   ;; ── run entry ────────────────────────────────────────────────
@@ -829,33 +1159,104 @@
     call $main_start
     i32.const 0)
 
-  ;; canon-lower realloc helper. Default behaviour: delegate to the
-  ;; embed's `cabi_realloc`. When `$import_alloc_override` is
-  ;; non-zero (set by `$random_get` and any future list<T>-returning
-  ;; preview1 import), instead return that pointer and clear the
-  ;; slot — the host's next canon-lift'd allocation lands directly
-  ;; in the caller's preview1 buffer with no extra memcpy.
+  ;; canon-lower realloc helper. Dispatches on `$import_alloc_mode`:
   ;;
-  ;; The override is single-shot: each `$cabi_import_realloc` call
-  ;; either consumes-and-clears the override or falls through to
-  ;; `$main_cabi_realloc`. The canon ABI for `list<u8>` makes
-  ;; exactly one realloc call per return, so a single-shot slot
-  ;; is sufficient; a stray second realloc inside the same import
-  ;; falls through to the embed's heap allocator (correct but
-  ;; defeats the zero-copy claim).
+  ;;   mode 0 (default) — delegate to `$main_cabi_realloc`. Used by
+  ;;     any canon-lift'd allocation outside an args/environ /
+  ;;     random_get window. Today no preview1 body relies on this
+  ;;     path returning a valid pointer (clocks / exit / stdout /
+  ;;     stderr never trigger a list/string lift), but it's kept
+  ;;     defensively so a future preview2 import that *does*
+  ;;     allocate without setting a mode still works.
+  ;;
+  ;;   mode 1 (one-shot) — return `$oneshot_ptr`, clear it, drop
+  ;;     mode back to 0. Used by `$random_get` so the host's single
+  ;;     `list<u8>` backing alloc lands in the caller's preview1
+  ;;     `buf`.
+  ;;
+  ;;   mode 2 (count) — every allocation comes from the bump arena
+  ;;     (`$ret_area + 32`); `align == 1` allocs additionally bump
+  ;;     `$strings_sz` by `size`. Used by `args_sizes_get` /
+  ;;     `environ_sizes_get` to compute argv_buf_size /
+  ;;     env_buf_size without a second host call.
+  ;;
+  ;;   mode 3 (separate) — `align == 1` allocs go to
+  ;;     `$strings_dst + $strings_cur`, advancing `$strings_cur` by
+  ;;     `size + 1` (the +1 leaves room for a NUL/`=`/`\0` byte
+  ;;     written after the host call). Non-align-1 allocs (the
+  ;;     list backing) come from the bump arena. Used by
+  ;;     `args_get` / `environ_get` so strings land in argv_buf /
+  ;;     env_buf directly.
+  ;;
+  ;; All four modes preserve single-shot / per-call semantics: the
+  ;; caller resets `$arena_cur` and other globals at the start of
+  ;; its body, and the entire state machine resets to mode 0 at the
+  ;; end. No state bleeds across preview1 calls.
   (func $cabi_import_realloc (type $cabi_realloc)
-    global.get $import_alloc_override
-    if (result i32)
-      global.get $import_alloc_override
-      i32.const 0
-      global.set $import_alloc_override
-    else
-      local.get 0
-      local.get 1
+    (local $mode i32)
+    global.get $import_alloc_mode
+    local.tee $mode
+    i32.const 1
+    i32.eq
+    if
+      ;; mode 1: one-shot override.
+      global.get $oneshot_ptr
+      i32.const 0  global.set $oneshot_ptr
+      i32.const 0  global.set $import_alloc_mode
+      return
+    end
+    local.get $mode
+    i32.const 2
+    i32.eq
+    if
+      ;; mode 2: count. If align == 1, accumulate strings_sz; always
+      ;; serve from bump arena.
+      local.get 2
+      i32.const 1
+      i32.eq
+      if
+        global.get $strings_sz
+        local.get 3
+        i32.add
+        global.set $strings_sz
+      end
+      local.get 2          ;; align
+      local.get 3          ;; size
+      call $arena_alloc
+      return
+    end
+    local.get $mode
+    i32.const 3
+    i32.eq
+    if
+      ;; mode 3: separate. align == 1 → strings_dst; else → arena.
+      local.get 2
+      i32.const 1
+      i32.eq
+      if
+        global.get $strings_dst
+        global.get $strings_cur
+        i32.add
+        ;; advance strings_cur by size + 1
+        global.get $strings_cur
+        local.get 3
+        i32.add
+        i32.const 1
+        i32.add
+        global.set $strings_cur
+        return
+      end
       local.get 2
       local.get 3
-      call $main_cabi_realloc
-    end)
+      call $arena_alloc
+      return
+    end
+    ;; mode 0 (or anything else, defensively): delegate.
+    local.get 0
+    local.get 1
+    local.get 2
+    local.get 3
+    call $main_cabi_realloc)
 
   ;; ── exports ──────────────────────────────────────────────────
   ;;
