@@ -99,9 +99,29 @@
     (func $main_cabi_realloc (type $cabi_realloc)))
 
   ;; preview2 instance imports actually consumed by the v1 adapter.
-  ;; `wasi:cli/exit@0.2.6.exit-with-code(u8)` is the lossless
-  ;; replacement for the wasmtime adapter's `exit(result<_, _>)` —
-  ;; preserves the numeric proc_exit code end-to-end.
+  ;;
+  ;; `wasi:cli/exit@0.2.6.exit-with-code(u8)` is the lossless,
+  ;; `@unstable(feature = cli-exit-with-code)` extension that
+  ;; preserves the numeric proc_exit code end-to-end. Wamr today
+  ;; implements it on its host side (see
+  ;; `cataggar/wamr:src/component/wasi_cli_adapter.zig:cliExitWithCode`).
+  ;; Wasmtime v44 also implements it but gates the linker binding
+  ;; behind `-S cli-exit-with-code` (off by default).
+  ;;
+  ;; `wasi:cli/exit@0.2.6.exit(result<_, _>)` is the stable
+  ;; `@since(version = 0.2.0)` form that every runtime targeting
+  ;; the wasi-cli interface supplies. It collapses any non-zero
+  ;; numeric code to a single error bit. The adapter routes
+  ;; through here as a fallback inside `$proc_exit` when
+  ;; `exit-with-code` returns (which it won't on a host that
+  ;; honored the canon contract); the import itself is mostly
+  ;; defensive for any strict-0.2.0 host that wires only `exit`.
+  ;;
+  ;; Both imports declared together mirrors the canonical
+  ;; wasi-cli@0.2.6 interface body — the encoded component-type
+  ;; surface stays identical to wit-component's reference output.
+  (import "wasi:cli/exit@0.2.6" "exit"
+    (func $exit (type $i32_void)))
   (import "wasi:cli/exit@0.2.6" "exit-with-code"
     (func $exit_with_code (type $i32_void)))
 
@@ -166,12 +186,24 @@
   ;; ── preview1 surface ─────────────────────────────────────────
   ;;
   ;; proc_exit(code: i32) -> ! :  preview1 declares no return, but
-  ;; the canon-lift'd signature in core wasm is `(i32) -> ()`. The
-  ;; body lowers through `wasi:cli/exit.exit-with-code(u8)` and
-  ;; then traps so the call never returns. The host's
-  ;; `exit-with-code` itself traps after stashing the code on the
-  ;; `WasiCliAdapter.exit_code` slot, so in practice the
-  ;; `unreachable` here is defensive.
+  ;; the canon-lift'd signature in core wasm is `(i32) -> ()`.
+  ;;
+  ;; Two-step dispatch:
+  ;;
+  ;;   1. Call `wasi:cli/exit.exit-with-code(u8)`. On runtimes that
+  ;;      have bound the `@unstable(cli-exit-with-code)` extension
+  ;;      (wamr today) this traps with the original numeric code
+  ;;      stashed on the host — the rest of this body never runs.
+  ;;
+  ;;   2. If `exit-with-code` returned (i.e. the runtime stubs it
+  ;;      out), fall through to `wasi:cli/exit.exit(result)` —
+  ;;      the stable `@since(version = 0.2.0)` form that every
+  ;;      wasi-cli host implements. `result.err = 1`, `result.ok = 0`.
+  ;;      Encode `code != 0` → 1, `code == 0` → 0.
+  ;;
+  ;; The final `unreachable` is defensive — both host calls trap
+  ;; on their canonical shapes, but a runtime that ignores both
+  ;; would deadlock without it.
   (func $proc_exit (type $proc_exit_sig)
     (local $code_u8 i32)
     ;; clamp to u8 (preview1 proc_exit code is i32; preview2
@@ -183,6 +215,12 @@
     local.set $code_u8
     local.get $code_u8
     call $exit_with_code
+    ;; Fallback to stable exit(result). `result` discriminant: 0=ok, 1=err.
+    ;; Map non-zero code → err, zero → ok.
+    local.get 0
+    i32.const 0
+    i32.ne
+    call $exit
     unreachable)
 
   ;; proc_raise(sig: i32) -> errno
