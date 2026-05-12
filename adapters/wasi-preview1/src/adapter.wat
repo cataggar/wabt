@@ -46,6 +46,12 @@
 ;;     the host writes strings directly into the caller's preview1
 ;;     argv_buf / env_buf (no main-heap allocation for any of these
 ;;     paths).
+;;   * `fd_prestat_get` / `fd_prestat_dir_name` — lifts
+;;     `wasi:filesystem/preopens.get-directories` once per call into
+;;     the bump arena (no permanent cache) and reads the i-th
+;;     preopen out for `wasi-libc`'s startup walk. The wider
+;;     filesystem surface (path_open, fd_read, stat, readdir) is
+;;     still pending under subphases (a2)/(b)/(c) of #165.
 ;;
 ;; Declared preview2 imports the adapter consumes today:
 ;;
@@ -68,13 +74,20 @@
 ;;     preview1 `random_get` import;
 ;;   * `wasi:clocks/wall-clock@0.2.6.{now, resolution}` +
 ;;     `wasi:clocks/monotonic-clock@0.2.6.{now, resolution}` —
-;;     backing for the preview1 `clock_*_get` imports.
+;;     backing for the preview1 `clock_*_get` imports;
+;;   * `wasi:filesystem/preopens@0.2.6.get-directories` — backing
+;;     for the preview1 `fd_prestat_*` walk;
+;;   * `wasi:filesystem/types@0.2.6` — only the bare `descriptor`
+;;     resource is declared for now (its `own<>` reference is the
+;;     payload of `preopens.get-directories`' return). Methods
+;;     arrive in subphases (a2)/(b)/(c) of #165.
 ;;
 ;; Still ENOSYS (tracked under cataggar/wabt#168):
 ;;
-;;   * `fd_read`, `fd_close`, `fd_prestat_get`, `fd_prestat_dir_name`,
-;;     plus the path_* surface — wait for filesystem read-side
-;;     (#165);
+;;   * `fd_read`, `fd_close`, `path_open`, plus the rest of the
+;;     filesystem surface (`fd_filestat_get`, `path_filestat_get`,
+;;     `fd_readdir`, the `path_*` write-side, sockets) — wait for
+;;     subphases (a2)/(b)/(c) of #165 and #166;
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
 ;;     preview1 cares about.
 
@@ -160,6 +173,14 @@
   ;;   after running the host-side iteration.
   (type $get_arguments_sig   (func (param i32)))
   (type $get_environment_sig (func (param i32)))
+
+  ;; `wasi:filesystem/preopens.get-directories() ->
+  ;;   list<tuple<descriptor, string>>` — same shape as the
+  ;;   `wasi:cli/environment` calls above. The host writes
+  ;;   `(list_ptr, list_len)` at the ret_area; the list backing is
+  ;;   12-byte tuples of `(descriptor_handle: i32, name_ptr: i32,
+  ;;   name_len: i32)`.
+  (type $get_directories_sig (func (param i32)))
 
   ;; ── imports ──────────────────────────────────────────────────
   ;;
@@ -273,6 +294,15 @@
     (func $get_arguments (type $get_arguments_sig)))
   (import "wasi:cli/environment@0.2.6" "get-environment"
     (func $get_environment (type $get_environment_sig)))
+
+  ;; `wasi:filesystem/preopens.get-directories() ->
+  ;; list<tuple<descriptor, string>>` backing the preview1
+  ;; `fd_prestat_get` / `fd_prestat_dir_name` imports. Lifted on
+  ;; each preview1 call via mode 2 (count) of the import-alloc
+  ;; state machine — the canon list backing + each name lands in
+  ;; the bump arena and gets reset after the call.
+  (import "wasi:filesystem/preopens@0.2.6" "get-directories"
+    (func $get_directories (type $get_directories_sig)))
 
   ;; ── adapter state ────────────────────────────────────────────
   ;;
@@ -735,8 +765,157 @@
     i32.const 0)             ;; SUCCESS
 
   (func $fd_fdstat_set_flags (type $fd_fdstat_set_flags_sig) i32.const 52)
-  (func $fd_prestat_get (type $fd_prestat_get_sig) i32.const 52)
-  (func $fd_prestat_dir_name (type $fd_prestat_dir_name_sig) i32.const 52)
+
+  ;; preview1 `fd_prestat_get(fd, prestat_ptr) -> errno`.
+  ;;
+  ;; wasi-libc walks preopens at startup by calling
+  ;; `fd_prestat_get(fd)` for `fd = 3, 4, 5, …` until it returns
+  ;; `EBADF`. Each call lifts the full preopens list from the host
+  ;; via `wasi:filesystem/preopens.get-directories` into the bump
+  ;; arena (mode 2), looks up the `idx = fd - 3` entry, writes the
+  ;; preview1 `prestat` record, then resets the arena. No
+  ;; permanent allocation; each call is stateless.
+  ;;
+  ;; preview1 `prestat` layout (8 bytes, align 4):
+  ;;   offset 0: u8  tag (0 = PREOPENTYPE_DIR)
+  ;;   offset 1..3: pad
+  ;;   offset 4: u32 pr_name_len
+  ;;
+  ;; We `i32.store offset=0` a single zero to cover the tag + 3
+  ;; pad bytes in one write — `PREOPENTYPE_DIR` is 0.
+  ;;
+  ;; fd < 3 (stdio) returns `EBADF`; fd >= 3 + n_preopens also
+  ;; returns `EBADF`, matching wasmtime's reference adapter.
+  (func $fd_prestat_get (type $fd_prestat_get_sig)
+    (local $ra i32) (local $idx i32) (local $list_ptr i32)
+    (local $list_len i32) (local $entry i32) (local $name_len i32)
+    local.get 0
+    i32.const 3
+    i32.sub
+    local.tee $idx
+    i32.const 0
+    i32.lt_s
+    if
+      i32.const 8                ;; EBADF for stdio
+      return
+    end
+    ;; mode 2 (count) — the canon list backing + each per-name
+    ;; alloc land in the bump arena; nothing reaches the embed's
+    ;; heap.
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_directories
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=0
+    local.set $list_ptr
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    local.get $idx
+    local.get $list_len
+    i32.ge_u
+    if
+      i32.const 0  global.set $arena_cur
+      i32.const 0  global.set $strings_sz
+      i32.const 8                ;; EBADF — past the last preopen
+      return
+    end
+    ;; entry = list_ptr + idx * 12 (tuple stride is 12 bytes:
+    ;; descriptor handle i32, name_ptr i32, name_len i32)
+    local.get $list_ptr
+    local.get $idx
+    i32.const 12
+    i32.mul
+    i32.add
+    local.tee $entry
+    i32.load offset=8
+    local.set $name_len
+    ;; Write prestat at prestat_ptr.
+    local.get 1
+    i32.const 0                  ;; tag + 3 pad bytes
+    i32.store offset=0
+    local.get 1
+    local.get $name_len
+    i32.store offset=4
+    ;; Cleanup.
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 0)
+
+  ;; preview1 `fd_prestat_dir_name(fd, buf, buf_len) -> errno`.
+  ;; Same lift + lookup as `$fd_prestat_get`; instead of writing a
+  ;; prestat record we `memory.copy` up to `buf_len` bytes of the
+  ;; preopen's name into the caller's buffer. `buf_len` ≥ name_len
+  ;; is the normal wasi-libc flow (the caller sized the buffer from
+  ;; the preceding `fd_prestat_get`); we clamp defensively.
+  (func $fd_prestat_dir_name (type $fd_prestat_dir_name_sig)
+    (local $ra i32) (local $idx i32) (local $list_ptr i32)
+    (local $list_len i32) (local $entry i32)
+    (local $name_ptr i32) (local $name_len i32) (local $copy_len i32)
+    local.get 0
+    i32.const 3
+    i32.sub
+    local.tee $idx
+    i32.const 0
+    i32.lt_s
+    if
+      i32.const 8
+      return
+    end
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 2  global.set $import_alloc_mode
+    call $ensure_ret_area
+    local.tee $ra
+    call $get_directories
+    i32.const 0  global.set $import_alloc_mode
+    local.get $ra
+    i32.load offset=0
+    local.set $list_ptr
+    local.get $ra
+    i32.load offset=4
+    local.set $list_len
+    local.get $idx
+    local.get $list_len
+    i32.ge_u
+    if
+      i32.const 0  global.set $arena_cur
+      i32.const 0  global.set $strings_sz
+      i32.const 8
+      return
+    end
+    local.get $list_ptr
+    local.get $idx
+    i32.const 12
+    i32.mul
+    i32.add
+    local.tee $entry
+    i32.load offset=4
+    local.set $name_ptr
+    local.get $entry
+    i32.load offset=8
+    local.set $name_len
+    ;; copy_len = min(buf_len, name_len)
+    local.get 2
+    local.get $name_len
+    i32.lt_u
+    if (result i32)
+      local.get 2
+    else
+      local.get $name_len
+    end
+    local.set $copy_len
+    local.get 1                  ;; buf
+    local.get $name_ptr
+    local.get $copy_len
+    memory.copy
+    i32.const 0  global.set $arena_cur
+    i32.const 0  global.set $strings_sz
+    i32.const 0)
 
   ;; ── args / environ ───────────────────────────────────────────
   ;;
