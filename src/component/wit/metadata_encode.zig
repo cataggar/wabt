@@ -448,6 +448,13 @@ fn buildInterfaceBody(
                     } });
                     builder.type_idx += 1;
                     try builder.bindName(td.name, .{ .type_idx = resource_idx });
+                    // Track that `td.name` is a resource so a bare
+                    // `.name` reference to it in a value-type position
+                    // (tuple element, list element, record field, func
+                    // param/result, etc.) auto-wraps as `own<R>` in
+                    // `lowerType`. Matches the component-model spec /
+                    // wit-component's reference encoder (#182).
+                    try builder.resource_names.put(ar, td.name, {});
 
                     // Methods / statics / constructors synthesize their
                     // canonical-ABI external names (`[method]R.M`,
@@ -519,6 +526,21 @@ fn buildInterfaceBody(
                     const export_slot = builder.type_idx;
                     builder.type_idx += 1;
                     try builder.bindName(visible_name, .{ .type_idx = export_slot });
+                    // If the source interface defines `un.name` as a
+                    // resource, register the visible (post-`rename`)
+                    // name in `resource_names` so bare references to
+                    // it in value-type positions auto-wrap as
+                    // `own<R>` (#182). Local resources are tracked at
+                    // the resource-decl site above; this branch
+                    // handles `use other.{R};`-introduced resources
+                    // (e.g. `preopens.use types.{descriptor}`).
+                    for (src_lookup.iface.items) |src_item| {
+                        if (src_item != .type) continue;
+                        if (!std.mem.eql(u8, src_item.type.name, un.name)) continue;
+                        if (src_item.type.kind != .resource) break;
+                        try builder.resource_names.put(ar, visible_name, {});
+                        break;
+                    }
                 }
             },
         }
@@ -561,6 +583,19 @@ const BodyBuilder = struct {
     /// `type_idx` produced by the compound's lowering.
     name_map: std.StringHashMapUnmanaged(ctypes.ValType),
 
+    /// Subset of `name_map` keys whose binding refers to a resource
+    /// type (locally defined via `resource R { … }` or brought in via
+    /// `use other.{R}`). Per the component-model spec, a bare `.name`
+    /// reference to a resource in a value-type position (tuple
+    /// element, list element, record field, variant payload, option
+    /// inner, result ok/err, func param, func result) implicitly
+    /// resolves to `own<R>`. `lowerType` consults this set on the
+    /// `.name` arm and emits `handleSlot(idx, .own)` instead of the
+    /// bare type-idx alias. Non-resource named types (aliases,
+    /// records, variants, enums, flags) fall through to the plain
+    /// `name_map.get(n)` path. Tracked under cataggar/wabt#182.
+    resource_names: std.StringHashMapUnmanaged(void) = .empty,
+
     fn lowerType(self: *BodyBuilder, t: ast.Type) EncodeError!ctypes.ValType {
         return switch (t) {
             .bool => .bool,
@@ -600,7 +635,17 @@ const BodyBuilder = struct {
                 for (fields, 0..) |f, i| inner[i] = try self.lowerType(f);
                 break :blk try self.appendCompound(.{ .tuple = .{ .fields = inner } });
             },
-            .name => |n| self.name_map.get(n) orelse error.InvalidWit,
+            .name => |n| blk: {
+                // Bare resource references auto-wrap as `own<R>` in
+                // any value-type position (#182). Non-resource named
+                // bindings fall through to the plain alias lookup.
+                if (self.resource_names.contains(n)) {
+                    const bound = self.name_map.get(n) orelse return error.InvalidWit;
+                    if (bound != .type_idx) return error.InvalidWit;
+                    break :blk try self.handleSlot(bound.type_idx, .own);
+                }
+                break :blk self.name_map.get(n) orelse error.InvalidWit;
+            },
             .borrow => |n| try self.handleValType(n, .borrow),
             .own => |n| try self.handleValType(n, .own),
         };
@@ -1566,4 +1611,286 @@ test "metadata_encode: use clause from qualified versioned source ref" {
     // the alias-instance-export decl between `streams` and `stdout`.
     try testing.expectEqual(@as(usize, 5), world_body.decls.len);
     try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+}
+
+// ── #182: auto-wrap bare resource refs with own<> ─────────────────────────
+//
+// The component-model spec / wit-component's reference encoder
+// auto-wraps a bare `.name` reference to a resource with `own<>` in
+// any value-type position (tuple element, list element, record
+// field, variant payload, option inner, result ok/err, func param,
+// func result). Without this sugar a tuple/list/record over a bare
+// resource ref lowers to `Defined(Tuple([Type(N), …]))` where
+// `Type(N)` is the resource alias — wasmtime rejects this at parse
+// time ("type index N is not a defined type"). The tests below pin
+// the auto-own behavior for each value-type position and verify
+// negative cases (type aliases, explicit borrow<>) are unaffected.
+
+test "metadata_encode #182: bare resource as func result auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    open: func() -> handle;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: ExportDecl "handle" (type sub-resource)         — slot 0
+    //   1: TypeDef.val .own=0   (auto-wrapped result slot) — slot 1
+    //   2: TypeDef.func open() -> type_idx=1               — slot 2
+    //   3: ExportDecl "open" func=2
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type == .val);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    try testing.expect(iface.decls[2].type == .func);
+    try testing.expect(iface.decls[2].type.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.results.unnamed.type_idx);
+}
+
+test "metadata_encode #182: bare resource as func param auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    consume: func(h: handle);
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    //   0: ExportDecl "handle" (sub-resource)              — slot 0
+    //   1: TypeDef.val .own=0  (auto-wrapped param slot)   — slot 1
+    //   2: TypeDef.func consume(h: type_idx=1) -> none     — slot 2
+    //   3: ExportDecl "consume" func=2
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    const func = iface.decls[2].type.func;
+    try testing.expectEqual(@as(usize, 1), func.params.len);
+    try testing.expectEqualStrings("h", func.params[0].name);
+    try testing.expect(func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), func.params[0].type.type_idx);
+    try testing.expect(func.results == .none);
+}
+
+test "metadata_encode #182: bare resource in tuple element of use-introduced resource (preopens shape)" {
+    // The motivating fixture: `preopens.get-directories` returns
+    // `list<tuple<descriptor, string>>` where `descriptor` comes in
+    // via `use types.{descriptor};`. The encoder must auto-wrap the
+    // bare `descriptor` tuple element as `own<descriptor>` against
+    // the *export slot* of the `use`-introduced alias (NOT the
+    // outer alias slot), matching wit-component's wire bytes.
+    const source =
+        \\package wasi:filesystem@0.2.6;
+        \\interface types { resource descriptor { } }
+        \\interface preopens {
+        \\    use types.{descriptor};
+        \\    get-directories: func() -> list<tuple<descriptor, string>>;
+        \\}
+        \\world demo { import types; import preopens; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    // Walk: world body → preopens instance type body.
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // World decls: 0 = types instance, 1 = import types,
+    //              2 = alias instance_export "descriptor",
+    //              3 = preopens instance, 4 = import preopens.
+    const preopens_body = world_body.decls[3].type.instance;
+    //   0: Alias.outer sort=type count=1 idx=1      — local slot 0
+    //   1: ExportDecl "descriptor" type=eq{0}       — local slot 1
+    //   2: TypeDef.val .own=1                       — local slot 2
+    //      (auto-wrap of bare `descriptor` in tuple)
+    //   3: TypeDef.tuple<type_idx=2, string>        — local slot 3
+    //   4: TypeDef.list<type_idx=3>                 — local slot 4
+    //   5: TypeDef.func () -> type_idx=4            — local slot 5
+    //   6: ExportDecl "get-directories" func=5
+    try testing.expectEqual(@as(usize, 7), preopens_body.decls.len);
+
+    // The auto-wrap: own slot referencing the export-eq slot (1).
+    try testing.expect(preopens_body.decls[2].type == .val);
+    try testing.expect(preopens_body.decls[2].type.val == .own);
+    try testing.expectEqual(@as(u32, 1), preopens_body.decls[2].type.val.own);
+
+    // Tuple slot points to the own slot (2), not the bare export
+    // slot (1). This is the bug #181 worked around with explicit
+    // `own<>`; the auto-own path must produce the same wire bytes.
+    try testing.expect(preopens_body.decls[3].type == .tuple);
+    const tup = preopens_body.decls[3].type.tuple;
+    try testing.expectEqual(@as(usize, 2), tup.fields.len);
+    try testing.expect(tup.fields[0] == .type_idx);
+    try testing.expectEqual(@as(u32, 2), tup.fields[0].type_idx);
+    try testing.expect(tup.fields[1] == .string);
+}
+
+test "metadata_encode #182: bare resource as record field auto-wraps to own<R>" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource handle { }
+        \\    record wrapper { h: handle, label: string }
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    //   0: ExportDecl "handle" (sub-resource)              — slot 0
+    //   1: TypeDef.val .own=0  (auto-wrapped field slot)   — slot 1
+    //   2: TypeDef.record {h: type_idx=1, label: string}   — slot 2
+    //   3: ExportDecl "wrapper" type=eq{2}                 — slot 3
+    try testing.expectEqual(@as(usize, 4), iface.decls.len);
+    try testing.expect(iface.decls[1].type.val == .own);
+    try testing.expectEqual(@as(u32, 0), iface.decls[1].type.val.own);
+    try testing.expect(iface.decls[2].type == .record);
+    const rec = iface.decls[2].type.record;
+    try testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try testing.expectEqualStrings("h", rec.fields[0].name);
+    try testing.expect(rec.fields[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 1), rec.fields[0].type.type_idx);
+    try testing.expect(rec.fields[1].type == .string);
+}
+
+test "metadata_encode #182: option/list/result/variant payload all auto-wrap" {
+    // Compact case covering the four remaining value-type positions.
+    // Each container's inner type must point at its own `own<R>`
+    // slot. Type defs come before func defs so forward refs aren't
+    // needed (encoder processes items in declaration order).
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    resource r { }
+        \\    variant variant-out { some(r), nothing }
+        \\    maybe: func() -> option<r>;
+        \\    many:  func() -> list<r>;
+        \\    fall:  func() -> result<r, string>;
+        \\    pick:  func() -> variant-out;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Walk through the decls and count `.val .own = 0` slots — one
+    // per auto-wrap site. Expected sites:
+    //   * variant-case-`some` payload (auto-wrap of `r`)
+    //   * option inner (`option<r>`)
+    //   * list element (`list<r>`)
+    //   * result.ok (`result<r, string>`)
+    // Four auto-wraps total, plus zero for the `pick` return (that's
+    // a `variant-out` named type reference, not a bare resource ref).
+    var own_slots: usize = 0;
+    for (iface.decls) |d| {
+        if (d == .type and d.type == .val and d.type.val == .own and d.type.val.own == 0) {
+            own_slots += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 4), own_slots);
+}
+
+test "metadata_encode #182: type alias to primitive is NOT auto-wrapped" {
+    // Negative: `type byte-count = u32;` followed by
+    // `sized: func() -> byte-count` must NOT route through the
+    // resource auto-wrap path — `byte-count` is a primitive alias,
+    // not a resource. The result must be the primitive ValType, not
+    // wrapped in `own<>`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface i {
+        \\    type byte-count = u32;
+        \\    sized: func() -> byte-count;
+        \\}
+        \\world demo { export i; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape:
+    //   0: TypeDef.func sized() -> u32                    — slot 0
+    //   1: ExportDecl "sized" func=0
+    // (Primitive aliases don't consume a body slot — name_map
+    // maps directly to the primitive ValType.)
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[0].type.func.results.unnamed == .u32);
+}
+
+test "metadata_encode #182: explicit borrow<R> on use-introduced resource still works" {
+    // Regression guard: the auto-own path must not break the
+    // existing explicit `borrow<R>` resolution for resources brought
+    // in via `use other.{R}`. The visible name (after `rename`) ends
+    // up in `resource_names` *and* in `name_map`; the explicit
+    // `borrow<R>` AST node goes through `handleValType`, which looks
+    // up `name_map` directly — unaffected by `resource_names`.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface types { resource handle { } }
+        \\interface ops {
+        \\    use types.{handle};
+        \\    peek: func(h: borrow<handle>);
+        \\}
+        \\world demo { import types; import ops; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "demo");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    const ops_body = world_body.decls[3].type.instance;
+    // ops body:
+    //   0: Alias.outer count=1 idx=1                       — slot 0
+    //   1: ExportDecl "handle" type=eq{0}                  — slot 1
+    //   2: TypeDef.val .borrow=1  (explicit borrow<>)      — slot 2
+    //   3: TypeDef.func peek(h: type_idx=2) -> none        — slot 3
+    //   4: ExportDecl "peek" func=3
+    try testing.expectEqual(@as(usize, 5), ops_body.decls.len);
+    try testing.expect(ops_body.decls[2].type == .val);
+    try testing.expect(ops_body.decls[2].type.val == .borrow);
+    try testing.expectEqual(@as(u32, 1), ops_body.decls[2].type.val.borrow);
 }
