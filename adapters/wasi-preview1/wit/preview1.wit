@@ -54,6 +54,14 @@ world command {
     import wasi:cli/stdout@0.2.6;
     import wasi:cli/stderr@0.2.6;
 
+    /// Cryptographically-secure RNG backing the preview1 `random_get`
+    /// import. wasi-libc's `getentropy`, Zig's `std.crypto.random`,
+    /// Rust's `rand` wasi backend and Go's runtime RNG seed all
+    /// route through here at startup; the adapter's `$random_get`
+    /// canon-lowers `get-random-bytes` against the caller's buf via
+    /// a one-shot `cabi_import_realloc` override (zero copy).
+    import wasi:random/random@0.2.6;
+
     /// Canon-lift'd `run()` entry. The adapter calls
     /// `__main_module__._start` and returns `ok` on normal return;
     /// `proc_exit` traps out of `_start` so this tail is unreachable
