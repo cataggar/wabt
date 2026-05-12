@@ -102,7 +102,7 @@
 ;;     — exported as ENOSYS=52 stubs so wasi-libc embeds that pull
 ;;     these in via the C runtime startup splice cleanly. Programs
 ;;     that actually call socket(2) get a well-defined errno
-;;     (deferred preview2 sockets → cataggar/wabt#168).
+;;     (deferred preview2 sockets → cataggar/wabt#178).
 ;;
 ;; Declared preview2 imports the adapter consumes:
 ;;
@@ -134,14 +134,15 @@
 ;;     `[method]directory-entry-stream.read-directory-entry` +
 ;;     `[resource-drop]directory-entry-stream`.
 ;;
-;; Still ENOSYS / not lifted (tracked under cataggar/wabt#168):
+;; Still ENOSYS / not lifted (sub-issues split out of #168):
 ;;
 ;;   * `fd_fdstat_set_flags` — no preview2 equivalent for the flags
-;;     preview1 cares about.
+;;     preview1 cares about (cataggar/wabt#179).
 ;;   * `fd_pread`, `fd_advise`, `fd_allocate`, `fd_renumber`,
-;;     `fd_tell`, `path_readlink` — out of v3 scope.
+;;     `fd_tell`, `path_readlink` — out of v3 scope
+;;     (cataggar/wabt#180).
 ;;   * `sock_*` — ENOSYS stubs only; preview2 `wasi:sockets/*`
-;;     surface deferred.
+;;     surface deferred (cataggar/wabt#178).
 
 (module
   ;; ── func types ────────────────────────────────────────────────

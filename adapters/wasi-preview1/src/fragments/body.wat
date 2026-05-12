@@ -1706,7 +1706,7 @@
   ;; and falls back to `FILETYPE_UNKNOWN` when stdio isn't actually
   ;; a tty. We unconditionally report `character_device` to keep
   ;; this change in the "no new preview2 imports" bucket of
-  ;; cataggar/wabt#168. The trade-off is that a guest redirected to
+  ;; cataggar/wabt#179. The trade-off is that a guest redirected to
   ;; a file/pipe still believes it's writing to a tty — acceptable
   ;; for the v3 scope (CLI fixtures); revisit alongside the
   ;; terminal-* imports if a fixture surfaces the mismatch.
@@ -1722,7 +1722,7 @@
   ;; fd >= 3 keeps the ENOSYS=52 stub — preview2 has
   ;; `descriptor.{get-flags, get-type}` we could lift here, but the
   ;; preview1 `fdstat` also needs `fs_rights_*` which has no
-  ;; preview2 equivalent. Tracked under cataggar/wabt#168.
+  ;; preview2 equivalent. Tracked under cataggar/wabt#179.
   (func $fd_fdstat_get (type $fd_fdstat_get_sig)
     (local $rights i64)
     local.get 0
