@@ -7,7 +7,6 @@ pub const usage =
     \\Run a WebAssembly spec test (.wast file).
     \\
     \\Options:
-    \\  -h, --help   Show this help
     \\
 ;
 
@@ -25,6 +24,10 @@ pub fn runBinaryValidation(allocator: std.mem.Allocator, wasm_bytes: []const u8)
 }
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
+    if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, usage);
+        return;
+    }
     const alloc = init.gpa;
 
     var input_file: ?[]const u8 = null;
@@ -32,16 +35,13 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            writeStdout(init.io, usage);
-            return;
-        } else {
+        {
             input_file = arg;
         }
     }
 
     const in_path = input_file orelse {
-        std.debug.print("no input file specified. Use `wabt help spectest` for usage.\n", .{});
+        std.debug.print("no input file specified. Use `wabt spec run help` for usage.\n", .{});
         return;
     };
 

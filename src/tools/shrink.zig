@@ -46,7 +46,6 @@ pub const usage =
     \\  -s, --seed <N>        Reserved for compatibility (currently unused;
     \\                        wabt's reductions are deterministic)
     \\      --allow-empty     Permit shrinking down to an empty module
-    \\  -h, --help            Show this help
     \\
 ;
 
@@ -345,6 +344,10 @@ pub fn shrinkBytes(
 // ── CLI entry point ─────────────────────────────────────────────────
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
+    if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
+        writeStdout(init.io, usage);
+        return;
+    }
     const alloc = init.gpa;
 
     var output_file: ?[]const u8 = null;
@@ -357,10 +360,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
-            writeStdout(init.io, usage);
-            return;
-        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= sub_args.len) {
                 std.debug.print("error: {s} requires an argument\n", .{arg});
@@ -392,7 +392,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else {
             if (pos_count >= positionals.len) {
                 std.debug.print(
-                    "error: unexpected positional argument '{s}'. Use `wabt help shrink`.\n",
+                    "error: unexpected positional argument '{s}'. Use `wabt module shrink help`.\n",
                     .{arg},
                 );
                 std.process.exit(1);
@@ -404,7 +404,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 
     if (pos_count < 2) {
         std.debug.print(
-            "error: shrink requires <predicate> and <input.wasm>. Use `wabt help shrink`.\n",
+            "error: shrink requires <predicate> and <input.wasm>. Use `wabt module shrink help`.\n",
             .{},
         );
         std.process.exit(1);

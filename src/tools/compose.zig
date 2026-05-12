@@ -2,7 +2,7 @@
 //!
 //! The `compose` subject covers the WAC composition language. It
 //! ships in phase 1 with **no verbs implemented**. The dispatcher
-//! exists for taxonomic uniformity — `wabt help compose` reports the
+//! exists for taxonomic uniformity — `wabt component compose help` reports the
 //! original planned verbs that were filed and closed as not planned
 //! (#138 – #142). Future WAC integration will require new issues.
 

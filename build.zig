@@ -308,6 +308,45 @@ pub fn build(b: *std.Build) void {
         wabt_unknown.addArg("not-a-real-subcommand");
         wabt_unknown.expectExitCode(1);
         test_step.dependOn(&wabt_unknown.step);
+
+        // ── #185: leaf `help` subword + rejected -h / --help flags ──
+        //
+        // One representative leaf per subject. The positional `help`
+        // form must exit 0; the legacy `-h` / `--help` flags must be
+        // rejected as unknown options (exit non-zero). Mirrors the
+        // top-level `parseSubcommand` test assertions in
+        // `src/tools/wabt.zig` at the verb tier.
+        const help_cases = [_][3][]const u8{
+            .{ "text", "parse", "<input.wat>" },
+            .{ "module", "validate", "<input.wasm>" },
+            .{ "component", "new", "<input.wasm>" },
+            .{ "spec", "run", "<input.wast>" },
+        };
+        inline for (help_cases) |c| {
+            const subject = c[0];
+            const verb = c[1];
+
+            // `wabt <subject> <verb> help` → exit 0.
+            const ok = b.addRunArtifact(wabt_exe);
+            ok.addArgs(&.{ subject, verb, "help" });
+            ok.expectExitCode(0);
+            test_step.dependOn(&ok.step);
+
+            // `wabt <subject> <verb> -h` → exit non-zero (the flag is
+            // no longer recognised; the leaf falls through to its
+            // existing unknown-option / missing-input error path).
+            const dash_h = b.addRunArtifact(wabt_exe);
+            dash_h.addArgs(&.{ subject, verb, "-h" });
+            dash_h.expectExitCode(1);
+            test_step.dependOn(&dash_h.step);
+
+            // `wabt <subject> <verb> --help` → exit non-zero, same
+            // reasoning as above.
+            const dash_help = b.addRunArtifact(wabt_exe);
+            dash_help.addArgs(&.{ subject, verb, "--help" });
+            dash_help.expectExitCode(1);
+            test_step.dependOn(&dash_help.step);
+        }
     }
 }
 
