@@ -16,10 +16,22 @@
 // that's parsed first.
 
 interface exit {
-    /// Exit the program with an explicit numeric status code. The
-    /// preserves-numeric-code variant of `exit(result<_, _>)`.
-    /// `wasi:cli@0.2.6` defines both; we declare only the one the
-    /// preview1 adapter uses.
+    /// Exit the program — stable `@since(version = 0.2.0)` form
+    /// of the wasi:cli@0.2.6 exit interface. The `result<_, _>`
+    /// param carries a single bit (ok | err) so numeric codes are
+    /// structurally lost on this path. The adapter only routes
+    /// through here as a fallback for runtimes that haven't bound
+    /// the `@unstable(cli-exit-with-code)` `exit-with-code` import
+    /// yet — see `../../src/adapter.wat` for the two-step
+    /// dispatch.
+    exit: func(status: result);
+
+    /// Exit the program with an explicit numeric status code —
+    /// the `@unstable(feature = cli-exit-with-code)` extension of
+    /// the wasi:cli@0.2.6 exit interface. Preserves the numeric
+    /// proc_exit code end-to-end when the host has implemented
+    /// `cli-exit-with-code` (wamr today, wasmtime as soon as
+    /// they catch up to the unstable surface).
     exit-with-code: func(status-code: u8);
 }
 
