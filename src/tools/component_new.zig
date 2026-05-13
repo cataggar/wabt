@@ -329,6 +329,39 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     // module that goes inside the wrapping component.
     const stripped_core = try stripComponentTypeSections(ar, core_bytes);
 
+    // ── Phase 1: collect resource-providing imports.
+    //
+    // For each `is_export=false` extern that exposes resources via
+    // `.sub_resource` type_slots, record the (qualified_name -> resource
+    // names) shape so we can emit an instance-type import that lets
+    // the exported funcs reach those resources by name. Cross-extern
+    // resource names must be unique within a world; ambiguity is a
+    // user-facing error (#198 scope is the wasi-http reproducer
+    // pattern, which uses unique names — wider scoping is a
+    // follow-up).
+    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    const ImportShape = struct {
+        qualified_name: []const u8,
+        resources: []const []const u8,
+    };
+    var import_shapes = std.ArrayListUnmanaged(ImportShape).empty;
+    for (decoded.externs) |ext| {
+        if (ext.is_export) continue;
+        var rs = std.ArrayListUnmanaged([]const u8).empty;
+        for (ext.type_slots) |slot| switch (slot) {
+            .sub_resource => |name| try rs.append(ar, name),
+            else => {},
+        };
+        if (rs.items.len == 0) continue;
+        const owned = try rs.toOwnedSlice(ar);
+        try import_shapes.append(ar, .{ .qualified_name = ext.qualified_name, .resources = owned });
+        for (owned) |name| {
+            const gop = try resource_owner.getOrPut(ar, name);
+            if (gop.found_existing) return error.AmbiguousResourceName;
+            gop.value_ptr.* = ext.qualified_name;
+        }
+    }
+
     // ── Build component AST.
     var core_modules = try ar.alloc(ctypes.CoreModule, 1);
     core_modules[0] = .{ .data = stripped_core };
@@ -336,50 +369,277 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     var core_instances = try ar.alloc(ctypes.CoreInstanceExpr, 1);
     core_instances[0] = .{ .instantiate = .{ .module_idx = 0, .args = &.{} } };
 
-    // For each export interface, emit an alias per func, a type def
-    // per func, a canon lift per func, and a component instance
-    // bundling them. Imports are deferred.
     var aliases = std.ArrayListUnmanaged(ctypes.Alias).empty;
     var types = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
     var canons = std.ArrayListUnmanaged(ctypes.Canon).empty;
     var instances = std.ArrayListUnmanaged(ctypes.InstanceExpr).empty;
     var exports = std.ArrayListUnmanaged(ctypes.ExportDecl).empty;
+    var imports = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
 
-    var comp_instance_idx: u32 = 0;
+    // Component-level type-index counter. Bumped whenever a type or
+    // type-sort alias is emitted; consulted to know the wire index
+    // any newly-allocated slot will receive.
+    var comp_type_idx: u32 = 0;
+    // Section emission order — appended to as items are inserted so
+    // the on-wire layout exactly matches insertion order. Avoids
+    // section_order batching surprises (resource aliases must be
+    // adjacent to the hoisted typedefs that reference them).
+    var order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+    const Section = struct {
+        fn appendType(o: *std.ArrayListUnmanaged(ctypes.SectionEntry), ar2: std.mem.Allocator, types_len: usize) !void {
+            try o.append(ar2, .{ .kind = .type, .start = @intCast(types_len - 1), .count = 1 });
+        }
+        fn appendAlias(o: *std.ArrayListUnmanaged(ctypes.SectionEntry), ar2: std.mem.Allocator, aliases_len: usize) !void {
+            try o.append(ar2, .{ .kind = .alias, .start = @intCast(aliases_len - 1), .count = 1 });
+        }
+    };
+
+    // ── Phase 2: emit instance-type + import for each resource-
+    //    providing import. Records the component-instance index
+    //    allocated to the import for later aliasing.
+    var import_inst_idx_for = std.StringHashMapUnmanaged(u32).empty;
+    for (import_shapes.items, 0..) |shape, i| {
+        const inst_decls = try ar.alloc(ctypes.Decl, shape.resources.len);
+        for (shape.resources, 0..) |name, j| {
+            inst_decls[j] = .{ .@"export" = .{
+                .name = name,
+                .desc = .{ .type = .sub_resource },
+            } };
+        }
+        try types.append(ar, .{ .instance = .{ .decls = inst_decls } });
+        try Section.appendType(&order, ar, types.items.len);
+        const inst_type_idx = comp_type_idx;
+        comp_type_idx += 1;
+        try imports.append(ar, .{
+            .name = shape.qualified_name,
+            .desc = .{ .instance = inst_type_idx },
+        });
+        try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
+        try import_inst_idx_for.put(ar, shape.qualified_name, @intCast(i));
+    }
+    const import_inst_count: u32 = @intCast(imports.items.len);
+
+    // Core module + core instance always come after the imports
+    // (the lifted funcs come from the core instance, which is the
+    // sole consumer of the import surface today).
+    try order.append(ar, .{ .kind = .core_module, .start = 0, .count = 1 });
+    try order.append(ar, .{ .kind = .core_instance, .start = 0, .count = 1 });
+
+    // ── Phase 3: walk export externs, hoisting resource handles
+    //    referenced by their func sigs.
+    //
+    // Cache of resource-name -> component-level type idx of the
+    // alias from the providing import instance. Reused across
+    // exports referencing the same resource.
+    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    // Cache of (resource_name, handle_kind) -> component-level type
+    // idx of the hoisted `(type (own/borrow alias_slot))` typedef.
+    // Reused across funcs/exports referencing the same handle.
+    const HandleKind = enum { own, borrow };
+    const HandleKey = struct { name: []const u8, kind: HandleKind };
+    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
+    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
+
+    const HandleResolver = struct {
+        ar: std.mem.Allocator,
+        ext_slots: []const metadata_decode.TypeSlot,
+        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+        aliases: *std.ArrayListUnmanaged(ctypes.Alias),
+        resource_owner: *std.StringHashMapUnmanaged([]const u8),
+        import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
+        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
+        hoist_idxs: *std.ArrayListUnmanaged(u32),
+        comp_type_idx: *u32,
+        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+
+        fn resourceAlias(self: @This(), name: []const u8) !u32 {
+            if (self.resource_alias_idx.get(name)) |idx| return idx;
+            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
+            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
+            try self.aliases.append(self.ar, .{ .instance_export = .{
+                .sort = .type,
+                .instance_idx = inst_idx,
+                .name = name,
+            } });
+            try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.resource_alias_idx.put(self.ar, name, slot);
+            return slot;
+        }
+
+        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
+            for (self.hoist_keys.items, 0..) |k, i| {
+                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
+                    return self.hoist_idxs.items[i];
+                }
+            }
+            const alias_slot = try self.resourceAlias(name);
+            const vt: ctypes.ValType = switch (kind) {
+                .own => .{ .own = alias_slot },
+                .borrow => .{ .borrow = alias_slot },
+            };
+            try self.types.append(self.ar, .{ .val = vt });
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
+            try self.hoist_idxs.append(self.ar, slot);
+            return slot;
+        }
+
+        fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
+            return switch (v) {
+                .own => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
+                },
+                .borrow => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
+                },
+                else => v,
+            };
+        }
+
+        fn rewriteSig(self: @This(), sig: ctypes.FuncType) !ctypes.FuncType {
+            const params = try self.ar.alloc(ctypes.NamedValType, sig.params.len);
+            for (sig.params, 0..) |p, i| {
+                params[i] = .{ .name = p.name, .type = try self.rewriteValType(p.type) };
+            }
+            const results: ctypes.FuncType.ResultList = switch (sig.results) {
+                .none => .none,
+                .unnamed => |v| .{ .unnamed = try self.rewriteValType(v) },
+                .named => |named| n: {
+                    const dst = try self.ar.alloc(ctypes.NamedValType, named.len);
+                    for (named, 0..) |nv, i| {
+                        dst[i] = .{ .name = nv.name, .type = try self.rewriteValType(nv.type) };
+                    }
+                    break :n .{ .named = dst };
+                },
+            };
+            return .{ .params = params, .results = results };
+        }
+    };
+
+    // For each export interface, emit (in this order):
+    //   * resource type aliases (lazily, on first reference);
+    //   * hoisted (own/borrow) typedefs (lazily, on first reference);
+    //   * func types referencing the hoisted slots;
+    //   * core func aliases for each func's core export;
+    //   * canon lifts;
+    //   * an inline-export instance bundling the lifted funcs;
+    //   * a top-level export of that instance.
+    //
+    // The per-func emission keeps the alias/own pair adjacent to the
+    // func type it serves; canon lifts and instances accumulate
+    // across exports and are flushed once at the end via section_order
+    // so the type/alias/func indexspaces grow monotonically.
+    const CapturedFunc = struct {
+        ext_qualified: []const u8,
+        fn_name: []const u8,
+        func_type_idx: u32,
+        core_func_alias_idx: u32,
+    };
+    var captured_funcs = std.ArrayListUnmanaged(CapturedFunc).empty;
+    var ext_export_start = std.ArrayListUnmanaged(struct {
+        ext: metadata_decode.WorldExtern,
+        start: u32,
+    }).empty;
+    // Core-func index counter. Bumps once per `.alias instance_export`
+    // with `sort = .{.core = .func}` (the only producer of core funcs
+    // in the wrapping component today). Used as the canon lift's
+    // `core_func_idx`, which is positional in the core-func
+    // indexspace — NOT the absolute position in the `aliases` array.
+    var core_func_idx: u32 = 0;
+
     for (decoded.externs) |ext| {
-        if (!ext.is_export) continue; // imports TBD
-        var inline_exports = std.ArrayListUnmanaged(ctypes.InlineExport).empty;
+        if (!ext.is_export) continue;
+        const resolver = HandleResolver{
+            .ar = ar,
+            .ext_slots = ext.type_slots,
+            .types = &types,
+            .aliases = &aliases,
+            .resource_owner = &resource_owner,
+            .import_inst_idx_for = &import_inst_idx_for,
+            .resource_alias_idx = &resource_alias_idx,
+            .hoist_keys = &hoist_keys,
+            .hoist_idxs = &hoist_idxs,
+            .comp_type_idx = &comp_type_idx,
+            .order = &order,
+        };
+        const start: u32 = @intCast(captured_funcs.items.len);
         for (ext.funcs) |fn_ref| {
+            const rewritten = try resolver.rewriteSig(fn_ref.sig);
+            try types.append(ar, .{ .func = rewritten });
+            try Section.appendType(&order, ar, types.items.len);
+            const func_type_idx = comp_type_idx;
+            comp_type_idx += 1;
+
             const core_func_export_name = try std.fmt.allocPrint(ar, "{s}#{s}", .{ ext.qualified_name, fn_ref.name });
             try aliases.append(ar, .{ .instance_export = .{
                 .sort = .{ .core = .func },
                 .instance_idx = 0,
                 .name = core_func_export_name,
             } });
-            const core_func_idx: u32 = @intCast(aliases.items.len - 1);
+            try Section.appendAlias(&order, ar, aliases.items.len);
+            const cf_idx = core_func_idx;
+            core_func_idx += 1;
 
-            try types.append(ar, .{ .func = fn_ref.sig });
-            const type_idx: u32 = @intCast(types.items.len - 1);
-
-            try canons.append(ar, .{ .lift = .{
-                .core_func_idx = core_func_idx,
-                .type_idx = type_idx,
-                .opts = &.{},
-            } });
-            const lifted_func_idx: u32 = @intCast(canons.items.len - 1);
-
-            try inline_exports.append(ar, .{
-                .name = fn_ref.name,
-                .sort_idx = .{ .sort = .func, .idx = lifted_func_idx },
+            try captured_funcs.append(ar, .{
+                .ext_qualified = ext.qualified_name,
+                .fn_name = fn_ref.name,
+                .func_type_idx = func_type_idx,
+                .core_func_alias_idx = cf_idx,
             });
         }
-        try instances.append(ar, .{ .exports = try inline_exports.toOwnedSlice(ar) });
+        try ext_export_start.append(ar, .{ .ext = ext, .start = start });
+    }
+
+    // ── Canon lifts and instance exprs: appended to flat lists,
+    //    section_order entries appended after.
+    for (captured_funcs.items) |cf| {
+        try canons.append(ar, .{ .lift = .{
+            .core_func_idx = cf.core_func_alias_idx,
+            .type_idx = cf.func_type_idx,
+            .opts = &.{},
+        } });
+    }
+
+    var comp_func_idx: u32 = 0;
+    for (ext_export_start.items, 0..) |es, ei| {
+        const end: u32 = if (ei + 1 < ext_export_start.items.len)
+            ext_export_start.items[ei + 1].start
+        else
+            @intCast(captured_funcs.items.len);
+        const fn_count = end - es.start;
+        var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+        for (0..fn_count) |i| {
+            const cf = captured_funcs.items[es.start + i];
+            inline_exports[i] = .{
+                .name = cf.fn_name,
+                .sort_idx = .{ .sort = .func, .idx = comp_func_idx },
+            };
+            comp_func_idx += 1;
+        }
+        try instances.append(ar, .{ .exports = inline_exports });
+        const inst_idx = import_inst_count + @as(u32, @intCast(ei));
         try exports.append(ar, .{
-            .name = ext.qualified_name,
+            .name = es.ext.qualified_name,
             .desc = .{ .instance = 0 },
-            .sort_idx = .{ .sort = .instance, .idx = comp_instance_idx },
+            .sort_idx = .{ .sort = .instance, .idx = inst_idx },
         });
-        comp_instance_idx += 1;
+    }
+
+    if (canons.items.len > 0) {
+        try order.append(ar, .{ .kind = .canon, .start = 0, .count = @intCast(canons.items.len) });
+    }
+    if (instances.items.len > 0) {
+        try order.append(ar, .{ .kind = .instance, .start = 0, .count = @intCast(instances.items.len) });
+    }
+    if (exports.items.len > 0) {
+        try order.append(ar, .{ .kind = .@"export", .start = 0, .count = @intCast(exports.items.len) });
     }
 
     const comp: ctypes.Component = .{
@@ -391,8 +651,9 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         .aliases = try aliases.toOwnedSlice(ar),
         .types = try types.toOwnedSlice(ar),
         .canons = try canons.toOwnedSlice(ar),
-        .imports = &.{},
+        .imports = try imports.toOwnedSlice(ar),
         .exports = try exports.toOwnedSlice(ar),
+        .section_order = try order.toOwnedSlice(ar),
     };
     return writer.encode(alloc, &comp);
 }
@@ -540,6 +801,159 @@ test "buildComponent: builds a wrapping component for the adder fixture" {
     try testing.expectEqual(@as(usize, 1), loaded.instances.len);
     try testing.expectEqual(@as(usize, 1), loaded.exports.len);
     try testing.expectEqualStrings("docs:adder/add@0.1.0", loaded.exports[0].name);
+}
+
+test "buildComponent #198: wraps cross-iface-use resources with import + alias + hoist" {
+    // Mirrors the #191 reproducer end-to-end: the world imports a
+    // resource-providing interface and exports another interface
+    // whose func uses those resources via `use` + `own<R>`. Before
+    // #198, buildComponent placed the decoded `.own = N` refs
+    // verbatim into the wrapping component's flat type list, where
+    // N indexed the originating iface body's slots — producing
+    // dangling type refs that `wasm-tools validate` rejected.
+    //
+    // Synth core module: exports
+    // `wasi:http/incoming-handler@0.2.6#handle` taking two i32s.
+    // Name length: 39 bytes.
+    const core_only = [_]u8{
+        // preamble
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        // type section: 1 type — (func (param i32 i32))
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        // function section: 1 func of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // export section: 1 export
+        //   body = 1(count) + 1(name_len) + 39(name) + 1(sort) + 1(idx) = 43
+        0x07, 43, 0x01,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 0x00,
+        // code section: 1 body
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    , "http-hello");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:http-hello";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // 1 import for the resource-providing interface.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", loaded.imports[0].name);
+    try testing.expect(loaded.imports[0].desc == .instance);
+
+    // The import references an instance type whose decls are two
+    // sub_resource exports for incoming-request + response-outparam.
+    const inst_type_idx = loaded.imports[0].desc.instance;
+    try testing.expect(inst_type_idx < loaded.type_indexspace.len);
+    const inst_contrib = loaded.type_indexspace[inst_type_idx];
+    try testing.expect(inst_contrib == .type_def);
+    const inst_td = loaded.types[inst_contrib.type_def];
+    try testing.expect(inst_td == .instance);
+    const inst_decls = inst_td.instance.decls;
+    try testing.expectEqual(@as(usize, 2), inst_decls.len);
+    var saw_in_req = false;
+    var saw_out = false;
+    for (inst_decls) |d| switch (d) {
+        .@"export" => |e| switch (e.desc) {
+            .type => |tb| switch (tb) {
+                .sub_resource => {
+                    if (std.mem.eql(u8, e.name, "incoming-request")) saw_in_req = true;
+                    if (std.mem.eql(u8, e.name, "response-outparam")) saw_out = true;
+                },
+                else => return error.UnexpectedTypeBound,
+            },
+            else => return error.UnexpectedExportDesc,
+        },
+        else => return error.UnexpectedInstanceDecl,
+    };
+    try testing.expect(saw_in_req);
+    try testing.expect(saw_out);
+
+    // 2 type-sort aliases (one per imported resource) + 1
+    // core-func-sort alias (for the handle export).
+    try testing.expectEqual(@as(usize, 3), loaded.aliases.len);
+    var type_alias_count: usize = 0;
+    var core_func_alias_count: usize = 0;
+    for (loaded.aliases) |a| switch (a) {
+        .instance_export => |ie| switch (ie.sort) {
+            .type => type_alias_count += 1,
+            .core => |cs| if (cs == .func) {
+                core_func_alias_count += 1;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), type_alias_count);
+    try testing.expectEqual(@as(usize, 1), core_func_alias_count);
+
+    // 1 export for the lifted interface.
+    try testing.expectEqual(@as(usize, 1), loaded.exports.len);
+    try testing.expectEqualStrings("wasi:http/incoming-handler@0.2.6", loaded.exports[0].name);
+    try testing.expect(loaded.exports[0].desc == .instance);
+
+    // Canon lift count: one per exported func.
+    try testing.expectEqual(@as(usize, 1), loaded.canons.len);
+    try testing.expect(loaded.canons[0] == .lift);
+    // The lift's func type's params must reference hoisted typedefs
+    // (.type_idx) — NOT raw .own/.borrow. Resolve through to confirm
+    // each landed on a `(type (own <alias_slot>))`.
+    const lift = loaded.canons[0].lift;
+    try testing.expect(lift.type_idx < loaded.type_indexspace.len);
+    const ft_contrib = loaded.type_indexspace[lift.type_idx];
+    try testing.expect(ft_contrib == .type_def);
+    const ft = loaded.types[ft_contrib.type_def];
+    try testing.expect(ft == .func);
+    const fsig = ft.func;
+    try testing.expectEqual(@as(usize, 2), fsig.params.len);
+    for (fsig.params) |p| {
+        try testing.expect(p.type == .type_idx);
+        try testing.expect(p.type.type_idx < loaded.type_indexspace.len);
+        const own_contrib = loaded.type_indexspace[p.type.type_idx];
+        try testing.expect(own_contrib == .type_def);
+        const hoisted = loaded.types[own_contrib.type_def];
+        try testing.expect(hoisted == .val);
+        try testing.expect(hoisted.val == .own);
+    }
 }
 
 test "buildComponent: rejects core wasm without component-type section" {
