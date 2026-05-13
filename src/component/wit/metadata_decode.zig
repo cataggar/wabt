@@ -9,11 +9,20 @@
 //!   * the list of funcs in the interface, with their full
 //!     component-level signatures.
 //!
-//! Currently MVP-scoped: only the wamr-fixture shape is recognised
+//! MVP-scoped: the on-wire shape recognised is
 //! (component-type wrapper → world component-type → instance-type
-//! per interface → func type per func). Compound types (record,
-//! variant, etc.) and resource handles in interface bodies aren't
-//! recognised yet — they'll surface as `error.UnsupportedShape`.
+//! per interface → func type per func). Decls the encoder emits to
+//! surface cross-interface `use` clauses (world-body
+//! `alias instance-export`s; interface-body
+//! `alias outer (type 1 K)` + `export "T" (type (eq L))` mirror
+//! pairs) and to introduce resources / compound typedefs
+//! (`export "R" (type (sub resource))`, `(type record/variant/…)`
+//! + `export "N" (type (eq L))`) are walked past transparently —
+//! they don't surface as world externs or as funcs, but their
+//! presence no longer trips `error.UnsupportedShape`. Resource
+//! handles inside func signatures are returned as their raw
+//! `ValType.own` / `.borrow` type-index references; resolving
+//! those back to qualified names is a follow-up.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -69,15 +78,29 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
 
     const world_body = outer.decls[0].type.component;
 
-    // Walk world body in pairs: (type=instance, import|export).
+    // Walk world body. Logical content is (type=instance,
+    // import|export) pairs, but the encoder also splices `.alias`
+    // instance-export decls between pairs whenever a consuming
+    // interface has a `use src.{T};` clause
+    // (metadata_encode.zig:190-201). Those aliases are transparent
+    // to this decoder — they bump the on-wire type-index but don't
+    // introduce a new world extern.
     var externs = std.ArrayListUnmanaged(WorldExtern).empty;
     var i: usize = 0;
     while (i < world_body.decls.len) {
         const decl = world_body.decls[i];
+        if (decl == .alias) {
+            i += 1;
+            continue;
+        }
         if (decl != .type or decl.type != .instance) return error.UnsupportedShape;
         const inst_type = decl.type.instance;
-        if (i + 1 >= world_body.decls.len) return error.UnsupportedShape;
-        const next = world_body.decls[i + 1];
+        // Find the matching import|export decl, skipping any alias
+        // decls the encoder may have spliced in between.
+        var j: usize = i + 1;
+        while (j < world_body.decls.len and world_body.decls[j] == .alias) : (j += 1) {}
+        if (j >= world_body.decls.len) return error.UnsupportedShape;
+        const next = world_body.decls[j];
         var is_export: bool = undefined;
         var qualified_name: []const u8 = undefined;
         switch (next) {
@@ -97,7 +120,7 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
             .qualified_name = qualified_name,
             .funcs = funcs,
         });
-        i += 2;
+        i = j + 1;
     }
 
     // Bare world name is the part after `/` (and before `@`) of the
@@ -113,17 +136,55 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
 }
 
 fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeError![]const FuncRef {
+    // Logical content per func is a (type=func, export "name" func=N)
+    // pair, but the encoder may interleave:
+    //   * `.alias outer (type 1 K)` decls for each `use`-imported
+    //     type (metadata_encode.zig:509-513);
+    //   * `.@"export"` decls with `.type` desc — both `eq{}` mirrors
+    //     for use-imported types / named compound typedefs
+    //     (metadata_encode.zig:522-525, 762-765) and `sub_resource`
+    //     exports for locally-declared resources
+    //     (metadata_encode.zig:445-448);
+    //   * `.type` decls whose body is a compound type (record /
+    //     variant / enum / flags) hoisted before their `eq{}` export
+    //     (metadata_encode.zig:410, 422, 426, 430).
+    // Walk past all of those transparently. Only
+    // `.type = .func` + immediately-following `.@"export"` with
+    // `.func` desc becomes a `FuncRef`.
     var funcs = std.ArrayListUnmanaged(FuncRef).empty;
     var j: usize = 0;
     while (j < inst.decls.len) {
         const d = inst.decls[j];
-        if (d != .type or d.type != .func) return error.UnsupportedShape;
-        const sig = d.type.func;
-        if (j + 1 >= inst.decls.len) return error.UnsupportedShape;
-        const exp = inst.decls[j + 1];
-        if (exp != .@"export") return error.UnsupportedShape;
-        try funcs.append(arena, .{ .name = exp.@"export".name, .sig = sig });
-        j += 2;
+        switch (d) {
+            .alias => {
+                j += 1;
+                continue;
+            },
+            .@"export" => |e| {
+                switch (e.desc) {
+                    .type => {
+                        j += 1;
+                        continue;
+                    },
+                    else => return error.UnsupportedShape,
+                }
+            },
+            .type => |td| switch (td) {
+                .func => |sig| {
+                    if (j + 1 >= inst.decls.len) return error.UnsupportedShape;
+                    const exp = inst.decls[j + 1];
+                    if (exp != .@"export") return error.UnsupportedShape;
+                    if (exp.@"export".desc != .func) return error.UnsupportedShape;
+                    try funcs.append(arena, .{ .name = exp.@"export".name, .sig = sig });
+                    j += 2;
+                },
+                else => {
+                    j += 1;
+                    continue;
+                },
+            },
+            else => return error.UnsupportedShape,
+        }
     }
     return try funcs.toOwnedSlice(arena);
 }
@@ -232,6 +293,68 @@ test "decode: round-trip adder world" {
     try testing.expect(w.externs[0].funcs[0].sig.params[0].type == .u32);
     try testing.expect(w.externs[0].funcs[0].sig.results == .unnamed);
     try testing.expect(w.externs[0].funcs[0].sig.results.unnamed == .u32);
+}
+
+test "decode #191: world with cross-interface `use` and resources" {
+    // Reproducer from cataggar/wabt#191. The encoder splices
+    // `.alias` decls at the world level (for each `use`-imported
+    // type) and `.alias` + `.@"export" type=eq` mirror pairs +
+    // `.@"export" type=sub_resource` decls inside the interface
+    // bodies. Before the fix, every one of those tripped
+    // `error.UnsupportedShape`.
+    const wit_source =
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "http-hello");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const w = try decode(arena.allocator(), ct);
+
+    try testing.expectEqualStrings("http-hello", w.name);
+    try testing.expectEqualStrings("wasi:http/http-hello@0.2.6", w.qualified_name);
+    try testing.expectEqual(@as(usize, 2), w.externs.len);
+
+    // extern 0: import wasi:http/types@0.2.6 — resources only, no funcs.
+    try testing.expect(!w.externs[0].is_export);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", w.externs[0].qualified_name);
+    try testing.expectEqual(@as(usize, 0), w.externs[0].funcs.len);
+
+    // extern 1: export wasi:http/incoming-handler@0.2.6 — one func
+    // `handle(request: own<R>, response-out: own<R>) -> ()`.
+    try testing.expect(w.externs[1].is_export);
+    try testing.expectEqualStrings("wasi:http/incoming-handler@0.2.6", w.externs[1].qualified_name);
+    try testing.expectEqual(@as(usize, 1), w.externs[1].funcs.len);
+
+    const f = w.externs[1].funcs[0];
+    try testing.expectEqualStrings("handle", f.name);
+    try testing.expectEqual(@as(usize, 2), f.sig.params.len);
+    try testing.expectEqualStrings("request", f.sig.params[0].name);
+    // The encoder hoists `own<R>` into a `(type (val (own R)))`
+    // TypeDef before the func; the func's param therefore points
+    // at that slot via `.type_idx`. Resolving the chain back to a
+    // resource name is out of scope for this decoder (see file
+    // doc comment).
+    try testing.expect(f.sig.params[0].type == .type_idx);
+    try testing.expectEqualStrings("response-out", f.sig.params[1].name);
+    try testing.expect(f.sig.params[1].type == .type_idx);
+    try testing.expect(f.sig.results == .none);
 }
 
 test "extractFromCoreWasm: finds custom section" {
