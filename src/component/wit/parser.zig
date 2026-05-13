@@ -4,36 +4,46 @@
 //! produces the AST in `ast.zig`. The parser uses an arena allocator
 //! for all AST allocations.
 //!
-//! Supported grammar (a strict subset of the full Component Model
-//! WIT spec — sufficient to parse all `wamr/examples/components/*`
-//! WIT files plus the common shapes used by `wit-bindgen` /
-//! `wit-component`):
+//! Supported grammar — sufficient to parse every `*.wit` file in
+//! canonical `wasi-http@0.2.6` + `wasi-cli@0.2.6` + `wasi-io@0.2.6` +
+//! `wasi-clocks@0.2.6` + `wasi-random@0.2.6` + `wasi-filesystem@0.2.6`
+//! + `wasi-sockets@0.2.6` (see the file-by-file harness test below):
 //!
 //!   * `package <ns>:<name>[@<semver>];`
-//!   * Doc comments (`///` and `/** … */`) attached to the next item
+//!   * Doc comments (`///` and `/** … */`) attached to the next item.
+//!   * `@<id>` and `@<id>(<args>?)` annotations on any item — treated
+//!     as no-op metadata. Grammar within `(...)` is balanced-paren
+//!     skipping; no string-literal values supported (canonical files
+//!     use `@since(version = X.Y.Z)` / `@unstable(feature = id)` /
+//!     bare `@deprecated`).
 //!   * `interface <name> { <items> }`
 //!   * `world <name> { <items> }`
 //!   * Inside an interface: `type`, `record`, `variant`, `enum`,
-//!     `flags`, `<name>: func(...) [-> <type>];`, `use … . { … };`
+//!     `flags`, `resource`, `<name>: func(...) [-> <type>];`,
+//!     `use … . { … };`.
 //!   * Inside a world: `import|export` of an interface ref, named
-//!     function, or inline interface; `use`; `type`; `include`
+//!     function, or inline interface; `use`; `type`; `include`.
+//!   * Resources: empty bodies (`resource R;`), `{}`-bodies with
+//!     `constructor`, named methods, and `static` methods.
+//!   * `func(p: T, …,)` — trailing comma in parameter lists.
 //!   * Types: all primitives (`u8/u16/u32/u64`, `s8/s16/s32/s64`,
 //!     `f32/f64`, `bool`, `char`, `string`); `list<T>`,
 //!     `option<T>`, `result<T,E>` (and `result` / `result<_, E>`),
-//!     `tuple<T,U,...>`, named type references.
+//!     `tuple<T,U,...>`, `own<R>`, `borrow<R>`, named type
+//!     references.
 //!
-//! Explicitly NOT supported yet (returns
+//! Explicitly NOT supported yet (parser returns
 //! `error.UnsupportedFeature` with a precise span pointing at the
-//! offending keyword — extending the parser to handle these is a
-//! mechanical addition):
-//!   * `resource` blocks with `constructor` / methods / `static`
-//!   * Handle types: `own<T>`, `borrow<T>`
-//!   * Streams: `stream<T>` / `future<T>` / `error-context`
-//!   * Async: `async func` / gates
+//! offending keyword):
+//!   * Streams: `stream<T>` / `future<T>` / `error-context`.
+//!   * Async: `async func`.
 //!   * Multi-package files (only the first `package` decl is
-//!     honoured)
+//!     honoured; multi-file primary-package inheritance is the
+//!     resolver's job — see Phase 2 of #195).
 //!   * String escapes inside `%` explicit identifiers (the lexer
-//!     accepts them but identifier text is taken verbatim)
+//!     accepts them but identifier text is taken verbatim).
+//!   * String-literal annotation args (`@deprecated("msg")`) —
+//!     canonical wasi files don't use them.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -132,6 +142,7 @@ const Parser = struct {
                         }..t.span.end];
                     }
                 },
+                .at => try self.consumeAnnotationAfterAt(),
                 else => return t,
             }
         }
@@ -141,16 +152,60 @@ const Parser = struct {
     /// leaving the next non-doc token in the lookahead. Matches
     /// `nextNonDoc`'s doc-accumulation semantics, but stops at the
     /// boundary instead of consuming the following non-doc token.
+    /// Also transparently skips any annotations (`@<id>(<args>?)`)
+    /// interleaved with the docs — annotations are no-op metadata
+    /// for this parser scope, like `nextNonDoc` does.
     fn skipLeadingDocs(self: *Parser) ParseError!void {
         while (true) {
             const t = try self.peekTok();
-            if (t.tag != .doc_comment and t.tag != .doc_block) return;
-            _ = try self.nextTok();
-            if (self.pending_docs.len == 0) {
-                self.pending_docs = t.span.slice(self.source);
-            } else {
-                const ptr_start: usize = @intFromPtr(self.pending_docs.ptr) - @intFromPtr(self.source.ptr);
-                self.pending_docs = self.source[ptr_start..t.span.end];
+            switch (t.tag) {
+                .doc_comment, .doc_block => {
+                    _ = try self.nextTok();
+                    if (self.pending_docs.len == 0) {
+                        self.pending_docs = t.span.slice(self.source);
+                    } else {
+                        const ptr_start: usize = @intFromPtr(self.pending_docs.ptr) - @intFromPtr(self.source.ptr);
+                        self.pending_docs = self.source[ptr_start..t.span.end];
+                    }
+                },
+                .at => {
+                    _ = try self.nextTok();
+                    try self.consumeAnnotationAfterAt();
+                },
+                else => return,
+            }
+        }
+    }
+
+    /// Consume one annotation body after `@` has already been read.
+    /// Grammar:
+    ///   `<id>` ( `(` <args> `)` )?
+    /// where `<args>` is any token sequence with balanced parens —
+    /// the parser does not interpret annotation values for this
+    /// scope (canonical wasi files use `@since(version = X.Y.Z)`
+    /// and `@unstable(feature = id)`; the encoder is gate-agnostic
+    /// and treats all annotations as no-op metadata).
+    fn consumeAnnotationAfterAt(self: *Parser) ParseError!void {
+        const name_tok = try self.nextTok();
+        switch (name_tok.tag) {
+            .id, .explicit_id => {},
+            // Keyword names are allowed as annotation tags too
+            // (`@async` etc. — none used in upstream 0.2.6 today,
+            // but cheap to tolerate).
+            .kw_use, .kw_type, .kw_func, .kw_record, .kw_resource, .kw_flags, .kw_variant, .kw_enum, .kw_bool, .kw_string, .kw_option, .kw_result, .kw_future, .kw_stream, .kw_error_context, .kw_list, .kw_as, .kw_from, .kw_static, .kw_interface, .kw_tuple, .kw_import, .kw_export, .kw_world, .kw_package, .kw_constructor, .kw_async, .kw_include, .kw_with, .kw_own, .kw_borrow => {},
+            else => return self.fail(name_tok.span, "expected annotation name after `@`"),
+        }
+        const peek = try self.peekTok();
+        if (peek.tag != .lparen) return;
+        _ = try self.nextTok();
+        var depth: usize = 1;
+        while (depth > 0) {
+            const inner = try self.nextTok();
+            switch (inner.tag) {
+                .lparen => depth += 1,
+                .rparen => depth -= 1,
+                .eof => return self.fail(inner.span, "unterminated annotation arg list"),
+                else => {},
             }
         }
     }
@@ -444,6 +499,16 @@ const Parser = struct {
     /// `resource <name> { (constructor(...) | <id>: [static] func(...) [-> T];)* }`
     fn parseResource(self: *Parser, docs: []const u8) ParseError!ast.TypeDef {
         const name = try self.parseId();
+        // Resources without a body: `resource <name>;` — used in
+        // canonical wasi-cli/terminal.wit etc. to declare a
+        // resource that has no methods. Treat as an empty resource.
+        if (try self.eatIf(.semicolon)) {
+            return .{
+                .docs = docs,
+                .name = name,
+                .kind = .{ .resource = &.{} },
+            };
+        }
         _ = try self.expect(.lbrace);
         var methods = std.ArrayListUnmanaged(ast.ResourceMethod).empty;
         while (true) {
@@ -503,7 +568,14 @@ const Parser = struct {
                 _ = try self.expect(.colon);
                 const ty = try self.parseType();
                 try params.append(self.allocator, .{ .name = param_name, .type = ty });
-                if (try self.eatIf(.comma)) continue;
+                if (try self.eatIf(.comma)) {
+                    // Trailing comma — closing `)` immediately
+                    // after the comma is legal in canonical WIT
+                    // (every multi-line func sig in wasi-* uses
+                    // it). Treat as loop terminator.
+                    if (try self.eatIf(.rparen)) break;
+                    continue;
+                }
                 _ = try self.expect(.rparen);
                 break;
             }
@@ -1158,4 +1230,249 @@ test "parse: borrow<R> and own<R> type syntax" {
     try testing.expectEqualStrings("output-stream", own_ty.own);
     try testing.expect(borrow_ty == .borrow);
     try testing.expectEqualStrings("output-stream", borrow_ty.borrow);
+}
+
+test "parse #195: @since/@unstable/@deprecated annotations at item positions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Annotations attach (per the canonical wasi-http layout) to
+    // every item-introducing keyword: world, interface, use,
+    // import/export, include, type aliases, record/variant/enum/
+    // flags, resource decls, resource members (constructor/method/
+    // static), and individual named funcs. The parser drops them
+    // as no-op metadata.
+    const source =
+        \\package docs:demo@0.2.6;
+        \\
+        \\@since(version = 0.2.0)
+        \\interface i {
+        \\    @since(version = 0.2.0)
+        \\    use other.{thing};
+        \\
+        \\    @since(version = 0.2.0)
+        \\    type byte = u8;
+        \\
+        \\    @since(version = 0.2.0)
+        \\    record r { x: u32 }
+        \\
+        \\    @since(version = 0.2.0)
+        \\    variant v { a, b(string) }
+        \\
+        \\    @since(version = 0.2.0)
+        \\    enum e { a, b }
+        \\
+        \\    @since(version = 0.2.0)
+        \\    flags f { a, b }
+        \\
+        \\    @unstable(feature = experimental)
+        \\    resource res {
+        \\        @since(version = 0.2.0)
+        \\        constructor();
+        \\        @since(version = 0.2.0)
+        \\        m: func();
+        \\        @since(version = 0.2.0)
+        \\        s: static func();
+        \\    }
+        \\
+        \\    @since(version = 0.2.0)
+        \\    bare-func: func();
+        \\}
+        \\
+        \\@deprecated
+        \\world w {
+        \\    @since(version = 0.2.0)
+        \\    import i;
+        \\    @since(version = 0.2.0)
+        \\    export i;
+        \\    @since(version = 0.2.0)
+        \\    include base;
+        \\}
+        \\
+        \\world base {
+        \\    import i;
+        \\}
+    ;
+    const doc = try parseInto(&arena, source);
+    try testing.expect(doc.package != null);
+    try testing.expectEqual(@as(usize, 3), doc.items.len);
+    try testing.expect(doc.items[0] == .interface);
+    // Verify the interface's items parsed through annotations: use,
+    // type, record, variant, enum, flags, res (resource), bare-func.
+    const iface_items = doc.items[0].interface.items;
+    try testing.expectEqual(@as(usize, 8), iface_items.len);
+    try testing.expect(iface_items[0] == .use);
+    try testing.expect(iface_items[1] == .type);
+    try testing.expect(iface_items[2] == .type);
+    try testing.expect(iface_items[3] == .type);
+    try testing.expect(iface_items[4] == .type);
+    try testing.expect(iface_items[5] == .type);
+    try testing.expect(iface_items[6] == .type);
+    try testing.expect(iface_items[7] == .func);
+    // World w has 3 items: import + export + include.
+    try testing.expect(doc.items[1] == .world);
+    try testing.expectEqual(@as(usize, 3), doc.items[1].world.items.len);
+}
+
+test "parse #195: trailing comma in single-line func param list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    f: func(x: u32,) -> u32;
+        \\}
+    );
+    const items = doc.items[0].interface.items;
+    try testing.expectEqual(@as(usize, 1), items.len);
+    try testing.expect(items[0] == .func);
+    try testing.expectEqual(@as(usize, 1), items[0].func.func.params.len);
+    try testing.expectEqualStrings("x", items[0].func.func.params[0].name);
+}
+
+test "parse #195: trailing comma in multi-line func param list" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Mirrors the canonical wasi-* style: every multi-line func sig
+    // has a trailing comma after the last param before `)`.
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    subscribe-instant: func(
+        \\        when: u64,
+        \\    ) -> u32;
+        \\    blocking-read: func(
+        \\        max: u64,
+        \\        offset: u32,
+        \\    );
+        \\}
+    );
+    const items = doc.items[0].interface.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(usize, 1), items[0].func.func.params.len);
+    try testing.expectEqualStrings("when", items[0].func.func.params[0].name);
+    try testing.expect(items[0].func.func.result.? == .u32);
+    try testing.expectEqual(@as(usize, 2), items[1].func.func.params.len);
+    try testing.expect(items[1].func.func.result == null);
+}
+
+test "parse #195: stacked annotations on a single item" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\@since(version = 0.2.0)
+        \\@unstable(feature = io)
+        \\@deprecated
+        \\interface foo {
+        \\    bar: func();
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), doc.items.len);
+    try testing.expect(doc.items[0] == .interface);
+    try testing.expectEqualStrings("foo", doc.items[0].interface.name);
+}
+
+test "parse #195: bare annotation with no args" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\@unstable
+        \\interface foo {
+        \\    @deprecated
+        \\    bar: func();
+        \\}
+    );
+    try testing.expectEqual(@as(usize, 1), doc.items.len);
+    try testing.expectEqualStrings("foo", doc.items[0].interface.name);
+    try testing.expectEqual(@as(usize, 1), doc.items[0].interface.items.len);
+}
+
+test "parse #195: every canonical wasi-* WIT file parses individually" {
+    // Phase 1 acceptance for #195: every `*.wit` file in canonical
+    // wasi-http@0.2.6 + wasi-cli + wasi-io + wasi-clocks +
+    // wasi-random + wasi-filesystem + wasi-sockets (all pinned at
+    // v0.2.6) parses without grammar errors.
+    //
+    // Files vendored at src/component/wit/wasi-canon/<pkg>/*.wit. Some files
+    // omit a `package` decl (it's inherited from sibling files in
+    // the same directory in the canonical multi-file layout); this
+    // test prepends a synthetic placeholder package decl when one
+    // is missing, since standalone parse is what's exercised here
+    // (multi-file primary-package handling is Phase 2 scope).
+    const Fixture = struct { path: []const u8, content: []const u8 };
+    const fixtures = [_]Fixture{
+        .{ .path = "cli/command.wit", .content = @embedFile("wasi-canon/cli/command.wit") },
+        .{ .path = "cli/environment.wit", .content = @embedFile("wasi-canon/cli/environment.wit") },
+        .{ .path = "cli/exit.wit", .content = @embedFile("wasi-canon/cli/exit.wit") },
+        .{ .path = "cli/imports.wit", .content = @embedFile("wasi-canon/cli/imports.wit") },
+        .{ .path = "cli/run.wit", .content = @embedFile("wasi-canon/cli/run.wit") },
+        .{ .path = "cli/stdio.wit", .content = @embedFile("wasi-canon/cli/stdio.wit") },
+        .{ .path = "cli/terminal.wit", .content = @embedFile("wasi-canon/cli/terminal.wit") },
+        .{ .path = "clocks/monotonic-clock.wit", .content = @embedFile("wasi-canon/clocks/monotonic-clock.wit") },
+        .{ .path = "clocks/timezone.wit", .content = @embedFile("wasi-canon/clocks/timezone.wit") },
+        .{ .path = "clocks/wall-clock.wit", .content = @embedFile("wasi-canon/clocks/wall-clock.wit") },
+        .{ .path = "clocks/world.wit", .content = @embedFile("wasi-canon/clocks/world.wit") },
+        .{ .path = "filesystem/preopens.wit", .content = @embedFile("wasi-canon/filesystem/preopens.wit") },
+        .{ .path = "filesystem/types.wit", .content = @embedFile("wasi-canon/filesystem/types.wit") },
+        .{ .path = "filesystem/world.wit", .content = @embedFile("wasi-canon/filesystem/world.wit") },
+        .{ .path = "http/handler.wit", .content = @embedFile("wasi-canon/http/handler.wit") },
+        .{ .path = "http/proxy.wit", .content = @embedFile("wasi-canon/http/proxy.wit") },
+        .{ .path = "http/types.wit", .content = @embedFile("wasi-canon/http/types.wit") },
+        .{ .path = "io/error.wit", .content = @embedFile("wasi-canon/io/error.wit") },
+        .{ .path = "io/poll.wit", .content = @embedFile("wasi-canon/io/poll.wit") },
+        .{ .path = "io/streams.wit", .content = @embedFile("wasi-canon/io/streams.wit") },
+        .{ .path = "io/world.wit", .content = @embedFile("wasi-canon/io/world.wit") },
+        .{ .path = "random/insecure-seed.wit", .content = @embedFile("wasi-canon/random/insecure-seed.wit") },
+        .{ .path = "random/insecure.wit", .content = @embedFile("wasi-canon/random/insecure.wit") },
+        .{ .path = "random/random.wit", .content = @embedFile("wasi-canon/random/random.wit") },
+        .{ .path = "random/world.wit", .content = @embedFile("wasi-canon/random/world.wit") },
+        .{ .path = "sockets/instance-network.wit", .content = @embedFile("wasi-canon/sockets/instance-network.wit") },
+        .{ .path = "sockets/ip-name-lookup.wit", .content = @embedFile("wasi-canon/sockets/ip-name-lookup.wit") },
+        .{ .path = "sockets/network.wit", .content = @embedFile("wasi-canon/sockets/network.wit") },
+        .{ .path = "sockets/tcp-create-socket.wit", .content = @embedFile("wasi-canon/sockets/tcp-create-socket.wit") },
+        .{ .path = "sockets/tcp.wit", .content = @embedFile("wasi-canon/sockets/tcp.wit") },
+        .{ .path = "sockets/udp-create-socket.wit", .content = @embedFile("wasi-canon/sockets/udp-create-socket.wit") },
+        .{ .path = "sockets/udp.wit", .content = @embedFile("wasi-canon/sockets/udp.wit") },
+        .{ .path = "sockets/world.wit", .content = @embedFile("wasi-canon/sockets/world.wit") },
+    };
+
+    for (fixtures) |f| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const ar = arena.allocator();
+
+        // Prepend a synthetic placeholder `package` decl when the
+        // file doesn't carry one. The Phase 1 test only exercises
+        // parser grammar coverage; multi-file primary-package
+        // inheritance is Phase 2 scope.
+        const trimmed = std.mem.trimStart(u8, f.content, " \t\r\n");
+        // Skip leading line/doc comments to find the first real keyword.
+        var i: usize = 0;
+        while (i < trimmed.len) {
+            if (std.mem.startsWith(u8, trimmed[i..], "///")) {
+                while (i < trimmed.len and trimmed[i] != '\n') i += 1;
+            } else if (std.mem.startsWith(u8, trimmed[i..], "//")) {
+                while (i < trimmed.len and trimmed[i] != '\n') i += 1;
+            } else if (std.mem.startsWith(u8, trimmed[i..], "/*")) {
+                // skip block comment
+                while (i + 1 < trimmed.len and !(trimmed[i] == '*' and trimmed[i + 1] == '/')) i += 1;
+                if (i + 1 < trimmed.len) i += 2;
+            } else if (trimmed[i] == ' ' or trimmed[i] == '\t' or trimmed[i] == '\r' or trimmed[i] == '\n') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        const has_pkg = i < trimmed.len and std.mem.startsWith(u8, trimmed[i..], "package ");
+        const src = if (has_pkg)
+            f.content
+        else
+            try std.fmt.allocPrint(ar, "package wabt:test@0.2.6;\n{s}", .{f.content});
+
+        var diag: ParseDiagnostic = .{};
+        _ = parse(ar, src, &diag) catch |err| {
+            std.debug.print(
+                "\nfile: {s}\nerror: {s} at [{d}..{d}]: {s}\n",
+                .{ f.path, @errorName(err), diag.span.start, diag.span.end, diag.msg },
+            );
+            return err;
+        };
+    }
 }
