@@ -312,6 +312,118 @@ fn pickBuiltinAdapter(alloc: std.mem.Allocator, core_bytes: []const u8) []const 
     };
 }
 
+/// Conservative predicate: does this imported func's sig fit the
+/// #202-scope shape (all `own`/`borrow` slots resolve to a resource
+/// bound LOCAL to the same import's instance-type body; no compound
+/// types, no value-type refs requiring cross-iface alias plumbing)?
+///
+/// Funcs that don't pass this check are silently skipped from the
+/// import-wiring pass — the wrapping component is still valid (the
+/// core wasm's matching import is left dangling, same as before #202),
+/// but those calls will fall through to wamr's no-op stub. Lifting
+/// the restriction is tracked under #203 along with the memory +
+/// cabi_realloc opts that string/list lowering needs anyway.
+fn sigFitsImportBody(
+    sig: ctypes.FuncType,
+    ext_slots: []const metadata_decode.TypeSlot,
+    local_resource_idx: *std.StringHashMapUnmanaged(u32),
+) bool {
+    const checkVT = struct {
+        fn run(
+            v: ctypes.ValType,
+            slots: []const metadata_decode.TypeSlot,
+            local: *std.StringHashMapUnmanaged(u32),
+        ) bool {
+            return switch (v) {
+                .own, .borrow => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(slots, k) orelse
+                        break :blk false;
+                    break :blk local.contains(name);
+                },
+                // Compound types and outer-scope type_idx refs would
+                // require `alias outer` plumbing inside the body.
+                .type_idx => false,
+                else => true,
+            };
+        }
+    }.run;
+
+    for (sig.params) |p| if (!checkVT(p.type, ext_slots, local_resource_idx)) return false;
+    switch (sig.results) {
+        .none => {},
+        .unnamed => |v| if (!checkVT(v, ext_slots, local_resource_idx)) return false,
+        .named => |named| for (named) |nv| {
+            if (!checkVT(nv.type, ext_slots, local_resource_idx)) return false;
+        },
+    }
+    return true;
+}
+
+/// Rewrite a `FuncType`'s value-type tree so `own`/`borrow` references
+/// in its `.ext_slots` form land on the body-local type-index slot
+/// where the named resource was bound via a `sub_resource` export
+/// declarator. Used to construct the func-type declarators that live
+/// inside an instance-type body for an imported interface — the
+/// surrounding body's local type-index space is the only scope those
+/// handle refs can validly target.
+///
+/// Callers must gate with `sigFitsImportBody` before invoking; this
+/// helper returns `error.UnresolvedResource` for any slot that doesn't
+/// reduce to a locally-bound resource.
+fn rewriteSigForInstanceBody(
+    ar: std.mem.Allocator,
+    sig: ctypes.FuncType,
+    ext_slots: []const metadata_decode.TypeSlot,
+    local_resource_idx: *std.StringHashMapUnmanaged(u32),
+) !ctypes.FuncType {
+    const rewriteVT = struct {
+        fn run(
+            v: ctypes.ValType,
+            slots: []const metadata_decode.TypeSlot,
+            local: *std.StringHashMapUnmanaged(u32),
+        ) !ctypes.ValType {
+            return switch (v) {
+                .own => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(slots, k) orelse
+                        return error.UnresolvedResource;
+                    const idx = local.get(name) orelse return error.UnresolvedResource;
+                    break :blk .{ .own = idx };
+                },
+                .borrow => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(slots, k) orelse
+                        return error.UnresolvedResource;
+                    const idx = local.get(name) orelse return error.UnresolvedResource;
+                    break :blk .{ .borrow = idx };
+                },
+                else => v,
+            };
+        }
+    }.run;
+
+    const params = try ar.alloc(ctypes.NamedValType, sig.params.len);
+    for (sig.params, 0..) |p, i| {
+        params[i] = .{
+            .name = p.name,
+            .type = try rewriteVT(p.type, ext_slots, local_resource_idx),
+        };
+    }
+    const results: ctypes.FuncType.ResultList = switch (sig.results) {
+        .none => .none,
+        .unnamed => |v| .{ .unnamed = try rewriteVT(v, ext_slots, local_resource_idx) },
+        .named => |named| n: {
+            const dst = try ar.alloc(ctypes.NamedValType, named.len);
+            for (named, 0..) |nv, i| {
+                dst[i] = .{
+                    .name = nv.name,
+                    .type = try rewriteVT(nv.type, ext_slots, local_resource_idx),
+                };
+            }
+            break :n .{ .named = dst };
+        },
+    };
+    return .{ .params = params, .results = results };
+}
+
 /// Construct the wrapping component bytes from a core module that
 /// has an embedded `component-type:<world>` custom section.
 pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
@@ -329,20 +441,23 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     // module that goes inside the wrapping component.
     const stripped_core = try stripComponentTypeSections(ar, core_bytes);
 
-    // ── Phase 1: collect resource-providing imports.
+    // ── Phase 1: collect resource-providing and func-bearing imports.
     //
-    // For each `is_export=false` extern that exposes resources via
-    // `.sub_resource` type_slots, record the (qualified_name -> resource
-    // names) shape so we can emit an instance-type import that lets
-    // the exported funcs reach those resources by name. Cross-extern
-    // resource names must be unique within a world; ambiguity is a
-    // user-facing error (#198 scope is the wasi-http reproducer
-    // pattern, which uses unique names — wider scoping is a
-    // follow-up).
+    // For each `is_export=false` extern, record the
+    // (qualified_name -> [resource names], [funcs], ext_slots) shape so
+    // we can emit an instance-type import that lets the exported funcs
+    // reach those resources by name AND can lower the imported funcs
+    // back into the core wasm. Cross-extern resource names must be
+    // unique within a world; ambiguity is a user-facing error (#198
+    // scope is the wasi-http reproducer pattern, which uses unique
+    // names — wider scoping is a follow-up). Imports with neither
+    // resources nor funcs are skipped (no surface to wire).
     var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
     const ImportShape = struct {
         qualified_name: []const u8,
         resources: []const []const u8,
+        funcs: []const metadata_decode.FuncRef,
+        ext_slots: []const metadata_decode.TypeSlot,
     };
     var import_shapes = std.ArrayListUnmanaged(ImportShape).empty;
     for (decoded.externs) |ext| {
@@ -352,9 +467,14 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .sub_resource => |name| try rs.append(ar, name),
             else => {},
         };
-        if (rs.items.len == 0) continue;
+        if (rs.items.len == 0 and ext.funcs.len == 0) continue;
         const owned = try rs.toOwnedSlice(ar);
-        try import_shapes.append(ar, .{ .qualified_name = ext.qualified_name, .resources = owned });
+        try import_shapes.append(ar, .{
+            .qualified_name = ext.qualified_name,
+            .resources = owned,
+            .funcs = ext.funcs,
+            .ext_slots = ext.type_slots,
+        });
         for (owned) |name| {
             const gop = try resource_owner.getOrPut(ar, name);
             if (gop.found_existing) return error.AmbiguousResourceName;
@@ -366,8 +486,12 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     var core_modules = try ar.alloc(ctypes.CoreModule, 1);
     core_modules[0] = .{ .data = stripped_core };
 
-    var core_instances = try ar.alloc(ctypes.CoreInstanceExpr, 1);
-    core_instances[0] = .{ .instantiate = .{ .module_idx = 0, .args = &.{} } };
+    // Core instances list: each `is_export=false` import that has funcs
+    // contributes one inline-exports bundle (built in Phase 2.5 below);
+    // the main core-module instantiation is appended last. The main
+    // instance's index is therefore `K = bundles.len`, where K is
+    // computed once Phase 2.5 has run.
+    var core_instances = std.ArrayListUnmanaged(ctypes.CoreInstanceExpr).empty;
 
     var aliases = std.ArrayListUnmanaged(ctypes.Alias).empty;
     var types = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
@@ -394,19 +518,68 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         }
     };
 
-    // ── Phase 2: emit instance-type + import for each resource-
-    //    providing import. Records the component-instance index
-    //    allocated to the import for later aliasing.
+    // ── Phase 2: emit instance-type + import for each
+    //    resource-providing or func-bearing import. Records the
+    //    component-instance index allocated to the import for later
+    //    aliasing, and remembers exactly which funcs got wired in so
+    //    Phase 2.5 lowers the same subset.
+    //
+    // The instance-type body lists, in order:
+    //   1. an `.@"export" sub_resource` decl per imported resource
+    //      (bumps the body-local type-index space by 1 each);
+    //   2. a `.type func` decl per imported func that fits the
+    //      conservative import-body shape (handles + primitives only),
+    //      with the func's sig rewritten so `own`/`borrow` slots
+    //      resolve against the body-local sub_resource slots (bumps
+    //      the body-local type-index space by 1 each);
+    //   3. an `.@"export" func` decl per such imported func, naming
+    //      the func and pointing at its body-local type-index.
+    //
+    // Funcs that don't fit (cross-iface handle refs, compound types,
+    // anything needing string/list lowering) are silently skipped.
+    // The core wasm's matching import is left dangling for now,
+    // exactly as before #202; #203 picks up the rest.
     var import_inst_idx_for = std.StringHashMapUnmanaged(u32).empty;
+    var wired_funcs_by_shape = try ar.alloc(
+        []const metadata_decode.FuncRef,
+        import_shapes.items.len,
+    );
     for (import_shapes.items, 0..) |shape, i| {
-        const inst_decls = try ar.alloc(ctypes.Decl, shape.resources.len);
-        for (shape.resources, 0..) |name, j| {
-            inst_decls[j] = .{ .@"export" = .{
+        // resource_name → body-local type-index (where the
+        // sub_resource export binds it). Built as we emit them.
+        var local_resource_idx = std.StringHashMapUnmanaged(u32).empty;
+
+        var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
+        var local_type_idx: u32 = 0;
+        for (shape.resources) |name| {
+            try inst_decls.append(ar, .{ .@"export" = .{
                 .name = name,
                 .desc = .{ .type = .sub_resource },
-            } };
+            } });
+            try local_resource_idx.put(ar, name, local_type_idx);
+            local_type_idx += 1;
         }
-        try types.append(ar, .{ .instance = .{ .decls = inst_decls } });
+        var wired = std.ArrayListUnmanaged(metadata_decode.FuncRef).empty;
+        for (shape.funcs) |fn_ref| {
+            if (!sigFitsImportBody(fn_ref.sig, shape.ext_slots, &local_resource_idx)) continue;
+            const rewritten = try rewriteSigForInstanceBody(
+                ar,
+                fn_ref.sig,
+                shape.ext_slots,
+                &local_resource_idx,
+            );
+            try inst_decls.append(ar, .{ .type = .{ .func = rewritten } });
+            const ft_local_idx = local_type_idx;
+            local_type_idx += 1;
+            try inst_decls.append(ar, .{ .@"export" = .{
+                .name = fn_ref.name,
+                .desc = .{ .func = ft_local_idx },
+            } });
+            try wired.append(ar, fn_ref);
+        }
+        wired_funcs_by_shape[i] = try wired.toOwnedSlice(ar);
+
+        try types.append(ar, .{ .instance = .{ .decls = try inst_decls.toOwnedSlice(ar) } });
         try Section.appendType(&order, ar, types.items.len);
         const inst_type_idx = comp_type_idx;
         comp_type_idx += 1;
@@ -419,11 +592,106 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
-    // Core module + core instance always come after the imports
-    // (the lifted funcs come from the core instance, which is the
-    // sole consumer of the import surface today).
+    // ── Phase 2.5: wire each imported func through to the core wasm.
+    //
+    // Per imported func, emit (in this order):
+    //   * `alias instance_export sort=.func` from the import instance,
+    //     producing a component-level func indexspace slot;
+    //   * `canon lower` of that component func into a core func.
+    //
+    // Then, per import that contributed funcs, emit a
+    // `core_instance.exports` inline-exports bundle keyed by the func's
+    // canonical method-encoded name (e.g. `[constructor]fields`). The
+    // bundle's core-instance index is later referenced by the main
+    // core-module instantiation's `(with …)` args, completing the
+    // wire-up.
+    //
+    // `canon.lower.opts` is intentionally empty for now; wiring
+    // memory + cabi_realloc opts is tracked under #203 (it requires
+    // the wasm-tools shim/fixup trampoline pattern to break the
+    // forward-reference cycle between the lowers and the main core
+    // instance's exports).
+    var comp_func_idx: u32 = 0;
+    var core_func_idx: u32 = 0;
+    // Per-import bundles, by import-shape index. `null` when the
+    // import has no funcs to lower.
+    const Bundle = struct { core_inst_idx: u32 };
+    var bundles_by_shape = try ar.alloc(?Bundle, import_shapes.items.len);
+    for (bundles_by_shape) |*b| b.* = null;
+
+    for (import_shapes.items, 0..) |_, i| {
+        const wired = wired_funcs_by_shape[i];
+        if (wired.len == 0) continue;
+        const import_inst_idx: u32 = @intCast(i);
+        // 1. alias.instance_export(.func) per imported func.
+        const fn_comp_func_idx_base = comp_func_idx;
+        for (wired) |fn_ref| {
+            try aliases.append(ar, .{ .instance_export = .{
+                .sort = .func,
+                .instance_idx = import_inst_idx,
+                .name = fn_ref.name,
+            } });
+            try Section.appendAlias(&order, ar, aliases.items.len);
+            comp_func_idx += 1;
+        }
+        // 2. canon.lower per imported func.
+        const lowered_core_func_idx_base = core_func_idx;
+        for (wired, 0..) |_, fi| {
+            try canons.append(ar, .{ .lower = .{
+                .func_idx = fn_comp_func_idx_base + @as(u32, @intCast(fi)),
+                .opts = &.{},
+            } });
+            core_func_idx += 1;
+        }
+        try order.append(ar, .{
+            .kind = .canon,
+            .start = @intCast(canons.items.len - wired.len),
+            .count = @intCast(wired.len),
+        });
+
+        // 3. core_instance.exports bundle for this import.
+        const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len);
+        for (wired, 0..) |fn_ref, fi| {
+            bundle_exports[fi] = .{
+                .name = fn_ref.name,
+                .sort_idx = .{
+                    .sort = .func,
+                    .idx = lowered_core_func_idx_base + @as(u32, @intCast(fi)),
+                },
+            };
+        }
+        try core_instances.append(ar, .{ .exports = bundle_exports });
+        bundles_by_shape[i] = .{ .core_inst_idx = @intCast(core_instances.items.len - 1) };
+    }
+
+    // ── Main core_module + main core_instance.instantiate.
+    //
+    // The main instance's index in the core-instance indexspace is
+    // `main_core_inst_idx`, which equals the number of inline-exports
+    // bundles emitted in Phase 2.5. The `(with …)` args feed each
+    // bundle into the core module under the import's qualified name.
     try order.append(ar, .{ .kind = .core_module, .start = 0, .count = 1 });
-    try order.append(ar, .{ .kind = .core_instance, .start = 0, .count = 1 });
+
+    var main_args = std.ArrayListUnmanaged(ctypes.CoreInstantiateArg).empty;
+    for (import_shapes.items, 0..) |shape, i| {
+        if (bundles_by_shape[i]) |b| {
+            try main_args.append(ar, .{
+                .name = shape.qualified_name,
+                .instance_idx = b.core_inst_idx,
+            });
+        }
+    }
+    try core_instances.append(ar, .{ .instantiate = .{
+        .module_idx = 0,
+        .args = try main_args.toOwnedSlice(ar),
+    } });
+    const main_core_inst_idx: u32 = @intCast(core_instances.items.len - 1);
+    // One contiguous `.core_instance` section covering bundles + main.
+    try order.append(ar, .{
+        .kind = .core_instance,
+        .start = 0,
+        .count = @intCast(core_instances.items.len),
+    });
 
     // ── Phase 3: walk export externs, hoisting resource handles
     //    referenced by their func sigs.
@@ -547,12 +815,14 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         ext: metadata_decode.WorldExtern,
         start: u32,
     }).empty;
-    // Core-func index counter. Bumps once per `.alias instance_export`
-    // with `sort = .{.core = .func}` (the only producer of core funcs
-    // in the wrapping component today). Used as the canon lift's
-    // `core_func_idx`, which is positional in the core-func
-    // indexspace — NOT the absolute position in the `aliases` array.
-    var core_func_idx: u32 = 0;
+    // Core-func index counter is shared with Phase 2.5: `canon.lower`
+    // bumped it once per imported func, and now each
+    // `.alias instance_export` with `sort = .{.core = .func}` bumps it
+    // once per exported func. Together they keep the core-func
+    // indexspace strictly positional across both phases. The component
+    // func indexspace (`comp_func_idx`) is likewise carried over —
+    // Phase 2.5's func aliases already populated indices `0..M-1`, so
+    // the lifts emitted here land at `M..M+exported_funcs-1`.
 
     for (decoded.externs) |ext| {
         if (!ext.is_export) continue;
@@ -580,7 +850,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             const core_func_export_name = try std.fmt.allocPrint(ar, "{s}#{s}", .{ ext.qualified_name, fn_ref.name });
             try aliases.append(ar, .{ .instance_export = .{
                 .sort = .{ .core = .func },
-                .instance_idx = 0,
+                .instance_idx = main_core_inst_idx,
                 .name = core_func_export_name,
             } });
             try Section.appendAlias(&order, ar, aliases.items.len);
@@ -599,6 +869,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 
     // ── Canon lifts and instance exprs: appended to flat lists,
     //    section_order entries appended after.
+    const lifts_start: u32 = @intCast(canons.items.len);
     for (captured_funcs.items) |cf| {
         try canons.append(ar, .{ .lift = .{
             .core_func_idx = cf.core_func_alias_idx,
@@ -606,8 +877,8 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .opts = &.{},
         } });
     }
+    const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
 
-    var comp_func_idx: u32 = 0;
     for (ext_export_start.items, 0..) |es, ei| {
         const end: u32 = if (ei + 1 < ext_export_start.items.len)
             ext_export_start.items[ei + 1].start
@@ -632,8 +903,8 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         });
     }
 
-    if (canons.items.len > 0) {
-        try order.append(ar, .{ .kind = .canon, .start = 0, .count = @intCast(canons.items.len) });
+    if (lifts_count > 0) {
+        try order.append(ar, .{ .kind = .canon, .start = lifts_start, .count = lifts_count });
     }
     if (instances.items.len > 0) {
         try order.append(ar, .{ .kind = .instance, .start = 0, .count = @intCast(instances.items.len) });
@@ -644,7 +915,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 
     const comp: ctypes.Component = .{
         .core_modules = core_modules,
-        .core_instances = core_instances,
+        .core_instances = try core_instances.toOwnedSlice(ar),
         .core_types = &.{},
         .components = &.{},
         .instances = try instances.toOwnedSlice(ar),
@@ -954,6 +1225,185 @@ test "buildComponent #198: wraps cross-iface-use resources with import + alias +
         try testing.expect(hoisted == .val);
         try testing.expect(hoisted.val == .own);
     }
+}
+
+test "buildComponent #202: emits canon.lower + with-args for imported interface methods" {
+    // Reproducer from cataggar/wabt#202: an imported resource method
+    // (here `[constructor]fields` returning `own<fields>`) must be
+    // wired through the wrapping component into the core wasm's
+    // matching import. Before #202, `core_instances[0].instantiate.args`
+    // was empty and no `canon.lower` was emitted, so the core import
+    // dangled and wamr's interpreter quietly returned 0.
+    //
+    // Synth core module: 1 type `(func -> i32)`, 1 type
+    // `(func i32 i32 -> )`, 1 import
+    // `wasi:http/types@0.2.6.[constructor]fields` (type 1), 1 defined
+    // func of type 2, 1 export
+    // `wasi:http/incoming-handler@0.2.6#handle` (defined func idx 1).
+    const core_only = [_]u8{
+        // preamble
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        // type section: 3 types
+        //   body = 1(count) + 3(type 0: (func)) + 4(type 1: (func -> i32))
+        //   + 5(type 2: (func i32 i32 -> )) = 13
+        0x01, 13, 3,
+        0x60, 0x00, 0x00,
+        0x60, 0x00, 0x01, 0x7f,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        // import section: 1 import — wasi:http/types@0.2.6 . [constructor]fields : (func -> i32)
+        //   entry = 22(module: 1+21) + 20(field: 1+19) + 1(kind) + 1(typeidx) = 44
+        //   body  = 1(count) + 44 = 45
+        0x02, 45, 1,
+        21, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 't', 'y', 'p', 'e', 's', '@', '0', '.', '2', '.', '6',
+        19, '[', 'c', 'o', 'n', 's', 't', 'r', 'u', 'c', 't',
+        'o', 'r', ']', 'f', 'i', 'e', 'l', 'd', 's',
+        0x00, 1,
+        // function section: 1 func of type 2 (the handle)
+        0x03, 2, 1, 2,
+        // export section: handle export (defined-func idx 1)
+        //   entry = 40(name: 1+39) + 1(sort) + 1(idx) = 42
+        //   body  = 1(count) + 42 = 43
+        0x07, 43, 1,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 1,
+        // code section: 1 body (nop)
+        0x0a, 4, 1, 2, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource fields {
+        \\        constructor();
+        \\    }
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    , "http-hello");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:http-hello";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // (1) Single instance-import for wasi:http/types@0.2.6, whose
+    // instance-type body now includes a func-bound export for
+    // `[constructor]fields` in addition to the three sub_resource
+    // declarators #198 already verified.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", loaded.imports[0].name);
+    try testing.expect(loaded.imports[0].desc == .instance);
+    const inst_type_idx = loaded.imports[0].desc.instance;
+    const inst_contrib = loaded.type_indexspace[inst_type_idx];
+    try testing.expect(inst_contrib == .type_def);
+    const inst_td = loaded.types[inst_contrib.type_def];
+    try testing.expect(inst_td == .instance);
+    var saw_ctor_func_export = false;
+    var saw_fields_sub = false;
+    for (inst_td.instance.decls) |d| switch (d) {
+        .@"export" => |e| switch (e.desc) {
+            .type => |tb| if (tb == .sub_resource and std.mem.eql(u8, e.name, "fields")) {
+                saw_fields_sub = true;
+            },
+            .func => if (std.mem.eql(u8, e.name, "[constructor]fields")) {
+                saw_ctor_func_export = true;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    try testing.expect(saw_fields_sub);
+    try testing.expect(saw_ctor_func_export);
+
+    // (2) A component-level alias pulls `[constructor]fields` into the
+    // wrapping component's func indexspace, sourced from the types
+    // import instance (component-instance idx 0).
+    var saw_ctor_alias = false;
+    for (loaded.aliases) |a| switch (a) {
+        .instance_export => |ie| if (ie.sort == .func and
+            std.mem.eql(u8, ie.name, "[constructor]fields") and
+            ie.instance_idx == 0)
+        {
+            saw_ctor_alias = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_ctor_alias);
+
+    // (3) Exactly one canon.lower (for the constructor) and one
+    // canon.lift (for the handle export). The lower's func_idx must
+    // resolve back to an imported func — i.e. it must point at a
+    // component func indexspace slot whose contributor is an alias.
+    var n_lower: usize = 0;
+    var n_lift: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .lower => n_lower += 1,
+        .lift => n_lift += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), n_lower);
+    try testing.expectEqual(@as(usize, 1), n_lift);
+
+    // (4) Two core instances: an inline-exports bundle (idx 0) and
+    // the main instantiation (idx 1). The bundle exposes
+    // `[constructor]fields` as a core func; the main carries one
+    // `(with …)` arg sourcing it.
+    try testing.expectEqual(@as(usize, 2), loaded.core_instances.len);
+    try testing.expect(loaded.core_instances[0] == .exports);
+    var saw_bundle_ctor = false;
+    for (loaded.core_instances[0].exports) |ie| {
+        if (std.mem.eql(u8, ie.name, "[constructor]fields") and ie.sort_idx.sort == .func) {
+            saw_bundle_ctor = true;
+        }
+    }
+    try testing.expect(saw_bundle_ctor);
+
+    try testing.expect(loaded.core_instances[1] == .instantiate);
+    const main_inst = loaded.core_instances[1].instantiate;
+    try testing.expectEqual(@as(u32, 0), main_inst.module_idx);
+    try testing.expectEqual(@as(usize, 1), main_inst.args.len);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", main_inst.args[0].name);
+    try testing.expectEqual(@as(u32, 0), main_inst.args[0].instance_idx);
+
+    // (5) The handle export remains intact — Phase 3 still hooks the
+    // exported func onto the main core instance (now idx 1, not 0).
+    try testing.expectEqual(@as(usize, 1), loaded.exports.len);
+    try testing.expectEqualStrings(
+        "wasi:http/incoming-handler@0.2.6",
+        loaded.exports[0].name,
+    );
 }
 
 test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
