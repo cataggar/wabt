@@ -36,7 +36,84 @@ pub const ResolveError = parser.ParseError || error{
     InvalidLayout,
     /// A `*.wit` file under `<root>` was empty.
     EmptyWit,
+    /// Two or more files in the same directory carry differing
+    /// `package <ns>:<name>[@<ver>];` declarations.
+    PackageDeclConflict,
+    /// No file in the directory carries a `package <ns>:<name>;`
+    /// declaration — qualified-name resolution would fail.
+    NoPackageDeclInDirectory,
 };
+
+/// Optional diagnostic populated by the resolver on errors that
+/// have a path-level explanation. Mirrors `parser.ParseDiagnostic`
+/// but uses file paths instead of byte spans.
+pub const ResolveDiagnostic = struct {
+    msg: []const u8 = "",
+    path: []const u8 = "",
+    path2: []const u8 = "",
+};
+
+/// Lightweight scanner: returns the byte range `[start, end)` of
+/// the first `package <ns>:<name>[@<ver>];` declaration in `buf`,
+/// skipping only leading whitespace, `//` / `///` line comments,
+/// `/* … */` block comments, and `@<id>(<args>?)` annotations
+/// before the decl. Returns null if no leading decl is found
+/// (the file may still contain `package` mid-stream, but that's
+/// not a top-level decl).
+pub fn scanForPackageDecl(buf: []const u8) ?struct { start: usize, end: usize } {
+    var i: usize = 0;
+    while (i < buf.len) {
+        const c = buf[i];
+        switch (c) {
+            ' ', '\t', '\r', '\n' => i += 1,
+            '/' => {
+                if (i + 1 >= buf.len) return null;
+                if (buf[i + 1] == '/') {
+                    while (i < buf.len and buf[i] != '\n') i += 1;
+                } else if (buf[i + 1] == '*') {
+                    i += 2;
+                    while (i + 1 < buf.len and !(buf[i] == '*' and buf[i + 1] == '/')) i += 1;
+                    if (i + 1 < buf.len) i += 2;
+                } else {
+                    return null;
+                }
+            },
+            '@' => {
+                // Skip annotation: `@` <id> `(<balanced parens>)`?
+                i += 1;
+                // skip id chars
+                while (i < buf.len and isIdentChar(buf[i])) i += 1;
+                // skip optional `( ... )`
+                while (i < buf.len and (buf[i] == ' ' or buf[i] == '\t' or buf[i] == '\r' or buf[i] == '\n')) i += 1;
+                if (i < buf.len and buf[i] == '(') {
+                    var depth: usize = 1;
+                    i += 1;
+                    while (i < buf.len and depth > 0) : (i += 1) {
+                        if (buf[i] == '(') depth += 1;
+                        if (buf[i] == ')') depth -= 1;
+                    }
+                }
+            },
+            'p' => {
+                // Look for `package ` literal.
+                if (i + 8 <= buf.len and std.mem.eql(u8, buf[i .. i + 8], "package ")) {
+                    const decl_start = i;
+                    // Advance until the next `;` or end of buf.
+                    while (i < buf.len and buf[i] != ';') i += 1;
+                    if (i >= buf.len) return null;
+                    return .{ .start = decl_start, .end = i + 1 };
+                }
+                return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '-' or c == '_';
+}
 
 pub const Resolver = struct {
     /// The "main" parsed doc — the package the world being embedded
@@ -122,7 +199,63 @@ pub const Resolver = struct {
         iface: ast.Interface,
         pkg: ast.PackageId,
     };
+
+    /// Look up a world by reference. Same package-matching rules as
+    /// `findInterfaceWithPkg`. Used by `metadata_encode` to expand
+    /// `include` items.
+    pub fn findWorld(self: Resolver, ref: ast.InterfaceRef) ?WorldLookup {
+        return self.findWorldCtx(ref, null);
+    }
+
+    pub fn findWorldCtx(self: Resolver, ref: ast.InterfaceRef, ctx_pkg: ?ast.PackageId) ?WorldLookup {
+        if (ref.package == null) {
+            if (ctx_pkg) |cp| {
+                if (self.main.package) |mp| {
+                    if (packageMatches(mp, cp)) {
+                        if (findWorldInDoc(self.main, ref.name)) |w| return .{ .world = w, .pkg = mp };
+                    }
+                }
+                for (self.deps) |dep| {
+                    if (dep.package) |dp| {
+                        if (packageMatches(dp, cp)) {
+                            if (findWorldInDoc(dep, ref.name)) |w| return .{ .world = w, .pkg = dp };
+                        }
+                    }
+                }
+            }
+            if (findWorldInDoc(self.main, ref.name)) |w| {
+                return .{ .world = w, .pkg = self.main.package orelse return null };
+            }
+            return null;
+        }
+        const target_pkg = ref.package.?;
+        if (self.main.package) |mp| {
+            if (packageMatches(mp, target_pkg)) {
+                if (findWorldInDoc(self.main, ref.name)) |w| return .{ .world = w, .pkg = mp };
+            }
+        }
+        for (self.deps) |dep| {
+            if (dep.package) |dp| {
+                if (packageMatches(dp, target_pkg)) {
+                    if (findWorldInDoc(dep, ref.name)) |w| return .{ .world = w, .pkg = dp };
+                }
+            }
+        }
+        return null;
+    }
+
+    pub const WorldLookup = struct {
+        world: ast.World,
+        pkg: ast.PackageId,
+    };
 };
+
+fn findWorldInDoc(doc: ast.Document, name: []const u8) ?ast.World {
+    for (doc.items) |it| {
+        if (it == .world and std.mem.eql(u8, it.world.name, name)) return it.world;
+    }
+    return null;
+}
 
 fn findInterfaceInDoc(doc: ast.Document, name: []const u8) ?ast.Interface {
     for (doc.items) |it| {
@@ -161,13 +294,36 @@ pub const WitSource = struct {
 /// and concatenate them, separated by '\n'. Returns the concatenated
 /// buffer (caller frees) and the list of file paths included.
 ///
-/// Empty result → no `.wit` files found.
+/// Read every top-level `*.wit` file under `dir` (sorted, non-recursive)
+/// and concatenate them into a single source buffer, separated by '\n'.
+///
+/// Canonical WIT directories often have a single `package <id>;`
+/// declaration that's inherited by every other file in the same
+/// directory (e.g. `wasi-http/wit/proxy.wit` carries the package
+/// decl; `types.wit` and `handler.wit` don't). To produce a parser-
+/// digestible buffer we:
+///
+///   1. Scan each file for a leading `package` decl.
+///   2. Require the directory contain exactly one DISTINCT decl
+///      (multiple files may carry it as long as they match); error
+///      with `PackageDeclConflict` on a mismatch and
+///      `NoPackageDeclInDirectory` if none has one.
+///   3. Concat the canonical decl-bearing file FIRST (with its
+///      decl intact), then other files alphabetically afterwards
+///      with any duplicate decl stripped.
+///
+/// Returns the concatenated buffer (caller frees) and the list of
+/// file paths included (in concat order).
+///
+/// Empty result (no `.wit` files found) → returns `text.len == 0`.
 pub fn readWitDir(
     alloc: Allocator,
     io: std.Io,
     dir_path: []const u8,
-) !struct { text: []u8, paths: [][]const u8 } {
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true });
+    diag: ?*ResolveDiagnostic,
+) ResolveError!struct { text: []u8, paths: [][]const u8 } {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
+        return error.FileSystemError;
     defer dir.close(io);
 
     var entries: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -176,7 +332,7 @@ pub fn readWitDir(
         entries.deinit(alloc);
     }
     var it = dir.iterate();
-    while (try it.next(io)) |entry| {
+    while ((it.next(io) catch return error.FileSystemError)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".wit")) continue;
         try entries.append(alloc, try alloc.dupe(u8, entry.name));
@@ -187,6 +343,77 @@ pub fn readWitDir(
         }
     }.lt);
 
+    if (entries.items.len == 0) {
+        return .{ .text = try alloc.alloc(u8, 0), .paths = try alloc.alloc([]const u8, 0) };
+    }
+
+    // Read every file into memory, scan each for its leading package
+    // decl, and validate consistency.
+    const FileEntry = struct {
+        name: []const u8,
+        full_path: []const u8,
+        buf: []u8,
+        pkg_start: usize,
+        pkg_end: usize,
+        has_pkg: bool,
+    };
+    var files = try alloc.alloc(FileEntry, entries.items.len);
+    defer {
+        for (files) |f| {
+            alloc.free(f.full_path);
+            alloc.free(f.buf);
+        }
+        alloc.free(files);
+    }
+    var canonical_decl: ?[]const u8 = null;
+    var canonical_path: []const u8 = "";
+    var first_decl_idx: ?usize = null;
+    for (entries.items, 0..) |name, i| {
+        const full = std.fs.path.join(alloc, &.{ dir_path, name }) catch return error.FileSystemError;
+        const buf = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            full,
+            alloc,
+            std.Io.Limit.limited(1 << 20),
+        ) catch return error.FileSystemError;
+        files[i] = .{
+            .name = name,
+            .full_path = full,
+            .buf = buf,
+            .pkg_start = 0,
+            .pkg_end = 0,
+            .has_pkg = false,
+        };
+        if (scanForPackageDecl(buf)) |range| {
+            files[i].pkg_start = range.start;
+            files[i].pkg_end = range.end;
+            files[i].has_pkg = true;
+            const decl_text = std.mem.trim(u8, buf[range.start..range.end], " \t\r\n");
+            if (canonical_decl) |canon| {
+                if (!std.mem.eql(u8, canon, decl_text)) {
+                    if (diag) |d| d.* = .{
+                        .msg = "files in the same WIT directory have differing `package` decls",
+                        .path = canonical_path,
+                        .path2 = full,
+                    };
+                    return error.PackageDeclConflict;
+                }
+            } else {
+                canonical_decl = decl_text;
+                canonical_path = full;
+                first_decl_idx = i;
+            }
+        }
+    }
+
+    if (first_decl_idx == null) {
+        if (diag) |d| d.* = .{
+            .msg = "no `package <ns>:<name>[@<ver>];` decl found in any file under this directory",
+            .path = dir_path,
+        };
+        return error.NoPackageDeclInDirectory;
+    }
+
     var combined: std.ArrayListUnmanaged(u8) = .empty;
     errdefer combined.deinit(alloc);
     var paths: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -195,19 +422,29 @@ pub fn readWitDir(
         paths.deinit(alloc);
     }
 
-    for (entries.items) |name| {
-        const full = try std.fs.path.join(alloc, &.{ dir_path, name });
-        const buf = try std.Io.Dir.cwd().readFileAlloc(
-            io,
-            full,
-            alloc,
-            std.Io.Limit.limited(1 << 20),
-        );
-        defer alloc.free(buf);
-        try combined.appendSlice(alloc, buf);
+    // Emit order: the package-bearing file first (decl intact), then
+    // every other file in alphabetical order with any duplicate decl
+    // stripped.
+    const first = first_decl_idx.?;
+    {
+        const f = files[first];
+        try combined.appendSlice(alloc, f.buf);
         try combined.append(alloc, '\n');
-        try paths.append(alloc, full);
+        try paths.append(alloc, try alloc.dupe(u8, f.full_path));
     }
+    for (files, 0..) |f, i| {
+        if (i == first) continue;
+        try paths.append(alloc, try alloc.dupe(u8, f.full_path));
+        if (f.has_pkg) {
+            // Strip the duplicate decl; keep surrounding content.
+            try combined.appendSlice(alloc, f.buf[0..f.pkg_start]);
+            try combined.appendSlice(alloc, f.buf[f.pkg_end..]);
+        } else {
+            try combined.appendSlice(alloc, f.buf);
+        }
+        try combined.append(alloc, '\n');
+    }
+
     return .{
         .text = try combined.toOwnedSlice(alloc),
         .paths = try paths.toOwnedSlice(alloc),
@@ -228,6 +465,18 @@ pub fn parseLayout(
     io: std.Io,
     root: []const u8,
 ) ResolveError!Resolver {
+    return parseLayoutWithDiag(arena, io, root, null);
+}
+
+/// Like `parseLayout` but also populates `diag` on errors that have
+/// a file-path-level explanation (`PackageDeclConflict`,
+/// `NoPackageDeclInDirectory`).
+pub fn parseLayoutWithDiag(
+    arena: Allocator,
+    io: std.Io,
+    root: []const u8,
+    diag: ?*ResolveDiagnostic,
+) ResolveError!Resolver {
     const stat = std.Io.Dir.cwd().statFile(io, root, .{}) catch return error.InvalidLayout;
 
     if (stat.kind != .directory) {
@@ -243,7 +492,7 @@ pub fn parseLayout(
     }
 
     // Read main package.
-    const main_combined = readWitDir(arena, io, root) catch return error.FileSystemError;
+    const main_combined = try readWitDir(arena, io, root, diag);
     if (main_combined.text.len == 0) return error.EmptyWit;
     const main = try parser.parse(arena, main_combined.text, null);
 
@@ -282,7 +531,7 @@ pub fn parseLayout(
         const entry_path = try std.fs.path.join(arena, &.{ deps_path, name });
         switch (kind) {
             .directory => {
-                const combined = readWitDir(arena, io, entry_path) catch return error.FileSystemError;
+                const combined = try readWitDir(arena, io, entry_path, diag);
                 if (combined.text.len == 0) continue;
                 const doc = try parser.parse(arena, combined.text, null);
                 try dep_docs.append(arena, doc);
@@ -400,4 +649,243 @@ test "resolver: package missing version on either side matches" {
     };
     const iface = res.findInterface(ref);
     try std.testing.expect(iface != null);
+}
+
+test "scanForPackageDecl: finds leading decl past whitespace/comments/annotations" {
+    // Plain package decl at the very start.
+    {
+        const buf = "package wasi:http@0.2.6;\ninterface i { f: func(); }";
+        const r = scanForPackageDecl(buf).?;
+        try std.testing.expectEqualStrings("package wasi:http@0.2.6;", buf[r.start..r.end]);
+    }
+    // Leading line + block comments.
+    {
+        const buf =
+            \\// header comment
+            \\/* block */
+            \\package wasi:http@0.2.6;
+        ;
+        const r = scanForPackageDecl(buf).?;
+        try std.testing.expectEqualStrings("package wasi:http@0.2.6;", buf[r.start..r.end]);
+    }
+    // Leading doc comments + annotations.
+    {
+        const buf =
+            \\/// doc
+            \\@since(version = 0.2.0)
+            \\package wasi:http@0.2.6;
+        ;
+        const r = scanForPackageDecl(buf).?;
+        try std.testing.expectEqualStrings("package wasi:http@0.2.6;", buf[r.start..r.end]);
+    }
+    // No leading decl — returns null.
+    {
+        const buf = "interface i { f: func(); }";
+        try std.testing.expect(scanForPackageDecl(buf) == null);
+    }
+    // `package` appearing mid-stream is NOT a leading decl.
+    {
+        const buf = "interface i { f: func(); }\npackage wasi:http@0.2.6;";
+        try std.testing.expect(scanForPackageDecl(buf) == null);
+    }
+}
+
+test "resolver #195p2: multi-file primary package — decl in non-first file" {
+    // Repro mirrors wasi-http/wit/: handler.wit (no pkg decl),
+    // proxy.wit (carries the decl), types.wit (no pkg decl).
+    // Alphabetical concat → decl mid-stream → parse fails pre-fix.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a-handler.wit",
+        .data = "interface handler { handle: func(); }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b-proxy.wit",
+        .data = "package wasi:http@0.2.6;\nworld w { import handler; }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "c-types.wit",
+        .data = "interface types { t: func(); }",
+    });
+
+    const tmp_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const res = try parseLayoutWithDiag(allocator, std.testing.io, tmp_root, null);
+    try std.testing.expect(res.main.package != null);
+    try std.testing.expectEqualStrings("wasi", res.main.package.?.namespace);
+    try std.testing.expectEqualStrings("http", res.main.package.?.name);
+    try std.testing.expectEqualStrings("0.2.6", res.main.package.?.version.?);
+    // All three files' items should be merged into one document.
+    // Order: items from the decl-bearing file first (just `world w`),
+    // then alphabetical others (`handler` then `types`).
+    try std.testing.expectEqual(@as(usize, 3), res.main.items.len);
+}
+
+test "resolver #195p2: package decl conflict between files" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a.wit",
+        .data = "package wasi:http@0.2.6;\ninterface i { f: func(); }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b.wit",
+        .data = "package wasi:http@0.2.5;\ninterface j { f: func(); }",
+    });
+
+    const tmp_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var diag: ResolveDiagnostic = .{};
+    const got = parseLayoutWithDiag(allocator, std.testing.io, tmp_root, &diag);
+    try std.testing.expectError(error.PackageDeclConflict, got);
+    try std.testing.expect(diag.msg.len > 0);
+    try std.testing.expect(diag.path.len > 0);
+    try std.testing.expect(diag.path2.len > 0);
+}
+
+test "resolver #195p2: no package decl in directory" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a.wit",
+        .data = "interface i { f: func(); }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b.wit",
+        .data = "interface j { f: func(); }",
+    });
+
+    const tmp_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var diag: ResolveDiagnostic = .{};
+    const got = parseLayoutWithDiag(allocator, std.testing.io, tmp_root, &diag);
+    try std.testing.expectError(error.NoPackageDeclInDirectory, got);
+    try std.testing.expect(diag.msg.len > 0);
+}
+
+test "resolver #195p2: duplicate-but-matching package decls are deduped" {
+    // wasi-http does NOT actually do this (only one file carries the
+    // decl), but other multi-file packages might. Verify the resolver
+    // accepts duplicated identical decls.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "a.wit",
+        .data = "package ex:p@1.0.0;\ninterface ia { f: func(); }",
+    });
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "b.wit",
+        .data = "package ex:p@1.0.0;\ninterface ib { f: func(); }",
+    });
+
+    const tmp_root = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const res = try parseLayoutWithDiag(allocator, std.testing.io, tmp_root, null);
+    try std.testing.expect(res.main.package != null);
+    try std.testing.expectEqualStrings("ex", res.main.package.?.namespace);
+    try std.testing.expectEqualStrings("p", res.main.package.?.name);
+    try std.testing.expectEqual(@as(usize, 2), res.main.items.len);
+}
+
+test "resolver #195p2: canonical wasi-http proxy world resolves through the layout" {
+    // Phase 2 acceptance for #195. Assembles a temp WIT tree that
+    // mirrors the canonical wasi-http@0.2.6 layout (http/* as the
+    // main package, cli/clocks/filesystem/io/random/sockets under
+    // deps/) and asserts parseLayout resolves all packages.
+    //
+    // Source files are vendored at src/component/wit/wasi-canon/
+    // (added in #200 / Phase 1). We copy them out at test time
+    // using the runtime IO interface — simpler than @embedFile-ing
+    // 33 files a second time.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    // Build the layout: <tmp>/wit/ (main = http) +
+    // <tmp>/wit/deps/{cli,clocks,filesystem,io,random,sockets}/.
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.createDirPath(io, "wit/deps");
+
+    const pkgs = [_]struct { src_dir: []const u8, dst_rel: []const u8 }{
+        .{ .src_dir = "src/component/wit/wasi-canon/http", .dst_rel = "wit" },
+        .{ .src_dir = "src/component/wit/wasi-canon/cli", .dst_rel = "wit/deps/cli" },
+        .{ .src_dir = "src/component/wit/wasi-canon/clocks", .dst_rel = "wit/deps/clocks" },
+        .{ .src_dir = "src/component/wit/wasi-canon/filesystem", .dst_rel = "wit/deps/filesystem" },
+        .{ .src_dir = "src/component/wit/wasi-canon/io", .dst_rel = "wit/deps/io" },
+        .{ .src_dir = "src/component/wit/wasi-canon/random", .dst_rel = "wit/deps/random" },
+        .{ .src_dir = "src/component/wit/wasi-canon/sockets", .dst_rel = "wit/deps/sockets" },
+    };
+
+    for (pkgs) |pkg| {
+        try tmp.dir.createDirPath(io, pkg.dst_rel);
+        var src = try cwd.openDir(io, pkg.src_dir, .{ .iterate = true });
+        defer src.close(io);
+        var it = src.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".wit")) continue;
+            const src_path = try std.fs.path.join(allocator, &.{ pkg.src_dir, entry.name });
+            const buf = try cwd.readFileAlloc(io, src_path, allocator, std.Io.Limit.limited(1 << 20));
+            const dst_path = try std.fs.path.join(allocator, &.{ pkg.dst_rel, entry.name });
+            try tmp.dir.writeFile(io, .{ .sub_path = dst_path, .data = buf });
+        }
+    }
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    var diag: ResolveDiagnostic = .{};
+    const res = parseLayoutWithDiag(allocator, io, tmp_wit, &diag) catch |err| {
+        std.debug.print(
+            "\nparseLayout failed: {s}\n  msg: {s}\n  path: {s}\n  path2: {s}\n",
+            .{ @errorName(err), diag.msg, diag.path, diag.path2 },
+        );
+        return err;
+    };
+
+    // Main package is wasi:http@0.2.6.
+    try std.testing.expect(res.main.package != null);
+    try std.testing.expectEqualStrings("wasi", res.main.package.?.namespace);
+    try std.testing.expectEqualStrings("http", res.main.package.?.name);
+    try std.testing.expectEqualStrings("0.2.6", res.main.package.?.version.?);
+
+    // All 6 dep packages are present and named.
+    try std.testing.expectEqual(@as(usize, 6), res.deps.len);
+    var saw_cli = false;
+    var saw_clocks = false;
+    var saw_filesystem = false;
+    var saw_io = false;
+    var saw_random = false;
+    var saw_sockets = false;
+    for (res.deps) |dep| {
+        try std.testing.expect(dep.package != null);
+        const n = dep.package.?.name;
+        if (std.mem.eql(u8, n, "cli")) saw_cli = true;
+        if (std.mem.eql(u8, n, "clocks")) saw_clocks = true;
+        if (std.mem.eql(u8, n, "filesystem")) saw_filesystem = true;
+        if (std.mem.eql(u8, n, "io")) saw_io = true;
+        if (std.mem.eql(u8, n, "random")) saw_random = true;
+        if (std.mem.eql(u8, n, "sockets")) saw_sockets = true;
+    }
+    try std.testing.expect(saw_cli);
+    try std.testing.expect(saw_clocks);
+    try std.testing.expect(saw_filesystem);
+    try std.testing.expect(saw_io);
+    try std.testing.expect(saw_random);
+    try std.testing.expect(saw_sockets);
 }

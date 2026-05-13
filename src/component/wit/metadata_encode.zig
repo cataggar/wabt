@@ -79,6 +79,7 @@ pub const EncodeError = error{
     UnknownInterface,
     UnsupportedWitFeature,
     InvalidWit,
+    IncludeCycle,
 } || writer.EncodeError;
 
 /// Encode the named world from `doc` as a `component-type:<world>`
@@ -111,6 +112,26 @@ pub fn encodeWorldFromResolver(
     const world = findWorld(resolver.main, world_name) orelse return error.UnknownWorld;
     const pkg_id = resolver.main.package orelse return error.InvalidWit;
 
+    // Expand `include` items in the world body. Walks the world's
+    // items recursively, splicing in the contents of each included
+    // world (applying any `with { N as A }` renames) and detecting
+    // cycles. World-level `.use` items are dropped (no-op for
+    // emission); `.type` items still surface as
+    // `error.UnsupportedWitFeature` for now (Phase 4 work).
+    var expanded_items = std.ArrayListUnmanaged(ast.WorldItem).empty;
+    var include_stack = std.StringHashMapUnmanaged(void).empty;
+    try expandWorldItems(ar, resolver, world, pkg_id, &include_stack, &expanded_items);
+
+    // Implicit imports: every interface in the (expanded) world body
+    // may `use types.{...}` from a sibling interface that isn't
+    // otherwise present in the world. The component-model wire
+    // format requires those types to be reachable, so the encoder
+    // synthesises a matching `.import` for every transitively-used
+    // source interface not already imported or exported. This
+    // mirrors `wit-component`'s behaviour and is what makes the
+    // canonical `wasi-http/proxy` world encode end-to-end.
+    try addImplicitImports(ar, resolver, pkg_id, &expanded_items);
+
     // Build the world's body component-type decls.
     var world_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
 
@@ -139,18 +160,19 @@ pub fn encodeWorldFromResolver(
     // can emit alias-export decls right after each import without
     // having to re-walk every other interface.
     var alias_requests = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
-    for (world.items) |item| {
+    for (expanded_items.items) |item| {
         switch (item) {
             .@"export", .import => |we| {
                 try collectUseRequests(ar, resolver, we, &alias_requests);
             },
-            .use, .include, .type => return error.UnsupportedWitFeature,
+            .use => {},
+            .include, .type => return error.UnsupportedWitFeature,
         }
     }
 
     // Each `export <iface>;` / `import <ns>:<pkg>/<iface>;` becomes a
     // type=instance-type decl followed by an export/import decl.
-    for (world.items) |item| {
+    for (expanded_items.items) |item| {
         switch (item) {
             .@"export", .import => |we| {
                 const is_export = item == .@"export";
@@ -200,7 +222,8 @@ pub fn encodeWorldFromResolver(
                     }
                 }
             },
-            .use, .include, .type => return error.UnsupportedWitFeature,
+            .use => {},
+            .include, .type => return error.UnsupportedWitFeature,
         }
     }
 
@@ -321,6 +344,285 @@ fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
     return null;
 }
 
+/// Reorder interface items so type defs come out in dependency order.
+/// `use` items are emitted first (they bind use-imported names);
+/// type defs are then emitted such that any type referenced by another
+/// type appears first; funcs come last (they may reference any name
+/// bound by this point).
+///
+/// Canonical wasi-* files routinely forward-reference named types
+/// within an interface (e.g. `variant error-code` referencing a
+/// `record DNS-error-payload` declared later in the same file).
+fn sortIfaceItemsForEncoding(
+    ar: Allocator,
+    items: []const ast.InterfaceItem,
+) EncodeError![]const ast.InterfaceItem {
+    var uses = std.ArrayListUnmanaged(ast.InterfaceItem).empty;
+    var types = std.ArrayListUnmanaged(ast.InterfaceItem).empty;
+    var funcs = std.ArrayListUnmanaged(ast.InterfaceItem).empty;
+    for (items) |it| {
+        switch (it) {
+            .use => try uses.append(ar, it),
+            .type => try types.append(ar, it),
+            .func => try funcs.append(ar, it),
+        }
+    }
+
+    // Worklist topo-sort over types. A type is emittable when every
+    // named reference inside it either (a) is a primitive, (b) was
+    // already emitted in this pass, or (c) is bound via a `use`
+    // (collected upfront below).
+    var bound = std.StringHashMapUnmanaged(void).empty;
+    for (uses.items) |u_it| for (u_it.use.names) |un| {
+        const visible = un.rename orelse un.name;
+        try bound.put(ar, visible, {});
+    };
+
+    var sorted_types = std.ArrayListUnmanaged(ast.InterfaceItem).empty;
+    while (types.items.len > 0) {
+        var made_progress = false;
+        var i: usize = 0;
+        while (i < types.items.len) {
+            const t_item = types.items[i];
+            const td = t_item.type;
+            if (typeKindAllDepsBound(td.kind, bound, td.name)) {
+                try sorted_types.append(ar, t_item);
+                try bound.put(ar, td.name, {});
+                // Remove from types by swapping with the last element.
+                types.items[i] = types.items[types.items.len - 1];
+                types.items.len -= 1;
+                made_progress = true;
+            } else {
+                i += 1;
+            }
+        }
+        if (!made_progress) {
+            // Circular reference or unresolved name — fall back to
+            // declaration order and let the encoder error out at the
+            // real reference site with a more useful diagnostic.
+            for (types.items) |t_item| try sorted_types.append(ar, t_item);
+            break;
+        }
+    }
+
+    var out = std.ArrayListUnmanaged(ast.InterfaceItem).empty;
+    try out.appendSlice(ar, uses.items);
+    try out.appendSlice(ar, sorted_types.items);
+    try out.appendSlice(ar, funcs.items);
+    return try out.toOwnedSlice(ar);
+}
+
+fn typeKindAllDepsBound(
+    kind: ast.TypeDefKind,
+    bound: std.StringHashMapUnmanaged(void),
+    self_name: []const u8,
+) bool {
+    return switch (kind) {
+        .alias => |t| typeAllDepsBound(t, bound, self_name),
+        .record => |fields| blk: {
+            for (fields) |f| if (!typeAllDepsBound(f.type, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .variant => |cases| blk: {
+            for (cases) |c| if (c.type) |t| if (!typeAllDepsBound(t, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .@"enum", .flags => true,
+        .resource => |methods| blk: {
+            // Resources bind their own name BEFORE processing their
+            // method bodies, so self-references inside method sigs
+            // are always resolvable. Pass `self_name` so the inner
+            // type walker can treat it as bound.
+            for (methods) |m| {
+                for (m.func.params) |p| if (!typeAllDepsBound(p.type, bound, self_name)) break :blk false;
+                if (m.func.result) |r| if (!typeAllDepsBound(r, bound, self_name)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn typeAllDepsBound(t: ast.Type, bound: std.StringHashMapUnmanaged(void), self_name: []const u8) bool {
+    return switch (t) {
+        .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .char, .string => true,
+        .list => |inner| typeAllDepsBound(inner.*, bound, self_name),
+        .option => |inner| typeAllDepsBound(inner.*, bound, self_name),
+        .result => |r| blk: {
+            if (r.ok) |t2| if (!typeAllDepsBound(t2.*, bound, self_name)) break :blk false;
+            if (r.err) |t2| if (!typeAllDepsBound(t2.*, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .tuple => |ts| blk: {
+            for (ts) |t2| if (!typeAllDepsBound(t2, bound, self_name)) break :blk false;
+            break :blk true;
+        },
+        .name, .borrow, .own => |n| (self_name.len > 0 and std.mem.eql(u8, n, self_name)) or bound.contains(n),
+    };
+}
+
+/// Recursively expand `world.items`, splicing in the contents of any
+/// `.include` items into `out`. World-level `.use` items are dropped
+/// (they bind types into the world's name scope, which the encoder
+/// resolves lazily). `.include` cycles surface as `error.IncludeCycle`.
+///
+/// `ctx_pkg` is the consuming world's package, used as the fallback
+/// when an `include` target ref has no explicit package qualifier
+/// (`include foo;` resolves first in the consuming world's package).
+fn expandWorldItems(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    world: ast.World,
+    ctx_pkg: ast.PackageId,
+    visited: *std.StringHashMapUnmanaged(void),
+    out: *std.ArrayListUnmanaged(ast.WorldItem),
+) EncodeError!void {
+    for (world.items) |item| {
+        switch (item) {
+            .import, .@"export", .type => try out.append(ar, item),
+            .use => {},
+            .include => |inc| {
+                const target = resolver.findWorldCtx(inc.target, ctx_pkg) orelse return error.UnknownWorld;
+                const ns = if (target.pkg.namespace.len > 0) target.pkg.namespace else "<anon>";
+                const pn = target.pkg.name;
+                const key = try std.fmt.allocPrint(ar, "{s}:{s}/{s}", .{ ns, pn, target.world.name });
+                const gop = try visited.getOrPut(ar, key);
+                if (gop.found_existing) return error.IncludeCycle;
+
+                var inner = std.ArrayListUnmanaged(ast.WorldItem).empty;
+                try expandWorldItems(ar, resolver, target.world, target.pkg, visited, &inner);
+                _ = visited.remove(key);
+
+                for (inner.items) |inner_item| {
+                    const renamed = applyWithRenames(inner_item, inc.with);
+                    try out.append(ar, renamed);
+                }
+            },
+        }
+    }
+}
+
+fn applyWithRenames(item: ast.WorldItem, mapping: []const ast.UseName) ast.WorldItem {
+    if (mapping.len == 0) return item;
+    return switch (item) {
+        .import => |we| .{ .import = renameExtern(we, mapping) },
+        .@"export" => |we| .{ .@"export" = renameExtern(we, mapping) },
+        else => item,
+    };
+}
+
+fn renameExtern(we: ast.WorldExtern, mapping: []const ast.UseName) ast.WorldExtern {
+    const old = externShortName(we) orelse return we;
+    for (mapping) |m| {
+        if (std.mem.eql(u8, m.name, old)) {
+            const new = m.rename orelse return we;
+            return setExternShortName(we, new);
+        }
+    }
+    return we;
+}
+
+fn externShortName(we: ast.WorldExtern) ?[]const u8 {
+    return switch (we) {
+        .named_func => |nf| nf.name,
+        .named_interface => |ni| ni.name,
+        .interface_ref => |ir| if (ir.ref.package == null) ir.ref.name else null,
+    };
+}
+
+fn setExternShortName(we: ast.WorldExtern, new_name: []const u8) ast.WorldExtern {
+    return switch (we) {
+        .named_func => |nf| .{ .named_func = .{ .docs = nf.docs, .name = new_name, .func = nf.func } },
+        .named_interface => |ni| .{ .named_interface = .{ .docs = ni.docs, .name = new_name, .items = ni.items } },
+        .interface_ref => |ir| .{ .interface_ref = .{ .docs = ir.docs, .ref = .{ .package = ir.ref.package, .name = new_name } } },
+    };
+}
+
+/// For every interface in `items`, walk its `use` clauses and
+/// ensure the source interface is reachable in the world. Synthesises
+/// an `.import` for each source interface not already present.
+/// Mirrors `wit-component`'s implicit-import behaviour: the spec
+/// requires types referenced via `use` to be reachable via the
+/// world's import/export surface.
+///
+/// The result list is topologically ordered — every source interface
+/// appears BEFORE any interface that consumes it via `use`. This
+/// matters because the encoder builds `world_alias_map` import-by-
+/// import in declaration order; a consumer that references an alias
+/// not-yet-populated trips `error.InvalidWit`.
+fn addImplicitImports(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    ctx_pkg: ast.PackageId,
+    items: *std.ArrayListUnmanaged(ast.WorldItem),
+) EncodeError!void {
+    const original = try items.toOwnedSlice(ar);
+    items.* = .empty;
+
+    var seen = std.StringHashMapUnmanaged(void).empty;
+
+    const Helper = struct {
+        fn visit(
+            arena: Allocator,
+            res: wit_resolver.Resolver,
+            ctx: ast.PackageId,
+            out: *std.ArrayListUnmanaged(ast.WorldItem),
+            visited: *std.StringHashMapUnmanaged(void),
+            item: ast.WorldItem,
+        ) EncodeError!void {
+            const we = switch (item) {
+                .import, .@"export" => |w| w,
+                else => {
+                    try out.append(arena, item);
+                    return;
+                },
+            };
+            const ref = switch (we) {
+                .interface_ref => |ir| ir.ref,
+                else => {
+                    try out.append(arena, item);
+                    return;
+                },
+            };
+            const qn = qualifiedName(arena, we, ctx) catch return error.InvalidWit;
+            if (visited.contains(qn)) return;
+            try visited.put(arena, qn, {});
+
+            // Recurse on the iface's `use` source ifaces first.
+            const lookup = res.findInterfaceWithPkgCtx(ref, ctx) orelse return error.UnknownInterface;
+            for (lookup.iface.items) |iface_item| {
+                if (iface_item != .use) continue;
+                const u = iface_item.use;
+                const src_lookup = res.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse return error.UnknownInterface;
+                const src_qn = try formatQualifiedName(
+                    arena,
+                    src_lookup.pkg.namespace,
+                    src_lookup.pkg.name,
+                    u.from.name,
+                    src_lookup.pkg.version,
+                );
+                if (visited.contains(src_qn)) continue;
+                const synth: ast.WorldExtern = .{ .interface_ref = .{
+                    .docs = "",
+                    .ref = .{
+                        .package = .{
+                            .namespace = src_lookup.pkg.namespace,
+                            .name = src_lookup.pkg.name,
+                            .version = src_lookup.pkg.version,
+                        },
+                        .name = u.from.name,
+                    },
+                } };
+                try visit(arena, res, ctx, out, visited, .{ .import = synth });
+            }
+            try out.append(arena, item);
+        }
+    };
+
+    for (original) |it| {
+        try Helper.visit(ar, resolver, ctx_pkg, items, &seen, it);
+    }
+}
+
 /// Compute the qualified name to advertise on the wire for a world's
 /// extern. `<id>;` and `<id>@<ver>;` get prefixed by the document's
 /// package; `<ns>:<pkg>/<iface>[@<ver>];` is used as-is.
@@ -394,7 +696,17 @@ fn buildInterfaceBody(
         .type_idx = 0,
         .name_map = .empty,
     };
-    for (iface_body.items) |it| {
+    // Reorder iface items so type defs come out in dependency order
+    // (forward references between named types are common in canonical
+    // wasi-* files — `variant error-code` references `record
+    // DNS-error-payload` which is defined later in the same file).
+    // `use` items must come first to bind use-imported names; types
+    // are then emitted in topological order (each type's name-deps
+    // are emitted before it); funcs come last (they may reference
+    // any name).
+    const sorted_items = try sortIfaceItemsForEncoding(ar, iface_body.items);
+
+    for (sorted_items) |it| {
         switch (it) {
             .func => |f| try builder.emitFuncExport(f.name, f.func, null),
             .type => |td| switch (td.kind) {
@@ -1567,20 +1879,47 @@ test "metadata_encode: use of an unknown type in source iface reports InvalidWit
     defer testing.allocator.free(bytes);
 }
 
-test "metadata_encode: rejects use whose source iface is not in the world" {
-    // The source interface of a `use` clause must also be reachable
-    // from the world body (as an import or export). Without that,
-    // the world body has no instance to alias from, and the
-    // pre-pass key won't be populated — leaving the consuming-iface
-    // body looking up a slot that doesn't exist.
+test "metadata_encode: implicit-imports source iface used by an iface in the world (#195 phase 4)" {
+    // Before #195 phase 4, the source interface of a `use` clause
+    // had to be explicitly imported/exported by the world; without
+    // that, the encoder returned `error.InvalidWit`. Now the
+    // encoder auto-imports the source — mirroring wit-component's
+    // implicit-import behaviour — so worlds like `wasi-http/proxy`
+    // (which only includes `imports`, not the underlying
+    // `wasi:http/types` interface that its exports `use`) encode
+    // cleanly.
     const source =
         \\package docs:demo@0.1.0;
         \\interface streams { resource output-stream { } }
-        \\interface stdout { use streams.{output-stream}; }
+        \\interface stdout { use streams.{output-stream}; get-stdout: func() -> own<output-stream>; }
         \\world cmd { import stdout; }
     ;
-    const r = encodeWorldFromSource(testing.allocator, source, "cmd");
-    try testing.expectError(error.InvalidWit, r);
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "cmd");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(bytes, arena.allocator());
+
+    // The world body should contain TWO imports — `stdout`
+    // (explicitly declared) and `streams` (auto-imported because
+    // `stdout` uses it).
+    const wb = comp.types[0].component.decls[0].type.component;
+    var import_names = std.ArrayListUnmanaged([]const u8).empty;
+    for (wb.decls) |d| switch (d) {
+        .import => |im| try import_names.append(arena.allocator(), im.name),
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), import_names.items.len);
+    var saw_streams = false;
+    var saw_stdout = false;
+    for (import_names.items) |n| {
+        if (std.mem.endsWith(u8, n, "/streams@0.1.0")) saw_streams = true;
+        if (std.mem.endsWith(u8, n, "/stdout@0.1.0")) saw_stdout = true;
+    }
+    try testing.expect(saw_streams);
+    try testing.expect(saw_stdout);
 }
 
 test "metadata_encode: use clause from qualified versioned source ref" {
@@ -1894,3 +2233,113 @@ test "metadata_encode #182: explicit borrow<R> on use-introduced resource still 
     try testing.expect(ops_body.decls[2].type.val == .borrow);
     try testing.expectEqual(@as(u32, 1), ops_body.decls[2].type.val.borrow);
 }
+
+test "metadata_encode #195p3: include splices base world's items" {
+    // Synthetic include test mirroring wasi-http's
+    // `world proxy { include imports; export incoming-handler; }`
+    // pattern. The consumer world should encode as if `base`'s
+    // items were inlined.
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface b { g: func(); }
+        \\world base {
+        \\    import a;
+        \\}
+        \\world consumer {
+        \\    include base;
+        \\    export b;
+        \\}
+    ;
+    const ct = try encodeWorldFromSource(testing.allocator, source, "consumer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+
+    // World body: import a (instance) + export b (instance) — 4 decls.
+    const wb = comp.types[0].component.decls[0].type.component;
+    var imports: usize = 0;
+    var exports: usize = 0;
+    for (wb.decls) |d| switch (d) {
+        .import => imports += 1,
+        .@"export" => exports += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), imports);
+    try testing.expectEqual(@as(usize, 1), exports);
+}
+
+test "metadata_encode #195p3: transitive include (3 deep)" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface b { g: func(); }
+        \\interface c { h: func(); }
+        \\world inner { import a; }
+        \\world middle { include inner; import b; }
+        \\world outer { include middle; export c; }
+    ;
+    const ct = try encodeWorldFromSource(testing.allocator, source, "outer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+
+    const wb = comp.types[0].component.decls[0].type.component;
+    var imports: usize = 0;
+    var exports: usize = 0;
+    for (wb.decls) |d| switch (d) {
+        .import => imports += 1,
+        .@"export" => exports += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), imports); // a + b
+    try testing.expectEqual(@as(usize, 1), exports); // c
+}
+
+test "metadata_encode #195p3: include cycle is detected" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\world w1 { include w2; }
+        \\world w2 { include w1; }
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "w1");
+    try testing.expectError(error.IncludeCycle, r);
+}
+
+test "metadata_encode #195p3: include with { N as A } rename" {
+    const source =
+        \\package docs:demo@0.1.0;
+        \\interface a { f: func(); }
+        \\interface a-renamed { f: func(); }
+        \\world base { import a; }
+        \\world consumer { include base with { a as a-renamed }; }
+    ;
+    // The rename should rebind the imported name `a` to `a-renamed`.
+    // Since both interfaces exist in the package, the encoder uses
+    // the renamed local name to look up the interface body. Both
+    // should encode without error.
+    const ct = try encodeWorldFromSource(testing.allocator, source, "consumer");
+    defer testing.allocator.free(ct);
+
+    const loader = @import("../loader.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const comp = try loader.load(ct, arena.allocator());
+    const wb = comp.types[0].component.decls[0].type.component;
+    var found_renamed = false;
+    for (wb.decls) |d| switch (d) {
+        .import => |im| {
+            if (std.mem.indexOf(u8, im.name, "/a-renamed@") != null) found_renamed = true;
+        },
+        else => {},
+    };
+    try testing.expect(found_renamed);
+}
+

@@ -956,6 +956,117 @@ test "buildComponent #198: wraps cross-iface-use resources with import + alias +
     }
 }
 
+test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
+    // Phase 5 acceptance for #195: pointing wabt at the canonical
+    // wasi-http@0.2.6 WIT layout + a Zig stub exporting
+    // `wasi:http/incoming-handler@0.2.6#handle` round-trips through
+    // metadata_encode (with include expansion + implicit imports +
+    // type topo-sort) and buildComponent (with resource hoisting,
+    // #199) into a binary whose component-level type indexspace is
+    // sound.
+    //
+    // The vendored canonical files live at src/component/wit/wasi-canon/
+    // (added in #200 / Phase 1). We assemble a temp WIT tree at test
+    // time and drive the embed + new pipeline against a synthesised
+    // core wasm exporting the proxy world's lifted func.
+    const wit_resolver = wabt.component.wit.resolver;
+    const wit_encode = wabt.component.wit.metadata_encode;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const alloc = ar.allocator();
+    const io = std.testing.io;
+    const cwd = std.Io.Dir.cwd();
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.createDirPath(io, "wit/deps");
+
+    const pkgs = [_]struct { src_dir: []const u8, dst_rel: []const u8 }{
+        .{ .src_dir = "src/component/wit/wasi-canon/http", .dst_rel = "wit" },
+        .{ .src_dir = "src/component/wit/wasi-canon/cli", .dst_rel = "wit/deps/cli" },
+        .{ .src_dir = "src/component/wit/wasi-canon/clocks", .dst_rel = "wit/deps/clocks" },
+        .{ .src_dir = "src/component/wit/wasi-canon/filesystem", .dst_rel = "wit/deps/filesystem" },
+        .{ .src_dir = "src/component/wit/wasi-canon/io", .dst_rel = "wit/deps/io" },
+        .{ .src_dir = "src/component/wit/wasi-canon/random", .dst_rel = "wit/deps/random" },
+        .{ .src_dir = "src/component/wit/wasi-canon/sockets", .dst_rel = "wit/deps/sockets" },
+    };
+    for (pkgs) |pkg| {
+        try tmp.dir.createDirPath(io, pkg.dst_rel);
+        var src = try cwd.openDir(io, pkg.src_dir, .{ .iterate = true });
+        defer src.close(io);
+        var it = src.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".wit")) continue;
+            const src_path = try std.fs.path.join(alloc, &.{ pkg.src_dir, entry.name });
+            const buf = try cwd.readFileAlloc(io, src_path, alloc, std.Io.Limit.limited(1 << 20));
+            const dst_path = try std.fs.path.join(alloc, &.{ pkg.dst_rel, entry.name });
+            try tmp.dir.writeFile(io, .{ .sub_path = dst_path, .data = buf });
+        }
+    }
+
+    const tmp_wit = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try wit_resolver.parseLayout(alloc, io, tmp_wit);
+
+    // Encode the proxy world's component-type metadata.
+    const ct_payload = try wit_encode.encodeWorldFromResolver(testing.allocator, res, "proxy");
+    defer testing.allocator.free(ct_payload);
+    try testing.expect(ct_payload.len > 0);
+
+    // Synthesise a core wasm exporting
+    // `wasi:http/incoming-handler@0.2.6#handle (i32, i32) -> ()`,
+    // matching the world's sole export, then attach the embedded
+    // component-type section.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 43, 0x01,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:proxy";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+    try testing.expect(comp_bytes.len > 0);
+
+    // The wrapping component must parse cleanly. Validators
+    // (wasm-tools) accept this binary in interactive runs; this
+    // in-process check uses the wabt loader as a smoke-test
+    // proxy to keep the test self-contained.
+    const loaded = try loader.load(comp_bytes, alloc);
+    try testing.expect(loaded.imports.len >= 1);
+    try testing.expect(loaded.exports.len >= 1);
+    // The exported instance must be the proxy world's
+    // incoming-handler export.
+    var saw_export = false;
+    for (loaded.exports) |e| {
+        if (std.mem.indexOf(u8, e.name, "wasi:http/incoming-handler@0.2.6") != null) {
+            saw_export = true;
+            break;
+        }
+    }
+    try testing.expect(saw_export);
+}
+
 test "buildComponent: rejects core wasm without component-type section" {
     const bare = [_]u8{
         0x00, 0x61, 0x73, 0x6d,
