@@ -199,7 +199,63 @@ pub const Resolver = struct {
         iface: ast.Interface,
         pkg: ast.PackageId,
     };
+
+    /// Look up a world by reference. Same package-matching rules as
+    /// `findInterfaceWithPkg`. Used by `metadata_encode` to expand
+    /// `include` items.
+    pub fn findWorld(self: Resolver, ref: ast.InterfaceRef) ?WorldLookup {
+        return self.findWorldCtx(ref, null);
+    }
+
+    pub fn findWorldCtx(self: Resolver, ref: ast.InterfaceRef, ctx_pkg: ?ast.PackageId) ?WorldLookup {
+        if (ref.package == null) {
+            if (ctx_pkg) |cp| {
+                if (self.main.package) |mp| {
+                    if (packageMatches(mp, cp)) {
+                        if (findWorldInDoc(self.main, ref.name)) |w| return .{ .world = w, .pkg = mp };
+                    }
+                }
+                for (self.deps) |dep| {
+                    if (dep.package) |dp| {
+                        if (packageMatches(dp, cp)) {
+                            if (findWorldInDoc(dep, ref.name)) |w| return .{ .world = w, .pkg = dp };
+                        }
+                    }
+                }
+            }
+            if (findWorldInDoc(self.main, ref.name)) |w| {
+                return .{ .world = w, .pkg = self.main.package orelse return null };
+            }
+            return null;
+        }
+        const target_pkg = ref.package.?;
+        if (self.main.package) |mp| {
+            if (packageMatches(mp, target_pkg)) {
+                if (findWorldInDoc(self.main, ref.name)) |w| return .{ .world = w, .pkg = mp };
+            }
+        }
+        for (self.deps) |dep| {
+            if (dep.package) |dp| {
+                if (packageMatches(dp, target_pkg)) {
+                    if (findWorldInDoc(dep, ref.name)) |w| return .{ .world = w, .pkg = dp };
+                }
+            }
+        }
+        return null;
+    }
+
+    pub const WorldLookup = struct {
+        world: ast.World,
+        pkg: ast.PackageId,
+    };
 };
+
+fn findWorldInDoc(doc: ast.Document, name: []const u8) ?ast.World {
+    for (doc.items) |it| {
+        if (it == .world and std.mem.eql(u8, it.world.name, name)) return it.world;
+    }
+    return null;
+}
 
 fn findInterfaceInDoc(doc: ast.Document, name: []const u8) ?ast.Interface {
     for (doc.items) |it| {
