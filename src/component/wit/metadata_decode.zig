@@ -95,6 +95,21 @@ pub const WorldExtern = struct {
     type_slots: []const TypeSlot,
     /// Funcs declared by the interface this extern references.
     funcs: []const FuncRef,
+    /// Raw on-wire instance-type body decls. 1:1 with `type_slots`
+    /// for the type-allocating decls (every `.type`/`.alias`/`.@"export" type`
+    /// decl bumps the body-local type-index space by one) plus the
+    /// `.@"export" func` decls that name the captured funcs. Useful
+    /// when a consumer needs to transplant the body verbatim into a
+    /// new component or build a typed view over it (e.g. the
+    /// canonical-ABI `flatten` pass in `src/component/adapter/abi.zig`
+    /// resolves `.type_idx` refs against exactly this slice).
+    ///
+    /// Cross-iface `alias outer` and `alias instance_export` decls
+    /// inside this body reference scopes that exist in the encoded
+    /// `component-type` payload's world body; consumers transplanting
+    /// the body elsewhere must rebase those refs (or restrict
+    /// themselves to bodies that don't contain them).
+    inst_decls: []const ctypes.Decl,
 };
 
 pub const DecodedWorld = struct {
@@ -181,6 +196,7 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
             .qualified_name = qualified_name,
             .type_slots = body.type_slots,
             .funcs = body.funcs,
+            .inst_decls = inst_type.decls,
         });
         i = j + 1;
     }
