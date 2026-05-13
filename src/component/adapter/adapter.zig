@@ -1555,12 +1555,17 @@ fn assemble(in: Inputs) ![]u8 {
     return writer.encode(in.gpa, &comp);
 }
 
-fn buildCanonLowerOpts(
+/// Build the `CanonOpt[]` slice for a `canon.lower` derived from the
+/// canonical-ABI classification of an imported func. Both the
+/// adapter splicer and the plain-wrap path (`component new`) need
+/// this — `memory` + `cabi_realloc` come from the main core
+/// instance regardless of whether the splicer is involved.
+pub fn buildCanonLowerOpts(
     arena: Allocator,
     o: abi.FuncOpts,
     memory_core_idx: u32,
     realloc_core_idx: u32,
-) SpliceError![]const ctypes.CanonOpt {
+) error{OutOfMemory}![]const ctypes.CanonOpt {
     var n: usize = 0;
     if (o.memory) n += 1;
     if (o.realloc) n += 1;

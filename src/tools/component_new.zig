@@ -458,6 +458,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         resources: []const []const u8,
         funcs: []const metadata_decode.FuncRef,
         ext_slots: []const metadata_decode.TypeSlot,
+        inst_decls: []const ctypes.Decl,
     };
     var import_shapes = std.ArrayListUnmanaged(ImportShape).empty;
     for (decoded.externs) |ext| {
@@ -474,12 +475,49 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .resources = owned,
             .funcs = ext.funcs,
             .ext_slots = ext.type_slots,
+            .inst_decls = ext.inst_decls,
         });
         for (owned) |name| {
             const gop = try resource_owner.getOrPut(ar, name);
             if (gop.found_existing) return error.AmbiguousResourceName;
             gop.value_ptr.* = ext.qualified_name;
         }
+    }
+
+    // ── Phase 1.5: classify every imported func to decide whether
+    //    canon.lower needs the `(memory <main>) + (realloc <cabi>)`
+    //    options bundle. Funcs whose sigs reach `string`/`list` (or
+    //    multi-result indirect lowering) need the opts; everything
+    //    else (handle-only, primitives, enum) lowers cleanly with
+    //    `.opts = &.{}` via the #202 fast path.
+    //
+    // Computing this upfront lets us avoid the shim/fixup
+    // machinery entirely when no func needs it — keeping the #202
+    // reproducer's wire output bit-identical, and avoiding the
+    // forward-reference cycle on `(memory main_inst …)` aliases
+    // that the shim/fixup pattern exists to break.
+    var any_func_needs_opts = false;
+    for (import_shapes.items) |shape| {
+        const resolver = wabt.component.adapter.abi.TypeResolver{
+            .inst_decls = shape.inst_decls,
+            .world_decls = &.{},
+        };
+        for (shape.funcs) |fn_ref| {
+            const ftr = wabt.component.adapter.abi.FuncTypeRef{
+                .func = fn_ref.sig,
+                .resolver = resolver,
+            };
+            const cls = wabt.component.adapter.abi.classifyFunc(ftr);
+            if (cls.opts.memory or cls.opts.realloc or cls.opts.string_encoding) {
+                any_func_needs_opts = true;
+                break;
+            }
+        }
+        if (any_func_needs_opts) break;
+    }
+
+    if (any_func_needs_opts) {
+        return try buildComponentShimFixup(alloc, ar, decoded, stripped_core);
     }
 
     // ── Build component AST.
@@ -929,6 +967,573 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     return writer.encode(alloc, &comp);
 }
 
+/// Shim/fixup path of `buildComponent`: emitted when at least one
+/// imported func needs `(memory)` + `(realloc)` canon-lower opts to
+/// lower its string / list / multi-result params or results
+/// (cataggar/wabt#203).
+///
+/// The forward-reference cycle — canon.lower needs the main
+/// instance's `memory` / `cabi_realloc` exports, but the main
+/// instance needs the lowered funcs as `(with …)` args — is broken
+/// with the wasm-tools shim/fixup trampoline pattern:
+///
+///   1. `shim` core module exposes one trapping trampoline per
+///      lowered func, all `call_indirect`-ing through a funcref
+///      table also exported as `$imports`.
+///   2. Instantiate shim. Per-import shim-stub bundles bind the
+///      main module's imports to the shim's stubs by canonical
+///      method name (`[constructor]fields`, `[method]fields.append`,
+///      …).
+///   3. Instantiate main with those bundles as `(with …)` args.
+///      Main's `memory` + `cabi_realloc` are now reachable.
+///   4. Alias main's memory and cabi_realloc, then emit
+///      `canon.lower` per wired func with the opts pointing at them.
+///   5. `fixup` core module has an active element segment that
+///      populates the shim's `$imports` table from offset 0 with
+///      the lowered funcs.
+///   6. Instantiate fixup with `(with "" <bundle of lowered funcs +
+///      shim.$imports>)`. The active elem fires on instantiation,
+///      patching every shim stub to call the real lowered func.
+///
+/// Cross-iface handle refs in imported func sigs are still
+/// skipped here — the verbatim body lift assumes the body's
+/// `alias outer` / `alias instance_export` references resolve
+/// against an outer scope that we don't currently reconstruct.
+/// Lifting that restriction is a separate follow-up.
+fn buildComponentShimFixup(
+    alloc: std.mem.Allocator,
+    ar: std.mem.Allocator,
+    decoded: metadata_decode.DecodedWorld,
+    stripped_core: []const u8,
+) ![]u8 {
+    const abi = wabt.component.adapter.abi;
+    const shim_mod = wabt.component.adapter.shim;
+    const fixup_mod = wabt.component.adapter.fixup;
+    const wtypes = wabt.types;
+
+    const core_exports = try probeCoreExports(stripped_core);
+    const memory_export_name = core_exports.memory_name orelse return error.MissingCoreExportMemory;
+    const realloc_export_name = core_exports.realloc_name orelse return error.MissingCabiRealloc;
+
+    // ── Phase 1: re-collect import shapes (same as the fast path).
+    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    const ImportShape = struct {
+        qualified_name: []const u8,
+        resources: []const []const u8,
+        funcs: []const metadata_decode.FuncRef,
+        ext_slots: []const metadata_decode.TypeSlot,
+        inst_decls: []const ctypes.Decl,
+    };
+    var import_shapes = std.ArrayListUnmanaged(ImportShape).empty;
+    for (decoded.externs) |ext| {
+        if (ext.is_export) continue;
+        var rs = std.ArrayListUnmanaged([]const u8).empty;
+        for (ext.type_slots) |slot| switch (slot) {
+            .sub_resource => |name| try rs.append(ar, name),
+            else => {},
+        };
+        if (rs.items.len == 0 and ext.funcs.len == 0) continue;
+        const owned = try rs.toOwnedSlice(ar);
+        try import_shapes.append(ar, .{
+            .qualified_name = ext.qualified_name,
+            .resources = owned,
+            .funcs = ext.funcs,
+            .ext_slots = ext.type_slots,
+            .inst_decls = ext.inst_decls,
+        });
+        for (owned) |name| {
+            const gop = try resource_owner.getOrPut(ar, name);
+            if (gop.found_existing) return error.AmbiguousResourceName;
+            gop.value_ptr.* = ext.qualified_name;
+        }
+    }
+
+    // ── Phase 2: classify each imported func + compute its lowered
+    //    core signature. A func is "wired" (gets a canon.lower +
+    //    shim slot) iff its body lift would be valid — i.e. its sig
+    //    doesn't reach types that the instance-type body's alias
+    //    decls bind. For #203 minimum scope we just call
+    //    classifyFunc with an empty world_decls; the resolver
+    //    falls back to scalar-handle for any unresolvable type idx,
+    //    which is the correct ABI shape for resource handles but
+    //    silently wrong for outer-aliased compound types. The
+    //    follow-up that wires cross-iface refs into the body also
+    //    flips this to a hard skip.
+    const WiredFunc = struct {
+        fn_ref: metadata_decode.FuncRef,
+        opts: abi.FuncOpts,
+        slot_params: []const wtypes.ValType,
+        slot_results: []const wtypes.ValType,
+    };
+    var wired_by_shape = try ar.alloc([]WiredFunc, import_shapes.items.len);
+    var total_wired: u32 = 0;
+    for (import_shapes.items, 0..) |shape, i| {
+        var list = std.ArrayListUnmanaged(WiredFunc).empty;
+        const resolver = abi.TypeResolver{
+            .inst_decls = shape.inst_decls,
+            .world_decls = &.{},
+        };
+        for (shape.funcs) |fn_ref| {
+            const ftr = abi.FuncTypeRef{ .func = fn_ref.sig, .resolver = resolver };
+            const cls = abi.classifyFunc(ftr);
+            const lowered = try abi.lowerCoreSig(ar, ftr);
+            try list.append(ar, .{
+                .fn_ref = fn_ref,
+                .opts = cls.opts,
+                .slot_params = lowered.params,
+                .slot_results = lowered.results,
+            });
+        }
+        wired_by_shape[i] = try list.toOwnedSlice(ar);
+        total_wired += @intCast(wired_by_shape[i].len);
+    }
+
+    // ── Phase 3: build shim + fixup core wasm bytes.
+    const shim_slots = try ar.alloc(shim_mod.Slot, total_wired);
+    {
+        var k: usize = 0;
+        for (wired_by_shape) |wired| for (wired) |w| {
+            shim_slots[k] = .{ .params = w.slot_params, .results = w.slot_results };
+            k += 1;
+        };
+    }
+    const shim_bytes = try shim_mod.build(ar, shim_slots);
+    const fixup_bytes = try fixup_mod.build(ar, shim_slots);
+
+    // ── Phase 4: build the wrapping component AST.
+    //
+    // core_modules: [main(0), shim(1), fixup(2)].
+    const core_modules = try ar.alloc(ctypes.CoreModule, 3);
+    core_modules[0] = .{ .data = stripped_core };
+    core_modules[1] = .{ .data = shim_bytes };
+    core_modules[2] = .{ .data = fixup_bytes };
+
+    var core_instances = std.ArrayListUnmanaged(ctypes.CoreInstanceExpr).empty;
+    var aliases = std.ArrayListUnmanaged(ctypes.Alias).empty;
+    var types = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    var canons = std.ArrayListUnmanaged(ctypes.Canon).empty;
+    var instances = std.ArrayListUnmanaged(ctypes.InstanceExpr).empty;
+    var exports = std.ArrayListUnmanaged(ctypes.ExportDecl).empty;
+    var imports = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
+    var comp_type_idx: u32 = 0;
+    var order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+    const Section = struct {
+        fn appendType(o: *std.ArrayListUnmanaged(ctypes.SectionEntry), arx: std.mem.Allocator, n: usize) !void {
+            try o.append(arx, .{ .kind = .type, .start = @intCast(n - 1), .count = 1 });
+        }
+        fn appendAlias(o: *std.ArrayListUnmanaged(ctypes.SectionEntry), arx: std.mem.Allocator, n: usize) !void {
+            try o.append(arx, .{ .kind = .alias, .start = @intCast(n - 1), .count = 1 });
+        }
+    };
+
+    // ── Phase 4a: emit instance-type + import per shape using the
+    //    metadata's encoded body verbatim. Resource sub_resource
+    //    exports live inside it already; func type defs + named
+    //    `.@"export" func` decls too. The body's local type-index
+    //    space matches the func sigs' slot refs by construction.
+    var import_inst_idx_for = std.StringHashMapUnmanaged(u32).empty;
+    for (import_shapes.items, 0..) |shape, i| {
+        try types.append(ar, .{ .instance = .{ .decls = shape.inst_decls } });
+        try Section.appendType(&order, ar, types.items.len);
+        const inst_type_idx = comp_type_idx;
+        comp_type_idx += 1;
+        try imports.append(ar, .{
+            .name = shape.qualified_name,
+            .desc = .{ .instance = inst_type_idx },
+        });
+        try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
+        try import_inst_idx_for.put(ar, shape.qualified_name, @intCast(i));
+    }
+    const import_inst_count: u32 = @intCast(imports.items.len);
+
+    // ── Phase 4b: alias each wired imported func into the
+    //    component-level func indexspace. These slots become the
+    //    `func_idx` operand of `canon.lower` in Phase 4f.
+    var comp_func_idx: u32 = 0;
+    const FuncAlias = struct { comp_func_idx: u32 };
+    var func_alias_by_shape = try ar.alloc([]FuncAlias, import_shapes.items.len);
+    for (import_shapes.items, 0..) |_, i| {
+        const wired = wired_by_shape[i];
+        var slots = try ar.alloc(FuncAlias, wired.len);
+        for (wired, 0..) |w, fi| {
+            try aliases.append(ar, .{ .instance_export = .{
+                .sort = .func,
+                .instance_idx = @intCast(i),
+                .name = w.fn_ref.name,
+            } });
+            try Section.appendAlias(&order, ar, aliases.items.len);
+            slots[fi] = .{ .comp_func_idx = comp_func_idx };
+            comp_func_idx += 1;
+        }
+        func_alias_by_shape[i] = slots;
+    }
+
+    // ── Phase 4c: emit core modules section then start core_instance.
+    try order.append(ar, .{ .kind = .core_module, .start = 0, .count = 3 });
+
+    // Core-func index space: shim contributes `total_wired` stubs
+    // when we alias them below; main exports + lowered funcs follow.
+    var core_func_idx: u32 = 0;
+    // Core-instance index counter — drives every `instance_idx`
+    // payload that follows.
+    //
+    // Step 1: instantiate shim (no args).
+    try core_instances.append(ar, .{ .instantiate = .{ .module_idx = 1, .args = &.{} } });
+    const shim_inst_idx: u32 = @intCast(core_instances.items.len - 1);
+
+    // Step 2: alias the shim's N stubs by name ("0","1",…) as core
+    // funcs. These become the source funcs for the per-shape
+    // bundles that satisfy main's `(with …)` args.
+    const shim_stub_core_idx_base = core_func_idx;
+    {
+        var k: u32 = 0;
+        while (k < total_wired) : (k += 1) {
+            const name = try std.fmt.allocPrint(ar, "{d}", .{k});
+            try aliases.append(ar, .{ .instance_export = .{
+                .sort = .{ .core = .func },
+                .instance_idx = shim_inst_idx,
+                .name = name,
+            } });
+            try Section.appendAlias(&order, ar, aliases.items.len);
+            core_func_idx += 1;
+        }
+    }
+
+    // Step 3: per import shape, build an inline-exports bundle
+    // mapping each wired func's canonical method name to its shim
+    // stub. Bundle indices live in the core-instance indexspace.
+    var bundle_for_main_args = std.ArrayListUnmanaged(ctypes.CoreInstantiateArg).empty;
+    {
+        var stub_cursor: u32 = shim_stub_core_idx_base;
+        for (import_shapes.items, 0..) |shape, i| {
+            const wired = wired_by_shape[i];
+            if (wired.len == 0) continue;
+            const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len);
+            for (wired, 0..) |w, fi| {
+                bundle_exports[fi] = .{
+                    .name = w.fn_ref.name,
+                    .sort_idx = .{ .sort = .func, .idx = stub_cursor },
+                };
+                stub_cursor += 1;
+            }
+            try core_instances.append(ar, .{ .exports = bundle_exports });
+            const bundle_inst_idx: u32 = @intCast(core_instances.items.len - 1);
+            try bundle_for_main_args.append(ar, .{
+                .name = shape.qualified_name,
+                .instance_idx = bundle_inst_idx,
+            });
+        }
+    }
+
+    // Step 4: instantiate main with the per-shape bundles as args.
+    try core_instances.append(ar, .{ .instantiate = .{
+        .module_idx = 0,
+        .args = try bundle_for_main_args.toOwnedSlice(ar),
+    } });
+    const main_core_inst_idx: u32 = @intCast(core_instances.items.len - 1);
+
+    // ── Phase 4d: alias `memory` + `cabi_realloc` from main —
+    //    these are the canon.lower opts targets.
+    try aliases.append(ar, .{ .instance_export = .{
+        .sort = .{ .core = .memory },
+        .instance_idx = main_core_inst_idx,
+        .name = memory_export_name,
+    } });
+    try Section.appendAlias(&order, ar, aliases.items.len);
+    const memory_core_idx: u32 = 0; // first core-memory we alias
+
+    try aliases.append(ar, .{ .instance_export = .{
+        .sort = .{ .core = .func },
+        .instance_idx = main_core_inst_idx,
+        .name = realloc_export_name,
+    } });
+    try Section.appendAlias(&order, ar, aliases.items.len);
+    const realloc_core_idx: u32 = core_func_idx;
+    core_func_idx += 1;
+
+    // ── Phase 4e: alias the shim's `$imports` table. Used as the
+    //    `$imports` import of the fixup module's args bundle.
+    try aliases.append(ar, .{ .instance_export = .{
+        .sort = .{ .core = .table },
+        .instance_idx = shim_inst_idx,
+        .name = "$imports",
+    } });
+    try Section.appendAlias(&order, ar, aliases.items.len);
+    const shim_table_core_idx: u32 = 0; // first core-table we alias
+
+    // ── Phase 4f: canon.lower per wired func with opts pointing
+    //    at the memory + cabi_realloc indices aliased in Phase 4d.
+    const lowered_core_idx_base = core_func_idx;
+    {
+        const lowers_start: u32 = @intCast(canons.items.len);
+        for (wired_by_shape, 0..) |wired, si| {
+            for (wired, 0..) |w, fi| {
+                const opts = try wabt.component.adapter.adapter.buildCanonLowerOpts(
+                    ar,
+                    w.opts,
+                    memory_core_idx,
+                    realloc_core_idx,
+                );
+                try canons.append(ar, .{ .lower = .{
+                    .func_idx = func_alias_by_shape[si][fi].comp_func_idx,
+                    .opts = opts,
+                } });
+                core_func_idx += 1;
+            }
+        }
+        const lowers_count: u32 = @as(u32, @intCast(canons.items.len)) - lowers_start;
+        if (lowers_count > 0) {
+            try order.append(ar, .{ .kind = .canon, .start = lowers_start, .count = lowers_count });
+        }
+    }
+
+    // ── Phase 4g: build the fixup module's args bundle. Maps each
+    //    slot's stable name ("0","1",…) to the lowered core func at
+    //    `lowered_core_idx_base + i`, plus `$imports` → the shim's
+    //    table. Then instantiate fixup with this bundle.
+    {
+        const bundle_size = total_wired + 1;
+        const bundle = try ar.alloc(ctypes.CoreInlineExport, bundle_size);
+        var k: u32 = 0;
+        while (k < total_wired) : (k += 1) {
+            const name = try std.fmt.allocPrint(ar, "{d}", .{k});
+            bundle[k] = .{
+                .name = name,
+                .sort_idx = .{ .sort = .func, .idx = lowered_core_idx_base + k },
+            };
+        }
+        bundle[total_wired] = .{
+            .name = "$imports",
+            .sort_idx = .{ .sort = .table, .idx = shim_table_core_idx },
+        };
+        try core_instances.append(ar, .{ .exports = bundle });
+        const fixup_args_idx: u32 = @intCast(core_instances.items.len - 1);
+
+        const fixup_args = try ar.alloc(ctypes.CoreInstantiateArg, 1);
+        fixup_args[0] = .{ .name = "", .instance_idx = fixup_args_idx };
+        try core_instances.append(ar, .{ .instantiate = .{
+            .module_idx = 2,
+            .args = fixup_args,
+        } });
+    }
+
+    try order.append(ar, .{
+        .kind = .core_instance,
+        .start = 0,
+        .count = @intCast(core_instances.items.len),
+    });
+
+    // ── Phase 5: export-side. Mirrors the #202 fast path: walk
+    //    `is_export=true` externs, hoist their resource handles via
+    //    the same HandleResolver, emit `canon.lift` per func, and a
+    //    top-level instance export per ext. The only difference is
+    //    that `instance_idx` for the `alias instance_export
+    //    sort=core(.func)` calls is `main_core_inst_idx` (not
+    //    literal 0) — same generalisation as #202.
+    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    const HandleKind = enum { own, borrow };
+    const HandleKey = struct { name: []const u8, kind: HandleKind };
+    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
+    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
+
+    const HandleResolver = struct {
+        ar: std.mem.Allocator,
+        ext_slots: []const metadata_decode.TypeSlot,
+        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+        aliases: *std.ArrayListUnmanaged(ctypes.Alias),
+        resource_owner: *std.StringHashMapUnmanaged([]const u8),
+        import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
+        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
+        hoist_idxs: *std.ArrayListUnmanaged(u32),
+        comp_type_idx: *u32,
+        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+
+        fn resourceAlias(self: @This(), name: []const u8) !u32 {
+            if (self.resource_alias_idx.get(name)) |idx| return idx;
+            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
+            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
+            try self.aliases.append(self.ar, .{ .instance_export = .{
+                .sort = .type,
+                .instance_idx = inst_idx,
+                .name = name,
+            } });
+            try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.resource_alias_idx.put(self.ar, name, slot);
+            return slot;
+        }
+
+        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
+            for (self.hoist_keys.items, 0..) |k, i| {
+                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
+                    return self.hoist_idxs.items[i];
+                }
+            }
+            const alias_slot = try self.resourceAlias(name);
+            const vt: ctypes.ValType = switch (kind) {
+                .own => .{ .own = alias_slot },
+                .borrow => .{ .borrow = alias_slot },
+            };
+            try self.types.append(self.ar, .{ .val = vt });
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
+            try self.hoist_idxs.append(self.ar, slot);
+            return slot;
+        }
+
+        fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
+            return switch (v) {
+                .own => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
+                },
+                .borrow => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
+                },
+                else => v,
+            };
+        }
+
+        fn rewriteSig(self: @This(), sig: ctypes.FuncType) !ctypes.FuncType {
+            const params = try self.ar.alloc(ctypes.NamedValType, sig.params.len);
+            for (sig.params, 0..) |p, i| {
+                params[i] = .{ .name = p.name, .type = try self.rewriteValType(p.type) };
+            }
+            const results: ctypes.FuncType.ResultList = switch (sig.results) {
+                .none => .none,
+                .unnamed => |v| .{ .unnamed = try self.rewriteValType(v) },
+                .named => |named| n: {
+                    const dst = try self.ar.alloc(ctypes.NamedValType, named.len);
+                    for (named, 0..) |nv, i| {
+                        dst[i] = .{ .name = nv.name, .type = try self.rewriteValType(nv.type) };
+                    }
+                    break :n .{ .named = dst };
+                },
+            };
+            return .{ .params = params, .results = results };
+        }
+    };
+
+    const CapturedFunc = struct {
+        ext_qualified: []const u8,
+        fn_name: []const u8,
+        func_type_idx: u32,
+        core_func_alias_idx: u32,
+    };
+    var captured_funcs = std.ArrayListUnmanaged(CapturedFunc).empty;
+    var ext_export_start = std.ArrayListUnmanaged(struct {
+        ext: metadata_decode.WorldExtern,
+        start: u32,
+    }).empty;
+
+    for (decoded.externs) |ext| {
+        if (!ext.is_export) continue;
+        const resolver = HandleResolver{
+            .ar = ar,
+            .ext_slots = ext.type_slots,
+            .types = &types,
+            .aliases = &aliases,
+            .resource_owner = &resource_owner,
+            .import_inst_idx_for = &import_inst_idx_for,
+            .resource_alias_idx = &resource_alias_idx,
+            .hoist_keys = &hoist_keys,
+            .hoist_idxs = &hoist_idxs,
+            .comp_type_idx = &comp_type_idx,
+            .order = &order,
+        };
+        const start: u32 = @intCast(captured_funcs.items.len);
+        for (ext.funcs) |fn_ref| {
+            const rewritten = try resolver.rewriteSig(fn_ref.sig);
+            try types.append(ar, .{ .func = rewritten });
+            try Section.appendType(&order, ar, types.items.len);
+            const func_type_idx = comp_type_idx;
+            comp_type_idx += 1;
+
+            const core_func_export_name = try std.fmt.allocPrint(ar, "{s}#{s}", .{ ext.qualified_name, fn_ref.name });
+            try aliases.append(ar, .{ .instance_export = .{
+                .sort = .{ .core = .func },
+                .instance_idx = main_core_inst_idx,
+                .name = core_func_export_name,
+            } });
+            try Section.appendAlias(&order, ar, aliases.items.len);
+            const cf_idx = core_func_idx;
+            core_func_idx += 1;
+
+            try captured_funcs.append(ar, .{
+                .ext_qualified = ext.qualified_name,
+                .fn_name = fn_ref.name,
+                .func_type_idx = func_type_idx,
+                .core_func_alias_idx = cf_idx,
+            });
+        }
+        try ext_export_start.append(ar, .{ .ext = ext, .start = start });
+    }
+
+    const lifts_start: u32 = @intCast(canons.items.len);
+    for (captured_funcs.items) |cf| {
+        try canons.append(ar, .{ .lift = .{
+            .core_func_idx = cf.core_func_alias_idx,
+            .type_idx = cf.func_type_idx,
+            .opts = &.{},
+        } });
+    }
+    const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
+
+    for (ext_export_start.items, 0..) |es, ei| {
+        const end: u32 = if (ei + 1 < ext_export_start.items.len)
+            ext_export_start.items[ei + 1].start
+        else
+            @intCast(captured_funcs.items.len);
+        const fn_count = end - es.start;
+        var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+        for (0..fn_count) |i| {
+            const cf = captured_funcs.items[es.start + i];
+            inline_exports[i] = .{
+                .name = cf.fn_name,
+                .sort_idx = .{ .sort = .func, .idx = comp_func_idx },
+            };
+            comp_func_idx += 1;
+        }
+        try instances.append(ar, .{ .exports = inline_exports });
+        const inst_idx = import_inst_count + @as(u32, @intCast(ei));
+        try exports.append(ar, .{
+            .name = es.ext.qualified_name,
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = inst_idx },
+        });
+    }
+
+    if (lifts_count > 0) {
+        try order.append(ar, .{ .kind = .canon, .start = lifts_start, .count = lifts_count });
+    }
+    if (instances.items.len > 0) {
+        try order.append(ar, .{ .kind = .instance, .start = 0, .count = @intCast(instances.items.len) });
+    }
+    if (exports.items.len > 0) {
+        try order.append(ar, .{ .kind = .@"export", .start = 0, .count = @intCast(exports.items.len) });
+    }
+
+    const comp: ctypes.Component = .{
+        .core_modules = core_modules,
+        .core_instances = try core_instances.toOwnedSlice(ar),
+        .core_types = &.{},
+        .components = &.{},
+        .instances = try instances.toOwnedSlice(ar),
+        .aliases = try aliases.toOwnedSlice(ar),
+        .types = try types.toOwnedSlice(ar),
+        .canons = try canons.toOwnedSlice(ar),
+        .imports = try imports.toOwnedSlice(ar),
+        .exports = try exports.toOwnedSlice(ar),
+        .section_order = try order.toOwnedSlice(ar),
+    };
+    return writer.encode(alloc, &comp);
+}
+
 /// Walk core wasm sections, dropping every `component-type:*` custom
 /// section. Returns a freshly-allocated slice that borrows nothing.
 fn stripComponentTypeSections(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
@@ -964,6 +1569,82 @@ fn stripComponentTypeSections(alloc: std.mem.Allocator, core_bytes: []const u8) 
 }
 
 const LebRead = struct { value: u32, bytes_read: usize };
+
+/// Discover the `memory` and `cabi_realloc` exports of a stripped
+/// core wasm module. Both are needed to lower imported component
+/// methods that take or return `string` / `list` — the canon.lower
+/// op references them via `(memory <main_inst.memory>)` +
+/// `(realloc <main_inst.cabi_realloc>)`.
+///
+/// Scans the core wasm's export section only (assumes the
+/// `component-type:*` custom sections have already been stripped).
+/// Returns null for either field if the export is absent — callers
+/// gate on these to decide whether shim+fixup wiring is even
+/// possible.
+const CoreExports = struct {
+    /// Name under which the core module exports its memory, or null
+    /// if no memory export was found.
+    memory_name: ?[]const u8,
+    /// Name under which the core module exports its `cabi_realloc`
+    /// func, or null if no func export with that name exists.
+    realloc_name: ?[]const u8,
+};
+
+fn probeCoreExports(core_bytes: []const u8) !CoreExports {
+    if (core_bytes.len < 8) return error.InvalidCoreModule;
+    if (!std.mem.eql(u8, core_bytes[0..4], "\x00asm")) return error.InvalidCoreModule;
+
+    var memory_name: ?[]const u8 = null;
+    var realloc_name: ?[]const u8 = null;
+
+    var i: usize = 8;
+    while (i < core_bytes.len) {
+        const id = core_bytes[i];
+        i += 1;
+        const sz = try readU32Leb(core_bytes, i);
+        i += sz.bytes_read;
+        if (i + sz.value > core_bytes.len) return error.InvalidCoreModule;
+        const body = core_bytes[i .. i + sz.value];
+        i += sz.value;
+
+        // Section ID 7 = export section.
+        if (id != 7) continue;
+
+        var p: usize = 0;
+        const n = try readU32Leb(body, p);
+        p += n.bytes_read;
+        var k: u32 = 0;
+        while (k < n.value) : (k += 1) {
+            const nl = try readU32Leb(body, p);
+            p += nl.bytes_read;
+            if (p + nl.value > body.len) return error.InvalidCoreModule;
+            const name = body[p .. p + nl.value];
+            p += nl.value;
+            if (p >= body.len) return error.InvalidCoreModule;
+            const kind = body[p];
+            p += 1;
+            const idx = try readU32Leb(body, p);
+            p += idx.bytes_read;
+            // export kinds: 0=func, 1=table, 2=memory, 3=global, 4=tag.
+            switch (kind) {
+                0 => if (std.mem.eql(u8, name, "cabi_realloc")) {
+                    realloc_name = name;
+                },
+                2 => if (memory_name == null) {
+                    // First memory export wins; canonical convention
+                    // is "memory" but a malformed name shouldn't trip
+                    // the probe — the canon.lower opt references the
+                    // memory by core-memory index, not by name.
+                    memory_name = name;
+                },
+                else => {},
+            }
+        }
+        break;
+    }
+
+    return .{ .memory_name = memory_name, .realloc_name = realloc_name };
+}
 
 fn readU32Leb(buf: []const u8, start: usize) !LebRead {
     var result: u32 = 0;
@@ -1404,6 +2085,283 @@ test "buildComponent #202: emits canon.lower + with-args for imported interface 
         "wasi:http/incoming-handler@0.2.6",
         loaded.exports[0].name,
     );
+
+    // (6) #203 regression: the #202 reproducer must keep using the
+    // no-opts fast path — every canon.lower opts list is empty and
+    // there's exactly 1 core module (no shim/fixup machinery).
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    for (loaded.canons) |c| switch (c) {
+        .lower => |l| try testing.expectEqual(@as(usize, 0), l.opts.len),
+        else => {},
+    };
+}
+
+test "buildComponent #203a: string/list params trigger shim+fixup + opts" {
+    // Reproducer for #203: an imported method whose sig contains
+    // `string` and `list` forces canon.lower to take memory +
+    // realloc + string-encoding opts. The wrapping component emits
+    // the shim+fixup trampoline pattern to break the
+    // forward-reference cycle between canon.lower (which needs
+    // main's memory/cabi_realloc exports) and main's instantiation
+    // (which needs the lowered funcs as `(with …)` args).
+    //
+    // Synth core wasm: exports `wasi:http/incoming-handler@0.2.6#handle`
+    // plus the `memory` + `cabi_realloc` exports the shim/fixup
+    // path requires.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 14, 2,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+        0x03, 3, 2, 0, 1,
+        0x05, 3, 1, 0x00, 0x01,
+        0x07, 67, 3,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 0,
+        6, 'm', 'e', 'm', 'o', 'r', 'y',
+        0x02, 0,
+        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
+        0x00, 1,
+        0x0a, 9, 2,
+        2, 0x00, 0x0b,
+        4, 0x00, 0x41, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource fields {
+        \\        constructor();
+        \\        append: func(name: string, value: list<u8>) -> string;
+        \\    }
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    , "http-hello");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:http-hello";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // (1) Three core modules: main, shim, fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+
+    // (2) At least one canon.lower carries memory + realloc +
+    // string_encoding opts. The constructor (handle-only) lowers
+    // without opts; append takes `string` + `list<u8>` and returns
+    // `string`, forcing all three.
+    var saw_full_opts = false;
+    var saw_string_encoding_utf8 = false;
+    for (loaded.canons) |c| switch (c) {
+        .lower => |l| {
+            var has_memory = false;
+            var has_realloc = false;
+            var has_encoding = false;
+            for (l.opts) |o| switch (o) {
+                .memory => has_memory = true,
+                .realloc => has_realloc = true,
+                .string_encoding => |enc| {
+                    has_encoding = true;
+                    if (enc == .utf8) saw_string_encoding_utf8 = true;
+                },
+                else => {},
+            };
+            if (has_memory and has_realloc and has_encoding) saw_full_opts = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_full_opts);
+    try testing.expect(saw_string_encoding_utf8);
+
+    // (3) Core-instance topology: shim, per-iface bundle (1),
+    // main, fixup-args bundle, fixup. With one funcful import
+    // shape that's 5 entries total.
+    try testing.expectEqual(@as(usize, 5), loaded.core_instances.len);
+    try testing.expect(loaded.core_instances[0] == .instantiate);
+    try testing.expectEqual(@as(u32, 1), loaded.core_instances[0].instantiate.module_idx);
+    try testing.expect(loaded.core_instances[4] == .instantiate);
+    try testing.expectEqual(@as(u32, 2), loaded.core_instances[4].instantiate.module_idx);
+
+    // (4) The handle export survives intact.
+    try testing.expectEqual(@as(usize, 1), loaded.exports.len);
+    try testing.expectEqualStrings(
+        "wasi:http/incoming-handler@0.2.6",
+        loaded.exports[0].name,
+    );
+}
+
+test "buildComponent #203b: handle-only world stays on no-opts fast path" {
+    // Verifies that a world whose imported funcs touch only handles
+    // + primitives skips the shim/fixup machinery entirely. Same
+    // WIT shape as the #202 reproducer but asserts the negative
+    // side: no extra core modules, no extra core instances, no
+    // canon.lower opts.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        0x01, 13, 3,
+        0x60, 0x00, 0x00,
+        0x60, 0x00, 0x01, 0x7f,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x02, 45, 1,
+        21, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 't', 'y', 'p', 'e', 's', '@', '0', '.', '2', '.', '6',
+        19, '[', 'c', 'o', 'n', 's', 't', 'r', 'u', 'c', 't',
+        'o', 'r', ']', 'f', 'i', 'e', 'l', 'd', 's',
+        0x00, 1,
+        0x03, 2, 1, 2,
+        0x07, 43, 1,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 1,
+        0x0a, 4, 1, 2, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource fields { constructor(); }
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    , "http-hello");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:http-hello";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // Fast path emits: 1 inline-export bundle + 1 main = 2 core instances.
+    try testing.expectEqual(@as(usize, 2), loaded.core_instances.len);
+    // No canon.lower opts: handle-only sigs.
+    for (loaded.canons) |c| switch (c) {
+        .lower => |l| try testing.expectEqual(@as(usize, 0), l.opts.len),
+        else => {},
+    };
+}
+
+test "buildComponent #203c: shim/fixup needed but core lacks memory export → error" {
+    // Same WIT as #203a (forces shim/fixup), but the synth core
+    // wasm omits both `memory` and `cabi_realloc`. The classifier
+    // routes to the shim/fixup path, which then can't satisfy its
+    // memory/realloc opts and must surface a clear error rather
+    // than silently emitting unwirable canon.lower entries.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d,
+        0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x07, 43, 0x01,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:http@0.2.6;
+        \\
+        \\interface types {
+        \\    resource fields {
+        \\        constructor();
+        \\        append: func(name: string, value: list<u8>) -> string;
+        \\    }
+        \\    resource incoming-request {}
+        \\    resource response-outparam {}
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    use types.{incoming-request, response-outparam};
+        \\    handle: func(request: incoming-request, response-out: response-outparam);
+        \\}
+        \\
+        \\world http-hello {
+        \\    import types;
+        \\    export incoming-handler;
+        \\}
+    , "http-hello");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:http-hello";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    try testing.expectError(
+        error.MissingCoreExportMemory,
+        buildComponent(testing.allocator, core_with_ct.items),
+    );
 }
 
 test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
@@ -1466,20 +2424,42 @@ test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
     try testing.expect(ct_payload.len > 0);
 
     // Synthesise a core wasm exporting
-    // `wasi:http/incoming-handler@0.2.6#handle (i32, i32) -> ()`,
-    // matching the world's sole export, then attach the embedded
-    // component-type section.
+    // `wasi:http/incoming-handler@0.2.6#handle (i32, i32) -> ()`
+    // plus the `memory` + `cabi_realloc` exports any wasi:p2
+    // proxy ships, since wasi:http's imported methods take
+    // `string`/`list` args and so trip the #203 shim/fixup
+    // emission path which canon.lower's against both.
     const core_only = [_]u8{
+        // preamble
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 43, 0x01,
+        // type section: 2 types
+        //   type 0: (func i32 i32) -> ()             — handle
+        //   type 1: (func i32 i32 i32 i32) -> i32    — cabi_realloc
+        0x01, 14, 2,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+        // function section: 2 funcs
+        0x03, 3, 2, 0, 1,
+        // memory section: 1 memory, initial=1 page, no max
+        0x05, 3, 1, 0x00, 0x01,
+        // export section: handle, memory, cabi_realloc
+        //   body = 1(count) + 42(handle) + 9(memory) + 15(cabi) = 67
+        0x07, 67, 3,
         39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
         '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
         'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
         '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0x00,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x00, 0,
+        6, 'm', 'e', 'm', 'o', 'r', 'y',
+        0x02, 0,
+        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
+        0x00, 1,
+        // code section: 2 bodies
+        //   handle:        size=2, locals=0, end
+        //   cabi_realloc:  size=4, locals=0, i32.const 0, end
+        0x0a, 9, 2,
+        2, 0x00, 0x0b,
+        4, 0x00, 0x41, 0x00, 0x0b,
     };
     var core_with_ct = std.ArrayListUnmanaged(u8).empty;
     defer core_with_ct.deinit(testing.allocator);
