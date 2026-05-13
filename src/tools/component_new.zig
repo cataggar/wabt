@@ -995,11 +995,18 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 ///      shim.$imports>)`. The active elem fires on instantiation,
 ///      patching every shim stub to call the real lowered func.
 ///
-/// Cross-iface handle refs in imported func sigs are still
-/// skipped here — the verbatim body lift assumes the body's
-/// `alias outer` / `alias instance_export` references resolve
-/// against an outer scope that we don't currently reconstruct.
-/// Lifting that restriction is a separate follow-up.
+/// Cross-iface handle refs in imported func sigs are rebased
+/// before the body is transplanted: each `alias outer (type 1 K)`
+/// in the body resolves into the metadata's world body at slot K,
+/// which (when the encoder emitted it for a `use src.{T};` clause,
+/// the only case currently in scope) is an
+/// `alias instance_export sort=type inst=I name=N`. The wrapping
+/// component emits a matching top-level
+/// `alias instance_export sort=type, instance_idx=<wrapping inst
+/// for I>, name=N`, then the body's outer-alias is rewritten to
+/// point at that new top-level slot (cataggar/wabt#206). The "K
+/// resolves to a direct typedef" case is currently passed through
+/// unchanged — the wabt encoder doesn't produce it.
 fn buildComponentShimFixup(
     alloc: std.mem.Allocator,
     ar: std.mem.Allocator,
@@ -1127,13 +1134,165 @@ fn buildComponentShimFixup(
     };
 
     // ── Phase 4a: emit instance-type + import per shape using the
-    //    metadata's encoded body verbatim. Resource sub_resource
-    //    exports live inside it already; func type defs + named
-    //    `.@"export" func` decls too. The body's local type-index
-    //    space matches the func sigs' slot refs by construction.
+    //    metadata's encoded body verbatim where possible. Cross-iface
+    //    `alias outer (type 1 K)` decls inside the body reference
+    //    slots in the metadata's world body — a scope we don't
+    //    reconstruct verbatim in the wrapping component. Rebase
+    //    those refs by walking the body, emitting top-level
+    //    `alias instance_export sort=type` decls at the wrapping
+    //    component level, and rewriting each `alias outer` to
+    //    point at the new top-level slot (cataggar/wabt#206).
+    //
+    // To make the rebase work irrespective of shape iteration order
+    // (a body in shape `i` may reference a type owned by shape `j`
+    // with `j > i`), populate `import_inst_idx_for` for all shapes
+    // first.
     var import_inst_idx_for = std.StringHashMapUnmanaged(u32).empty;
     for (import_shapes.items, 0..) |shape, i| {
-        try types.append(ar, .{ .instance = .{ .decls = shape.inst_decls } });
+        try import_inst_idx_for.put(ar, shape.qualified_name, @intCast(i));
+    }
+
+    // World-body resolution tables. The metadata's encoded world
+    // body is the outer scope `alias outer (type 1 K)` body refs
+    // resolve against.
+    //
+    // * `world_inst_qname[wii]` — qualified name of the instance
+    //   import/export at world-body instance-index slot `wii`.
+    // * `world_type_kind[K]`    — kind of the world-body type-index
+    //   slot at position K. Only `.alias_instance_export` is
+    //   rebased; everything else passes through.
+    const WorldTypeKind = union(enum) {
+        alias_instance_export: struct { world_inst_idx: u32, name: []const u8 },
+        other,
+    };
+    var world_inst_qname = std.ArrayListUnmanaged([]const u8).empty;
+    var world_type_kind = std.ArrayListUnmanaged(WorldTypeKind).empty;
+    for (decoded.world_decls) |d| switch (d) {
+        .type => try world_type_kind.append(ar, .other),
+        .core_type => try world_type_kind.append(ar, .other),
+        .alias => |a| switch (a) {
+            .instance_export => |ie| if (ie.sort == .type) {
+                try world_type_kind.append(ar, .{ .alias_instance_export = .{
+                    .world_inst_idx = ie.instance_idx,
+                    .name = ie.name,
+                } });
+            },
+            .outer => |o| if (o.sort == .type) {
+                try world_type_kind.append(ar, .other);
+            },
+        },
+        .import => |im| switch (im.desc) {
+            .instance => try world_inst_qname.append(ar, im.name),
+            else => {},
+        },
+        .@"export" => |e| switch (e.desc) {
+            .instance => try world_inst_qname.append(ar, e.name),
+            else => {},
+        },
+    };
+
+    // Cache: `<wrapping_inst_idx>::<name>` → new top-level
+    // type-index slot. Reused across shapes — a single source type
+    // referenced by multiple downstream bodies emits one alias.
+    var rebase_cache = std.StringHashMapUnmanaged(u32).empty;
+
+    const RebaseCtx = struct {
+        ar: std.mem.Allocator,
+        world_inst_qname: []const []const u8,
+        world_type_kind: []const WorldTypeKind,
+        import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
+        rebase_cache: *std.StringHashMapUnmanaged(u32),
+        aliases: *std.ArrayListUnmanaged(ctypes.Alias),
+        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+        comp_type_idx: *u32,
+
+        /// Resolve `(world_inst_idx, name)` to a top-level
+        /// type-index slot, emitting the alias if not cached.
+        /// Returns `null` if the target's owning iface wasn't
+        /// imported into the wrapping component.
+        fn rebaseTarget(self: *@This(), wii: u32, name: []const u8) !?u32 {
+            if (wii >= self.world_inst_qname.len) return null;
+            const src_qname = self.world_inst_qname[wii];
+            const wrapping_inst_idx = self.import_inst_idx_for.get(src_qname) orelse return null;
+            const cache_key = try std.fmt.allocPrint(self.ar, "{d}::{s}", .{ wrapping_inst_idx, name });
+            if (self.rebase_cache.get(cache_key)) |slot| return slot;
+            try self.aliases.append(self.ar, .{ .instance_export = .{
+                .sort = .type,
+                .instance_idx = wrapping_inst_idx,
+                .name = name,
+            } });
+            try self.order.append(self.ar, .{
+                .kind = .alias,
+                .start = @intCast(self.aliases.items.len - 1),
+                .count = 1,
+            });
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.rebase_cache.put(self.ar, cache_key, slot);
+            return slot;
+        }
+
+        /// Walk `body`, rewriting each cross-iface alias decl to
+        /// point at a wrapping-component-scope slot. Returns a
+        /// freshly-allocated decl slice with the same length and
+        /// the same body-local type-indexspace shape.
+        fn rebaseInstDecls(self: *@This(), body: []const ctypes.Decl) ![]ctypes.Decl {
+            const out = try self.ar.alloc(ctypes.Decl, body.len);
+            for (body, 0..) |d, i| {
+                out[i] = blk: switch (d) {
+                    .alias => |a| switch (a) {
+                        .outer => |o| {
+                            if (o.sort != .type or o.outer_count != 1) break :blk d;
+                            if (o.idx >= self.world_type_kind.len) break :blk d;
+                            switch (self.world_type_kind[o.idx]) {
+                                .alias_instance_export => |ie| {
+                                    const new_slot = (try self.rebaseTarget(ie.world_inst_idx, ie.name)) orelse break :blk d;
+                                    break :blk .{ .alias = .{ .outer = .{
+                                        .sort = .type,
+                                        .outer_count = 1,
+                                        .idx = new_slot,
+                                    } } };
+                                },
+                                .other => break :blk d,
+                            }
+                        },
+                        .instance_export => |ie| {
+                            // Body-side `alias instance_export
+                            // sort=type` references the outer
+                            // (world) instance indexspace. Rebase
+                            // identically; rewrite as an
+                            // `alias outer` pointing at the new
+                            // top-level slot.
+                            if (ie.sort != .type) break :blk d;
+                            const new_slot = (try self.rebaseTarget(ie.instance_idx, ie.name)) orelse break :blk d;
+                            break :blk .{ .alias = .{ .outer = .{
+                                .sort = .type,
+                                .outer_count = 1,
+                                .idx = new_slot,
+                            } } };
+                        },
+                    },
+                    else => d,
+                };
+            }
+            return out;
+        }
+    };
+
+    var rebase_ctx = RebaseCtx{
+        .ar = ar,
+        .world_inst_qname = world_inst_qname.items,
+        .world_type_kind = world_type_kind.items,
+        .import_inst_idx_for = &import_inst_idx_for,
+        .rebase_cache = &rebase_cache,
+        .aliases = &aliases,
+        .order = &order,
+        .comp_type_idx = &comp_type_idx,
+    };
+
+    for (import_shapes.items) |shape| {
+        const rebased = try rebase_ctx.rebaseInstDecls(shape.inst_decls);
+        try types.append(ar, .{ .instance = .{ .decls = rebased } });
         try Section.appendType(&order, ar, types.items.len);
         const inst_type_idx = comp_type_idx;
         comp_type_idx += 1;
@@ -1142,7 +1301,6 @@ fn buildComponentShimFixup(
             .desc = .{ .instance = inst_type_idx },
         });
         try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
-        try import_inst_idx_for.put(ar, shape.qualified_name, @intCast(i));
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
@@ -2364,6 +2522,175 @@ test "buildComponent #203c: shim/fixup needed but core lacks memory export → e
     );
 }
 
+test "buildComponent #206: cross-iface use in imported method body triggers outer-alias rebase" {
+    // Reproducer for #206 (follow-up to #203). One imported iface
+    // (`api`) `use`s a resource from another imported iface
+    // (`streams`); its method's `string` param forces shim/fixup.
+    // The encoded `api` body contains an
+    // `alias outer (type 1 K)` whose K points at the metadata's
+    // world body — a scope the wrapping component doesn't
+    // reconstruct verbatim. Before this fix the body lift was
+    // dangling; after the fix the wrapping component emits a
+    // top-level `alias instance_export sort=.type` from the
+    // `streams` import instance and rewrites the body's outer
+    // alias to point at that new top-level slot.
+    //
+    // Synth core wasm: identical layout to #203a (handle export +
+    // memory + cabi_realloc), reused for convenience. The `api`
+    // import's wired `consume` func is unused by the core but
+    // still gets a canon.lower + shim slot.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 14, 2,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+        0x03, 3, 2, 0, 1,
+        0x05, 3, 1, 0x00, 0x01,
+        0x07, 67, 3,
+        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
+        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
+        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
+        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
+        0x00, 0,
+        6, 'm', 'e', 'm', 'o', 'r', 'y',
+        0x02, 0,
+        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
+        0x00, 1,
+        0x0a, 9, 2,
+        2, 0x00, 0x0b,
+        4, 0x00, 0x41, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package docs:demo@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource input-stream { }
+        \\}
+        \\
+        \\interface api {
+        \\    use streams.{input-stream};
+        \\    consume: func(name: string) -> own<input-stream>;
+        \\}
+        \\
+        \\interface incoming-handler {
+        \\    handle: func();
+        \\}
+        \\
+        \\world demo {
+        \\    import streams;
+        \\    import api;
+        \\    export incoming-handler;
+        \\}
+    , "demo");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:demo";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // (1) Shim/fixup path — three core modules.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+
+    // (2) Two instance imports — `streams` (idx 0) + `api` (idx 1).
+    try testing.expectEqual(@as(usize, 2), loaded.imports.len);
+    try testing.expectEqualStrings("docs:demo/streams@0.1.0", loaded.imports[0].name);
+    try testing.expectEqualStrings("docs:demo/api@0.1.0", loaded.imports[1].name);
+
+    // (3) A top-level `alias instance_export sort=.type` rebased
+    // from `streams` exposes `input-stream` at wrapping-component
+    // scope. This is the alias the rebase pass emits so the
+    // `api` body's `alias outer` no longer dangles.
+    var saw_rebased_alias = false;
+    var rebased_alias_slot: ?u32 = null;
+    for (loaded.type_indexspace, 0..) |contrib, slot| {
+        if (contrib != .alias) continue;
+        const a = loaded.aliases[contrib.alias];
+        if (a != .instance_export) continue;
+        const ie = a.instance_export;
+        if (ie.sort == .type and
+            ie.instance_idx == 0 and
+            std.mem.eql(u8, ie.name, "input-stream"))
+        {
+            saw_rebased_alias = true;
+            rebased_alias_slot = @intCast(slot);
+        }
+    }
+    try testing.expect(saw_rebased_alias);
+    try testing.expect(rebased_alias_slot != null);
+
+    // (4) The `api` body's `alias outer (type 1 K)` decls have
+    // been rewritten: K now points at a wrapping-component slot
+    // whose contributor is an `alias instance_export sort=.type`
+    // (i.e. the rebased alias from (3)), not at a dangling
+    // metadata-world-body slot.
+    const api_inst_type_idx = loaded.imports[1].desc.instance;
+    const api_inst_contrib = loaded.type_indexspace[api_inst_type_idx];
+    try testing.expect(api_inst_contrib == .type_def);
+    const api_inst_td = loaded.types[api_inst_contrib.type_def];
+    try testing.expect(api_inst_td == .instance);
+    var saw_rebased_body_outer = false;
+    for (api_inst_td.instance.decls) |d| switch (d) {
+        .alias => |a| switch (a) {
+            .outer => |o| {
+                if (o.sort != .type) continue;
+                try testing.expectEqual(@as(u32, 1), o.outer_count);
+                // The rewritten idx must land on the top-level
+                // rebased alias slot — both the value and the
+                // contributor kind must match.
+                try testing.expect(o.idx < loaded.type_indexspace.len);
+                const contrib = loaded.type_indexspace[o.idx];
+                try testing.expect(contrib == .alias);
+                const top_alias = loaded.aliases[contrib.alias];
+                try testing.expect(top_alias == .instance_export);
+                try testing.expect(top_alias.instance_export.sort == .type);
+                try testing.expectEqualStrings("input-stream", top_alias.instance_export.name);
+                try testing.expectEqual(@as(u32, 0), top_alias.instance_export.instance_idx);
+                saw_rebased_body_outer = true;
+            },
+            else => {},
+        },
+        else => {},
+    };
+    try testing.expect(saw_rebased_body_outer);
+
+    // (5) `consume` is wired with full canon-lower opts (string
+    // param forces memory + utf8 encoding; the `own<input-stream>`
+    // result is a scalar handle so no realloc needed). At least
+    // one canon.lower carries memory + string_encoding.
+    var saw_consume_opts = false;
+    for (loaded.canons) |c| switch (c) {
+        .lower => |l| {
+            var has_memory = false;
+            var has_encoding = false;
+            for (l.opts) |o| switch (o) {
+                .memory => has_memory = true,
+                .string_encoding => has_encoding = true,
+                else => {},
+            };
+            if (has_memory and has_encoding) saw_consume_opts = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_consume_opts);
+}
+
 test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
     // Phase 5 acceptance for #195: pointing wabt at the canonical
     // wasi-http@0.2.6 WIT layout + a Zig stub exporting
@@ -2495,6 +2822,50 @@ test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
         }
     }
     try testing.expect(saw_export);
+
+    // (#206) Cross-iface alias rebase: every `alias outer (type 1
+    // K)` decl inside any transplanted imported instance-type body
+    // resolves into the wrapping-component typespace (not into the
+    // dangling metadata-world-body typespace it referred to before
+    // the rebase pass). For each imported instance type body in
+    // the wrapping component, walk its decls and assert each
+    // `alias outer` lands on a top-level slot whose contributor is
+    // a `alias instance_export sort=.type` from an instance import
+    // of the wrapping component.
+    //
+    // We also assert that at least one such rebased outer-alias
+    // exists — the canonical wasi-http proxy world has dozens of
+    // `use` clauses across `wasi:http/*`, so the rebase must have
+    // fired on this fixture.
+    var n_rebased: usize = 0;
+    for (loaded.imports) |imp| {
+        if (imp.desc != .instance) continue;
+        const inst_type_idx = imp.desc.instance;
+        if (inst_type_idx >= loaded.type_indexspace.len) continue;
+        const contrib = loaded.type_indexspace[inst_type_idx];
+        if (contrib != .type_def) continue;
+        const td = loaded.types[contrib.type_def];
+        if (td != .instance) continue;
+        for (td.instance.decls) |d| switch (d) {
+            .alias => |a| switch (a) {
+                .outer => |o| {
+                    if (o.sort != .type) continue;
+                    try testing.expectEqual(@as(u32, 1), o.outer_count);
+                    try testing.expect(o.idx < loaded.type_indexspace.len);
+                    const tgt = loaded.type_indexspace[o.idx];
+                    try testing.expect(tgt == .alias);
+                    const top_alias = loaded.aliases[tgt.alias];
+                    try testing.expect(top_alias == .instance_export);
+                    try testing.expect(top_alias.instance_export.sort == .type);
+                    try testing.expect(top_alias.instance_export.instance_idx < loaded.imports.len);
+                    n_rebased += 1;
+                },
+                else => {},
+            },
+            else => {},
+        };
+    }
+    try testing.expect(n_rebased > 0);
 }
 
 test "buildComponent: rejects core wasm without component-type section" {
