@@ -137,6 +137,24 @@ const Parser = struct {
         }
     }
 
+    /// Drain any pending doc-comment tokens into `pending_docs`,
+    /// leaving the next non-doc token in the lookahead. Matches
+    /// `nextNonDoc`'s doc-accumulation semantics, but stops at the
+    /// boundary instead of consuming the following non-doc token.
+    fn skipLeadingDocs(self: *Parser) ParseError!void {
+        while (true) {
+            const t = try self.peekTok();
+            if (t.tag != .doc_comment and t.tag != .doc_block) return;
+            _ = try self.nextTok();
+            if (self.pending_docs.len == 0) {
+                self.pending_docs = t.span.slice(self.source);
+            } else {
+                const ptr_start: usize = @intFromPtr(self.pending_docs.ptr) - @intFromPtr(self.source.ptr);
+                self.pending_docs = self.source[ptr_start..t.span.end];
+            }
+        }
+    }
+
     fn takeDocs(self: *Parser) []const u8 {
         const d = self.pending_docs;
         self.pending_docs = "";
@@ -163,15 +181,18 @@ const Parser = struct {
     fn parseDocument(self: *Parser) ParseError!ast.Document {
         var package: ?ast.PackageId = null;
 
-        // Optional `package <ns>:<name>[@<semver>];`
-        var first = try self.peekTok();
-        // Skip leading docs to peek at the first significant token.
-        while (first.tag == .doc_comment or first.tag == .doc_block) {
-            _ = try self.nextNonDoc();
-            first = try self.peekTok();
-        }
+        // Drain any leading doc comments into `pending_docs` without
+        // consuming the first significant token. If a `package` decl
+        // follows, the leading docs are discarded (PackageId carries
+        // no doc field); if an item follows directly (no `package`),
+        // the docs attach to that item as usual via `nextNonDoc` /
+        // `takeDocs`.
+        try self.skipLeadingDocs();
+        const first = try self.peekTok();
 
+        // Optional `package <ns>:<name>[@<semver>];`
         if (first.tag == .kw_package) {
+            _ = self.takeDocs();
             _ = try self.nextNonDoc();
             package = try self.parsePackageId();
             _ = try self.expect(.semicolon);
@@ -826,6 +847,60 @@ fn parseInto(arena: *std.heap.ArenaAllocator, source: []const u8) !ast.Document 
         std.debug.print("parse error: {s} at [{d}, {d}]: {s}\n", .{ @errorName(err), diag.span.start, diag.span.end, diag.msg });
         return err;
     };
+}
+
+test "parse #192: leading doc comment before package" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // Before #192 was fixed, the leading-doc skip loop in
+    // parseDocument used `nextNonDoc()` and silently ate the
+    // `package` keyword along with the doc, so this source failed
+    // with `error.UnexpectedToken` on the `wasi` identifier.
+    const source =
+        \\/// Doc comment before package.
+        \\package docs:adder@0.1.0;
+        \\
+        \\interface i {
+        \\    f: func();
+        \\}
+        \\
+        \\world w {
+        \\    import i;
+        \\}
+    ;
+    const doc = try parseInto(&arena, source);
+    try testing.expect(doc.package != null);
+    try testing.expectEqualStrings("docs", doc.package.?.namespace);
+    try testing.expectEqualStrings("adder", doc.package.?.name);
+    try testing.expectEqualStrings("0.1.0", doc.package.?.version.?);
+    try testing.expectEqual(@as(usize, 2), doc.items.len);
+    try testing.expect(doc.items[0] == .interface);
+    try testing.expectEqualStrings("i", doc.items[0].interface.name);
+    // The leading doc was meant for the package decl (which has no
+    // doc field); ensure it didn't leak onto the first interface.
+    try testing.expectEqualStrings("", doc.items[0].interface.docs);
+    try testing.expect(doc.items[1] == .world);
+    try testing.expectEqualStrings("w", doc.items[1].world.name);
+}
+
+test "parse #192: leading doc comment with no package attaches to first item" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    // When there is no `package` decl, the leading doc should
+    // attach to the first item as its docstring — matching the
+    // normal "docs before any item" behaviour.
+    const source =
+        \\/// doc-for-iface
+        \\interface foo {
+        \\    bar: func();
+        \\}
+    ;
+    const doc = try parseInto(&arena, source);
+    try testing.expectEqual(@as(?ast.PackageId, null), doc.package);
+    try testing.expectEqual(@as(usize, 1), doc.items.len);
+    try testing.expect(doc.items[0] == .interface);
+    try testing.expectEqualStrings("foo", doc.items[0].interface.name);
+    try testing.expectEqualStrings("/// doc-for-iface", doc.items[0].interface.docs);
 }
 
 test "parse: empty document" {
