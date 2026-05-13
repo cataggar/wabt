@@ -119,6 +119,17 @@ pub const DecodedWorld = struct {
     qualified_name: []const u8,
     /// All world externs (imports and exports), in declaration order.
     externs: []const WorldExtern,
+    /// Raw on-wire world body decls. The outer scope that
+    /// `WorldExtern.inst_decls`'s `alias outer (type 1 K)` references
+    /// resolve against. Lets consumers transplanting an interface
+    /// body into a new component rebase those cross-iface refs
+    /// (per `cataggar/wabt#206`).
+    ///
+    /// In declaration order: alternating `.type (instance …)` slots,
+    /// `.import` / `.export` decls (one per `WorldExtern`), and
+    /// `.alias instance_export sort=type` decls the encoder splices
+    /// in for `use src.{T};` clauses.
+    world_decls: []const ctypes.Decl,
 };
 
 /// Return the WIT-visible name of the resource bound at `slot`,
@@ -210,6 +221,7 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
         .name = bare,
         .qualified_name = world_qualified,
         .externs = try externs.toOwnedSlice(arena),
+        .world_decls = world_body.decls,
     };
 }
 
