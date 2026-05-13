@@ -39,14 +39,60 @@ pub const DecodeError = error{
 pub const FuncRef = struct {
     /// Func name within the interface (e.g. `add`).
     name: []const u8,
-    /// Component-level signature.
+    /// Component-level signature. `ValType.type_idx` / `.own` /
+    /// `.borrow` payloads reference slots in the enclosing
+    /// `WorldExtern.type_slots`. Resource-handle references are
+    /// resolved during decode (resolved to `.own` / `.borrow` at
+    /// the resource binding's slot); compound-type references
+    /// stay as `.type_idx` pointing at a `TypeSlot.typedef` entry.
     sig: ctypes.FuncType,
+};
+
+/// Per-slot view of an interface body's type-index space.
+///
+/// `decodeInterfaceBody` walks the body in declaration order and
+/// allocates one `TypeSlot` per type-allocating decl. The on-wire
+/// type-index used in `ValType.type_idx` / `.own` / `.borrow`
+/// payloads inside the captured func sigs maps directly into this
+/// slice.
+pub const TypeSlot = union(enum) {
+    /// `.alias outer (type N K)` — points at slot `K` in an outer
+    /// scope (typically the world body). Anonymous in the
+    /// interface scope.
+    alias_outer: u32,
+    /// `.alias instance-export` (sort=type) — references a named
+    /// type export of an instance in the outer scope.
+    alias_instance_export: struct {
+        instance_idx: u32,
+        name: []const u8,
+    },
+    /// `.@"export"` decl with `.type.eq{target}` desc — binds
+    /// `name` to a slot that mirrors `target`. Used for
+    /// `use`-imported types and named compound typedefs.
+    export_eq: struct { name: []const u8, target: u32 },
+    /// `.@"export"` decl with `.type.sub_resource` desc — local
+    /// `resource R {}` declaration. Carries the resource's WIT
+    /// name.
+    sub_resource: []const u8,
+    /// Hoisted value-type def (`.type = .val …`). The encoder
+    /// emits these for `own<R>` / `borrow<R>` references and for
+    /// bare primitive type-defs inside an interface body.
+    val: ctypes.ValType,
+    /// Any other typedef body — record / variant / enum / flags /
+    /// option / result / list / tuple / resource / func /
+    /// component / instance. Stored verbatim so consumers can
+    /// inspect compound-type shapes themselves.
+    typedef: ctypes.TypeDef,
 };
 
 pub const WorldExtern = struct {
     is_export: bool,
     /// Qualified name on the wire (e.g. `docs:adder/add@0.1.0`).
     qualified_name: []const u8,
+    /// Interface-body type-index space, in slot-allocation order.
+    /// `ValType.type_idx` / `.own` / `.borrow` payloads inside
+    /// `funcs[].sig` reference indices into this slice.
+    type_slots: []const TypeSlot,
     /// Funcs declared by the interface this extern references.
     funcs: []const FuncRef,
 };
@@ -59,6 +105,21 @@ pub const DecodedWorld = struct {
     /// All world externs (imports and exports), in declaration order.
     externs: []const WorldExtern,
 };
+
+/// Return the WIT-visible name of the resource bound at `slot`,
+/// or null if the slot doesn't carry a name. A resource's
+/// canonical name is on its `.sub_resource` slot (locally
+/// declared) or `.export_eq` slot (use-imported) — both carry the
+/// WIT name directly. Alias slots are anonymous in the local
+/// interface scope.
+pub fn resourceNameForSlot(slots: []const TypeSlot, slot: u32) ?[]const u8 {
+    if (slot >= slots.len) return null;
+    return switch (slots[slot]) {
+        .sub_resource => |name| name,
+        .export_eq => |e| e.name,
+        else => null,
+    };
+}
 
 /// Decode the given `component-type` custom-section payload.
 /// All returned slices borrow from `arena`.
@@ -114,11 +175,12 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
             },
             else => return error.UnsupportedShape,
         }
-        const funcs = try decodeInterfaceBody(arena, inst_type);
+        const body = try decodeInterfaceBody(arena, inst_type);
         try externs.append(arena, .{
             .is_export = is_export,
             .qualified_name = qualified_name,
-            .funcs = funcs,
+            .type_slots = body.type_slots,
+            .funcs = body.funcs,
         });
         i = j + 1;
     }
@@ -135,58 +197,198 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
     };
 }
 
-fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeError![]const FuncRef {
-    // Logical content per func is a (type=func, export "name" func=N)
-    // pair, but the encoder may interleave:
-    //   * `.alias outer (type 1 K)` decls for each `use`-imported
-    //     type (metadata_encode.zig:509-513);
-    //   * `.@"export"` decls with `.type` desc — both `eq{}` mirrors
-    //     for use-imported types / named compound typedefs
-    //     (metadata_encode.zig:522-525, 762-765) and `sub_resource`
-    //     exports for locally-declared resources
-    //     (metadata_encode.zig:445-448);
-    //   * `.type` decls whose body is a compound type (record /
-    //     variant / enum / flags) hoisted before their `eq{}` export
-    //     (metadata_encode.zig:410, 422, 426, 430).
-    // Walk past all of those transparently. Only
-    // `.type = .func` + immediately-following `.@"export"` with
-    // `.func` desc becomes a `FuncRef`.
-    var funcs = std.ArrayListUnmanaged(FuncRef).empty;
+const DecodedInterface = struct {
+    type_slots: []const TypeSlot,
+    funcs: []const FuncRef,
+};
+
+fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeError!DecodedInterface {
+    // Walk in declaration order, allocating one TypeSlot per
+    // type-allocating decl. `.@"export"` with `.func` desc is the
+    // only decl that does NOT allocate a type slot (it allocates a
+    // func slot we don't track). Func sigs are captured at their
+    // `.type=.func` slot and held aside for post-walk resolution
+    // — references inside the sig may point at slots that haven't
+    // been seen yet on a strict left-to-right walk, but the
+    // encoder always hoists referenced slots BEFORE the func that
+    // uses them, so a single-pass slot table is sufficient.
+    var slots = std.ArrayListUnmanaged(TypeSlot).empty;
+    const CapturedFunc = struct { slot: u32, sig: ctypes.FuncType, name: []const u8 };
+    var captured = std.ArrayListUnmanaged(CapturedFunc).empty;
+
     var j: usize = 0;
     while (j < inst.decls.len) {
         const d = inst.decls[j];
         switch (d) {
-            .alias => {
+            .alias => |a| {
+                switch (a) {
+                    .outer => |o| {
+                        if (o.sort != .type) return error.UnsupportedShape;
+                        try slots.append(arena, .{ .alias_outer = o.idx });
+                    },
+                    .instance_export => |ie| {
+                        if (ie.sort != .type) return error.UnsupportedShape;
+                        try slots.append(arena, .{ .alias_instance_export = .{
+                            .instance_idx = ie.instance_idx,
+                            .name = ie.name,
+                        } });
+                    },
+                }
                 j += 1;
-                continue;
             },
             .@"export" => |e| {
                 switch (e.desc) {
-                    .type => {
-                        j += 1;
-                        continue;
+                    .type => |tb| switch (tb) {
+                        .eq => |target| {
+                            try slots.append(arena, .{ .export_eq = .{
+                                .name = e.name,
+                                .target = target,
+                            } });
+                        },
+                        .sub_resource => {
+                            try slots.append(arena, .{ .sub_resource = e.name });
+                        },
+                    },
+                    .func => |func_type_idx| {
+                        // No type-slot allocation. The export must
+                        // refer to a `.type=.func` slot we already
+                        // captured — promote that captured entry
+                        // to a `FuncRef` under this export's name.
+                        // (We currently require the export to
+                        // immediately follow its func type def, so
+                        // the latest captured entry matches; the
+                        // encoder never interleaves.)
+                        if (captured.items.len == 0) return error.UnsupportedShape;
+                        const last = &captured.items[captured.items.len - 1];
+                        if (last.slot != func_type_idx) return error.UnsupportedShape;
+                        if (last.name.len != 0) return error.UnsupportedShape;
+                        last.name = e.name;
                     },
                     else => return error.UnsupportedShape,
                 }
+                j += 1;
             },
-            .type => |td| switch (td) {
-                .func => |sig| {
-                    if (j + 1 >= inst.decls.len) return error.UnsupportedShape;
-                    const exp = inst.decls[j + 1];
-                    if (exp != .@"export") return error.UnsupportedShape;
-                    if (exp.@"export".desc != .func) return error.UnsupportedShape;
-                    try funcs.append(arena, .{ .name = exp.@"export".name, .sig = sig });
-                    j += 2;
-                },
-                else => {
-                    j += 1;
-                    continue;
-                },
+            .type => |td| {
+                const slot_idx: u32 = @intCast(slots.items.len);
+                switch (td) {
+                    .val => |v| try slots.append(arena, .{ .val = v }),
+                    .func => |sig| {
+                        try slots.append(arena, .{ .typedef = td });
+                        try captured.append(arena, .{
+                            .slot = slot_idx,
+                            .sig = sig,
+                            .name = "",
+                        });
+                    },
+                    else => try slots.append(arena, .{ .typedef = td }),
+                }
+                j += 1;
             },
             else => return error.UnsupportedShape,
         }
     }
-    return try funcs.toOwnedSlice(arena);
+
+    // Resolve captured func sigs against the completed slot table.
+    var funcs = try arena.alloc(FuncRef, captured.items.len);
+    for (captured.items, 0..) |c, idx| {
+        if (c.name.len == 0) return error.UnsupportedShape;
+        funcs[idx] = .{
+            .name = c.name,
+            .sig = try resolveFuncSig(arena, slots.items, c.sig),
+        };
+    }
+
+    return .{
+        .type_slots = try slots.toOwnedSlice(arena),
+        .funcs = funcs,
+    };
+}
+
+/// Rewrite every `ValType.type_idx` reference in `sig` according
+/// to the rules in the module doc — chase aliases and `eq{}`
+/// mirrors; substitute `.own` / `.borrow` / primitives inline
+/// when the chain terminates at a `.val` slot.
+fn resolveFuncSig(arena: Allocator, slots: []const TypeSlot, sig: ctypes.FuncType) DecodeError!ctypes.FuncType {
+    const params = try arena.alloc(ctypes.NamedValType, sig.params.len);
+    for (sig.params, 0..) |p, i| {
+        params[i] = .{ .name = p.name, .type = resolveValType(slots, p.type) };
+    }
+    const results: ctypes.FuncType.ResultList = switch (sig.results) {
+        .none => .none,
+        .unnamed => |v| .{ .unnamed = resolveValType(slots, v) },
+        .named => |named| blk: {
+            const dst = try arena.alloc(ctypes.NamedValType, named.len);
+            for (named, 0..) |nv, i| {
+                dst[i] = .{ .name = nv.name, .type = resolveValType(slots, nv.type) };
+            }
+            break :blk .{ .named = dst };
+        },
+    };
+    return .{ .params = params, .results = results };
+}
+
+fn resolveValType(slots: []const TypeSlot, vt: ctypes.ValType) ctypes.ValType {
+    return switch (vt) {
+        .type_idx => |n| resolveSlotRef(slots, n),
+        // Resource handles encoded as bare `.own` / `.borrow` are
+        // already in the canonical resolved form; chase the slot
+        // they point at to land on the underlying resource binding.
+        .own => |n| .{ .own = chaseResourceSlot(slots, n) },
+        .borrow => |n| .{ .borrow = chaseResourceSlot(slots, n) },
+        else => vt,
+    };
+}
+
+/// Resolve a `ValType.type_idx = n` payload to its canonical
+/// form. Chases alias / eq slots, substituting `.val` slots
+/// inline. Compound-typedef destinations stay as `.type_idx`
+/// (now pointing at the resolved slot).
+fn resolveSlotRef(slots: []const TypeSlot, n: u32) ctypes.ValType {
+    var cur = n;
+    var hops: usize = 0;
+    while (hops < slots.len) : (hops += 1) {
+        if (cur >= slots.len) return .{ .type_idx = cur };
+        switch (slots[cur]) {
+            .alias_outer, .alias_instance_export => return .{ .type_idx = cur },
+            .export_eq => |e| {
+                if (e.target == cur) return .{ .type_idx = cur };
+                cur = e.target;
+            },
+            .sub_resource => return .{ .type_idx = cur },
+            .val => |v| return switch (v) {
+                .type_idx => |n2| resolveSlotRef(slots, n2),
+                .own => |r| .{ .own = chaseResourceSlot(slots, r) },
+                .borrow => |r| .{ .borrow = chaseResourceSlot(slots, r) },
+                else => v,
+            },
+            .typedef => return .{ .type_idx = cur },
+        }
+    }
+    return .{ .type_idx = cur };
+}
+
+/// Resolve `.own = n` / `.borrow = n` references to their
+/// canonical resource binding slot. The encoder emits
+/// `.val .own = K` where K is already the named slot
+/// (`.sub_resource` for a local resource, `.export_eq` for a
+/// `use`-imported one) — we keep it as-is. Only follow through
+/// raw outer aliases that have no naming binding of their own.
+fn chaseResourceSlot(slots: []const TypeSlot, n: u32) u32 {
+    if (n >= slots.len) return n;
+    switch (slots[n]) {
+        .alias_outer, .alias_instance_export => {
+            // Anonymous alias to an outer slot — look ahead in
+            // the local slot table for an `.export_eq` whose
+            // target is this slot, which is the encoder's
+            // canonical naming binding for `use`-imported types.
+            for (slots, 0..) |s, i| switch (s) {
+                .export_eq => |e| if (e.target == n) return @intCast(i),
+                else => {},
+            };
+            return n;
+        },
+        else => return n,
+    }
 }
 
 fn bareName(qualified: []const u8) []const u8 {
@@ -346,15 +548,107 @@ test "decode #191: world with cross-interface `use` and resources" {
     try testing.expectEqualStrings("handle", f.name);
     try testing.expectEqual(@as(usize, 2), f.sig.params.len);
     try testing.expectEqualStrings("request", f.sig.params[0].name);
-    // The encoder hoists `own<R>` into a `(type (val (own R)))`
-    // TypeDef before the func; the func's param therefore points
-    // at that slot via `.type_idx`. Resolving the chain back to a
-    // resource name is out of scope for this decoder (see file
-    // doc comment).
-    try testing.expect(f.sig.params[0].type == .type_idx);
+    // Resource handles are resolved during decode: `own<R>` ref
+    // chains land on the resource binding slot in `type_slots`,
+    // which a consumer can name via `resourceNameForSlot`.
+    try testing.expect(f.sig.params[0].type == .own);
+    try testing.expectEqualStrings(
+        "incoming-request",
+        resourceNameForSlot(w.externs[1].type_slots, f.sig.params[0].type.own).?,
+    );
     try testing.expectEqualStrings("response-out", f.sig.params[1].name);
-    try testing.expect(f.sig.params[1].type == .type_idx);
+    try testing.expect(f.sig.params[1].type == .own);
+    try testing.expectEqualStrings(
+        "response-outparam",
+        resourceNameForSlot(w.externs[1].type_slots, f.sig.params[1].type.own).?,
+    );
     try testing.expect(f.sig.results == .none);
+
+    // `type_slots` is populated and exposes at least one named
+    // resource binding per use-imported resource.
+    try testing.expect(w.externs[1].type_slots.len > 0);
+    var seen_in_req = false;
+    var seen_out = false;
+    for (w.externs[1].type_slots) |s| switch (s) {
+        .export_eq => |e| {
+            if (std.mem.eql(u8, e.name, "incoming-request")) seen_in_req = true;
+            if (std.mem.eql(u8, e.name, "response-outparam")) seen_out = true;
+        },
+        .sub_resource => |n| {
+            if (std.mem.eql(u8, n, "incoming-request")) seen_in_req = true;
+            if (std.mem.eql(u8, n, "response-outparam")) seen_out = true;
+        },
+        else => {},
+    };
+    try testing.expect(seen_in_req);
+    try testing.expect(seen_out);
+}
+
+test "decode #194: local resource borrow/own round-trips" {
+    // Self-contained reproducer for #194 acceptance: a resource
+    // declared in the same interface as its consumer. The
+    // encoder emits `.@"export" .type.sub_resource` for the
+    // resource, then hoists `.val .borrow=<slot>` /
+    // `.val .own=<slot>` decls before the func that uses them.
+    const wit_source =
+        \\package docs:demo@0.1.0;
+        \\
+        \\interface i {
+        \\    resource r {}
+        \\    f: func(x: borrow<r>) -> own<r>;
+        \\}
+        \\
+        \\world w {
+        \\    export i;
+        \\}
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "w");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try decode(arena.allocator(), ct);
+
+    try testing.expectEqual(@as(usize, 1), decoded.externs.len);
+    const ext = decoded.externs[0];
+    try testing.expectEqual(@as(usize, 1), ext.funcs.len);
+    const f = ext.funcs[0];
+    try testing.expectEqualStrings("f", f.name);
+    try testing.expectEqual(@as(usize, 1), f.sig.params.len);
+    try testing.expect(f.sig.params[0].type == .borrow);
+    try testing.expectEqualStrings(
+        "r",
+        resourceNameForSlot(ext.type_slots, f.sig.params[0].type.borrow).?,
+    );
+    try testing.expect(f.sig.results == .unnamed);
+    try testing.expect(f.sig.results.unnamed == .own);
+    try testing.expectEqualStrings(
+        "r",
+        resourceNameForSlot(ext.type_slots, f.sig.results.unnamed.own).?,
+    );
+}
+
+test "decode #194: primitive params stay primitive after resolution" {
+    // Regression guard: the post-walk substitution pass must not
+    // turn primitives into spurious `.type_idx` refs. Mirrors the
+    // adder shape with explicit assertions on the canonical
+    // primitive ValTypes.
+    const wit_source =
+        \\package docs:adder@0.1.0;
+        \\interface add { add: func(x: u32, y: u32) -> u32; }
+        \\world adder { export add; }
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "adder");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const w = try decode(arena.allocator(), ct);
+
+    const f = w.externs[0].funcs[0];
+    try testing.expect(f.sig.params[0].type == .u32);
+    try testing.expect(f.sig.params[1].type == .u32);
+    try testing.expect(f.sig.results.unnamed == .u32);
 }
 
 test "extractFromCoreWasm: finds custom section" {
