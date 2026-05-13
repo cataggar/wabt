@@ -218,9 +218,11 @@ interface types {
     /// splicer-synthesised `[resource-drop]directory-entry-stream`.
     ///
     /// Declared BEFORE `descriptor` because `descriptor.read-directory`
-    /// references `own<directory-entry-stream>` in its return type;
-    /// the encoder binds resource names lazily as it walks the
+    /// references `directory-entry-stream` in its return type; the
+    /// encoder binds resource names lazily as it walks the
     /// interface body, so the referent must precede the reference.
+    /// The bare resource ref auto-wraps as
+    /// `own<directory-entry-stream>` per cataggar/wabt#182.
     resource directory-entry-stream {
         read-directory-entry: func() -> result<option<directory-entry>, error-code>;
     }
@@ -239,7 +241,7 @@ interface types {
             path: string,
             open-flags: open-flags,
             %flags: descriptor-flags
-        ) -> result<own<descriptor>, error-code>;
+        ) -> result<descriptor, error-code>;
 
         /// Open an `input-stream` reading from `offset`. Backs
         /// preview1 `fd_read` for regular files. The adapter opens
@@ -247,7 +249,7 @@ interface types {
         /// adapter-tracked file position), reads via
         /// `input-stream.blocking-read`, drops the stream, and
         /// advances its tracked position by the bytes returned.
-        read-via-stream: func(offset: u64) -> result<own<input-stream>, error-code>;
+        read-via-stream: func(offset: u64) -> result<input-stream, error-code>;
 
         /// Open an `output-stream` writing at `offset`. Backs
         /// preview1 `fd_write` for fd ≥ 3 and `fd_pwrite`. The
@@ -255,7 +257,7 @@ interface types {
         /// `blocking-write-and-flush` returns; for `fd_write` the
         /// tracked position is advanced by total bytes written, for
         /// `fd_pwrite` it is left untouched (POSIX semantics).
-        write-via-stream: func(offset: u64) -> result<own<output-stream>, error-code>;
+        write-via-stream: func(offset: u64) -> result<output-stream, error-code>;
 
         /// Open an append-mode `output-stream`. Used by the adapter
         /// only when `descriptor-flags::append` was requested at
@@ -263,7 +265,7 @@ interface types {
         /// adapter routes ordinary `fd_write` through this when the
         /// fd was opened with `FDFLAGS_APPEND` (deferred — current
         /// adapter always uses `write-via-stream`).
-        append-via-stream: func() -> result<own<output-stream>, error-code>;
+        append-via-stream: func() -> result<output-stream, error-code>;
 
         /// Backs preview1 `fd_filestat_set_size`.
         set-size: func(size: u64) -> result<_, error-code>;
@@ -386,7 +388,7 @@ interface types {
         /// listing each call (wasi-libc's `readdir(3)` then
         /// continues by re-reading from the start, matching the
         /// behaviour of the wasmtime reference adapter).
-        read-directory: func() -> result<own<directory-entry-stream>, error-code>;
+        read-directory: func() -> result<directory-entry-stream, error-code>;
     }
 }
 

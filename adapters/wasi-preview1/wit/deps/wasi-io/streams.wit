@@ -5,9 +5,10 @@
 //   * `stream-error` variant — the canonical version's
 //     `last-operation-failed` case carries an `error` resource
 //     payload from `wasi:io/error`. We mirror that shape via
-//     `use error.{error};` + `last-operation-failed(own<error>)`
+//     `use error.{error};` + `last-operation-failed(error)`
 //     so the encoded `component-type:` section is byte-identical
-//     to wasmtime's reference adapter for this case.
+//     to wasmtime's reference adapter for this case. Bare
+//     `error` auto-wraps as `own<error>` per cataggar/wabt#182.
 //
 //   * `output-stream` resource with `blocking-write-and-flush` —
 //     the single method the preview1 → preview2 adapter calls in
@@ -29,12 +30,14 @@ interface streams {
 
     /// Failure modes for `output-stream` writes. Matches the
     /// canonical wasi:io@0.2.6 variant shape: the
-    /// `last-operation-failed` case carries an `own<error>` payload
-    /// from `wasi:io/error`. The adapter discards the payload —
-    /// preview1 `fd_write` is itself blocking, so any non-`ok`
-    /// outcome traps before the host sees the resource.
+    /// `last-operation-failed` case carries an owned `error`
+    /// resource payload from `wasi:io/error` (the bare `error`
+    /// ref auto-wraps as `own<error>` per cataggar/wabt#182).
+    /// The adapter discards the payload — preview1 `fd_write` is
+    /// itself blocking, so any non-`ok` outcome traps before the
+    /// host sees the resource.
     variant stream-error {
-        last-operation-failed(own<error>),
+        last-operation-failed(error),
         closed,
     }
 
