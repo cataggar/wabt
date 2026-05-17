@@ -159,6 +159,17 @@
 ;;     lift not pursued — preview1 v3 has no socket-creation
 ;;     primitives, so the lift would be functionally moot
 ;;     (cataggar/wabt#178 closed as won't-implement).
+;;   * `poll_oneoff` — exported as ENOSYS=52 stub. wasi-libc and
+;;     Zig's stdlib reference it as part of standard startup
+;;     imports (Zig's `std.Io.Threaded` cites it for sleep / I/O
+;;     readiness), so embeds that pull it in via linker startup
+;;     would otherwise fail at `wabt component new` time with
+;;     `MissingRequiredExport`. Programs that actually call
+;;     `poll_oneoff(2)` get the well-defined ENOSYS errno; a real
+;;     preview2 lift (CLOCK subscriptions through
+;;     `wasi:clocks/monotonic-clock.subscribe-{duration,instant}`
+;;     + `wasi:io/poll.poll`; FD subscriptions through
+;;     `wasi:io/streams.subscribe`) is deferred per cataggar/wabt#208.
 
 (module
   ;; ── func types ────────────────────────────────────────────────
@@ -259,6 +270,15 @@
   (type $proc_exit_sig        (func (param i32)))
   (type $proc_raise_sig       (func (param i32) (result i32)))
   (type $sched_yield_sig      (func (result i32)))
+
+  ;; preview1 poll_oneoff signature (cataggar/wabt#208).
+  ;; poll_oneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr) -> errno
+  ;; Currently implemented as an ENOSYS=52 stub — see $poll_oneoff in
+  ;; body.wat for the rationale and follow-up plan (proper preview2
+  ;; routing through `wasi:io/poll.poll` + `wasi:clocks/monotonic-
+  ;; clock.subscribe-{duration,instant}` + `wasi:io/streams.subscribe`
+  ;; tracked separately).
+  (type $poll_oneoff_sig      (func (param i32 i32 i32 i32) (result i32)))
 
   ;; preview2 import signatures (canon-lower'd by the wrapping
   ;; component; here they are plain core-wasm function types). The

@@ -567,6 +567,44 @@
     ;; advisory.
     i32.const 0)
 
+  ;; preview1 `poll_oneoff(in_ptr, out_ptr, nsubscriptions,
+  ;;                        nevents_ptr) -> errno`.
+  ;;
+  ;; **MVP ENOSYS=52 stub** (cataggar/wabt#208). wasi-libc and
+  ;; Zig's stdlib pull `poll_oneoff` into standard startup imports
+  ;; (Zig declares it for `std.Io.Threaded` sleeps / I/O readiness),
+  ;; so embeds that don't actively call it would otherwise be
+  ;; blocked at `wabt component new` time with
+  ;; `MissingRequiredExport` from `gc.run`'s required-export
+  ;; seeding. A real lift would:
+  ;;
+  ;;   * Iterate `*in_ptr` reading 48-byte `subscription` records
+  ;;     (userdata: u64; u.tag: u8 + 7 pad; u.payload: 40 bytes —
+  ;;     clock: clockid u32, timeout u64, precision u64, flags
+  ;;     u16; fd_read/fd_write: fd u32).
+  ;;   * Translate CLOCK entries to pollables via
+  ;;     `wasi:clocks/monotonic-clock.subscribe-{duration,instant}`
+  ;;     (clockid ∈ {MONOTONIC=1, REALTIME=0}; abs flag selects
+  ;;     `subscribe-instant`; otherwise relative `subscribe-duration`).
+  ;;   * Translate FD entries to pollables via
+  ;;     `wasi:io/streams.subscribe` on the descriptor's
+  ;;     input-stream / output-stream.
+  ;;   * `wasi:io/poll.poll([pollables])` to block on the union.
+  ;;   * Write back one 32-byte `event` per ready index into
+  ;;     `*out_ptr`, set `*nevents_ptr` to the count.
+  ;;
+  ;; Returning ENOSYS lets the program decide — wasi-libc / Zig
+  ;; std typically surface it as `EAGAIN`/`EINTR` callers or as a
+  ;; sleep-call failure. Defensively writes 0 to `*nevents_ptr`
+  ;; so callers reading it after an error see a defined value.
+  (func $poll_oneoff (type $poll_oneoff_sig)
+    ;; *nevents_ptr = 0
+    local.get 3
+    i32.const 0
+    i32.store
+    ;; ENOSYS=52
+    i32.const 52)
+
   ;; ── fd_* (mostly ENOSYS stubs until subsequent commits) ──────
 
   ;; Helper: return cached stdout handle, populating it on first

@@ -2989,6 +2989,75 @@ test "builtin_adapter: reactor world imports the same preview2 surface as comman
     }
 }
 
+// ── #208: `poll_oneoff` export presence + GC-pass survival ─────────────────
+// wasi-libc + Zig stdlib pull `poll_oneoff` in via standard startup
+// imports; the adapter must export it (even as an ENOSYS stub) so
+// `gc.run`'s required-export seeding succeeds and `wabt component
+// new` doesn't bail out with `error.MissingRequiredExport`.
+
+test "builtin_adapter: command exports poll_oneoff with the canonical preview1 signature (#208)" {
+    var owned = try core_imports.extract(testing.allocator, builtin_adapter.wasi_preview1_command_wasm);
+    defer owned.deinit();
+
+    const e = owned.interface.findExport("poll_oneoff") orelse {
+        return error.PollOneoffMissingFromCommandAdapter;
+    };
+    try testing.expect(e.kind == .func);
+    const sig = e.sig.?;
+    // poll_oneoff(in_ptr, out_ptr, nsubscriptions, nevents_ptr) -> errno
+    // Core-wasm shape: (i32, i32, i32, i32) -> i32.
+    try testing.expectEqual(@as(usize, 4), sig.params.len);
+    for (sig.params) |p| try testing.expectEqual(wabt.types.ValType.i32, p);
+    try testing.expectEqual(@as(usize, 1), sig.results.len);
+    try testing.expectEqual(wabt.types.ValType.i32, sig.results[0]);
+}
+
+test "builtin_adapter: reactor exports poll_oneoff with the canonical preview1 signature (#208)" {
+    var owned = try core_imports.extract(testing.allocator, builtin_adapter.wasi_preview1_reactor_wasm);
+    defer owned.deinit();
+
+    const e = owned.interface.findExport("poll_oneoff") orelse {
+        return error.PollOneoffMissingFromReactorAdapter;
+    };
+    try testing.expect(e.kind == .func);
+    const sig = e.sig.?;
+    try testing.expectEqual(@as(usize, 4), sig.params.len);
+    for (sig.params) |p| try testing.expectEqual(wabt.types.ValType.i32, p);
+    try testing.expectEqual(@as(usize, 1), sig.results.len);
+    try testing.expectEqual(wabt.types.ValType.i32, sig.results[0]);
+}
+
+test "builtin_adapter: gc.run satisfies a poll_oneoff requirement (regression for #208)" {
+    // Concrete repro of issue #208's failing path: an embed that
+    // imports `wasi_snapshot_preview1.poll_oneoff` causes the
+    // splicer to seed `gc.run`'s required-export set with
+    // `"poll_oneoff"`. Before this fix the adapter had no
+    // `poll_oneoff` export and `gc.run` returned
+    // `error.MissingRequiredExport` immediately. With the ENOSYS
+    // stub in place gc.run must succeed AND the survival-set
+    // bytes must re-load cleanly.
+    const gc = wabt.component.adapter.gc;
+    const required = [_][]const u8{"poll_oneoff"};
+
+    const out_cmd = try gc.run(
+        testing.allocator,
+        builtin_adapter.wasi_preview1_command_wasm,
+        &required,
+    );
+    defer testing.allocator.free(out_cmd);
+    try testing.expect(out_cmd.len > 8);
+    try testing.expectEqualSlices(u8, "\x00asm", out_cmd[0..4]);
+
+    const out_rx = try gc.run(
+        testing.allocator,
+        builtin_adapter.wasi_preview1_reactor_wasm,
+        &required,
+    );
+    defer testing.allocator.free(out_rx);
+    try testing.expect(out_rx.len > 8);
+    try testing.expectEqualSlices(u8, "\x00asm", out_rx[0..4]);
+}
+
 test "probeStartExport: core with `_start` func export -> .yes" {
     // Hand-rolled core wasm:
     //   - type 0: (func)
