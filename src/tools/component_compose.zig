@@ -513,13 +513,49 @@ pub fn composeBinaries(
 
     // ── Instances. We emit two instance sections (providers, then
     //    consumer); the slice below holds them in declaration order
-    //    and `section_order` slices them apart. ──
+    //    and `section_order` slices them apart.
+    //
+    //    Provider Instantiate args (issue #214): each provider's own
+    //    imports must be satisfied by the wrapper, otherwise wasmtime
+    //    aborts at the inner Instantiate site with `missing import
+    //    named X`. We satisfy them from the wrapper's outer-imports —
+    //    the bubbled-up consumer-imports the prologue just emitted.
+    //    Post-`--align-wasi` rewrite both halves agree on names by
+    //    construction, so a name-match against the unresolved
+    //    consumer-imports yields the right wrapper-instance index. ──
+    var inst_slot_for_consumer_name = std.StringHashMapUnmanaged(u32).empty;
+    {
+        var inst_count: u32 = 0;
+        for (link.unresolved) |u_idx| {
+            const imp = consumer.imports[u_idx];
+            if (imp.desc == .instance) {
+                try inst_slot_for_consumer_name.put(ar, imp.name, inst_count);
+                inst_count += 1;
+            }
+        }
+    }
+
     var instances_list = std.ArrayListUnmanaged(ctypes.InstanceExpr).empty;
     for (0..num_providers) |p_local| {
         const comp_idx: u32 = @intCast(p_local + 1);
+        var prov_args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
+        for (providers[p_local].imports) |p_imp| {
+            // Out-of-scope for #214: providers with non-instance-typed
+            // imports. Real-world `wasm-tools component new` providers
+            // pull wasi:* in via `(import "wasi:io/error@0.2.6"
+            // (instance (type N)))` exclusively, so this is a clean
+            // failure mode rather than a silent incorrect emission.
+            if (p_imp.desc != .instance) return error.UnsupportedComposeShape;
+            const wrap_inst_idx = inst_slot_for_consumer_name.get(p_imp.name) orelse
+                return error.UnmatchedProviderImport;
+            try prov_args.append(ar, .{
+                .name = p_imp.name,
+                .sort_idx = .{ .sort = .instance, .idx = wrap_inst_idx },
+            });
+        }
         try instances_list.append(ar, .{ .instantiate = .{
             .component_idx = comp_idx,
-            .args = &.{},
+            .args = try prov_args.toOwnedSlice(ar),
         } });
     }
 
@@ -1857,4 +1893,164 @@ test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
 
     // No @0.2.10 reference should survive anywhere in the composed bytes.
     try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+}
+
+// ── #214: provider Instantiate args wired from wrapper outer-imports ───────
+
+test "composeBinaries: provider with own imports gets Instantiate args wired (#214)" {
+    // Provider imports the same wasi:io/error interface the consumer
+    // imports. After compose, the provider's Instantiate must be
+    // emitted with one arg pointing at the wrapper outer-import that
+    // bubbled up from the consumer's unresolved-imports list.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{provider_bytes};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Two instance section entries: provider instantiation first,
+    // then consumer instantiation.
+    try testing.expectEqual(@as(usize, 2), loaded.instances.len);
+    const prov_inst = loaded.instances[0];
+    try testing.expect(prov_inst == .instantiate);
+    try testing.expectEqual(@as(u32, 1), prov_inst.instantiate.component_idx);
+
+    // The fix: the provider's args list must NOT be empty — it
+    // must wire wasi:io/error@0.2.6 to the wrapper outer-import.
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqualStrings(
+        "wasi:io/error@0.2.6",
+        prov_inst.instantiate.args[0].name,
+    );
+    try testing.expect(prov_inst.instantiate.args[0].sort_idx.sort == .instance);
+    // Wrapper instance indexspace: outer-imports occupy [0..N-1].
+    // There's only one outer-import here, so its idx is 0.
+    try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
+}
+
+test "composeBinaries: provider import the consumer doesn't share → UnmatchedProviderImport (#214)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    // Provider needs an interface the consumer doesn't import. The
+    // wrapper outer-import set comes from `link.unresolved` (consumer
+    // only), so there's nothing to wire this to.
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:filesystem/types@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{provider_bytes};
+    const r = composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    try testing.expectError(error.UnmatchedProviderImport, r);
+}
+
+test "compose end-to-end: provider with mismatched wasi version composes after --align-wasi (#214)" {
+    // The actual user-reported scenario in #214: consumer imports
+    // wasi:io/error@0.2.6, provider imports wasi:io/error@0.2.10.
+    // After `--align-wasi=0.2.6` aligns both names to @0.2.6, the
+    // provider's Instantiate is wired to the wrapper outer-import.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    // Detect conflict and align.
+    const consumer_ast = try loader.load(consumer_bytes, ar);
+    const provider_ast = try loader.load(provider_bytes, ar);
+    const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
+    const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
+    try testing.expectEqual(@as(usize, 1), conflicts.len);
+    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 0), resolution.unresolved.len);
+
+    // Apply rewrites.
+    const cb = try rewrite_extern_names.apply(ar, consumer_bytes, resolution.rules);
+    const pb = try rewrite_extern_names.apply(ar, provider_bytes, resolution.rules);
+
+    // Compose. The proximate failure in #214 was that this step
+    // emitted `Instantiate { component_index: 1, args: [] }` and
+    // wasmtime then reported `missing import named wasi:io/error
+    // @0.2.6` at the inner Instantiate site.
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // No @0.2.10 byte survives, and the provider's Instantiate has
+    // its arg wired to the wrapper outer-import.
+    try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+    try testing.expectEqual(@as(usize, 2), loaded.instances.len);
+    const prov_inst = loaded.instances[0];
+    try testing.expect(prov_inst == .instantiate);
+    try testing.expectEqual(@as(u32, 1), prov_inst.instantiate.component_idx);
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqualStrings(
+        "wasi:io/error@0.2.6",
+        prov_inst.instantiate.args[0].name,
+    );
 }
