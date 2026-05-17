@@ -31,6 +31,8 @@ const writer = wabt.component.writer;
 const loader = wabt.component.loader;
 const compose = wabt.component.compose;
 const type_walk = wabt.component.type_walk;
+const extern_name = wabt.component.extern_name;
+const rewrite_extern_names = wabt.component.rewrite_extern_names;
 
 pub const usage =
     \\Usage: wabt component compose [options] <consumer.wasm>
@@ -39,11 +41,117 @@ pub const usage =
     \\components' exports by interface name.
     \\
     \\Options:
-    \\  -d, --define <file>     Provider component (repeatable)
-    \\  -o, --output <file>     Output file (default: <input>.composed.wasm)
-    \\      --skip-validation   Skip post-encoding component validation
+    \\  -d, --define <file>           Provider component (repeatable)
+    \\  -o, --output <file>           Output file (default: <input>.composed.wasm)
+    \\      --skip-validation         Skip post-encoding component validation
+    \\      --align-wasi=<mode>       Reconcile wasi:* version mismatches across
+    \\                                the compose seam. Mode is one of:
+    \\                                  error  default — refuse and list conflicts
+    \\                                  auto   pick the lowest observed wasi version
+    \\                                  <X>    explicit target (e.g. 0.2.6)
+    \\      --rewrite-import=<spec>   Rewrite a non-wasi package version
+    \\                                across the seam. Spec form:
+    \\                                  <ns>:<pkg>@<from>=<to>
+    \\                                (repeatable; for wasi:* use --align-wasi)
     \\
 ;
+
+const AlignWasi = union(enum) {
+    error_default,
+    target: []const u8,
+    auto,
+};
+
+const ExplicitRewrite = struct {
+    spec: []const u8,
+    ns: []const u8,
+    pkg: []const u8,
+    from: []const u8,
+    to: []const u8,
+};
+
+const Resolution = struct {
+    rules: []const extern_name.Rule,
+    unresolved: []const compose.Conflict,
+};
+
+/// Combine `--align-wasi` + `--rewrite-import` settings with the
+/// observed conflicts to produce a rule list (passed to
+/// `rewrite_extern_names.apply`) and an unresolved-conflicts list (if
+/// non-empty, the caller emits a diagnostic and refuses to compose).
+fn resolveRules(
+    arena: std.mem.Allocator,
+    conflicts: []const compose.Conflict,
+    align_wasi: AlignWasi,
+    explicit_rewrites: []const ExplicitRewrite,
+) !Resolution {
+    var rules_list = std.ArrayListUnmanaged(extern_name.Rule).empty;
+    var unresolved = std.ArrayListUnmanaged(compose.Conflict).empty;
+
+    for (conflicts) |c| {
+        const wasi_handled = std.mem.eql(u8, c.ns, "wasi") and switch (align_wasi) {
+            .error_default => false,
+            .target, .auto => true,
+        };
+        if (wasi_handled) {
+            const target = switch (align_wasi) {
+                .target => |v| v,
+                .auto => lowestVersion(c.occurrences),
+                .error_default => unreachable,
+            };
+            try rules_list.append(arena, .{
+                .ns = c.ns,
+                .pkg = c.pkg,
+                .iface = c.iface,
+                .to_version = target,
+            });
+            continue;
+        }
+
+        var matched_explicit = false;
+        for (explicit_rewrites) |er| {
+            if (!std.mem.eql(u8, er.ns, c.ns)) continue;
+            if (!std.mem.eql(u8, er.pkg, c.pkg)) continue;
+            try rules_list.append(arena, .{
+                .ns = er.ns,
+                .pkg = er.pkg,
+                .from_version = er.from,
+                .to_version = er.to,
+            });
+            matched_explicit = true;
+            break;
+        }
+        if (matched_explicit) continue;
+
+        try unresolved.append(arena, c);
+    }
+
+    return .{
+        .rules = try rules_list.toOwnedSlice(arena),
+        .unresolved = try unresolved.toOwnedSlice(arena),
+    };
+}
+
+/// Parse a `--rewrite-import` spec: `<ns>:<pkg>@<from>=<to>`.
+fn parseExplicitRewrite(spec: []const u8) ?ExplicitRewrite {
+    const colon = std.mem.indexOfScalar(u8, spec, ':') orelse return null;
+    if (colon == 0) return null;
+    const ns = spec[0..colon];
+    const after_ns = spec[colon + 1 ..];
+
+    const at = std.mem.indexOfScalar(u8, after_ns, '@') orelse return null;
+    if (at == 0) return null;
+    const pkg = after_ns[0..at];
+    const after_pkg = after_ns[at + 1 ..];
+
+    const eq = std.mem.indexOfScalar(u8, after_pkg, '=') orelse return null;
+    if (eq == 0) return null;
+    const from = after_pkg[0..eq];
+    const to = after_pkg[eq + 1 ..];
+    if (to.len == 0) return null;
+
+    return .{ .spec = spec, .ns = ns, .pkg = pkg, .from = from, .to = to };
+}
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
@@ -57,6 +165,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var output_file: ?[]const u8 = null;
     var skip_validation: bool = false;
     var consumer_path: ?[]const u8 = null;
+    var align_wasi: AlignWasi = .error_default;
+    var explicit_rewrites = std.ArrayListUnmanaged(ExplicitRewrite).empty;
+    defer explicit_rewrites.deinit(alloc);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -77,6 +188,30 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             output_file = sub_args[i];
         } else if (std.mem.eql(u8, arg, "--skip-validation")) {
             skip_validation = true;
+        } else if (std.mem.startsWith(u8, arg, "--align-wasi=")) {
+            const mode = arg["--align-wasi=".len..];
+            if (mode.len == 0) {
+                std.debug.print("error: --align-wasi requires a value (error|auto|<version>)\n", .{});
+                std.process.exit(1);
+            }
+            if (std.mem.eql(u8, mode, "error")) {
+                align_wasi = .error_default;
+            } else if (std.mem.eql(u8, mode, "auto")) {
+                align_wasi = .auto;
+            } else {
+                if (extern_name.SemVer.parse(mode) == null) {
+                    std.debug.print("error: --align-wasi=<X>: '{s}' is not a major.minor.patch version (e.g. 0.2.6)\n", .{mode});
+                    std.process.exit(1);
+                }
+                align_wasi = .{ .target = mode };
+            }
+        } else if (std.mem.startsWith(u8, arg, "--rewrite-import=")) {
+            const spec = arg["--rewrite-import=".len..];
+            const rule = parseExplicitRewrite(spec) orelse {
+                std.debug.print("error: --rewrite-import='{s}' is not in the form <ns>:<pkg>@<from>=<to>\n", .{spec});
+                std.process.exit(1);
+            };
+            try explicit_rewrites.append(alloc, rule);
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown option '{s}'. Use `wabt component compose help`.\n", .{arg});
             std.process.exit(1);
@@ -122,6 +257,67 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         };
     }
 
+    // ── Version-mismatch reconciliation pre-pass (issue #209) ──
+    var prepass_arena = std.heap.ArenaAllocator.init(alloc);
+    defer prepass_arena.deinit();
+    const pa = prepass_arena.allocator();
+
+    const consumer_ast = loader.load(consumer_bytes, pa) catch |err| {
+        std.debug.print("error: cannot parse consumer '{s}': {s}\n", .{ cons_path, @errorName(err) });
+        std.process.exit(1);
+    };
+    const provider_asts = try pa.alloc(ctypes.Component, provider_bytes.len);
+    for (provider_bytes, 0..) |b, idx| {
+        provider_asts[idx] = loader.load(b, pa) catch |err| {
+            std.debug.print(
+                "error: cannot parse provider '{s}': {s}\n",
+                .{ providers_paths.items[idx], @errorName(err) },
+            );
+            std.process.exit(1);
+        };
+    }
+    const provider_ptrs = try pa.alloc(*const ctypes.Component, provider_asts.len);
+    for (provider_asts, 0..) |*p, idx| provider_ptrs[idx] = p;
+
+    const conflicts = try compose.detectVersionConflicts(pa, &consumer_ast, provider_ptrs);
+
+    const resolution = try resolveRules(pa, conflicts, align_wasi, explicit_rewrites.items);
+
+    if (resolution.unresolved.len > 0) {
+        printConflictDiagnostic(
+            resolution.unresolved,
+            cons_path,
+            providers_paths.items,
+        );
+        std.process.exit(1);
+    }
+
+    // Apply rules to all input byte streams. Rewritten bytes are
+    // arena-allocated; we replace the slices we hand to
+    // composeBinaries but keep the originals alive for the defer-free
+    // contract above.
+    const rules = resolution.rules;
+    const final_consumer_bytes: []const u8 = if (rules.len == 0)
+        consumer_bytes
+    else
+        rewrite_extern_names.apply(pa, consumer_bytes, rules) catch |err| {
+            std.debug.print("error: rewriting consumer extern names: {s}\n", .{@errorName(err)});
+            std.process.exit(1);
+        };
+    const final_provider_bytes = try pa.alloc([]const u8, provider_bytes.len);
+    for (provider_bytes, 0..) |b, idx| {
+        final_provider_bytes[idx] = if (rules.len == 0)
+            b
+        else
+            rewrite_extern_names.apply(pa, b, rules) catch |err| {
+                std.debug.print(
+                    "error: rewriting provider '{s}' extern names: {s}\n",
+                    .{ providers_paths.items[idx], @errorName(err) },
+                );
+                std.process.exit(1);
+            };
+    }
+
     const out_path = output_file orelse blk: {
         if (std.mem.endsWith(u8, cons_path, ".wasm")) {
             const stem = cons_path[0 .. cons_path.len - 5];
@@ -130,7 +326,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         break :blk std.fmt.allocPrint(alloc, "{s}.composed.wasm", .{cons_path}) catch cons_path;
     };
 
-    const out_bytes = composeBinaries(alloc, consumer_bytes, provider_bytes) catch |err| {
+    const out_bytes = composeBinaries(alloc, final_consumer_bytes, final_provider_bytes) catch |err| {
         std.debug.print("error: composing component: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -152,6 +348,69 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.debug.print("error: cannot write '{s}': {any}\n", .{ out_path, err });
         std.process.exit(1);
     };
+}
+
+/// Pick the lowest observed version across `occurrences` using
+/// `SemVer` ordering (so 0.2.6 < 0.2.10). Falls back to the first
+/// occurrence's version when the version strings don't parse —
+/// `detectVersionConflicts` will only have selected groups with at
+/// least one parseable version, so the fallback only triggers on
+/// pathological mixed inputs.
+fn lowestVersion(occurrences: []const compose.Occurrence) []const u8 {
+    var best: []const u8 = occurrences[0].version;
+    var best_sv: ?extern_name.SemVer = extern_name.SemVer.parse(best);
+    for (occurrences[1..]) |o| {
+        const sv = extern_name.SemVer.parse(o.version) orelse continue;
+        if (best_sv) |b| {
+            if (sv.cmp(b) < 0) {
+                best = o.version;
+                best_sv = sv;
+            }
+        } else {
+            best = o.version;
+            best_sv = sv;
+        }
+    }
+    return best;
+}
+
+fn printConflictDiagnostic(
+    conflicts: []const compose.Conflict,
+    consumer_path: []const u8,
+    provider_paths: []const []const u8,
+) void {
+    std.debug.print("error: version-mismatched outer imports across compose seam:\n", .{});
+    for (conflicts) |c| {
+        const role_name = "  {s}:{s}/{s}";
+        std.debug.print(role_name ++ "\n", .{ c.ns, c.pkg, c.iface });
+        for (c.occurrences) |o| {
+            const src_label: []const u8 = if (o.where.source_idx == 0)
+                consumer_path
+            else
+                provider_paths[o.where.source_idx - 1];
+            const role: []const u8 = switch (o.where.role) {
+                .@"import" => "import",
+                .@"export" => "export",
+            };
+            std.debug.print("    @{s}  ({s} of {s})\n", .{ o.version, role, src_label });
+        }
+    }
+    var hint_pkg: []const u8 = "wasi";
+    for (conflicts) |c| {
+        if (std.mem.eql(u8, c.ns, "wasi")) {
+            hint_pkg = c.ns;
+            const lowest = lowestVersion(c.occurrences);
+            std.debug.print(
+                "hint: re-run with `--align-wasi={s}` to rewrite every wasi:* reference to that version.\n",
+                .{lowest},
+            );
+            return;
+        }
+    }
+    std.debug.print(
+        "hint: re-run with `--rewrite-import=<ns>:<pkg>@<from>=<to>` for each non-wasi conflict above.\n",
+        .{},
+    );
 }
 
 fn writeStdout(io: std.Io, text: []const u8) void {
@@ -176,7 +435,7 @@ fn writeStdout(io: std.Io, text: []const u8) void {
 pub fn composeBinaries(
     alloc: std.mem.Allocator,
     consumer_bytes: []const u8,
-    provider_bytes: []const []u8,
+    provider_bytes: []const []const u8,
 ) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -1382,4 +1641,220 @@ test "composeBinaries: re-export desc is un-ascribed (#132)" {
     // loaded desc. Seeing 0 proves the writer took the 0x00 path,
     // which is exactly what wasm-tools-compose does (`ty: None`).
     try testing.expectEqual(@as(u32, 0), loaded.exports[0].desc.instance);
+}
+
+// ── #209 version-reconciliation pre-pass tests ─────────────────────────────
+
+test "parseExplicitRewrite: well-formed spec" {
+    const r = parseExplicitRewrite("azure:codegen@0.1.0=0.2.0").?;
+    try testing.expectEqualStrings("azure", r.ns);
+    try testing.expectEqualStrings("codegen", r.pkg);
+    try testing.expectEqualStrings("0.1.0", r.from);
+    try testing.expectEqualStrings("0.2.0", r.to);
+}
+
+test "parseExplicitRewrite: missing pieces are rejected" {
+    try testing.expect(parseExplicitRewrite("") == null);
+    try testing.expect(parseExplicitRewrite("noseparators") == null);
+    try testing.expect(parseExplicitRewrite("ns:pkg@0.1.0") == null);
+    try testing.expect(parseExplicitRewrite("ns:pkg@=0.1.0") == null);
+    try testing.expect(parseExplicitRewrite("ns:pkg@0.1.0=") == null);
+    try testing.expect(parseExplicitRewrite(":pkg@0.1.0=0.2.0") == null);
+    try testing.expect(parseExplicitRewrite("ns:@0.1.0=0.2.0") == null);
+}
+
+test "lowestVersion: picks 0.2.6 over 0.2.10" {
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 1, .role = .@"export" } },
+        .{ .version = "0.2.8", .where = .{ .source_idx = 1, .role = .@"import" } },
+    };
+    try testing.expectEqualStrings("0.2.6", lowestVersion(&occs));
+}
+
+test "resolveRules: default error mode leaves wasi conflicts unresolved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
+    };
+    const res = try resolveRules(ar, &conflicts, .error_default, &.{});
+    try testing.expectEqual(@as(usize, 0), res.rules.len);
+    try testing.expectEqual(@as(usize, 1), res.unresolved.len);
+}
+
+test "resolveRules: --align-wasi=<X> rewrites every wasi conflict to X" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs1 = [_]compose.Occurrence{
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+    };
+    const occs2 = [_]compose.Occurrence{
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"export" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs1 },
+        .{ .ns = "wasi", .pkg = "io", .iface = "streams", .occurrences = &occs2 },
+    };
+    const res = try resolveRules(ar, &conflicts, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 2), res.rules.len);
+    try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+    try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
+    try testing.expectEqualStrings("0.2.6", res.rules[1].to_version);
+}
+
+test "resolveRules: --align-wasi=auto picks lowest per conflict" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 1, .role = .@"export" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
+    };
+    const res = try resolveRules(ar, &conflicts, .auto, &.{});
+    try testing.expectEqual(@as(usize, 1), res.rules.len);
+    try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
+    try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+}
+
+test "resolveRules: --rewrite-import handles non-wasi conflicts" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.0", .where = .{ .source_idx = 1, .role = .@"export" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "azure", .pkg = "codegen", .iface = "models", .occurrences = &occs },
+    };
+    const explicit = [_]ExplicitRewrite{
+        .{
+            .spec = "azure:codegen@0.1.0=0.2.0",
+            .ns = "azure",
+            .pkg = "codegen",
+            .from = "0.1.0",
+            .to = "0.2.0",
+        },
+    };
+    const res = try resolveRules(ar, &conflicts, .error_default, &explicit);
+    try testing.expectEqual(@as(usize, 1), res.rules.len);
+    try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+    try testing.expectEqualStrings("0.2.0", res.rules[0].to_version);
+    try testing.expect(res.rules[0].from_version != null);
+    try testing.expectEqualStrings("0.1.0", res.rules[0].from_version.?);
+}
+
+test "resolveRules: non-wasi conflict without explicit rewrite stays unresolved" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.0", .where = .{ .source_idx = 1, .role = .@"export" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "azure", .pkg = "codegen", .iface = "models", .occurrences = &occs },
+    };
+    // --align-wasi=auto does NOT cover non-wasi namespaces.
+    const res = try resolveRules(ar, &conflicts, .auto, &.{});
+    try testing.expectEqual(@as(usize, 0), res.rules.len);
+    try testing.expectEqual(@as(usize, 1), res.unresolved.len);
+}
+
+test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer imports wasi:io/error@0.2.6 (one instance import).
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const cons_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &cons_types, .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    // Provider exports the SAME interface at @0.2.10. Without rewriting,
+    // the seam wouldn't match and both versions would bubble up.
+    const prov_instances = [_]ctypes.InstanceExpr{
+        .{ .exports = &[_]ctypes.InlineExport{} },
+    };
+    const prov_exports = [_]ctypes.ExportDecl{
+        .{
+            .name = "wasi:io/error@0.2.10",
+            .desc = .{ .instance = 0 },
+            .sort_idx = .{ .sort = .instance, .idx = 0 },
+        },
+    };
+    const prov_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &prov_instances, .aliases = &.{},
+        .types = &prov_types, .canons = &.{},
+        .imports = &.{}, .exports = &prov_exports,
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    // Detect → should report one conflict at io/error.
+    const consumer_ast = try loader.load(consumer_bytes, ar);
+    const provider_ast = try loader.load(provider_bytes, ar);
+    const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
+    const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
+    try testing.expectEqual(@as(usize, 1), conflicts.len);
+
+    // Resolve → align to 0.2.6.
+    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 0), resolution.unresolved.len);
+    try testing.expectEqual(@as(usize, 1), resolution.rules.len);
+
+    // Apply rewrites.
+    const cb = try rewrite_extern_names.apply(ar, consumer_bytes, resolution.rules);
+    const pb = try rewrite_extern_names.apply(ar, provider_bytes, resolution.rules);
+
+    // After rewriting, the seam must match exactly.
+    const cb_ast = try loader.load(cb, ar);
+    const pb_ast = try loader.load(pb, ar);
+    try testing.expectEqualStrings("wasi:io/error@0.2.6", cb_ast.imports[0].name);
+    try testing.expectEqualStrings("wasi:io/error@0.2.6", pb_ast.exports[0].name);
+
+    // Final compose should produce zero unresolved imports.
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+    try testing.expectEqual(@as(usize, 0), loaded.imports.len);
+
+    // No @0.2.10 reference should survive anywhere in the composed bytes.
+    try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
 }

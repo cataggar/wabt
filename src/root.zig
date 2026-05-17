@@ -35,6 +35,8 @@ pub const component = struct {
     pub const loader = @import("component/loader.zig");
     pub const writer = @import("component/writer.zig");
     pub const compose = @import("component/compose.zig");
+    pub const extern_name = @import("component/extern_name.zig");
+    pub const rewrite_extern_names = @import("component/rewrite_extern_names.zig");
     pub const type_walk = @import("component/type_walk.zig");
     pub const wit = struct {
         pub const lexer = @import("component/wit/lexer.zig");
@@ -69,6 +71,8 @@ test {
     _ = @import("component/loader.zig");
     _ = @import("component/writer.zig");
     _ = @import("component/compose.zig");
+    _ = @import("component/extern_name.zig");
+    _ = @import("component/rewrite_extern_names.zig");
     _ = @import("component/type_walk.zig");
     _ = @import("component/wit/lexer.zig");
     _ = @import("component/wit/ast.zig");
