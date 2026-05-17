@@ -1935,3 +1935,109 @@ test "apply: malformed `name` section falls back to verbatim copy (#214 cosmetic
     // Section content survives verbatim.
     try testing.expect(std.mem.indexOf(u8, out, &.{ 0x05, 0xff, 0xee }) != null);
 }
+
+// ── #222: method-export decls survive the rewriter ─────────────────────────
+
+test "apply: preserves [method]R.M-named export decls inside instance-type bodies (#222)" {
+    // Audit-bake for #222. The rewriter walks type sections and
+    // descends into instance/component-type bodies via
+    // `rewriteDeclList`. Each `0x04` (export) decl's name slot is
+    // run through `extern_name.rewrite`, which is a no-op for
+    // method-style names (`[method]R.M`) because `extern_name.parse`
+    // doesn't recognise the `[method]…` prefix as an extern-name
+    // form. Verify the decl survives byte-equivalently and isn't
+    // dropped or corrupted.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Instance type body mirroring wasi:io/poll@0.2.10's canonical
+    // shape: a sub_resource export, a borrow-handle type, a func
+    // type, a method export, a list-of-borrows compound, and a
+    // poll func + export.
+    const borrow_handle = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const ready_func = ctypes.TypeDef{ .func = .{
+        .params = &.{},
+        .results = .none,
+    } };
+    const block_func = ctypes.TypeDef{ .func = .{
+        .params = &.{},
+        .results = .none,
+    } };
+    const inner_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "pollable", .desc = .{ .type = .sub_resource } } },
+        .{ .type = borrow_handle },
+        .{ .type = ready_func },
+        .{ .@"export" = .{ .name = "[method]pollable.ready", .desc = .{ .func = 2 } } },
+        .{ .type = block_func },
+        .{ .@"export" = .{ .name = "[method]pollable.block", .desc = .{ .func = 4 } } },
+    };
+    const iface_inst = ctypes.TypeDef{ .instance = .{ .decls = &inner_decls } };
+    // Wrap inside a component type with one import declaring the
+    // instance — that's the real-world shape wt-component emits.
+    const ct_decls = [_]ctypes.Decl{
+        .{ .type = iface_inst },
+        .{ .import = .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } } },
+    };
+    const ct = ctypes.TypeDef{ .component = .{ .decls = &ct_decls } };
+    const types = [_]ctypes.TypeDef{ct};
+    const comp: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &types, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const bytes = try writer.encode(ar, &comp);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, bytes, &rules);
+
+    const loaded = try loader.load(out, ar);
+    try testing.expectEqual(@as(usize, 1), loaded.types.len);
+    try testing.expect(loaded.types[0] == .component);
+    const got_ct_decls = loaded.types[0].component.decls;
+
+    // Find the instance-type decl and walk its body.
+    var got_inst_opt: ?ctypes.InstanceTypeDecl = null;
+    for (got_ct_decls) |d| {
+        if (d == .type and d.type == .instance) {
+            got_inst_opt = d.type.instance;
+            break;
+        }
+    }
+    const got_inst = got_inst_opt orelse return error.MissingInstanceType;
+
+    // Both `[method]pollable.ready` and `[method]pollable.block`
+    // export decls must survive — if the rewriter accidentally
+    // dropped them this would be the symptom the user reports in
+    // #222 (narrowed interface in the composed binary).
+    try testing.expectEqual(@as(usize, inner_decls.len), got_inst.decls.len);
+    var saw_ready = false;
+    var saw_block = false;
+    for (got_inst.decls) |d| {
+        if (d != .@"export") continue;
+        if (std.mem.eql(u8, d.@"export".name, "[method]pollable.ready")) {
+            try testing.expect(d.@"export".desc == .func);
+            saw_ready = true;
+        }
+        if (std.mem.eql(u8, d.@"export".name, "[method]pollable.block")) {
+            try testing.expect(d.@"export".desc == .func);
+            saw_block = true;
+        }
+    }
+    try testing.expect(saw_ready);
+    try testing.expect(saw_block);
+
+    // And the import name itself was rewritten to @0.2.6.
+    var saw_import = false;
+    for (got_ct_decls) |d| {
+        if (d == .import) {
+            try testing.expectEqualStrings("wasi:io/poll@0.2.6", d.import.name);
+            saw_import = true;
+        }
+    }
+    try testing.expect(saw_import);
+}

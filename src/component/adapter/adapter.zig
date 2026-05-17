@@ -148,7 +148,8 @@ pub fn splice(
     defer pristine_iface.deinit();
 
     const live_namespaces = try collectLiveNamespaces(a, pristine_iface.interface);
-    const live_methods_by_namespace = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
+    const live_methods_adapter = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
+    const live_methods_by_namespace = try augmentLiveMethodsByNamespaceWithEmbed(a, live_methods_adapter, embed_bytes);
     const live_export_names = try collectLiveExportNames(a, pristine_world);
 
     const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_methods_by_namespace, live_export_names);
@@ -258,7 +259,8 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
     defer pristine_iface.deinit();
 
     const live_namespaces = try collectLiveNamespaces(a, pristine_iface.interface);
-    const live_methods_by_namespace = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
+    const live_methods_adapter = try collectLiveMethodsByNamespace(a, pristine_iface.interface);
+    const live_methods_by_namespace = try augmentLiveMethodsByNamespaceWithEmbed(a, live_methods_adapter, embed_bytes);
     const live_export_names = try collectLiveExportNames(a, pristine_world);
 
     const gc_world_result = try world_gc.gcWorld(a, pristine_world, live_namespaces, live_methods_by_namespace, live_export_names);
@@ -524,6 +526,120 @@ fn collectLiveMethodsByNamespace(
         }
     }
 
+    var out = try arena.alloc(world_gc.LiveMethodSet, by_ns.count());
+    var i: usize = 0;
+    var it = by_ns.iterator();
+    while (it.next()) |entry| : (i += 1) {
+        out[i] = .{
+            .namespace = entry.value_ptr.namespace,
+            .methods = try entry.value_ptr.methods.toOwnedSlice(arena),
+            .type_exports = try entry.value_ptr.type_exports.toOwnedSlice(arena),
+        };
+    }
+    return out;
+}
+
+/// Augment a `live_methods_by_namespace` set with methods + type
+/// exports declared by the embed's `component-type:<world>` custom
+/// section. Mirrors `wit-component`'s policy: every iface the user's
+/// WIT names as an import is kept verbatim in the wrapping
+/// component's instance-type body — its declared methods are the
+/// contract the user wrote and must survive the adapter-driven GC
+/// regardless of which lowered names the adapter happened to need
+/// (cataggar/wabt#222).
+///
+/// Returns `base` unchanged when the embed has no component-type
+/// section, or when decoding it fails (we fall back to the adapter-
+/// derived view rather than failing the splice).
+fn augmentLiveMethodsByNamespaceWithEmbed(
+    arena: Allocator,
+    base: []const world_gc.LiveMethodSet,
+    embed_bytes: []const u8,
+) SpliceError![]const world_gc.LiveMethodSet {
+    const NamespaceBuilder = struct {
+        namespace: []const u8,
+        methods: std.ArrayListUnmanaged([]const u8),
+        method_seen: std.StringHashMapUnmanaged(void),
+        type_exports: std.ArrayListUnmanaged([]const u8),
+        type_export_seen: std.StringHashMapUnmanaged(void),
+    };
+
+    var by_ns = std.StringArrayHashMapUnmanaged(NamespaceBuilder).empty;
+    defer by_ns.deinit(arena);
+
+    // Seed from the adapter-derived view.
+    for (base) |s| {
+        const gop = try by_ns.getOrPut(arena, s.namespace);
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .namespace = s.namespace,
+            .methods = .empty,
+            .method_seen = .empty,
+            .type_exports = .empty,
+            .type_export_seen = .empty,
+        };
+        const b = gop.value_ptr;
+        for (s.methods) |m| {
+            const mg = try b.method_seen.getOrPut(arena, m);
+            if (!mg.found_existing) try b.methods.append(arena, m);
+        }
+        for (s.type_exports) |t| {
+            const tg = try b.type_export_seen.getOrPut(arena, t);
+            if (!tg.found_existing) try b.type_exports.append(arena, t);
+        }
+    }
+
+    // Decode the embed's component-type. Absent / malformed → fall
+    // back to the adapter-derived view unchanged.
+    const found = metadata_decode.extractFromCoreWasm(embed_bytes) catch
+        return finalizeLiveSet(arena, &by_ns);
+    const ct = found orelse return finalizeLiveSet(arena, &by_ns);
+
+    const decoded = metadata_decode.decode(arena, ct.payload) catch
+        return finalizeLiveSet(arena, &by_ns);
+
+    // For each embed-declared import, add every `.@"export"` name
+    // its instance-type body declares. Methods (`.@"export" func`)
+    // contribute to `methods`; type exports (`.@"export" type`)
+    // contribute to `type_exports`. The encoded names match the
+    // canonical lowered form (e.g. `[method]pollable.ready`,
+    // `pollable`), so they line up 1:1 with `gcInstanceBody`'s
+    // name-match seeding.
+    for (decoded.externs) |ext| {
+        if (ext.is_export) continue;
+
+        const gop = try by_ns.getOrPut(arena, ext.qualified_name);
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .namespace = ext.qualified_name,
+            .methods = .empty,
+            .method_seen = .empty,
+            .type_exports = .empty,
+            .type_export_seen = .empty,
+        };
+        const b = gop.value_ptr;
+
+        for (ext.inst_decls) |d| switch (d) {
+            .@"export" => |e| switch (e.desc) {
+                .func => {
+                    const mg = try b.method_seen.getOrPut(arena, e.name);
+                    if (!mg.found_existing) try b.methods.append(arena, e.name);
+                },
+                .type => {
+                    const tg = try b.type_export_seen.getOrPut(arena, e.name);
+                    if (!tg.found_existing) try b.type_exports.append(arena, e.name);
+                },
+                else => {},
+            },
+            else => {},
+        };
+    }
+
+    return finalizeLiveSet(arena, &by_ns);
+}
+
+fn finalizeLiveSet(
+    arena: Allocator,
+    by_ns: anytype,
+) SpliceError![]const world_gc.LiveMethodSet {
     var out = try arena.alloc(world_gc.LiveMethodSet, by_ns.count());
     var i: usize = 0;
     var it = by_ns.iterator();
@@ -2566,3 +2682,146 @@ test "spliceMany: rejects two adapters with non-env imports" {
     };
     try testing.expectError(error.AmbiguousPrimaryAdapter, spliceMany(a, embed_bytes, &adapters));
 }
+
+test "augmentLiveMethodsByNamespaceWithEmbed #222: embed-declared methods join adapter live set" {
+    // Regression for cataggar/wabt#222.
+    //
+    // The wasmtime upstream preview1 adapter's core wasm imports
+    // only `[resource-drop]pollable` and `poll` from
+    // `wasi:io/poll@0.2.6` — not the `[method]pollable.*` methods.
+    // Pre-fix, `world_gc.gcInstanceBody` consequently dropped both
+    // methods from the wrapping component's `wasi:io/poll`
+    // instance-type body, even when the user's embed component-type
+    // declared the canonical interface (resource pollable with
+    // `ready` + `block` methods + iface-level `poll`).
+    //
+    // The fix: also seed the live set from the embed's
+    // `component-type:<world>` custom section so every method the
+    // user's WIT declares for an imported iface survives GC.
+    //
+    // This unit test mirrors that scenario in isolation:
+    //
+    //   * `base`: simulates `collectLiveMethodsByNamespace`'s
+    //     output for the wasmtime adapter — only `poll` + the
+    //     resource-drop appear under `wasi:io/poll@0.2.6`.
+    //   * Build a synthetic embed with a `component-type` custom
+    //     section whose world declares
+    //     `import wasi:io/poll@0.2.6` carrying the canonical
+    //     `pollable.ready` + `pollable.block` methods.
+    //   * After `augmentLiveMethodsByNamespaceWithEmbed` the
+    //     namespace's `methods` set contains all four (adapter
+    //     contributions union embed contributions).
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ns = "wasi:io/poll@0.2.6";
+    const adapter_methods = [_][]const u8{ "[resource-drop]pollable", "poll" };
+    const adapter_type_exports = [_][]const u8{"pollable"};
+
+    const base = [_]world_gc.LiveMethodSet{
+        .{
+            .namespace = ns,
+            .methods = &adapter_methods,
+            .type_exports = &adapter_type_exports,
+        },
+    };
+
+    const ct_payload = try metadata_encode_for_test.encodeWorldFromSource(a,
+        \\package wasi:io@0.2.6;
+        \\
+        \\interface poll {
+        \\    resource pollable {
+        \\        ready: func() -> bool;
+        \\        block: func();
+        \\    }
+        \\    poll: func(in: list<borrow<pollable>>) -> list<u32>;
+        \\}
+        \\
+        \\world demo {
+        \\    import poll;
+        \\}
+    , "demo");
+    defer a.free(ct_payload);
+
+    var embed = std.ArrayListUnmanaged(u8).empty;
+    defer embed.deinit(a);
+    try embed.appendSlice(a, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    const cs_name = "component-type:demo";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(a);
+    try writeU32Leb(a, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(a, cs_name);
+    try cs_body.appendSlice(a, ct_payload);
+    try embed.append(a, 0x00);
+    try writeU32Leb(a, &embed, @intCast(cs_body.items.len));
+    try embed.appendSlice(a, cs_body.items);
+
+    const augmented = try augmentLiveMethodsByNamespaceWithEmbed(arena, &base, embed.items);
+
+    // Locate the wasi:io/poll entry in the result.
+    var idx: ?usize = null;
+    for (augmented, 0..) |s, i| if (std.mem.eql(u8, s.namespace, ns)) {
+        idx = i;
+    };
+    try testing.expect(idx != null);
+    const entry = augmented[idx.?];
+
+    // Adapter-derived methods survive verbatim.
+    var has_drop = false;
+    var has_poll = false;
+    // Embed-derived methods are now present too.
+    var has_ready = false;
+    var has_block = false;
+    for (entry.methods) |m| {
+        if (std.mem.eql(u8, m, "[resource-drop]pollable")) has_drop = true;
+        if (std.mem.eql(u8, m, "poll")) has_poll = true;
+        if (std.mem.eql(u8, m, "[method]pollable.ready")) has_ready = true;
+        if (std.mem.eql(u8, m, "[method]pollable.block")) has_block = true;
+    }
+    try testing.expect(has_drop);
+    try testing.expect(has_poll);
+    try testing.expect(has_ready);
+    try testing.expect(has_block);
+
+    // `pollable` type-export remains a type anchor.
+    var has_pollable = false;
+    for (entry.type_exports) |t| if (std.mem.eql(u8, t, "pollable")) {
+        has_pollable = true;
+    };
+    try testing.expect(has_pollable);
+}
+
+test "augmentLiveMethodsByNamespaceWithEmbed: empty embed falls back to base unchanged" {
+    // No component-type custom section on the embed → the function
+    // must return the base set verbatim. Same applies if the
+    // embed has malformed metadata (we treat that as "no useful
+    // signal" rather than failing the splice).
+    const a = testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(a);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const ns = "wasi:io/poll@0.2.6";
+    const adapter_methods = [_][]const u8{"poll"};
+    const adapter_type_exports = [_][]const u8{"pollable"};
+
+    const base = [_]world_gc.LiveMethodSet{
+        .{
+            .namespace = ns,
+            .methods = &adapter_methods,
+            .type_exports = &adapter_type_exports,
+        },
+    };
+
+    const empty_embed = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const augmented = try augmentLiveMethodsByNamespaceWithEmbed(arena, &base, &empty_embed);
+    try testing.expectEqual(@as(usize, 1), augmented.len);
+    try testing.expectEqualStrings(ns, augmented[0].namespace);
+    try testing.expectEqual(@as(usize, 1), augmented[0].methods.len);
+    try testing.expectEqualStrings("poll", augmented[0].methods[0]);
+    try testing.expectEqualStrings("pollable", augmented[0].type_exports[0]);
+}
+
+const metadata_encode_for_test = @import("../wit/metadata_encode.zig");

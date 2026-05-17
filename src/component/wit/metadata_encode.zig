@@ -1603,6 +1603,95 @@ test "metadata_encode: flags typedef" {
     try testing.expectEqual(@as(u32, 1), iface.decls[2].type.func.params[0].type.type_idx);
 }
 
+test "metadata_encode #222: @since-annotated resource methods survive end-to-end" {
+    // Audit-bake for #222. The user reported that resource methods
+    // carrying `@since(version = X.Y.Z)` annotations were dropped
+    // from the emitted interface body. Verified here that:
+    //   1. The parser captures all methods through annotations.
+    //   2. `metadata_encode` emits every method's func-type +
+    //      `[method]R.M`-named export decl.
+    //   3. `loader.load` round-trips the encoded section back.
+    //
+    // Uses the exact canonical `wasi:io/poll@0.2.6` shape the user
+    // pasted, including list types (which exercise the realloc-opt
+    // path).
+    const source =
+        \\package wasi:io@0.2.6;
+        \\
+        \\@since(version = 0.2.0)
+        \\interface poll {
+        \\  @since(version = 0.2.0)
+        \\  resource pollable {
+        \\    @since(version = 0.2.0)
+        \\    ready: func() -> bool;
+        \\
+        \\    @since(version = 0.2.0)
+        \\    block: func();
+        \\  }
+        \\
+        \\  @since(version = 0.2.0)
+        \\  poll: func(in: list<borrow<pollable>>) -> list<u32>;
+        \\}
+        \\
+        \\world test { import poll; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "test");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const iface = comp.types[0].component.decls[0].type.component.decls[0].type.instance;
+    // Body shape (12 decls per the canonical lowering):
+    //   0: export "pollable" (sub_resource)
+    //   1: type val .borrow=0
+    //   2: type func (ready's sig)
+    //   3: export "[method]pollable.ready" func=2
+    //   4: type val .borrow=0
+    //   5: type func (block's sig)
+    //   6: export "[method]pollable.block" func=4
+    //   7: type val .borrow=0  (poll's list-element handle)
+    //   8: type list type_idx=7
+    //   9: type list u32
+    //  10: type func (poll's sig)
+    //  11: export "poll" func=10
+    try testing.expectEqual(@as(usize, 12), iface.decls.len);
+
+    // Pin every method/func export — these are the ones the user
+    // reported missing.
+    var saw_pollable = false;
+    var saw_ready = false;
+    var saw_block = false;
+    var saw_poll = false;
+    for (iface.decls) |d| {
+        if (d != .@"export") continue;
+        const e = d.@"export";
+        if (std.mem.eql(u8, e.name, "pollable")) {
+            try testing.expect(e.desc == .type);
+            try testing.expect(e.desc.type == .sub_resource);
+            saw_pollable = true;
+        }
+        if (std.mem.eql(u8, e.name, "[method]pollable.ready")) {
+            try testing.expect(e.desc == .func);
+            saw_ready = true;
+        }
+        if (std.mem.eql(u8, e.name, "[method]pollable.block")) {
+            try testing.expect(e.desc == .func);
+            saw_block = true;
+        }
+        if (std.mem.eql(u8, e.name, "poll")) {
+            try testing.expect(e.desc == .func);
+            saw_poll = true;
+        }
+    }
+    try testing.expect(saw_pollable);
+    try testing.expect(saw_ready);
+    try testing.expect(saw_block);
+    try testing.expect(saw_poll);
+}
+
 test "metadata_encode: resource with constructor + method + static" {
     // Mirrors `wasi:io/streams.output-stream` style: a constructor, a
     // method (gets implicit `self: borrow<R>`), and a static. The
