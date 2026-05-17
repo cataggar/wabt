@@ -973,12 +973,23 @@ fn buildWrapperPrologue(
         .arena = arena,
     };
 
+    // Shared name → wrapper-inst-idx table (issue #220). When sources
+    // dedup imports by name (the `composeBinaries` bubble loop drops
+    // a provider import whose name was already added by the consumer),
+    // the dropped source still needs `inst_slot_for_unres_imp` entries
+    // for any alias-remap in its type closure to resolve. The shared
+    // table threads the consumer-allocated wrapper-inst-idx through to
+    // every subsequent source so each source can populate its local
+    // `inst_slot_for_unres_imp` for absorbed-by-name imports.
+    var name_to_wrap_inst = std.StringHashMapUnmanaged(u32).empty;
+
     var inst_count: u32 = 0;
     for (sources) |source| {
         inst_count = try appendSourcePrologue(
             arena,
             source.component,
             source.bubble_import_idxs,
+            &name_to_wrap_inst,
             &types_out,
             &aliases_out,
             &imports_out,
@@ -1010,30 +1021,66 @@ fn buildWrapperPrologue(
 /// must be self-contained within its own typespace. (Real-world
 /// inputs satisfy this: wasi-tooling-emitted components never have a
 /// type body referencing a slot defined in a different file/source.)
+///
+/// `name_to_wrap_inst` (issue #220) is the shared table threaded
+/// across sources. Newly-bubbled instance-typed imports register
+/// their `name → wrapper-inst-idx` here; a second pass over
+/// `source.imports[]` then populates `inst_slot_for_unres_imp` for
+/// any instance-typed source-import whose NAME matches an earlier
+/// source's bubble (the dedup-absorbed case). Without that second
+/// pass, the source's alias-remap calls `inst_slot_for_unres_imp.get`
+/// with an `imp_idx` that's structurally valid but missing from the
+/// local map → `error.UnsupportedComposeShape`.
 fn appendSourcePrologue(
     arena: std.mem.Allocator,
     source: *const ctypes.Component,
     bubble_import_idxs: []const u32,
+    name_to_wrap_inst: *std.StringHashMapUnmanaged(u32),
     types_out: *std.ArrayListUnmanaged(ctypes.TypeDef),
     aliases_out: *std.ArrayListUnmanaged(ctypes.Alias),
     imports_out: *std.ArrayListUnmanaged(ctypes.ImportDecl),
     emitter: *PrologueEmitter,
     inst_count_start: u32,
 ) !u32 {
-    if (bubble_import_idxs.len == 0) return inst_count_start;
-
     // Map: source.imports idx → wrapper-instance idx. Only
     // instance-typed imports contribute to the wrapper's instance
     // indexspace.
     var inst_slot_for_unres_imp = std.AutoHashMapUnmanaged(u32, u32).empty;
     var inst_count: u32 = inst_count_start;
+
+    // First pass: imports this source IS bubbling. Allocate a fresh
+    // wrapper-inst-idx for each and record both in the local map
+    // (for this source's alias-remap) AND in the shared
+    // `name_to_wrap_inst` (so subsequent sources can resolve their
+    // dedup-absorbed imports of the same name).
     for (bubble_import_idxs) |imp_idx| {
         const imp = source.imports[imp_idx];
         if (imp.desc == .instance) {
             try inst_slot_for_unres_imp.put(arena, imp_idx, inst_count);
+            // First emitter for this name wins; subsequent sources
+            // with the same name are dedup-absorbed by composeBinaries
+            // so won't reach this branch.
+            _ = try name_to_wrap_inst.getOrPutValue(arena, imp.name, inst_count);
             inst_count += 1;
         }
     }
+
+    // Second pass: instance-typed source imports NOT in this
+    // source's bubble list whose name was bubbled by an EARLIER
+    // source. Bind them to the same wrapper-inst-idx so the source's
+    // own alias-remap resolves cleanly (issue #220). Skips imports
+    // whose name was never bubbled (those wouldn't have been
+    // referenced by an alias either; defensive).
+    for (source.imports, 0..) |imp, k| {
+        if (imp.desc != .instance) continue;
+        const imp_idx: u32 = @intCast(k);
+        if (inst_slot_for_unres_imp.contains(imp_idx)) continue;
+        if (name_to_wrap_inst.get(imp.name)) |wrap_idx| {
+            try inst_slot_for_unres_imp.put(arena, imp_idx, wrap_idx);
+        }
+    }
+
+    if (bubble_import_idxs.len == 0) return inst_count_start;
 
     // Map: source type-indexspace idx → bubbled import idx whose
     // desc references that slot. Used to bubble each import right
@@ -2501,4 +2548,136 @@ test "composeBinaries: mixed .instance + .func provider imports both bubble (#21
     }
     try testing.expect(saw_inst_sort);
     try testing.expect(saw_func_sort);
+}
+
+// ── #220: alias-remap resolves dedup-absorbed imports ──────────────────────
+
+test "composeBinaries: consumer alias to a name also bubbled from provider resolves (#220)" {
+    // Repro of #220. Pre-fix shape:
+    //   * Provider has wasi:io/error + wasi:io/streams imports.
+    //     `streams` body has `(alias outer 1 K)` referring to the
+    //     outer typespace slot K, which is an
+    //     `alias-instance-export sort=type` decl that pulls `error`
+    //     from the wasi:io/error import into the provider's
+    //     typespace (the canonical wt-component-emitted shape).
+    //   * Consumer also imports wasi:io/error → `composeBinaries`'s
+    //     bubble loop dedups it: the provider's wasi:io/error is
+    //     DROPPED from the provider's bubble list.
+    //   * Pre-#220 `appendSourcePrologue` populated its per-source
+    //     `inst_slot_for_unres_imp` only from the local bubble list.
+    //     The provider's bubble list (streams only) doesn't include
+    //     the wasi:io/error imp idx; the alias's `comp_instance_indexspace`
+    //     lookup returns `.import = <wasi:io/error idx>` → `inst_slot_for_unres_imp.get`
+    //     returns null → `error.UnsupportedComposeShape`.
+    //   * Post-#220 a SHARED `name_to_wrap_inst` table threads the
+    //     consumer-allocated wrapper-inst-idx for wasi:io/error
+    //     through to the provider's prologue. The second pass over
+    //     `source.imports` adds the absorbed import to the local map.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer: minimal — one wasi:io/error import.
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const cons_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &cons_types, .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const cb = try writer.encode(ar, &consumer);
+
+    // Provider: same fixture shape as the #129 test — wasi:io/error
+    // import (instance with `export "error" (sub resource)`) + alias
+    // pulling the resource into the outer typespace + wasi:io/streams
+    // import whose body refs that alias.
+    const error_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{
+            .name = "error",
+            .desc = .{ .type = .sub_resource },
+        } },
+    };
+    const error_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &error_decls } };
+    const streams_decls = [_]ctypes.Decl{
+        .{ .alias = .{ .outer = .{
+            .sort = .type,
+            .outer_count = 1,
+            .idx = 1, // slot 1 = alias-instance-export resource binding
+        } } },
+        .{ .@"export" = .{
+            .name = "with-error",
+            .desc = .{ .type = .{ .eq = 0 } },
+        } },
+    };
+    const streams_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &streams_decls } };
+    const prov_types = [_]ctypes.TypeDef{ error_inst_type, streams_inst_type };
+    const prov_aliases = [_]ctypes.Alias{
+        .{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = 0, // wasi:io/error import
+            .name = "error",
+        } },
+    };
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+        .{ .name = "wasi:io/streams@0.2.6", .desc = .{ .instance = 2 } },
+    };
+    const prov_section_order = [_]ctypes.SectionEntry{
+        .{ .kind = .type, .start = 0, .count = 1 },
+        .{ .kind = .import, .start = 0, .count = 1 },
+        .{ .kind = .alias, .start = 0, .count = 1 },
+        .{ .kind = .type, .start = 1, .count = 1 },
+        .{ .kind = .import, .start = 1, .count = 1 },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &prov_aliases,
+        .types = &prov_types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+        .section_order = &prov_section_order,
+    };
+    const pb = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper outer-imports: deduped wasi:io/error (1) + provider's
+    // wasi:io/streams (1) = 2 total.
+    try testing.expectEqual(@as(usize, 2), loaded.imports.len);
+    var saw_error = false;
+    var saw_streams = false;
+    for (loaded.imports) |imp| {
+        if (std.mem.eql(u8, imp.name, "wasi:io/error@0.2.6")) saw_error = true;
+        if (std.mem.eql(u8, imp.name, "wasi:io/streams@0.2.6")) saw_streams = true;
+    }
+    try testing.expect(saw_error);
+    try testing.expect(saw_streams);
+
+    // The provider's replicated alias must resolve to wrapper-
+    // instance idx 0 — the consumer-bubbled wasi:io/error import the
+    // provider's wasi:io/error absorbed against. Pre-#220 this lookup
+    // failed with UnsupportedComposeShape.
+    var found = false;
+    for (loaded.aliases) |a| {
+        switch (a) {
+            .instance_export => |ie| {
+                if (ie.sort != .type) continue;
+                if (!std.mem.eql(u8, ie.name, "error")) continue;
+                try testing.expectEqual(@as(u32, 0), ie.instance_idx);
+                found = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(found);
 }
