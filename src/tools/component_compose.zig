@@ -497,24 +497,93 @@ pub fn composeBinariesOpts(
     //    referenced (e.g. `tcgc.wasm`'s wasi:http/types). Strict
     //    mode keeps `error.UnmatchedProviderImport` reachable for
     //    callers who want to detect the situation explicitly.
+    //
+    //    "Widest wins" name canonicalisation (#224): when the SAME
+    //    import name appears in multiple sources but with different
+    //    instance-type bodies (e.g. consumer declares
+    //    `wasi:random/random@0.2.6` with just `get-random-bytes`
+    //    while a provider declares the same name with
+    //    `get-random-bytes` + `get-random-u64`), the source whose
+    //    body has the most `.@"export"` decls becomes the canonical
+    //    bubbler. Other sources with the same name are
+    //    dedup-absorbed via the #220 `name_to_wrap_inst` thread,
+    //    so their internal alias-remaps still resolve to the wider
+    //    outer instance. This keeps the wrapping component's outer
+    //    import type a superset of every source's narrower view —
+    //    which is what wasm structural subtyping requires for the
+    //    inner Instantiate args to validate.
+    //
+    //    Pre-pass: for each name appearing in consumer's bubble set
+    //    (link.unresolved) OR any provider's imports, pick the
+    //    widest source. Then build per-source bubble lists by
+    //    keeping only names where THIS source is canonical.
+    var canonical_src_for_name = std.StringHashMapUnmanaged(u32).empty;
+    var canonical_decl_count = std.StringHashMapUnmanaged(usize).empty;
+    {
+        // Source idx 0 = consumer; 1..N = provider idx + 1.
+        for (link.unresolved) |u_idx| {
+            const imp = consumer.imports[u_idx];
+            const n = importInstanceDeclCount(&consumer, imp);
+            canonical_src_for_name.put(ar, imp.name, 0) catch return error.OutOfMemory;
+            canonical_decl_count.put(ar, imp.name, n) catch return error.OutOfMemory;
+        }
+        if (bubble_unmatched_provider_imports) {
+            for (providers, 0..) |*provider, p_idx| {
+                const src_idx: u32 = @intCast(p_idx + 1);
+                for (provider.imports) |p_imp| {
+                    const n = importInstanceDeclCount(provider, p_imp);
+                    if (canonical_decl_count.get(p_imp.name)) |existing| {
+                        if (n > existing) {
+                            canonical_src_for_name.put(ar, p_imp.name, src_idx) catch return error.OutOfMemory;
+                            canonical_decl_count.put(ar, p_imp.name, n) catch return error.OutOfMemory;
+                        }
+                    } else {
+                        canonical_src_for_name.put(ar, p_imp.name, src_idx) catch return error.OutOfMemory;
+                        canonical_decl_count.put(ar, p_imp.name, n) catch return error.OutOfMemory;
+                    }
+                }
+            }
+        }
+    }
+
     var sources_list = std.ArrayListUnmanaged(PrologueSource).empty;
+
+    // Consumer's bubble list: keep only names where consumer is the
+    // canonical source. Names where a provider has a wider body get
+    // dropped here — the provider will bubble them with the wider
+    // body and the consumer's internal alias-remap resolves via
+    // #220's shared `name_to_wrap_inst` thread.
+    var consumer_bubble = std.ArrayListUnmanaged(u32).empty;
+    for (link.unresolved) |u_idx| {
+        const imp = consumer.imports[u_idx];
+        const canon = canonical_src_for_name.get(imp.name) orelse 0;
+        if (canon == 0) try consumer_bubble.append(ar, u_idx);
+    }
     try sources_list.append(ar, .{
         .component = &consumer,
-        .bubble_import_idxs = link.unresolved,
+        .bubble_import_idxs = try consumer_bubble.toOwnedSlice(ar),
     });
 
     // Track which names have already been bubbled at the wrapper
     // level so dedup across consumer + each provider works by name.
     var bubbled_names = std.StringHashMapUnmanaged(void).empty;
-    for (link.unresolved) |u_idx| {
+    for (sources_list.items[0].bubble_import_idxs) |u_idx| {
         try bubbled_names.put(ar, consumer.imports[u_idx].name, {});
     }
 
     if (bubble_unmatched_provider_imports) {
         for (providers, 0..) |*provider, p_idx| {
+            const src_idx: u32 = @intCast(p_idx + 1);
             var prov_bubble = std.ArrayListUnmanaged(u32).empty;
             for (provider.imports, 0..) |p_imp, imp_idx| {
                 if (bubbled_names.contains(p_imp.name)) continue;
+                // Only this provider's canonical names bubble here;
+                // non-canonical names (a later provider has a wider
+                // body, or an earlier provider already bubbled) are
+                // dedup-absorbed and rely on the shared
+                // `name_to_wrap_inst` table.
+                const canon = canonical_src_for_name.get(p_imp.name) orelse src_idx;
+                if (canon != src_idx) continue;
                 // Bubble-up supports `.instance` and `.func` provider
                 // imports. `.func` is for componentize-js-style
                 // outputs that emit lifted-export callbacks as
@@ -533,7 +602,6 @@ pub fn composeBinariesOpts(
                 try bubbled_names.put(ar, p_imp.name, {});
             }
             if (prov_bubble.items.len == 0) continue;
-            _ = p_idx;
             try sources_list.append(ar, .{
                 .component = provider,
                 .bubble_import_idxs = try prov_bubble.toOwnedSlice(ar),
@@ -881,6 +949,33 @@ fn lookupConsumerType(c: *const ctypes.Component, type_idx: u32) ?ctypes.TypeDef
     }
     if (type_idx >= c.types.len) return null;
     return c.types[type_idx];
+}
+
+/// Count `.@"export"` decls inside the instance-type body referenced
+/// by `imp`. Used by the "widest wins" canonicalisation pass in
+/// `composeBinariesOpts` to decide which source should bubble a
+/// given import name when multiple sources declare it
+/// (cataggar/wabt#224).
+///
+/// Returns 0 for non-instance descs and for instance descs whose
+/// referenced type slot isn't an `.instance` TypeDef — those compare
+/// as the narrowest possible body, so any actual instance body wins.
+fn importInstanceDeclCount(c: *const ctypes.Component, imp: ctypes.ImportDecl) usize {
+    const type_idx = switch (imp.desc) {
+        .instance => |idx| idx,
+        else => return 0,
+    };
+    const td = lookupConsumerType(c, type_idx) orelse return 0;
+    const inst = switch (td) {
+        .instance => |ii| ii,
+        else => return 0,
+    };
+    var count: usize = 0;
+    for (inst.decls) |d| switch (d) {
+        .@"export" => count += 1,
+        else => {},
+    };
+    return count;
 }
 
 /// Build a stub `Component` whose `raw_bytes` carry the original
@@ -2864,4 +2959,138 @@ test "compose end-to-end: resource methods survive --align-wasi rewrite + compos
     try testing.expect(std.mem.indexOf(u8, composed, "[method]pollable.block") != null);
     // And no @0.2.10 residue.
     try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+}
+
+test "composeBinaries: widest-source wins when consumer + provider declare same name with different bodies (#224)" {
+    // Regression for cataggar/wabt#224.
+    //
+    // When both the consumer and a provider import the same
+    // interface NAME but each declares a DIFFERENT subset of decls
+    // (the consumer's WIT used a narrower view of the iface than
+    // the provider's), the wrapping component's outer-import must
+    // expose the WIDEST body — otherwise the inner Instantiate of
+    // the provider passes a narrower instance than its declared
+    // type requires, and validation fails with `missing expected
+    // export <name>`.
+    //
+    // The user's repro pipeline (azure-sdk-for-zig codegen-cli):
+    //
+    //   * cli's WIT declares `import wasi:random/random@0.2.6`
+    //     with just `get-random-bytes`.
+    //   * tcgc.wasm (provider) declares the same import name with
+    //     `get-random-bytes` + `get-random-u64`.
+    //
+    // Pre-fix the wrapper's outer import had only
+    // `get-random-bytes` (consumer-first dedup) and
+    // `wasm-tools validate` rejected the inner Instantiate of
+    // tcgc with `missing expected export get-random-u64`.
+    //
+    // Post-fix the "widest wins" pre-pass identifies tcgc as the
+    // canonical bubbler for that name and emits the wider body at
+    // wrapper scope; the consumer's narrower view is satisfied
+    // structurally (instance subtyping admits a wider instance
+    // through a narrower-typed import slot).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer: imports "ns:foo/iface@0.1.0" with 1 export
+    // ("method-a"). Built as a single instance-type body listing
+    // a func type + a single `.@"export"` decl pointing at it.
+    const cons_func_a: ctypes.FuncType = .{
+        .params = &.{},
+        .results = .none,
+    };
+    const cons_inst_decls = [_]ctypes.Decl{
+        .{ .type = .{ .func = cons_func_a } },
+        .{ .@"export" = .{ .name = "method-a", .desc = .{ .func = 0 } } },
+    };
+    const cons_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &cons_inst_decls } },
+    };
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "ns:foo/iface@0.1.0", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{},   .core_instances = &.{},
+        .core_types = &.{},     .components = &.{},
+        .instances = &.{},      .aliases = &.{},
+        .types = &cons_types,   .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    // Provider: imports the SAME name but with 2 exports
+    // ("method-a" + "method-b").
+    const prov_func_a: ctypes.FuncType = .{ .params = &.{}, .results = .none };
+    const prov_func_b: ctypes.FuncType = .{ .params = &.{}, .results = .none };
+    const prov_inst_decls = [_]ctypes.Decl{
+        .{ .type = .{ .func = prov_func_a } },
+        .{ .@"export" = .{ .name = "method-a", .desc = .{ .func = 0 } } },
+        .{ .type = .{ .func = prov_func_b } },
+        .{ .@"export" = .{ .name = "method-b", .desc = .{ .func = 1 } } },
+    };
+    const prov_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &prov_inst_decls } },
+    };
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "ns:foo/iface@0.1.0", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{},   .core_instances = &.{},
+        .core_types = &.{},     .components = &.{},
+        .instances = &.{},      .aliases = &.{},
+        .types = &prov_types,   .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{provider_bytes};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper has exactly one outer-import — the deduped iface name.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqualStrings("ns:foo/iface@0.1.0", loaded.imports[0].name);
+    try testing.expect(loaded.imports[0].desc == .instance);
+
+    // The outer-import's instance type body is the WIDER provider
+    // body: it must contain BOTH "method-a" and "method-b" as
+    // `.@"export" .func` decls.
+    const type_idx = loaded.imports[0].desc.instance;
+    const contrib = loaded.type_indexspace[type_idx];
+    try testing.expect(contrib == .type_def);
+    const td = loaded.types[contrib.type_def];
+    try testing.expect(td == .instance);
+
+    var saw_a = false;
+    var saw_b = false;
+    for (td.instance.decls) |d| switch (d) {
+        .@"export" => |e| {
+            if (std.mem.eql(u8, e.name, "method-a") and e.desc == .func) saw_a = true;
+            if (std.mem.eql(u8, e.name, "method-b") and e.desc == .func) saw_b = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_a);
+    try testing.expect(saw_b);
+
+    // Both nested components' Instantiate args wire ns:foo/iface to
+    // the wrapper's single bubbled outer-import (wrapper-instance
+    // idx 0).
+    const prov_inst = loaded.instances[0];
+    try testing.expect(prov_inst == .instantiate);
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqualStrings("ns:foo/iface@0.1.0", prov_inst.instantiate.args[0].name);
+    try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
+
+    const cons_inst = loaded.instances[1];
+    try testing.expect(cons_inst == .instantiate);
+    try testing.expectEqual(@as(usize, 1), cons_inst.instantiate.args.len);
+    try testing.expectEqualStrings("ns:foo/iface@0.1.0", cons_inst.instantiate.args[0].name);
+    try testing.expectEqual(@as(u32, 0), cons_inst.instantiate.args[0].sort_idx.idx);
 }
