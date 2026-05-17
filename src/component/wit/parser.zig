@@ -106,6 +106,17 @@ const Parser = struct {
         return error.UnexpectedToken;
     }
 
+    /// Same as `fail` but also records the offending token's tag in
+    /// `ParseDiagnostic.token` so callers can render the actual kind
+    /// (e.g. `got token: .lparen`) in their diagnostic. Issue #216
+    /// motivated this: `UnexpectedToken` errors were losing the
+    /// per-token information the diagnostic struct was designed to
+    /// surface.
+    fn failTok(self: *Parser, tok: lexer.Tok, msg: []const u8) ParseError {
+        if (self.diag) |d| d.token = tok.tag;
+        return self.fail(tok.span, msg);
+    }
+
     fn peekTok(self: *Parser) ParseError!lexer.Tok {
         if (self.lookahead) |t| return t;
         const t = try self.lex.next();
@@ -193,7 +204,7 @@ const Parser = struct {
             // (`@async` etc. — none used in upstream 0.2.6 today,
             // but cheap to tolerate).
             .kw_use, .kw_type, .kw_func, .kw_record, .kw_resource, .kw_flags, .kw_variant, .kw_enum, .kw_bool, .kw_string, .kw_option, .kw_result, .kw_future, .kw_stream, .kw_error_context, .kw_list, .kw_as, .kw_from, .kw_static, .kw_interface, .kw_tuple, .kw_import, .kw_export, .kw_world, .kw_package, .kw_constructor, .kw_async, .kw_include, .kw_with, .kw_own, .kw_borrow => {},
-            else => return self.fail(name_tok.span, "expected annotation name after `@`"),
+            else => return self.failTok(name_tok, "expected annotation name after `@`"),
         }
         const peek = try self.peekTok();
         if (peek.tag != .lparen) return;
@@ -204,7 +215,7 @@ const Parser = struct {
             switch (inner.tag) {
                 .lparen => depth += 1,
                 .rparen => depth -= 1,
-                .eof => return self.fail(inner.span, "unterminated annotation arg list"),
+                .eof => return self.failTok(inner, "unterminated annotation arg list"),
                 else => {},
             }
         }
@@ -219,7 +230,7 @@ const Parser = struct {
     fn expect(self: *Parser, want: lexer.Token) ParseError!lexer.Tok {
         const t = try self.nextNonDoc();
         if (t.tag != want) {
-            return self.fail(t.span, "unexpected token");
+            return self.failTok(t, "unexpected token");
         }
         return t;
     }
@@ -271,9 +282,9 @@ const Parser = struct {
                     try items.append(self.allocator, .{ .use = u });
                 },
                 .kw_resource, .kw_stream, .kw_future, .kw_error_context, .kw_async => {
-                    return self.fail(t.span, "feature not yet supported");
+                    return self.failTok(t, "feature not yet supported");
                 },
-                else => return self.fail(t.span, "expected `interface`, `world`, or `use`"),
+                else => return self.failTok(t, "expected `interface`, `world`, or `use`"),
             }
         }
 
@@ -387,7 +398,7 @@ const Parser = struct {
                 return .{ .type = td };
             },
             .kw_stream, .kw_future, .kw_error_context, .kw_async, .kw_constructor => {
-                return self.fail(head.span, "feature not yet supported");
+                return self.failTok(head, "feature not yet supported");
             },
             .id, .explicit_id => {
                 // `name: func(...) [-> result];`
@@ -398,7 +409,7 @@ const Parser = struct {
                 _ = try self.expect(.semicolon);
                 return .{ .func = .{ .docs = docs, .name = name, .func = f } };
             },
-            else => return self.fail(head.span, "expected interface item"),
+            else => return self.failTok(head, "expected interface item"),
         }
     }
 
@@ -537,7 +548,7 @@ const Parser = struct {
                         head = try self.nextNonDoc();
                     }
                     if (head.tag != .kw_func) {
-                        return self.fail(head.span, "expected `func`");
+                        return self.failTok(head, "expected `func`");
                     }
                     const f = try self.parseFuncSignature();
                     _ = try self.expect(.semicolon);
@@ -548,7 +559,7 @@ const Parser = struct {
                         .func = f,
                     });
                 },
-                else => return self.fail(t.span, "expected `constructor` or method declaration"),
+                else => return self.failTok(t, "expected `constructor` or method declaration"),
             }
         }
         return .{
@@ -663,15 +674,15 @@ const Parser = struct {
                 _ = try self.expect(.lt);
                 const name_tok = try self.nextNonDoc();
                 if (name_tok.tag != .id and name_tok.tag != .explicit_id) {
-                    return self.fail(name_tok.span, "expected resource name");
+                    return self.failTok(name_tok, "expected resource name");
                 }
                 const name = try self.identText(name_tok);
                 _ = try self.expect(.gt);
                 break :blk if (t.tag == .kw_own) ast.Type{ .own = name } else ast.Type{ .borrow = name };
             },
-            .kw_stream, .kw_future, .kw_error_context => return self.fail(t.span, "feature not yet supported"),
+            .kw_stream, .kw_future, .kw_error_context => return self.failTok(t, "feature not yet supported"),
             .id, .explicit_id => .{ .name = try self.identText(t) },
-            else => return self.fail(t.span, "expected a type"),
+            else => return self.failTok(t, "expected a type"),
         };
     }
 
@@ -774,7 +785,7 @@ const Parser = struct {
             .kw_enum => return .{ .type = try self.parseEnum(docs) },
             .kw_flags => return .{ .type = try self.parseFlags(docs) },
             .kw_include => return .{ .include = try self.parseInclude(docs) },
-            else => return self.fail(head.span, "expected world item"),
+            else => return self.failTok(head, "expected world item"),
         }
     }
 
@@ -840,7 +851,7 @@ const Parser = struct {
                             },
                         } };
                     },
-                    else => return self.fail(after_colon.span, "expected `func`, `interface`, or qualified-package name"),
+                    else => return self.failTok(after_colon, "expected `func`, `interface`, or qualified-package name"),
                 }
             },
             .at => {
@@ -859,7 +870,7 @@ const Parser = struct {
                     .ref = .{ .name = head_text },
                 } };
             },
-            else => return self.fail(peek.span, "expected `;`, `:`, or `@` after world-extern name"),
+            else => return self.failTok(peek, "expected `;`, `:`, or `@` after world-extern name"),
         }
     }
 
@@ -902,7 +913,7 @@ const Parser = struct {
                 const text = t.span.slice(self.source);
                 return text[1..];
             },
-            else => return self.fail(t.span, "expected identifier"),
+            else => return self.failTok(t, "expected identifier"),
         }
     }
 };
@@ -916,7 +927,11 @@ const testing = std.testing;
 fn parseInto(arena: *std.heap.ArenaAllocator, source: []const u8) !ast.Document {
     var diag: ParseDiagnostic = .{};
     return parse(arena.allocator(), source, &diag) catch |err| {
-        std.debug.print("parse error: {s} at [{d}, {d}]: {s}\n", .{ @errorName(err), diag.span.start, diag.span.end, diag.msg });
+        const tok_name: []const u8 = if (diag.token) |t| @tagName(t) else "?";
+        std.debug.print(
+            "parse error: {s} at [{d}, {d}] (token: .{s}): {s}\n",
+            .{ @errorName(err), diag.span.start, diag.span.end, tok_name, diag.msg },
+        );
         return err;
     };
 }
@@ -1384,6 +1399,26 @@ test "parse #195: bare annotation with no args" {
     try testing.expectEqual(@as(usize, 1), doc.items[0].interface.items.len);
 }
 
+test "parse #216: failure diagnostic carries the offending token tag" {
+    // Issue #216 asks the parser to surface the actual token kind
+    // that triggered an `UnexpectedToken` error, so users producing
+    // smaller repros can pinpoint the construct. `failTok` plumbs
+    // the tag into `ParseDiagnostic.token` for every error site.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const source =
+        \\interface foo {
+        \\    bar: 123;
+        \\}
+    ;
+    var diag: ParseDiagnostic = .{};
+    try testing.expectError(error.UnexpectedToken, parse(arena.allocator(), source, &diag));
+    try testing.expect(diag.token != null);
+    // The `123` integer literal where a `func` keyword was expected
+    // — exact tag depends on lexer enum values; assert by name.
+    try testing.expectEqualStrings("integer", @tagName(diag.token.?));
+}
+
 test "parse #195: every canonical wasi-* WIT file parses individually" {
     // Phase 1 acceptance for #195: every `*.wit` file in canonical
     // wasi-http@0.2.6 + wasi-cli + wasi-io + wasi-clocks +
@@ -1468,9 +1503,10 @@ test "parse #195: every canonical wasi-* WIT file parses individually" {
 
         var diag: ParseDiagnostic = .{};
         _ = parse(ar, src, &diag) catch |err| {
+            const tok_name: []const u8 = if (diag.token) |t| @tagName(t) else "?";
             std.debug.print(
-                "\nfile: {s}\nerror: {s} at [{d}..{d}]: {s}\n",
-                .{ f.path, @errorName(err), diag.span.start, diag.span.end, diag.msg },
+                "\nfile: {s}\nerror: {s} at [{d}..{d}] (token: .{s}): {s}\n",
+                .{ f.path, @errorName(err), diag.span.start, diag.span.end, tok_name, diag.msg },
             );
             return err;
         };

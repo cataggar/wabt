@@ -1,35 +1,46 @@
-// Trimmed slice of `wasi:clocks@0.2.6.wall-clock`. Mirrors the canonical
-// `bytecodealliance/wasi-clocks@v0.2.6/wit/wall.wit` shape but declares
-// only `now` + `resolution` (the only two funcs the preview1
-// → preview2 adapter calls). `subscribe-duration` and the rest of the
-// canonical interface stay out of this trimmed copy to keep
-// `metadata_encode` output minimal.
-//
-// Backs the preview1 `clock_time_get(REALTIME, …)` /
-// `clock_res_get(REALTIME, …)` imports. Zig `std.time.timestamp()`,
-// Rust `std::time::SystemTime::now()`, Go `time.Now()` and C's
-// `clock_gettime(CLOCK_REALTIME, …)` all route through here.
-//
-// NOTE: the package declaration for this multi-file slice lives in
-// `monotonic-clock.wit` (which sorts before `wall-clock.wit`
-// alphabetically — `m` < `w`). `resolver.readWitDir` concatenates
-// files in order, so the `package wasi:clocks@0.2.6;` directive
-// must appear in the file parsed first.
-
+package wasi:clocks@0.2.6;
+/// WASI Wall Clock is a clock API intended to let users query the current
+/// time. The name "wall" makes an analogy to a "clock on the wall", which
+/// is not necessarily monotonic as it may be reset.
+///
+/// It is intended to be portable at least between Unix-family platforms and
+/// Windows.
+///
+/// A wall clock is a clock which measures the date and time according to
+/// some external reference.
+///
+/// External references may be reset, so this clock is not necessarily
+/// monotonic, making it unsuitable for measuring elapsed time.
+///
+/// It is intended for reporting the current date and time for humans.
+@since(version = 0.2.0)
 interface wall-clock {
-    /// Wall-clock instant — POSIX-style split into integral seconds
-    /// since UTC midnight 1970-01-01 plus a sub-second nanoseconds
-    /// component (0..999_999_999).
+    /// A time and date in seconds plus nanoseconds.
+    @since(version = 0.2.0)
     record datetime {
         seconds: u64,
         nanoseconds: u32,
     }
 
-    /// Current wall-clock time. Used by preview1
-    /// `clock_time_get(REALTIME, …)`.
+    /// Read the current value of the clock.
+    ///
+    /// This clock is not monotonic, therefore calling this function repeatedly
+    /// will not necessarily produce a sequence of non-decreasing values.
+    ///
+    /// The returned timestamps represent the number of seconds since
+    /// 1970-01-01T00:00:00Z, also known as [POSIX's Seconds Since the Epoch],
+    /// also known as [Unix Time].
+    ///
+    /// The nanoseconds field of the output is always less than 1000000000.
+    ///
+    /// [POSIX's Seconds Since the Epoch]: https://pubs.opengroup.org/onlinepubs/9699919799/xrat/V4_xbd_chap04.html#tag_21_04_16
+    /// [Unix Time]: https://en.wikipedia.org/wiki/Unix_time
+    @since(version = 0.2.0)
     now: func() -> datetime;
 
-    /// Wall-clock resolution. Used by preview1
-    /// `clock_res_get(REALTIME, …)`.
+    /// Query the resolution of the clock.
+    ///
+    /// The nanoseconds field of the output is always less than 1000000000.
+    @since(version = 0.2.0)
     resolution: func() -> datetime;
 }

@@ -1,394 +1,676 @@
-// Trimmed slice of `wasi:filesystem@0.2.6.types`. The canonical
-// `bytecodealliance/wasi-filesystem@v0.2.6/wit/types.wit` declares
-// the full `descriptor` surface (~30 methods) plus many auxiliary
-// types. This slice declares the subset the preview1 → preview2
-// adapter consumes after cataggar/wabt#165 (read-side) and
-// cataggar/wabt#166 (write-side + filestat/readdir):
-//
-//   * `path-flags`, `open-flags`, `descriptor-flags`,
-//     `descriptor-type`, `error-code` — the flag/enum types.
-//   * `descriptor-stat`, `directory-entry`, `new-timestamp` —
-//     the record/variant types passed by stat/set-times/readdir.
-//   * `descriptor` resource with the methods backing every preview1
-//     fd_* / path_* the adapter wires (open-at, read-via-stream,
-//     write-via-stream, append-via-stream, sync, sync-data, set-size,
-//     set-times, set-times-at, stat, stat-at, create-directory-at,
-//     remove-directory-at, unlink-file-at, rename-at, symlink-at,
-//     link-at, read-directory). `[resource-drop]descriptor` is
-//     auto-bound by the splicer.
-//   * `directory-entry-stream` resource with `read-directory-entry`
-//     backing preview1 `fd_readdir`. `[resource-drop]…` likewise
-//     splicer-synthesised.
-//
-// Out of scope for now (still ENOSYS or not exposed at all):
-// `read`, `write`, `is-same-object`, `metadata-hash`,
-// `metadata-hash-at` — none of these correspond to preview1
-// imports we need to satisfy in this scope.
-//
-// NOTE: the package declaration for this multi-file slice lives in
-// `preopens.wit` (which sorts before `types.wit` — `p` < `t`).
-// `resolver.readWitDir` concatenates files in order, so the
-// `package wasi:filesystem@0.2.6;` directive must appear in the
-// file that's parsed first.
-
+package wasi:filesystem@0.2.6;
+/// WASI filesystem is a filesystem API primarily intended to let users run WASI
+/// programs that access their files on their existing filesystems, without
+/// significant overhead.
+///
+/// It is intended to be roughly portable between Unix-family platforms and
+/// Windows, though it does not hide many of the major differences.
+///
+/// Paths are passed as interface-type `string`s, meaning they must consist of
+/// a sequence of Unicode Scalar Values (USVs). Some filesystems may contain
+/// paths which are not accessible by this API.
+///
+/// The directory separator in WASI is always the forward-slash (`/`).
+///
+/// All paths in WASI are relative paths, and are interpreted relative to a
+/// `descriptor` referring to a base directory. If a `path` argument to any WASI
+/// function starts with `/`, or if any step of resolving a `path`, including
+/// `..` and symbolic link steps, reaches a directory outside of the base
+/// directory, or reaches a symlink to an absolute or rooted path in the
+/// underlying filesystem, the function fails with `error-code::not-permitted`.
+///
+/// For more information about WASI path resolution and sandboxing, see
+/// [WASI filesystem path resolution].
+///
+/// [WASI filesystem path resolution]: https://github.com/WebAssembly/wasi-filesystem/blob/main/path-resolution.md
+@since(version = 0.2.0)
 interface types {
-    /// Pull in `input-stream` + `output-stream` from
-    /// `wasi:io/streams` — `read-via-stream` returns the former,
-    /// `write-via-stream` / `append-via-stream` the latter. The
-    /// encoder requires the source interface to also be imported
-    /// at the world level, which the preview1 world already does
-    /// (`wasi:io/streams@0.2.6` is on the import list for the
-    /// stdout/stderr write path).
-    use wasi:io/streams@0.2.6.{input-stream, output-stream};
-
-    /// Pull in `datetime` from `wasi:clocks/wall-clock` — the
-    /// `descriptor-stat` record fields and the `new-timestamp`
-    /// variant payload both reference it. The preview1 world
-    /// already imports `wasi:clocks/wall-clock@0.2.6` for the
-    /// REALTIME clockid path, so the encoder's "source interface
-    /// must also be reachable from the world body" requirement is
-    /// already satisfied.
+    @since(version = 0.2.0)
+    use wasi:io/streams@0.2.6.{input-stream, output-stream, error};
+    @since(version = 0.2.0)
     use wasi:clocks/wall-clock@0.2.6.{datetime};
 
-    /// Modifiers for `descriptor.open-at` path lookup. Bit 0
-    /// (`symlink-follow`) matches preview1 `LOOKUPFLAGS_SYMLINK_FOLLOW`.
-    flags path-flags {
-        symlink-follow,
-    }
-    /// `O_*`-style modifiers for `descriptor.open-at`. Bit positions
-    /// match preview1 `OFLAGS_*` (CREAT=0, DIRECTORY=1, EXCL=2,
-    /// TRUNC=3), so the adapter passes `oflags & 0xF` through
-    /// unchanged.
-    flags open-flags {
-        create,
-        directory,
-        exclusive,
-        truncate,
-    }
+    /// File size or length of a region within a file.
+    @since(version = 0.2.0)
+    type filesize = u64;
 
-    /// Capabilities + sync modes for a descriptor. Bits do NOT
-    /// match preview1 fdflags/rights one-to-one; the adapter
-    /// constructs this from `fs_rights_base` + `fdflags` (see
-    /// `descriptor_flags_from_flags` in
-    /// wasi-preview1-component-adapter/src/lib.rs).
-    flags descriptor-flags {
-        read,
-        write,
-        file-integrity-sync,
-        data-integrity-sync,
-        requested-write-sync,
-        mutate-directory,
-    }
-
-    /// Type of a filesystem object referenced by a descriptor.
-    /// Ordinals (0..7) feed the adapter's
-    /// `$preview1_filetype_from_descriptor_type` helper. Preview1
-    /// `__wasi_filetype_t` mapping:
-    ///   unknown          → 0  UNKNOWN
-    ///   block-device     → 1  BLOCK_DEVICE
-    ///   character-device → 2  CHARACTER_DEVICE
-    ///   directory        → 3  DIRECTORY
-    ///   fifo             → 6  SOCKET_STREAM (preview1 has no FIFO ord)
-    ///   symbolic-link    → 7  SYMBOLIC_LINK
-    ///   regular-file     → 4  REGULAR_FILE
-    ///   socket           → 5  SOCKET_DGRAM (closest preview1 ord)
+    /// The type of a filesystem object referenced by a descriptor.
+    ///
+    /// Note: This was called `filetype` in earlier versions of WASI.
+    @since(version = 0.2.0)
     enum descriptor-type {
+        /// The type of the descriptor or file is unknown or is different from
+        /// any of the other types specified.
         unknown,
+        /// The descriptor refers to a block device inode.
         block-device,
+        /// The descriptor refers to a character device inode.
         character-device,
+        /// The descriptor refers to a directory inode.
         directory,
+        /// The descriptor refers to a named pipe.
         fifo,
+        /// The file refers to a symbolic link inode.
         symbolic-link,
+        /// The descriptor refers to a regular file inode.
         regular-file,
+        /// The descriptor refers to a socket.
         socket,
     }
 
-    /// Hint passed to `descriptor.advise(offset, length, advice)`
-    /// to inform the host of the caller's intended access pattern.
-    /// Ordinals (0..5) align byte-for-byte with preview1's
-    /// `__wasi_advice_t`, so the adapter forwards the value
-    /// unchanged after a `> 5` bounds check (cataggar/wabt#180).
-    enum advice {
-        normal,
-        sequential,
-        random,
-        will-need,
-        dont-need,
-        no-reuse,
+    /// Descriptor flags.
+    ///
+    /// Note: This was called `fdflags` in earlier versions of WASI.
+    @since(version = 0.2.0)
+    flags descriptor-flags {
+        /// Read mode: Data can be read.
+        read,
+        /// Write mode: Data can be written to.
+        write,
+        /// Request that writes be performed according to synchronized I/O file
+        /// integrity completion. The data stored in the file and the file's
+        /// metadata are synchronized. This is similar to `O_SYNC` in POSIX.
+        ///
+        /// The precise semantics of this operation have not yet been defined for
+        /// WASI. At this time, it should be interpreted as a request, and not a
+        /// requirement.
+        file-integrity-sync,
+        /// Request that writes be performed according to synchronized I/O data
+        /// integrity completion. Only the data stored in the file is
+        /// synchronized. This is similar to `O_DSYNC` in POSIX.
+        ///
+        /// The precise semantics of this operation have not yet been defined for
+        /// WASI. At this time, it should be interpreted as a request, and not a
+        /// requirement.
+        data-integrity-sync,
+        /// Requests that reads be performed at the same level of integrity
+        /// requested for writes. This is similar to `O_RSYNC` in POSIX.
+        ///
+        /// The precise semantics of this operation have not yet been defined for
+        /// WASI. At this time, it should be interpreted as a request, and not a
+        /// requirement.
+        requested-write-sync,
+        /// Mutating directories mode: Directory contents may be mutated.
+        ///
+        /// When this flag is unset on a descriptor, operations using the
+        /// descriptor which would create, rename, delete, modify the data or
+        /// metadata of filesystem objects, or obtain another handle which
+        /// would permit any of those, shall fail with `error-code::read-only` if
+        /// they would otherwise succeed.
+        ///
+        /// This may only be set on directories.
+        mutate-directory,
     }
 
-    /// Error surface for filesystem operations. Ordinals (0..36)
-    /// are mapped to preview1 errno values via the adapter's
-    /// `$errno_from_error_code` helper.
-    enum error-code {
-        access,
-        would-block,
-        already,
-        bad-descriptor,
-        busy,
-        deadlock,
-        quota,
-        exist,
-        file-too-large,
-        illegal-byte-sequence,
-        in-progress,
-        interrupted,
-        invalid,
-        io,
-        is-directory,
-        loop,
-        too-many-links,
-        message-size,
-        name-too-long,
-        no-device,
-        no-entry,
-        no-lock,
-        insufficient-memory,
-        insufficient-space,
-        not-directory,
-        not-empty,
-        not-recoverable,
-        unsupported,
-        no-tty,
-        no-such-device,
-        overflow,
-        not-permitted,
-        pipe,
-        read-only,
-        invalid-seek,
-        text-file-busy,
-        cross-device,
-    }
-
-    /// File attributes returned by `descriptor.stat` /
-    /// `descriptor.stat-at`. The adapter translates this into a
-    /// 64-byte preview1 `__wasi_filestat_t` record:
-    ///   offset  0:  u64 dev   (always 0 — preview2 hides it)
-    ///   offset  8:  u64 ino   (always 0 — preview2 hides it)
-    ///   offset 16:  u8  filetype (+ 7 pad)
-    ///   offset 24:  u64 nlink
-    ///   offset 32:  u64 size
-    ///   offset 40:  u64 atim_ns (0 if option::none)
-    ///   offset 48:  u64 mtim_ns (0 if option::none)
-    ///   offset 56:  u64 ctim_ns (0 if option::none)
+    /// File attributes.
+    ///
+    /// Note: This was called `filestat` in earlier versions of WASI.
+    @since(version = 0.2.0)
     record descriptor-stat {
+        /// File type.
         %type: descriptor-type,
-        link-count: u64,
-        size: u64,
+        /// Number of hard links to the file.
+        link-count: link-count,
+        /// For regular files, the file size in bytes. For symbolic links, the
+        /// length in bytes of the pathname contained in the symbolic link.
+        size: filesize,
+        /// Last data access timestamp.
+        ///
+        /// If the `option` is none, the platform doesn't maintain an access
+        /// timestamp for this file.
         data-access-timestamp: option<datetime>,
+        /// Last data modification timestamp.
+        ///
+        /// If the `option` is none, the platform doesn't maintain a
+        /// modification timestamp for this file.
         data-modification-timestamp: option<datetime>,
+        /// Last file status-change timestamp.
+        ///
+        /// If the `option` is none, the platform doesn't maintain a
+        /// status-change timestamp for this file.
         status-change-timestamp: option<datetime>,
     }
 
-    /// New value passed to `set-times` / `set-times-at`. The adapter
-    /// builds one of these per timestamp from the preview1 fstflags
-    /// bits:
-    ///   ATIM     (0x01) → timestamp(datetime { atim_ns / 1e9, atim_ns % 1e9 })
-    ///   ATIM_NOW (0x02) → now
-    ///   MTIM     (0x04) → timestamp(datetime { mtim_ns / 1e9, mtim_ns % 1e9 })
-    ///   MTIM_NOW (0x08) → now
-    ///   none of the above → no-change
-    /// Preview1 rejects ATIM | ATIM_NOW (and MTIM | MTIM_NOW) as
-    /// EINVAL — the adapter checks before constructing the variant.
+    /// Flags determining the method of how paths are resolved.
+    @since(version = 0.2.0)
+    flags path-flags {
+        /// As long as the resolved path corresponds to a symbolic link, it is
+        /// expanded.
+        symlink-follow,
+    }
+
+    /// Open flags used by `open-at`.
+    @since(version = 0.2.0)
+    flags open-flags {
+        /// Create file if it does not exist, similar to `O_CREAT` in POSIX.
+        create,
+        /// Fail if not a directory, similar to `O_DIRECTORY` in POSIX.
+        directory,
+        /// Fail if file already exists, similar to `O_EXCL` in POSIX.
+        exclusive,
+        /// Truncate file to size 0, similar to `O_TRUNC` in POSIX.
+        truncate,
+    }
+
+    /// Number of hard links to an inode.
+    @since(version = 0.2.0)
+    type link-count = u64;
+
+    /// When setting a timestamp, this gives the value to set it to.
+    @since(version = 0.2.0)
     variant new-timestamp {
+        /// Leave the timestamp set to its previous value.
         no-change,
+        /// Set the timestamp to the current time of the system clock associated
+        /// with the filesystem.
         now,
+        /// Set the timestamp to the given value.
         timestamp(datetime),
     }
 
-    /// One entry returned by `directory-entry-stream.read-directory-entry`.
-    /// The adapter packs each entry into a preview1 `__wasi_dirent_t` +
-    /// trailing `name` bytes:
-    ///   offset 0:  u64 d_next       (cookie — adapter uses 1-based counter)
-    ///   offset 8:  u64 d_ino        (always 0 — preview2 hides ino)
-    ///   offset 16: u32 d_namlen     (= name.len)
-    ///   offset 20: u8  d_type       (preview1 filetype)
-    ///   offset 21: u8 × 3 pad
-    ///   offset 24: u8 × d_namlen    (name bytes, no trailing NUL)
+    /// A directory entry.
     record directory-entry {
+        /// The type of the file referred to by this directory entry.
         %type: descriptor-type,
+
+        /// The name of the object.
         name: string,
     }
 
-    /// Cursor over a directory's entries opened by
-    /// `descriptor.read-directory`. Each `read-directory-entry` call
-    /// returns one entry (or `option::none` at end-of-stream); the
-    /// adapter loops until the caller's preview1 buffer is full or
-    /// the stream is exhausted, then drops the stream via the
-    /// splicer-synthesised `[resource-drop]directory-entry-stream`.
-    ///
-    /// Declared BEFORE `descriptor` because `descriptor.read-directory`
-    /// references `directory-entry-stream` in its return type; the
-    /// encoder binds resource names lazily as it walks the
-    /// interface body, so the referent must precede the reference.
-    /// The bare resource ref auto-wraps as
-    /// `own<directory-entry-stream>` per cataggar/wabt#182.
-    resource directory-entry-stream {
-        read-directory-entry: func() -> result<option<directory-entry>, error-code>;
+    /// Error codes returned by functions, similar to `errno` in POSIX.
+    /// Not all of these error codes are returned by the functions provided by this
+    /// API; some are used in higher-level library layers, and others are provided
+    /// merely for alignment with POSIX.
+    enum error-code {
+        /// Permission denied, similar to `EACCES` in POSIX.
+        access,
+        /// Resource unavailable, or operation would block, similar to `EAGAIN` and `EWOULDBLOCK` in POSIX.
+        would-block,
+        /// Connection already in progress, similar to `EALREADY` in POSIX.
+        already,
+        /// Bad descriptor, similar to `EBADF` in POSIX.
+        bad-descriptor,
+        /// Device or resource busy, similar to `EBUSY` in POSIX.
+        busy,
+        /// Resource deadlock would occur, similar to `EDEADLK` in POSIX.
+        deadlock,
+        /// Storage quota exceeded, similar to `EDQUOT` in POSIX.
+        quota,
+        /// File exists, similar to `EEXIST` in POSIX.
+        exist,
+        /// File too large, similar to `EFBIG` in POSIX.
+        file-too-large,
+        /// Illegal byte sequence, similar to `EILSEQ` in POSIX.
+        illegal-byte-sequence,
+        /// Operation in progress, similar to `EINPROGRESS` in POSIX.
+        in-progress,
+        /// Interrupted function, similar to `EINTR` in POSIX.
+        interrupted,
+        /// Invalid argument, similar to `EINVAL` in POSIX.
+        invalid,
+        /// I/O error, similar to `EIO` in POSIX.
+        io,
+        /// Is a directory, similar to `EISDIR` in POSIX.
+        is-directory,
+        /// Too many levels of symbolic links, similar to `ELOOP` in POSIX.
+        loop,
+        /// Too many links, similar to `EMLINK` in POSIX.
+        too-many-links,
+        /// Message too large, similar to `EMSGSIZE` in POSIX.
+        message-size,
+        /// Filename too long, similar to `ENAMETOOLONG` in POSIX.
+        name-too-long,
+        /// No such device, similar to `ENODEV` in POSIX.
+        no-device,
+        /// No such file or directory, similar to `ENOENT` in POSIX.
+        no-entry,
+        /// No locks available, similar to `ENOLCK` in POSIX.
+        no-lock,
+        /// Not enough space, similar to `ENOMEM` in POSIX.
+        insufficient-memory,
+        /// No space left on device, similar to `ENOSPC` in POSIX.
+        insufficient-space,
+        /// Not a directory or a symbolic link to a directory, similar to `ENOTDIR` in POSIX.
+        not-directory,
+        /// Directory not empty, similar to `ENOTEMPTY` in POSIX.
+        not-empty,
+        /// State not recoverable, similar to `ENOTRECOVERABLE` in POSIX.
+        not-recoverable,
+        /// Not supported, similar to `ENOTSUP` and `ENOSYS` in POSIX.
+        unsupported,
+        /// Inappropriate I/O control operation, similar to `ENOTTY` in POSIX.
+        no-tty,
+        /// No such device or address, similar to `ENXIO` in POSIX.
+        no-such-device,
+        /// Value too large to be stored in data type, similar to `EOVERFLOW` in POSIX.
+        overflow,
+        /// Operation not permitted, similar to `EPERM` in POSIX.
+        not-permitted,
+        /// Broken pipe, similar to `EPIPE` in POSIX.
+        pipe,
+        /// Read-only file system, similar to `EROFS` in POSIX.
+        read-only,
+        /// Invalid seek, similar to `ESPIPE` in POSIX.
+        invalid-seek,
+        /// Text file busy, similar to `ETXTBSY` in POSIX.
+        text-file-busy,
+        /// Cross-device link, similar to `EXDEV` in POSIX.
+        cross-device,
     }
 
-    /// Opaque handle to a filesystem object — directory, regular
-    /// file, symlink, character/block device, etc. Preview2 hands
-    /// the adapter back an opaque resource handle; the adapter
-    /// stashes it in the per-fd descriptor table.
+    /// File or memory access pattern advisory information.
+    @since(version = 0.2.0)
+    enum advice {
+        /// The application has no advice to give on its behavior with respect
+        /// to the specified data.
+        normal,
+        /// The application expects to access the specified data sequentially
+        /// from lower offsets to higher offsets.
+        sequential,
+        /// The application expects to access the specified data in a random
+        /// order.
+        random,
+        /// The application expects to access the specified data in the near
+        /// future.
+        will-need,
+        /// The application expects that it will not access the specified data
+        /// in the near future.
+        dont-need,
+        /// The application expects to access the specified data once and then
+        /// not reuse it thereafter.
+        no-reuse,
+    }
+
+    /// A 128-bit hash value, split into parts because wasm doesn't have a
+    /// 128-bit integer type.
+    @since(version = 0.2.0)
+    record metadata-hash-value {
+       /// 64 bits of a 128-bit hash value.
+       lower: u64,
+       /// Another 64 bits of a 128-bit hash value.
+       upper: u64,
+    }
+
+    /// A descriptor is a reference to a filesystem object, which may be a file,
+    /// directory, named pipe, special file, or other object on which filesystem
+    /// calls may be made.
+    @since(version = 0.2.0)
     resource descriptor {
-        /// Open a file or directory relative to this descriptor.
-        /// Backs preview1 `path_open`. The adapter translates
-        /// preview1 `dirflags` / `oflags` / `fdflags` /
-        /// `fs_rights_base` into the preview2 flag bundle below.
-        open-at: func(
-            path-flags: path-flags,
-            path: string,
-            open-flags: open-flags,
-            %flags: descriptor-flags
-        ) -> result<descriptor, error-code>;
+        /// Return a stream for reading from a file, if available.
+        ///
+        /// May fail with an error-code describing why the file cannot be read.
+        ///
+        /// Multiple read, write, and append streams may be active on the same open
+        /// file and they do not interfere with each other.
+        ///
+        /// Note: This allows using `read-stream`, which is similar to `read` in POSIX.
+        @since(version = 0.2.0)
+        read-via-stream: func(
+            /// The offset within the file at which to start reading.
+            offset: filesize,
+        ) -> result<input-stream, error-code>;
 
-        /// Open an `input-stream` reading from `offset`. Backs
-        /// preview1 `fd_read` for regular files. The adapter opens
-        /// one stream per `fd_read` call (starting at the
-        /// adapter-tracked file position), reads via
-        /// `input-stream.blocking-read`, drops the stream, and
-        /// advances its tracked position by the bytes returned.
-        read-via-stream: func(offset: u64) -> result<input-stream, error-code>;
+        /// Return a stream for writing to a file, if available.
+        ///
+        /// May fail with an error-code describing why the file cannot be written.
+        ///
+        /// Note: This allows using `write-stream`, which is similar to `write` in
+        /// POSIX.
+        @since(version = 0.2.0)
+        write-via-stream: func(
+            /// The offset within the file at which to start writing.
+            offset: filesize,
+        ) -> result<output-stream, error-code>;
 
-        /// Open an `output-stream` writing at `offset`. Backs
-        /// preview1 `fd_write` for fd ≥ 3 and `fd_pwrite`. The
-        /// adapter opens one stream per call and drops it after
-        /// `blocking-write-and-flush` returns; for `fd_write` the
-        /// tracked position is advanced by total bytes written, for
-        /// `fd_pwrite` it is left untouched (POSIX semantics).
-        write-via-stream: func(offset: u64) -> result<output-stream, error-code>;
-
-        /// Open an append-mode `output-stream`. Used by the adapter
-        /// only when `descriptor-flags::append` was requested at
-        /// open time; preview1 doesn't surface this directly — the
-        /// adapter routes ordinary `fd_write` through this when the
-        /// fd was opened with `FDFLAGS_APPEND` (deferred — current
-        /// adapter always uses `write-via-stream`).
+        /// Return a stream for appending to a file, if available.
+        ///
+        /// May fail with an error-code describing why the file cannot be appended.
+        ///
+        /// Note: This allows using `write-stream`, which is similar to `write` with
+        /// `O_APPEND` in POSIX.
+        @since(version = 0.2.0)
         append-via-stream: func() -> result<output-stream, error-code>;
 
-        /// Backs preview1 `fd_filestat_set_size`.
-        set-size: func(size: u64) -> result<_, error-code>;
-
-        /// Backs preview1 `fd_filestat_set_times`. Both timestamps
-        /// take a `new-timestamp` variant; the adapter constructs
-        /// each from the preview1 fstflags bits + raw u64 ns values.
-        set-times: func(
-            data-access-timestamp: new-timestamp,
-            data-modification-timestamp: new-timestamp
-        ) -> result<_, error-code>;
-
-        /// Backs preview1 `fd_filestat_get`. The adapter unpacks the
-        /// returned `descriptor-stat` into the 64-byte preview1
-        /// `filestat` layout described on `descriptor-stat`.
-        stat: func() -> result<descriptor-stat, error-code>;
-
-        /// Backs preview1 `fd_fdstat_get` (fd ≥ 3 branch) — returns
-        /// the preview2 `descriptor-type` enum which the adapter
-        /// maps to a preview1 `__wasi_filetype_t` byte via
-        /// `$preview1_filetype_from_descriptor_type` in
-        /// `fragments/body.wat`. Tracked under cataggar/wabt#179.
-        get-type: func() -> result<descriptor-type, error-code>;
-
-        /// Backs preview1 `fd_fdstat_get` (fd ≥ 3 branch) — returns
-        /// the preview2 `descriptor-flags` bitmap. The adapter
-        /// extracts preview1 `fs_flags` bits (DSYNC / SYNC) via
-        /// `$preview1_fs_flags_from_descriptor_flags`; the remaining
-        /// preview1 fdflags (APPEND / NONBLOCK / RSYNC) have no
-        /// preview2 source and stay 0 (cataggar/wabt#179).
-        get-flags: func() -> result<descriptor-flags, error-code>;
-
-        /// Backs preview1 `fd_advise(fd, offset, length, advice)`.
-        /// preview1's `__wasi_advice_t` ordinals (NORMAL=0…NOREUSE=5)
-        /// align byte-for-byte with the preview2 `advice` enum, so
-        /// the adapter forwards the value unchanged after a `> 5`
-        /// bounds check (cataggar/wabt#180).
+        /// Provide file advisory information on a descriptor.
+        ///
+        /// This is similar to `posix_fadvise` in POSIX.
+        @since(version = 0.2.0)
         advise: func(
-            offset: u64,
-            length: u64,
+            /// The offset within the file to which the advisory applies.
+            offset: filesize,
+            /// The length of the region to which the advisory applies.
+            length: filesize,
+            /// The advice.
             advice: advice
         ) -> result<_, error-code>;
 
-        /// Backs preview1 `path_readlink(fd, path, buf, buf_len,
-        /// bufused)`. Returns the link target as a string; the
-        /// adapter memcpy's `min(returned-len, buf_len)` bytes into
-        /// the caller's `buf` and reports the truncated length in
-        /// `*bufused_ptr` (matches the wasmtime reference adapter
-        /// and POSIX `readlink(3)` semantics — wasi-libc detects
-        /// truncation by re-issuing with a larger buf when
-        /// `bufused == buf_len`). Tracked under cataggar/wabt#180.
-        readlink-at: func(path: string) -> result<string, error-code>;
-
-        /// Backs preview1 `path_filestat_get`. Same return shape as
-        /// `stat` plus the `(path-flags, path)` lookup arguments.
-        stat-at: func(
-            path-flags: path-flags,
-            path: string
-        ) -> result<descriptor-stat, error-code>;
-
-        /// Backs preview1 `path_filestat_set_times`.
-        set-times-at: func(
-            path-flags: path-flags,
-            path: string,
-            data-access-timestamp: new-timestamp,
-            data-modification-timestamp: new-timestamp
-        ) -> result<_, error-code>;
-
-        /// Backs preview1 `path_create_directory`.
-        create-directory-at: func(path: string) -> result<_, error-code>;
-
-        /// Backs preview1 `path_remove_directory`.
-        remove-directory-at: func(path: string) -> result<_, error-code>;
-
-        /// Backs preview1 `path_unlink_file`.
-        unlink-file-at: func(path: string) -> result<_, error-code>;
-
-        /// Backs preview1 `path_symlink`. Note the argument order:
-        /// `old-path` (the symlink target) first, `new-path` (the
-        /// symlink path itself, relative to `self`) second. Matches
-        /// POSIX `symlinkat(target, dirfd, linkpath)`.
-        symlink-at: func(
-            old-path: string,
-            new-path: string
-        ) -> result<_, error-code>;
-
-        /// Backs preview1 `path_rename`. `self` is the source
-        /// directory; `new-descriptor` is the destination directory
-        /// (passed as `borrow<descriptor>` to avoid double-owning
-        /// the handle the adapter is also tracking in its fd table).
-        rename-at: func(
-            old-path: string,
-            new-descriptor: borrow<descriptor>,
-            new-path: string
-        ) -> result<_, error-code>;
-
-        /// Backs preview1 `path_link`. Hard-link from `(self,
-        /// old-path)` to `(new-descriptor, new-path)`.
-        link-at: func(
-            old-path-flags: path-flags,
-            old-path: string,
-            new-descriptor: borrow<descriptor>,
-            new-path: string
-        ) -> result<_, error-code>;
-
-        /// Backs preview1 `fd_sync` (file-integrity sync — flushes
-        /// data + metadata).
-        sync: func() -> result<_, error-code>;
-
-        /// Backs preview1 `fd_datasync` (data-integrity sync —
-        /// flushes data only).
+        /// Synchronize the data of a file to disk.
+        ///
+        /// This function succeeds with no effect if the file descriptor is not
+        /// opened for writing.
+        ///
+        /// Note: This is similar to `fdatasync` in POSIX.
+        @since(version = 0.2.0)
         sync-data: func() -> result<_, error-code>;
 
-        /// Open a fresh `directory-entry-stream` reading from the
-        /// start of this directory. Backs preview1 `fd_readdir`. The
-        /// adapter opens one stream per call, iterates
-        /// `read-directory-entry()` filling the caller's buffer, and
-        /// drops the stream. Resumable cookies are not modelled —
-        /// the adapter ignores the input cookie and emits a fresh
-        /// listing each call (wasi-libc's `readdir(3)` then
-        /// continues by re-reading from the start, matching the
-        /// behaviour of the wasmtime reference adapter).
-        read-directory: func() -> result<directory-entry-stream, error-code>;
-    }
-}
+        /// Get flags associated with a descriptor.
+        ///
+        /// Note: This returns similar flags to `fcntl(fd, F_GETFL)` in POSIX.
+        ///
+        /// Note: This returns the value that was the `fs_flags` value returned
+        /// from `fdstat_get` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        get-flags: func() -> result<descriptor-flags, error-code>;
 
+        /// Get the dynamic type of a descriptor.
+        ///
+        /// Note: This returns the same value as the `type` field of the `fd-stat`
+        /// returned by `stat`, `stat-at` and similar.
+        ///
+        /// Note: This returns similar flags to the `st_mode & S_IFMT` value provided
+        /// by `fstat` in POSIX.
+        ///
+        /// Note: This returns the value that was the `fs_filetype` value returned
+        /// from `fdstat_get` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        get-type: func() -> result<descriptor-type, error-code>;
+
+        /// Adjust the size of an open file. If this increases the file's size, the
+        /// extra bytes are filled with zeros.
+        ///
+        /// Note: This was called `fd_filestat_set_size` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        set-size: func(size: filesize) -> result<_, error-code>;
+
+        /// Adjust the timestamps of an open file or directory.
+        ///
+        /// Note: This is similar to `futimens` in POSIX.
+        ///
+        /// Note: This was called `fd_filestat_set_times` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        set-times: func(
+            /// The desired values of the data access timestamp.
+            data-access-timestamp: new-timestamp,
+            /// The desired values of the data modification timestamp.
+            data-modification-timestamp: new-timestamp,
+        ) -> result<_, error-code>;
+
+        /// Read from a descriptor, without using and updating the descriptor's offset.
+        ///
+        /// This function returns a list of bytes containing the data that was
+        /// read, along with a bool which, when true, indicates that the end of the
+        /// file was reached. The returned list will contain up to `length` bytes; it
+        /// may return fewer than requested, if the end of the file is reached or
+        /// if the I/O operation is interrupted.
+        ///
+        /// In the future, this may change to return a `stream<u8, error-code>`.
+        ///
+        /// Note: This is similar to `pread` in POSIX.
+        @since(version = 0.2.0)
+        read: func(
+            /// The maximum number of bytes to read.
+            length: filesize,
+            /// The offset within the file at which to read.
+            offset: filesize,
+        ) -> result<tuple<list<u8>, bool>, error-code>;
+
+        /// Write to a descriptor, without using and updating the descriptor's offset.
+        ///
+        /// It is valid to write past the end of a file; the file is extended to the
+        /// extent of the write, with bytes between the previous end and the start of
+        /// the write set to zero.
+        ///
+        /// In the future, this may change to take a `stream<u8, error-code>`.
+        ///
+        /// Note: This is similar to `pwrite` in POSIX.
+        @since(version = 0.2.0)
+        write: func(
+            /// Data to write
+            buffer: list<u8>,
+            /// The offset within the file at which to write.
+            offset: filesize,
+        ) -> result<filesize, error-code>;
+
+        /// Read directory entries from a directory.
+        ///
+        /// On filesystems where directories contain entries referring to themselves
+        /// and their parents, often named `.` and `..` respectively, these entries
+        /// are omitted.
+        ///
+        /// This always returns a new stream which starts at the beginning of the
+        /// directory. Multiple streams may be active on the same directory, and they
+        /// do not interfere with each other.
+        @since(version = 0.2.0)
+        read-directory: func() -> result<directory-entry-stream, error-code>;
+
+        /// Synchronize the data and metadata of a file to disk.
+        ///
+        /// This function succeeds with no effect if the file descriptor is not
+        /// opened for writing.
+        ///
+        /// Note: This is similar to `fsync` in POSIX.
+        @since(version = 0.2.0)
+        sync: func() -> result<_, error-code>;
+
+        /// Create a directory.
+        ///
+        /// Note: This is similar to `mkdirat` in POSIX.
+        @since(version = 0.2.0)
+        create-directory-at: func(
+            /// The relative path at which to create the directory.
+            path: string,
+        ) -> result<_, error-code>;
+
+        /// Return the attributes of an open file or directory.
+        ///
+        /// Note: This is similar to `fstat` in POSIX, except that it does not return
+        /// device and inode information. For testing whether two descriptors refer to
+        /// the same underlying filesystem object, use `is-same-object`. To obtain
+        /// additional data that can be used do determine whether a file has been
+        /// modified, use `metadata-hash`.
+        ///
+        /// Note: This was called `fd_filestat_get` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        stat: func() -> result<descriptor-stat, error-code>;
+
+        /// Return the attributes of a file or directory.
+        ///
+        /// Note: This is similar to `fstatat` in POSIX, except that it does not
+        /// return device and inode information. See the `stat` description for a
+        /// discussion of alternatives.
+        ///
+        /// Note: This was called `path_filestat_get` in earlier versions of WASI.
+        @since(version = 0.2.0)
+        stat-at: func(
+            /// Flags determining the method of how the path is resolved.
+            path-flags: path-flags,
+            /// The relative path of the file or directory to inspect.
+            path: string,
+        ) -> result<descriptor-stat, error-code>;
+
+        /// Adjust the timestamps of a file or directory.
+        ///
+        /// Note: This is similar to `utimensat` in POSIX.
+        ///
+        /// Note: This was called `path_filestat_set_times` in earlier versions of
+        /// WASI.
+        @since(version = 0.2.0)
+        set-times-at: func(
+            /// Flags determining the method of how the path is resolved.
+            path-flags: path-flags,
+            /// The relative path of the file or directory to operate on.
+            path: string,
+            /// The desired values of the data access timestamp.
+            data-access-timestamp: new-timestamp,
+            /// The desired values of the data modification timestamp.
+            data-modification-timestamp: new-timestamp,
+        ) -> result<_, error-code>;
+
+        /// Create a hard link.
+        ///
+        /// Fails with `error-code::no-entry` if the old path does not exist,
+        /// with `error-code::exist` if the new path already exists, and
+        /// `error-code::not-permitted` if the old path is not a file.
+        ///
+        /// Note: This is similar to `linkat` in POSIX.
+        @since(version = 0.2.0)
+        link-at: func(
+            /// Flags determining the method of how the path is resolved.
+            old-path-flags: path-flags,
+            /// The relative source path from which to link.
+            old-path: string,
+            /// The base directory for `new-path`.
+            new-descriptor: borrow<descriptor>,
+            /// The relative destination path at which to create the hard link.
+            new-path: string,
+        ) -> result<_, error-code>;
+
+        /// Open a file or directory.
+        ///
+        /// If `flags` contains `descriptor-flags::mutate-directory`, and the base
+        /// descriptor doesn't have `descriptor-flags::mutate-directory` set,
+        /// `open-at` fails with `error-code::read-only`.
+        ///
+        /// If `flags` contains `write` or `mutate-directory`, or `open-flags`
+        /// contains `truncate` or `create`, and the base descriptor doesn't have
+        /// `descriptor-flags::mutate-directory` set, `open-at` fails with
+        /// `error-code::read-only`.
+        ///
+        /// Note: This is similar to `openat` in POSIX.
+        @since(version = 0.2.0)
+        open-at: func(
+            /// Flags determining the method of how the path is resolved.
+            path-flags: path-flags,
+            /// The relative path of the object to open.
+            path: string,
+            /// The method by which to open the file.
+            open-flags: open-flags,
+            /// Flags to use for the resulting descriptor.
+            %flags: descriptor-flags,
+        ) -> result<descriptor, error-code>;
+
+        /// Read the contents of a symbolic link.
+        ///
+        /// If the contents contain an absolute or rooted path in the underlying
+        /// filesystem, this function fails with `error-code::not-permitted`.
+        ///
+        /// Note: This is similar to `readlinkat` in POSIX.
+        @since(version = 0.2.0)
+        readlink-at: func(
+            /// The relative path of the symbolic link from which to read.
+            path: string,
+        ) -> result<string, error-code>;
+
+        /// Remove a directory.
+        ///
+        /// Return `error-code::not-empty` if the directory is not empty.
+        ///
+        /// Note: This is similar to `unlinkat(fd, path, AT_REMOVEDIR)` in POSIX.
+        @since(version = 0.2.0)
+        remove-directory-at: func(
+            /// The relative path to a directory to remove.
+            path: string,
+        ) -> result<_, error-code>;
+
+        /// Rename a filesystem object.
+        ///
+        /// Note: This is similar to `renameat` in POSIX.
+        @since(version = 0.2.0)
+        rename-at: func(
+            /// The relative source path of the file or directory to rename.
+            old-path: string,
+            /// The base directory for `new-path`.
+            new-descriptor: borrow<descriptor>,
+            /// The relative destination path to which to rename the file or directory.
+            new-path: string,
+        ) -> result<_, error-code>;
+
+        /// Create a symbolic link (also known as a "symlink").
+        ///
+        /// If `old-path` starts with `/`, the function fails with
+        /// `error-code::not-permitted`.
+        ///
+        /// Note: This is similar to `symlinkat` in POSIX.
+        @since(version = 0.2.0)
+        symlink-at: func(
+            /// The contents of the symbolic link.
+            old-path: string,
+            /// The relative destination path at which to create the symbolic link.
+            new-path: string,
+        ) -> result<_, error-code>;
+
+        /// Unlink a filesystem object that is not a directory.
+        ///
+        /// Return `error-code::is-directory` if the path refers to a directory.
+        /// Note: This is similar to `unlinkat(fd, path, 0)` in POSIX.
+        @since(version = 0.2.0)
+        unlink-file-at: func(
+            /// The relative path to a file to unlink.
+            path: string,
+        ) -> result<_, error-code>;
+
+        /// Test whether two descriptors refer to the same filesystem object.
+        ///
+        /// In POSIX, this corresponds to testing whether the two descriptors have the
+        /// same device (`st_dev`) and inode (`st_ino` or `d_ino`) numbers.
+        /// wasi-filesystem does not expose device and inode numbers, so this function
+        /// may be used instead.
+        @since(version = 0.2.0)
+        is-same-object: func(other: borrow<descriptor>) -> bool;
+
+        /// Return a hash of the metadata associated with a filesystem object referred
+        /// to by a descriptor.
+        ///
+        /// This returns a hash of the last-modification timestamp and file size, and
+        /// may also include the inode number, device number, birth timestamp, and
+        /// other metadata fields that may change when the file is modified or
+        /// replaced. It may also include a secret value chosen by the
+        /// implementation and not otherwise exposed.
+        ///
+        /// Implementations are encouraged to provide the following properties:
+        ///
+        ///  - If the file is not modified or replaced, the computed hash value should
+        ///    usually not change.
+        ///  - If the object is modified or replaced, the computed hash value should
+        ///    usually change.
+        ///  - The inputs to the hash should not be easily computable from the
+        ///    computed hash.
+        ///
+        /// However, none of these is required.
+        @since(version = 0.2.0)
+        metadata-hash: func() -> result<metadata-hash-value, error-code>;
+
+        /// Return a hash of the metadata associated with a filesystem object referred
+        /// to by a directory descriptor and a relative path.
+        ///
+        /// This performs the same hash computation as `metadata-hash`.
+        @since(version = 0.2.0)
+        metadata-hash-at: func(
+            /// Flags determining the method of how the path is resolved.
+            path-flags: path-flags,
+            /// The relative path of the file or directory to inspect.
+            path: string,
+        ) -> result<metadata-hash-value, error-code>;
+    }
+
+    /// A stream of directory entries.
+    @since(version = 0.2.0)
+    resource directory-entry-stream {
+        /// Read a single directory entry from a `directory-entry-stream`.
+        @since(version = 0.2.0)
+        read-directory-entry: func() -> result<option<directory-entry>, error-code>;
+    }
+
+    /// Attempts to extract a filesystem-related `error-code` from the stream
+    /// `error` provided.
+    ///
+    /// Stream operations which return `stream-error::last-operation-failed`
+    /// have a payload with more information about the operation that failed.
+    /// This payload can be passed through to this function to see if there's
+    /// filesystem-related information about the error to return.
+    ///
+    /// Note that this function is fallible because not all stream-related
+    /// errors are filesystem-related errors.
+    @since(version = 0.2.0)
+    filesystem-error-code: func(err: borrow<error>) -> option<error-code>;
+}

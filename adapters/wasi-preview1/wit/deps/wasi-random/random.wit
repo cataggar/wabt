@@ -1,26 +1,29 @@
-// Trimmed slice of `wasi:random@0.2.6.random`. Mirrors the canonical
-// `bytecodealliance/wasi-random@v0.2.6/wit/random.wit` shape but
-// declares only the one function the preview1 → preview2 adapter
-// calls: `get-random-bytes`.
-//
-//   * `get-insecure-random-bytes` / `get-insecure-random-u64` /
-//     `get-random-u64` exist in the canonical interface but are not
-//     consumed by the adapter; they stay out of this trimmed copy
-//     to keep `metadata_encode` output minimal.
-//
-// Backs the preview1 `random_get(buf, len) -> errno` import.
-// `wasi-libc`'s `getentropy`, Zig's `std.crypto.random`, Rust's
-// `rand` crate's wasi backend and Go's runtime RNG seed all route
-// through there at startup, so without this wiring every guest
-// that touches randomness traps at process spawn with `ENOSYS`.
-
 package wasi:random@0.2.6;
-
+/// WASI Random is a random data API.
+///
+/// It is intended to be portable at least between Unix-family platforms and
+/// Windows.
+@since(version = 0.2.0)
 interface random {
-    /// Return `len` cryptographically-secure random bytes. The host
-    /// invokes the adapter's `cabi_import_realloc` once to allocate
-    /// the backing buffer for the returned `list<u8>`. The adapter
-    /// installs a one-shot override around the call so the buffer
-    /// is the caller's preview1 `buf` pointer — zero copy.
+    /// Return `len` cryptographically-secure random or pseudo-random bytes.
+    ///
+    /// This function must produce data at least as cryptographically secure and
+    /// fast as an adequately seeded cryptographically-secure pseudo-random
+    /// number generator (CSPRNG). It must not block, from the perspective of
+    /// the calling program, under any circumstances, including on the first
+    /// request and on requests for numbers of bytes. The returned data must
+    /// always be unpredictable.
+    ///
+    /// This function must always return fresh data. Deterministic environments
+    /// must omit this function, rather than implementing it with deterministic
+    /// data.
+    @since(version = 0.2.0)
     get-random-bytes: func(len: u64) -> list<u8>;
+
+    /// Return a cryptographically-secure random or pseudo-random `u64` value.
+    ///
+    /// This function returns the same type of data as `get-random-bytes`,
+    /// represented as a `u64`.
+    @since(version = 0.2.0)
+    get-random-u64: func() -> u64;
 }

@@ -53,6 +53,14 @@ pub const usage =
     \\                                across the seam. Spec form:
     \\                                  <ns>:<pkg>@<from>=<to>
     \\                                (repeatable; for wasi:* use --align-wasi)
+    \\      --no-bubble-unmatched-imports
+    \\                                Refuse (with UnmatchedProviderImport)
+    \\                                instead of bubbling provider imports the
+    \\                                consumer doesn't declare to the wrapping
+    \\                                component's outer-imports. Default is
+    \\                                bubble — matches `wac compose` and lets
+    \\                                the resulting component be hosted by any
+    \\                                runtime that supplies those interfaces.
     \\
 ;
 
@@ -168,6 +176,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var align_wasi: AlignWasi = .error_default;
     var explicit_rewrites = std.ArrayListUnmanaged(ExplicitRewrite).empty;
     defer explicit_rewrites.deinit(alloc);
+    var bubble_unmatched_provider_imports: bool = true;
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -212,6 +221,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 std.process.exit(1);
             };
             try explicit_rewrites.append(alloc, rule);
+        } else if (std.mem.eql(u8, arg, "--no-bubble-unmatched-imports")) {
+            bubble_unmatched_provider_imports = false;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             std.debug.print("error: unknown option '{s}'. Use `wabt component compose help`.\n", .{arg});
             std.process.exit(1);
@@ -326,7 +337,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         break :blk std.fmt.allocPrint(alloc, "{s}.composed.wasm", .{cons_path}) catch cons_path;
     };
 
-    const out_bytes = composeBinaries(alloc, final_consumer_bytes, final_provider_bytes) catch |err| {
+    const out_bytes = composeBinariesOpts(alloc, final_consumer_bytes, final_provider_bytes, .{
+        .bubble_unmatched_provider_imports = bubble_unmatched_provider_imports,
+    }) catch |err| {
         std.debug.print("error: composing component: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -437,6 +450,25 @@ pub fn composeBinaries(
     consumer_bytes: []const u8,
     provider_bytes: []const []const u8,
 ) ![]u8 {
+    return composeBinariesOpts(alloc, consumer_bytes, provider_bytes, .{});
+}
+
+pub const ComposeOptions = struct {
+    /// When true (default), provider imports the consumer doesn't
+    /// declare are bubbled up as wrapper outer-imports, matching
+    /// `wac compose`'s behaviour. When false, they trigger
+    /// `error.UnmatchedProviderImport` instead — the strict mode
+    /// some callers may want to surface for explicit detection.
+    bubble_unmatched_provider_imports: bool = true,
+};
+
+pub fn composeBinariesOpts(
+    alloc: std.mem.Allocator,
+    consumer_bytes: []const u8,
+    provider_bytes: []const []const u8,
+    opts: ComposeOptions,
+) ![]u8 {
+    const bubble_unmatched_provider_imports = opts.bubble_unmatched_provider_imports;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -450,9 +482,57 @@ pub fn composeBinaries(
 
     const link = try compose.plan(ar, &consumer, provider_ptrs);
 
-    const num_unresolved: u32 = @intCast(link.unresolved.len);
     const num_providers: u32 = @intCast(provider_bytes.len);
     const num_bindings: u32 = @intCast(link.bindings.len);
+
+    // ── Sources contributing to the wrapper prologue (#216). The
+    //    consumer's unresolved imports always bubble up. Each
+    //    provider's imports also bubble up IF they don't already
+    //    appear in the wrapper's outer-import set by name AND
+    //    bubble-up is enabled (default; gated by
+    //    --no-bubble-unmatched-imports). This matches `wac compose`'s
+    //    behaviour and lets `wabt component compose` work
+    //    out-of-the-box on real-world consumer + provider pairs where
+    //    the provider pulls in wasi packages the consumer never
+    //    referenced (e.g. `tcgc.wasm`'s wasi:http/types). Strict
+    //    mode keeps `error.UnmatchedProviderImport` reachable for
+    //    callers who want to detect the situation explicitly.
+    var sources_list = std.ArrayListUnmanaged(PrologueSource).empty;
+    try sources_list.append(ar, .{
+        .component = &consumer,
+        .bubble_import_idxs = link.unresolved,
+    });
+
+    // Track which names have already been bubbled at the wrapper
+    // level so dedup across consumer + each provider works by name.
+    var bubbled_names = std.StringHashMapUnmanaged(void).empty;
+    for (link.unresolved) |u_idx| {
+        try bubbled_names.put(ar, consumer.imports[u_idx].name, {});
+    }
+
+    if (bubble_unmatched_provider_imports) {
+        for (providers, 0..) |*provider, p_idx| {
+            var prov_bubble = std.ArrayListUnmanaged(u32).empty;
+            for (provider.imports, 0..) |p_imp, imp_idx| {
+                if (bubbled_names.contains(p_imp.name)) continue;
+                // Bubble-up only supports instance-typed provider imports.
+                // Non-instance ones (`.func`, `.value`, …) would need
+                // separate wrapper-side machinery; until a real input
+                // demands them, refuse with UnsupportedComposeShape so
+                // the failure is loud, not silent (mirrors #214's
+                // strict-mode behaviour for provider Instantiate args).
+                if (p_imp.desc != .instance) return error.UnsupportedComposeShape;
+                try prov_bubble.append(ar, @intCast(imp_idx));
+                try bubbled_names.put(ar, p_imp.name, {});
+            }
+            if (prov_bubble.items.len == 0) continue;
+            _ = p_idx;
+            try sources_list.append(ar, .{
+                .component = provider,
+                .bubble_import_idxs = try prov_bubble.toOwnedSlice(ar),
+            });
+        }
+    }
 
     // ── Wrapper prologue: build the interleaved type / alias / import
     //    section sequence that establishes the wrapper's outer type
@@ -488,12 +568,13 @@ pub fn composeBinaries(
     //    references that exact slot — this preserves the consumer's
     //    `type N → import (instance (type N)) → alias …` interleaving
     //    pattern that wt-component output relies on. ──
-    const prologue = try buildWrapperPrologue(ar, &consumer, link);
+    const prologue = try buildWrapperPrologue(ar, sources_list.items);
     const types_list_items = prologue.types;
     const aliases_prologue = prologue.aliases;
     const imports_arr = prologue.imports;
     const prologue_section_entries = prologue.section_entries;
     const num_prologue_aliases: u32 = @intCast(aliases_prologue.len);
+    const num_unresolved: u32 = @intCast(imports_arr.len);
 
     // ── Nested components: consumer at idx 0, providers at idx 1..N.
     //    Each is wrapped in a passthrough Component AST whose
@@ -515,21 +596,22 @@ pub fn composeBinaries(
     //    consumer); the slice below holds them in declaration order
     //    and `section_order` slices them apart.
     //
-    //    Provider Instantiate args (issue #214): each provider's own
-    //    imports must be satisfied by the wrapper, otherwise wasmtime
-    //    aborts at the inner Instantiate site with `missing import
-    //    named X`. We satisfy them from the wrapper's outer-imports —
-    //    the bubbled-up consumer-imports the prologue just emitted.
-    //    Post-`--align-wasi` rewrite both halves agree on names by
-    //    construction, so a name-match against the unresolved
-    //    consumer-imports yields the right wrapper-instance index. ──
-    var inst_slot_for_consumer_name = std.StringHashMapUnmanaged(u32).empty;
+    //    Provider Instantiate args (issue #214 + #216): each provider's
+    //    own imports must be satisfied by the wrapper, otherwise
+    //    wasmtime aborts at the inner Instantiate site with
+    //    `missing import named X`. We satisfy them by looking up
+    //    each provider import's name in the COMBINED wrapper
+    //    outer-import set (consumer-derived + post-bubble provider-
+    //    derived; #216 made that set big enough to cover provider-
+    //    unique imports out of the box). Strict mode (#214 behaviour,
+    //    `--no-bubble-unmatched-imports`) surfaces a missing match
+    //    as `error.UnmatchedProviderImport`. ──
+    var inst_slot_for_outer_name = std.StringHashMapUnmanaged(u32).empty;
     {
         var inst_count: u32 = 0;
-        for (link.unresolved) |u_idx| {
-            const imp = consumer.imports[u_idx];
+        for (imports_arr) |imp| {
             if (imp.desc == .instance) {
-                try inst_slot_for_consumer_name.put(ar, imp.name, inst_count);
+                try inst_slot_for_outer_name.put(ar, imp.name, inst_count);
                 inst_count += 1;
             }
         }
@@ -546,7 +628,7 @@ pub fn composeBinaries(
             // (instance (type N)))` exclusively, so this is a clean
             // failure mode rather than a silent incorrect emission.
             if (p_imp.desc != .instance) return error.UnsupportedComposeShape;
-            const wrap_inst_idx = inst_slot_for_consumer_name.get(p_imp.name) orelse
+            const wrap_inst_idx = inst_slot_for_outer_name.get(p_imp.name) orelse
                 return error.UnmatchedProviderImport;
             try prov_args.append(ar, .{
                 .name = p_imp.name,
@@ -818,68 +900,125 @@ const Prologue = struct {
 
 const SENTINEL_TYPE_IDX: u32 = std.math.maxInt(u32);
 
-/// Build the wrapping component's prologue: walk the consumer's
-/// `type_indexspace` in encounter order, restricted to slots
-/// reachable from `link.unresolved` imports, and emit each closure
-/// slot as a cloned type def (`.type_def` contributors) or a
-/// replicated alias decl (`.alias` contributors). After each emitted
-/// slot, bubble up any unresolved instance-typed import whose desc
-/// references that exact slot — preserving the consumer's
-/// `type N → import (instance (type N)) → alias …` interleaving
-/// pattern that wt-component output relies on.
+/// One source contributing to the wrapper prologue. The wrapper
+/// outer-imports are the union of every source's `bubble_import_idxs`
+/// — consumer imports that bubble up because no provider exports
+/// match them (issue #115), plus provider imports that bubble up
+/// because the consumer doesn't declare them (issue #216).
+const PrologueSource = struct {
+    component: *const ctypes.Component,
+    /// Indices into `component.imports` to bubble up as wrapper
+    /// outer-imports.
+    bubble_import_idxs: []const u32,
+};
+
+/// Build the wrapping component's prologue across one OR MORE
+/// sources. Each source contributes type-closure clones into the
+/// wrapper's `types[]`, alias replications into `aliases[]`,
+/// bubble-up imports into `imports[]`, and section emission entries
+/// into `section_entries[]`. Sources are walked sequentially; the
+/// wrapper's type and instance indexspaces grow monotonically.
 ///
-/// Forward-only references hold by virtue of walking the consumer in
-/// encounter order: a well-formed component only has type-def bodies
-/// referencing earlier type-indexspace slots, only has imports'
-/// descs referencing earlier type-indexspace slots, and only has
-/// aliases' instance-idx operands referencing earlier
-/// instance-indexspace slots.
+/// Single-source invariant (consumer-only, pre-#216): equivalent to
+/// the old `buildWrapperPrologue(consumer, link)` — bug-for-bug. The
+/// existing test suite covers this; #216 layers per-provider sources
+/// on top.
 fn buildWrapperPrologue(
     arena: std.mem.Allocator,
-    consumer: *const ctypes.Component,
-    link: compose.Plan,
+    sources: []const PrologueSource,
 ) !Prologue {
-    // Map: consumer.imports idx → position within `link.unresolved`.
-    // Aliases of sort `.type` whose source instance is an unresolved
-    // consumer instance import remap their `instance_idx` through
-    // this table to the wrapper-instance idx the bubbled-up import
-    // occupies. Only `.instance`-desc imports contribute to the
-    // wrapper's instance indexspace, but we record all entries so the
-    // caller can detect non-instance unresolved imports.
-    var unres_pos = std.AutoHashMapUnmanaged(u32, u32).empty;
-    var inst_slot_for_unres_imp = std.AutoHashMapUnmanaged(u32, u32).empty;
+    var types_out = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    var aliases_out = std.ArrayListUnmanaged(ctypes.Alias).empty;
+    var imports_out = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
+    var section_entries = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+
+    var emitter: PrologueEmitter = .{
+        .entries = &section_entries,
+        .arena = arena,
+    };
+
     var inst_count: u32 = 0;
-    for (link.unresolved, 0..) |imp_idx, k| {
-        try unres_pos.put(arena, imp_idx, @intCast(k));
-        const imp = consumer.imports[imp_idx];
+    for (sources) |source| {
+        inst_count = try appendSourcePrologue(
+            arena,
+            source.component,
+            source.bubble_import_idxs,
+            &types_out,
+            &aliases_out,
+            &imports_out,
+            &emitter,
+            inst_count,
+        );
+    }
+
+    try emitter.flush();
+
+    return .{
+        .types = try types_out.toOwnedSlice(arena),
+        .aliases = try aliases_out.toOwnedSlice(arena),
+        .imports = try imports_out.toOwnedSlice(arena),
+        .section_entries = try section_entries.toOwnedSlice(arena),
+        .type_remap = &.{}, // per-source remaps are not exposed across the API
+    };
+}
+
+/// Per-source prologue walk: append cloned type defs, replicated
+/// alias decls, and bubbled imports for `source` to the shared
+/// accumulators. `inst_count_start` is the wrapper-instance idx the
+/// next bubbled instance-typed import would take (cumulative across
+/// previously-walked sources); returns the new cumulative count.
+///
+/// Forward-only references within `source`'s typespace hold by
+/// virtue of walking its `type_indexspace` in encounter order.
+/// Cross-source references are NOT supported — each source's closure
+/// must be self-contained within its own typespace. (Real-world
+/// inputs satisfy this: wasi-tooling-emitted components never have a
+/// type body referencing a slot defined in a different file/source.)
+fn appendSourcePrologue(
+    arena: std.mem.Allocator,
+    source: *const ctypes.Component,
+    bubble_import_idxs: []const u32,
+    types_out: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    aliases_out: *std.ArrayListUnmanaged(ctypes.Alias),
+    imports_out: *std.ArrayListUnmanaged(ctypes.ImportDecl),
+    emitter: *PrologueEmitter,
+    inst_count_start: u32,
+) !u32 {
+    if (bubble_import_idxs.len == 0) return inst_count_start;
+
+    // Map: source.imports idx → wrapper-instance idx. Only
+    // instance-typed imports contribute to the wrapper's instance
+    // indexspace.
+    var inst_slot_for_unres_imp = std.AutoHashMapUnmanaged(u32, u32).empty;
+    var inst_count: u32 = inst_count_start;
+    for (bubble_import_idxs) |imp_idx| {
+        const imp = source.imports[imp_idx];
         if (imp.desc == .instance) {
             try inst_slot_for_unres_imp.put(arena, imp_idx, inst_count);
             inst_count += 1;
         }
     }
 
-    // Map: consumer type-indexspace idx → unresolved consumer.imports
-    // idx whose `.instance` desc references that slot. Used to bubble
-    // up each unresolved instance import right after its referenced
-    // type slot, preserving the consumer's interleaving.
+    // Map: source type-indexspace idx → bubbled import idx whose
+    // `.instance` desc references that slot. Used to bubble each
+    // import right after its referenced type slot, preserving
+    // wt-component's interleaving pattern.
     var imp_for_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
-    for (link.unresolved) |imp_idx| {
-        const imp = consumer.imports[imp_idx];
+    for (bubble_import_idxs) |imp_idx| {
+        const imp = source.imports[imp_idx];
         if (imp.desc == .instance) {
             try imp_for_type_idx.put(arena, imp.desc.instance, imp_idx);
         }
     }
 
-    // ── BFS the closure of consumer-typespace idxs reachable from
-    //    every unresolved import's desc. Only `.type_def` contributor
-    //    slots have a body to walk; `.alias` and `.import` slots are
-    //    terminal at this level. ──
+    // BFS the closure of source-typespace idxs reachable from every
+    // bubbled import's desc.
     var queue = std.ArrayListUnmanaged(u32).empty;
     var in_closure = std.AutoHashMapUnmanaged(u32, void).empty;
     var max_idx: u32 = 0;
 
-    for (link.unresolved) |u_idx| {
-        const imp = consumer.imports[u_idx];
+    for (bubble_import_idxs) |u_idx| {
+        const imp = source.imports[u_idx];
         var seeds = std.ArrayListUnmanaged(u32).empty;
         try type_walk.collectExternDescRefs(arena, imp.desc, &seeds);
         for (seeds.items) |s| {
@@ -893,7 +1032,7 @@ fn buildWrapperPrologue(
     var head: usize = 0;
     while (head < queue.items.len) : (head += 1) {
         const cur = queue.items[head];
-        const td = lookupConsumerType(consumer, cur) orelse continue;
+        const td = lookupConsumerType(source, cur) orelse continue;
         var refs = std.ArrayListUnmanaged(u32).empty;
         try type_walk.collectTypeDefRefs(arena, td, &refs, 0);
         for (refs.items) |r| {
@@ -904,43 +1043,22 @@ fn buildWrapperPrologue(
         }
     }
 
-    // remap covers every consumer-typespace idx that could be
-    // operand to a depth-0 ref in any cloned body. Size it to
-    // accommodate the consumer's indexspace, its types[], and the
-    // highest BFS-encountered idx (which may sit *past* the
-    // indexspace for hand-built fixtures with `types: &.{}` whose
-    // imports still cite a numeric type idx).
-    var remap_len: usize = consumer.type_indexspace.len;
-    if (consumer.types.len > remap_len) remap_len = consumer.types.len;
+    // remap covers every source-typespace idx that could be operand
+    // to a depth-0 ref in any cloned body within this source.
+    // Per-source: a fresh table sized to fit the source's typespace.
+    var remap_len: usize = source.type_indexspace.len;
+    if (source.types.len > remap_len) remap_len = source.types.len;
     if (in_closure.count() > 0 and @as(usize, max_idx) + 1 > remap_len) {
         remap_len = @as(usize, max_idx) + 1;
     }
     const remap = try arena.alloc(u32, remap_len);
     @memset(remap, SENTINEL_TYPE_IDX);
 
-    // ── Walk the consumer type-indexspace in encounter order. For
-    //    each closure slot, emit either a cloned type def or a
-    //    replicated alias. After each slot, bubble up any unresolved
-    //    instance-typed import whose desc references it. Adjacent
-    //    same-kind emissions chunk into a single SectionEntry. ──
-    var types_out = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
-    var aliases_out = std.ArrayListUnmanaged(ctypes.Alias).empty;
-    var imports_out = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
-    var section_entries = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
     var emitted_imp = std.AutoHashMapUnmanaged(u32, void).empty;
 
-    var emitter: PrologueEmitter = .{
-        .entries = &section_entries,
-        .arena = arena,
-    };
-
-    // Walk every slot up to the highest referenced one — that covers
-    // the consumer's full type-indexspace plus any out-of-bounds idxs
-    // (hand-built fixtures whose imports cite a numeric slot not
-    // backed by an actual contributor).
     const N: usize = blk: {
-        var n: usize = consumer.type_indexspace.len;
-        if (consumer.types.len > n) n = consumer.types.len;
+        var n: usize = source.type_indexspace.len;
+        if (source.types.len > n) n = source.types.len;
         if (in_closure.count() > 0 and @as(usize, max_idx) + 1 > n) {
             n = @as(usize, max_idx) + 1;
         }
@@ -950,36 +1068,25 @@ fn buildWrapperPrologue(
     for (0..N) |k_usize| {
         const k: u32 = @intCast(k_usize);
         if (in_closure.contains(k)) {
-            // Pick the contributor: real loaded components have a
-            // populated `type_indexspace`; hand-built fixtures
-            // synthesize a `.type_def(k)` mapping straight into
-            // `consumer.types[]` (or fall back to an empty instance
-            // type if even that's out of range).
-            const contrib: ctypes.TypeContributor = if (k < consumer.type_indexspace.len)
-                consumer.type_indexspace[k]
+            const contrib: ctypes.TypeContributor = if (k < source.type_indexspace.len)
+                source.type_indexspace[k]
             else
                 .{ .type_def = k };
 
             switch (contrib) {
                 .type_def => |local| {
-                    const td: ctypes.TypeDef = if (local < consumer.types.len)
-                        consumer.types[local]
+                    const td: ctypes.TypeDef = if (local < source.types.len)
+                        source.types[local]
                     else
-                        // Hand-built fixtures (e.g. tests with
-                        // `types: &.{}`) declare imports referencing
-                        // slots not materialised in `types[]`.
-                        // Substitute an empty instance type — keeps
-                        // the wrapper structurally valid; real
-                        // compose inputs always supply the type.
                         .{ .instance = .{ .decls = &.{} } };
                     if (k < remap.len) remap[k] = @intCast(types_out.items.len + aliases_out.items.len);
                     try emitter.note(.type, @intCast(types_out.items.len));
                     try types_out.append(arena, try type_walk.cloneTypeDef(arena, td, remap, 0));
                 },
                 .alias => |alias_idx| {
-                    if (alias_idx >= consumer.aliases.len) return error.UnsupportedComposeShape;
-                    const orig = consumer.aliases[alias_idx];
-                    const remapped = try remapAliasToWrapper(arena, orig, &inst_slot_for_unres_imp, consumer);
+                    if (alias_idx >= source.aliases.len) return error.UnsupportedComposeShape;
+                    const orig = source.aliases[alias_idx];
+                    const remapped = try remapAliasToWrapper(arena, orig, &inst_slot_for_unres_imp, source);
                     if (k < remap.len) remap[k] = @intCast(types_out.items.len + aliases_out.items.len);
                     try emitter.note(.alias, @intCast(aliases_out.items.len));
                     try aliases_out.append(arena, remapped);
@@ -988,12 +1095,10 @@ fn buildWrapperPrologue(
             }
         }
 
-        // After the type slot, bubble up any unresolved instance
-        // import whose desc references this exact slot. The wrapper
-        // import's desc references the wrapper-side idx that the
-        // closure slot just emitted — which `remap[k]` resolves to.
+        // After the type slot, bubble up any import whose desc
+        // references this exact slot.
         if (imp_for_type_idx.get(k)) |imp_idx| {
-            const orig_imp = consumer.imports[imp_idx];
+            const orig_imp = source.imports[imp_idx];
             try emitter.note(.import, @intCast(imports_out.items.len));
             try imports_out.append(arena, .{
                 .name = try arena.dupe(u8, orig_imp.name),
@@ -1003,13 +1108,12 @@ fn buildWrapperPrologue(
         }
     }
 
-    // Bubble up any remaining unresolved imports the interleaved walk
-    // didn't already emit — non-instance descs (e.g. `.func`), or
-    // `.instance` descs whose referenced slot is past `N` (shouldn't
-    // happen in well-formed inputs, defensive).
-    for (link.unresolved) |imp_idx| {
+    // Bubble up any remaining imports the interleaved walk didn't
+    // emit — non-instance descs, or `.instance` descs whose
+    // referenced slot is past `N` (defensive).
+    for (bubble_import_idxs) |imp_idx| {
         if (emitted_imp.contains(imp_idx)) continue;
-        const orig_imp = consumer.imports[imp_idx];
+        const orig_imp = source.imports[imp_idx];
         try emitter.note(.import, @intCast(imports_out.items.len));
         try imports_out.append(arena, .{
             .name = try arena.dupe(u8, orig_imp.name),
@@ -1017,15 +1121,7 @@ fn buildWrapperPrologue(
         });
     }
 
-    try emitter.flush();
-
-    return .{
-        .types = types_out.items,
-        .aliases = aliases_out.items,
-        .imports = imports_out.items,
-        .section_entries = section_entries.items,
-        .type_remap = remap,
-    };
+    return inst_count;
 }
 
 /// Run-length-encodes a sequence of single-element section emissions
@@ -1954,7 +2050,7 @@ test "composeBinaries: provider with own imports gets Instantiate args wired (#2
     try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
 }
 
-test "composeBinaries: provider import the consumer doesn't share → UnmatchedProviderImport (#214)" {
+test "composeBinaries: provider import the consumer doesn't share → UnmatchedProviderImport (#214 strict)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -1969,9 +2065,9 @@ test "composeBinaries: provider import the consumer doesn't share → UnmatchedP
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
-    // Provider needs an interface the consumer doesn't import. The
-    // wrapper outer-import set comes from `link.unresolved` (consumer
-    // only), so there's nothing to wire this to.
+    // Provider needs an interface the consumer doesn't import.
+    // With `bubble_unmatched_provider_imports = false` (strict
+    // mode), there's nothing to wire it to → UnmatchedProviderImport.
     const prov_imports = [_]ctypes.ImportDecl{
         .{ .name = "wasi:filesystem/types@0.2.6", .desc = .{ .instance = 0 } },
     };
@@ -1983,7 +2079,12 @@ test "composeBinaries: provider import the consumer doesn't share → UnmatchedP
     const provider_bytes = try writer.encode(ar, &provider);
 
     var providers_buf = [_][]const u8{provider_bytes};
-    const r = composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    const r = composeBinariesOpts(
+        testing.allocator,
+        consumer_bytes,
+        providers_buf[0..],
+        .{ .bubble_unmatched_provider_imports = false },
+    );
     try testing.expectError(error.UnmatchedProviderImport, r);
 }
 
@@ -2053,4 +2154,118 @@ test "compose end-to-end: provider with mismatched wasi version composes after -
         "wasi:io/error@0.2.6",
         prov_inst.instantiate.args[0].name,
     );
+}
+
+// ── #216: bubble unmatched provider imports up to the wrapper ──────────────
+
+test "composeBinaries: provider imports the consumer doesn't share are bubbled by default (#216)" {
+    // Consumer doesn't import wasi:http/types at all. Provider does.
+    // Default behaviour (post-#216) bubbles wasi:http/types up to
+    // the wrapper's outer-imports so the composed component can be
+    // hosted by any runtime that supplies that interface.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:http/types@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{provider_bytes};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper outer-imports = consumer's wasi:io/error (bubbled by
+    // #115) + provider's wasi:http/types (bubbled by #216).
+    try testing.expectEqual(@as(usize, 2), loaded.imports.len);
+    var saw_error = false;
+    var saw_http = false;
+    for (loaded.imports) |imp| {
+        if (std.mem.eql(u8, imp.name, "wasi:io/error@0.2.6")) saw_error = true;
+        if (std.mem.eql(u8, imp.name, "wasi:http/types@0.2.6")) saw_http = true;
+    }
+    try testing.expect(saw_error);
+    try testing.expect(saw_http);
+
+    // Provider's Instantiate args wire wasi:http/types to the
+    // wrapper's bubbled outer-import (wrapper-instance idx 1, since
+    // wasi:io/error came first at idx 0).
+    try testing.expectEqual(@as(usize, 2), loaded.instances.len);
+    const prov_inst = loaded.instances[0];
+    try testing.expect(prov_inst == .instantiate);
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqualStrings(
+        "wasi:http/types@0.2.6",
+        prov_inst.instantiate.args[0].name,
+    );
+    try testing.expect(prov_inst.instantiate.args[0].sort_idx.sort == .instance);
+    try testing.expectEqual(@as(u32, 1), prov_inst.instantiate.args[0].sort_idx.idx);
+}
+
+test "composeBinaries: consumer+provider overlap dedups in wrapper outer-imports (#216)" {
+    // Both halves import wasi:io/error. The bubble-up logic must
+    // dedup by name — the wrapper has ONE wasi:io/error outer-import,
+    // and both nested components' Instantiate args reference it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{provider_bytes};
+    const composed = try composeBinaries(testing.allocator, consumer_bytes, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Exactly one wrapper outer-import — the consumer's, deduped
+    // with the provider's matching name.
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqualStrings("wasi:io/error@0.2.6", loaded.imports[0].name);
+
+    // Provider's Instantiate args point at the same outer-import
+    // (wrapper-instance idx 0).
+    const prov_inst = loaded.instances[0];
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
 }
