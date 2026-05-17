@@ -13,22 +13,43 @@
 //! The rewriter walks a component byte stream and rebuilds it with
 //! every `extern_name.parse`-recognized name run through
 //! `extern_name.rewrite(rules)`. Sections that don't carry externnames
-//! (custom, core_module, core_instance, core_type, alias, canon,
-//! start, value) are copied verbatim — preserving the original
-//! section interleaving that the AST cannot represent. Sections that
-//! do carry externnames (top-level import, top-level export, instance
-//! inline-exports, and type-body import/export decls inside
-//! component/instance types) are parsed item-by-item; each item's
-//! name is rewritten, the rest of the item's bytes are copied
-//! verbatim. Nested-component sections recurse.
+//! (custom, core_type, alias, canon, start, value) are copied
+//! verbatim — preserving the original section interleaving that the
+//! AST cannot represent. Sections that DO carry externnames are
+//! parsed item-by-item; each item's name is rewritten, the rest of
+//! the item's bytes are copied verbatim. Nested-component sections
+//! recurse.
 //!
-//! Scope intentionally excludes alias `instance_export.name` and
-//! `instantiate.args[].name` slots: in real-world wasm-tools / jco
-//! output those carry instance-internal labels (method names,
-//! resource names) that do not carry the `@<semver>` suffix the
-//! parser recognizes, so the rewriter would not produce any
-//! substitution there. Widening that scope is a no-op for those
-//! inputs and a no-cost addition if a future fixture demands it.
+//! Coverage (per issue #212 — the original #209/#210 patch only
+//! handled the four component-level sections marked ☆):
+//!
+//!   * top-level import section (id=10) ☆
+//!   * top-level export section (id=11) ☆
+//!   * type section (id=7), descending into component-/instance-type
+//!     bodies' import + export decls ☆
+//!   * component-instance section (id=5):
+//!       - instantiate arg names (plain `name` slots whose string
+//!         content carries the externname grammar)
+//!       - inline-export names (externname-prefix slots) ☆
+//!   * core-instance section (id=2):
+//!       - instantiate arg names (plain `name` slots)
+//!       - inline-export names (plain `name` slots)
+//!   * core-module section (id=1): descend into the embedded core
+//!     wasm; rewrite the `mod` field of each core import (core
+//!     section id=2). Core import `fld` fields, all other core
+//!     sections, and the core wasm preamble pass through verbatim.
+//!   * nested-component section (id=4): recurse into the body.
+//!
+//! Scope intentionally excludes alias `instance_export.name` (it
+//! references an export *within* a source instance — a method or
+//! resource name, not a package externname), and the `name` custom
+//! section's debug strings (per #212, "may be safe to skip for
+//! actual instantiation" — wasmtime ignores them; widening if
+//! cosmetic-dump tools complain is a follow-up).
+//!
+//! All section size LEBs at every nesting level recompute when an
+//! externname's encoded byte length changes (e.g. `@0.2.10` →
+//! `@0.2.6` shortens by 2 bytes per occurrence).
 
 const std = @import("std");
 const leb128 = @import("../leb128.zig");
@@ -67,6 +88,13 @@ const Reader = struct {
     fn readU32(self: *Reader) Error!u32 {
         const slice = self.data[self.pos..];
         const r = leb128.readU32Leb128(slice) catch return error.UnexpectedEnd;
+        self.pos += r.bytes_read;
+        return r.value;
+    }
+
+    fn readU64(self: *Reader) Error!u64 {
+        const slice = self.data[self.pos..];
+        const r = leb128.readU64Leb128(slice) catch return error.UnexpectedEnd;
         self.pos += r.bytes_read;
         return r.value;
     }
@@ -128,6 +156,8 @@ pub fn apply(arena: Allocator, bytes: []const u8, rules: []const extern_name.Rul
 
         const new_body_opt: ?[]const u8 = switch (id) {
             // Section IDs that may carry component-level externnames.
+            1 => try rewriteCoreModuleSection(arena, body, rules),
+            2 => try rewriteCoreInstanceSection(arena, body, rules),
             4 => try apply(arena, body, rules),
             5 => try rewriteInstanceSection(arena, body, rules),
             7 => try rewriteTypeSection(arena, body, rules),
@@ -198,12 +228,18 @@ fn rewriteInstanceSection(arena: Allocator, body: []const u8, rules: []const ext
         switch (tag) {
             0x00 => {
                 // instantiate: component_idx + count + (plain-name + sortidx)*
+                //
+                // The arg `name` is a plain `name` (no externname prefix
+                // byte) but its string content is the externname form
+                // when it provides a top-level component package
+                // (e.g. `wasi:io/error@0.2.10`); see issue #212 site 2.
+                // Non-externname strings pass through unchanged.
                 try copyU32(&r, &w, arena); // component_idx
                 const arg_count = try r.readU32();
                 try writeU32Leb(&w, arena, arg_count);
                 var j: u32 = 0;
                 while (j < arg_count) : (j += 1) {
-                    try copyName(&r, &w, arena);
+                    try rewritePlainName(&r, &w, arena, rules);
                     try copySortIdx(&r, &w, arena);
                 }
             },
@@ -223,6 +259,61 @@ fn rewriteInstanceSection(arena: Allocator, body: []const u8, rules: []const ext
     return w.toOwnedSlice(arena);
 }
 
+/// Component-level core-instance section (id=2) rewriter (issue #212).
+///
+/// Core-instance grammar:
+///
+///   coreinstance       ::= coreinstanceexpr
+///   coreinstanceexpr   ::= 0x00 m:<moduleidx>  arg*:vec(coreinstantiatearg)
+///                       |  0x01 export*:vec(coreinlineexport)
+///   coreinstantiatearg ::= n:<name> 0x12 i:<coreinstanceidx>
+///   coreinlineexport   ::= n:<name> s:<coresort> i:<coreidx>
+///
+/// Both `name` slots are plain names (no externname prefix byte) but
+/// their string content carries the externname grammar in real
+/// `wasm-tools component new` output — the core-instance instantiate
+/// arg names declare which top-level component-package imports back
+/// the core module's `(import "wasi:io/poll@0.2.10" "..." ...)` entries.
+fn rewriteCoreInstanceSection(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error![]u8 {
+    var r = Reader{ .data = body };
+    var w = std.ArrayListUnmanaged(u8).empty;
+    const count = try r.readU32();
+    try writeU32Leb(&w, arena, count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const tag = try r.readByte();
+        try w.append(arena, tag);
+        switch (tag) {
+            0x00 => {
+                try copyU32(&r, &w, arena); // moduleidx
+                const arg_count = try r.readU32();
+                try writeU32Leb(&w, arena, arg_count);
+                var j: u32 = 0;
+                while (j < arg_count) : (j += 1) {
+                    try rewritePlainName(&r, &w, arena, rules);
+                    // 0x12 (instance sort) + instance idx
+                    const sort_byte = try r.readByte();
+                    try w.append(arena, sort_byte);
+                    try copyU32(&r, &w, arena);
+                }
+            },
+            0x01 => {
+                const exp_count = try r.readU32();
+                try writeU32Leb(&w, arena, exp_count);
+                var j: u32 = 0;
+                while (j < exp_count) : (j += 1) {
+                    try rewritePlainName(&r, &w, arena, rules);
+                    const sort_byte = try r.readByte();
+                    try w.append(arena, sort_byte);
+                    try copyU32(&r, &w, arena);
+                }
+            },
+            else => return error.InvalidEncoding,
+        }
+    }
+    return w.toOwnedSlice(arena);
+}
+
 fn rewriteTypeSection(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error![]u8 {
     var r = Reader{ .data = body };
     var w = std.ArrayListUnmanaged(u8).empty;
@@ -233,6 +324,115 @@ fn rewriteTypeSection(arena: Allocator, body: []const u8, rules: []const extern_
         try rewriteOneTypeDef(&r, &w, arena, rules);
     }
     return w.toOwnedSlice(arena);
+}
+
+/// Component-level core-module section (id=1) rewriter (issue #212).
+///
+/// The section's body is a raw core wasm binary (`\x00asm` magic +
+/// version + core sections). Only the **core import section** (core
+/// id=2) carries externname-grammar strings — the `mod` field of
+/// each import is what links the core module to a top-level
+/// component-package import (e.g. `(import "wasi:io/poll@0.2.10"
+/// "[resource-drop]pollable" ...)`). The `fld` field is the method
+/// or resource name within the interface and is not an externname.
+///
+/// All other core sections (custom, type, function, table, memory,
+/// global, export, start, element, code, data, datacount) carry no
+/// externname strings and pass through verbatim. We still walk past
+/// them via section headers so we can recompute the import section's
+/// size LEB when its body length changes.
+fn rewriteCoreModuleSection(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error![]u8 {
+    if (body.len < 8) return error.UnexpectedEnd;
+    var w = std.ArrayListUnmanaged(u8).empty;
+    // Core preamble: 4 bytes magic + 4 bytes version. We don't
+    // validate them here — the loader's pre-pass already ensured the
+    // component as a whole is well-formed, and a malformed inner
+    // core module will surface at the post-encoding loader.load
+    // re-validation.
+    try w.appendSlice(arena, body[0..8]);
+
+    var r = Reader{ .data = body, .pos = 8 };
+    while (r.remaining() > 0) {
+        const id = try r.readByte();
+        const size = try r.readU32();
+        const body_start = r.pos;
+        if (body_start + size > r.data.len) return error.UnexpectedEnd;
+        const sec_body = r.data[body_start .. body_start + size];
+        r.pos = body_start + size;
+
+        if (id == 2) {
+            const new_body = try rewriteCoreImportSection(arena, sec_body, rules);
+            try w.append(arena, id);
+            try writeU32Leb(&w, arena, @intCast(new_body.len));
+            try w.appendSlice(arena, new_body);
+        } else {
+            try w.append(arena, id);
+            try writeU32Leb(&w, arena, size);
+            try w.appendSlice(arena, sec_body);
+        }
+    }
+    return w.toOwnedSlice(arena);
+}
+
+fn rewriteCoreImportSection(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error![]u8 {
+    var r = Reader{ .data = body };
+    var w = std.ArrayListUnmanaged(u8).empty;
+    const count = try r.readU32();
+    try writeU32Leb(&w, arena, count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        // module name — the externname-grammar carrier.
+        try rewritePlainName(&r, &w, arena, rules);
+        // field name — method / resource name within the interface,
+        // never an externname.
+        try copyName(&r, &w, arena);
+        // importdesc — variable length; track src position and copy
+        // verbatim after advancing the reader.
+        const desc_start = r.pos;
+        try skipCoreImportDesc(&r);
+        try w.appendSlice(arena, r.data[desc_start..r.pos]);
+    }
+    return w.toOwnedSlice(arena);
+}
+
+fn skipCoreImportDesc(r: *Reader) Error!void {
+    const kind = try r.readByte();
+    switch (kind) {
+        0x00 => _ = try r.readU32(), // func: typeidx
+        0x01 => {
+            // table: reftype byte + limits
+            _ = try r.readByte();
+            try skipCoreLimits(r);
+        },
+        0x02 => try skipCoreLimits(r), // memory: limits
+        0x03 => {
+            // global: valtype byte + mut byte
+            _ = try r.readByte();
+            _ = try r.readByte();
+        },
+        0x04 => {
+            // tag: attribute byte + sig idx
+            _ = try r.readByte();
+            _ = try r.readU32();
+        },
+        else => return error.InvalidEncoding,
+    }
+}
+
+/// Skip past a core-wasm `limits` structure. Mirrors the byte layout
+/// `src/binary/reader.zig:readLimits` consumes — flag bits encode
+/// has_max (0x01), is_shared (0x02), is_64 (0x04), and custom
+/// page-size (0x08).
+fn skipCoreLimits(r: *Reader) Error!void {
+    const flags = try r.readByte();
+    if (flags & 0x04 != 0) {
+        _ = try r.readU64();
+        if (flags & 0x01 != 0) _ = try r.readU64();
+    } else {
+        _ = try r.readU32();
+        if (flags & 0x01 != 0) _ = try r.readU32();
+    }
+    if (flags & 0x08 != 0) _ = try r.readU32();
 }
 
 // ── Type-def walking ──────────────────────────────────────────────────────
@@ -319,6 +519,24 @@ fn rewriteExternNameSlot(r: *Reader, w: *std.ArrayListUnmanaged(u8), arena: Allo
         // touches the in-line `@ver` suffix on the importname itself).
         try copyName(r, w, arena);
     }
+}
+
+/// Rewrite a plain `name` slot (no externname prefix byte). The
+/// string content is run through `extern_name.rewrite`; non-extern
+/// strings (e.g. `"env"`, `"__main_module__"`, method names) pass
+/// through unchanged because `extern_name.parse` returns null for
+/// them. Used by:
+///   * core-instance instantiate arg names (component section id=2)
+///   * core-instance inline-export names (component section id=2)
+///   * component-instance instantiate arg names (component section id=5)
+///   * core wasm import `module` names (core section id=2 inside id=1)
+fn rewritePlainName(r: *Reader, w: *std.ArrayListUnmanaged(u8), arena: Allocator, rules: []const extern_name.Rule) Error!void {
+    const len = try r.readU32();
+    const name = try r.readBytes(len);
+    if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
+    const new_name = try extern_name.rewrite(arena, name, rules);
+    try writeU32Leb(w, arena, @intCast(new_name.len));
+    try w.appendSlice(arena, new_name);
 }
 
 fn copyName(r: *Reader, w: *std.ArrayListUnmanaged(u8), arena: Allocator) Error!void {
@@ -784,4 +1002,418 @@ test "apply: extending the version string (0.2.6 → 0.2.10) round-trips" {
     const out = try apply(ar, bytes, &rules);
     const loaded = try loader.load(out, ar);
     try testing.expectEqualStrings("wasi:io/error@0.2.10", loaded.imports[0].name);
+}
+
+test "apply: recurses through nested-component import sections (regression for #212 site 2)" {
+    // A wrapping component embeds another component as a nested
+    // component section. The nested component has its own top-level
+    // import declaring `wasi:http/types@0.2.10`. The rewriter's id=4
+    // dispatch (`apply` recurses) must descend through and rewrite
+    // the nested component's import name.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const nested_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:http/types@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const nested_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const nested = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &nested_types, .canons = &.{},
+        .imports = &nested_imports, .exports = &.{},
+    };
+    const nested_bytes = try writer.encode(ar, &nested);
+
+    var passthrough = nested;
+    passthrough.raw_bytes = nested_bytes;
+    var passthrough_ptr = passthrough;
+    const components_arr = [_]*ctypes.Component{&passthrough_ptr};
+
+    const outer = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &components_arr,
+        .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const outer_bytes = try writer.encode(ar, &outer);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "http", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, outer_bytes, &rules);
+
+    // Re-load and walk the nested component's imports — the rewrite
+    // must have reached through the id=4 boundary.
+    const loaded = try loader.load(out, ar);
+    try testing.expectEqual(@as(usize, 1), loaded.components.len);
+    try testing.expectEqual(@as(usize, 1), loaded.components[0].imports.len);
+    try testing.expectEqualStrings(
+        "wasi:http/types@0.2.6",
+        loaded.components[0].imports[0].name,
+    );
+
+    // And no @0.2.10 byte sequence survives anywhere.
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+}
+
+// ── #212: core_instance + core_module section rewrites ─────────────────────
+
+test "rewriteCoreInstanceSection: rewrites instantiate arg name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Hand-rolled core_instance section body:
+    //   count = 1
+    //   instance[0]:
+    //     tag = 0x00 (instantiate)
+    //     module_idx = 0
+    //     arg_count = 1
+    //     arg[0]: name = "wasi:io/poll@0.2.10", sort = 0x12, inst_idx = 5
+    var body = std.ArrayListUnmanaged(u8).empty;
+    try body.append(ar, 0x01); // count
+    try body.append(ar, 0x00); // instantiate
+    try body.append(ar, 0x00); // module_idx
+    try body.append(ar, 0x01); // arg_count
+    const arg_name = "wasi:io/poll@0.2.10";
+    try body.append(ar, arg_name.len);
+    try body.appendSlice(ar, arg_name);
+    try body.append(ar, 0x12); // instance sort
+    try body.append(ar, 0x05); // inst_idx
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try rewriteCoreInstanceSection(ar, body.items, &rules);
+
+    // Re-read to verify: expect "wasi:io/poll@0.2.6" with len 18.
+    var r2 = Reader{ .data = out };
+    try testing.expectEqual(@as(u32, 1), try r2.readU32());
+    try testing.expectEqual(@as(u8, 0x00), try r2.readByte());
+    try testing.expectEqual(@as(u32, 0), try r2.readU32());
+    try testing.expectEqual(@as(u32, 1), try r2.readU32());
+    const out_name = try r2.readName();
+    try testing.expectEqualStrings("wasi:io/poll@0.2.6", out_name);
+    try testing.expectEqual(@as(u8, 0x12), try r2.readByte());
+    try testing.expectEqual(@as(u32, 5), try r2.readU32());
+}
+
+test "rewriteCoreInstanceSection: rewrites inline-export name + leaves non-extern names alone" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // body:
+    //   count = 1
+    //   instance[0]:
+    //     tag = 0x01 (inline exports)
+    //     export_count = 2
+    //     export[0]: name = "wasi:io/streams@0.2.10", sort = 0x12, idx = 3
+    //     export[1]: name = "memory",                  sort = 0x02, idx = 0
+    var body = std.ArrayListUnmanaged(u8).empty;
+    try body.append(ar, 0x01); // count
+    try body.append(ar, 0x01); // inline exports
+    try body.append(ar, 0x02); // export_count
+    const n1 = "wasi:io/streams@0.2.10";
+    try body.append(ar, n1.len);
+    try body.appendSlice(ar, n1);
+    try body.append(ar, 0x12);
+    try body.append(ar, 0x03);
+    const n2 = "memory";
+    try body.append(ar, n2.len);
+    try body.appendSlice(ar, n2);
+    try body.append(ar, 0x02);
+    try body.append(ar, 0x00);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try rewriteCoreInstanceSection(ar, body.items, &rules);
+
+    var r2 = Reader{ .data = out };
+    try testing.expectEqual(@as(u32, 1), try r2.readU32());
+    try testing.expectEqual(@as(u8, 0x01), try r2.readByte());
+    try testing.expectEqual(@as(u32, 2), try r2.readU32());
+    try testing.expectEqualStrings("wasi:io/streams@0.2.6", try r2.readName());
+    try testing.expectEqual(@as(u8, 0x12), try r2.readByte());
+    try testing.expectEqual(@as(u32, 3), try r2.readU32());
+    try testing.expectEqualStrings("memory", try r2.readName());
+    try testing.expectEqual(@as(u8, 0x02), try r2.readByte());
+    try testing.expectEqual(@as(u32, 0), try r2.readU32());
+}
+
+test "rewriteCoreImportSection: rewrites module name across multiple imports + import descs" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Build a core wasm import section body with three imports
+    // covering func/memory/global desc shapes:
+    //   1. module="wasi:io/poll@0.2.10" field="[resource-drop]pollable"
+    //      desc = func typeidx=0
+    //   2. module="env"                    field="memory"
+    //      desc = memory limits flags=0x00 min=0
+    //   3. module="wasi:random/random@0.2.10" field="get-random-bytes"
+    //      desc = global valtype=0x7f mut=0x00
+    var body = std.ArrayListUnmanaged(u8).empty;
+    try body.append(ar, 0x03); // count
+
+    const m1 = "wasi:io/poll@0.2.10";
+    try body.append(ar, m1.len);
+    try body.appendSlice(ar, m1);
+    const f1 = "[resource-drop]pollable";
+    try body.append(ar, f1.len);
+    try body.appendSlice(ar, f1);
+    try body.append(ar, 0x00); // func desc
+    try body.append(ar, 0x00); // typeidx 0
+
+    const m2 = "env";
+    try body.append(ar, m2.len);
+    try body.appendSlice(ar, m2);
+    const f2 = "memory";
+    try body.append(ar, f2.len);
+    try body.appendSlice(ar, f2);
+    try body.append(ar, 0x02); // memory desc
+    try body.append(ar, 0x00); // limits flags = min only
+    try body.append(ar, 0x00); // min
+
+    const m3 = "wasi:random/random@0.2.10";
+    try body.append(ar, m3.len);
+    try body.appendSlice(ar, m3);
+    const f3 = "get-random-bytes";
+    try body.append(ar, f3.len);
+    try body.appendSlice(ar, f3);
+    try body.append(ar, 0x03); // global desc
+    try body.append(ar, 0x7f); // i32
+    try body.append(ar, 0x00); // immutable
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+        .{ .ns = "wasi", .pkg = "random", .to_version = "0.2.6" },
+    };
+    const out = try rewriteCoreImportSection(ar, body.items, &rules);
+
+    var r2 = Reader{ .data = out };
+    try testing.expectEqual(@as(u32, 3), try r2.readU32());
+
+    try testing.expectEqualStrings("wasi:io/poll@0.2.6", try r2.readName());
+    try testing.expectEqualStrings("[resource-drop]pollable", try r2.readName());
+    try testing.expectEqual(@as(u8, 0x00), try r2.readByte());
+    try testing.expectEqual(@as(u32, 0), try r2.readU32());
+
+    try testing.expectEqualStrings("env", try r2.readName());
+    try testing.expectEqualStrings("memory", try r2.readName());
+    try testing.expectEqual(@as(u8, 0x02), try r2.readByte());
+    try testing.expectEqual(@as(u8, 0x00), try r2.readByte());
+    try testing.expectEqual(@as(u32, 0), try r2.readU32());
+
+    try testing.expectEqualStrings("wasi:random/random@0.2.6", try r2.readName());
+    try testing.expectEqualStrings("get-random-bytes", try r2.readName());
+    try testing.expectEqual(@as(u8, 0x03), try r2.readByte());
+    try testing.expectEqual(@as(u8, 0x7f), try r2.readByte());
+    try testing.expectEqual(@as(u8, 0x00), try r2.readByte());
+}
+
+test "rewriteCoreModuleSection: rewrites imports across surrounding sections" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // A minimal core wasm body with one type section and one
+    // import section. The import section is sandwiched between a
+    // custom section before and a custom section after, so we
+    // exercise the verbatim-copy path for non-import sections.
+    var body = std.ArrayListUnmanaged(u8).empty;
+    // Preamble: \x00asm + version 1.
+    try body.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    // Custom section (id 0): name="x", payload="hi".
+    try body.append(ar, 0x00);
+    try body.append(ar, 0x04); // size
+    try body.append(ar, 0x01);
+    try body.append(ar, 'x');
+    try body.append(ar, 'h');
+    try body.append(ar, 'i');
+    // Type section (id 1): 1 type, () -> ().
+    try body.append(ar, 0x01);
+    try body.append(ar, 0x04); // size
+    try body.append(ar, 0x01); // count
+    try body.append(ar, 0x60); // func
+    try body.append(ar, 0x00); // 0 params
+    try body.append(ar, 0x00); // 0 results
+    // Import section (id 2): 1 import.
+    {
+        var imp = std.ArrayListUnmanaged(u8).empty;
+        try imp.append(ar, 0x01); // count
+        const m = "wasi:io/poll@0.2.10";
+        try imp.append(ar, m.len);
+        try imp.appendSlice(ar, m);
+        const f = "[resource-drop]pollable";
+        try imp.append(ar, f.len);
+        try imp.appendSlice(ar, f);
+        try imp.append(ar, 0x00); // func desc
+        try imp.append(ar, 0x00); // typeidx 0
+        try body.append(ar, 0x02);
+        try body.append(ar, @intCast(imp.items.len));
+        try body.appendSlice(ar, imp.items);
+    }
+    // Another custom section after.
+    try body.append(ar, 0x00);
+    try body.append(ar, 0x04); // size
+    try body.append(ar, 0x01);
+    try body.append(ar, 'y');
+    try body.append(ar, 'b');
+    try body.append(ar, 'e');
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try rewriteCoreModuleSection(ar, body.items, &rules);
+
+    // Output must (a) preserve the preamble + custom sections + type
+    // section verbatim, (b) rewrite the import section's module
+    // name, and (c) contain no `@0.2.10` substring anywhere.
+    try testing.expectEqualSlices(u8, "\x00asm", out[0..4]);
+    try testing.expectEqualSlices(u8, &.{ 0x01, 0x00, 0x00, 0x00 }, out[4..8]);
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:io/poll@0.2.6") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+    // Custom-section payloads survive.
+    try testing.expect(std.mem.indexOf(u8, out, "hi") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ybe") != null);
+    // Type section's `(func)` body survives.
+    try testing.expect(std.mem.indexOf(u8, out, &.{ 0x60, 0x00, 0x00 }) != null);
+}
+
+test "rewriteCoreModuleSection: empty core wasm (no sections) round-trips" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const body = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try rewriteCoreModuleSection(ar, &body, &rules);
+    try testing.expectEqualSlices(u8, &body, out);
+}
+
+test "apply: rewrites every @0.2.10 site at component + core levels (e2e for #212)" {
+    // Build a component byte stream by hand combining:
+    //   - top-level import (component section id=10) — addressed by #210
+    //   - top-level export (component section id=11) — addressed by #210
+    //   - core_module section (component id=1) whose inner core wasm
+    //     import section references `wasi:io/poll@0.2.10`         — #212 site 3
+    //   - core_instance section (component id=2) whose instantiate
+    //     args reference `wasi:io/poll@0.2.10`                    — #212 site 1
+    //   - instance section (component id=5) whose instantiate args
+    //     reference `wasi:http/types@0.2.10`                       — #212 site 2 (component-side)
+    //
+    // After `apply` with the canonical rules, zero `@0.2.10`
+    // substring may survive.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    // Component preamble.
+    try bytes.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    // ── Section id=1 (core_module) — one tiny core wasm with a
+    //     single (import "wasi:io/poll@0.2.10" "x" (func 0)) entry.
+    {
+        var core = std.ArrayListUnmanaged(u8).empty;
+        try core.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+        // type section: 1 type, () -> ().
+        try core.appendSlice(ar, &.{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 });
+        // import section: 1 import, mod="wasi:io/poll@0.2.10", fld="x", func 0.
+        var imp = std.ArrayListUnmanaged(u8).empty;
+        try imp.append(ar, 0x01); // count
+        const m = "wasi:io/poll@0.2.10";
+        try imp.append(ar, m.len);
+        try imp.appendSlice(ar, m);
+        try imp.append(ar, 0x01);
+        try imp.append(ar, 'x');
+        try imp.append(ar, 0x00); // func desc
+        try imp.append(ar, 0x00); // typeidx
+        try core.append(ar, 0x02);
+        try core.append(ar, @intCast(imp.items.len));
+        try core.appendSlice(ar, imp.items);
+        try bytes.append(ar, 0x01); // section id 1
+        try bytes.append(ar, @intCast(core.items.len));
+        try bytes.appendSlice(ar, core.items);
+    }
+
+    // ── Section id=2 (core_instance) — one instantiate of module 0
+    //     with one arg named `wasi:io/poll@0.2.10`.
+    {
+        var ci = std.ArrayListUnmanaged(u8).empty;
+        try ci.append(ar, 0x01); // count
+        try ci.append(ar, 0x00); // instantiate
+        try ci.append(ar, 0x00); // module_idx 0
+        try ci.append(ar, 0x01); // arg_count
+        const n = "wasi:io/poll@0.2.10";
+        try ci.append(ar, n.len);
+        try ci.appendSlice(ar, n);
+        try ci.append(ar, 0x12);
+        try ci.append(ar, 0x00); // inst_idx
+        try bytes.append(ar, 0x02);
+        try bytes.append(ar, @intCast(ci.items.len));
+        try bytes.appendSlice(ar, ci.items);
+    }
+
+    // ── Section id=7 (type) — define one empty instance type as a
+    //     type slot to back the import/export descs.
+    try bytes.appendSlice(ar, &.{ 0x07, 0x03, 0x01, 0x42, 0x00 });
+
+    // ── Section id=10 (import) — one component-level instance
+    //     import named `wasi:http/types@0.2.10`.
+    {
+        var imp = std.ArrayListUnmanaged(u8).empty;
+        try imp.append(ar, 0x01); // count
+        try imp.append(ar, 0x00); // prefix
+        const n = "wasi:http/types@0.2.10";
+        try imp.append(ar, n.len);
+        try imp.appendSlice(ar, n);
+        try imp.append(ar, 0x05); // instance desc
+        try imp.append(ar, 0x00); // type idx 0
+        try bytes.append(ar, 0x0a);
+        try bytes.append(ar, @intCast(imp.items.len));
+        try bytes.appendSlice(ar, imp.items);
+    }
+
+    // ── Section id=11 (export) — one re-export named `wasi:http/
+    //     outgoing-handler@0.2.10` pointing at instance 0.
+    {
+        var exp = std.ArrayListUnmanaged(u8).empty;
+        try exp.append(ar, 0x01); // count
+        try exp.append(ar, 0x00); // prefix
+        const n = "wasi:http/outgoing-handler@0.2.10";
+        try exp.append(ar, n.len);
+        try exp.appendSlice(ar, n);
+        try exp.append(ar, 0x05); // sort: instance
+        try exp.append(ar, 0x00); // sort idx 0
+        try exp.append(ar, 0x00); // no explicit desc
+        try bytes.append(ar, 0x0b);
+        try bytes.append(ar, @intCast(exp.items.len));
+        try bytes.appendSlice(ar, exp.items);
+    }
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+        .{ .ns = "wasi", .pkg = "http", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, bytes.items, &rules);
+
+    // Every @0.2.10 site has been rewritten — including the ones
+    // inside the embedded core wasm and the core-instance args.
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+    // The rewritten strings are still present at the right surface.
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:io/poll@0.2.6") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:http/types@0.2.6") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:http/outgoing-handler@0.2.6") != null);
 }
