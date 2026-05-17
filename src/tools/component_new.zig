@@ -3134,3 +3134,125 @@ test "pickBuiltinAdapter: malformed core falls back to command-shape adapter" {
     const picked = pickBuiltinAdapter(testing.allocator, &garbage);
     try testing.expectEqual(builtin_adapter.wasi_preview1_command_wasm.ptr, picked.ptr);
 }
+
+test "buildComponent #222: resource methods survive in wrapping component's imported instance body" {
+    // Reproducer for #222 — `wabt component new` was dropping
+    // `[method]X.Y` exports from imported interface bodies. The
+    // user-visible case: `wasi:io/poll@0.2.6`'s `pollable` resource
+    // came through with no methods at all (just the type-def and
+    // the iface-level `poll` function), making the wrapping
+    // component's import shape narrower than what the embed's
+    // component-type metadata declared.
+    //
+    // Synth core: handle export + memory + cabi_realloc (identical
+    // shape to #203a). The list<borrow<...>> param on `poll`
+    // forces the shim/fixup path, which is where the narrowing
+    // lives — `buildComponentShimFixup` Phase 4a copies
+    // `shape.inst_decls` verbatim through `rebaseInstDecls`, so
+    // the surfacing of all method exports here is the regression
+    // pin.
+    const core_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 14, 2,
+        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
+        0x03, 3, 2, 0, 1,
+        0x05, 3, 1, 0x00, 0x01,
+        0x07, 51, 3,
+        23, 'w', 'a', 's', 'i', ':', 'i', 'o', '/', 'p', 'o', 'l', 'l',
+        '@', '0', '.', '2', '.', '6', '#', 'p', 'o', 'l', 'l',
+        0x00, 0,
+        6, 'm', 'e', 'm', 'o', 'r', 'y',
+        0x02, 0,
+        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
+        0x00, 1,
+        0x0a, 9, 2,
+        2, 0x00, 0x0b,
+        4, 0x00, 0x41, 0x00, 0x0b,
+    };
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
+        \\package wasi:io@0.2.6;
+        \\
+        \\interface poll {
+        \\    resource pollable {
+        \\        ready: func() -> bool;
+        \\        block: func();
+        \\    }
+        \\    poll: func(in: list<borrow<pollable>>) -> list<u32>;
+        \\}
+        \\
+        \\interface streams {
+        \\    use poll.{pollable};
+        \\    resource input-stream {
+        \\        subscribe: func() -> pollable;
+        \\    }
+        \\}
+        \\
+        \\world demo {
+        \\    import poll;
+        \\    import streams;
+        \\    export poll;
+        \\}
+    , "demo");
+    defer testing.allocator.free(ct_payload);
+
+    var core_with_ct = std.ArrayListUnmanaged(u8).empty;
+    defer core_with_ct.deinit(testing.allocator);
+    try core_with_ct.appendSlice(testing.allocator, core_only[0..core_only.len]);
+    const cs_name = "component-type:demo";
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(testing.allocator);
+    try writeU32Leb(testing.allocator, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(testing.allocator, cs_name);
+    try cs_body.appendSlice(testing.allocator, ct_payload);
+    try core_with_ct.append(testing.allocator, 0);
+    try writeU32Leb(testing.allocator, &core_with_ct, @intCast(cs_body.items.len));
+    try core_with_ct.appendSlice(testing.allocator, cs_body.items);
+
+    const comp_bytes = try buildComponent(testing.allocator, core_with_ct.items);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Exactly two imports — wasi:io/poll@0.2.6 + wasi:io/streams@0.2.6.
+    // The wasi:io/poll body must carry the full canonical set of
+    // decls (the `pollable` resource export + BOTH method exports
+    // + the iface-level `poll` export). The bug pre-#222 narrowed
+    // the wasi:io/poll body to just `pollable` + `poll`, dropping
+    // the methods — because `wasi:io/poll` is reachable via the
+    // `streams` body's `use poll.{pollable}` clause, the wrapping
+    // emit path uses a narrowed pruning view here.
+    try testing.expectEqual(@as(usize, 2), loaded.imports.len);
+    var poll_inst_type_idx: ?u32 = null;
+    for (loaded.imports) |im| {
+        if (std.mem.eql(u8, im.name, "wasi:io/poll@0.2.6")) {
+            poll_inst_type_idx = im.desc.instance;
+        }
+    }
+    try testing.expect(poll_inst_type_idx != null);
+    const contrib = loaded.type_indexspace[poll_inst_type_idx.?];
+    try testing.expect(contrib == .type_def);
+    const td = loaded.types[contrib.type_def];
+    try testing.expect(td == .instance);
+
+    var saw_pollable = false;
+    var saw_ready = false;
+    var saw_block = false;
+    var saw_poll = false;
+    for (td.instance.decls) |d| switch (d) {
+        .@"export" => |e| {
+            if (std.mem.eql(u8, e.name, "pollable") and e.desc == .type) saw_pollable = true;
+            if (std.mem.eql(u8, e.name, "[method]pollable.ready") and e.desc == .func) saw_ready = true;
+            if (std.mem.eql(u8, e.name, "[method]pollable.block") and e.desc == .func) saw_block = true;
+            if (std.mem.eql(u8, e.name, "poll") and e.desc == .func) saw_poll = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_pollable);
+    try testing.expect(saw_ready);
+    try testing.expect(saw_block);
+    try testing.expect(saw_poll);
+}

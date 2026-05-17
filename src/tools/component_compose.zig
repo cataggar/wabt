@@ -2681,3 +2681,187 @@ test "composeBinaries: consumer alias to a name also bubbled from provider resol
     }
     try testing.expect(found);
 }
+
+// ── #222: method-export decls survive composition + --align-wasi rewrite ───
+
+test "composeBinaries: provider with resource methods retains them post-compose (#222)" {
+    // Audit-bake for #222. The user reported the COMPOSED component
+    // ends up with a narrowed `wasi:io/poll` interface (resource
+    // pollable + bare `poll`, no `[method]pollable.ready` /
+    // `[method]pollable.block`). Both halves' canonical WIT
+    // declares the methods, so the narrowing must happen during
+    // compose if anywhere. This test exercises a minimal seam
+    // through `composeBinaries` and asserts every method-export
+    // decl survives in the composed bytes.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Provider: imports wasi:io/poll@0.2.10 (full canonical body
+    // with pollable + 2 methods).
+    const borrow_handle_a = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const ready_func = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const borrow_handle_b = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const block_func = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const inst_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "pollable", .desc = .{ .type = .sub_resource } } },
+        .{ .type = borrow_handle_a },
+        .{ .type = ready_func },
+        .{ .@"export" = .{ .name = "[method]pollable.ready", .desc = .{ .func = 2 } } },
+        .{ .type = borrow_handle_b },
+        .{ .type = block_func },
+        .{ .@"export" = .{ .name = "[method]pollable.block", .desc = .{ .func = 4 } } },
+    };
+    const iface_inst = ctypes.TypeDef{ .instance = .{ .decls = &inst_decls } };
+    const prov_types = [_]ctypes.TypeDef{iface_inst};
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &prov_types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const pb = try writer.encode(ar, &provider);
+
+    // Consumer: same poll import, same shape (so dedup applies).
+    const borrow_handle_c = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const ready_func_c = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const borrow_handle_d = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const block_func_c = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const cons_inst_decls = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "pollable", .desc = .{ .type = .sub_resource } } },
+        .{ .type = borrow_handle_c },
+        .{ .type = ready_func_c },
+        .{ .@"export" = .{ .name = "[method]pollable.ready", .desc = .{ .func = 2 } } },
+        .{ .type = borrow_handle_d },
+        .{ .type = block_func_c },
+        .{ .@"export" = .{ .name = "[method]pollable.block", .desc = .{ .func = 4 } } },
+    };
+    const cons_iface_inst = ctypes.TypeDef{ .instance = .{ .decls = &cons_inst_decls } };
+    const cons_types = [_]ctypes.TypeDef{cons_iface_inst};
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &cons_types, .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const cb = try writer.encode(ar, &consumer);
+
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper outer-imports: deduped wasi:io/poll (1 total).
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqualStrings("wasi:io/poll@0.2.10", loaded.imports[0].name);
+
+    // Wrapper's instance-type body (the wrapper-side cloned copy
+    // from `appendSourcePrologue`) must preserve both method
+    // exports. The wrapper has the instance type as the bubbled
+    // type closure.
+    var saw_ready = false;
+    var saw_block = false;
+    for (loaded.types) |t| {
+        if (t != .instance) continue;
+        for (t.instance.decls) |d| {
+            if (d != .@"export") continue;
+            if (std.mem.eql(u8, d.@"export".name, "[method]pollable.ready")) {
+                try testing.expect(d.@"export".desc == .func);
+                saw_ready = true;
+            }
+            if (std.mem.eql(u8, d.@"export".name, "[method]pollable.block")) {
+                try testing.expect(d.@"export".desc == .func);
+                saw_block = true;
+            }
+        }
+    }
+    try testing.expect(saw_ready);
+    try testing.expect(saw_block);
+
+    // Composed bytes must literally contain the method names — last-line
+    // defense if the type-walk somehow miscounted.
+    try testing.expect(std.mem.indexOf(u8, composed, "[method]pollable.ready") != null);
+    try testing.expect(std.mem.indexOf(u8, composed, "[method]pollable.block") != null);
+}
+
+test "compose end-to-end: resource methods survive --align-wasi rewrite + compose (#222)" {
+    // Same fixture as above but with mismatched versions (consumer
+    // @0.2.6, provider @0.2.10) → forces the --align-wasi=0.2.6
+    // path. Both halves' method-export decls must survive the
+    // byte-level rewriter AND the compose wrapper construction.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const borrow_handle_a = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const ready_func = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const borrow_handle_b = ctypes.TypeDef{ .val = .{ .borrow = 0 } };
+    const block_func = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const inst_decls_template = [_]ctypes.Decl{
+        .{ .@"export" = .{ .name = "pollable", .desc = .{ .type = .sub_resource } } },
+        .{ .type = borrow_handle_a },
+        .{ .type = ready_func },
+        .{ .@"export" = .{ .name = "[method]pollable.ready", .desc = .{ .func = 2 } } },
+        .{ .type = borrow_handle_b },
+        .{ .type = block_func },
+        .{ .@"export" = .{ .name = "[method]pollable.block", .desc = .{ .func = 4 } } },
+    };
+    const iface_inst = ctypes.TypeDef{ .instance = .{ .decls = &inst_decls_template } };
+    const types = [_]ctypes.TypeDef{iface_inst};
+
+    // Consumer @0.2.6.
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/poll@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &types, .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const cb_orig = try writer.encode(ar, &consumer);
+
+    // Provider @0.2.10.
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const pb_orig = try writer.encode(ar, &provider);
+
+    // Detect → align to 0.2.6.
+    const consumer_ast = try loader.load(cb_orig, ar);
+    const provider_ast = try loader.load(pb_orig, ar);
+    const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
+    const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
+    try testing.expectEqual(@as(usize, 1), conflicts.len);
+    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+
+    // Apply --align-wasi rewrite.
+    const cb = try rewrite_extern_names.apply(ar, cb_orig, resolution.rules);
+    const pb = try rewrite_extern_names.apply(ar, pb_orig, resolution.rules);
+
+    // Compose.
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    // Methods must survive the entire pipeline.
+    try testing.expect(std.mem.indexOf(u8, composed, "[method]pollable.ready") != null);
+    try testing.expect(std.mem.indexOf(u8, composed, "[method]pollable.block") != null);
+    // And no @0.2.10 residue.
+    try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+}
