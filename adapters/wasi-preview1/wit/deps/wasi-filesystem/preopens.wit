@@ -1,42 +1,11 @@
-// Trimmed slice of `wasi:filesystem@0.2.6.preopens`. Mirrors the
-// canonical `bytecodealliance/wasi-filesystem@v0.2.6/wit/preopens.wit`
-// shape but declares only the one func the preview1 → preview2
-// adapter calls: `get-directories`.
-//
-// Backs the preview1 `fd_prestat_get` / `fd_prestat_dir_name`
-// imports. `wasi-libc` walks preopens at startup by repeatedly
-// calling `fd_prestat_get(fd)` for `fd = 3, 4, 5, …` until
-// `EBADF`, then `fd_prestat_dir_name(fd, buf, buf_len)` to read
-// each name. Both route through `get-directories` on the host
-// side, which returns a `list<tuple<descriptor, string>>` of all
-// preopened directories. The bare `descriptor` tuple element
-// auto-wraps as `own<descriptor>` in the encoder per the
-// component-model spec (cataggar/wabt#182).
-//
-// `use wasi:filesystem/types.{descriptor};` references the
-// `descriptor` resource declared in `types.wit`. The
-// `metadata_encode` encoder requires the source interface
-// (`types`) to also be imported by the world that consumes this
-// interface (see the test at
-// `src/component/wit/metadata_encode.zig:1525`), so the
-// preview1 world body imports both `wasi:filesystem/types@0.2.6`
-// and `wasi:filesystem/preopens@0.2.6`.
-//
-// This file holds the package declaration for the multi-file
-// `wasi:filesystem@0.2.6` slice — `resolver.readWitDir`
-// concatenates `.wit` files in lexicographic order, and
-// `preopens.wit` sorts before `types.wit` (`p` < `t`), so the
-// parser sees this file's `package wasi:filesystem@0.2.6;`
-// directive first.
-
 package wasi:filesystem@0.2.6;
 
+@since(version = 0.2.0)
 interface preopens {
+    @since(version = 0.2.0)
     use types.{descriptor};
 
-    /// Return the set of preopened directories made available to
-    /// the guest. Each entry is `(handle, name)` where `handle`
-    /// is the preview2 `descriptor` for the directory and `name`
-    /// is the path the guest sees the directory mounted under.
+    /// Return the set of preopened directories, and their paths.
+    @since(version = 0.2.0)
     get-directories: func() -> list<tuple<descriptor, string>>;
 }

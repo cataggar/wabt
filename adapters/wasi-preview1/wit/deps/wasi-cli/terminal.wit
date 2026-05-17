@@ -1,59 +1,62 @@
-// Trimmed slice of `wasi:cli@0.2.6.{terminal-input, terminal-output,
-// terminal-stdin, terminal-stdout, terminal-stderr}`. Mirrors the
-// canonical `bytecodealliance/wasi-cli@v0.2.6/wit/terminal.wit`.
-//
-// Backs preview1 `fd_fdstat_get` stdio terminal detection: the
-// adapter probes each of fd 0 / 1 / 2 via the corresponding
-// `get-terminal-<n>` getter at first access, caches the resulting
-// boolean, and reports `__WASI_FILETYPE_CHARACTER_DEVICE` when the
-// option is `Some` (drop the handle immediately — we only need to
-// know whether stdio is a tty) or `__WASI_FILETYPE_UNKNOWN`
-// otherwise. Tracked under cataggar/wabt#179.
-//
-// `terminal-stdin` / `terminal-stdout` / `terminal-stderr` each
-// `use` from their respective `terminal-input` / `terminal-output`
-// interfaces, so the encoder needs both the source resource
-// interfaces AND the getter interfaces declared in the world.
-//
-// Bare-resource positions (`-> option<terminal-input>` and `->
-// option<terminal-output>`) auto-wrap as `option<own<...>>` per the
-// component-model spec (cataggar/wabt#182). The canonical bare form
-// below produces the same wire bytes wit-component emits.
-//
-// This file is a package-less continuation of `wasi:cli@0.2.6`; the
-// package declaration lives in `environment.wit` (which sorts before
-// this file — `e` < `t`).
-
+/// Terminal input.
+///
+/// In the future, this may include functions for disabling echoing,
+/// disabling input buffering so that keyboard events are sent through
+/// immediately, querying supported features, and so on.
+@since(version = 0.2.0)
 interface terminal-input {
     /// The input side of a terminal.
-    resource terminal-input { }
+    @since(version = 0.2.0)
+    resource terminal-input;
 }
 
+/// Terminal output.
+///
+/// In the future, this may include functions for querying the terminal
+/// size, being notified of terminal size changes, querying supported
+/// features, and so on.
+@since(version = 0.2.0)
 interface terminal-output {
     /// The output side of a terminal.
-    resource terminal-output { }
+    @since(version = 0.2.0)
+    resource terminal-output;
 }
 
+/// An interface providing an optional `terminal-input` for stdin as a
+/// link-time authority.
+@since(version = 0.2.0)
 interface terminal-stdin {
+    @since(version = 0.2.0)
     use terminal-input.{terminal-input};
 
-    /// If stdin is connected to a terminal, return a `terminal-input`
-    /// handle allowing further interaction with it.
+    /// If stdin is connected to a terminal, return a `terminal-input` handle
+    /// allowing further interaction with it.
+    @since(version = 0.2.0)
     get-terminal-stdin: func() -> option<terminal-input>;
 }
 
+/// An interface providing an optional `terminal-output` for stdout as a
+/// link-time authority.
+@since(version = 0.2.0)
 interface terminal-stdout {
+    @since(version = 0.2.0)
     use terminal-output.{terminal-output};
 
-    /// If stdout is connected to a terminal, return a `terminal-output`
-    /// handle allowing further interaction with it.
+    /// If stdout is connected to a terminal, return a `terminal-output` handle
+    /// allowing further interaction with it.
+    @since(version = 0.2.0)
     get-terminal-stdout: func() -> option<terminal-output>;
 }
 
+/// An interface providing an optional `terminal-output` for stderr as a
+/// link-time authority.
+@since(version = 0.2.0)
 interface terminal-stderr {
+    @since(version = 0.2.0)
     use terminal-output.{terminal-output};
 
-    /// If stderr is connected to a terminal, return a `terminal-output`
-    /// handle allowing further interaction with it.
+    /// If stderr is connected to a terminal, return a `terminal-output` handle
+    /// allowing further interaction with it.
+    @since(version = 0.2.0)
     get-terminal-stderr: func() -> option<terminal-output>;
 }

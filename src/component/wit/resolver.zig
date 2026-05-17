@@ -889,3 +889,32 @@ test "resolver #195p2: canonical wasi-http proxy world resolves through the layo
     try std.testing.expect(saw_random);
     try std.testing.expect(saw_sockets);
 }
+
+test "resolver #216: bundled wasi-cli adapter deps now expose stdin" {
+    // After #216 the bundled `adapters/wasi-preview1/wit/deps/wasi-cli`
+    // is the FULL canonical wasi:cli@0.2.6 set instead of a trimmed
+    // slice that only carried stdout + stderr. Users authoring their
+    // own world against the bundled WIT can now `import wasi:cli/
+    // stdin@0.2.6;` without `UnknownInterface`.
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    const res = try parseLayout(allocator, io, "adapters/wasi-preview1/wit");
+
+    // Find the wasi:cli dep and verify it declares a `stdin` interface.
+    var found_stdin = false;
+    for (res.deps) |dep| {
+        if (dep.package == null) continue;
+        if (!std.mem.eql(u8, dep.package.?.name, "cli")) continue;
+        for (dep.items) |item| {
+            if (item != .interface) continue;
+            if (std.mem.eql(u8, item.interface.name, "stdin")) {
+                found_stdin = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_stdin);
+}

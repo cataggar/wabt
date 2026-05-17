@@ -1,42 +1,26 @@
-// Trimmed slice of `wasi:cli@0.2.6.{stdout,stderr}`. Mirrors the
-// canonical `bytecodealliance/wasi-cli@v0.2.6/wit/stdio.wit` shape,
-// but declares only the two interfaces the preview1 adapter actually
-// calls (`stdout` + `stderr`; `stdin` is not on the preview1
-// `fd_read` path yet and stays out of the trimmed copy).
-//
-// `use wasi:io/streams@0.2.6.{output-stream};` exercises the
-// interface-level `use` encoder path landed in PR #149 (Phase
-// 1.c.2.5): each interface body emits an `alias outer (type 1 K)`
-// + `export "output-stream" (type (eq L))` pair, and the world
-// body emits a matching `alias instance-export sort=type` decl
-// right after the `wasi:io/streams@0.2.6` import.
-//
-// Bare-resource return positions (`-> output-stream`) auto-wrap as
-// `own<output-stream>` in the encoder per the component-model spec
-// (cataggar/wabt#182). The canonical bare form below produces the
-// same wire bytes wit-component emits.
-//
-// The package declaration for the multi-file `wasi:cli@0.2.6` slice
-// lives in `environment.wit` (which sorts before this file —
-// `e` < `s`). This file is a package-less continuation parsed
-// after `environment.wit`.
+@since(version = 0.2.0)
+interface stdin {
+  @since(version = 0.2.0)
+  use wasi:io/streams@0.2.6.{input-stream};
 
-interface stdout {
-    use wasi:io/streams@0.2.6.{output-stream};
-
-    /// Obtain a handle to the standard output stream. The handle is
-    /// owned: the adapter must `[resource-drop]output-stream` it on
-    /// teardown to release the underlying sink. In practice we cache
-    /// a single handle per process and never drop it — preview1
-    /// doesn't expose `fd_close` for fd 1/2.
-    get-stdout: func() -> output-stream;
+  @since(version = 0.2.0)
+  get-stdin: func() -> input-stream;
 }
 
-interface stderr {
-    use wasi:io/streams@0.2.6.{output-stream};
+@since(version = 0.2.0)
+interface stdout {
+  @since(version = 0.2.0)
+  use wasi:io/streams@0.2.6.{output-stream};
 
-    /// Same shape as `stdout.get-stdout`, against fd 2. The two
-    /// interfaces are split upstream so a guest can drop one
-    /// without losing the other; the adapter consumes both.
-    get-stderr: func() -> output-stream;
+  @since(version = 0.2.0)
+  get-stdout: func() -> output-stream;
+}
+
+@since(version = 0.2.0)
+interface stderr {
+  @since(version = 0.2.0)
+  use wasi:io/streams@0.2.6.{output-stream};
+
+  @since(version = 0.2.0)
+  get-stderr: func() -> output-stream;
 }
