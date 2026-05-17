@@ -7,6 +7,7 @@
   (export "proc_exit"                  (func $proc_exit))
   (export "proc_raise"                 (func $proc_raise))
   (export "sched_yield"                (func $sched_yield))
+  (export "poll_oneoff"                (func $poll_oneoff))
   (export "fd_write"                   (func $fd_write))
   (export "fd_pwrite"                  (func $fd_pwrite))
   (export "fd_read"                    (func $fd_read))
