@@ -515,13 +515,20 @@ pub fn composeBinariesOpts(
             var prov_bubble = std.ArrayListUnmanaged(u32).empty;
             for (provider.imports, 0..) |p_imp, imp_idx| {
                 if (bubbled_names.contains(p_imp.name)) continue;
-                // Bubble-up only supports instance-typed provider imports.
-                // Non-instance ones (`.func`, `.value`, …) would need
-                // separate wrapper-side machinery; until a real input
-                // demands them, refuse with UnsupportedComposeShape so
-                // the failure is loud, not silent (mirrors #214's
-                // strict-mode behaviour for provider Instantiate args).
-                if (p_imp.desc != .instance) return error.UnsupportedComposeShape;
+                // Bubble-up supports `.instance` and `.func` provider
+                // imports. `.func` is for componentize-js-style
+                // outputs that emit lifted-export callbacks as
+                // top-level func imports (e.g. tcgc.wasm's
+                // `import-func-compile`; issue #218). Other sorts
+                // (`.value`, `.type`-bound, `.component`, `.module`)
+                // would each need their own wrapper-side indexspace
+                // tracking; until a real input demands them, refuse
+                // with UnsupportedComposeShape so the failure is
+                // loud, not silent.
+                switch (p_imp.desc) {
+                    .instance, .func => {},
+                    else => return error.UnsupportedComposeShape,
+                }
                 try prov_bubble.append(ar, @intCast(imp_idx));
                 try bubbled_names.put(ar, p_imp.name, {});
             }
@@ -606,13 +613,32 @@ pub fn composeBinariesOpts(
     //    unique imports out of the box). Strict mode (#214 behaviour,
     //    `--no-bubble-unmatched-imports`) surfaces a missing match
     //    as `error.UnmatchedProviderImport`. ──
+    // ── Wrapper outer-import lookup tables, by sort.
+    //
+    //    `inst_slot_for_outer_name`: name → wrapper-instance idx for
+    //    every `.instance`-typed outer-import (consumer-bubbled or
+    //    provider-bubbled). Built in encounter order so the
+    //    wrapper's instance indexspace matches what the writer
+    //    emits.
+    //    `func_slot_for_outer_name`: same but for `.func`-typed
+    //    outer-imports (#218; tcgc-style providers' lifted-export
+    //    callbacks).
     var inst_slot_for_outer_name = std.StringHashMapUnmanaged(u32).empty;
+    var func_slot_for_outer_name = std.StringHashMapUnmanaged(u32).empty;
     {
         var inst_count: u32 = 0;
+        var func_count: u32 = 0;
         for (imports_arr) |imp| {
-            if (imp.desc == .instance) {
-                try inst_slot_for_outer_name.put(ar, imp.name, inst_count);
-                inst_count += 1;
+            switch (imp.desc) {
+                .instance => {
+                    try inst_slot_for_outer_name.put(ar, imp.name, inst_count);
+                    inst_count += 1;
+                },
+                .func => {
+                    try func_slot_for_outer_name.put(ar, imp.name, func_count);
+                    func_count += 1;
+                },
+                else => {},
             }
         }
     }
@@ -622,18 +648,28 @@ pub fn composeBinariesOpts(
         const comp_idx: u32 = @intCast(p_local + 1);
         var prov_args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
         for (providers[p_local].imports) |p_imp| {
-            // Out-of-scope for #214: providers with non-instance-typed
-            // imports. Real-world `wasm-tools component new` providers
-            // pull wasi:* in via `(import "wasi:io/error@0.2.6"
-            // (instance (type N)))` exclusively, so this is a clean
-            // failure mode rather than a silent incorrect emission.
-            if (p_imp.desc != .instance) return error.UnsupportedComposeShape;
-            const wrap_inst_idx = inst_slot_for_outer_name.get(p_imp.name) orelse
-                return error.UnmatchedProviderImport;
-            try prov_args.append(ar, .{
-                .name = p_imp.name,
-                .sort_idx = .{ .sort = .instance, .idx = wrap_inst_idx },
-            });
+            switch (p_imp.desc) {
+                .instance => {
+                    const wrap_inst_idx = inst_slot_for_outer_name.get(p_imp.name) orelse
+                        return error.UnmatchedProviderImport;
+                    try prov_args.append(ar, .{
+                        .name = p_imp.name,
+                        .sort_idx = .{ .sort = .instance, .idx = wrap_inst_idx },
+                    });
+                },
+                .func => {
+                    const wrap_func_idx = func_slot_for_outer_name.get(p_imp.name) orelse
+                        return error.UnmatchedProviderImport;
+                    try prov_args.append(ar, .{
+                        .name = p_imp.name,
+                        .sort_idx = .{ .sort = .func, .idx = wrap_func_idx },
+                    });
+                },
+                // `.value`, `.type`-bound, `.component`, `.module`
+                // provider imports aren't currently supported — see
+                // the bubble-up loop above for the matching refuse.
+                else => return error.UnsupportedComposeShape,
+            }
         }
         try instances_list.append(ar, .{ .instantiate = .{
             .component_idx = comp_idx,
@@ -1000,14 +1036,18 @@ fn appendSourcePrologue(
     }
 
     // Map: source type-indexspace idx → bubbled import idx whose
-    // `.instance` desc references that slot. Used to bubble each
-    // import right after its referenced type slot, preserving
-    // wt-component's interleaving pattern.
+    // desc references that slot. Used to bubble each import right
+    // after its referenced type slot, preserving wt-component's
+    // interleaving pattern. Covers both `.instance` (desc=.instance)
+    // and `.func` (desc=.func) imports — #218 added `.func` for
+    // componentize-js-style top-level func imports.
     var imp_for_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
     for (bubble_import_idxs) |imp_idx| {
         const imp = source.imports[imp_idx];
-        if (imp.desc == .instance) {
-            try imp_for_type_idx.put(arena, imp.desc.instance, imp_idx);
+        switch (imp.desc) {
+            .instance => |t| try imp_for_type_idx.put(arena, t, imp_idx),
+            .func => |t| try imp_for_type_idx.put(arena, t, imp_idx),
+            else => {},
         }
     }
 
@@ -2268,4 +2308,197 @@ test "composeBinaries: consumer+provider overlap dedups in wrapper outer-imports
     const prov_inst = loaded.instances[0];
     try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
     try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
+}
+
+// ── #218: top-level `.func` provider imports bubble up + Instantiate-wired ──
+
+test "loader correctly separates outer vs nested component imports (#218 audit)" {
+    // Pins the audit result behind #218: wabt's loader stores each
+    // component's imports into THAT component's `imports[]` — nested
+    // imports never leak into the parent's list. The compose
+    // bubble-up loop walks only `provider.imports` (top level), so a
+    // nested `.func` import is never visited.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const func_type = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const inner_func_imports = [_]ctypes.ImportDecl{
+        .{ .name = "import-func-compile", .desc = .{ .func = 0 } },
+    };
+    const inner_types = [_]ctypes.TypeDef{func_type};
+    const inner = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &inner_types, .canons = &.{},
+        .imports = &inner_func_imports, .exports = &.{},
+    };
+    const inner_bytes = try writer.encode(ar, &inner);
+
+    var passthrough = inner;
+    passthrough.raw_bytes = inner_bytes;
+    var passthrough_ptr = passthrough;
+    const components_arr = [_]*ctypes.Component{&passthrough_ptr};
+
+    const outer_instance_type = ctypes.TypeDef{ .instance = .{ .decls = &.{} } };
+    const outer_types = [_]ctypes.TypeDef{outer_instance_type};
+    const outer_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const outer = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &components_arr,
+        .instances = &.{}, .aliases = &.{},
+        .types = &outer_types, .canons = &.{},
+        .imports = &outer_imports, .exports = &.{},
+    };
+    const outer_bytes = try writer.encode(ar, &outer);
+    const loaded = try loader.load(outer_bytes, ar);
+
+    try testing.expectEqual(@as(usize, 1), loaded.imports.len);
+    try testing.expectEqual(ctypes.ExternDesc{ .instance = 0 }, loaded.imports[0].desc);
+    try testing.expectEqual(@as(usize, 1), loaded.components.len);
+    try testing.expectEqual(@as(usize, 1), loaded.components[0].imports.len);
+    try testing.expect(loaded.components[0].imports[0].desc == .func);
+}
+
+test "composeBinaries: bubbles top-level .func provider import (#218)" {
+    // tcgc.wasm-style: the provider has a top-level `.func` import
+    // (componentize-js's lifted-export callback). Pre-#218 this hit
+    // `error.UnsupportedComposeShape`. Post-#218 we bubble the
+    // `.func` to the wrapper's outer-imports and wire the provider's
+    // Instantiate arg with `sort = .func`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer: one wasi:io/error import.
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const cb = try writer.encode(ar, &consumer);
+
+    // Provider: one top-level `.func` import (`import-func-compile`)
+    // backed by a func type def. No instance imports.
+    const func_type = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const prov_types = [_]ctypes.TypeDef{func_type};
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "import-func-compile", .desc = .{ .func = 0 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &prov_types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const pb = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // Wrapper has both imports — consumer's instance + provider's bubbled func.
+    try testing.expectEqual(@as(usize, 2), loaded.imports.len);
+    var saw_error = false;
+    var saw_func = false;
+    for (loaded.imports) |imp| {
+        if (std.mem.eql(u8, imp.name, "wasi:io/error@0.2.6")) {
+            try testing.expect(imp.desc == .instance);
+            saw_error = true;
+        }
+        if (std.mem.eql(u8, imp.name, "import-func-compile")) {
+            try testing.expect(imp.desc == .func);
+            saw_func = true;
+        }
+    }
+    try testing.expect(saw_error);
+    try testing.expect(saw_func);
+
+    // Provider's Instantiate has its arg wired with sort = .func to
+    // the wrapper-func slot (idx 0 since it's the first .func
+    // outer-import).
+    try testing.expectEqual(@as(usize, 2), loaded.instances.len);
+    const prov_inst = loaded.instances[0];
+    try testing.expect(prov_inst == .instantiate);
+    try testing.expectEqual(@as(usize, 1), prov_inst.instantiate.args.len);
+    try testing.expectEqualStrings(
+        "import-func-compile",
+        prov_inst.instantiate.args[0].name,
+    );
+    try testing.expect(prov_inst.instantiate.args[0].sort_idx.sort == .func);
+    try testing.expectEqual(@as(u32, 0), prov_inst.instantiate.args[0].sort_idx.idx);
+}
+
+test "composeBinaries: mixed .instance + .func provider imports both bubble (#218)" {
+    // Mirrors the user's actual tcgc.wasm shape: a mix of `.instance`
+    // imports (the wasi:* set) AND a top-level `.func` import (the
+    // componentize-js lifted-export callback). Both bubble; the
+    // wrapper-instance and wrapper-func indexspaces grow
+    // independently.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+    };
+    const cb = try writer.encode(ar, &consumer);
+
+    const func_type = ctypes.TypeDef{ .func = .{ .params = &.{}, .results = .none } };
+    const inst_type = ctypes.TypeDef{ .instance = .{ .decls = &.{} } };
+    const prov_types = [_]ctypes.TypeDef{ inst_type, func_type };
+    const prov_imports = [_]ctypes.ImportDecl{
+        // Provider shares wasi:io/error with the consumer — dedup applies.
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+        // …and contributes its own wasi:http/types (instance, bubbled by #216).
+        .{ .name = "wasi:http/types@0.2.6", .desc = .{ .instance = 0 } },
+        // …and a top-level func import (bubbled by #218).
+        .{ .name = "import-func-compile", .desc = .{ .func = 1 } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .components = &.{}, .instances = &.{}, .aliases = &.{},
+        .types = &prov_types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const pb = try writer.encode(ar, &provider);
+
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    var arena2 = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena2.deinit();
+    const loaded = try loader.load(composed, arena2.allocator());
+
+    // 3 wrapper outer-imports: consumer wasi:io/error (deduped) +
+    // provider's wasi:http/types + provider's import-func-compile.
+    try testing.expectEqual(@as(usize, 3), loaded.imports.len);
+
+    // Provider's Instantiate has 3 args.
+    const prov_inst = loaded.instances[0];
+    try testing.expectEqual(@as(usize, 3), prov_inst.instantiate.args.len);
+    var saw_inst_sort = false;
+    var saw_func_sort = false;
+    for (prov_inst.instantiate.args) |a| {
+        if (a.sort_idx.sort == .instance) saw_inst_sort = true;
+        if (a.sort_idx.sort == .func) saw_func_sort = true;
+    }
+    try testing.expect(saw_inst_sort);
+    try testing.expect(saw_func_sort);
 }
