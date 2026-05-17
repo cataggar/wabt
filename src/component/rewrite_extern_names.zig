@@ -13,39 +13,49 @@
 //! The rewriter walks a component byte stream and rebuilds it with
 //! every `extern_name.parse`-recognized name run through
 //! `extern_name.rewrite(rules)`. Sections that don't carry externnames
-//! (custom, core_type, alias, canon, start, value) are copied
-//! verbatim — preserving the original section interleaving that the
-//! AST cannot represent. Sections that DO carry externnames are
-//! parsed item-by-item; each item's name is rewritten, the rest of
-//! the item's bytes are copied verbatim. Nested-component sections
+//! (most custom sections, core_type, alias, canon, start, value) are
+//! copied verbatim — preserving the original section interleaving
+//! that the AST cannot represent. Sections that DO carry externnames
+//! are parsed item-by-item; each item's name is rewritten, the rest
+//! of the item's bytes are copied verbatim. Nested-component sections
 //! recurse.
 //!
-//! Coverage (per issue #212 — the original #209/#210 patch only
-//! handled the four component-level sections marked ☆):
+//! Coverage:
 //!
-//!   * top-level import section (id=10) ☆
-//!   * top-level export section (id=11) ☆
+//!   * top-level import section (id=10) — #209/#210
+//!   * top-level export section (id=11) — #209/#210
 //!   * type section (id=7), descending into component-/instance-type
-//!     bodies' import + export decls ☆
+//!     bodies' import + export decls — #209/#210
 //!   * component-instance section (id=5):
 //!       - instantiate arg names (plain `name` slots whose string
-//!         content carries the externname grammar)
-//!       - inline-export names (externname-prefix slots) ☆
+//!         content carries the externname grammar) — #212
+//!       - inline-export names (externname-prefix slots) — #209/#210
 //!   * core-instance section (id=2):
-//!       - instantiate arg names (plain `name` slots)
-//!       - inline-export names (plain `name` slots)
+//!       - instantiate arg names (plain `name` slots) — #212
+//!       - inline-export names (plain `name` slots) — #212
 //!   * core-module section (id=1): descend into the embedded core
 //!     wasm; rewrite the `mod` field of each core import (core
 //!     section id=2). Core import `fld` fields, all other core
-//!     sections, and the core wasm preamble pass through verbatim.
-//!   * nested-component section (id=4): recurse into the body.
+//!     sections, and the core wasm preamble pass through verbatim
+//!     — #212.
+//!   * nested-component section (id=4): recurse into the body — #209.
+//!   * custom section (id=0), name = `name` / `component-name`:
+//!     parse subsections, scan each name string for embedded
+//!     externname substrings (e.g. `"ty-wasi:io/error@0.2.10"`),
+//!     rewrite each one's `@ver` suffix. Other custom sections
+//!     (producer metadata, `component-type:…:encoded world`) pass
+//!     through verbatim because their layout is opaque. Cosmetic;
+//!     wasmtime ignores debug names but `wasm-tools dump` / `jco
+//!     wit` walk them — #214.
 //!
-//! Scope intentionally excludes alias `instance_export.name` (it
-//! references an export *within* a source instance — a method or
-//! resource name, not a package externname), and the `name` custom
-//! section's debug strings (per #212, "may be safe to skip for
-//! actual instantiation" — wasmtime ignores them; widening if
-//! cosmetic-dump tools complain is a follow-up).
+//! Scope intentionally excludes alias `instance_export.name` — it
+//! references an export *within* a source instance (a method or
+//! resource name, not a package externname).
+//!
+//! Wrapper-side wiring (provider Instantiate args matching the
+//! wrapper's outer-import indexes) is NOT this module's job — that
+//! lives in `src/tools/component_compose.zig`'s wrapper construction,
+//! see issue #214.
 //!
 //! All section size LEBs at every nesting level recompute when an
 //! externname's encoded byte length changes (e.g. `@0.2.10` →
@@ -156,6 +166,7 @@ pub fn apply(arena: Allocator, bytes: []const u8, rules: []const extern_name.Rul
 
         const new_body_opt: ?[]const u8 = switch (id) {
             // Section IDs that may carry component-level externnames.
+            0 => try rewriteCustomSection(arena, body, rules),
             1 => try rewriteCoreModuleSection(arena, body, rules),
             2 => try rewriteCoreInstanceSection(arena, body, rules),
             4 => try apply(arena, body, rules),
@@ -433,6 +444,205 @@ fn skipCoreLimits(r: *Reader) Error!void {
         if (flags & 0x01 != 0) _ = try r.readU32();
     }
     if (flags & 0x08 != 0) _ = try r.readU32();
+}
+
+// ── #214 cosmetic: rewrite externnames embedded in name custom sections ──
+//
+// `wasm-tools component new` emits debug-name custom sections
+// (`name` for core wasm and `component-name` for component-level)
+// containing strings of the form `"ty-wasi:io/error@0.2.10"` etc.
+// These never affect instantiation — wasmtime ignores them — but
+// downstream cosmetic tools (`wasm-tools dump`, `jco wit`) walk them
+// and complain when their version suffix doesn't match the binary's
+// outer-import surface.
+//
+// We scan each name string for embedded externname-shape substrings
+// and rewrite each one's `@ver` suffix through `extern_name.rewrite`.
+// Other custom sections (producer metadata, `component-type:…:encoded
+// world`) pass through verbatim because their byte layout is opaque
+// to this module and rewriting them would risk corrupting
+// downstream consumers.
+
+fn rewriteCustomSection(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error!?[]u8 {
+    var r = Reader{ .data = body };
+    const sec_name_len = r.readU32() catch return @as(?[]u8, null);
+    if (r.pos + sec_name_len > r.data.len) return @as(?[]u8, null);
+    const sec_name = r.data[r.pos .. r.pos + sec_name_len];
+    r.pos += sec_name_len;
+
+    if (!std.mem.eql(u8, sec_name, "name") and
+        !std.mem.eql(u8, sec_name, "component-name"))
+    {
+        return null; // copy verbatim
+    }
+
+    const payload = r.data[r.pos..];
+    const new_payload = rewriteNameSectionPayload(arena, payload, rules) catch {
+        return null; // parse failure → verbatim
+    };
+    if (new_payload.ptr == payload.ptr) return null;
+
+    var w = std.ArrayListUnmanaged(u8).empty;
+    try writeU32Leb(&w, arena, @intCast(sec_name.len));
+    try w.appendSlice(arena, sec_name);
+    try w.appendSlice(arena, new_payload);
+    return try w.toOwnedSlice(arena);
+}
+
+fn rewriteNameSectionPayload(arena: Allocator, body: []const u8, rules: []const extern_name.Rule) Error![]const u8 {
+    var r = Reader{ .data = body };
+    var w = std.ArrayListUnmanaged(u8).empty;
+    var any_change = false;
+
+    while (r.remaining() > 0) {
+        const subsec_id = try r.readByte();
+        const subsec_size = try r.readU32();
+        const sub_body_start = r.pos;
+        if (sub_body_start + subsec_size > r.data.len) return error.UnexpectedEnd;
+        const sub_body = r.data[sub_body_start .. sub_body_start + subsec_size];
+        r.pos = sub_body_start + subsec_size;
+
+        const new_sub: []const u8 = rewriteNameSubsection(arena, subsec_id, sub_body, rules) catch sub_body;
+        if (new_sub.ptr != sub_body.ptr) any_change = true;
+
+        try w.append(arena, subsec_id);
+        try writeU32Leb(&w, arena, @intCast(new_sub.len));
+        try w.appendSlice(arena, new_sub);
+    }
+
+    if (!any_change) return body;
+    return try w.toOwnedSlice(arena);
+}
+
+/// Rewrite a single name subsection. Subsection id 0 is the module
+/// name (single `name` payload); all other ids per the wasm spec
+/// carry `namemap = vec(idx + name)`. Indirect name maps (locals,
+/// labels, fields) use `vec(idx + namemap)` — we handle those by
+/// trying namemap first and falling back via `error.InvalidEncoding`
+/// (which the caller treats as a verbatim-copy directive).
+fn rewriteNameSubsection(arena: Allocator, id: u8, body: []const u8, rules: []const extern_name.Rule) Error![]const u8 {
+    if (id == 0) {
+        var r = Reader{ .data = body };
+        const len = try r.readU32();
+        if (r.pos + len != body.len) return error.InvalidEncoding;
+        const name = body[r.pos .. r.pos + len];
+        const new_name = try rewriteEmbeddedExternNames(arena, name, rules);
+        if (new_name.ptr == name.ptr) return body;
+        var w = std.ArrayListUnmanaged(u8).empty;
+        try writeU32Leb(&w, arena, @intCast(new_name.len));
+        try w.appendSlice(arena, new_name);
+        return try w.toOwnedSlice(arena);
+    }
+
+    // namemap form: vec(idx + name). If parsing doesn't consume the
+    // full body cleanly, bail to verbatim copy via error.InvalidEncoding.
+    var r = Reader{ .data = body };
+    var w = std.ArrayListUnmanaged(u8).empty;
+    var any_change = false;
+    const count = try r.readU32();
+    try writeU32Leb(&w, arena, count);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        const idx = try r.readU32();
+        const len = try r.readU32();
+        if (r.pos + len > body.len) return error.UnexpectedEnd;
+        const name = body[r.pos .. r.pos + len];
+        r.pos += len;
+        const new_name = try rewriteEmbeddedExternNames(arena, name, rules);
+        if (new_name.ptr != name.ptr) any_change = true;
+        try writeU32Leb(&w, arena, idx);
+        try writeU32Leb(&w, arena, @intCast(new_name.len));
+        try w.appendSlice(arena, new_name);
+    }
+    if (r.pos != body.len) return error.InvalidEncoding;
+    if (!any_change) return body;
+    return try w.toOwnedSlice(arena);
+}
+
+/// Scan `s` for substrings that look like externnames
+/// (`[ns:]?pkg/iface[@digits.digits.digits]`) and rewrite each one's
+/// `@ver` suffix per the rule list. Identifier chars include
+/// alphanumerics, `-`, and `_`; identifiers must start with an
+/// alpha character. Returns `s` unchanged when no rule fires.
+///
+/// The scanner tries each position as a potential externname start,
+/// not just identifier-boundary positions — this lets debug strings
+/// like `"ty-wasi:io/error@0.2.10"` (with a static `"ty-"` prefix)
+/// pick up the embedded `wasi:io/error@0.2.10` match even though
+/// `ty-wasi` is one greedy identifier.
+fn rewriteEmbeddedExternNames(arena: Allocator, s: []const u8, rules: []const extern_name.Rule) Error![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var any_change = false;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (matchExternNameAt(s, i)) |end| {
+            const orig = s[i..end];
+            const rewritten = try extern_name.rewrite(arena, orig, rules);
+            if (rewritten.ptr != orig.ptr) {
+                try out.appendSlice(arena, rewritten);
+                any_change = true;
+                i = end;
+                continue;
+            }
+        }
+        try out.append(arena, s[i]);
+        i += 1;
+    }
+    if (!any_change) return s;
+    return try out.toOwnedSlice(arena);
+}
+
+fn matchExternNameAt(s: []const u8, start: usize) ?usize {
+    if (start >= s.len) return null;
+    if (!isExternNameIdentStart(s[start])) return null;
+
+    var i = start;
+    while (i < s.len and isExternNameIdentChar(s[i])) i += 1;
+    if (i == start) return null;
+    if (i >= s.len) return null;
+
+    // Optional `<ns>:` prefix.
+    if (s[i] == ':') {
+        i += 1;
+        const pkg_start = i;
+        while (i < s.len and isExternNameIdentChar(s[i])) i += 1;
+        if (i == pkg_start) return null;
+        if (i >= s.len) return null;
+    } else if (s[i] != '/') {
+        return null;
+    }
+
+    // Slash separator.
+    if (s[i] != '/') return null;
+    i += 1;
+
+    // Iface ident.
+    const iface_start = i;
+    while (i < s.len and isExternNameIdentChar(s[i])) i += 1;
+    if (i == iface_start) return null;
+
+    // Optional `@digits.digits.digits` suffix.
+    if (i < s.len and s[i] == '@') {
+        const at_pos = i;
+        i += 1;
+        const v_start = i;
+        while (i < s.len and (std.ascii.isDigit(s[i]) or s[i] == '.')) i += 1;
+        if (i == v_start) {
+            // `@` with no version digits — back up; the @ probably
+            // belongs to surrounding text.
+            i = at_pos;
+        }
+    }
+
+    return i;
+}
+
+fn isExternNameIdentStart(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_';
+}
+
+fn isExternNameIdentChar(c: u8) bool {
+    return isExternNameIdentStart(c) or (c >= '0' and c <= '9') or c == '-';
 }
 
 // ── Type-def walking ──────────────────────────────────────────────────────
@@ -1062,6 +1272,151 @@ test "apply: recurses through nested-component import sections (regression for #
     try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
 }
 
+// ── #214 audit: confirm #213's recursion reaches deeper sites ──────────────
+
+test "apply: rewrites a nested component's component-type-body import (audit for #214 site A.1)" {
+    // outer component
+    //   → component section (id=4) carrying nested component bytes
+    //     → nested component
+    //       → type section (id=7)
+    //         → component-type (0x41)
+    //           → instance type decl (slot for desc)
+    //           → import decl: "wasi:io/error@0.2.10"
+    //
+    // #213's apply() recurses on id=4; the nested type section walker
+    // handles 0x41 / 0x03 decls. This test pins that contract end-to-end.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const inner_instance_type = ctypes.TypeDef{ .instance = .{ .decls = &.{} } };
+    const ct_decls = [_]ctypes.Decl{
+        .{ .type = inner_instance_type },
+        .{ .import = .{ .name = "wasi:io/error@0.2.10", .desc = .{ .instance = 0 } } },
+    };
+    const ct = ctypes.TypeDef{ .component = .{ .decls = &ct_decls } };
+    const nested_types = [_]ctypes.TypeDef{ct};
+    const nested = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &nested_types, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const nested_bytes = try writer.encode(ar, &nested);
+
+    var passthrough = nested;
+    passthrough.raw_bytes = nested_bytes;
+    var passthrough_ptr = passthrough;
+    const components_arr = [_]*ctypes.Component{&passthrough_ptr};
+
+    const outer = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &components_arr,
+        .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const outer_bytes = try writer.encode(ar, &outer);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, outer_bytes, &rules);
+
+    // No @0.2.10 substring may survive at any depth.
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:io/error@0.2.6") != null);
+
+    // Loader walks deep enough that we can re-verify structurally.
+    const loaded = try loader.load(out, ar);
+    try testing.expectEqual(@as(usize, 1), loaded.components.len);
+    const inner_types = loaded.components[0].types;
+    try testing.expect(inner_types.len >= 1);
+    try testing.expect(inner_types[0] == .component);
+    var found = false;
+    for (inner_types[0].component.decls) |d| {
+        if (d == .import) {
+            try testing.expectEqualStrings("wasi:io/error@0.2.6", d.import.name);
+            found = true;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "apply: rewrites a nested component's core_module imports (audit for #214 site A.2)" {
+    // outer component
+    //   → component section (id=4) carrying nested component bytes
+    //     → nested component
+    //       → core_module section (id=1) carrying raw core wasm
+    //         → core import section (core id=2)
+    //           → (import "wasi:io/poll@0.2.10" "[resource-drop]pollable" ...)
+    //
+    // #213's apply() recurses on id=4 and the nested rewriteCoreModuleSection
+    // walks the embedded core wasm import section.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Hand-roll a minimal core wasm: preamble + type section + import section.
+    var core_bytes = std.ArrayListUnmanaged(u8).empty;
+    try core_bytes.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    // type section: 1 type, () -> ().
+    try core_bytes.appendSlice(ar, &.{ 0x01, 0x04, 0x01, 0x60, 0x00, 0x00 });
+    // import section: 1 import.
+    {
+        var imp = std.ArrayListUnmanaged(u8).empty;
+        try imp.append(ar, 0x01);
+        const m = "wasi:io/poll@0.2.10";
+        try imp.append(ar, m.len);
+        try imp.appendSlice(ar, m);
+        const f = "[resource-drop]pollable";
+        try imp.append(ar, f.len);
+        try imp.appendSlice(ar, f);
+        try imp.append(ar, 0x00); // func desc
+        try imp.append(ar, 0x00); // typeidx 0
+        try core_bytes.append(ar, 0x02);
+        try core_bytes.append(ar, @intCast(imp.items.len));
+        try core_bytes.appendSlice(ar, imp.items);
+    }
+
+    const core_modules = [_]ctypes.CoreModule{
+        .{ .data = core_bytes.items },
+    };
+    const nested = ctypes.Component{
+        .core_modules = &core_modules, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const nested_bytes = try writer.encode(ar, &nested);
+
+    var passthrough = nested;
+    passthrough.raw_bytes = nested_bytes;
+    var passthrough_ptr = passthrough;
+    const components_arr = [_]*ctypes.Component{&passthrough_ptr};
+
+    const outer = ctypes.Component{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &components_arr,
+        .instances = &.{}, .aliases = &.{},
+        .types = &.{}, .canons = &.{},
+        .imports = &.{}, .exports = &.{},
+    };
+    const outer_bytes = try writer.encode(ar, &outer);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, outer_bytes, &rules);
+
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "wasi:io/poll@0.2.6") != null);
+    // The field name is not an externname — it survives unchanged.
+    try testing.expect(std.mem.indexOf(u8, out, "[resource-drop]pollable") != null);
+}
+
 // ── #212: core_instance + core_module section rewrites ─────────────────────
 
 test "rewriteCoreInstanceSection: rewrites instantiate arg name" {
@@ -1416,4 +1771,167 @@ test "apply: rewrites every @0.2.10 site at component + core levels (e2e for #21
     try testing.expect(std.mem.indexOf(u8, out, "wasi:io/poll@0.2.6") != null);
     try testing.expect(std.mem.indexOf(u8, out, "wasi:http/types@0.2.6") != null);
     try testing.expect(std.mem.indexOf(u8, out, "wasi:http/outgoing-handler@0.2.6") != null);
+}
+
+// ── #214 cosmetic: `name` / `component-name` custom section ────────────────
+
+test "matchExternNameAt: recognizes standard patterns" {
+    // Bare pkg/iface, no ns, no version.
+    try testing.expectEqual(@as(?usize, 9), matchExternNameAt("pkg/iface", 0));
+    // ns:pkg/iface, no version.
+    try testing.expectEqual(@as(?usize, 11), matchExternNameAt("ns:pkg/face", 0));
+    // Standard wasi-style with version.
+    try testing.expectEqual(@as(?usize, 19), matchExternNameAt("wasi:io/error@0.2.6", 0));
+    // Embedded after a `ty-` prefix: matching at offset 0 picks up
+    // "ty-wasi:io/error@0.2.6" as a whole, but starting at offset 3
+    // recovers the inner "wasi:..." externname.
+    const s = "ty-wasi:io/error@0.2.6";
+    try testing.expectEqual(@as(?usize, 22), matchExternNameAt(s, 0)); // greedy: ns="ty-wasi"
+    try testing.expectEqual(@as(?usize, 22), matchExternNameAt(s, 3)); // ns="wasi"
+}
+
+test "matchExternNameAt: rejects non-externname patterns" {
+    try testing.expectEqual(@as(?usize, null), matchExternNameAt("", 0));
+    try testing.expectEqual(@as(?usize, null), matchExternNameAt("just-text", 0));
+    try testing.expectEqual(@as(?usize, null), matchExternNameAt("missing-slash", 0));
+    try testing.expectEqual(@as(?usize, null), matchExternNameAt("/leading-slash", 0));
+    // Trailing `@` without digits — the @ stays out of the match.
+    try testing.expectEqual(@as(?usize, 9), matchExternNameAt("pkg/iface@", 0));
+}
+
+test "rewriteEmbeddedExternNames: rewrites only the embedded substring" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try rewriteEmbeddedExternNames(ar, "ty-wasi:io/error@0.2.10", &rules);
+    try testing.expectEqualStrings("ty-wasi:io/error@0.2.6", out);
+
+    // Multiple embedded externnames in one string get rewritten in
+    // a single pass.
+    const out2 = try rewriteEmbeddedExternNames(
+        ar,
+        "alias[wasi:io/error@0.2.10 -> wasi:io/streams@0.2.10]",
+        &rules,
+    );
+    try testing.expectEqualStrings(
+        "alias[wasi:io/error@0.2.6 -> wasi:io/streams@0.2.6]",
+        out2,
+    );
+
+    // No matches: pointer identity is preserved (signals no allocation).
+    const in = "no-extern-name-here";
+    const out3 = try rewriteEmbeddedExternNames(ar, in, &rules);
+    try testing.expectEqual(in.ptr, out3.ptr);
+}
+
+test "apply: rewrites externnames inside the `name` custom section (#214 cosmetic)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Build a component with one custom section named "name" whose
+    // payload has a namemap subsection (id=4) listing one entry whose
+    // name string carries an embedded extern_name.
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    try bytes.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    var ns_payload = std.ArrayListUnmanaged(u8).empty;
+    // Subsection: id=4 (type names), namemap.
+    var subsec = std.ArrayListUnmanaged(u8).empty;
+    try subsec.append(ar, 0x01); // count = 1
+    try subsec.append(ar, 0x00); // idx = 0
+    const debug_name = "ty-wasi:io/error@0.2.10";
+    try subsec.append(ar, @intCast(debug_name.len));
+    try subsec.appendSlice(ar, debug_name);
+    try ns_payload.append(ar, 0x04); // subsec id
+    try ns_payload.append(ar, @intCast(subsec.items.len));
+    try ns_payload.appendSlice(ar, subsec.items);
+
+    var custom_body = std.ArrayListUnmanaged(u8).empty;
+    const sec_name = "name";
+    try custom_body.append(ar, @intCast(sec_name.len));
+    try custom_body.appendSlice(ar, sec_name);
+    try custom_body.appendSlice(ar, ns_payload.items);
+
+    try bytes.append(ar, 0x00); // custom section id
+    try bytes.append(ar, @intCast(custom_body.items.len));
+    try bytes.appendSlice(ar, custom_body.items);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, bytes.items, &rules);
+
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "ty-wasi:io/error@0.2.6") != null);
+}
+
+test "apply: leaves non-`name` custom sections verbatim (#214 cosmetic)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    try bytes.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    // Custom section named "producers" with arbitrary payload that
+    // happens to contain `@0.2.10`. Must survive untouched because
+    // we only rewrite name / component-name sections.
+    var custom_body = std.ArrayListUnmanaged(u8).empty;
+    const sec_name = "producers";
+    try custom_body.append(ar, @intCast(sec_name.len));
+    try custom_body.appendSlice(ar, sec_name);
+    const payload = "free-form-text-@0.2.10";
+    try custom_body.appendSlice(ar, payload);
+
+    try bytes.append(ar, 0x00);
+    try bytes.append(ar, @intCast(custom_body.items.len));
+    try bytes.appendSlice(ar, custom_body.items);
+
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, bytes.items, &rules);
+    try testing.expect(std.mem.indexOf(u8, out, "@0.2.10") != null);
+}
+
+test "apply: malformed `name` section falls back to verbatim copy (#214 cosmetic)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // A `name` section whose subsection body doesn't parse as namemap:
+    // partial garbage bytes. The rewriter should bail to verbatim copy.
+    var bytes = std.ArrayListUnmanaged(u8).empty;
+    try bytes.appendSlice(ar, &.{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 });
+
+    var ns_payload = std.ArrayListUnmanaged(u8).empty;
+    // Subsection id=99 (unknown) + size=3 + payload that won't parse
+    // as namemap (count=5 but only 1 byte left).
+    try ns_payload.append(ar, 99);
+    try ns_payload.append(ar, 0x03);
+    try ns_payload.appendSlice(ar, &.{ 0x05, 0xff, 0xee });
+
+    var custom_body = std.ArrayListUnmanaged(u8).empty;
+    const sec_name = "name";
+    try custom_body.append(ar, @intCast(sec_name.len));
+    try custom_body.appendSlice(ar, sec_name);
+    try custom_body.appendSlice(ar, ns_payload.items);
+
+    try bytes.append(ar, 0x00);
+    try bytes.append(ar, @intCast(custom_body.items.len));
+    try bytes.appendSlice(ar, custom_body.items);
+
+    // No rule will fire, so the cleanest assertion is "this didn't
+    // crash and the output round-trips through apply".
+    const rules = [_]extern_name.Rule{
+        .{ .ns = "wasi", .pkg = "io", .to_version = "0.2.6" },
+    };
+    const out = try apply(ar, bytes.items, &rules);
+    // Section content survives verbatim.
+    try testing.expect(std.mem.indexOf(u8, out, &.{ 0x05, 0xff, 0xee }) != null);
 }
