@@ -93,6 +93,29 @@ const REACTOR_EMBED_WIT =
     \\}
 ;
 
+/// WIT for an embed that imports a non-WASI iface whose func sig
+/// references a Defined type (`result<u32, u32>`). Used by the #228
+/// regression test to verify `buildEmbedExtraImports` preserves the
+/// Defined typedef in the wrapping component's iface body — pre-fix
+/// the Defined was dropped, leaving the func's `type_idx` operand
+/// dangling and the wrapping component unparseable.
+const EXTRA_DEFINED_EMBED_WIT =
+    \\package docs:demo@0.1.0;
+    \\
+    \\interface api {
+    \\    compute: func() -> result<u32, u32>;
+    \\}
+    \\
+    \\world demo {
+    \\    import api;
+    \\}
+;
+
+pub const EXTRA_DEFINED_NAMESPACE = "docs:demo/api@0.1.0";
+pub const EXTRA_DEFINED_FUNC = "compute";
+pub const EXTRA_DEFINED_EMBED_CT_SECTION_NAME =
+    "component-type:docs:demo@0.1.0:demo:encoded world";
+
 pub const ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:command:encoded world";
 pub const REACTOR_ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:reactor:encoded world";
 pub const EMBED_CT_SECTION_NAME = "component-type:embed-mock";
@@ -799,6 +822,113 @@ pub fn buildSyntheticReactorEmbedWithSecondary(allocator: Allocator) ![]u8 {
     }
 
     try appendCustomSection(allocator, &out, REACTOR_EMBED_CT_SECTION_NAME, ct);
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a synthetic command-shape embed core wasm that imports a
+/// non-WASI namespace whose iface body declares a func with a
+/// **Defined** result type (`result<u32, u32>`). Regression fixture
+/// for cataggar/wabt#228 — see `EXTRA_DEFINED_EMBED_WIT`.
+///
+/// Imports:
+///   * `wasi_snapshot_preview1.fd_write`     (func, () -> i32)
+///   * `docs:demo/api@0.1.0.compute`         (func, () -> i32)
+///
+/// Exports:
+///   * `_start`                              (func, () -> ())
+///   * `memory`                              (memory 0)
+///
+/// Carries a `component-type:docs:demo@0.1.0:demo:encoded world`
+/// custom section so the splicer's `embed_metadata` lookup
+/// recovers the canonical `docs:demo/api` body — without it the
+/// `buildEmbedExtraImports` fallback path would synthesize a
+/// primitive-only sig (() -> u32) from the core wasm signature
+/// alone, skipping the Defined-type test entirely.
+///
+/// `_start` body: trivial `i32.const 0; drop; end`. The
+/// imported `compute` is never actually called — its presence in
+/// the core wasm imports is enough to drive `buildEmbedExtraImports`
+/// down the `docs:demo/api` path. Caller frees with the same
+/// allocator.
+pub fn buildSyntheticEmbedWithExtraDefinedImport(allocator: Allocator) ![]u8 {
+    const ct = try metadata_encode.encodeWorldFromSource(allocator, EXTRA_DEFINED_EMBED_WIT, "demo");
+    defer allocator.free(ct);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try writeMagic(allocator, &out);
+
+    // Type section: 2 types — () -> i32 (preview1 + compute), () -> () (_start).
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f }); // type 0: () -> i32
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 }); // type 1: () -> ()
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    // Import section: wasi_snapshot_preview1.fd_write + docs:demo/api@0.1.0.compute.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02); // count
+        try writeName(allocator, &b, "wasi_snapshot_preview1");
+        try writeName(allocator, &b, PREVIEW1_EXPORT);
+        try b.append(allocator, 0x00); // func
+        try b.append(allocator, 0x00); // typeidx 0
+        try writeName(allocator, &b, EXTRA_DEFINED_NAMESPACE);
+        try writeName(allocator, &b, EXTRA_DEFINED_FUNC);
+        try b.append(allocator, 0x00); // func
+        try b.append(allocator, 0x00); // typeidx 0
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // Function section: 1 defined func (_start, type 1)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x01);
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+
+    // Memory section: 1 memory (limits: min 0, no max)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        try writeSection(allocator, &out, 0x05, b.items);
+    }
+
+    // Export section: _start (func 2 = imports 0..1 + defined 0), memory (0)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try writeName(allocator, &b, "_start");
+        try b.appendSlice(allocator, &.{ 0x00, 0x02 }); // func, idx 2
+        try writeName(allocator, &b, "memory");
+        try b.appendSlice(allocator, &.{ 0x02, 0x00 }); // memory, idx 0
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // Code section: _start = i32.const 0; drop; end
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x05);
+        try b.append(allocator, 0x00);
+        try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x1a, 0x0b });
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    try appendCustomSection(allocator, &out, EXTRA_DEFINED_EMBED_CT_SECTION_NAME, ct);
 
     return out.toOwnedSlice(allocator);
 }

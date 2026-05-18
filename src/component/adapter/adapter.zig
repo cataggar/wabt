@@ -42,6 +42,7 @@ const abi = @import("abi.zig");
 const gc = @import("gc.zig");
 const world_gc = @import("world_gc.zig");
 const metadata_decode = @import("../wit/metadata_decode.zig");
+const type_walk = @import("../type_walk.zig");
 const leb = @import("../../leb128.zig");
 
 pub const SpliceError = error{
@@ -1822,42 +1823,89 @@ fn buildEmbedExtraImports(b: *Builder, a: Allocator, in: Inputs) SpliceError![]c
         }
         if (funcs.items.len == 0) continue;
 
-        // Build the instance type: one (export "<name>" (func F))
-        // per func, with each func having a fresh component-level
-        // FuncType. Prefer pulling the FuncType verbatim from the
-        // embed's component-type if available (preserves original
-        // param names + non-primitive types). Otherwise synthesize
-        // a p0/p1-named primitive sig from the core import sig.
+        // Build the instance type's body. Two paths:
+        //
+        //   * If the embed's `component-type:<world>` custom section
+        //     declares this namespace as an import with a body that
+        //     is self-contained (no aliases — i.e. no
+        //     `use other-iface.{T};` references), clone its decls
+        //     verbatim into the wrapping component's arena. This
+        //     preserves every supporting `Type(Defined(...))` decl
+        //     (Result/Record/Variant/List/etc.) the FuncTypes
+        //     reference via `type_idx`. Cataggar/wabt#228 motivated
+        //     this path: pre-fix the splicer only emitted
+        //     `Type(Func)` + `Export` decls per imported function,
+        //     dropping the Defined type-defs the funcs referenced
+        //     and producing a wrapping component with dangling
+        //     local-type-index operands.
+        //
+        //   * Otherwise (no embed component-type section, or its
+        //     body has cross-iface aliases we don't yet rebase),
+        //     fall back to the original per-func synthesis path
+        //     which builds a primitive-only body from the core
+        //     wasm sigs.
         var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
-        var local_type_idx: u32 = 0;
-        for (funcs.items) |f| {
-            const ft: ctypes.FuncType = lookupEmbedFuncType(in.embed_world, ns, f.name) orelse blk_ft: {
-                const params = try a.alloc(ctypes.NamedValType, f.sig.params.len);
-                for (f.sig.params, 0..) |p, pi| {
-                    const pname = try std.fmt.allocPrint(a, "p{d}", .{pi});
-                    params[pi] = .{ .name = pname, .type = coreToCompValType(p) };
-                }
-                const results: ctypes.FuncType.ResultList = if (f.sig.results.len == 0) .none else blk: {
-                    if (f.sig.results.len == 1) {
-                        break :blk .{ .unnamed = coreToCompValType(f.sig.results[0]) };
+        const canonical_inst_decls = lookupEmbedExtraInstDecls(in.embed_metadata, ns);
+        const used_canonical = canonical_inst_decls != null and
+            isInstBodyAliasFree(canonical_inst_decls.?);
+        if (used_canonical) {
+            // Identity remap: the new body keeps the same local
+            // type-slot layout as the original, so each `type_idx`
+            // operand resolves to the same Defined the embed
+            // declared.
+            const decls = canonical_inst_decls.?;
+            const slot_count = countInstBodyTypeSlots(decls);
+            const identity_remap = try a.alloc(u32, @max(slot_count, 1));
+            for (identity_remap, 0..) |*x, i| x.* = @intCast(i);
+            for (decls) |d| {
+                try inst_decls.append(a, try type_walk.cloneDecl(a, d, identity_remap, &.{}));
+            }
+        } else {
+            // Fallback: per-func synthesis. One (export "<name>"
+            // (func F)) per func, with each func having a fresh
+            // component-level FuncType. Prefer pulling the
+            // FuncType verbatim from the embed's component-type
+            // if available (preserves original param names +
+            // non-primitive types). Otherwise synthesize a
+            // p0/p1-named primitive sig from the core sigs alone.
+            //
+            // Warning: this path silently substitutes primitive
+            // sigs when `lookupEmbedFuncType` returns null, so any
+            // func whose sig reaches a Defined type WITHOUT an
+            // embed component-type section will end up with the
+            // wrong shape. That's the same trade-off the code has
+            // always made; the canonical-body path above is
+            // strictly better when available.
+            var local_type_idx: u32 = 0;
+            for (funcs.items) |f| {
+                const ft: ctypes.FuncType = lookupEmbedFuncType(in.embed_world, ns, f.name) orelse blk_ft: {
+                    const params = try a.alloc(ctypes.NamedValType, f.sig.params.len);
+                    for (f.sig.params, 0..) |p, pi| {
+                        const pname = try std.fmt.allocPrint(a, "p{d}", .{pi});
+                        params[pi] = .{ .name = pname, .type = coreToCompValType(p) };
                     }
-                    const named = try a.alloc(ctypes.NamedValType, f.sig.results.len);
-                    for (f.sig.results, 0..) |r, ri| {
-                        const rname = try std.fmt.allocPrint(a, "r{d}", .{ri});
-                        named[ri] = .{ .name = rname, .type = coreToCompValType(r) };
-                    }
-                    break :blk .{ .named = named };
+                    const results: ctypes.FuncType.ResultList = if (f.sig.results.len == 0) .none else blk: {
+                        if (f.sig.results.len == 1) {
+                            break :blk .{ .unnamed = coreToCompValType(f.sig.results[0]) };
+                        }
+                        const named = try a.alloc(ctypes.NamedValType, f.sig.results.len);
+                        for (f.sig.results, 0..) |r, ri| {
+                            const rname = try std.fmt.allocPrint(a, "r{d}", .{ri});
+                            named[ri] = .{ .name = rname, .type = coreToCompValType(r) };
+                        }
+                        break :blk .{ .named = named };
+                    };
+                    break :blk_ft .{ .params = params, .results = results };
                 };
-                break :blk_ft .{ .params = params, .results = results };
-            };
 
-            try inst_decls.append(a, .{ .type = .{ .func = ft } });
-            const ftype_idx = local_type_idx;
-            local_type_idx += 1;
-            try inst_decls.append(a, .{ .@"export" = .{
-                .name = f.name,
-                .desc = .{ .func = ftype_idx },
-            } });
+                try inst_decls.append(a, .{ .type = .{ .func = ft } });
+                const ftype_idx = local_type_idx;
+                local_type_idx += 1;
+                try inst_decls.append(a, .{ .@"export" = .{
+                    .name = f.name,
+                    .desc = .{ .func = ftype_idx },
+                } });
+            }
         }
 
         const inst_type_idx = try b.addType(.{ .instance = .{
@@ -1902,6 +1950,66 @@ fn coreToCompValType(v: wtypes.ValType) ctypes.ValType {
         .f64 => .f64,
         else => .u32,
     };
+}
+
+/// Look up the canonical instance-body decls the embed declared
+/// for `ns` in its `component-type:<world>` custom section. Used
+/// by `buildEmbedExtraImports` (cataggar/wabt#228) so the wrapping
+/// component's import body preserves every Defined typedef the
+/// embed's FuncTypes reference via `type_idx`.
+///
+/// Searches both imports and exports in `embed_metadata.externs`;
+/// returns the matching extern's `inst_decls`, or null when no
+/// component-type section was decoded or the namespace isn't
+/// present.
+fn lookupEmbedExtraInstDecls(maybe_metadata: ?metadata_decode.DecodedWorld, ns: []const u8) ?[]const ctypes.Decl {
+    const md = maybe_metadata orelse return null;
+    for (md.externs) |ext| {
+        if (!std.mem.eql(u8, ext.qualified_name, ns)) continue;
+        if (ext.is_export) continue;
+        return ext.inst_decls;
+    }
+    return null;
+}
+
+/// An instance body is "alias-free" when none of its decls is an
+/// `.alias` decl. Such bodies are self-contained and can be cloned
+/// verbatim into a new component's arena without rebasing
+/// cross-iface `(alias outer 1 K)` references — the simple
+/// fast-path that `buildEmbedExtraImports` (cataggar/wabt#228)
+/// takes for user-defined ifaces without `use` clauses.
+///
+/// Bodies that DO contain aliases would need outer-scope rebasing
+/// (`component_new.rebaseInstDecls` does this for the
+/// shim/fixup path); supporting that here is a follow-up if a
+/// real input demands it. For now alias-bearing bodies fall back
+/// to the per-func synthesis path.
+fn isInstBodyAliasFree(decls: []const ctypes.Decl) bool {
+    for (decls) |d| if (d == .alias) return false;
+    return true;
+}
+
+/// Count the local-type-slot allocations in an instance-body decl
+/// list. Mirrors `world_gc.allocatesWorldBodyTypeSlot` semantics
+/// at depth 1: every `.type` / `.core_type` decl and every
+/// type-sort `.alias` (whether `instance_export` or `outer`)
+/// bumps the local type indexspace by one. Used to size the
+/// identity remap passed to `type_walk.cloneDecl` in
+/// `buildEmbedExtraImports`.
+fn countInstBodyTypeSlots(decls: []const ctypes.Decl) u32 {
+    var n: u32 = 0;
+    for (decls) |d| switch (d) {
+        .type, .core_type => n += 1,
+        .alias => |a| {
+            const sort: ctypes.Sort = switch (a) {
+                .instance_export => |ie| ie.sort,
+                .outer => |o| o.sort,
+            };
+            if (sort == .type) n += 1;
+        },
+        else => {},
+    };
+    return n;
 }
 
 /// Walk the embed's world body to find an exported func type by
@@ -2825,3 +2933,81 @@ test "augmentLiveMethodsByNamespaceWithEmbed: empty embed falls back to base unc
 }
 
 const metadata_encode_for_test = @import("../wit/metadata_encode.zig");
+
+test "splice #228: embed's iface body Defined() decls survive in wrapping component's import body" {
+    // Reproducer for cataggar/wabt#228.
+    //
+    // The embed's `component-type:<world>` custom section declares
+    // an import iface `docs:demo/api` whose `compute` func returns
+    // a `result<u32, u32>`. Pre-fix the splicer's
+    // `buildEmbedExtraImports` only emitted `Type(Func)` + `Export`
+    // decls per imported func, dropping the supporting
+    // `Type(Defined(Result))` typedef the FuncType's `type_idx`
+    // operand pointed at. The wrapping component then had the
+    // local-type-index of the Result-typedef out of bounds, and
+    // wasm-tools rejected with `unknown type N: type index out of
+    // bounds`.
+    //
+    // Post-fix the canonical-body path clones the embed's iface
+    // body verbatim (Defined Result + Func + Export), preserving
+    // every local type-slot operand. This test asserts the three
+    // canonical decls survive in the wrapping component's iface
+    // body in the right order with consistent local-type-idx refs.
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithExtraDefinedImport(a);
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Find the wrapping component's `docs:demo/api@0.1.0` import.
+    var maybe_inst_idx: ?u32 = null;
+    for (comp.imports) |im| {
+        if (std.mem.eql(u8, im.name, test_fixtures.EXTRA_DEFINED_NAMESPACE)) {
+            try testing.expect(im.desc == .instance);
+            maybe_inst_idx = im.desc.instance;
+        }
+    }
+    try testing.expect(maybe_inst_idx != null);
+
+    const contrib = comp.type_indexspace[maybe_inst_idx.?];
+    try testing.expect(contrib == .type_def);
+    const td = comp.types[contrib.type_def];
+    try testing.expect(td == .instance);
+
+    // The iface body must carry the full canonical shape:
+    //   [0] Type(Defined Result)
+    //   [1] Type(Func)
+    //   [2] Export "compute" desc=.func=<slot pointing at [1]>
+    //
+    // And the Func's results=Unnamed(Type(0)) must resolve to the
+    // Defined Result at slot 0 (NOT dangle past the body's local
+    // type-index range).
+    const decls = td.instance.decls;
+    try testing.expectEqual(@as(usize, 3), decls.len);
+
+    // decl[0]: Defined Result typedef.
+    try testing.expect(decls[0] == .type);
+    try testing.expect(decls[0].type == .result);
+
+    // decl[1]: Func typedef whose result type is `Unnamed(Type(0))`.
+    try testing.expect(decls[1] == .type);
+    try testing.expect(decls[1].type == .func);
+    const ft = decls[1].type.func;
+    try testing.expect(ft.results == .unnamed);
+    try testing.expect(ft.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 0), ft.results.unnamed.type_idx);
+
+    // decl[2]: Export "compute" pointing at the Func at slot 1.
+    try testing.expect(decls[2] == .@"export");
+    const e = decls[2].@"export";
+    try testing.expectEqualStrings("compute", e.name);
+    try testing.expect(e.desc == .func);
+    try testing.expectEqual(@as(u32, 1), e.desc.func);
+}
