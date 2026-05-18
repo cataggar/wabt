@@ -83,38 +83,139 @@ const Resolution = struct {
     unresolved: []const compose.Conflict,
 };
 
+/// One observation of a wasi:* outer-extern name across any source.
+/// Carries just the `(pkg, version)` pair — `ns` is implicitly
+/// "wasi" (the only namespace `--align-wasi` rewrites) and `iface`
+/// is not needed because alignment is applied at the package level.
+///
+/// `collectWasiObservations` walks every source's outer imports and
+/// exports and emits an entry per matching name. The resulting
+/// slice may contain duplicates (multiple sources reaching the same
+/// name) — `resolveRules` dedupes per `(pkg, target_version)`.
+pub const WasiObservation = struct {
+    pkg: []const u8,
+    version: []const u8,
+};
+
+/// Collect every wasi:* outer extern-name observation across the
+/// consumer + each provider. Used by `resolveRules` to know which
+/// wasi packages the composed output references, so
+/// `--align-wasi=...` can rewrite every reference rather than only
+/// those that happen to conflict across sources (cataggar/wabt#226).
+pub fn collectWasiObservations(
+    arena: std.mem.Allocator,
+    consumer: *const ctypes.Component,
+    providers: []const *const ctypes.Component,
+) ![]const WasiObservation {
+    var out = std.ArrayListUnmanaged(WasiObservation).empty;
+
+    const observe = struct {
+        fn run(
+            ar: std.mem.Allocator,
+            list: *std.ArrayListUnmanaged(WasiObservation),
+            name: []const u8,
+        ) !void {
+            const parts = extern_name.parse(name) orelse return;
+            if (!std.mem.eql(u8, parts.ns, "wasi")) return;
+            const ver = parts.version orelse return;
+            try list.append(ar, .{ .pkg = parts.pkg, .version = ver });
+        }
+    }.run;
+
+    for (consumer.imports) |imp| try observe(arena, &out, imp.name);
+    for (consumer.exports) |exp| try observe(arena, &out, exp.name);
+    for (providers) |p| {
+        for (p.imports) |imp| try observe(arena, &out, imp.name);
+        for (p.exports) |exp| try observe(arena, &out, exp.name);
+    }
+
+    return out.toOwnedSlice(arena);
+}
+
+/// Pick the lowest semver across `observations`. Used by
+/// `--align-wasi=auto` to converge every wasi:* reference on the
+/// single lowest version any source observed — broader than the
+/// previous per-conflict lowest, matching the user-intent of #226
+/// (auto = "normalize every wasi:* reference to the lowest seen").
+///
+/// Caller must ensure `observations.len > 0`.
+fn lowestObservedVersion(observations: []const WasiObservation) []const u8 {
+    var best: []const u8 = observations[0].version;
+    var best_sv: ?extern_name.SemVer = extern_name.SemVer.parse(best);
+    for (observations[1..]) |o| {
+        const sv = extern_name.SemVer.parse(o.version) orelse continue;
+        if (best_sv) |b| {
+            if (sv.cmp(b) < 0) {
+                best = o.version;
+                best_sv = sv;
+            }
+        } else {
+            best = o.version;
+            best_sv = sv;
+        }
+    }
+    return best;
+}
+
 /// Combine `--align-wasi` + `--rewrite-import` settings with the
-/// observed conflicts to produce a rule list (passed to
-/// `rewrite_extern_names.apply`) and an unresolved-conflicts list (if
-/// non-empty, the caller emits a diagnostic and refuses to compose).
+/// observed conflicts + every wasi:* outer-name observation to
+/// produce a rule list (passed to `rewrite_extern_names.apply`) and
+/// an unresolved-conflicts list (if non-empty, the caller emits a
+/// diagnostic and refuses to compose).
+///
+/// `wasi_observations` is the union of every wasi:* outer-name
+/// reference seen across consumer + providers (including
+/// single-occurrence names). In `.target` / `.auto` modes the
+/// emitted rule list covers every distinct `(wasi, pkg)` pair in
+/// the observation list — so non-conflicting wasi:* names align
+/// alongside conflicting ones (cataggar/wabt#226).
 fn resolveRules(
     arena: std.mem.Allocator,
     conflicts: []const compose.Conflict,
+    wasi_observations: []const WasiObservation,
     align_wasi: AlignWasi,
     explicit_rewrites: []const ExplicitRewrite,
 ) !Resolution {
     var rules_list = std.ArrayListUnmanaged(extern_name.Rule).empty;
     var unresolved = std.ArrayListUnmanaged(compose.Conflict).empty;
 
+    // ── Pass 1: target/auto-mode wasi alignment over EVERY observed
+    //    wasi:* package (not just conflict groups). Pre-#226 this
+    //    pass only handled groups that `detectVersionConflicts`
+    //    reported, which silently skipped single-occurrence
+    //    mis-versioned names — leaving e.g. `wasi:http/types@0.2.10`
+    //    untouched in a `--align-wasi=0.2.6` run when only the
+    //    provider imported it.
+    var wasi_pkg_seen = std.StringHashMapUnmanaged(void).empty;
+    defer wasi_pkg_seen.deinit(arena);
+    const align_target: ?[]const u8 = switch (align_wasi) {
+        .error_default => null,
+        .target => |v| v,
+        .auto => if (wasi_observations.len == 0) null else lowestObservedVersion(wasi_observations),
+    };
+    if (align_target) |target| {
+        for (wasi_observations) |o| {
+            const gop = try wasi_pkg_seen.getOrPut(arena, o.pkg);
+            if (gop.found_existing) continue;
+            try rules_list.append(arena, .{
+                .ns = "wasi",
+                .pkg = o.pkg,
+                .to_version = target,
+            });
+        }
+    }
+
+    // ── Pass 2: per-conflict handling for namespaces NOT covered
+    //    above. wasi:* conflicts are already covered by pass 1 in
+    //    target/auto modes; in error_default mode they fall through
+    //    here and surface in `unresolved` so the caller can render
+    //    a diagnostic.
     for (conflicts) |c| {
-        const wasi_handled = std.mem.eql(u8, c.ns, "wasi") and switch (align_wasi) {
+        const wasi_handled_by_pass1 = std.mem.eql(u8, c.ns, "wasi") and switch (align_wasi) {
             .error_default => false,
             .target, .auto => true,
         };
-        if (wasi_handled) {
-            const target = switch (align_wasi) {
-                .target => |v| v,
-                .auto => lowestVersion(c.occurrences),
-                .error_default => unreachable,
-            };
-            try rules_list.append(arena, .{
-                .ns = c.ns,
-                .pkg = c.pkg,
-                .iface = c.iface,
-                .to_version = target,
-            });
-            continue;
-        }
+        if (wasi_handled_by_pass1) continue;
 
         var matched_explicit = false;
         for (explicit_rewrites) |er| {
@@ -291,8 +392,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     for (provider_asts, 0..) |*p, idx| provider_ptrs[idx] = p;
 
     const conflicts = try compose.detectVersionConflicts(pa, &consumer_ast, provider_ptrs);
+    const wasi_observations = try collectWasiObservations(pa, &consumer_ast, provider_ptrs);
 
-    const resolution = try resolveRules(pa, conflicts, align_wasi, explicit_rewrites.items);
+    const resolution = try resolveRules(pa, conflicts, wasi_observations, align_wasi, explicit_rewrites.items);
 
     if (resolution.unresolved.len > 0) {
         printConflictDiagnostic(
@@ -1998,12 +2100,16 @@ test "resolveRules: default error mode leaves wasi conflicts unresolved" {
     const conflicts = [_]compose.Conflict{
         .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
     };
-    const res = try resolveRules(ar, &conflicts, .error_default, &.{});
+    const obs = [_]WasiObservation{
+        .{ .pkg = "io", .version = "0.2.6" },
+        .{ .pkg = "io", .version = "0.2.10" },
+    };
+    const res = try resolveRules(ar, &conflicts, &obs, .error_default, &.{});
     try testing.expectEqual(@as(usize, 0), res.rules.len);
     try testing.expectEqual(@as(usize, 1), res.unresolved.len);
 }
 
-test "resolveRules: --align-wasi=<X> rewrites every wasi conflict to X" {
+test "resolveRules: --align-wasi=<X> rewrites every wasi package to X (#226)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -2020,14 +2126,23 @@ test "resolveRules: --align-wasi=<X> rewrites every wasi conflict to X" {
         .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs1 },
         .{ .ns = "wasi", .pkg = "io", .iface = "streams", .occurrences = &occs2 },
     };
-    const res = try resolveRules(ar, &conflicts, .{ .target = "0.2.6" }, &.{});
-    try testing.expectEqual(@as(usize, 2), res.rules.len);
+    const obs = [_]WasiObservation{
+        .{ .pkg = "io", .version = "0.2.6" },
+        .{ .pkg = "io", .version = "0.2.10" },
+    };
+    // Post-#226: pkg-level rules — one Rule per unique (wasi, pkg)
+    // covers every iface under that pkg, regardless of whether the
+    // iface conflicted across sources.
+    const res = try resolveRules(ar, &conflicts, &obs, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 1), res.rules.len);
     try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+    try testing.expectEqualStrings("wasi", res.rules[0].ns);
+    try testing.expectEqualStrings("io", res.rules[0].pkg);
+    try testing.expect(res.rules[0].iface == null);
     try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
-    try testing.expectEqualStrings("0.2.6", res.rules[1].to_version);
 }
 
-test "resolveRules: --align-wasi=auto picks lowest per conflict" {
+test "resolveRules: --align-wasi=auto picks global lowest across observations (#226)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -2039,7 +2154,11 @@ test "resolveRules: --align-wasi=auto picks lowest per conflict" {
     const conflicts = [_]compose.Conflict{
         .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
     };
-    const res = try resolveRules(ar, &conflicts, .auto, &.{});
+    const obs = [_]WasiObservation{
+        .{ .pkg = "io", .version = "0.2.10" },
+        .{ .pkg = "io", .version = "0.2.6" },
+    };
+    const res = try resolveRules(ar, &conflicts, &obs, .auto, &.{});
     try testing.expectEqual(@as(usize, 1), res.rules.len);
     try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
     try testing.expectEqual(@as(usize, 0), res.unresolved.len);
@@ -2066,7 +2185,7 @@ test "resolveRules: --rewrite-import handles non-wasi conflicts" {
             .to = "0.2.0",
         },
     };
-    const res = try resolveRules(ar, &conflicts, .error_default, &explicit);
+    const res = try resolveRules(ar, &conflicts, &.{}, .error_default, &explicit);
     try testing.expectEqual(@as(usize, 1), res.rules.len);
     try testing.expectEqual(@as(usize, 0), res.unresolved.len);
     try testing.expectEqualStrings("0.2.0", res.rules[0].to_version);
@@ -2087,9 +2206,66 @@ test "resolveRules: non-wasi conflict without explicit rewrite stays unresolved"
         .{ .ns = "azure", .pkg = "codegen", .iface = "models", .occurrences = &occs },
     };
     // --align-wasi=auto does NOT cover non-wasi namespaces.
-    const res = try resolveRules(ar, &conflicts, .auto, &.{});
+    const res = try resolveRules(ar, &conflicts, &.{}, .auto, &.{});
     try testing.expectEqual(@as(usize, 0), res.rules.len);
     try testing.expectEqual(@as(usize, 1), res.unresolved.len);
+}
+
+test "resolveRules: --align-wasi=<X> rewrites single-occurrence non-conflicting wasi name (#226)" {
+    // The user-facing #226 case: only the provider imports
+    // `wasi:http/types@0.2.10`; the consumer never references it.
+    // `detectVersionConflicts` produces ZERO conflicts (single
+    // occurrence). Pre-#226 `--align-wasi=0.2.6` skipped this name
+    // and left the composed output at 0.2.10, breaking wasmtime
+    // 44.0.1 (which has wasi:http@0.2.6). Post-#226 the global
+    // observation walk catches it and emits a `wasi:http` → 0.2.6
+    // rule.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const obs = [_]WasiObservation{
+        .{ .pkg = "http", .version = "0.2.10" },
+    };
+    const res = try resolveRules(ar, &.{}, &obs, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 1), res.rules.len);
+    try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+    try testing.expectEqualStrings("wasi", res.rules[0].ns);
+    try testing.expectEqualStrings("http", res.rules[0].pkg);
+    try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
+}
+
+test "resolveRules: --align-wasi=<X> aligns mixed single-occurrence + conflicting wasi pkgs (#226)" {
+    // Combination case: one pkg with a conflict (wasi:io across
+    // consumer + provider), one pkg with only a single occurrence
+    // (wasi:http on the provider only). Both get pkg-level rules
+    // at the target version.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const occs = [_]compose.Occurrence{
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+    };
+    const conflicts = [_]compose.Conflict{
+        .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
+    };
+    const obs = [_]WasiObservation{
+        .{ .pkg = "io", .version = "0.2.6" },
+        .{ .pkg = "io", .version = "0.2.10" },
+        .{ .pkg = "http", .version = "0.2.10" },
+    };
+    const res = try resolveRules(ar, &conflicts, &obs, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 2), res.rules.len);
+    try testing.expectEqual(@as(usize, 0), res.unresolved.len);
+    // Both rules align to 0.2.6 — observation-encounter order
+    // determines iteration order (io first since it appears first
+    // in `obs`).
+    try testing.expectEqualStrings("io", res.rules[0].pkg);
+    try testing.expectEqualStrings("0.2.6", res.rules[0].to_version);
+    try testing.expectEqualStrings("http", res.rules[1].pkg);
+    try testing.expectEqualStrings("0.2.6", res.rules[1].to_version);
 }
 
 test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
@@ -2145,7 +2321,8 @@ test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
     try testing.expectEqual(@as(usize, 1), conflicts.len);
 
     // Resolve → align to 0.2.6.
-    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+    const obs = try collectWasiObservations(ar, &consumer_ast, &provider_ptrs);
+    const resolution = try resolveRules(ar, conflicts, obs, .{ .target = "0.2.6" }, &.{});
     try testing.expectEqual(@as(usize, 0), resolution.unresolved.len);
     try testing.expectEqual(@as(usize, 1), resolution.rules.len);
 
@@ -2171,6 +2348,87 @@ test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
 
     // No @0.2.10 reference should survive anywhere in the composed bytes.
     try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+}
+
+test "compose end-to-end: --align-wasi rewrites single-occurrence non-conflicting wasi name (#226)" {
+    // Reproducer for cataggar/wabt#226 in miniature.
+    //
+    // Pre-#226 `--align-wasi=<X>` only rewrote names that appeared
+    // in `detectVersionConflicts`'s output. A wasi:* name imported
+    // by only one side (e.g. `wasi:http/types@0.2.10` only on the
+    // provider) had no conflict to report, slipped past the rewrite
+    // pass, and bubbled up at its original version — leaving the
+    // composed component with mixed @0.2.6 / @0.2.10 wasi imports
+    // and a wasmtime link error.
+    //
+    // Post-#226 `collectWasiObservations` catches every wasi:*
+    // outer name regardless of conflict status; `resolveRules`
+    // emits a pkg-level rule for each.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Consumer imports wasi:io/error@0.2.6 only.
+    const cons_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
+    };
+    const cons_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const consumer: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &cons_types, .canons = &.{},
+        .imports = &cons_imports, .exports = &.{},
+    };
+    const consumer_bytes = try writer.encode(ar, &consumer);
+
+    // Provider imports wasi:http/types@0.2.10 (NOT mentioned by
+    // the consumer) — single occurrence, no conflict.
+    const prov_imports = [_]ctypes.ImportDecl{
+        .{ .name = "wasi:http/types@0.2.10", .desc = .{ .instance = 0 } },
+    };
+    const prov_types = [_]ctypes.TypeDef{
+        .{ .instance = .{ .decls = &.{} } },
+    };
+    const provider: ctypes.Component = .{
+        .core_modules = &.{}, .core_instances = &.{},
+        .core_types = &.{}, .components = &.{},
+        .instances = &.{}, .aliases = &.{},
+        .types = &prov_types, .canons = &.{},
+        .imports = &prov_imports, .exports = &.{},
+    };
+    const provider_bytes = try writer.encode(ar, &provider);
+
+    // detectVersionConflicts returns 0 conflicts — io/error and
+    // http/types are different ifaces, each seen only once.
+    const consumer_ast = try loader.load(consumer_bytes, ar);
+    const provider_ast = try loader.load(provider_bytes, ar);
+    const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
+    const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
+    try testing.expectEqual(@as(usize, 0), conflicts.len);
+
+    // resolveRules + observations gives us two pkg-level rules.
+    const obs = try collectWasiObservations(ar, &consumer_ast, &provider_ptrs);
+    const resolution = try resolveRules(ar, conflicts, obs, .{ .target = "0.2.6" }, &.{});
+    try testing.expectEqual(@as(usize, 2), resolution.rules.len);
+    try testing.expectEqual(@as(usize, 0), resolution.unresolved.len);
+
+    // Apply rewrites + compose.
+    const cb = try rewrite_extern_names.apply(ar, consumer_bytes, resolution.rules);
+    const pb = try rewrite_extern_names.apply(ar, provider_bytes, resolution.rules);
+    var providers_buf = [_][]const u8{pb};
+    const composed = try composeBinaries(testing.allocator, cb, providers_buf[0..]);
+    defer testing.allocator.free(composed);
+
+    // Critical assertion: NO @0.2.10 reference survives in the
+    // composed bytes — `wasi:http/types` was caught by the global
+    // observation walk and rewritten to @0.2.6 alongside the
+    // consumer's wasi:io/error.
+    try testing.expect(std.mem.indexOf(u8, composed, "@0.2.10") == null);
+    try testing.expect(std.mem.indexOf(u8, composed, "wasi:http/types@0.2.6") != null);
+    try testing.expect(std.mem.indexOf(u8, composed, "wasi:io/error@0.2.6") != null);
 }
 
 // ── #214: provider Instantiate args wired from wrapper outer-imports ───────
@@ -2305,7 +2563,8 @@ test "compose end-to-end: provider with mismatched wasi version composes after -
     const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
     const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
     try testing.expectEqual(@as(usize, 1), conflicts.len);
-    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+    const obs = try collectWasiObservations(ar, &consumer_ast, &provider_ptrs);
+    const resolution = try resolveRules(ar, conflicts, obs, .{ .target = "0.2.6" }, &.{});
     try testing.expectEqual(@as(usize, 0), resolution.unresolved.len);
 
     // Apply rewrites.
@@ -2943,7 +3202,8 @@ test "compose end-to-end: resource methods survive --align-wasi rewrite + compos
     const provider_ptrs = [_]*const ctypes.Component{&provider_ast};
     const conflicts = try compose.detectVersionConflicts(ar, &consumer_ast, &provider_ptrs);
     try testing.expectEqual(@as(usize, 1), conflicts.len);
-    const resolution = try resolveRules(ar, conflicts, .{ .target = "0.2.6" }, &.{});
+    const obs = try collectWasiObservations(ar, &consumer_ast, &provider_ptrs);
+    const resolution = try resolveRules(ar, conflicts, obs, .{ .target = "0.2.6" }, &.{});
 
     // Apply --align-wasi rewrite.
     const cb = try rewrite_extern_names.apply(ar, cb_orig, resolution.rules);
