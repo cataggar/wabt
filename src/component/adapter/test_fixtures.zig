@@ -116,6 +116,38 @@ pub const EXTRA_DEFINED_FUNC = "compute";
 pub const EXTRA_DEFINED_EMBED_CT_SECTION_NAME =
     "component-type:docs:demo@0.1.0:demo:encoded world";
 
+/// WIT for an embed that imports a non-WASI iface whose func sig
+/// needs the full set of canon-lower options (memory + realloc +
+/// string_encoding). Used by the #230 regression test to verify
+/// `buildEmbedExtraImports` routes funcs through the shim/fixup
+/// table so the lower can reference `main_inst`'s memory and
+/// `cabi_realloc` exports (which aren't aliasable before
+/// `main_inst` is instantiated — the cycle the shim/fixup pattern
+/// was designed to break).
+///
+/// `record singleton { a: u32 }` is a Defined typedef (so this
+/// fixture also exercises the #228 type-closure path). Its flat
+/// repr is a single `i32`, matching the embed's `(i32, i32) -> i32`
+/// core import sig — so the lowered shim trampoline shape lines up
+/// with what the embed declares and the result validates clean.
+const EXTRA_STRING_EMBED_WIT =
+    \\package docs:opts@0.1.0;
+    \\
+    \\interface api {
+    \\    record singleton { a: u32 }
+    \\    compute: func(s: string) -> singleton;
+    \\}
+    \\
+    \\world opts {
+    \\    import api;
+    \\}
+;
+
+pub const EXTRA_STRING_NAMESPACE = "docs:opts/api@0.1.0";
+pub const EXTRA_STRING_FUNC = "compute";
+pub const EXTRA_STRING_EMBED_CT_SECTION_NAME =
+    "component-type:docs:opts@0.1.0:opts:encoded world";
+
 pub const ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:command:encoded world";
 pub const REACTOR_ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:reactor:encoded world";
 pub const EMBED_CT_SECTION_NAME = "component-type:embed-mock";
@@ -929,6 +961,133 @@ pub fn buildSyntheticEmbedWithExtraDefinedImport(allocator: Allocator) ![]u8 {
     }
 
     try appendCustomSection(allocator, &out, EXTRA_DEFINED_EMBED_CT_SECTION_NAME, ct);
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a synthetic command-shape embed core wasm that imports a
+/// non-WASI namespace whose iface body declares a func needing
+/// canon-lower opts (memory + string_encoding). Regression fixture
+/// for cataggar/wabt#230 — see `EXTRA_STRING_EMBED_WIT`.
+///
+/// Imports:
+///   * `wasi_snapshot_preview1.fd_write`     (func, () -> i32)
+///   * `docs:opts/api@0.1.0.compute`         (func, (i32, i32) -> i32)
+///         — the canonical-ABI lowered form for
+///         `compute: func(s: string) -> singleton` with
+///         `record singleton { a: u32 }`.
+///
+/// Exports:
+///   * `_start`                              (func, () -> ())
+///   * `memory`                              (memory 0)
+///   * `cabi_realloc`                        (func, (i32,i32,i32,i32) -> i32)
+///         — needed so the wrapper can alias it for the
+///         `realloc` canon-opt on any embed-extra canon.lower.
+///         (compute itself doesn't actually need realloc — the
+///         result is flat — but having it lets the same fixture
+///         exercise a wider range of opt combinations.)
+///
+/// Carries a `component-type:docs:opts@0.1.0:opts:encoded world`
+/// custom section so the splicer's `embed_metadata` lookup
+/// recovers the canonical `compute` FuncType.
+pub fn buildSyntheticEmbedWithExtraStringImport(allocator: Allocator) ![]u8 {
+    const ct = try metadata_encode.encodeWorldFromSource(allocator, EXTRA_STRING_EMBED_WIT, "opts");
+    defer allocator.free(ct);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try writeMagic(allocator, &out);
+
+    // Type section: 4 types.
+    //   type 0: () -> i32 (preview1.fd_write)
+    //   type 1: () -> () (_start)
+    //   type 2: (i32, i32) -> i32 (compute, lowered form)
+    //   type 3: (i32, i32, i32, i32) -> i32 (cabi_realloc)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x04);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f });
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    // Import section: preview1.fd_write (type 0) + opts.api.compute (type 2).
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try writeName(allocator, &b, "wasi_snapshot_preview1");
+        try writeName(allocator, &b, PREVIEW1_EXPORT);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        try writeName(allocator, &b, EXTRA_STRING_NAMESPACE);
+        try writeName(allocator, &b, EXTRA_STRING_FUNC);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x02);
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // Function section: 2 defined funcs.
+    //   defined func 0: _start (type 1)
+    //   defined func 1: cabi_realloc (type 3)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x03);
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+
+    // Memory section: 1 memory (limits: min 0, no max)
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x00);
+        try writeSection(allocator, &out, 0x05, b.items);
+    }
+
+    // Export section: _start (defined func 0 = imports 0..1 + defined 0 = 2),
+    // memory (0), cabi_realloc (defined func 1 = imports + defined 1 = 3).
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x03);
+        try writeName(allocator, &b, "_start");
+        try b.appendSlice(allocator, &.{ 0x00, 0x02 });
+        try writeName(allocator, &b, "memory");
+        try b.appendSlice(allocator, &.{ 0x02, 0x00 });
+        try writeName(allocator, &b, "cabi_realloc");
+        try b.appendSlice(allocator, &.{ 0x00, 0x03 });
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // Code section: trivial bodies.
+    //   _start: i32.const 0; drop; end
+    //   cabi_realloc: i32.const 0; end (returns 0 ptr — fine since
+    //     the synthetic compute is never actually called in tests).
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        // body 0: _start
+        try b.append(allocator, 0x05);
+        try b.append(allocator, 0x00);
+        try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x1a, 0x0b });
+        // body 1: cabi_realloc
+        try b.append(allocator, 0x04);
+        try b.append(allocator, 0x00);
+        try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x0b });
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    try appendCustomSection(allocator, &out, EXTRA_STRING_EMBED_CT_SECTION_NAME, ct);
 
     return out.toOwnedSlice(allocator);
 }

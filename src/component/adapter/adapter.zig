@@ -54,6 +54,7 @@ pub const SpliceError = error{
     AdapterMissingRunExport,
     AdapterMissingPreview1Export,
     EmbedMissingRequiredExport,
+    EmbedMissingCabiRealloc,
     AdapterMissingReallocExport,
     FuncNotFound,
     NotAFuncExport,
@@ -191,11 +192,36 @@ pub fn splice(
     const buckets = try classifyAdapterImports(a, adapter_owned.interface, world, hoisted);
     const indirect_slots = try collectIndirectSlots(a, buckets);
 
-    var all_slots = try a.alloc(shim.Slot, preview1_slots.len + indirect_slots.len);
+    // Embed-extra slots (cataggar/wabt#230). One slot per func the
+    // embed imports from a non-WASI, non-`env`, non-`__main_module__`
+    // namespace. Their shim trampolines are appended after the
+    // primary's indirect slots; the fixup module's table-population
+    // pass canon.lowers each one with opts referencing main_inst's
+    // memory + cabi_realloc.
+    const embed_extra_slot_infos = try collectEmbedExtraSlotInfos(
+        a,
+        embed_owned.interface,
+        embed_metadata,
+        embed_world,
+        adapter_name,
+        &.{},
+    );
+    const embed_extra_slot_base: u32 = @intCast(preview1_slots.len + indirect_slots.len);
+
+    var all_slots = try a.alloc(shim.Slot, preview1_slots.len + indirect_slots.len + embed_extra_slot_infos.len);
     for (preview1_slots, 0..) |p1, i| {
         all_slots[i] = .{ .params = p1.params, .results = p1.results };
     }
-    @memcpy(all_slots[preview1_slots.len..], indirect_slots);
+    @memcpy(all_slots[preview1_slots.len..][0..indirect_slots.len], indirect_slots);
+    for (embed_extra_slot_infos, 0..) |info, i| {
+        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = &.{} };
+        const ftr = abi.FuncTypeRef{ .func = info.func_type, .resolver = resolver };
+        const lowered = try abi.lowerCoreSig(a, ftr);
+        all_slots[preview1_slots.len + indirect_slots.len + i] = .{
+            .params = lowered.params,
+            .results = lowered.results,
+        };
+    }
 
     // ── Phase B: build shim + fixup core modules ──────────────────────────
     const shim_bytes = try shim.build(a, all_slots);
@@ -219,6 +245,8 @@ pub fn splice(
         .buckets = buckets,
         .shape = detectShape(adapter_owned.interface),
         .embed_metadata = embed_metadata,
+        .embed_extra_slot_infos = embed_extra_slot_infos,
+        .embed_extra_slot_base = embed_extra_slot_base,
     });
 }
 
@@ -343,7 +371,26 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
     }
 
     // ── Phase B: build shim + fixup with the COMBINED slot table ───────────
-    var all_slots = try a.alloc(shim.Slot, preview1_slots.len + total_secondary_slots + indirect_slots.len);
+    //
+    // Slot layout:
+    //   [0..P)              primary preview1
+    //   [P..P+ΣS)           per-secondary bare exports
+    //   [P+ΣS..P+ΣS+I)      primary indirect WASI imports (canon.lowered)
+    //   [P+ΣS+I..P+ΣS+I+E)  embed-extra non-WASI imports
+    //                       (canon.lowered, cataggar/wabt#230)
+    const secondary_names = try a.alloc([]const u8, secondary_inputs.len);
+    for (secondary_inputs, secondary_names) |sin, *out_name| out_name.* = sin.name;
+    const embed_extra_slot_infos = try collectEmbedExtraSlotInfos(
+        a,
+        embed_owned.interface,
+        embed_metadata,
+        embed_world,
+        primary.name,
+        secondary_names,
+    );
+    const embed_extra_slot_base: u32 = @intCast(preview1_slots.len + total_secondary_slots + indirect_slots.len);
+
+    var all_slots = try a.alloc(shim.Slot, preview1_slots.len + total_secondary_slots + indirect_slots.len + embed_extra_slot_infos.len);
     for (preview1_slots, 0..) |p1, i| {
         all_slots[i] = .{ .params = p1.params, .results = p1.results };
     }
@@ -356,7 +403,16 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
             }
         }
     }
-    @memcpy(all_slots[preview1_slots.len + total_secondary_slots ..], indirect_slots);
+    @memcpy(all_slots[preview1_slots.len + total_secondary_slots ..][0..indirect_slots.len], indirect_slots);
+    for (embed_extra_slot_infos, 0..) |info, i| {
+        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = &.{} };
+        const ftr = abi.FuncTypeRef{ .func = info.func_type, .resolver = resolver };
+        const lowered = try abi.lowerCoreSig(a, ftr);
+        all_slots[embed_extra_slot_base + i] = .{
+            .params = lowered.params,
+            .results = lowered.results,
+        };
+    }
 
     const shim_bytes = try shim.build(a, all_slots);
     const fixup_bytes = try fixup.build(a, all_slots);
@@ -380,6 +436,8 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
         .shape = detectShape(primary_owned.interface),
         .secondaries = secondary_inputs,
         .embed_metadata = embed_metadata,
+        .embed_extra_slot_infos = embed_extra_slot_infos,
+        .embed_extra_slot_base = embed_extra_slot_base,
     });
 }
 
@@ -922,6 +980,19 @@ const Inputs = struct {
     /// and one extra core module + core instance in the assembled
     /// component. Empty for the single-adapter case.
     secondaries: []const SecondaryInputs = &.{},
+    /// Embed-extra (non-WASI) import slot infos. Each entry maps
+    /// 1:1 to a shim slot at offset
+    /// `embed_extra_slot_base + i`. `assemble`'s fixup phase
+    /// emits one `canon.lower` per entry, with opts derived from
+    /// `info.opts` + `main_inst`'s memory/cabi_realloc aliases.
+    /// Cataggar/wabt#230 — routing embed-extras through the fixup
+    /// table avoids the forward-reference cycle between
+    /// `canon.lower(opts=...)` and `main_inst`.
+    embed_extra_slot_infos: []const EmbedExtraSlotInfo = &.{},
+    /// Global shim-table offset where this splice's embed-extra
+    /// slots start. Computed in `splice`/`spliceN` as
+    /// `preview1.len + Σ(secondaries) + indirect.len`.
+    embed_extra_slot_base: u32 = 0,
 };
 
 /// Adapter shape, mirroring the wit-component reference encoder's
@@ -1242,9 +1313,13 @@ fn assemble(in: Inputs) ![]u8 {
     // WASI adapter (e.g. `docs:adder/add@0.1.0` for the calculator
     // fixture). These don't go through the adapter — instead, lift
     // each module-level group to a top-level component instance
-    // import, alias each func, canon-lower it, and bundle into an
-    // inline-export instance the embed can consume directly.
-    const embed_extra_args = try buildEmbedExtraImports(&b, a, in);
+    // import, alias each func through the shim's trampoline table
+    // (so the fixup module can canon.lower with proper opts after
+    // main_inst is created — cataggar/wabt#230), and bundle the
+    // trampoline aliases into an inline-export instance the embed
+    // consumes directly.
+    var embed_extra_iface_inst_for_ns = std.StringHashMapUnmanaged(u32).empty;
+    const embed_extra_args = try buildEmbedExtraImports(&b, a, in, shim_inst, &embed_extra_iface_inst_for_ns);
 
     // ── Step 6: instantiate main with primary + secondaries + extras ─
     const main_args = try a.alloc(
@@ -1437,7 +1512,13 @@ fn assemble(in: Inputs) ![]u8 {
     } });
 
     // ── Step 10: fixup bundle ────────────────────────────────────────
-    // Realloc opt source if any indirect canon-lower needs it.
+    // Realloc opt sources. Two distinct sources:
+    //   * Indirect WASI canon.lowers run from inside the adapter's
+    //     code; they encode results into the *adapter*'s memory via
+    //     the adapter's `cabi_import_realloc`.
+    //   * Embed-extra canon.lowers run from inside main's code; they
+    //     encode results into *main*'s memory via main's
+    //     `cabi_realloc`. (cataggar/wabt#230)
     var any_realloc = false;
     for (in.buckets) |bk| for (bk.indirect_funcs) |idf| {
         if (idf.cls.opts.realloc) any_realloc = true;
@@ -1452,6 +1533,22 @@ fn assemble(in: Inputs) ![]u8 {
             .sort = .{ .core = .func },
             .instance_idx = adapter_inst,
             .name = "cabi_import_realloc",
+        } });
+    }
+
+    var any_main_realloc = false;
+    for (in.embed_extra_slot_infos) |info| {
+        if (info.opts.realloc) any_main_realloc = true;
+    }
+    var main_realloc_idx: u32 = 0;
+    if (any_main_realloc) {
+        if (in.embed_iface.findExport("cabi_realloc") == null) {
+            return error.EmbedMissingCabiRealloc;
+        }
+        main_realloc_idx = try b.addAlias(.{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = main_inst,
+            .name = "cabi_realloc",
         } });
     }
 
@@ -1532,6 +1629,35 @@ fn assemble(in: Inputs) ![]u8 {
                 indirect_idx += 1;
             }
         }
+    }
+
+    // Funcs P+ΣS+I..P+ΣS+I+E-1: canon lower(memory, [realloc],
+    // [string-encoding]) of each embed-extra non-WASI import.
+    // The lowered funcs use main_inst's memory + cabi_realloc so
+    // strings/lists they pass back land in the embed's memory.
+    // (cataggar/wabt#230 — pre-fix these were lowered with empty
+    // opts inside `buildEmbedExtraImports`, which validated only
+    // for primitive-only sigs; routing them through the fixup
+    // table breaks the forward-reference cycle.)
+    for (in.embed_extra_slot_infos, 0..) |info, i| {
+        const iface_inst_idx = embed_extra_iface_inst_for_ns.get(info.ns) orelse
+            return error.UnsupportedShape;
+        const f_idx = try b.addAlias(.{ .instance_export = .{
+            .sort = .func,
+            .instance_idx = iface_inst_idx,
+            .name = info.fn_name,
+        } });
+        const opts = try buildCanonLowerOpts(a, info.opts, memory_idx, main_realloc_idx);
+        const cf_idx = try b.addCanon(.{ .lower = .{
+            .func_idx = f_idx,
+            .opts = opts,
+        } });
+        const slot_total: u32 = in.embed_extra_slot_base + @as(u32, @intCast(i));
+        const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
+        try fixup_inline.append(a, .{
+            .name = slot_name,
+            .sort_idx = .{ .sort = .func, .idx = cf_idx },
+        });
     }
 
     const fixup_bundle_inst = try b.addCoreInstance(.{ .exports = try fixup_inline.toOwnedSlice(a) });
@@ -1778,6 +1904,114 @@ const EmbedExtraArg = struct {
     inst_idx: u32,
 };
 
+/// Per-func metadata for an embed-extra namespace import.
+///
+/// Precomputed in `splice()` / `spliceN()` so the slot order is
+/// stable across (a) the shim trampoline table built in Phase B,
+/// (b) `buildEmbedExtraImports`'s shim-trampoline alias loop, and
+/// (c) the fixup phase's `canon.lower` loop. The `i`th entry in
+/// `embed_extra_slot_infos` corresponds to shim slot
+/// `embed_extra_slot_base + i`.
+///
+/// Each slot ultimately carries one `canon.lower(func, opts)` that
+/// the fixup module writes into the shim's `$imports` table at that
+/// slot's offset (mirror of the WASI-indirect canon.lower routing
+/// in Step 10 of `assemble`). Routing embed-extras through the
+/// fixup table lets us emit the lower AFTER `main_inst`'s memory +
+/// `cabi_realloc` are aliased — required for any embed-extra func
+/// whose sig reaches `string`/`list`/records (cataggar/wabt#230).
+pub const EmbedExtraSlotInfo = struct {
+    ns: []const u8,
+    fn_name: []const u8,
+    /// FuncType the embed declared in its `component-type:<world>`
+    /// (or synthesized from the core wasm sig as a fallback).
+    func_type: ctypes.FuncType,
+    /// Classification opts derived from `func_type`.
+    opts: abi.FuncOpts,
+    /// Iface body decls (for the abi.TypeResolver — empty when the
+    /// embed lacks a component-type section).
+    inst_decls: []const ctypes.Decl,
+};
+
+/// Walk the embed's core imports for non-WASI, non-`env`,
+/// non-`__main_module__` namespaces. For each func, recover its
+/// component-level FuncType (from the embed's component-type
+/// custom section when present; synthesized primitive sig
+/// otherwise), classify it via `abi.classifyFunc`, and emit one
+/// `EmbedExtraSlotInfo`. Iteration order matches
+/// `buildEmbedExtraImports`'s ns-then-func walk so slot indices
+/// line up by position.
+fn collectEmbedExtraSlotInfos(
+    arena: Allocator,
+    embed_iface: core_imports.CoreInterface,
+    embed_metadata: ?metadata_decode.DecodedWorld,
+    embed_world: ?decode.AdapterWorld,
+    adapter_name: []const u8,
+    secondary_names: []const []const u8,
+) SpliceError![]const EmbedExtraSlotInfo {
+    var ns_names = std.ArrayListUnmanaged([]const u8).empty;
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(arena);
+
+    for (embed_iface.imports) |im| {
+        if (im.kind != .func) continue;
+        if (std.mem.eql(u8, im.module_name, adapter_name)) continue;
+        if (std.mem.eql(u8, im.module_name, "env")) continue;
+        if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
+        var is_secondary = false;
+        for (secondary_names) |sn| if (std.mem.eql(u8, sn, im.module_name)) {
+            is_secondary = true;
+            break;
+        };
+        if (is_secondary) continue;
+        const gop = try seen.getOrPut(arena, im.module_name);
+        if (!gop.found_existing) try ns_names.append(arena, im.module_name);
+    }
+
+    var out = std.ArrayListUnmanaged(EmbedExtraSlotInfo).empty;
+    for (ns_names.items) |ns| {
+        const canonical_decls = lookupEmbedExtraInstDecls(embed_metadata, ns) orelse &.{};
+        for (embed_iface.imports) |im| {
+            if (im.kind != .func) continue;
+            if (!std.mem.eql(u8, im.module_name, ns)) continue;
+            const sig = im.sig orelse continue;
+            const ft: ctypes.FuncType = lookupEmbedFuncType(embed_world, ns, im.field_name) orelse blk_ft: {
+                const params = try arena.alloc(ctypes.NamedValType, sig.params.len);
+                for (sig.params, 0..) |p, pi| {
+                    const pname = try std.fmt.allocPrint(arena, "p{d}", .{pi});
+                    params[pi] = .{ .name = pname, .type = coreToCompValType(p) };
+                }
+                const results: ctypes.FuncType.ResultList = if (sig.results.len == 0) .none else r: {
+                    if (sig.results.len == 1) {
+                        break :r .{ .unnamed = coreToCompValType(sig.results[0]) };
+                    }
+                    const named = try arena.alloc(ctypes.NamedValType, sig.results.len);
+                    for (sig.results, 0..) |r, ri| {
+                        const rname = try std.fmt.allocPrint(arena, "r{d}", .{ri});
+                        named[ri] = .{ .name = rname, .type = coreToCompValType(r) };
+                    }
+                    break :r .{ .named = named };
+                };
+                break :blk_ft .{ .params = params, .results = results };
+            };
+            const resolver = abi.TypeResolver{
+                .inst_decls = canonical_decls,
+                .world_decls = &.{},
+            };
+            const ftr = abi.FuncTypeRef{ .func = ft, .resolver = resolver };
+            const cls = abi.classifyFunc(ftr);
+            try out.append(arena, .{
+                .ns = ns,
+                .fn_name = im.field_name,
+                .func_type = ft,
+                .opts = cls.opts,
+                .inst_decls = canonical_decls,
+            });
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
 /// For each non-WASI-adapter module the embed imports, synthesize a
 /// top-level component instance import (with primitive-typed funcs
 /// derived from the core wasm sigs), canon-lower each func, and
@@ -1789,9 +2023,18 @@ const EmbedExtraArg = struct {
 /// this synthesis; for those the user should `wasm-tools component
 /// embed --world` first to embed a richer component-type and then
 /// use the no-adapter path.
-fn buildEmbedExtraImports(b: *Builder, a: Allocator, in: Inputs) SpliceError![]const EmbedExtraArg {
-    // Collect distinct namespaces in declaration order, excluding
-    // the adapter and the env / __main_module__ "alias" namespaces.
+fn buildEmbedExtraImports(
+    b: *Builder,
+    a: Allocator,
+    in: Inputs,
+    shim_inst: u32,
+    iface_inst_idx_for_ns: *std.StringHashMapUnmanaged(u32),
+) SpliceError![]const EmbedExtraArg {
+    // Collect distinct namespaces in declaration order, mirroring
+    // `collectEmbedExtraSlotInfos`'s filter (skip primary adapter,
+    // env, __main_module__, and any secondary adapter name). The
+    // slot infos in `in.embed_extra_slot_infos` are emitted in
+    // this exact namespace+func order.
     var ns_names = std.ArrayListUnmanaged([]const u8).empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(a);
@@ -1801,6 +2044,12 @@ fn buildEmbedExtraImports(b: *Builder, a: Allocator, in: Inputs) SpliceError![]c
         if (std.mem.eql(u8, im.module_name, in.adapter_name)) continue;
         if (std.mem.eql(u8, im.module_name, "env")) continue;
         if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
+        var is_secondary = false;
+        for (in.secondaries) |sec| if (std.mem.eql(u8, sec.name, im.module_name)) {
+            is_secondary = true;
+            break;
+        };
+        if (is_secondary) continue;
         const gop = try seen.getOrPut(a, im.module_name);
         if (!gop.found_existing) try ns_names.append(a, im.module_name);
     }
@@ -1809,8 +2058,14 @@ fn buildEmbedExtraImports(b: *Builder, a: Allocator, in: Inputs) SpliceError![]c
 
     var out = std.ArrayListUnmanaged(EmbedExtraArg).empty;
 
+    // Cumulative func position into `in.embed_extra_slot_infos` —
+    // matches the same iteration order. Used to map per-func shim
+    // slot indices.
+    var slot_cursor: usize = 0;
+
     for (ns_names.items) |ns| {
-        // Gather funcs in this namespace.
+        // Gather funcs in this namespace (declaration order
+        // within the namespace; same order as the slot infos).
         var funcs = std.ArrayListUnmanaged(struct {
             name: []const u8,
             sig: core_imports.FuncSig,
@@ -1915,25 +2170,31 @@ fn buildEmbedExtraImports(b: *Builder, a: Allocator, in: Inputs) SpliceError![]c
             .name = ns,
             .desc = .{ .instance = inst_type_idx },
         });
+        try iface_inst_idx_for_ns.put(a, ns, imp_inst_idx);
 
-        // For each func: alias from the imported instance, canon
-        // lower (no opts — primitives only).
+        // For each func: alias the shim trampoline at this func's
+        // slot in the global shim table (`embed_extra_slot_base +
+        // slot_cursor`). The fixup module patches each trampoline
+        // with the canon-lowered func emitted in Step 10.
+        // (cataggar/wabt#230 — routing embed-extra funcs through
+        // the fixup table lets canon.lower reference
+        // `main.memory` + `main.cabi_realloc`, which aren't
+        // available before `main_inst` is instantiated below.)
         var inline_exps = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
-        for (funcs.items) |f| {
-            const fn_idx = try b.addAlias(.{ .instance_export = .{
-                .sort = .func,
-                .instance_idx = imp_inst_idx,
-                .name = f.name,
-            } });
-            const cf_idx = try b.addCanon(.{ .lower = .{
-                .func_idx = fn_idx,
-                .opts = &.{},
+        for (funcs.items, 0..) |f, fi| {
+            const slot_total: u32 = @intCast(in.embed_extra_slot_base + slot_cursor + fi);
+            const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
+            const f_idx = try b.addAlias(.{ .instance_export = .{
+                .sort = .{ .core = .func },
+                .instance_idx = shim_inst,
+                .name = slot_name,
             } });
             try inline_exps.append(a, .{
                 .name = f.name,
-                .sort_idx = .{ .sort = .func, .idx = cf_idx },
+                .sort_idx = .{ .sort = .func, .idx = f_idx },
             });
         }
+        slot_cursor += funcs.items.len;
 
         const bundle_inst = try b.addCoreInstance(.{ .exports = try inline_exps.toOwnedSlice(a) });
         try out.append(a, .{ .name = ns, .inst_idx = bundle_inst });
@@ -3010,4 +3271,80 @@ test "splice #228: embed's iface body Defined() decls survive in wrapping compon
     try testing.expectEqualStrings("compute", e.name);
     try testing.expect(e.desc == .func);
     try testing.expectEqual(@as(u32, 1), e.desc.func);
+}
+
+test "splice #230: embed-extra canon.lower carries memory + string_encoding opts for string-using sigs" {
+    // Regression for cataggar/wabt#230.
+    //
+    // Pre-fix `buildEmbedExtraImports` emitted `canon.lower` with
+    // `opts = &.{}` BEFORE `main_inst` was created — so even when
+    // the embed-extra func sig needed `memory` / `realloc` /
+    // `string-encoding` opts, those refs couldn't be wired
+    // (forward-reference cycle). The resulting comp.wasm failed
+    // `wasm-tools validate` at the canon-lower site for any func
+    // whose sig reached `string`/`list`/records.
+    //
+    // Post-fix embed-extra funcs route through the existing
+    // shim/fixup table (mirror of the WASI-indirect path). The
+    // fixup phase emits `canon.lower` AFTER `main_inst`'s memory
+    // + `cabi_realloc` aliases are available, so the lower carries
+    // the right opts.
+    //
+    // The fixture's `compute: func(s: string) -> singleton`
+    // (where `record singleton { a: u32 }`) classifies as needing
+    // memory + string_encoding (string param) but not realloc
+    // (result is flat). The shim/fixup routing is exercised
+    // regardless — every embed-extra func goes through the table
+    // post-#230, with opts derived per func.
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithExtraStringImport(a);
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Find the canon.lower for compute. Its opts list must include
+    // `memory` and `string_encoding`. (Realloc is NOT expected for
+    // this sig — the singleton record flat-returns as i32.)
+    var saw_lower_with_opts = false;
+    for (comp.canons) |c| switch (c) {
+        .lower => |l| {
+            var has_memory = false;
+            var has_string_encoding = false;
+            for (l.opts) |o| switch (o) {
+                .memory => has_memory = true,
+                .string_encoding => has_string_encoding = true,
+                else => {},
+            };
+            if (has_memory and has_string_encoding) saw_lower_with_opts = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_lower_with_opts);
+
+    // The wrapping component's `docs:opts/api` import body is
+    // alias-free + canonical (carries the `record singleton`
+    // Defined typedef — also covers the #228 type-closure path
+    // for the string-using case).
+    var saw_record_decl = false;
+    for (comp.imports) |im| {
+        if (!std.mem.eql(u8, im.name, test_fixtures.EXTRA_STRING_NAMESPACE)) continue;
+        const contrib = comp.type_indexspace[im.desc.instance];
+        if (contrib != .type_def) continue;
+        const td = comp.types[contrib.type_def];
+        if (td != .instance) continue;
+        for (td.instance.decls) |d| switch (d) {
+            .type => |tt| if (tt == .record) {
+                saw_record_decl = true;
+            },
+            else => {},
+        };
+    }
+    try testing.expect(saw_record_decl);
 }
