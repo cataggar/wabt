@@ -49,6 +49,7 @@ pub fn build(b: *std.Build) void {
         "src/tools/component_embed.zig",
         "src/tools/component_new.zig",
         "src/tools/component_compose.zig",
+        "src/tools/component_objdump.zig",
         // Subject dispatchers (added by #137 — six conceptual roots).
         "src/tools/text.zig",
         "src/tools/module.zig",
@@ -308,6 +309,25 @@ pub fn build(b: *std.Build) void {
         wabt_unknown.addArg("not-a-real-subcommand");
         wabt_unknown.expectExitCode(1);
         test_step.dependOn(&wabt_unknown.step);
+
+        // #232 — `wabt component objdump <component>` exits 0 and
+        // produces the expected summary header; `wabt module objdump`
+        // rejects the component preamble with the redirect message
+        // (and non-zero exit) instead of `error.InvalidVersion`.
+        const objdump_ok = b.addRunArtifact(wabt_exe);
+        objdump_ok.addArgs(&.{ "component", "objdump", "src/component/fixtures/stdio-echo.wasm" });
+        objdump_ok.expectExitCode(0);
+        objdump_ok.expectStdOutMatch("wabt component objdump:");
+        objdump_ok.expectStdOutMatch("Section order:");
+        objdump_ok.expectStdOutMatch("Core modules:");
+        objdump_ok.expectStdOutMatch("Component imports:");
+        test_step.dependOn(&objdump_ok.step);
+
+        const module_objdump_redirect = b.addRunArtifact(wabt_exe);
+        module_objdump_redirect.addArgs(&.{ "module", "objdump", "src/component/fixtures/stdio-echo.wasm" });
+        module_objdump_redirect.expectExitCode(1);
+        module_objdump_redirect.expectStdErrMatch("wabt component objdump");
+        test_step.dependOn(&module_objdump_redirect.step);
 
         // ── #185: leaf `help` subword + rejected -h / --help flags ──
         //
