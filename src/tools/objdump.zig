@@ -1,6 +1,8 @@
 const std = @import("std");
 const wabt = @import("wabt");
 
+const component_objdump = @import("component_objdump.zig");
+
 pub const usage =
     \\Usage: wabt module objdump [options] <file.wasm>
     \\
@@ -77,6 +79,14 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
     defer alloc.free(source);
+
+    if (component_objdump.looksLikeComponent(source)) {
+        std.debug.print(
+            "error: this looks like a Component Model binary — try `wabt component objdump`\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
 
     const output = dump(alloc, source) catch |err| {
         std.debug.print("error: {any}\n", .{err});
