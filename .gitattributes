@@ -8,3 +8,6 @@
 *.tsv text
 *.wasm binary
 *.wast binary
+
+# Parser test fixture with intentional mixed CR/LF line endings; keep bytes exact.
+test/parse/bad-crlf.txt -text

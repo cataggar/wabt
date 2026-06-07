@@ -951,7 +951,7 @@ const Parser = struct {
         meta.type_refs = self.collected_type_refs.toOwnedSlice(self.allocator) catch &.{};
         try module.type_meta.append(self.allocator, meta);
     }
-
+
     /// Scan a GC composite type body for type reference validation and duplicate field names.
     /// Consumes tokens up to (but not including) the closing ')' of the type form.
     fn scanGcTypeRefs(self: *Parser) void {
