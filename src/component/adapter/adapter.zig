@@ -214,7 +214,7 @@ pub fn splice(
     }
     @memcpy(all_slots[preview1_slots.len..][0..indirect_slots.len], indirect_slots);
     for (embed_extra_slot_infos, 0..) |info, i| {
-        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = &.{} };
+        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = info.world_decls };
         const ftr = abi.FuncTypeRef{ .func = info.func_type, .resolver = resolver };
         const lowered = try abi.lowerCoreSig(a, ftr);
         all_slots[preview1_slots.len + indirect_slots.len + i] = .{
@@ -405,7 +405,7 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
     }
     @memcpy(all_slots[preview1_slots.len + total_secondary_slots ..][0..indirect_slots.len], indirect_slots);
     for (embed_extra_slot_infos, 0..) |info, i| {
-        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = &.{} };
+        const resolver = abi.TypeResolver{ .inst_decls = info.inst_decls, .world_decls = info.world_decls };
         const ftr = abi.FuncTypeRef{ .func = info.func_type, .resolver = resolver };
         const lowered = try abi.lowerCoreSig(a, ftr);
         all_slots[embed_extra_slot_base + i] = .{
@@ -1931,6 +1931,13 @@ pub const EmbedExtraSlotInfo = struct {
     /// Iface body decls (for the abi.TypeResolver — empty when the
     /// embed lacks a component-type section).
     inst_decls: []const ctypes.Decl,
+    /// The embed's encoded world body decls — the outer scope the
+    /// `abi.TypeResolver` walks to resolve cross-iface `(alias outer
+    /// 1 K)` references (e.g. `wasi:http/outgoing-handler.handle`
+    /// reaching `error-code` in `wasi:http/types`). Without it the
+    /// resolver falls back to scalar-handle and drops required
+    /// canon-lower opts like `realloc` (cataggar/wabt#234).
+    world_decls: []const ctypes.Decl,
 };
 
 /// Walk the embed's core imports for non-WASI, non-`env`,
@@ -1949,6 +1956,7 @@ fn collectEmbedExtraSlotInfos(
     adapter_name: []const u8,
     secondary_names: []const []const u8,
 ) SpliceError![]const EmbedExtraSlotInfo {
+    const md_world_decls: []const ctypes.Decl = if (embed_metadata) |md| md.world_decls else &.{};
     var ns_names = std.ArrayListUnmanaged([]const u8).empty;
     var seen = std.StringHashMapUnmanaged(void).empty;
     defer seen.deinit(arena);
@@ -1996,7 +2004,7 @@ fn collectEmbedExtraSlotInfos(
             };
             const resolver = abi.TypeResolver{
                 .inst_decls = canonical_decls,
-                .world_decls = &.{},
+                .world_decls = md_world_decls,
             };
             const ftr = abi.FuncTypeRef{ .func = ft, .resolver = resolver };
             const cls = abi.classifyFunc(ftr);
@@ -2006,6 +2014,7 @@ fn collectEmbedExtraSlotInfos(
                 .func_type = ft,
                 .opts = cls.opts,
                 .inst_decls = canonical_decls,
+                .world_decls = md_world_decls,
             });
         }
     }
@@ -2056,6 +2065,25 @@ fn buildEmbedExtraImports(
 
     if (ns_names.items.len == 0) return &.{};
 
+    // Pre-pass: when a provider namespace's instance body is pruned to
+    // just its own imported funcs, type-exports consumed only by a
+    // *sibling* namespace's body (e.g. `wasi:http/outgoing-handler`'s
+    // `handle` references `request-options` / `outgoing-request` /
+    // `future-incoming-response` / `error-code` from `wasi:http/types`)
+    // would be dropped, leaving the sibling's rebased
+    // `alias instance-export` pointing at a missing export. Collect
+    // those cross-iface type needs up front, keyed by provider
+    // namespace, and feed them into each body's prune as extra live
+    // type-exports.
+    var cross_needs = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+    if (in.embed_metadata) |md| {
+        const tables = try buildWorldTypeTables(a, md.world_decls);
+        for (ns_names.items) |ns| {
+            const cbody = lookupEmbedExtraInstDecls(in.embed_metadata, ns) orelse continue;
+            try collectCrossIfaceTypeNeeds(a, tables, cbody, &cross_needs);
+        }
+    }
+
     var out = std.ArrayListUnmanaged(EmbedExtraArg).empty;
 
     // Cumulative func position into `in.embed_extra_slot_infos` —
@@ -2099,6 +2127,15 @@ fn buildEmbedExtraImports(
         //     fall back to the original per-func synthesis path
         //     which builds a primitive-only body from the core
         //     wasm sigs.
+        // Namespaces the adapter-hoisted world already imports (e.g.
+        // wasi:io/poll / wasi:io/streams, which the preview1 adapter
+        // imports for its own preview2 calls) must NOT be re-imported
+        // here — a second top-level import of the same name makes the
+        // component invalid ("import name conflicts"). Reuse the
+        // hoisted instance; the embed's own core imports for these
+        // funcs are still satisfied below via the shim/fixup bundle,
+        // whose canon.lower aliases each func from this shared instance.
+        const imp_inst_idx: u32 = if (findInstanceSlot(in.hoisted, ns)) |hslot| hslot.instance_idx else blk_imp: {
         var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
         const canonical_inst_decls = lookupEmbedExtraInstDecls(in.embed_metadata, ns);
         // Prune the canonical body down to just the funcs the embed
@@ -2115,16 +2152,38 @@ fn buildEmbedExtraImports(
         const pruned_inst_decls: ?[]const ctypes.Decl = if (canonical_inst_decls) |decls| blk: {
             const method_names = try a.alloc([]const u8, funcs.items.len);
             for (funcs.items, 0..) |f, fi| method_names[fi] = f.name;
-            break :blk world_gc.gcInstanceBody(a, decls, method_names, &.{}) catch null;
+            const extra_type_exports: []const []const u8 = if (cross_needs.get(ns)) |list|
+                list.items
+            else
+                &.{};
+            break :blk world_gc.gcInstanceBody(a, decls, method_names, extra_type_exports) catch null;
         } else null;
         const canonical_body = pruned_inst_decls orelse canonical_inst_decls;
-        const used_canonical = canonical_body != null and
+        const alias_free = canonical_body != null and
             isInstBodyAliasFree(canonical_body.?);
-        if (used_canonical) {
+        // When the pruned canonical body is self-contained except for
+        // cross-iface `(alias outer 1 K)` references (e.g.
+        // wasi:http/types pulling `pollable` from wasi:io/poll and
+        // `input-stream` from wasi:io/streams via `use`), rebase those
+        // aliases onto the wrapping component's matching imported
+        // instances and use the canonical body anyway. Without this
+        // the namespace falls to the per-func synthesis fallback,
+        // which drops the `Type(Defined(...))` decls the func sigs
+        // reference and emits dangling local `type_idx` operands —
+        // the `unknown type N: type index out of bounds` failure
+        // wasmtime rejects (cataggar/wabt#234).
+        const rebased_body: ?[]const ctypes.Decl = if (canonical_body != null and !alias_free)
+            (rebaseCanonicalInstBody(b, a, in, canonical_body.?, iface_inst_idx_for_ns) catch null)
+        else
+            null;
+        const final_canonical: ?[]const ctypes.Decl = if (alias_free) canonical_body else rebased_body;
+        if (final_canonical) |decls| {
             // Identity remap: `gcInstanceBody` already renumbered the
             // pruned body's local type-slot layout consistently, so
             // each `type_idx` operand still resolves to its Defined.
-            const decls = canonical_body.?;
+            // Any cross-iface `(alias outer 1 K)` decls were rewritten
+            // by `rebaseCanonicalInstBody` to point at fresh top-level
+            // type slots; `cloneDecl` leaves those `outer` idxs verbatim.
             const slot_count = countInstBodyTypeSlots(decls);
             const identity_remap = try a.alloc(u32, @max(slot_count, 1));
             for (identity_remap, 0..) |*x, i| x.* = @intCast(i);
@@ -2182,10 +2241,11 @@ fn buildEmbedExtraImports(
         const inst_type_idx = try b.addType(.{ .instance = .{
             .decls = try inst_decls.toOwnedSlice(a),
         } });
-        const imp_inst_idx = try b.addImport(.{
+        break :blk_imp try b.addImport(.{
             .name = ns,
             .desc = .{ .instance = inst_type_idx },
         });
+        };
         try iface_inst_idx_for_ns.put(a, ns, imp_inst_idx);
 
         // For each func: alias the shim trampoline at this func's
@@ -2264,6 +2324,162 @@ fn lookupEmbedExtraInstDecls(maybe_metadata: ?metadata_decode.DecodedWorld, ns: 
 fn isInstBodyAliasFree(decls: []const ctypes.Decl) bool {
     for (decls) |d| if (d == .alias) return false;
     return true;
+}
+
+/// Classification of a type-allocating world-body slot, used to
+/// rebase cross-iface `(alias outer 1 K)` references inside
+/// embed-extra instance bodies.
+const WorldTypeKind = union(enum) {
+    /// Slot K is an `alias instance-export sort=type inst=I name=N`
+    /// — type `N` exported by world-import instance `I`.
+    alias_instance_export: struct { world_inst_idx: u32, name: []const u8 },
+    other,
+};
+
+/// World-body resolution tables derived from the embed metadata's
+/// encoded world body: `inst_qname[I]` is the namespace of the
+/// world-body instance import/export at instance index `I`;
+/// `type_kind[K]` classifies the K-th type-allocating world-body slot.
+const WorldTypeTables = struct {
+    inst_qname: []const []const u8,
+    type_kind: []const WorldTypeKind,
+};
+
+fn buildWorldTypeTables(a: Allocator, world_decls: []const ctypes.Decl) !WorldTypeTables {
+    var inst_qname = std.ArrayListUnmanaged([]const u8).empty;
+    var type_kind = std.ArrayListUnmanaged(WorldTypeKind).empty;
+    for (world_decls) |d| switch (d) {
+        .type, .core_type => try type_kind.append(a, .other),
+        .alias => |al| switch (al) {
+            .instance_export => |ie| if (ie.sort == .type) try type_kind.append(a, .{
+                .alias_instance_export = .{ .world_inst_idx = ie.instance_idx, .name = ie.name },
+            }),
+            .outer => |o| if (o.sort == .type) try type_kind.append(a, .other),
+        },
+        .import => |im| switch (im.desc) {
+            .instance => try inst_qname.append(a, im.name),
+            else => {},
+        },
+        .@"export" => |e| switch (e.desc) {
+            .instance => try inst_qname.append(a, e.name),
+            else => {},
+        },
+    };
+    return .{
+        .inst_qname = try inst_qname.toOwnedSlice(a),
+        .type_kind = try type_kind.toOwnedSlice(a),
+    };
+}
+
+/// Rebase the cross-iface `(alias outer 1 K)` decls in an embed-extra
+/// instance-type body onto the wrapping component's matching imported
+/// instances, returning a new body that is valid to emit as a
+/// top-level instance type. Each such alias references a type slot K
+/// in the embed metadata's world body that resolves to an
+/// `alias instance-export sort=type inst=I name=N` — i.e. type `N`
+/// exported by world-import instance `I`. We find the wrapping
+/// component's instance for `I`'s namespace (adapter-hoisted or
+/// embed-extra), emit a fresh top-level
+/// `alias instance-export sort=type instance=<idx> name=N` via `b`,
+/// and rewrite the body's `(alias outer 1 K)` to
+/// `(alias outer 1 <new-top-level-type-slot>)`. Mirrors
+/// `component_new.rebaseInstDecls`.
+///
+/// Returns `null` (caller falls back) when the metadata is absent or
+/// any alias target can't be resolved to an imported instance.
+fn rebaseCanonicalInstBody(
+    b: *Builder,
+    a: Allocator,
+    in: Inputs,
+    body: []const ctypes.Decl,
+    iface_inst_idx_for_ns: *std.StringHashMapUnmanaged(u32),
+) !?[]const ctypes.Decl {
+    const md = in.embed_metadata orelse return null;
+    const tables = try buildWorldTypeTables(a, md.world_decls);
+
+    const out = try a.alloc(ctypes.Decl, body.len);
+    for (body, 0..) |d, i| {
+        switch (d) {
+            .alias => |al| switch (al) {
+                .outer => |o| {
+                    if (o.sort != .type or o.outer_count != 1) return null;
+                    if (o.idx >= tables.type_kind.len) return null;
+                    switch (tables.type_kind[o.idx]) {
+                        .alias_instance_export => |ie| {
+                            if (ie.world_inst_idx >= tables.inst_qname.len) return null;
+                            const src_ns = tables.inst_qname[ie.world_inst_idx];
+                            const inst_idx: u32 = if (findInstanceSlot(in.hoisted, src_ns)) |slot|
+                                slot.instance_idx
+                            else if (iface_inst_idx_for_ns.get(src_ns)) |idx|
+                                idx
+                            else
+                                return null;
+                            const new_slot = try b.addAlias(.{ .instance_export = .{
+                                .sort = .type,
+                                .instance_idx = inst_idx,
+                                .name = ie.name,
+                            } });
+                            out[i] = .{ .alias = .{ .outer = .{
+                                .sort = .type,
+                                .outer_count = 1,
+                                .idx = new_slot,
+                            } } };
+                        },
+                        .other => return null,
+                    }
+                },
+                // A body-level `alias instance-export` would reference
+                // the world's instance indexspace, not reconstructed
+                // here; bail to the fallback rather than mis-encode.
+                .instance_export => return null,
+            },
+            else => out[i] = d,
+        }
+    }
+    return out;
+}
+
+/// For an embed-extra instance body, collect the names of the
+/// type-exports it imports from OTHER namespaces via cross-iface
+/// `(alias outer 1 K)` decls, grouping them by the source namespace.
+/// Appends into `needs` (keyed by source namespace). Used so that
+/// when a provider namespace's body is pruned to its own live funcs,
+/// the type-exports consumed by sibling bodies (e.g.
+/// `wasi:http/outgoing-handler.handle` needing `request-options`,
+/// `outgoing-request`, … from `wasi:http/types`) are retained.
+fn collectCrossIfaceTypeNeeds(
+    a: Allocator,
+    tables: WorldTypeTables,
+    body: []const ctypes.Decl,
+    needs: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+) !void {
+    for (body) |d| {
+        const o = switch (d) {
+            .alias => |al| switch (al) {
+                .outer => |outer| outer,
+                else => continue,
+            },
+            else => continue,
+        };
+        if (o.sort != .type or o.outer_count != 1) continue;
+        if (o.idx >= tables.type_kind.len) continue;
+        switch (tables.type_kind[o.idx]) {
+            .alias_instance_export => |ie| {
+                if (ie.world_inst_idx >= tables.inst_qname.len) continue;
+                const src_ns = tables.inst_qname[ie.world_inst_idx];
+                const gop = try needs.getOrPut(a, src_ns);
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                // Dedup.
+                var present = false;
+                for (gop.value_ptr.items) |n| if (std.mem.eql(u8, n, ie.name)) {
+                    present = true;
+                    break;
+                };
+                if (!present) try gop.value_ptr.append(a, ie.name);
+            },
+            .other => {},
+        }
+    }
 }
 
 /// Count the local-type-slot allocations in an instance-body decl
@@ -2359,8 +2575,6 @@ fn resolveTypeIdxAtTopLevel(decls: []const ctypes.Decl, target: u32) ?ctypes.Typ
     };
     return null;
 }
-
-
 
 /// Synthesize a tiny core module that exports trapping versions of
 /// every `__main_module__.<name>` import the adapter requires that
@@ -2516,17 +2730,29 @@ fn reallocViaMemoryGrowBody() [51]u8 {
         // locals: 1 group of 1 i32
         0x01, 0x01, 0x7f,
         // assert old_ptr (local 0) == 0
-        0x41, 0x00, 0x20, 0x00, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        0x41, 0x00, 0x20,
+        0x00, 0x47, 0x04,
+        0x40, 0x00, 0x0b,
         // assert old_len (local 1) == 0
-        0x41, 0x00, 0x20, 0x01, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        0x41, 0x00, 0x20,
+        0x01, 0x47, 0x04,
+        0x40, 0x00, 0x0b,
         // assert new_len (local 3) == 65536
-        0x41, 0x80, 0x80, 0x04, 0x20, 0x03, 0x47, 0x04, 0x40, 0x00, 0x0b,
+        0x41, 0x80, 0x80,
+        0x04, 0x20, 0x03,
+        0x47, 0x04, 0x40,
+        0x00, 0x0b,
         // memory.grow 0 → local.tee 4
-        0x41, 0x01, 0x40, 0x00, 0x22, 0x04,
+        0x41,
+        0x01, 0x40, 0x00,
+        0x22, 0x04,
         // check grow result == -1 → unreachable
-        0x41, 0x7f, 0x46, 0x04, 0x40, 0x00, 0x0b,
+        0x41,
+        0x7f, 0x46, 0x04,
+        0x40, 0x00, 0x0b,
         // return local.get 4 << 16
-        0x20, 0x04, 0x41, 0x10, 0x74,
+        0x20, 0x04, 0x41,
+        0x10, 0x74,
         0x0b, // function end
     };
 }
@@ -2967,17 +3193,18 @@ test "splice: rejects a reactor-shaped adapter that imports __main_module__" {
     // body 1 (cabi_import_realloc): i32.const 0; end
     try ad.appendSlice(a, &.{
         0x0a, 0x10, 0x02,
-        0x09, 0x00, 0x10, 0x00, 0x10, 0x01, 0x1a, 0x41, 0x00, 0x0b,
-        0x04, 0x00, 0x41, 0x00, 0x0b,
+        0x09, 0x00, 0x10,
+        0x00, 0x10, 0x01,
+        0x1a, 0x41, 0x00,
+        0x0b, 0x04, 0x00,
+        0x41, 0x00, 0x0b,
     });
 
     // Encoded-world custom section — splice() parses this early, so
     // we must supply one even though the test will reject the shape
     // before it's used.
     const metadata_encode = @import("../wit/metadata_encode.zig");
-    const ct = try metadata_encode.encodeWorldFromSource(a,
-        "package wasi:cli@0.1.0;\ninterface stdout { flush: func() -> u32; }\nworld reactor { import stdout; }",
-        "reactor");
+    const ct = try metadata_encode.encodeWorldFromSource(a, "package wasi:cli@0.1.0;\ninterface stdout { flush: func() -> u32; }\nworld reactor { import stdout; }", "reactor");
     defer a.free(ct);
 
     const sec_name = "component-type:wasi:cli@0.1.0:reactor:encoded world";
@@ -3049,16 +3276,19 @@ test "spliceMany: rejects two adapters with non-env imports" {
         // Type section: () -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // Import section: __main_module__.x — func type 0
-        0x02, 0x15, 0x01,
-        15, '_', '_', 'm', 'a', 'i', 'n', '_', 'm', 'o', 'd', 'u', 'l', 'e', '_', '_',
-        1,  'x',
-        0x00, 0x00,
+        0x02, 0x15,
+        0x01, 15,   '_',  '_',  'm',  'a',  'i',  'n',
+        '_',  'm',  'o',  'd',  'u',  'l',  'e',  '_',
+        '_',  1,    'x',  0x00, 0x00,
         // Function section: 1 defined func, type 0
-        0x03, 0x02, 0x01, 0x00,
+        0x03, 0x02, 0x01,
+        0x00,
         // Export section: bare-name "thing" -> func 1
-        0x07, 0x09, 0x01, 5, 't', 'h', 'i', 'n', 'g', 0x00, 0x01,
+        0x07, 0x09, 0x01, 5,    't',  'h',  'i',
+        'n',  'g',  0x00, 0x01,
         // Code section: empty body (just end)
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x0a, 0x04, 0x01, 0x02,
+        0x00, 0x0b,
     };
 
     const adapters = [_]Adapter{
