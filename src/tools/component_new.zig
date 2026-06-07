@@ -500,7 +500,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     for (import_shapes.items) |shape| {
         const resolver = wabt.component.adapter.abi.TypeResolver{
             .inst_decls = shape.inst_decls,
-            .world_decls = &.{},
+            .world_decls = decoded.world_decls,
         };
         for (shape.funcs) |fn_ref| {
             const ftr = wabt.component.adapter.abi.FuncTypeRef{
@@ -1059,13 +1059,13 @@ fn buildComponentShimFixup(
     //    core signature. A func is "wired" (gets a canon.lower +
     //    shim slot) iff its body lift would be valid — i.e. its sig
     //    doesn't reach types that the instance-type body's alias
-    //    decls bind. For #203 minimum scope we just call
-    //    classifyFunc with an empty world_decls; the resolver
-    //    falls back to scalar-handle for any unresolvable type idx,
-    //    which is the correct ABI shape for resource handles but
-    //    silently wrong for outer-aliased compound types. The
-    //    follow-up that wires cross-iface refs into the body also
-    //    flips this to a hard skip.
+    //    decls bind. The resolver is seeded with the decoded world
+    //    decls so outer-aliased compound types (e.g. a cross-iface
+    //    `use`d `error-code` variant) resolve to their real
+    //    definition; otherwise they'd fall back to scalar-handle and
+    //    silently drop required canon-lower opts like `realloc`
+    //    (#234). Genuinely unresolvable idxs still fall back to the
+    //    scalar-handle shape, which is correct for resource handles.
     const WiredFunc = struct {
         fn_ref: metadata_decode.FuncRef,
         opts: abi.FuncOpts,
@@ -1078,7 +1078,7 @@ fn buildComponentShimFixup(
         var list = std.ArrayListUnmanaged(WiredFunc).empty;
         const resolver = abi.TypeResolver{
             .inst_decls = shape.inst_decls,
-            .world_decls = &.{},
+            .world_decls = decoded.world_decls,
         };
         for (shape.funcs) |fn_ref| {
             const ftr = abi.FuncTypeRef{ .func = fn_ref.sig, .resolver = resolver };
@@ -1339,6 +1339,14 @@ fn buildComponentShimFixup(
     try core_instances.append(ar, .{ .instantiate = .{ .module_idx = 1, .args = &.{} } });
     const shim_inst_idx: u32 = @intCast(core_instances.items.len - 1);
 
+    // Emit the shim instance as its own core-instance section now, so
+    // the stub aliases that follow (which reference it) validate
+    // against an already-defined core instance. The writer emits
+    // sections strictly in `order` sequence, so a single core-instance
+    // section at the end would place every instance *after* the alias
+    // sections that name them — invalid (#234).
+    try order.append(ar, .{ .kind = .core_instance, .start = shim_inst_idx, .count = 1 });
+
     // Step 2: alias the shim's N stubs by name ("0","1",…) as core
     // funcs. These become the source funcs for the per-shape
     // bundles that satisfy main's `(with …)` args.
@@ -1389,6 +1397,15 @@ fn buildComponentShimFixup(
         .args = try bundle_for_main_args.toOwnedSlice(ar),
     } });
     const main_core_inst_idx: u32 = @intCast(core_instances.items.len - 1);
+
+    // Flush the per-shape bundles + main instance as a core-instance
+    // section before the memory/realloc aliases (Phase 4d) and the
+    // `$imports` table alias (Phase 4e) that reference them (#234).
+    try order.append(ar, .{
+        .kind = .core_instance,
+        .start = shim_inst_idx + 1,
+        .count = main_core_inst_idx - shim_inst_idx,
+    });
 
     // ── Phase 4d: alias `memory` + `cabi_realloc` from main —
     //    these are the canon.lower opts targets.
@@ -1475,10 +1492,14 @@ fn buildComponentShimFixup(
         } });
     }
 
+    // Final core-instance section: the fixup-args bundle + fixup
+    // instance (Phase 4g). It follows the canon.lower section (Phase
+    // 4f) because the fixup args reference the lowered core funcs, and
+    // follows the `$imports` alias (Phase 4e) (#234).
     try order.append(ar, .{
         .kind = .core_instance,
-        .start = 0,
-        .count = @intCast(core_instances.items.len),
+        .start = main_core_inst_idx + 1,
+        .count = @as(u32, @intCast(core_instances.items.len)) - (main_core_inst_idx + 1),
     });
 
     // ── Phase 5: export-side. Mirrors the #202 fast path: walk

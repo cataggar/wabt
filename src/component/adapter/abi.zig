@@ -112,7 +112,102 @@ pub const TypeResolver = struct {
     pub fn resolveWorld(self: TypeResolver, idx: u32) ?ctypes.TypeDef {
         return resolveTypeIdxIn(self.world_decls, idx, &.{});
     }
+
+    /// Like `resolveLocal`, but also reports the decls scope in which
+    /// the resolved `TypeDef`'s own child `type_idx` references live.
+    /// When a `type_idx` resolves across an interface boundary (via an
+    /// `alias instance-export` into another imported interface's
+    /// body), the resolved type's children are numbered in *that*
+    /// interface's type-index space — so flattening them requires
+    /// rebasing the resolver onto the returned scope. Failing to
+    /// rebase silently drops nested `string`/`list` content and the
+    /// canon-lower opts (`realloc`/`string-encoding`) that go with it
+    /// (#234).
+    pub fn resolveLocalScoped(self: TypeResolver, idx: u32) ?ResolvedType {
+        return resolveTypeIdxInScoped(self.inst_decls, idx, self.world_decls);
+    }
 };
+
+/// A resolved `TypeDef` together with the decls scope its child
+/// `type_idx` references must be interpreted in.
+pub const ResolvedType = struct {
+    td: ctypes.TypeDef,
+    inst_decls: []const ctypes.Decl,
+};
+
+fn resolveTypeIdxInScoped(
+    decls: []const ctypes.Decl,
+    target: u32,
+    outer_decls: []const ctypes.Decl,
+) ?ResolvedType {
+    var cursor: u32 = 0;
+    for (decls) |d| {
+        switch (d) {
+            .type => |td| {
+                if (cursor == target) return .{ .td = td, .inst_decls = decls };
+                cursor += 1;
+            },
+            .core_type => cursor += 1,
+            .alias => |a| {
+                const sort: ctypes.Sort = switch (a) {
+                    .instance_export => |ie| ie.sort,
+                    .outer => |o| o.sort,
+                };
+                if (sort == .type) {
+                    if (cursor == target) return resolveAliasScoped(a, outer_decls);
+                    cursor += 1;
+                }
+            },
+            .@"export" => |e| switch (e.desc) {
+                .type => |bound| {
+                    if (cursor == target) return resolveTypeBoundScoped(bound, decls, outer_decls);
+                    cursor += 1;
+                },
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+fn resolveAliasScoped(a: ctypes.Alias, outer_decls: []const ctypes.Decl) ?ResolvedType {
+    return switch (a) {
+        .outer => |o| if (o.sort == .type)
+            resolveTypeIdxInScoped(outer_decls, o.idx, outer_decls)
+        else
+            null,
+        .instance_export => |ie| resolveInstanceTypeExportScoped(outer_decls, ie.instance_idx, ie.name),
+    };
+}
+
+fn resolveInstanceTypeExportScoped(
+    world_decls: []const ctypes.Decl,
+    instance_idx: u32,
+    name: []const u8,
+) ?ResolvedType {
+    const inst_decls = findInstanceBodyAtIdx(world_decls, instance_idx) orelse return null;
+    for (inst_decls) |d| switch (d) {
+        .@"export" => |e| {
+            if (e.desc != .type) continue;
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            return resolveTypeBoundScoped(e.desc.type, inst_decls, world_decls);
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn resolveTypeBoundScoped(
+    bound: ctypes.TypeBound,
+    decls: []const ctypes.Decl,
+    outer_decls: []const ctypes.Decl,
+) ?ResolvedType {
+    return switch (bound) {
+        .eq => |idx| resolveTypeIdxInScoped(decls, idx, outer_decls),
+        .sub_resource => ResolvedType{ .td = .{ .resource = .{} }, .inst_decls = decls },
+    };
+}
 
 /// Walk `decls` (instance or world body) and return the `TypeDef` at
 /// type-indexspace position `target`, following outer aliases into
@@ -309,10 +404,7 @@ fn flattenInner(vt: ctypes.ValType, resolver: TypeResolver, depth: u32) FlatInfo
             // list always flattens to (ptr, len) regardless of
             // element. Element walk only needed to propagate
             // contains_string.
-            const elem_info = if (resolver.resolveLocal(idx)) |td|
-                flattenTypeDef(td, resolver, depth + 1)
-            else
-                FlatInfo{ .flat = 1 };
+            const elem_info = resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 1 });
             break :blk .{
                 .flat = 2,
                 .needs_memory = true,
@@ -320,38 +412,29 @@ fn flattenInner(vt: ctypes.ValType, resolver: TypeResolver, depth: u32) FlatInfo
                 .contains_string = elem_info.contains_string,
             };
         },
-        .type_idx => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            // Likely an outer alias to a resource — treat as i32 handle.
-            .{ .flat = 1 },
-        .record => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 1 },
-        .variant => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 2 },
-        .tuple => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 1 },
-        .flags => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 1 },
+        // Likely an outer alias to a resource — treat as i32 handle.
+        .type_idx => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 1 }),
+        .record => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 1 }),
+        .variant => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 2 }),
+        .tuple => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 1 }),
+        .flags => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 1 }),
         .enum_ => .{ .flat = 1 },
-        .option => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 2 },
-        .result => |idx| if (resolver.resolveLocal(idx)) |td|
-            flattenTypeDef(td, resolver, depth + 1)
-        else
-            .{ .flat = 2 },
+        .option => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 2 }),
+        .result => |idx| resolveAndFlatten(idx, resolver, depth, FlatInfo{ .flat = 2 }),
     };
 }
+
+/// Resolve `idx` in `resolver`'s scope and flatten the resulting
+/// `TypeDef`, rebasing the resolver onto the scope the resolved type
+/// lives in (so cross-interface `type_idx` children resolve correctly,
+/// #234). Falls back to `unresolved` when `idx` can't be resolved
+/// (e.g. a bare outer alias to a resource → scalar handle).
+fn resolveAndFlatten(idx: u32, resolver: TypeResolver, depth: u32, unresolved: FlatInfo) FlatInfo {
+    const r = resolver.resolveLocalScoped(idx) orelse return unresolved;
+    const sub = TypeResolver{ .inst_decls = r.inst_decls, .world_decls = resolver.world_decls };
+    return flattenTypeDef(r.td, sub, depth + 1);
+}
+
 
 fn flattenTypeDef(td: ctypes.TypeDef, resolver: TypeResolver, depth: u32) FlatInfo {
     return switch (td) {
@@ -614,8 +697,9 @@ fn flattenSlots(
         .option,
         .result,
         => |idx| {
-            if (resolver.resolveLocal(idx)) |td| {
-                try flattenTypeDefSlots(arena, td, resolver, depth + 1, out);
+            if (resolver.resolveLocalScoped(idx)) |r| {
+                const sub = TypeResolver{ .inst_decls = r.inst_decls, .world_decls = resolver.world_decls };
+                try flattenTypeDefSlots(arena, r.td, sub, depth + 1, out);
             } else {
                 // Unresolvable (likely outer-aliased resource handle).
                 // Default depends on the leaf shape.
@@ -929,6 +1013,79 @@ test "classifyFunc: () -> own<resource> is direct (handle is i32)" {
     try testing.expectEqual(Class.direct, cls.class);
     try testing.expect(!cls.opts.memory);
     try testing.expectEqual(@as(u32, 1), cls.results_flat);
+}
+
+test "classifyFunc #234: cross-iface result whose nested string lives in another iface's scope needs realloc" {
+    // Regression for cataggar/wabt#234. Interface B's `make` returns a
+    // variant `err` that B pulls in via `use A.{err};`. `err`'s only
+    // string content is NESTED inside an `option<string>` case payload
+    // whose `type_idx` is numbered in A's local type space. Classifying
+    // `make` must rebase the resolver onto A's scope when it crosses the
+    // `use` boundary — otherwise the nested string is missed and the
+    // canon-lower `realloc` opt is dropped (the `canonical option
+    // realloc is required` validation failure).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Interface A body:
+    //   slot 0: .type option<string>
+    //   slot 1: .type variant { "boom"(type_idx 0) }
+    //   slot 2: .export "err" (type (eq 1))
+    const a_decls = try a.alloc(ctypes.Decl, 3);
+    a_decls[0] = .{ .type = .{ .option = .{ .inner = .string } } };
+    const cases = try a.alloc(ctypes.Case, 1);
+    cases[0] = .{ .name = "boom", .type = .{ .type_idx = 0 } };
+    a_decls[1] = .{ .type = .{ .variant = .{ .cases = cases } } };
+    a_decls[2] = .{ .@"export" = .{ .name = "err", .desc = .{ .type = .{ .eq = 1 } } } };
+
+    // Interface B body:
+    //   slot 0: .alias outer (type 1 <world-slot 1>)   ← `use A.{err}`
+    //   slot 1: .export "err" (type (eq 0))
+    //   slot 2: .type func () -> type_idx 1
+    //   .export "make" (func 2)
+    const b_decls = try a.alloc(ctypes.Decl, 4);
+    b_decls[0] = .{ .alias = .{ .outer = .{ .sort = .type, .outer_count = 1, .idx = 1 } } };
+    b_decls[1] = .{ .@"export" = .{ .name = "err", .desc = .{ .type = .{ .eq = 0 } } } };
+    b_decls[2] = .{ .type = .{ .func = .{
+        .params = &.{},
+        .results = .{ .unnamed = .{ .type_idx = 1 } },
+    } } };
+    b_decls[3] = .{ .@"export" = .{ .name = "make", .desc = .{ .func = 2 } } };
+
+    const a_inst = try a.create(ctypes.TypeDef);
+    a_inst.* = .{ .instance = .{ .decls = a_decls } };
+    const b_inst = try a.create(ctypes.TypeDef);
+    b_inst.* = .{ .instance = .{ .decls = b_decls } };
+
+    // World body:
+    //   decls[0]: .type instance A        (world type slot 0)
+    //   decls[1]: .import "mock:a/a" (instance 0)
+    //   decls[2]: .alias inst-export type inst=0 "err"  (world type slot 1)
+    //   decls[3]: .type instance B        (world type slot 2)
+    //   decls[4]: .import "mock:b/b" (instance 1)
+    const decls = try a.alloc(ctypes.Decl, 5);
+    decls[0] = .{ .type = a_inst.* };
+    decls[1] = .{ .import = .{ .name = "mock:a/a@0.1.0", .desc = .{ .instance = 0 } } };
+    decls[2] = .{ .alias = .{ .instance_export = .{ .sort = .type, .instance_idx = 0, .name = "err" } } };
+    decls[3] = .{ .type = b_inst.* };
+    decls[4] = .{ .import = .{ .name = "mock:b/b@0.1.0", .desc = .{ .instance = 2 } } };
+
+    const w = decode.AdapterWorld{
+        .component = undefined,
+        .body_decls = decls,
+        .body_type_count = 3,
+        .imports = &.{},
+        .exports = &.{},
+        .world_qualified_name = "mock:abi/abi-mock@0.1.0",
+    };
+
+    // B's instance type is at world type slot 2.
+    const ftr = try findFuncImport(w, 2, "make");
+    const cls = classifyFunc(ftr);
+    try testing.expect(cls.opts.memory);
+    try testing.expect(cls.opts.realloc);
+    try testing.expect(cls.opts.string_encoding);
 }
 
 test "lowerCoreSig: option<u32> result becomes ret-ptr (i32) -> ()" {

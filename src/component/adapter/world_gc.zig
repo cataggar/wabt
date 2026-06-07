@@ -519,7 +519,7 @@ const InstBodyMeta = struct {
 
 /// GC the body of a single instance type. Mirrors `gcWorld` but at
 /// depth 1 with a local type indexspace.
-fn gcInstanceBody(
+pub fn gcInstanceBody(
     arena: Allocator,
     decls: []const ctypes.Decl,
     live_methods: []const []const u8,

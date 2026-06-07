@@ -2101,14 +2101,30 @@ fn buildEmbedExtraImports(
         //     wasm sigs.
         var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
         const canonical_inst_decls = lookupEmbedExtraInstDecls(in.embed_metadata, ns);
-        const used_canonical = canonical_inst_decls != null and
-            isInstBodyAliasFree(canonical_inst_decls.?);
+        // Prune the canonical body down to just the funcs the embed
+        // actually imports from this namespace. A body whose *full*
+        // form carries cross-iface `use` aliases (e.g. wasi:http/types
+        // pulling `duration` from wasi:clocks) reduces to an
+        // alias-free, self-contained body once only the imported funcs
+        // (and their transitive local type-deps — resources, `own`
+        // wrappers, records, …) are retained. Without this, such
+        // namespaces fall to the per-func synthesis path below, which
+        // drops the `Type(Defined(...))` decls the func results
+        // reference and emits dangling local `type_idx` operands
+        // (the `unknown type N` failure in cataggar/wabt#234).
+        const pruned_inst_decls: ?[]const ctypes.Decl = if (canonical_inst_decls) |decls| blk: {
+            const method_names = try a.alloc([]const u8, funcs.items.len);
+            for (funcs.items, 0..) |f, fi| method_names[fi] = f.name;
+            break :blk world_gc.gcInstanceBody(a, decls, method_names, &.{}) catch null;
+        } else null;
+        const canonical_body = pruned_inst_decls orelse canonical_inst_decls;
+        const used_canonical = canonical_body != null and
+            isInstBodyAliasFree(canonical_body.?);
         if (used_canonical) {
-            // Identity remap: the new body keeps the same local
-            // type-slot layout as the original, so each `type_idx`
-            // operand resolves to the same Defined the embed
-            // declared.
-            const decls = canonical_inst_decls.?;
+            // Identity remap: `gcInstanceBody` already renumbered the
+            // pruned body's local type-slot layout consistently, so
+            // each `type_idx` operand still resolves to its Defined.
+            const decls = canonical_body.?;
             const slot_count = countInstBodyTypeSlots(decls);
             const identity_remap = try a.alloc(u32, @max(slot_count, 1));
             for (identity_remap, 0..) |*x, i| x.* = @intCast(i);

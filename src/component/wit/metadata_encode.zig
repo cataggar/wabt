@@ -178,7 +178,13 @@ pub fn encodeWorldFromResolver(
                 const is_export = item == .@"export";
                 const ext = we;
                 const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
-                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map);
+                // Type aliases this interface defines that another
+                // interface pulls in via `use <this>.{T};` must be
+                // surfaced as exports of this interface's instance type
+                // (see `buildInterfaceBody`'s `.alias` arm / #234).
+                const requested_exports: ?[]const []const u8 =
+                    if (alias_requests.get(iface_name)) |l| l.items else null;
+                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map, requested_exports);
                 const iface_type_idx = world_type_idx;
                 try world_decls.append(ar, .{ .type = .{
                     .instance = .{ .decls = iface_decls },
@@ -320,6 +326,17 @@ fn collectUseRequests(
             if (!already) try gop.value_ptr.append(ar, n.name);
         }
     }
+}
+
+/// Whether `name` is one of the type names another interface pulls in
+/// via `use <this-iface>.{name};` — i.e. a name that must be exported
+/// from this interface's instance type rather than inlined (#234).
+fn typeNameRequested(requested: ?[]const []const u8, name: []const u8) bool {
+    const list = requested orelse return false;
+    for (list) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
 }
 
 /// Convenience: parse `source` and encode the named world.
@@ -667,6 +684,7 @@ fn buildInterfaceBody(
     resolver: wit_resolver.Resolver,
     ext: ast.WorldExtern,
     world_alias_map: std.StringHashMapUnmanaged(u32),
+    requested_exports: ?[]const []const u8,
 ) EncodeError![]const ctypes.Decl {
     const ref = switch (ext) {
         .interface_ref => |ir| ir.ref,
@@ -712,7 +730,27 @@ fn buildInterfaceBody(
             .type => |td| switch (td.kind) {
                 .alias => |inner| {
                     const vt = try builder.lowerType(inner);
-                    try builder.bindName(td.name, vt);
+                    if (typeNameRequested(requested_exports, td.name)) {
+                        // A `type <name> = <T>;` alias that another
+                        // interface pulls in via `use <this>.{<name>};`.
+                        // The world body emits an `alias export …
+                        // "<name>"` against this interface's instance,
+                        // so the name MUST be exported here — otherwise
+                        // the reference dangles and the component fails
+                        // to validate (#234). Inlining (the `else`
+                        // branch) is only safe when no other interface
+                        // references the alias by name. Primitive RHS
+                        // valtypes don't occupy a slot yet, so
+                        // materialize one via a `.val` typedef before
+                        // exporting it.
+                        const body_slot = switch (vt) {
+                            .type_idx => |k| k,
+                            else => (try builder.appendCompound(.{ .val = vt })).type_idx,
+                        };
+                        try builder.exportNamedType(td.name, body_slot);
+                    } else {
+                        try builder.bindName(td.name, vt);
+                    }
                 },
                 .record => |fields| {
                     const lowered = try ar.alloc(ctypes.Field, fields.len);
@@ -2039,6 +2077,50 @@ test "metadata_encode: use clause from qualified versioned source ref" {
     // the alias-instance-export decl between `streams` and `stdout`.
     try testing.expectEqual(@as(usize, 5), world_body.decls.len);
     try testing.expectEqualStrings("output-stream", world_body.decls[2].alias.instance_export.name);
+}
+
+test "metadata_encode #234: cross-iface use of a type alias exports it from the source iface" {
+    // Regression for cataggar/wabt#234. When interface `timer` does
+    // `use clock.{duration}` where `clock` defines `type duration =
+    // u64`, the world body emits an `alias instance-export ...
+    // "duration"` against `clock`'s instance. That alias dangles
+    // unless `clock`'s instance type actually EXPORTS a type named
+    // `duration` — pre-fix the encoder inlined the alias to `u64` and
+    // emitted no export, producing `instance N has no export named
+    // 'duration'` at validation time.
+    const source =
+        \\package wabt:demo@0.0.0;
+        \\interface clock {
+        \\    type duration = u64;
+        \\    now: func() -> duration;
+        \\}
+        \\interface timer {
+        \\    use wabt:demo/clock@0.0.0.{duration};
+        \\    set: func(d: duration);
+        \\}
+        \\world w { import clock; import timer; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const world_body = comp.types[0].component.decls[0].type.component;
+    // decls[0] is the `clock` instance type; it must export `duration`
+    // as a named type so the cross-iface alias resolves.
+    const clock_inst = world_body.decls[0].type.instance;
+    var exports_duration = false;
+    for (clock_inst.decls) |d| {
+        if (d == .@"export" and d.@"export".desc == .type and
+            std.mem.eql(u8, d.@"export".name, "duration"))
+        {
+            exports_duration = true;
+        }
+    }
+    try testing.expect(exports_duration);
 }
 
 // ── #182: auto-wrap bare resource refs with own<> ─────────────────────────
