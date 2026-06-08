@@ -242,10 +242,15 @@ const Reader = struct {
             // Validate section ordering and duplicates (custom sections exempt)
             if (id_byte != 0) {
                 if (id_byte > 13) return error.InvalidSection;
-                // Check ordering: each non-custom section must have a higher ID
-                // than the previous non-custom section (except data_count=12 before code=10)
-                const order_id: u8 = if (id_byte == 12) 9 else id_byte; // data_count sorts before code
-                const last_order: u8 = if (last_non_custom_id == 12) 9 else last_non_custom_id;
+                // Check ordering: non-custom sections appear in increasing ID
+                // order, with one exception — the data-count section (id 12)
+                // sits between the element (id 9) and code (id 10) sections
+                // (WebAssembly spec, "Module" binary grammar). Scale every ID
+                // by 2 so data-count can occupy the half-step 9.5 (→ 19)
+                // without colliding with the element section (9 → 18); a plain
+                // remap to 9 makes `element, data_count` look like a duplicate.
+                const order_id: u8 = if (id_byte == 12) 19 else id_byte *| 2;
+                const last_order: u8 = if (last_non_custom_id == 12) 19 else last_non_custom_id *| 2;
                 if (order_id <= last_order and last_non_custom_id != 0) return error.InvalidSection;
                 // Check for duplicate sections
                 const mask: u16 = @as(u16, 1) << @intCast(id_byte);
@@ -747,4 +752,38 @@ test "read start section" {
     defer module.deinit();
     try std.testing.expect(module.start_var != null);
     try std.testing.expectEqual(@as(types.Index, 0), module.start_var.?.index);
+}
+
+test "accept element then data_count then code then data ordering" {
+    // The data-count section (id 12) is encoded between the element
+    // section (id 9) and the code section (id 10). A naive ordering
+    // check that remaps data_count's order to 9 sees `element(9),
+    // data_count(→9)` as non-increasing and rejects this valid module
+    // with InvalidSection. Regression for that false positive — this
+    // is exactly the section layout Zig's wasm32 backend emits for a
+    // module with a function table + passive/active data segments.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: one type () -> ()
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        // function section: one func of type 0
+        0x03, 0x02, 0x01, 0x00,
+        // table section: one funcref table, min 1
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
+        // memory section: one memory, min 1
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        // element section (id 9): one active elem, table 0, offset 0, func 0
+        0x09, 0x07, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00,
+        // data count section (id 12): 1 data segment
+        0x0c, 0x01, 0x01,
+        // code section (id 10): one body, empty (just `end`)
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        // data section (id 11): one active segment "hi"
+        0x0b, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x02, 'h', 'i',
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.data_segments.items.len);
+    try std.testing.expect(module.has_data_count);
+    try std.testing.expectEqual(@as(u32, 1), module.data_count);
 }
