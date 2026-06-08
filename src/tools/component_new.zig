@@ -62,17 +62,26 @@ const metadata_decode = wabt.component.wit.metadata_decode;
 const core_imports = wabt.component.adapter.core_imports;
 
 pub const usage =
-    \\Usage: wabt component new [options] <input.wasm>
+    \\Usage: wabt component new [options] [<wit-path>] <core.wasm>
     \\
-    \\Wrap a core wasm module (with embedded component-type metadata)
-    \\into a top-level component.
+    \\Wrap a core wasm module into a top-level WebAssembly component.
     \\
-    \\The input must already have a `component-type:<world>` custom
-    \\section, as produced by `wabt component embed` or
-    \\`wasm-tools component embed`.
+    \\The core must carry `component-type:<world>` metadata. Provide it
+    \\either by:
+    \\  * passing a <wit-path> positional (a `.wit` file or directory),
+    \\    in which case the world is embedded on the fly before wrapping
+    \\    — collapsing `wabt component embed` + `wabt component new` into
+    \\    a single call; or
+    \\  * pre-embedding with `wabt component embed` (or
+    \\    `wasm-tools component embed`) and passing only <core.wasm>.
     \\
     \\Options:
-    \\  -o, --output <file>     Output file (default: <input>.component.wasm)
+    \\  -o, --output <file>     Output file. Default: `<name>.wasm` when the
+    \\                          input is `<name>.core.wasm`, else
+    \\                          `<input>.component.wasm`.
+    \\  -w, --world <name>      World to embed from <wit-path>. Required only
+    \\                          when the WIT defines more than one world; with
+    \\                          exactly one world it is selected automatically.
     \\      --skip-validation   Skip post-encoding component validation
     \\      --adapt <n>=<file>  Splice in an adapter (may repeat). The
     \\                          primary is the unique adapter with at
@@ -106,7 +115,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var output_file: ?[]const u8 = null;
     var skip_validation: bool = false;
     var no_builtin_adapter: bool = false;
-    var input_path: ?[]const u8 = null;
+    var world_arg: ?[]const u8 = null;
+    var positionals: [2]?[]const u8 = .{ null, null };
+    var pos_count: usize = 0;
     var adapts = std.ArrayListUnmanaged(AdapterSpec).empty;
     defer adapts.deinit(alloc);
 
@@ -120,6 +131,13 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 std.process.exit(1);
             }
             output_file = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "-w") or std.mem.eql(u8, arg, "--world")) {
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: {s} requires an argument\n", .{arg});
+                std.process.exit(1);
+            }
+            world_arg = sub_args[i];
         } else if (std.mem.eql(u8, arg, "--skip-validation")) {
             skip_validation = true;
         } else if (std.mem.eql(u8, arg, "--no-builtin-adapter")) {
@@ -140,20 +158,31 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             std.debug.print("error: unknown option '{s}'. Use `wabt component new help`.\n", .{arg});
             std.process.exit(1);
         } else {
-            if (input_path != null) {
-                std.debug.print("error: unexpected positional argument '{s}'\n", .{arg});
+            if (pos_count >= positionals.len) {
+                std.debug.print("error: unexpected positional argument '{s}'. Use `wabt component new help`.\n", .{arg});
                 std.process.exit(1);
             }
-            input_path = arg;
+            positionals[pos_count] = arg;
+            pos_count += 1;
         }
     }
 
-    const in_path = input_path orelse {
-        std.debug.print("error: component new requires <input.wasm>. Use `wabt component new help`.\n", .{});
+    // Positionals are either `<core.wasm>` (already embedded) or
+    // `<wit-path> <core.wasm>` (embed the WIT world on the fly, then
+    // wrap — collapsing `component embed` + `component new` into one).
+    if (pos_count == 0) {
+        std.debug.print("error: component new requires <core.wasm> (optionally preceded by <wit-path>). Use `wabt component new help`.\n", .{});
         std.process.exit(1);
-    };
+    }
+    const wit_path: ?[]const u8 = if (pos_count == 2) positionals[0].? else null;
+    const in_path = positionals[pos_count - 1].?;
 
-    const core_bytes = std.Io.Dir.cwd().readFileAlloc(
+    if (wit_path == null and world_arg != null) {
+        std.debug.print("error: --world requires a <wit-path> positional to embed from.\n", .{});
+        std.process.exit(1);
+    }
+
+    const raw_core_bytes = std.Io.Dir.cwd().readFileAlloc(
         init.io,
         in_path,
         alloc,
@@ -162,15 +191,35 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.debug.print("error: cannot read '{s}': {any}\n", .{ in_path, err });
         std.process.exit(1);
     };
-    defer alloc.free(core_bytes);
+    defer alloc.free(raw_core_bytes);
+
+    // When a WIT path is given, embed the `component-type:<world>`
+    // section first (the same work `wabt component embed` does), so a
+    // plain core compiled by zig/etc. can be turned into a component
+    // in a single call.
+    const embedded_owned: ?[]u8 = if (wit_path) |wp|
+        embedWorld(init, alloc, wp, world_arg, raw_core_bytes)
+    else
+        null;
+    defer if (embedded_owned) |b| alloc.free(b);
+    const core_bytes: []const u8 = embedded_owned orelse raw_core_bytes;
 
     const out_path = output_file orelse blk: {
+        // A `<name>.core.wasm` input yields `<name>.wasm` — the core
+        // and component are the same artifact minus the `.core` tag.
+        if (std.mem.endsWith(u8, in_path, ".core.wasm")) {
+            const stem = in_path[0 .. in_path.len - ".core.wasm".len];
+            break :blk std.fmt.allocPrint(alloc, "{s}.wasm", .{stem}) catch in_path;
+        }
         if (std.mem.endsWith(u8, in_path, ".wasm")) {
             const stem = in_path[0 .. in_path.len - 5];
             break :blk std.fmt.allocPrint(alloc, "{s}.component.wasm", .{stem}) catch in_path;
         }
         break :blk std.fmt.allocPrint(alloc, "{s}.component.wasm", .{in_path}) catch in_path;
     };
+    // Free the derived default path (skip when it's `output_file`, which
+    // we borrow, or the `catch in_path` OOM fallback).
+    defer if (output_file == null and out_path.ptr != in_path.ptr) alloc.free(out_path);
 
     // Auto-attach the built-in wasi-preview1 → preview2 adapter when
     // the core imports preview1 and the user didn't already supply
@@ -253,6 +302,70 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 fn writeStdout(io: std.Io, text: []const u8) void {
     var stdout_file = std.Io.File.stdout();
     stdout_file.writeStreamingAll(io, text) catch {};
+}
+
+/// Embed a `component-type:<world>` custom section into `core_bytes`
+/// from the WIT at `wit_path` — the same work `wabt component embed`
+/// does, so `component new` can wrap a plain core in one call. The
+/// world is `world_arg` when given, else the WIT's sole world (an
+/// informative error is printed if zero or multiple worlds exist).
+/// Returns freshly-allocated embedded bytes; exits on error.
+fn embedWorld(
+    init: std.process.Init,
+    alloc: std.mem.Allocator,
+    wit_path: []const u8,
+    world_arg: ?[]const u8,
+    core_bytes: []const u8,
+) []u8 {
+    const wit = wabt.component.wit;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const resolver = wit.resolver.parseLayout(ar, init.io, wit_path) catch |err| {
+        std.debug.print("error: parsing WIT layout '{s}': {s}\n", .{ wit_path, @errorName(err) });
+        std.process.exit(1);
+    };
+
+    const world_name = world_arg orelse blk: {
+        if (wit.embed.autoselectWorld(resolver.main)) |name| break :blk name;
+        const names = wit.embed.worldNames(ar, resolver.main) catch &.{};
+        if (names.len == 0) {
+            std.debug.print(
+                "error: no world found in WIT '{s}'. Define a `world` or pass --world <name>.\n",
+                .{wit_path},
+            );
+        } else {
+            std.debug.print(
+                "error: WIT '{s}' defines {d} worlds; pass --world <name> to pick one.\n  available worlds: ",
+                .{ wit_path, names.len },
+            );
+            for (names, 0..) |n, idx| {
+                if (idx != 0) std.debug.print(", ", .{});
+                std.debug.print("{s}", .{n});
+            }
+            std.debug.print("\n", .{});
+        }
+        std.process.exit(1);
+    };
+
+    const ct_payload = wit.metadata_encode.encodeWorldFromResolver(alloc, resolver, world_name) catch |err| {
+        std.debug.print("error: encoding world '{s}': {s}\n", .{ world_name, @errorName(err) });
+        std.process.exit(1);
+    };
+    defer alloc.free(ct_payload);
+
+    const section_name = std.fmt.allocPrint(alloc, "component-type:{s}", .{world_name}) catch |err| {
+        std.debug.print("error: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer alloc.free(section_name);
+
+    return wit.embed.embedCustomSection(alloc, core_bytes, section_name, ct_payload) catch |err| {
+        std.debug.print("error: embedding world '{s}': {s}\n", .{ world_name, @errorName(err) });
+        std.process.exit(1);
+    };
 }
 
 fn userSuppliedAdapter(adapts: []const AdapterSpec, needle: []const u8) bool {
