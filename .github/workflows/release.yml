@@ -81,11 +81,6 @@ jobs:
           cp "zig-out/bin/wabt${EXT}" "$PKGNAME/bin/"
           cp LICENSE README.md "$PKGNAME/"
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
-          if command -v sha256sum &>/dev/null; then
-            sha256sum "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          else
-            shasum -a 256 "$PKGNAME.tar.gz" > "$PKGNAME.tar.gz.sha256"
-          fi
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -100,7 +95,6 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             wabt-*.tar.gz
-            wabt-*.sha256
             wabt-*.sbom.spdx.json
 
   source:
@@ -119,7 +113,6 @@ jobs:
         run: |
           PKGNAME="wabt-${{ steps.version.outputs.version }}"
           git archive --format=tar --prefix="$PKGNAME/" HEAD | xz > "$PKGNAME.tar.xz"
-          sha256sum "$PKGNAME.tar.xz" > "$PKGNAME.tar.xz.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -127,7 +120,6 @@ jobs:
           name: source
           path: |
             wabt-*.tar.xz
-            wabt-*.sha256
 
   release:
     name: Create Release
@@ -162,7 +154,6 @@ jobs:
           files: |
             wabt-*.tar.gz
             wabt-*.tar.xz
-            wabt-*.sha256
             wabt-*.sbom.spdx.json
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}
