@@ -103,10 +103,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    const world_name = world_arg orelse autoselectWorld(resolver.main) orelse {
-        std.debug.print("error: --world is required (no unique world found in WIT)\n", .{});
-        std.process.exit(1);
-    };
+    const world_name = world_arg orelse resolveSoleWorld(ar, resolver.main, wit_path);
 
     const ct_payload = wabt.component.wit.metadata_encode.encodeWorldFromResolver(alloc, resolver, world_name) catch |err| {
         std.debug.print("error: encoding world '{s}': {s}\n", .{ world_name, @errorName(err) });
@@ -131,7 +128,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     };
     defer alloc.free(section_name);
 
-    const embedded = embedCustomSection(alloc, core_bytes, section_name, ct_payload) catch |err| {
+    const embedded = wabt.component.wit.embed.embedCustomSection(alloc, core_bytes, section_name, ct_payload) catch |err| {
         std.debug.print("error: embedding custom section: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -159,147 +156,40 @@ fn writeStdout(io: std.Io, text: []const u8) void {
     stdout_file.writeStreamingAll(io, text) catch {};
 }
 
-/// If exactly one world is defined in the document, return its name.
-fn autoselectWorld(doc: wabt.component.wit.ast.Document) ?[]const u8 {
-    var found: ?[]const u8 = null;
-    for (doc.items) |it| {
-        if (it == .world) {
-            if (found != null) return null;
-            found = it.world.name;
+/// Resolve the sole world in `doc` (used when `--world` is omitted).
+/// Exits with an informative error if zero or multiple worlds exist.
+fn resolveSoleWorld(
+    ar: std.mem.Allocator,
+    doc: wabt.component.wit.ast.Document,
+    wit_path: []const u8,
+) []const u8 {
+    if (wabt.component.wit.embed.autoselectWorld(doc)) |name| return name;
+
+    const names = wabt.component.wit.embed.worldNames(ar, doc) catch &.{};
+    if (names.len == 0) {
+        std.debug.print(
+            "error: no world found in WIT '{s}'. Define a `world` or pass --world <name>.\n",
+            .{wit_path},
+        );
+    } else {
+        std.debug.print(
+            "error: WIT '{s}' defines {d} worlds; pass --world <name> to pick one.\n  available worlds: ",
+            .{ wit_path, names.len },
+        );
+        for (names, 0..) |n, i| {
+            if (i != 0) std.debug.print(", ", .{});
+            std.debug.print("{s}", .{n});
         }
+        std.debug.print("\n", .{});
     }
-    return found;
-}
-
-/// Append a custom section with `name` and `payload` to a core wasm
-/// binary. Existing custom sections with the same name are dropped.
-fn embedCustomSection(
-    alloc: std.mem.Allocator,
-    core_bytes: []const u8,
-    name: []const u8,
-    payload: []const u8,
-) ![]u8 {
-    if (core_bytes.len < 8) return error.InvalidCoreModule;
-    if (!std.mem.eql(u8, core_bytes[0..4], "\x00asm")) return error.InvalidCoreModule;
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-
-    // Copy preamble.
-    try out.appendSlice(alloc, core_bytes[0..8]);
-
-    var i: usize = 8;
-    while (i < core_bytes.len) {
-        if (i >= core_bytes.len) break;
-        const id = core_bytes[i];
-        i += 1;
-        const size_res = readU32Leb(core_bytes, i) catch return error.InvalidCoreModule;
-        const sec_size = size_res.value;
-        i += size_res.bytes_read;
-        if (i + sec_size > core_bytes.len) return error.InvalidCoreModule;
-        const body = core_bytes[i .. i + sec_size];
-        i += sec_size;
-
-        if (id == 0) {
-            // Custom section: read its name and skip if it matches.
-            const n_res = readU32Leb(body, 0) catch return error.InvalidCoreModule;
-            const name_len = n_res.value;
-            if (n_res.bytes_read + name_len > body.len) return error.InvalidCoreModule;
-            const sec_name = body[n_res.bytes_read .. n_res.bytes_read + name_len];
-            if (std.mem.eql(u8, sec_name, name)) continue;
-        }
-        // Re-emit unchanged.
-        try out.append(alloc, id);
-        try writeU32Leb(alloc, &out, sec_size);
-        try out.appendSlice(alloc, body);
-    }
-
-    // Append the new custom section.
-    var body = std.ArrayListUnmanaged(u8).empty;
-    defer body.deinit(alloc);
-    try writeU32Leb(alloc, &body, @intCast(name.len));
-    try body.appendSlice(alloc, name);
-    try body.appendSlice(alloc, payload);
-
-    try out.append(alloc, 0);
-    try writeU32Leb(alloc, &out, @intCast(body.items.len));
-    try out.appendSlice(alloc, body.items);
-
-    return try out.toOwnedSlice(alloc);
-}
-
-const LebRead = struct { value: u32, bytes_read: usize };
-
-fn readU32Leb(buf: []const u8, start: usize) !LebRead {
-    var result: u32 = 0;
-    var shift: u5 = 0;
-    var i: usize = start;
-    while (i < buf.len) : (i += 1) {
-        const b = buf[i];
-        result |= @as(u32, b & 0x7f) << shift;
-        if ((b & 0x80) == 0) {
-            return .{ .value = result, .bytes_read = i + 1 - start };
-        }
-        if (shift >= 25) return error.LebOverflow;
-        shift += 7;
-    }
-    return error.LebTruncated;
-}
-
-fn writeU32Leb(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: u32) !void {
-    var x = v;
-    while (true) {
-        var b: u8 = @intCast(x & 0x7f);
-        x >>= 7;
-        if (x != 0) b |= 0x80;
-        try out.append(alloc, b);
-        if (x == 0) break;
-    }
+    std.process.exit(1);
 }
 
 // ── tests ──────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
 
-test "embedCustomSection: appends section to a minimal core module" {
-    const core = [_]u8{
-        // preamble
-        0x00, 0x61, 0x73, 0x6d,
-        0x01, 0x00, 0x00, 0x00,
-    };
-    const payload = [_]u8{ 0x42, 0x00 };
-    const out = try embedCustomSection(testing.allocator, &core, "component-type:t", &payload);
-    defer testing.allocator.free(out);
-    try testing.expect(out.len > core.len);
-    // Custom section starts after the preamble; first byte of section is id=0.
-    try testing.expectEqual(@as(u8, 0), out[8]);
-}
-
-test "embedCustomSection: replaces existing same-name custom section" {
-    // preamble + custom section "x" with payload "old"
-    const core = [_]u8{
-        0x00, 0x61, 0x73, 0x6d,
-        0x01, 0x00, 0x00, 0x00,
-        0x00, 0x05, // section id=0, size=5
-        0x01, 'x', // name length=1, name="x"
-        'o', 'l', 'd', // payload "old"
-    };
-    const new_payload = "new!";
-    const out = try embedCustomSection(testing.allocator, &core, "x", new_payload);
-    defer testing.allocator.free(out);
-    // The original custom should be gone; only one section should
-    // remain, and it should hold "new!" as its payload.
-    try testing.expect(out.len > 8);
-    // Section starts at out[8], id=0, size LEB, name LEB, name, payload
-    try testing.expectEqual(@as(u8, 0), out[8]);
-    // size LEB single byte: 1 (name len) + 1 (name) + 4 (payload) = 6
-    try testing.expectEqual(@as(u8, 6), out[9]);
-    try testing.expectEqual(@as(u8, 1), out[10]);
-    try testing.expectEqual(@as(u8, 'x'), out[11]);
-    try testing.expectEqualStrings("new!", out[12..16]);
-}
-
-test "embedCustomSection: end-to-end with adder world" {
+test "embed end-to-end with adder world" {
     const wit_source =
         \\package docs:adder@0.1.0;
         \\
@@ -322,7 +212,7 @@ test "embedCustomSection: end-to-end with adder world" {
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
     };
-    const out = try embedCustomSection(testing.allocator, &core, "component-type:adder", ct);
+    const out = try wabt.component.wit.embed.embedCustomSection(testing.allocator, &core, "component-type:adder", ct);
     defer testing.allocator.free(out);
 
     // Should be: preamble (8) + custom section (1 id + LEB size + name LEB + name (20) + ct).
@@ -330,3 +220,4 @@ test "embedCustomSection: end-to-end with adder world" {
     try testing.expectEqualSlices(u8, "\x00asm\x01\x00\x00\x00", out[0..8]);
     try testing.expectEqual(@as(u8, 0), out[8]); // custom section id
 }
+
