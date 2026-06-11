@@ -3594,3 +3594,126 @@ test "splice #230: embed-extra canon.lower carries memory + string_encoding opts
     }
     try testing.expect(saw_record_decl);
 }
+
+test "splice #241: resource-bearing embed-extra import keeps own/borrow/option (not flattened to u32)" {
+    // Regression for cataggar/wabt#241.
+    //
+    // A component built from an embed whose WIT imports a resource-
+    // bearing interface (the minimal shape of `wasi:http/types` /
+    // `wasi:io/poll`) was malformed: the wrapping component's import
+    // instance-type body for that namespace lost its resource type
+    // definitions and had every method param flattened to bare `u32`
+    // — `borrow<R>` self handles, `own<R>` constructor results, and
+    // `option<string>` args all collapsed — so `wasm-tools validate`
+    // rejected it with `[constructor]… should return (own $T)`.
+    //
+    // Root cause: `buildEmbedExtraImports` fell back to per-func
+    // primitive synthesis (`coreToCompValType`) for namespaces the
+    // adapter does not hoist when the canonical-body path returned
+    // null. The fix preserves the embed's canonical instance body
+    // (resource defs + own/borrow/option typedefs) verbatim.
+    //
+    // This test splices the resource fixture and asserts the
+    // wrapping component's `docs:res/api@0.1.0` import body still
+    // carries (1) a `(type (sub resource))` export, (2) an `own`
+    // handle typedef (the constructor result), (3) a `borrow` handle
+    // typedef (the method self), and (4) an `option` typedef (the
+    // `option<string>` arg) — none of which survive the lossy
+    // primitive fallback.
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithResourceImport(a);
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    // Locate the wrapping component's `docs:res/api@0.1.0` import.
+    var maybe_inst_idx: ?u32 = null;
+    for (comp.imports) |im| {
+        if (std.mem.eql(u8, im.name, test_fixtures.EXTRA_RESOURCE_NAMESPACE)) {
+            try testing.expect(im.desc == .instance);
+            maybe_inst_idx = im.desc.instance;
+        }
+    }
+    try testing.expect(maybe_inst_idx != null);
+
+    const contrib = comp.type_indexspace[maybe_inst_idx.?];
+    try testing.expect(contrib == .type_def);
+    const td = comp.types[contrib.type_def];
+    try testing.expect(td == .instance);
+    const decls = td.instance.decls;
+
+    // Scan the body for the typed decls the lossy fallback would drop.
+    var has_sub_resource = false;
+    var has_own = false;
+    var has_borrow = false;
+    var has_option = false;
+    var ctor_func_slot: ?u32 = null;
+
+    // Build the body's local type-slot table (1:1 with type-allocating
+    // decls) so we can resolve `[constructor]thing`'s func result.
+    var slots = std.ArrayListUnmanaged(?ctypes.TypeDef).empty;
+    for (decls) |d| switch (d) {
+        .type => |t| {
+            switch (t) {
+                .val => |v| switch (v) {
+                    .own => has_own = true,
+                    .borrow => has_borrow = true,
+                    else => {},
+                },
+                .option => has_option = true,
+                else => {},
+            }
+            try slots.append(arena.allocator(), t);
+        },
+        .alias => |al| {
+            const sort: ctypes.Sort = switch (al) {
+                .instance_export => |ie| ie.sort,
+                .outer => |o| o.sort,
+            };
+            if (sort == .type) try slots.append(arena.allocator(), null);
+        },
+        .@"export" => |e| switch (e.desc) {
+            .type => |tb| {
+                if (tb == .sub_resource) has_sub_resource = true;
+                try slots.append(arena.allocator(), null);
+            },
+            .func => |fidx| {
+                if (std.mem.eql(u8, e.name, test_fixtures.EXTRA_RESOURCE_CTOR)) ctor_func_slot = fidx;
+            },
+            else => {},
+        },
+        else => {},
+    };
+
+    // (1) Resource type definition survives.
+    try testing.expect(has_sub_resource);
+    // (2)+(3) own + borrow handle typedefs survive (constructor result +
+    // method self), proving params were NOT flattened to bare u32.
+    try testing.expect(has_own);
+    try testing.expect(has_borrow);
+    // (4) the `option<string>` arg survives as an option typedef.
+    try testing.expect(has_option);
+
+    // Precise check for defect #2: `[constructor]thing`'s func result
+    // resolves to an `own<thing>` handle, not a plain scalar.
+    try testing.expect(ctor_func_slot != null);
+    const ctor_td = slots.items[ctor_func_slot.?] orelse unreachable;
+    try testing.expect(ctor_td == .func);
+    const res = ctor_td.func.results;
+    try testing.expect(res == .unnamed);
+    const res_vt: ctypes.ValType = switch (res.unnamed) {
+        .type_idx => |k| blk: {
+            const slot_td = slots.items[k] orelse break :blk res.unnamed;
+            break :blk if (slot_td == .val) slot_td.val else res.unnamed;
+        },
+        else => res.unnamed,
+    };
+    try testing.expect(res_vt == .own);
+}
