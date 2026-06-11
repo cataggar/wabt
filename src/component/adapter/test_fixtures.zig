@@ -148,30 +148,45 @@ pub const EXTRA_STRING_FUNC = "compute";
 pub const EXTRA_STRING_EMBED_CT_SECTION_NAME =
     "component-type:docs:opts@0.1.0:opts:encoded world";
 
-/// WIT for an embed that imports a non-WASI iface whose body declares
-/// a *resource* with a constructor and a method taking
-/// `option<string>`. Regression fixture for cataggar/wabt#241.
+/// WIT for an embed that imports a resource-bearing iface whose
+/// method signature references a resource *from another interface*
+/// via `use` (a `borrow<handle>` arg where `handle` lives in `dep`).
+/// Regression fixture for cataggar/wabt#241.
 ///
-/// This is the minimal shape of the `wasi:http/types` / `wasi:io/poll`
-/// interfaces that triggered the bug: their import instance-type
-/// bodies lost their resource type definitions and had every method
-/// param flattened to bare `u32` (the `borrow<R>` self handle, the
-/// `option<string>` arg) and `[constructor]thing` no longer returned
-/// `own<thing>`. Pre-fix, `buildEmbedExtraImports` fell back to
-/// per-func primitive synthesis (`coreToCompValType`) for such
-/// namespaces, producing a malformed component
-/// (`[constructor]…` not returning `(own $T)`).
+/// This is the minimal shape of `wasi:http/types` — whose body
+/// `use`s `pollable` (wasi:io/poll), `input-stream`/`output-stream`
+/// (wasi:io/streams), `duration` (wasi:clocks), etc. The bug: for
+/// such cross-iface-`use` namespaces the wrapping component's import
+/// instance-type body lost its resource type definitions and had
+/// method params flattened to bare `u32` (the `borrow<R>` self
+/// handle, the cross-iface `borrow<handle>`, the `option<string>`
+/// arg) and `[constructor]thing` no longer returned `own<thing>`.
 ///
-/// `[constructor]thing` lowers to `() -> i32` (own handle),
-/// `[method]thing.configure` to `(i32, i32, i32, i32) -> ()`
-/// (self borrow + `option<string>` = disc + ptr + len).
+/// Pre-fix, `buildEmbedExtraImports` could only clone the canonical
+/// instance body when it was alias-free; a body carrying cross-iface
+/// `(alias outer …)` references fell through to the lossy per-func
+/// primitive synthesis (`coreToCompValType`), producing a malformed
+/// component (`[constructor]…` not returning `(own $T)`). The fix
+/// rebases those cross-iface aliases onto the wrapping component's
+/// matching imported instances and keeps the typed body.
+///
+/// A self-contained (alias-free) resource interface is NOT enough to
+/// reproduce — the `use dep.{handle}` cross-iface reference is the
+/// essential trigger.
 const EXTRA_RESOURCE_EMBED_WIT =
     \\package docs:res@0.1.0;
     \\
+    \\interface dep {
+    \\    resource handle {
+    \\        wait: func();
+    \\    }
+    \\}
+    \\
     \\interface api {
+    \\    use dep.{handle};
     \\    resource thing {
     \\        constructor();
-    \\        configure: func(path: option<string>);
+    \\        configure: func(path: option<string>, h: borrow<handle>);
     \\    }
     \\}
     \\
@@ -181,6 +196,8 @@ const EXTRA_RESOURCE_EMBED_WIT =
 ;
 
 pub const EXTRA_RESOURCE_NAMESPACE = "docs:res/api@0.1.0";
+pub const EXTRA_RESOURCE_DEP_NAMESPACE = "docs:res/dep@0.1.0";
+pub const EXTRA_RESOURCE_DEP_METHOD = "[method]handle.wait";
 pub const EXTRA_RESOURCE_CTOR = "[constructor]thing";
 pub const EXTRA_RESOURCE_METHOD = "[method]thing.configure";
 pub const EXTRA_RESOURCE_EMBED_CT_SECTION_NAME =
@@ -1131,31 +1148,34 @@ pub fn buildSyntheticEmbedWithExtraStringImport(allocator: Allocator) ![]u8 {
 }
 
 /// Build a synthetic command-shape embed core wasm that imports a
-/// non-WASI namespace whose iface body declares a *resource* with a
-/// constructor and an `option<string>`-taking method. Regression
-/// fixture for cataggar/wabt#241 — see `EXTRA_RESOURCE_EMBED_WIT`.
+/// resource-bearing namespace whose method sig references a resource
+/// from *another* interface via `use` (cross-iface alias) plus an
+/// `option<string>` arg. Regression fixture for cataggar/wabt#241 —
+/// see `EXTRA_RESOURCE_EMBED_WIT`.
 ///
 /// Imports:
 ///   * `wasi_snapshot_preview1.fd_write`     (func, () -> i32)
+///   * `docs:res/dep@0.1.0.[method]handle.wait`
+///         (func, (i32) -> ())       — self borrow<handle>
 ///   * `docs:res/api@0.1.0.[constructor]thing`
 ///         (func, () -> i32)         — lowered `() -> own<thing>`
 ///   * `docs:res/api@0.1.0.[method]thing.configure`
-///         (func, (i32,i32,i32,i32) -> ())
-///         — lowered `(self: borrow<thing>, path: option<string>)`
+///         (func, (i32,i32,i32,i32,i32) -> ())
+///         — `(self: borrow<thing>, path: option<string>,
+///            h: borrow<handle>)` = self + disc + ptr + len + handle
 ///
 /// Exports:
 ///   * `_start`        (func, () -> ())
 ///   * `memory`        (memory 0)
 ///   * `cabi_realloc`  (func, (i32,i32,i32,i32) -> i32)
-///         — needed for the `option<string>` canon-lower opts.
 ///
 /// Carries a `component-type:docs:res@0.1.0:res:encoded world`
 /// custom section so the splicer's `embed_metadata` lookup recovers
-/// the canonical `docs:res/api` body — resource def + own/borrow
-/// handles + `option<string>`. Without the fix, the
-/// `buildEmbedExtraImports` fallback would synthesize a primitive
-/// `u32`-only body from the core wasm sigs, dropping the resource
-/// type defs and the `own<thing>` constructor result.
+/// the canonical `docs:res/api` body, whose `configure` sig carries
+/// a cross-iface `(alias outer …)` reference to `docs:res/dep`'s
+/// `handle`. Without the fix the alias-bearing body falls to the
+/// `coreToCompValType` fallback, dropping the resource type defs and
+/// the `own<thing>` / `borrow` / `option` types.
 pub fn buildSyntheticEmbedWithResourceImport(allocator: Allocator) ![]u8 {
     const ct = try metadata_encode.encodeWorldFromSource(allocator, EXTRA_RESOURCE_EMBED_WIT, "res");
     defer allocator.free(ct);
@@ -1165,31 +1185,38 @@ pub fn buildSyntheticEmbedWithResourceImport(allocator: Allocator) ![]u8 {
 
     try writeMagic(allocator, &out);
 
-    // Type section: 4 types.
+    // Type section: 5 types.
     //   type 0: () -> i32 (preview1.fd_write + [constructor]thing)
     //   type 1: () -> () (_start)
-    //   type 2: (i32,i32,i32,i32) -> () ([method]thing.configure)
-    //   type 3: (i32,i32,i32,i32) -> i32 (cabi_realloc)
+    //   type 2: (i32) -> () ([method]handle.wait)
+    //   type 3: (i32,i32,i32,i32,i32) -> () ([method]thing.configure)
+    //   type 4: (i32,i32,i32,i32) -> i32 (cabi_realloc)
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
-        try b.append(allocator, 0x04);
+        try b.append(allocator, 0x05);
         try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
         try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 });
-        try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x01, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x05, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x00 });
         try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f });
         try writeSection(allocator, &out, 0x01, b.items);
     }
 
-    // Import section: preview1.fd_write (type 0) + ctor (type 0) + method (type 2).
+    // Import section: preview1.fd_write (type 0) + dep.handle.wait (type 2)
+    // + ctor (type 0) + method (type 3).
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
-        try b.append(allocator, 0x03);
+        try b.append(allocator, 0x04);
         try writeName(allocator, &b, "wasi_snapshot_preview1");
         try writeName(allocator, &b, PREVIEW1_EXPORT);
         try b.append(allocator, 0x00);
         try b.append(allocator, 0x00);
+        try writeName(allocator, &b, EXTRA_RESOURCE_DEP_NAMESPACE);
+        try writeName(allocator, &b, EXTRA_RESOURCE_DEP_METHOD);
+        try b.append(allocator, 0x00);
+        try b.append(allocator, 0x02);
         try writeName(allocator, &b, EXTRA_RESOURCE_NAMESPACE);
         try writeName(allocator, &b, EXTRA_RESOURCE_CTOR);
         try b.append(allocator, 0x00);
@@ -1197,17 +1224,17 @@ pub fn buildSyntheticEmbedWithResourceImport(allocator: Allocator) ![]u8 {
         try writeName(allocator, &b, EXTRA_RESOURCE_NAMESPACE);
         try writeName(allocator, &b, EXTRA_RESOURCE_METHOD);
         try b.append(allocator, 0x00);
-        try b.append(allocator, 0x02);
+        try b.append(allocator, 0x03);
         try writeSection(allocator, &out, 0x02, b.items);
     }
 
-    // Function section: 2 defined funcs — _start (type 1), cabi_realloc (type 3).
+    // Function section: 2 defined funcs — _start (type 1), cabi_realloc (type 4).
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
         try b.append(allocator, 0x02);
         try b.append(allocator, 0x01);
-        try b.append(allocator, 0x03);
+        try b.append(allocator, 0x04);
         try writeSection(allocator, &out, 0x03, b.items);
     }
 
@@ -1221,18 +1248,18 @@ pub fn buildSyntheticEmbedWithResourceImport(allocator: Allocator) ![]u8 {
         try writeSection(allocator, &out, 0x05, b.items);
     }
 
-    // Export section: _start (func 3 = imports 0..2 + defined 0),
-    // memory (0), cabi_realloc (func 4 = imports 0..2 + defined 1).
+    // Export section: _start (func 4 = imports 0..3 + defined 0),
+    // memory (0), cabi_realloc (func 5 = imports 0..3 + defined 1).
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
         try b.append(allocator, 0x03);
         try writeName(allocator, &b, "_start");
-        try b.appendSlice(allocator, &.{ 0x00, 0x03 });
+        try b.appendSlice(allocator, &.{ 0x00, 0x04 });
         try writeName(allocator, &b, "memory");
         try b.appendSlice(allocator, &.{ 0x02, 0x00 });
         try writeName(allocator, &b, "cabi_realloc");
-        try b.appendSlice(allocator, &.{ 0x00, 0x04 });
+        try b.appendSlice(allocator, &.{ 0x00, 0x05 });
         try writeSection(allocator, &out, 0x07, b.items);
     }
 
