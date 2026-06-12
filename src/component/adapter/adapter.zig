@@ -1855,6 +1855,44 @@ pub fn buildCanonLowerOpts(
     return opts;
 }
 
+/// Build the `canon lift` option list for an exported func. Mirrors
+/// `buildCanonLowerOpts` but uses `abi.LiftOpts` and adds an optional
+/// `(post-return <cabi_post_…>)`. Emission order matches
+/// `wit-component`: memory, realloc, string-encoding, post-return.
+pub fn buildCanonLiftOpts(
+    arena: Allocator,
+    o: abi.LiftOpts,
+    memory_core_idx: u32,
+    realloc_core_idx: u32,
+    post_return_core_idx: ?u32,
+) error{OutOfMemory}![]const ctypes.CanonOpt {
+    var n: usize = 0;
+    if (o.memory) n += 1;
+    if (o.realloc) n += 1;
+    if (o.string_encoding) n += 1;
+    if (post_return_core_idx != null) n += 1;
+
+    const opts = try arena.alloc(ctypes.CanonOpt, n);
+    var i: usize = 0;
+    if (o.memory) {
+        opts[i] = .{ .memory = memory_core_idx };
+        i += 1;
+    }
+    if (o.realloc) {
+        opts[i] = .{ .realloc = realloc_core_idx };
+        i += 1;
+    }
+    if (o.string_encoding) {
+        opts[i] = .{ .string_encoding = .utf8 };
+        i += 1;
+    }
+    if (post_return_core_idx) |p| {
+        opts[i] = .{ .post_return = p };
+        i += 1;
+    }
+    return opts;
+}
+
 const RunInstanceExport = struct {
     qualified_name: []const u8,
     core_export_name: []const u8,
