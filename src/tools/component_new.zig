@@ -786,6 +786,374 @@ fn canonForIntrinsic(kind: IntrinsicKind, type_idx: u32) ctypes.Canon {
     };
 }
 
+// ── Guest-implemented (exported) resources (cataggar/wabt#250) ──────
+//
+// A guest core module can *define* a resource exported by one of its
+// interfaces. Then it:
+//   * exports a destructor core func `<iface>#[dtor]<resource>` (only
+//     when the WIT resource declares one), and
+//   * imports the canonical built-ins it uses to manage its own
+//     handles — `[resource-new]<R>` / `[resource-rep]<R>` /
+//     `[resource-drop]<R>` — from the module `[export]<iface>`.
+// The wrapping component must declare the exported resource type
+// (with its destructor wired through the shim so the host can call
+// back into the guest), export it from the interface instance, and
+// satisfy those `[export]…` intrinsic imports with `canon
+// resource.{new,rep,drop}` referencing the *exported* resource type.
+// Matches `wit-component` / `wasm-tools` (see validation.rs
+// `match_wit_resource_dtor`, encoding.rs `ShimKind::ResourceDtor`).
+
+/// Module-name prefix a guest uses for intrinsics that operate on a
+/// resource it exports (e.g. `[export]docs:demo/i@0.1.0`).
+const export_intrinsic_prefix = "[export]";
+
+/// A resource defined by an exported interface of the guest.
+const ExportedResource = struct {
+    /// Qualified name of the exporting interface (the export
+    /// instance's name, e.g. `docs:demo/i@0.1.0`).
+    ext_qualified: []const u8,
+    /// Bare resource WIT name (e.g. `thing`).
+    name: []const u8,
+    /// Core-export name of the guest's destructor, or null when the
+    /// resource declares no destructor.
+    dtor_export: ?[]const u8,
+};
+
+/// True iff the core module exports a *func* named `name`. Scans the
+/// export section only; a parse failure is reported (callers gate on
+/// it for dtor detection where a missing export simply means "no
+/// destructor").
+fn coreExportsFunc(core_bytes: []const u8, name: []const u8) !bool {
+    if (core_bytes.len < 8) return error.InvalidCoreModule;
+    if (!std.mem.eql(u8, core_bytes[0..4], "\x00asm")) return error.InvalidCoreModule;
+
+    var i: usize = 8;
+    while (i < core_bytes.len) {
+        const id = core_bytes[i];
+        i += 1;
+        const sz = try readU32Leb(core_bytes, i);
+        i += sz.bytes_read;
+        if (i + sz.value > core_bytes.len) return error.InvalidCoreModule;
+        const body = core_bytes[i .. i + sz.value];
+        i += sz.value;
+        if (id != 7) continue; // export section
+
+        var p: usize = 0;
+        const n = try readU32Leb(body, p);
+        p += n.bytes_read;
+        var k: u32 = 0;
+        while (k < n.value) : (k += 1) {
+            const nl = try readU32Leb(body, p);
+            p += nl.bytes_read;
+            if (p + nl.value > body.len) return error.InvalidCoreModule;
+            const ename = body[p .. p + nl.value];
+            p += nl.value;
+            if (p >= body.len) return error.InvalidCoreModule;
+            const kind = body[p];
+            p += 1;
+            const idx = try readU32Leb(body, p);
+            p += idx.bytes_read;
+            if (kind == 0 and std.mem.eql(u8, ename, name)) return true;
+        }
+        break;
+    }
+    return false;
+}
+
+/// Collect every resource defined by an exported interface, detecting
+/// each one's guest-exported destructor (if any). `ar`-owned copies.
+fn collectExportedResources(
+    ar: std.mem.Allocator,
+    decoded: metadata_decode.DecodedWorld,
+    stripped_core: []const u8,
+) ![]const ExportedResource {
+    var list = std.ArrayListUnmanaged(ExportedResource).empty;
+    for (decoded.externs) |ext| {
+        if (!ext.is_export) continue;
+        for (ext.type_slots) |slot| switch (slot) {
+            .sub_resource => |name| {
+                const dtor_name = try std.fmt.allocPrint(
+                    ar,
+                    "{s}#[dtor]{s}",
+                    .{ ext.qualified_name, name },
+                );
+                const has_dtor = coreExportsFunc(stripped_core, dtor_name) catch false;
+                try list.append(ar, .{
+                    .ext_qualified = ext.qualified_name,
+                    .name = try ar.dupe(u8, name),
+                    .dtor_export = if (has_dtor) dtor_name else null,
+                });
+            },
+            else => {},
+        };
+    }
+    return list.toOwnedSlice(ar);
+}
+
+/// One resource built-in intrinsic that operates on a guest-exported
+/// resource (`[export]<iface>` module). Grouped by `module` so each
+/// distinct `(with "[export]<iface>" …)` arg gets one bundle.
+const ExportSideIntrinsic = struct {
+    /// Full `[export]<iface>` module name — the `(with …)` arg key.
+    module: []const u8,
+    /// Canonical field name (e.g. `[resource-new]thing`).
+    field: []const u8,
+    /// Bare resource name (e.g. `thing`).
+    resource: []const u8,
+    kind: IntrinsicKind,
+};
+
+/// Partition collected intrinsics into import-side (resolved against
+/// imported interfaces by the existing `resolveResourceIntrinsicsByShape`)
+/// and export-side (`[export]<iface>` module, operating on a
+/// guest-exported resource). Export-side intrinsics must name a
+/// resource that some exported interface defines; otherwise it is a
+/// hard error (never leave the guest import dangling).
+fn partitionResourceIntrinsics(
+    ar: std.mem.Allocator,
+    intrinsics: []const ResourceIntrinsic,
+    exported: []const ExportedResource,
+) !struct {
+    import_side: []const ResourceIntrinsic,
+    export_side: []const ExportSideIntrinsic,
+} {
+    var imp = std.ArrayListUnmanaged(ResourceIntrinsic).empty;
+    var exp = std.ArrayListUnmanaged(ExportSideIntrinsic).empty;
+    for (intrinsics) |it| {
+        if (std.mem.startsWith(u8, it.module, export_intrinsic_prefix)) {
+            var found = false;
+            for (exported) |er| {
+                if (std.mem.eql(u8, er.name, it.resource)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std.debug.print(
+                    "error: core import `{s}` of `{s}` is an exported-resource " ++
+                        "intrinsic, but no exported interface defines resource `{s}`\n",
+                    .{ it.field, it.module, it.resource },
+                );
+                return error.UnresolvedResourceIntrinsic;
+            }
+            try exp.append(ar, .{
+                .module = it.module,
+                .field = it.field,
+                .resource = it.resource,
+                .kind = it.kind,
+            });
+        } else {
+            try imp.append(ar, it);
+        }
+    }
+    return .{
+        .import_side = try imp.toOwnedSlice(ar),
+        .export_side = try exp.toOwnedSlice(ar),
+    };
+}
+
+/// Group export-side intrinsics by their `[export]<iface>` module so
+/// each distinct module yields one inline-exports bundle + one main
+/// `(with …)` arg. Preserves first-seen module order.
+fn groupExportSideByModule(
+    ar: std.mem.Allocator,
+    export_side: []const ExportSideIntrinsic,
+) ![]const []const ExportSideIntrinsic {
+    var modules = std.ArrayListUnmanaged([]const u8).empty;
+    var groups = std.ArrayListUnmanaged(std.ArrayListUnmanaged(ExportSideIntrinsic)).empty;
+    for (export_side) |it| {
+        var gi: ?usize = null;
+        for (modules.items, 0..) |m, i| {
+            if (std.mem.eql(u8, m, it.module)) {
+                gi = i;
+                break;
+            }
+        }
+        const idx = gi orelse blk: {
+            try modules.append(ar, it.module);
+            try groups.append(ar, .empty);
+            break :blk groups.items.len - 1;
+        };
+        try groups.items[idx].append(ar, it);
+    }
+    var out = try ar.alloc([]const ExportSideIntrinsic, groups.items.len);
+    for (groups.items, 0..) |*g, i| out[i] = try g.toOwnedSlice(ar);
+    return out;
+}
+
+/// Deterministic import-arg name a nested export-interface component
+/// uses for the resource type `rname` it re-exports.
+fn nestedTypeImportName(ar: std.mem.Allocator, rname: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(ar, "import-type-{s}", .{rname});
+}
+
+/// Deterministic import-arg name for the `j`-th func. Kebab-valid:
+/// the index is glued to the word (`import-func0`), since a
+/// `-`-separated label segment may not begin with a digit.
+fn nestedFuncImportName(ar: std.mem.Allocator, j: usize) ![]const u8 {
+    return std.fmt.allocPrint(ar, "import-func{d}", .{j});
+}
+
+/// Transcription context for a nested export-interface component: maps
+/// each `own`/`borrow` handle to a hoisted defined handle type
+/// referencing the target resource type index (`res_target`) in the
+/// nested component, and hoists compound value types via `addType`.
+/// Handle types are hoisted (not inlined) to match `wit-component`'s
+/// encoding, which the validator expects.
+const NestedResolveCtx = struct {
+    ar: std.mem.Allocator,
+    ext_slots: []const metadata_decode.TypeSlot,
+    types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+    order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+    ty: *u32,
+    res_target: *std.StringHashMapUnmanaged(u32),
+
+    pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+        try self.types.append(self.ar, td);
+        try self.order.append(self.ar, .{ .kind = .type, .start = @intCast(self.types.items.len - 1), .count = 1 });
+        const idx = self.ty.*;
+        self.ty.* += 1;
+        return idx;
+    }
+
+    pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
+        return switch (v) {
+            .own => |k| .{ .type_idx = try self.hoistHandle(k, .own) },
+            .borrow => |k| .{ .type_idx = try self.hoistHandle(k, .borrow) },
+            else => v,
+        };
+    }
+
+    fn hoistHandle(self: @This(), slot: u32, comptime kind: enum { own, borrow }) lift_types.Error!u32 {
+        const name = metadata_decode.resourceNameForSlot(self.ext_slots, slot) orelse
+            return error.UnresolvedResource;
+        const res = self.res_target.get(name) orelse return error.UnresolvedResource;
+        const vt: ctypes.ValType = switch (kind) {
+            .own => .{ .own = res },
+            .borrow => .{ .borrow = res },
+        };
+        return self.addType(.{ .val = vt });
+    }
+};
+
+/// Build a nested sub-component that re-exports an interface defining
+/// resources, performing the type-export binding the component model
+/// requires (a resource used by an exported func must be *named* in
+/// that instance's type). Mirrors `wit-component`'s emitter:
+///
+///   (component
+///     (import "import-type-R"  (type (sub resource)))     ; type 0
+///     …func types vs imported R…
+///     (import "import-func-j"  (func <ty>))               ; func j
+///     (export "R" (type 0))                               ; new exported R
+///     …func types vs exported R…
+///     (export "<fn>" (func j) (func <ty>)))               ; re-ascribed
+///
+/// The outer component instantiates this with the top-level resource
+/// type and the lifted funcs as args (see callers). `res_names` are the
+/// resources this interface defines, in a stable order.
+fn buildExportInterfaceComponent(
+    ar: std.mem.Allocator,
+    ext: metadata_decode.WorldExtern,
+    res_names: []const []const u8,
+) !*ctypes.Component {
+    var types = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    var imports = std.ArrayListUnmanaged(ctypes.ImportDecl).empty;
+    var exports = std.ArrayListUnmanaged(ctypes.ExportDecl).empty;
+    var order = std.ArrayListUnmanaged(ctypes.SectionEntry).empty;
+    var ty: u32 = 0;
+
+    var imp_res = std.StringHashMapUnmanaged(u32).empty;
+    var exp_res = std.StringHashMapUnmanaged(u32).empty;
+
+    // 1. Import each resource type as a `(sub resource)`.
+    for (res_names) |rn| {
+        try imports.append(ar, .{
+            .name = try nestedTypeImportName(ar, rn),
+            .desc = .{ .type = .sub_resource },
+        });
+        try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
+        try imp_res.put(ar, rn, ty);
+        ty += 1;
+    }
+
+    // 2. Import each func, typed against the imported resources.
+    {
+        for (ext.funcs, 0..) |f, j| {
+            const ctx = NestedResolveCtx{
+                .ar = ar,
+                .ext_slots = ext.type_slots,
+                .types = &types,
+                .order = &order,
+                .ty = &ty,
+                .res_target = &imp_res,
+            };
+            const sig = try lift_types.transcribeFuncSig(ar, ctx, ext.type_slots, f.sig);
+            try types.append(ar, .{ .func = sig });
+            try order.append(ar, .{ .kind = .type, .start = @intCast(types.items.len - 1), .count = 1 });
+            const ft = ty;
+            ty += 1;
+            try imports.append(ar, .{
+                .name = try nestedFuncImportName(ar, j),
+                .desc = .{ .func = ft },
+            });
+            try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
+        }
+    }
+
+    // 3. Export each resource type, binding a fresh exported resource.
+    for (res_names) |rn| {
+        const src = imp_res.get(rn).?;
+        try exports.append(ar, .{
+            .name = rn,
+            .sort_idx = .{ .sort = .type, .idx = src },
+            .desc = .{ .type = .{ .eq = src } },
+        });
+        try order.append(ar, .{ .kind = .@"export", .start = @intCast(exports.items.len - 1), .count = 1 });
+        try exp_res.put(ar, rn, ty);
+        ty += 1;
+    }
+
+    // 4. Re-export each func, typed against the exported resources.
+    for (ext.funcs, 0..) |f, j| {
+        const ctx = NestedResolveCtx{
+            .ar = ar,
+            .ext_slots = ext.type_slots,
+            .types = &types,
+            .order = &order,
+            .ty = &ty,
+            .res_target = &exp_res,
+        };
+        const sig = try lift_types.transcribeFuncSig(ar, ctx, ext.type_slots, f.sig);
+        try types.append(ar, .{ .func = sig });
+        try order.append(ar, .{ .kind = .type, .start = @intCast(types.items.len - 1), .count = 1 });
+        const ft = ty;
+        ty += 1;
+        try exports.append(ar, .{
+            .name = f.name,
+            .sort_idx = .{ .sort = .func, .idx = @intCast(j) },
+            .desc = .{ .func = ft },
+        });
+        try order.append(ar, .{ .kind = .@"export", .start = @intCast(exports.items.len - 1), .count = 1 });
+    }
+
+    const comp = try ar.create(ctypes.Component);
+    comp.* = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = try types.toOwnedSlice(ar),
+        .canons = &.{},
+        .imports = try imports.toOwnedSlice(ar),
+        .exports = try exports.toOwnedSlice(ar),
+        .section_order = try order.toOwnedSlice(ar),
+    };
+    return comp;
+}
+
 /// Construct the wrapping component bytes from a core module that
 /// has an embedded `component-type:<world>` custom section.
 pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
@@ -878,7 +1246,25 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         if (any_func_needs_opts) break;
     }
 
-    if (any_func_needs_opts) {
+    // ── #250: collect guest-defined (exported) resources. A resource
+    //    with a destructor forces the shim/fixup path: its `(type
+    //    (resource … (dtor …)))` references a core func that only
+    //    exists once main is instantiated, but main's `[resource-new]`
+    //    / `[resource-rep]` imports reference that resource type — a
+    //    forward-reference cycle that the shim trampoline breaks
+    //    (exactly as wit-component's `ShimKind::ResourceDtor`).
+    //    Dtor-less exported resources have no cycle and stay on the
+    //    fast path.
+    const exported_resources = try collectExportedResources(ar, decoded, stripped_core);
+    var any_exported_dtor = false;
+    for (exported_resources) |er| {
+        if (er.dtor_export != null) {
+            any_exported_dtor = true;
+            break;
+        }
+    }
+
+    if (any_func_needs_opts or any_exported_dtor) {
         return try buildComponentShimFixup(alloc, ar, decoded, stripped_core);
     }
 
@@ -1019,21 +1405,39 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
-    // ── #248: resolve resource built-in intrinsic imports
-    //    (`[resource-drop|new|rep]<R>`). Group them by the import
-    //    shape whose bundle feeds the main core module under the
-    //    matching module name; remember the import instance that
-    //    provides each resource type.
+    // ── #250: declare each guest-defined (exported) resource type.
+    //    On the fast path every exported resource is dtor-less (a
+    //    destructor forces the shim path above), so the type carries
+    //    no destructor. `own`/`borrow` refs in exported func sigs and
+    //    the `[export]…` `resource.{new,rep,drop}` intrinsics below
+    //    resolve to these slots.
+    var exported_resource_type_idx = std.StringHashMapUnmanaged(u32).empty;
+    for (exported_resources) |er| {
+        if (exported_resource_type_idx.contains(er.name)) continue;
+        try types.append(ar, .{ .resource = .{ .destructor = null } });
+        try Section.appendType(&order, ar, types.items.len);
+        try exported_resource_type_idx.put(ar, er.name, comp_type_idx);
+        comp_type_idx += 1;
+    }
+
+    // ── #248/#250: resolve resource built-in intrinsic imports
+    //    (`[resource-drop|new|rep]<R>`). Import-side intrinsics group
+    //    by the import shape whose bundle feeds the main core module;
+    //    export-side intrinsics (`[export]<iface>` module) operate on
+    //    a guest-defined resource and resolve to the exported resource
+    //    type declared above.
     const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    const parts = try partitionResourceIntrinsics(ar, intrinsics, exported_resources);
     const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
     for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
     const intrinsics_by_shape = try resolveResourceIntrinsicsByShape(
         ar,
-        intrinsics,
+        parts.import_side,
         shape_qnames,
         &resource_owner,
         &import_inst_idx_for,
     );
+    const export_groups = try groupExportSideByModule(ar, parts.export_side);
     // Resource-name → component type idx of the alias from its
     // providing import instance. Shared across the intrinsic canons
     // emitted in Phase 2.5.
@@ -1146,6 +1550,32 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         bundles_by_shape[i] = .{ .core_inst_idx = @intCast(core_instances.items.len - 1) };
     }
 
+    // ── #250: export-side resource intrinsic bundles. Each
+    //    `[export]<iface>` module the guest imports from gets one
+    //    bundle of `canon resource.{new,rep,drop} <exported R type>`
+    //    core funcs, fed to the main instance under that module name
+    //    so the guest's own handle-management imports are satisfied.
+    const ExportBundle = struct { module: []const u8, core_inst_idx: u32 };
+    var export_bundles = std.ArrayListUnmanaged(ExportBundle).empty;
+    for (export_groups) |group| {
+        const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, group.len);
+        for (group, 0..) |it, gi| {
+            const type_idx = exported_resource_type_idx.get(it.resource).?;
+            try canons.append(ar, canonForIntrinsic(it.kind, type_idx));
+            try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+            bundle_exports[gi] = .{
+                .name = it.field,
+                .sort_idx = .{ .sort = .func, .idx = core_func_idx },
+            };
+            core_func_idx += 1;
+        }
+        try core_instances.append(ar, .{ .exports = bundle_exports });
+        try export_bundles.append(ar, .{
+            .module = group[0].module,
+            .core_inst_idx = @intCast(core_instances.items.len - 1),
+        });
+    }
+
     // ── Main core_module + main core_instance.instantiate.
     //
     // The main instance's index in the core-instance indexspace is
@@ -1162,6 +1592,9 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                 .instance_idx = b.core_inst_idx,
             });
         }
+    }
+    for (export_bundles.items) |eb| {
+        try main_args.append(ar, .{ .name = eb.module, .instance_idx = eb.core_inst_idx });
     }
     try core_instances.append(ar, .{ .instantiate = .{
         .module_idx = 0,
@@ -1198,12 +1631,17 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         resource_owner: *std.StringHashMapUnmanaged([]const u8),
         import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
         resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
         hoist_keys: *std.ArrayListUnmanaged(HandleKey),
         hoist_idxs: *std.ArrayListUnmanaged(u32),
         comp_type_idx: *u32,
         order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
 
         fn resourceAlias(self: @This(), name: []const u8) !u32 {
+            // #250: a guest-defined (exported) resource resolves to the
+            // resource type declared in this component — no import
+            // alias needed.
+            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
             if (self.resource_alias_idx.get(name)) |idx| return idx;
             const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
             const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
@@ -1334,6 +1772,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .resource_owner = &resource_owner,
             .import_inst_idx_for = &import_inst_idx_for,
             .resource_alias_idx = &resource_alias_idx,
+            .exported_resource_type_idx = &exported_resource_type_idx,
             .hoist_keys = &hoist_keys,
             .hoist_idxs = &hoist_idxs,
             .comp_type_idx = &comp_type_idx,
@@ -1379,22 +1818,64 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     }
     const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
 
+    var nested_components = std.ArrayListUnmanaged(*ctypes.Component).empty;
     for (ext_export_start.items, 0..) |es, ei| {
         const end: u32 = if (ei + 1 < ext_export_start.items.len)
             ext_export_start.items[ei + 1].start
         else
             @intCast(captured_funcs.items.len);
         const fn_count = end - es.start;
-        var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+
+        // Resources this interface defines (stable order).
+        var res_names = std.ArrayListUnmanaged([]const u8).empty;
+        for (exported_resources) |er| {
+            if (std.mem.eql(u8, er.ext_qualified, es.ext.qualified_name)) try res_names.append(ar, er.name);
+        }
+
+        // Each lifted func's component-func index.
+        const func_comp_idx = try ar.alloc(u32, fn_count);
         for (0..fn_count) |i| {
-            const cf = captured_funcs.items[es.start + i];
-            inline_exports[i] = .{
-                .name = cf.fn_name,
-                .sort_idx = .{ .sort = .func, .idx = comp_func_idx },
-            };
+            func_comp_idx[i] = comp_func_idx;
             comp_func_idx += 1;
         }
-        try instances.append(ar, .{ .exports = inline_exports });
+
+        if (res_names.items.len == 0) {
+            // Resource-free interface: a flat inline-export instance is
+            // sufficient (the pre-#250 behaviour).
+            var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+            for (0..fn_count) |i| {
+                const cf = captured_funcs.items[es.start + i];
+                inline_exports[i] = .{
+                    .name = cf.fn_name,
+                    .sort_idx = .{ .sort = .func, .idx = func_comp_idx[i] },
+                };
+            }
+            try instances.append(ar, .{ .exports = inline_exports });
+        } else {
+            // #250: interface defines resources → instantiate a nested
+            // sub-component that re-exports them with the required
+            // type-export binding (see buildExportInterfaceComponent).
+            const nested = try buildExportInterfaceComponent(ar, es.ext, res_names.items);
+            try nested_components.append(ar, nested);
+            const comp_idx: u32 = @intCast(nested_components.items.len - 1);
+            var args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
+            for (res_names.items) |rn| {
+                try args.append(ar, .{
+                    .name = try nestedTypeImportName(ar, rn),
+                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(rn).? },
+                });
+            }
+            for (0..fn_count) |i| {
+                try args.append(ar, .{
+                    .name = try nestedFuncImportName(ar, i),
+                    .sort_idx = .{ .sort = .func, .idx = func_comp_idx[i] },
+                });
+            }
+            try instances.append(ar, .{ .instantiate = .{
+                .component_idx = comp_idx,
+                .args = try args.toOwnedSlice(ar),
+            } });
+        }
         const inst_idx = import_inst_count + @as(u32, @intCast(ei));
         try exports.append(ar, .{
             .name = es.ext.qualified_name,
@@ -1405,6 +1886,9 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 
     if (lifts_count > 0) {
         try order.append(ar, .{ .kind = .canon, .start = lifts_start, .count = lifts_count });
+    }
+    if (nested_components.items.len > 0) {
+        try order.append(ar, .{ .kind = .component, .start = 0, .count = @intCast(nested_components.items.len) });
     }
     if (instances.items.len > 0) {
         try order.append(ar, .{ .kind = .instance, .start = 0, .count = @intCast(instances.items.len) });
@@ -1417,7 +1901,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         .core_modules = core_modules,
         .core_instances = try core_instances.toOwnedSlice(ar),
         .core_types = &.{},
-        .components = &.{},
+        .components = try nested_components.toOwnedSlice(ar),
         .instances = try instances.toOwnedSlice(ar),
         .aliases = try aliases.toOwnedSlice(ar),
         .types = try types.toOwnedSlice(ar),
@@ -1575,14 +2059,33 @@ fn buildComponentShimFixup(
         try validateGuestImportSigs(alloc, stripped_core, expected.items);
     }
 
-    // ── Phase 3: build shim + fixup core wasm bytes.
-    const shim_slots = try ar.alloc(shim_mod.Slot, total_wired);
+    // ── #250: guest-defined (exported) resources. Each one with a
+    //    destructor needs a shim trampoline slot (sig `(i32)->()`) so
+    //    its `(type (resource … (dtor …)))` can reference a core func
+    //    before the main module is instantiated; the fixup later
+    //    patches that slot to call main's real destructor export.
+    const exported_resources = try collectExportedResources(ar, decoded, stripped_core);
+    var dtor_resources = std.ArrayListUnmanaged(ExportedResource).empty;
+    for (exported_resources) |er| {
+        if (er.dtor_export != null) try dtor_resources.append(ar, er);
+    }
+    const dtor_count: u32 = @intCast(dtor_resources.items.len);
+
+    // ── Phase 3: build shim + fixup core wasm bytes. Slots are the
+    //    wired imported funcs followed by one trampoline per dtor'd
+    //    exported resource.
+    const i32_slot = [_]wtypes.ValType{.i32};
+    const shim_slots = try ar.alloc(shim_mod.Slot, total_wired + dtor_count);
     {
         var k: usize = 0;
         for (wired_by_shape) |wired| for (wired) |w| {
             shim_slots[k] = .{ .params = w.slot_params, .results = w.slot_results };
             k += 1;
         };
+        var d: usize = 0;
+        while (d < dtor_count) : (d += 1) {
+            shim_slots[total_wired + d] = .{ .params = &i32_slot, .results = &.{} };
+        }
     }
     const shim_bytes = try shim_mod.build(ar, shim_slots);
     const fixup_bytes = try fixup_mod.build(ar, shim_slots);
@@ -1784,21 +2287,25 @@ fn buildComponentShimFixup(
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
-    // ── #248: resolve resource built-in intrinsic imports
-    //    (`[resource-drop|new|rep]<R>`), grouped by the import shape
-    //    whose bundle feeds the main core module under the matching
-    //    module name.
+    // ── #248/#250: resolve resource built-in intrinsic imports.
+    //    Import-side group by import shape; export-side (`[export]…`)
+    //    operate on a guest-defined resource.
     const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    const parts = try partitionResourceIntrinsics(ar, intrinsics, exported_resources);
     const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
     for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
     const intrinsics_by_shape = try resolveResourceIntrinsicsByShape(
         ar,
-        intrinsics,
+        parts.import_side,
         shape_qnames,
         &resource_owner,
         &import_inst_idx_for,
     );
+    const export_groups = try groupExportSideByModule(ar, parts.export_side);
     var intrinsic_resource_alias = std.StringHashMapUnmanaged(u32).empty;
+    // #250: resource name → component type idx of the exported
+    // resource type declared below (Step 2.5).
+    var exported_resource_type_idx = std.StringHashMapUnmanaged(u32).empty;
 
     // ── Phase 4b: alias each wired imported func into the
     //    component-level func indexspace. These slots become the
@@ -1843,13 +2350,14 @@ fn buildComponentShimFixup(
     // sections that name them — invalid (#234).
     try order.append(ar, .{ .kind = .core_instance, .start = shim_inst_idx, .count = 1 });
 
-    // Step 2: alias the shim's N stubs by name ("0","1",…) as core
+    // Step 2: alias the shim's stubs by name ("0","1",…) as core
     // funcs. These become the source funcs for the per-shape
-    // bundles that satisfy main's `(with …)` args.
+    // bundles that satisfy main's `(with …)` args. The last
+    // `dtor_count` stubs are the destructor trampolines (#250).
     const shim_stub_core_idx_base = core_func_idx;
     {
         var k: u32 = 0;
-        while (k < total_wired) : (k += 1) {
+        while (k < total_wired + dtor_count) : (k += 1) {
             const name = try std.fmt.allocPrint(ar, "{d}", .{k});
             try aliases.append(ar, .{ .instance_export = .{
                 .sort = .{ .core = .func },
@@ -1859,6 +2367,30 @@ fn buildComponentShimFixup(
             try Section.appendAlias(&order, ar, aliases.items.len);
             core_func_idx += 1;
         }
+    }
+    const dtor_stub_core_base = shim_stub_core_idx_base + total_wired;
+
+    // ── #250 Step 2.5: declare each guest-defined (exported) resource
+    //    type. A dtor'd resource references its shim destructor stub
+    //    (aliased above) as a core func; the fixup later patches that
+    //    stub to call main's real `<iface>#[dtor]<R>` export. These
+    //    types must precede the export-side intrinsic canons and the
+    //    Phase 5 lifted func types that reference them.
+    for (exported_resources) |er| {
+        if (exported_resource_type_idx.contains(er.name)) continue;
+        var dtor_idx: ?u32 = null;
+        if (er.dtor_export != null) {
+            for (dtor_resources.items, 0..) |dr, d| {
+                if (std.mem.eql(u8, dr.name, er.name)) {
+                    dtor_idx = dtor_stub_core_base + @as(u32, @intCast(d));
+                    break;
+                }
+            }
+        }
+        try types.append(ar, .{ .resource = .{ .destructor = dtor_idx } });
+        try Section.appendType(&order, ar, types.items.len);
+        try exported_resource_type_idx.put(ar, er.name, comp_type_idx);
+        comp_type_idx += 1;
     }
 
     // ── #248: emit a resource-type alias + `canon resource.{drop,
@@ -1892,6 +2424,23 @@ fn buildComponentShimFixup(
         intrinsic_core_idx_by_shape[si] = idxs;
     }
 
+    // ── #250: export-side resource intrinsics. `canon resource.{new,
+    //    rep,drop} <exported R type>` referencing the resource types
+    //    declared in Step 2.5; their core funcs follow the import-side
+    //    intrinsics. Grouped into a bundle per `[export]<iface>` below.
+    const export_group_core_idxs = try ar.alloc([]u32, export_groups.len);
+    for (export_groups, 0..) |group, gi| {
+        const idxs = try ar.alloc(u32, group.len);
+        for (group, 0..) |it, j| {
+            const type_idx = exported_resource_type_idx.get(it.resource).?;
+            try canons.append(ar, canonForIntrinsic(it.kind, type_idx));
+            try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+            idxs[j] = core_func_idx;
+            core_func_idx += 1;
+        }
+        export_group_core_idxs[gi] = idxs;
+    }
+
     // Step 3: per import shape, build an inline-exports bundle
     // mapping each wired func's canonical method name to its shim
     // stub (plus any #248 resource intrinsics to their direct core
@@ -1922,6 +2471,21 @@ fn buildComponentShimFixup(
             try bundle_for_main_args.append(ar, .{
                 .name = shape.qualified_name,
                 .instance_idx = bundle_inst_idx,
+            });
+        }
+        // #250: one bundle per `[export]<iface>` module.
+        for (export_groups, 0..) |group, gi| {
+            const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, group.len);
+            for (group, 0..) |it, j| {
+                bundle_exports[j] = .{
+                    .name = it.field,
+                    .sort_idx = .{ .sort = .func, .idx = export_group_core_idxs[gi][j] },
+                };
+            }
+            try core_instances.append(ar, .{ .exports = bundle_exports });
+            try bundle_for_main_args.append(ar, .{
+                .name = group[0].module,
+                .instance_idx = @intCast(core_instances.items.len - 1),
             });
         }
     }
@@ -1997,12 +2561,28 @@ fn buildComponentShimFixup(
         }
     }
 
+    // ── #250 Phase 4f.5: alias main's real destructor exports
+    //    `<iface>#[dtor]<R>` as core funcs. The fixup writes these into
+    //    the shim table slots so the destructor trampolines forward to
+    //    the guest's real destructors.
+    const dtor_main_core_base = core_func_idx;
+    for (dtor_resources.items) |dr| {
+        try aliases.append(ar, .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = main_core_inst_idx,
+            .name = dr.dtor_export.?,
+        } });
+        try Section.appendAlias(&order, ar, aliases.items.len);
+        core_func_idx += 1;
+    }
+
     // ── Phase 4g: build the fixup module's args bundle. Maps each
     //    slot's stable name ("0","1",…) to the lowered core func at
-    //    `lowered_core_idx_base + i`, plus `$imports` → the shim's
+    //    `lowered_core_idx_base + i` (and each destructor slot to
+    //    main's real dtor export), plus `$imports` → the shim's
     //    table. Then instantiate fixup with this bundle.
     {
-        const bundle_size = total_wired + 1;
+        const bundle_size = total_wired + dtor_count + 1;
         const bundle = try ar.alloc(ctypes.CoreInlineExport, bundle_size);
         var k: u32 = 0;
         while (k < total_wired) : (k += 1) {
@@ -2012,7 +2592,15 @@ fn buildComponentShimFixup(
                 .sort_idx = .{ .sort = .func, .idx = lowered_core_idx_base + k },
             };
         }
-        bundle[total_wired] = .{
+        var d: u32 = 0;
+        while (d < dtor_count) : (d += 1) {
+            const name = try std.fmt.allocPrint(ar, "{d}", .{total_wired + d});
+            bundle[total_wired + d] = .{
+                .name = name,
+                .sort_idx = .{ .sort = .func, .idx = dtor_main_core_base + d },
+            };
+        }
+        bundle[total_wired + dtor_count] = .{
             .name = "$imports",
             .sort_idx = .{ .sort = .table, .idx = shim_table_core_idx },
         };
@@ -2058,12 +2646,16 @@ fn buildComponentShimFixup(
         resource_owner: *std.StringHashMapUnmanaged([]const u8),
         import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
         resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
         hoist_keys: *std.ArrayListUnmanaged(HandleKey),
         hoist_idxs: *std.ArrayListUnmanaged(u32),
         comp_type_idx: *u32,
         order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
 
         fn resourceAlias(self: @This(), name: []const u8) !u32 {
+            // #250: guest-defined (exported) resource → its declared
+            // resource type in this component.
+            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
             if (self.resource_alias_idx.get(name)) |idx| return idx;
             const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
             const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
@@ -2173,6 +2765,7 @@ fn buildComponentShimFixup(
             .resource_owner = &resource_owner,
             .import_inst_idx_for = &import_inst_idx_for,
             .resource_alias_idx = &resource_alias_idx,
+            .exported_resource_type_idx = &exported_resource_type_idx,
             .hoist_keys = &hoist_keys,
             .hoist_idxs = &hoist_idxs,
             .comp_type_idx = &comp_type_idx,
@@ -2216,22 +2809,59 @@ fn buildComponentShimFixup(
     }
     const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
 
+    var nested_components = std.ArrayListUnmanaged(*ctypes.Component).empty;
     for (ext_export_start.items, 0..) |es, ei| {
         const end: u32 = if (ei + 1 < ext_export_start.items.len)
             ext_export_start.items[ei + 1].start
         else
             @intCast(captured_funcs.items.len);
         const fn_count = end - es.start;
-        var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+
+        var res_names = std.ArrayListUnmanaged([]const u8).empty;
+        for (exported_resources) |er| {
+            if (std.mem.eql(u8, er.ext_qualified, es.ext.qualified_name)) try res_names.append(ar, er.name);
+        }
+
+        const func_comp_idx = try ar.alloc(u32, fn_count);
         for (0..fn_count) |i| {
-            const cf = captured_funcs.items[es.start + i];
-            inline_exports[i] = .{
-                .name = cf.fn_name,
-                .sort_idx = .{ .sort = .func, .idx = comp_func_idx },
-            };
+            func_comp_idx[i] = comp_func_idx;
             comp_func_idx += 1;
         }
-        try instances.append(ar, .{ .exports = inline_exports });
+
+        if (res_names.items.len == 0) {
+            var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+            for (0..fn_count) |i| {
+                const cf = captured_funcs.items[es.start + i];
+                inline_exports[i] = .{
+                    .name = cf.fn_name,
+                    .sort_idx = .{ .sort = .func, .idx = func_comp_idx[i] },
+                };
+            }
+            try instances.append(ar, .{ .exports = inline_exports });
+        } else {
+            // #250: interface defines resources → nested sub-component
+            // performing the required type-export binding.
+            const nested = try buildExportInterfaceComponent(ar, es.ext, res_names.items);
+            try nested_components.append(ar, nested);
+            const comp_idx: u32 = @intCast(nested_components.items.len - 1);
+            var args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
+            for (res_names.items) |rn| {
+                try args.append(ar, .{
+                    .name = try nestedTypeImportName(ar, rn),
+                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(rn).? },
+                });
+            }
+            for (0..fn_count) |i| {
+                try args.append(ar, .{
+                    .name = try nestedFuncImportName(ar, i),
+                    .sort_idx = .{ .sort = .func, .idx = func_comp_idx[i] },
+                });
+            }
+            try instances.append(ar, .{ .instantiate = .{
+                .component_idx = comp_idx,
+                .args = try args.toOwnedSlice(ar),
+            } });
+        }
         const inst_idx = import_inst_count + @as(u32, @intCast(ei));
         try exports.append(ar, .{
             .name = es.ext.qualified_name,
@@ -2242,6 +2872,9 @@ fn buildComponentShimFixup(
 
     if (lifts_count > 0) {
         try order.append(ar, .{ .kind = .canon, .start = lifts_start, .count = lifts_count });
+    }
+    if (nested_components.items.len > 0) {
+        try order.append(ar, .{ .kind = .component, .start = 0, .count = @intCast(nested_components.items.len) });
     }
     if (instances.items.len > 0) {
         try order.append(ar, .{ .kind = .instance, .start = 0, .count = @intCast(instances.items.len) });
@@ -2254,7 +2887,7 @@ fn buildComponentShimFixup(
         .core_modules = core_modules,
         .core_instances = try core_instances.toOwnedSlice(ar),
         .core_types = &.{},
-        .components = &.{},
+        .components = try nested_components.toOwnedSlice(ar),
         .instances = try instances.toOwnedSlice(ar),
         .aliases = try aliases.toOwnedSlice(ar),
         .types = try types.toOwnedSlice(ar),
@@ -4164,4 +4797,227 @@ test "buildComponent #248: drop of an unknown resource is a hard error" {
     defer testing.allocator.free(core);
 
     try testing.expectError(error.UnresolvedResourceIntrinsic, buildComponent(testing.allocator, core));
+}
+
+// ── #250: guest-implemented (exported) resource tests ──────────────
+
+fn countCanon(loaded: anytype, comptime tag: @TypeOf(.enum_literal)) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| {
+        if (std.meta.activeTag(c) == tag) n += 1;
+    }
+    return n;
+}
+
+/// True if any top-level instance, or any nested sub-component,
+/// exports a *type* named `name`.
+fn instanceExportsType(loaded: anytype, name: []const u8) bool {
+    for (loaded.instances) |inst| switch (inst) {
+        .exports => |exps| for (exps) |e| {
+            if (e.sort_idx.sort == .type and std.mem.eql(u8, e.name, name)) return true;
+        },
+        else => {},
+    };
+    for (loaded.components) |child| {
+        for (child.exports) |e| {
+            const si = e.sort_idx orelse continue;
+            if (si.sort == .type and std.mem.eql(u8, e.name, name)) return true;
+        }
+    }
+    return false;
+}
+
+/// True if the component declares at least one resource type def with
+/// (`with_dtor`) or without a destructor.
+fn hasResourceTypeDef(loaded: anytype, with_dtor: bool) bool {
+    for (loaded.types) |t| switch (t) {
+        .resource => |r| if ((r.destructor != null) == with_dtor) return true,
+        else => {},
+    };
+    return false;
+}
+
+test "buildComponent #250: dtor-less exported resource (fast path)" {
+    // A guest that *defines* an exported resource with no destructor:
+    // a constructor + a method, plus the `[resource-new]`/
+    // `[resource-rep]` intrinsics it imports from `[export]<iface>`.
+    // No destructor → no forward-reference cycle → fast path.
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        constructor(x: u32);
+        \\        get: func() -> u32;
+        \\    }
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]thing" (func (param i32) (result i32)))
+        \\  (import "[export]test:res/things@0.1.0" "[resource-rep]thing" (func (param i32) (result i32)))
+        \\  (func (export "test:res/things@0.1.0#[constructor]thing") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[method]thing.get") (param i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Fast path: single core module (no shim/fixup).
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // Exported resource type declared without a destructor.
+    try testing.expect(hasResourceTypeDef(loaded, false));
+    // resource.new + resource.rep wired (one each).
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_new));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_rep));
+    // The guest's `[export]…` intrinsic imports are satisfied.
+    try testing.expect(bundleExportsFunc(loaded, "[resource-new]thing"));
+    try testing.expect(bundleExportsFunc(loaded, "[resource-rep]thing"));
+    try testing.expect(mainWithArgFor(loaded, "[export]test:res/things@0.1.0"));
+    // The exported interface instance exposes the resource type.
+    try testing.expect(instanceExportsType(loaded, "thing"));
+}
+
+test "buildComponent #250: exported resource with destructor (shim/fixup path)" {
+    // A guest defining an exported resource *with* a destructor. The
+    // destructor forces the shim/fixup path: the resource type's dtor
+    // references a shim trampoline that the fixup patches to call the
+    // guest's real `#[dtor]thing` export.
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        constructor(x: u32);
+        \\        get: func() -> u32;
+        \\    }
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]thing" (func (param i32) (result i32)))
+        \\  (import "[export]test:res/things@0.1.0" "[resource-rep]thing" (func (param i32) (result i32)))
+        \\  (func (export "test:res/things@0.1.0#[constructor]thing") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[method]thing.get") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[dtor]thing") (param i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Shim/fixup path: main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    // Exported resource type declared *with* a destructor.
+    try testing.expect(hasResourceTypeDef(loaded, true));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_new));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_rep));
+    try testing.expect(bundleExportsFunc(loaded, "[resource-new]thing"));
+    try testing.expect(bundleExportsFunc(loaded, "[resource-rep]thing"));
+    try testing.expect(mainWithArgFor(loaded, "[export]test:res/things@0.1.0"));
+    try testing.expect(instanceExportsType(loaded, "thing"));
+}
+
+test "buildComponent #250: exported-resource intrinsic for an unknown resource is a hard error" {
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        get: func() -> u32;
+        \\    }
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]ghost" (func (param i32) (result i32)))
+        \\  (func (export "test:res/things@0.1.0#[method]thing.get") (param i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    try testing.expectError(error.UnresolvedResourceIntrinsic, buildComponent(testing.allocator, core));
+}
+
+test "buildComponent #250: rich resource interface (ctor, method, method->own, static, free func) on shim path" {
+    // Exercises the nested-component transcription across func shapes:
+    // a constructor, a borrow-self method, a method returning `own`,
+    // a static method over two borrows, and an interface-level free
+    // function returning `own`. The destructor forces the shim path.
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        constructor(x: u32);
+        \\        get: func() -> u32;
+        \\        clone: func() -> thing;
+        \\        merge: static func(a: borrow<thing>, b: borrow<thing>) -> thing;
+        \\    }
+        \\    make: func(v: u32) -> thing;
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]thing" (func (param i32) (result i32)))
+        \\  (import "[export]test:res/things@0.1.0" "[resource-rep]thing" (func (param i32) (result i32)))
+        \\  (func (export "test:res/things@0.1.0#[constructor]thing") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[method]thing.get") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[method]thing.clone") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[static]thing.merge") (param i32 i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#make") (param i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[dtor]thing") (param i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(hasResourceTypeDef(loaded, true));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_new));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_rep));
+    try testing.expect(instanceExportsType(loaded, "thing"));
+    // One nested sub-component re-exports the whole interface.
+    try testing.expect(loaded.components.len == 1);
 }
