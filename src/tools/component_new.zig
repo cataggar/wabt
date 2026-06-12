@@ -411,6 +411,84 @@ fn coreImportsModule(
     return false;
 }
 
+/// A wired import's name plus the canonical-ABI core signature its
+/// `canon.lower` is guaranteed to produce. `module` is the import
+/// instance's qualified name (e.g. `wasi:http/types@0.2.6`); `field`
+/// is the canonical method-encoded func name (e.g.
+/// `[static]response-outparam.set`).
+const ExpectedImportSig = struct {
+    module: []const u8,
+    field: []const u8,
+    params: []const wabt.types.ValType,
+    results: []const wabt.types.ValType,
+};
+
+/// Validate that the guest core module's declared import signature for
+/// each wired func matches the canonical-ABI lowering wabt provides for
+/// it. A mismatch means the produced component cannot link on a
+/// spec-compliant host (e.g. wasmtime rejects it at load with a core
+/// type mismatch), so fail early with an actionable diagnostic instead
+/// of emitting a component that only crashes at runtime. See #244: a
+/// guest that flattens an `error-code`-bearing import without the
+/// canonical `i64` widening trips exactly this check.
+fn validateGuestImportSigs(
+    gpa: std.mem.Allocator,
+    core_bytes: []const u8,
+    expected: []const ExpectedImportSig,
+) !void {
+    if (expected.len == 0) return;
+    var owned = core_imports.extract(gpa, core_bytes) catch return;
+    defer owned.deinit();
+    for (expected) |e| {
+        const declared = findDeclaredImportSig(owned.interface, e.module, e.field) orelse continue;
+        if (valTypesEql(declared.params, e.params) and valTypesEql(declared.results, e.results)) continue;
+        printImportSigMismatch(e, declared);
+        return error.CoreImportSignatureMismatch;
+    }
+}
+
+fn findDeclaredImportSig(
+    iface: core_imports.CoreInterface,
+    module: []const u8,
+    field: []const u8,
+) ?core_imports.FuncSig {
+    for (iface.imports) |im| {
+        if (im.kind == .func and im.sig != null and
+            std.mem.eql(u8, im.module_name, module) and
+            std.mem.eql(u8, im.field_name, field))
+            return im.sig.?;
+    }
+    return null;
+}
+
+fn valTypesEql(a: []const wabt.types.ValType, b: []const wabt.types.ValType) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| if (x != y) return false;
+    return true;
+}
+
+fn debugPrintCoreSig(params: []const wabt.types.ValType, results: []const wabt.types.ValType) void {
+    std.debug.print("(func", .{});
+    for (params) |p| std.debug.print(" (param {s})", .{@tagName(p)});
+    for (results) |r| std.debug.print(" (result {s})", .{@tagName(r)});
+    std.debug.print(")", .{});
+}
+
+fn printImportSigMismatch(e: ExpectedImportSig, declared: core_imports.FuncSig) void {
+    std.debug.print(
+        "error: core import signature mismatch for `{s}` of `{s}`\n  expected (canonical ABI lowering): ",
+        .{ e.field, e.module },
+    );
+    debugPrintCoreSig(e.params, e.results);
+    std.debug.print("\n  found (declared by core module):   ", .{});
+    debugPrintCoreSig(declared.params, declared.results);
+    std.debug.print(
+        "\n  hint: the core module's guest bindings flatten this import incorrectly; " ++
+            "regenerate them so the signature matches the canonical ABI.\n",
+        .{},
+    );
+}
+
 /// Result of inspecting the embed core for `_start`. `parse_error`
 /// is preserved separately so `pickBuiltinAdapter` can fall back to
 /// the command adapter for malformed cores (matching pre-#167
@@ -757,6 +835,33 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         });
         try order.append(ar, .{ .kind = .import, .start = @intCast(imports.items.len - 1), .count = 1 });
         try import_inst_idx_for.put(ar, shape.qualified_name, @intCast(i));
+    }
+
+    // Validate the guest's declared core import sigs against the
+    // canonical lowering before wiring them (mirrors the shim path's
+    // Phase 2.9 / #244). Funcs wired here lower with empty canon opts
+    // but still flatten per the canonical ABI, so a guest that
+    // mis-flattens (e.g. a `u64` param declared as `i32`) is caught
+    // early with an actionable diff instead of a host load failure.
+    {
+        const abi = wabt.component.adapter.abi;
+        var expected = std.ArrayListUnmanaged(ExpectedImportSig).empty;
+        for (import_shapes.items, 0..) |shape, i| {
+            const resolver = abi.TypeResolver{
+                .inst_decls = shape.inst_decls,
+                .world_decls = decoded.world_decls,
+            };
+            for (wired_funcs_by_shape[i]) |fn_ref| {
+                const lowered = try abi.lowerCoreSig(ar, .{ .func = fn_ref.sig, .resolver = resolver });
+                try expected.append(ar, .{
+                    .module = shape.qualified_name,
+                    .field = fn_ref.name,
+                    .params = lowered.params,
+                    .results = lowered.results,
+                });
+            }
+        }
+        try validateGuestImportSigs(alloc, stripped_core, expected.items);
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
@@ -1223,6 +1328,24 @@ fn buildComponentShimFixup(
         }
         wired_by_shape[i] = try list.toOwnedSlice(ar);
         total_wired += @intCast(wired_by_shape[i].len);
+    }
+
+    // ── Phase 2.9: validate the guest's declared core import sigs
+    //    against the canonical lowering we're about to provide. A
+    //    mismatch (e.g. #244's `error-code` flattened without the
+    //    canonical `i64`) would otherwise produce a component that
+    //    only fails to link at host load; fail early with a diff.
+    {
+        var expected = std.ArrayListUnmanaged(ExpectedImportSig).empty;
+        for (import_shapes.items, 0..) |shape, i| {
+            for (wired_by_shape[i]) |w| try expected.append(ar, .{
+                .module = shape.qualified_name,
+                .field = w.fn_ref.name,
+                .params = w.slot_params,
+                .results = w.slot_results,
+            });
+        }
+        try validateGuestImportSigs(alloc, stripped_core, expected.items);
     }
 
     // ── Phase 3: build shim + fixup core wasm bytes.
@@ -3406,4 +3529,100 @@ test "buildComponent #222: resource methods survive in wrapping component's impo
     try testing.expect(saw_ready);
     try testing.expect(saw_block);
     try testing.expect(saw_poll);
+}
+
+/// Hand-build a minimal core wasm with a single func import of the
+/// given param val types and no results (`(module.field) -> ()`).
+/// Only the type + import sections are emitted, which is all
+/// `core_imports.extract` needs to read the declared import sig. Name
+/// and section lengths stay < 128 bytes so single-byte LEBs suffice.
+fn buildCoreWithFuncImport(
+    alloc: std.mem.Allocator,
+    module: []const u8,
+    field: []const u8,
+    params: []const wabt.types.ValType,
+) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+
+    const writeSection = struct {
+        fn f(buf: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, id: u8, body: []const u8) !void {
+            std.debug.assert(body.len < 0x80);
+            try buf.append(a, id);
+            try buf.append(a, @intCast(body.len));
+            try buf.appendSlice(a, body);
+        }
+    }.f;
+
+    // Type section: 1 type `(params...) -> ()`.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(alloc);
+        try b.append(alloc, 0x01); // type count
+        try b.append(alloc, 0x60); // func form
+        std.debug.assert(params.len < 0x80);
+        try b.append(alloc, @intCast(params.len));
+        for (params) |p| try b.append(alloc, @intCast(@intFromEnum(p)));
+        try b.append(alloc, 0x00); // 0 results
+        try writeSection(&out, alloc, 0x01, b.items);
+    }
+    // Import section: `module.field` func with type idx 0.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(alloc);
+        try b.append(alloc, 0x01); // import count
+        try b.append(alloc, @intCast(module.len));
+        try b.appendSlice(alloc, module);
+        try b.append(alloc, @intCast(field.len));
+        try b.appendSlice(alloc, field);
+        try b.append(alloc, 0x00); // desc: func
+        try b.append(alloc, 0x00); // type idx 0
+        try writeSection(&out, alloc, 0x02, b.items);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "validateGuestImportSigs: all-i32 error-code import is rejected (#244)" {
+    // The guest declaring `[static]response-outparam.set` with an
+    // all-`i32` `error-code` flattening is non-canonical and only
+    // links on lenient hosts; wabt must reject it early rather than
+    // emit a component that fails to load on wasmtime.
+    const I = wabt.types.ValType.i32;
+    const L = wabt.types.ValType.i64;
+    const module = "wasi:http/types@0.2.6";
+    const field = "[static]response-outparam.set";
+
+    // The canonical core sig wabt lowers to (i64 at index 4).
+    const canonical = [_]wabt.types.ValType{ I, I, I, I, L, I, I, I, I };
+    const expected = [_]ExpectedImportSig{.{
+        .module = module,
+        .field = field,
+        .params = &canonical,
+        .results = &.{},
+    }};
+
+    // Guest declares all-i32: must be rejected.
+    {
+        const wrong = [_]wabt.types.ValType{ I, I, I, I, I, I, I, I, I };
+        const core = try buildCoreWithFuncImport(testing.allocator, module, field, &wrong);
+        defer testing.allocator.free(core);
+        try testing.expectError(
+            error.CoreImportSignatureMismatch,
+            validateGuestImportSigs(testing.allocator, core, &expected),
+        );
+    }
+    // Guest declares the canonical sig: accepted.
+    {
+        const core = try buildCoreWithFuncImport(testing.allocator, module, field, &canonical);
+        defer testing.allocator.free(core);
+        try validateGuestImportSigs(testing.allocator, core, &expected);
+    }
+    // Import wabt doesn't wire (absent from `expected`) is ignored.
+    {
+        const wrong = [_]wabt.types.ValType{ I, I, I, I, I, I, I, I, I };
+        const core = try buildCoreWithFuncImport(testing.allocator, module, field, &wrong);
+        defer testing.allocator.free(core);
+        try validateGuestImportSigs(testing.allocator, core, &.{});
+    }
 }

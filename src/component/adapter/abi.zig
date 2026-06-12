@@ -1148,3 +1148,52 @@ test "lowerCoreSig: u64 params lower to i64" {
     try testing.expectEqual(wtypes.ValType.i64, sig.params[0]);
     try testing.expectEqual(wtypes.ValType.i32, sig.params[1]);
 }
+
+test "lowerCoreSig: result with option<u64>-bearing variant widens joined slot to i64 (#244)" {
+    // Regression for cataggar/wabt#244. The canonical-ABI variant
+    // flattening joins each case's payload slot-by-slot with
+    // `join(i32, i64) = i64`, so a variant case carrying `option<u64>`
+    // forces a joined payload slot to `i64`. This mirrors `wasi:http`
+    // `[static]response-outparam.set`'s
+    // `result<own<…>, error-code>` param, whose canonical core sig is
+    // `(i32 i32 i32 i32 i64 i32 i32 i32 i32)` — wasm-tools/wasmtime
+    // require exactly this. The test locks in the `i64` so a future
+    // "fix" toward all-`i32` (which would corrupt `u64` payloads) is
+    // caught.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // instance body type-index space:
+    //   0: option<u64>
+    //   1: option<string>
+    //   2: variant { none_case, big(option<u64>), str(option<string>) }
+    //   3: result<u32, variant#2>
+    //   4: func(p0: u32, p1: result#3) -> ()
+    //   export "set" -> func 4
+    var inst_decls = try a.alloc(ctypes.Decl, 6);
+    inst_decls[0] = .{ .type = .{ .option = .{ .inner = .u64 } } };
+    inst_decls[1] = .{ .type = .{ .option = .{ .inner = .string } } };
+    const cases = try a.alloc(ctypes.Case, 3);
+    cases[0] = .{ .name = "none_case", .type = null };
+    cases[1] = .{ .name = "big", .type = .{ .type_idx = 0 } };
+    cases[2] = .{ .name = "str", .type = .{ .type_idx = 1 } };
+    inst_decls[2] = .{ .type = .{ .variant = .{ .cases = cases } } };
+    inst_decls[3] = .{ .type = .{ .result = .{ .ok = .u32, .err = .{ .type_idx = 2 } } } };
+    const params = try a.alloc(ctypes.NamedValType, 2);
+    params[0] = .{ .name = "p0", .type = .u32 };
+    params[1] = .{ .name = "p1", .type = .{ .type_idx = 3 } };
+    inst_decls[4] = .{ .type = .{ .func = .{ .params = params, .results = .none } } };
+    inst_decls[5] = .{ .@"export" = .{ .name = "set", .desc = .{ .func = 4 } } };
+
+    const world = try buildSyntheticWorld(a, inst_decls, 4);
+    const ftr = try findFuncImport(world, 0, "set");
+    const sig = try lowerCoreSig(a, ftr);
+
+    // p0(u32)=i32; result = disc i32 + joined payload [i32, i32, i64, i32]
+    // => [i32, i32, i32, i32, i64, i32]; the i64 lands at index 4.
+    const want = [_]wtypes.ValType{ .i32, .i32, .i32, .i32, .i64, .i32 };
+    try testing.expectEqual(@as(usize, want.len), sig.params.len);
+    try testing.expectEqual(@as(usize, 0), sig.results.len);
+    for (want, 0..) |w, idx| try testing.expectEqual(w, sig.params[idx]);
+}
