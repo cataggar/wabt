@@ -42,6 +42,7 @@ const abi = @import("abi.zig");
 const gc = @import("gc.zig");
 const world_gc = @import("world_gc.zig");
 const metadata_decode = @import("../wit/metadata_decode.zig");
+const lift_types = @import("../wit/lift_types.zig");
 const type_walk = @import("../type_walk.zig");
 const leb = @import("../../leb128.zig");
 
@@ -1216,6 +1217,23 @@ const Builder = struct {
     }
 };
 
+/// Adapter-side context for the shared `lift_types` transcriber: it
+/// hoists compound value types via the `Builder` and leaves resource
+/// handles / aliased `use`d types untouched (the reactor lift path
+/// doesn't rewrite those — preserving pre-#246 behaviour).
+const ReactorLiftCtx = struct {
+    b: *Builder,
+
+    pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+        return self.b.addType(td);
+    }
+
+    pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
+        _ = self;
+        return v;
+    }
+};
+
 fn assemble(in: Inputs) ![]u8 {
     const a = in.arena;
 
@@ -1751,7 +1769,13 @@ fn assemble(in: Inputs) ![]u8 {
                     .instance_idx = main_inst,
                     .name = core_export_name,
                 } });
-                const ftype_idx = try b.addType(.{ .func = fn_ref.sig });
+                const rewritten_sig = try lift_types.transcribeFuncSig(
+                    a,
+                    ReactorLiftCtx{ .b = &b },
+                    ext.type_slots,
+                    fn_ref.sig,
+                );
+                const ftype_idx = try b.addType(.{ .func = rewritten_sig });
                 const lifted_idx = try b.addCanon(.{ .lift = .{
                     .core_func_idx = core_func_idx,
                     .type_idx = ftype_idx,

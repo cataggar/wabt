@@ -60,6 +60,7 @@ const ctypes = wabt.component.types;
 const writer = wabt.component.writer;
 const metadata_decode = wabt.component.wit.metadata_decode;
 const core_imports = wabt.component.adapter.core_imports;
+const lift_types = wabt.component.wit.lift_types;
 
 pub const usage =
     \\Usage: wabt component new [options] <core.wasm>
@@ -1031,6 +1032,24 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         }
 
         fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
+            return lift_types.transcribeValType(self.ar, self, self.ext_slots, v);
+        }
+
+        /// Append a defined type to the component type section and
+        /// return its component-level type index. Used by the shared
+        /// `lift_types` transcriber to hoist compound value types.
+        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+            try self.types.append(self.ar, td);
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            return slot;
+        }
+
+        /// Resolve a leaf value type the transcriber doesn't hoist:
+        /// resource handles become defined handle types via
+        /// `hoistHandle`; anything else passes through unchanged.
+        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
             return switch (v) {
                 .own => |k| blk: {
                     const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
@@ -1818,6 +1837,24 @@ fn buildComponentShimFixup(
         }
 
         fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
+            return lift_types.transcribeValType(self.ar, self, self.ext_slots, v);
+        }
+
+        /// Append a defined type to the component type section and
+        /// return its component-level type index. Used by the shared
+        /// `lift_types` transcriber to hoist compound value types.
+        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+            try self.types.append(self.ar, td);
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            return slot;
+        }
+
+        /// Resolve a leaf value type the transcriber doesn't hoist:
+        /// resource handles become defined handle types via
+        /// `hoistHandle`; anything else passes through unchanged.
+        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
             return switch (v) {
                 .own => |k| blk: {
                     const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
