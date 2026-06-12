@@ -633,6 +633,159 @@ fn rewriteSigForInstanceBody(
     return .{ .params = params, .results = results };
 }
 
+// ── Resource built-in intrinsic imports (cataggar/wabt#248) ─────────
+//
+// A guest core module can import the canonical resource built-ins
+// directly, e.g.
+//   (import "wasi:io/streams@0.2.6" "[resource-drop]output-stream"
+//           (func (param i32)))
+// These are NOT WIT-declared methods (they never appear in
+// `ext.funcs`), so the normal method-wiring path leaves them dangling
+// and the produced component is rejected at instantiation
+// ("does not export an item named `[resource-drop]output-stream`").
+// We recognise them and wire each to a
+// `canon resource.{drop,new,rep} <resource-type>` placed in the same
+// import bundle, exactly as wit-component / wasm-tools do.
+
+const IntrinsicKind = enum { drop, new, rep };
+
+const ResourceIntrinsic = struct {
+    /// Import module name == the bundle key fed to the main core
+    /// module's `(with …)` arg.
+    module: []const u8,
+    /// Full canonical field name (e.g. `[resource-drop]output-stream`)
+    /// — used verbatim as the bundle's inline-export name so it
+    /// satisfies the guest's core import.
+    field: []const u8,
+    /// Bare resource name (e.g. `output-stream`).
+    resource: []const u8,
+    kind: IntrinsicKind,
+};
+
+/// Classify a core import field name as a resource built-in intrinsic.
+/// Returns null for ordinary names and the method-encoded forms
+/// (`[method]…`, `[static]…`, `[constructor]…`) which are real WIT
+/// funcs handled by the normal wiring path.
+fn classifyResourceIntrinsic(field: []const u8) ?struct {
+    kind: IntrinsicKind,
+    resource: []const u8,
+} {
+    const Pre = struct { p: []const u8, k: IntrinsicKind };
+    const pres = [_]Pre{
+        .{ .p = "[resource-drop]", .k = .drop },
+        .{ .p = "[resource-new]", .k = .new },
+        .{ .p = "[resource-rep]", .k = .rep },
+    };
+    for (pres) |pre| {
+        if (std.mem.startsWith(u8, field, pre.p)) {
+            return .{ .kind = pre.k, .resource = field[pre.p.len..] };
+        }
+    }
+    return null;
+}
+
+/// Scan the guest core module's imports for resource built-in
+/// intrinsics. Returns `ar`-owned copies. A core that fails to parse
+/// yields an empty list (the downstream loader surfaces the real
+/// error).
+fn collectResourceIntrinsics(
+    ar: std.mem.Allocator,
+    core_bytes: []const u8,
+) ![]const ResourceIntrinsic {
+    const owned = core_imports.extract(ar, core_bytes) catch return &.{};
+    var list = std.ArrayListUnmanaged(ResourceIntrinsic).empty;
+    for (owned.interface.imports) |im| {
+        if (im.kind != .func) continue;
+        const c = classifyResourceIntrinsic(im.field_name) orelse continue;
+        try list.append(ar, .{
+            .module = try ar.dupe(u8, im.module_name),
+            .field = try ar.dupe(u8, im.field_name),
+            .resource = try ar.dupe(u8, c.resource),
+            .kind = c.kind,
+        });
+    }
+    return list.toOwnedSlice(ar);
+}
+
+/// A resource intrinsic resolved against the world's imports: which
+/// import instance provides the resource type (the `alias
+/// instance_export sort=type` source the canon operand needs).
+const ResolvedIntrinsic = struct {
+    field: []const u8,
+    resource: []const u8,
+    kind: IntrinsicKind,
+    /// Component-instance index of the import that declares `resource`
+    /// as a sub_resource.
+    owner_inst_idx: u32,
+};
+
+/// Group resource intrinsics by the import shape whose qualified name
+/// equals the intrinsic's module (the bundle that feeds the main core
+/// module under that name). Validates that the bundle namespace is an
+/// imported interface and that the named resource is provided by some
+/// imported interface; otherwise fails with an actionable error (#248
+/// decision: hard error, never silently leave the import dangling).
+fn resolveResourceIntrinsicsByShape(
+    ar: std.mem.Allocator,
+    intrinsics: []const ResourceIntrinsic,
+    shape_qnames: []const []const u8,
+    resource_owner: *const std.StringHashMapUnmanaged([]const u8),
+    import_inst_idx_for: *const std.StringHashMapUnmanaged(u32),
+) ![]const []const ResolvedIntrinsic {
+    var by_shape = try ar.alloc(std.ArrayListUnmanaged(ResolvedIntrinsic), shape_qnames.len);
+    for (by_shape) |*l| l.* = .empty;
+    for (intrinsics) |it| {
+        var shape_idx: ?usize = null;
+        for (shape_qnames, 0..) |q, i| {
+            if (std.mem.eql(u8, q, it.module)) {
+                shape_idx = i;
+                break;
+            }
+        }
+        const si = shape_idx orelse {
+            std.debug.print(
+                "error: core import `{s}` of `{s}` is a resource intrinsic, " ++
+                    "but `{s}` is not an imported interface in the world\n",
+                .{ it.field, it.module, it.module },
+            );
+            return error.UnresolvedResourceIntrinsic;
+        };
+        const owner_qname = resource_owner.get(it.resource) orelse {
+            std.debug.print(
+                "error: core import `{s}` of `{s}` references resource `{s}`, " ++
+                    "which no imported interface in the world provides\n",
+                .{ it.field, it.module, it.resource },
+            );
+            return error.UnresolvedResourceIntrinsic;
+        };
+        const owner_inst_idx = import_inst_idx_for.get(owner_qname) orelse {
+            std.debug.print(
+                "error: core import `{s}` of `{s}` references resource `{s}`, " ++
+                    "whose providing interface `{s}` was not wired as an import instance\n",
+                .{ it.field, it.module, it.resource, owner_qname },
+            );
+            return error.UnresolvedResourceIntrinsic;
+        };
+        try by_shape[si].append(ar, .{
+            .field = it.field,
+            .resource = it.resource,
+            .kind = it.kind,
+            .owner_inst_idx = owner_inst_idx,
+        });
+    }
+    var out = try ar.alloc([]const ResolvedIntrinsic, shape_qnames.len);
+    for (by_shape, 0..) |*l, i| out[i] = try l.toOwnedSlice(ar);
+    return out;
+}
+
+fn canonForIntrinsic(kind: IntrinsicKind, type_idx: u32) ctypes.Canon {
+    return switch (kind) {
+        .drop => .{ .resource_drop = type_idx },
+        .new => .{ .resource_new = type_idx },
+        .rep => .{ .resource_rep = type_idx },
+    };
+}
+
 /// Construct the wrapping component bytes from a core module that
 /// has an embedded `component-type:<world>` custom section.
 pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
@@ -866,6 +1019,26 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
+    // ── #248: resolve resource built-in intrinsic imports
+    //    (`[resource-drop|new|rep]<R>`). Group them by the import
+    //    shape whose bundle feeds the main core module under the
+    //    matching module name; remember the import instance that
+    //    provides each resource type.
+    const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
+    for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
+    const intrinsics_by_shape = try resolveResourceIntrinsicsByShape(
+        ar,
+        intrinsics,
+        shape_qnames,
+        &resource_owner,
+        &import_inst_idx_for,
+    );
+    // Resource-name → component type idx of the alias from its
+    // providing import instance. Shared across the intrinsic canons
+    // emitted in Phase 2.5.
+    var intrinsic_resource_alias = std.StringHashMapUnmanaged(u32).empty;
+
     // ── Phase 2.5: wire each imported func through to the core wasm.
     //
     // Per imported func, emit (in this order):
@@ -895,7 +1068,8 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 
     for (import_shapes.items, 0..) |_, i| {
         const wired = wired_funcs_by_shape[i];
-        if (wired.len == 0) continue;
+        const drops = intrinsics_by_shape[i];
+        if (wired.len == 0 and drops.len == 0) continue;
         const import_inst_idx: u32 = @intCast(i);
         // 1. alias.instance_export(.func) per imported func.
         const fn_comp_func_idx_base = comp_func_idx;
@@ -917,14 +1091,42 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             } });
             core_func_idx += 1;
         }
-        try order.append(ar, .{
-            .kind = .canon,
-            .start = @intCast(canons.items.len - wired.len),
-            .count = @intCast(wired.len),
-        });
+        if (wired.len > 0) {
+            try order.append(ar, .{
+                .kind = .canon,
+                .start = @intCast(canons.items.len - wired.len),
+                .count = @intCast(wired.len),
+            });
+        }
+
+        // 2.5. #248: resource built-in intrinsics for this namespace.
+        //   Each `[resource-drop|new|rep]<R>` gets a resource-type
+        //   alias from its providing import instance plus a `canon
+        //   resource.{drop,new,rep}` core func. These need no canon
+        //   opts, so they slot cleanly into the fast path; the bundle
+        //   below exposes each under its canonical field name.
+        const intrinsic_core_idxs = try ar.alloc(u32, drops.len);
+        for (drops, 0..) |d, di| {
+            const type_idx = intrinsic_resource_alias.get(d.resource) orelse blk: {
+                try aliases.append(ar, .{ .instance_export = .{
+                    .sort = .type,
+                    .instance_idx = d.owner_inst_idx,
+                    .name = d.resource,
+                } });
+                try Section.appendAlias(&order, ar, aliases.items.len);
+                const idx = comp_type_idx;
+                comp_type_idx += 1;
+                try intrinsic_resource_alias.put(ar, d.resource, idx);
+                break :blk idx;
+            };
+            try canons.append(ar, canonForIntrinsic(d.kind, type_idx));
+            try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+            intrinsic_core_idxs[di] = core_func_idx;
+            core_func_idx += 1;
+        }
 
         // 3. core_instance.exports bundle for this import.
-        const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len);
+        const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len + drops.len);
         for (wired, 0..) |fn_ref, fi| {
             bundle_exports[fi] = .{
                 .name = fn_ref.name,
@@ -932,6 +1134,12 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     .sort = .func,
                     .idx = lowered_core_func_idx_base + @as(u32, @intCast(fi)),
                 },
+            };
+        }
+        for (drops, 0..) |d, di| {
+            bundle_exports[wired.len + di] = .{
+                .name = d.field,
+                .sort_idx = .{ .sort = .func, .idx = intrinsic_core_idxs[di] },
             };
         }
         try core_instances.append(ar, .{ .exports = bundle_exports });
@@ -1576,6 +1784,22 @@ fn buildComponentShimFixup(
     }
     const import_inst_count: u32 = @intCast(imports.items.len);
 
+    // ── #248: resolve resource built-in intrinsic imports
+    //    (`[resource-drop|new|rep]<R>`), grouped by the import shape
+    //    whose bundle feeds the main core module under the matching
+    //    module name.
+    const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
+    for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
+    const intrinsics_by_shape = try resolveResourceIntrinsicsByShape(
+        ar,
+        intrinsics,
+        shape_qnames,
+        &resource_owner,
+        &import_inst_idx_for,
+    );
+    var intrinsic_resource_alias = std.StringHashMapUnmanaged(u32).empty;
+
     // ── Phase 4b: alias each wired imported func into the
     //    component-level func indexspace. These slots become the
     //    `func_idx` operand of `canon.lower` in Phase 4f.
@@ -1637,22 +1861,61 @@ fn buildComponentShimFixup(
         }
     }
 
+    // ── #248: emit a resource-type alias + `canon resource.{drop,
+    //    new,rep}` per resource intrinsic. These need no canon opts
+    //    and don't reference main's memory/realloc, so — unlike the
+    //    method lowers (Phase 4f) — they can be emitted *before* the
+    //    main bundle and placed directly into it; no shim/fixup
+    //    trampoline is required. Their core funcs follow the shim
+    //    stubs in the core-func indexspace.
+    const intrinsic_core_idx_by_shape = try ar.alloc([]u32, import_shapes.items.len);
+    for (intrinsics_by_shape, 0..) |drops, si| {
+        const idxs = try ar.alloc(u32, drops.len);
+        for (drops, 0..) |d, di| {
+            const type_idx = intrinsic_resource_alias.get(d.resource) orelse blk: {
+                try aliases.append(ar, .{ .instance_export = .{
+                    .sort = .type,
+                    .instance_idx = d.owner_inst_idx,
+                    .name = d.resource,
+                } });
+                try Section.appendAlias(&order, ar, aliases.items.len);
+                const idx = comp_type_idx;
+                comp_type_idx += 1;
+                try intrinsic_resource_alias.put(ar, d.resource, idx);
+                break :blk idx;
+            };
+            try canons.append(ar, canonForIntrinsic(d.kind, type_idx));
+            try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+            idxs[di] = core_func_idx;
+            core_func_idx += 1;
+        }
+        intrinsic_core_idx_by_shape[si] = idxs;
+    }
+
     // Step 3: per import shape, build an inline-exports bundle
     // mapping each wired func's canonical method name to its shim
-    // stub. Bundle indices live in the core-instance indexspace.
+    // stub (plus any #248 resource intrinsics to their direct core
+    // funcs). Bundle indices live in the core-instance indexspace.
     var bundle_for_main_args = std.ArrayListUnmanaged(ctypes.CoreInstantiateArg).empty;
     {
         var stub_cursor: u32 = shim_stub_core_idx_base;
         for (import_shapes.items, 0..) |shape, i| {
             const wired = wired_by_shape[i];
-            if (wired.len == 0) continue;
-            const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len);
+            const drops = intrinsics_by_shape[i];
+            if (wired.len == 0 and drops.len == 0) continue;
+            const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, wired.len + drops.len);
             for (wired, 0..) |w, fi| {
                 bundle_exports[fi] = .{
                     .name = w.fn_ref.name,
                     .sort_idx = .{ .sort = .func, .idx = stub_cursor },
                 };
                 stub_cursor += 1;
+            }
+            for (drops, 0..) |d, di| {
+                bundle_exports[wired.len + di] = .{
+                    .name = d.field,
+                    .sort_idx = .{ .sort = .func, .idx = intrinsic_core_idx_by_shape[i][di] },
+                };
             }
             try core_instances.append(ar, .{ .exports = bundle_exports });
             const bundle_inst_idx: u32 = @intCast(core_instances.items.len - 1);
@@ -3662,4 +3925,243 @@ test "validateGuestImportSigs: all-i32 error-code import is rejected (#244)" {
         defer testing.allocator.free(core);
         try validateGuestImportSigs(testing.allocator, core, &.{});
     }
+}
+
+// ── #248: resource built-in intrinsic import wiring tests ───────────
+
+/// Assemble a core wasm module from WAT text and append a
+/// `component-type:<world>` custom section encoding `wit_src`. Caller
+/// owns the returned bytes.
+fn buildCoreFromWat(
+    alloc: std.mem.Allocator,
+    wat_src: []const u8,
+    wit_src: []const u8,
+    world: []const u8,
+) ![]u8 {
+    var module = try wabt.text.Parser.parseModule(alloc, wat_src);
+    defer module.deinit();
+    const core_only = try wabt.binary.writer.writeModule(alloc, &module);
+    defer alloc.free(core_only);
+
+    const ct_payload = try metadata_encode.encodeWorldFromSource(alloc, wit_src, world);
+    defer alloc.free(ct_payload);
+
+    const cs_name = try std.fmt.allocPrint(alloc, "component-type:{s}", .{world});
+    defer alloc.free(cs_name);
+
+    var cs_body = std.ArrayListUnmanaged(u8).empty;
+    defer cs_body.deinit(alloc);
+    try writeU32Leb(alloc, &cs_body, @intCast(cs_name.len));
+    try cs_body.appendSlice(alloc, cs_name);
+    try cs_body.appendSlice(alloc, ct_payload);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, core_only);
+    try out.append(alloc, 0); // custom section id
+    try writeU32Leb(alloc, &out, @intCast(cs_body.items.len));
+    try out.appendSlice(alloc, cs_body.items);
+    return out.toOwnedSlice(alloc);
+}
+
+/// True if any core-instance inline-exports bundle exports `name` as a
+/// core func.
+fn bundleExportsFunc(loaded: anytype, name: []const u8) bool {
+    for (loaded.core_instances) |ci| switch (ci) {
+        .exports => |exps| for (exps) |e| {
+            if (e.sort_idx.sort == .func and std.mem.eql(u8, e.name, name)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+fn countResourceDrops(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .resource_drop => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn mainWithArgFor(loaded: anytype, name: []const u8) bool {
+    for (loaded.core_instances) |ci| switch (ci) {
+        .instantiate => |inst| for (inst.args) |arg| {
+            if (std.mem.eql(u8, arg.name, name)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
+test "buildComponent #248: drop-only namespace wires canon resource.drop into the bundle" {
+    // A guest that only `[resource-drop]`s a handle (no methods on the
+    // interface) previously left the core import dangling, so the
+    // produced component was rejected at instantiation. The namespace
+    // must still get a bundle + `(with …)` arg carrying a `canon
+    // resource.drop`.
+    const wit =
+        \\package test:drop@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource output-stream;
+        \\}
+        \\
+        \\interface runner {
+        \\    go: func();
+        \\}
+        \\
+        \\world w {
+        \\    import streams;
+        \\    export runner;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "test:drop/streams@0.1.0" "[resource-drop]output-stream" (func (param i32)))
+        \\  (func (export "test:drop/runner@0.1.0#go"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Fast path: a single core module (no shim/fixup machinery).
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // Exactly one `canon resource.drop`.
+    try testing.expectEqual(@as(usize, 1), countResourceDrops(loaded));
+    // A bundle exposes the intrinsic under its canonical field name.
+    try testing.expect(bundleExportsFunc(loaded, "[resource-drop]output-stream"));
+    // The main core instance is fed that bundle under the namespace.
+    try testing.expect(mainWithArgFor(loaded, "test:drop/streams@0.1.0"));
+}
+
+test "buildComponent #248: drop wired alongside a handle-only method (fast path)" {
+    const wit =
+        \\package test:drop@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource output-stream {
+        \\        get-id: func() -> u32;
+        \\    }
+        \\}
+        \\
+        \\interface runner {
+        \\    go: func();
+        \\}
+        \\
+        \\world w {
+        \\    import streams;
+        \\    export runner;
+        \\}
+    ;
+    // `get-id` lowers to `(param i32 /*self*/) (result i32)`.
+    const wat =
+        \\(module
+        \\  (import "test:drop/streams@0.1.0" "[method]output-stream.get-id" (func (param i32) (result i32)))
+        \\  (import "test:drop/streams@0.1.0" "[resource-drop]output-stream" (func (param i32)))
+        \\  (func (export "test:drop/runner@0.1.0#go"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    try testing.expectEqual(@as(usize, 1), countResourceDrops(loaded));
+    try testing.expect(bundleExportsFunc(loaded, "[resource-drop]output-stream"));
+    try testing.expect(bundleExportsFunc(loaded, "[method]output-stream.get-id"));
+    try testing.expect(mainWithArgFor(loaded, "test:drop/streams@0.1.0"));
+}
+
+test "buildComponent #248: drop wired on the shim/fixup path (string method forces opts)" {
+    const wit =
+        \\package test:drop@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource output-stream {
+        \\        write: func(data: string) -> u32;
+        \\    }
+        \\}
+        \\
+        \\interface runner {
+        \\    go: func();
+        \\}
+        \\
+        \\world w {
+        \\    import streams;
+        \\    export runner;
+        \\}
+    ;
+    // `write` lowers to `(param i32 /*self*/ i32 i32 /*string ptr,len*/)
+    // (result i32)` and needs memory + realloc + string-encoding opts,
+    // forcing the shim/fixup path. The core must export `memory` +
+    // `cabi_realloc` for that path.
+    const wat =
+        \\(module
+        \\  (import "test:drop/streams@0.1.0" "[method]output-stream.write" (func (param i32 i32 i32) (result i32)))
+        \\  (import "test:drop/streams@0.1.0" "[resource-drop]output-stream" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\  (func (export "test:drop/runner@0.1.0#go"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Shim/fixup path: main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expectEqual(@as(usize, 1), countResourceDrops(loaded));
+    try testing.expect(bundleExportsFunc(loaded, "[resource-drop]output-stream"));
+    try testing.expect(mainWithArgFor(loaded, "test:drop/streams@0.1.0"));
+}
+
+test "buildComponent #248: drop of an unknown resource is a hard error" {
+    const wit =
+        \\package test:drop@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource output-stream;
+        \\}
+        \\
+        \\interface runner {
+        \\    go: func();
+        \\}
+        \\
+        \\world w {
+        \\    import streams;
+        \\    export runner;
+        \\}
+    ;
+    // `ghost` is not a resource provided by any imported interface.
+    const wat =
+        \\(module
+        \\  (import "test:drop/streams@0.1.0" "[resource-drop]ghost" (func (param i32)))
+        \\  (func (export "test:drop/runner@0.1.0#go"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    try testing.expectError(error.UnresolvedResourceIntrinsic, buildComponent(testing.allocator, core));
 }
