@@ -707,6 +707,37 @@ fn collectResourceIntrinsics(
     return list.toOwnedSlice(ar);
 }
 
+/// The canonical-ABI core signature a resource built-in intrinsic
+/// import must have (#251). All take the rep/handle `i32`; `new` and
+/// `rep` also return an `i32`, `drop` returns nothing.
+fn intrinsicExpectedSig(it: ResourceIntrinsic) ExpectedImportSig {
+    const param_i32 = &[_]wabt.types.ValType{.i32};
+    const result_i32 = &[_]wabt.types.ValType{.i32};
+    const no_results = &[_]wabt.types.ValType{};
+    return .{
+        .module = it.module,
+        .field = it.field,
+        .params = param_i32,
+        .results = if (it.kind == .drop) no_results else result_i32,
+    };
+}
+
+/// Validate each resource intrinsic import's declared core signature
+/// against its fixed canonical-ABI shape, reusing the #244 diagnostic.
+/// A mismatch (e.g. `[resource-drop]<R>` declared with a result) means
+/// the produced component can't link on a spec host, so fail early.
+fn validateResourceIntrinsicSigs(
+    alloc: std.mem.Allocator,
+    ar: std.mem.Allocator,
+    core_bytes: []const u8,
+    intrinsics: []const ResourceIntrinsic,
+) !void {
+    if (intrinsics.len == 0) return;
+    var expected = std.ArrayListUnmanaged(ExpectedImportSig).empty;
+    for (intrinsics) |it| try expected.append(ar, intrinsicExpectedSig(it));
+    try validateGuestImportSigs(alloc, core_bytes, expected.items);
+}
+
 /// A resource intrinsic resolved against the world's imports: which
 /// import instance provides the resource type (the `alias
 /// instance_export sort=type` source the canon operand needs).
@@ -1427,6 +1458,9 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     //    a guest-defined resource and resolve to the exported resource
     //    type declared above.
     const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    // #251: validate the intrinsics' declared core import sigs against
+    // their fixed canonical-ABI shapes before wiring them.
+    try validateResourceIntrinsicSigs(alloc, ar, stripped_core, intrinsics);
     const parts = try partitionResourceIntrinsics(ar, intrinsics, exported_resources);
     const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
     for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
@@ -2291,6 +2325,9 @@ fn buildComponentShimFixup(
     //    Import-side group by import shape; export-side (`[export]…`)
     //    operate on a guest-defined resource.
     const intrinsics = try collectResourceIntrinsics(ar, stripped_core);
+    // #251: validate the intrinsics' declared core import sigs against
+    // their fixed canonical-ABI shapes before wiring them.
+    try validateResourceIntrinsicSigs(alloc, ar, stripped_core, intrinsics);
     const parts = try partitionResourceIntrinsics(ar, intrinsics, exported_resources);
     const shape_qnames = try ar.alloc([]const u8, import_shapes.items.len);
     for (import_shapes.items, 0..) |s, i| shape_qnames[i] = s.qualified_name;
@@ -5020,4 +5057,67 @@ test "buildComponent #250: rich resource interface (ctor, method, method->own, s
     try testing.expect(instanceExportsType(loaded, "thing"));
     // One nested sub-component re-exports the whole interface.
     try testing.expect(loaded.components.len == 1);
+}
+
+// ── #251: resource intrinsic core-import signature validation ───────
+
+test "buildComponent #251: [resource-drop] declared with a result is rejected" {
+    // The canonical ABI fixes `[resource-drop]<R>` at `(func (param i32))`.
+    // A guest that declares it with an extra `(result i32)` must fail
+    // early with the #244 diagnostic, not at host link time.
+    const wit =
+        \\package test:drop@0.1.0;
+        \\
+        \\interface streams {
+        \\    resource output-stream;
+        \\}
+        \\
+        \\interface runner {
+        \\    go: func();
+        \\}
+        \\
+        \\world w {
+        \\    import streams;
+        \\    export runner;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "test:drop/streams@0.1.0" "[resource-drop]output-stream" (func (param i32) (result i32)))
+        \\  (func (export "test:drop/runner@0.1.0#go"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    try testing.expectError(error.CoreImportSignatureMismatch, buildComponent(testing.allocator, core));
+}
+
+test "buildComponent #251: [resource-new] declared without a result is rejected" {
+    // `[resource-new]<R>` is fixed at `(func (param i32) (result i32))`.
+    // Here the guest owns `thing` (export side) and mis-declares the
+    // intrinsic with no result.
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        get: func() -> u32;
+        \\    }
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]thing" (func (param i32)))
+        \\  (func (export "test:res/things@0.1.0#[method]thing.get") (param i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+
+    try testing.expectError(error.CoreImportSignatureMismatch, buildComponent(testing.allocator, core));
 }
