@@ -1277,6 +1277,32 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         if (any_func_needs_opts) break;
     }
 
+    // ── #253: an exported func whose lift needs `(memory)` / `(realloc)`
+    //    / string-encoding / `(post-return)` (its sig reaches
+    //    string/list/indirect) also requires the shim/fixup path, which
+    //    aliases `memory` + `cabi_realloc`. Scan exported funcs too.
+    if (!any_func_needs_opts) {
+        outer: for (decoded.externs) |ext| {
+            if (!ext.is_export) continue;
+            const resolver = wabt.component.adapter.abi.TypeResolver{
+                .inst_decls = ext.inst_decls,
+                .world_decls = decoded.world_decls,
+            };
+            for (ext.funcs) |fn_ref| {
+                const ftr = wabt.component.adapter.abi.FuncTypeRef{
+                    .func = fn_ref.sig,
+                    .resolver = resolver,
+                };
+                if (wabt.component.adapter.abi.liftNeedsOpts(
+                    wabt.component.adapter.abi.classifyFuncLift(ftr),
+                )) {
+                    any_func_needs_opts = true;
+                    break :outer;
+                }
+            }
+        }
+    }
+
     // ── #250: collect guest-defined (exported) resources. A resource
     //    with a destructor forces the shim/fixup path: its `(type
     //    (resource … (dtor …)))` references a core func that only
@@ -2785,6 +2811,8 @@ fn buildComponentShimFixup(
         fn_name: []const u8,
         func_type_idx: u32,
         core_func_alias_idx: u32,
+        lift_opts: abi.LiftOpts,
+        post_return_core_idx: ?u32,
     };
     var captured_funcs = std.ArrayListUnmanaged(CapturedFunc).empty;
     var ext_export_start = std.ArrayListUnmanaged(struct {
@@ -2809,6 +2837,10 @@ fn buildComponentShimFixup(
             .order = &order,
         };
         const start: u32 = @intCast(captured_funcs.items.len);
+        const lift_resolver = abi.TypeResolver{
+            .inst_decls = ext.inst_decls,
+            .world_decls = decoded.world_decls,
+        };
         for (ext.funcs) |fn_ref| {
             const rewritten = try resolver.rewriteSig(fn_ref.sig);
             try types.append(ar, .{ .func = rewritten });
@@ -2826,11 +2858,33 @@ fn buildComponentShimFixup(
             const cf_idx = core_func_idx;
             core_func_idx += 1;
 
+            // #253: lift options for this exported func, plus an
+            // optional `(post-return cabi_post_<name>)` when its result
+            // needs cleanup and the guest exports the matching
+            // `cabi_post_*` core func.
+            const lift_opts = abi.classifyFuncLift(.{ .func = fn_ref.sig, .resolver = lift_resolver });
+            var post_idx: ?u32 = null;
+            if (lift_opts.needs_post_return) {
+                const cabi_post_name = try std.fmt.allocPrint(ar, "cabi_post_{s}", .{core_func_export_name});
+                if (coreExportsFunc(stripped_core, cabi_post_name) catch false) {
+                    try aliases.append(ar, .{ .instance_export = .{
+                        .sort = .{ .core = .func },
+                        .instance_idx = main_core_inst_idx,
+                        .name = cabi_post_name,
+                    } });
+                    try Section.appendAlias(&order, ar, aliases.items.len);
+                    post_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            }
+
             try captured_funcs.append(ar, .{
                 .ext_qualified = ext.qualified_name,
                 .fn_name = fn_ref.name,
                 .func_type_idx = func_type_idx,
                 .core_func_alias_idx = cf_idx,
+                .lift_opts = lift_opts,
+                .post_return_core_idx = post_idx,
             });
         }
         try ext_export_start.append(ar, .{ .ext = ext, .start = start });
@@ -2838,10 +2892,17 @@ fn buildComponentShimFixup(
 
     const lifts_start: u32 = @intCast(canons.items.len);
     for (captured_funcs.items) |cf| {
+        const opts = try wabt.component.adapter.adapter.buildCanonLiftOpts(
+            ar,
+            cf.lift_opts,
+            memory_core_idx,
+            realloc_core_idx,
+            cf.post_return_core_idx,
+        );
         try canons.append(ar, .{ .lift = .{
             .core_func_idx = cf.core_func_alias_idx,
             .type_idx = cf.func_type_idx,
-            .opts = &.{},
+            .opts = opts,
         } });
     }
     const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
@@ -4874,6 +4935,22 @@ fn hasResourceTypeDef(loaded: anytype, with_dtor: bool) bool {
     return false;
 }
 
+/// Counts of each canon-lift option kind across every `.lift` canon.
+const LiftOptCounts = struct { memory: usize, realloc: usize, string_encoding: usize, post_return: usize };
+fn liftOptCounts(loaded: anytype) LiftOptCounts {
+    var c = LiftOptCounts{ .memory = 0, .realloc = 0, .string_encoding = 0, .post_return = 0 };
+    for (loaded.canons) |canon| switch (canon) {
+        .lift => |l| for (l.opts) |o| switch (o) {
+            .memory => c.memory += 1,
+            .realloc => c.realloc += 1,
+            .string_encoding => c.string_encoding += 1,
+            .post_return => c.post_return += 1,
+        },
+        else => {},
+    };
+    return c;
+}
+
 test "buildComponent #250: dtor-less exported resource (fast path)" {
     // A guest that *defines* an exported resource with no destructor:
     // a constructor + a method, plus the `[resource-new]`/
@@ -5120,4 +5197,164 @@ test "buildComponent #251: [resource-new] declared without a result is rejected"
     defer testing.allocator.free(core);
 
     try testing.expectError(error.CoreImportSignatureMismatch, buildComponent(testing.allocator, core));
+}
+
+// ── #253: canon-lift options for exported funcs needing string lifting ──
+
+test "buildComponent #253: exported func taking a string lifts with memory+realloc" {
+    const wit =
+        \\package test:g@0.1.0;
+        \\
+        \\interface greeter {
+        \\    take: func(s: string);
+        \\}
+        \\
+        \\world w {
+        \\    export greeter;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "test:g/greeter@0.1.0#take") (param i32 i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // String param forces the shim/fixup path.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    const c = liftOptCounts(loaded);
+    try testing.expectEqual(@as(usize, 1), c.memory);
+    try testing.expectEqual(@as(usize, 1), c.realloc); // for the incoming string param
+    try testing.expectEqual(@as(usize, 1), c.string_encoding);
+    try testing.expectEqual(@as(usize, 0), c.post_return); // no result to clean up
+}
+
+test "buildComponent #253: exported func returning a string lifts with memory+post-return" {
+    const wit =
+        \\package test:g@0.1.0;
+        \\
+        \\interface greeter {
+        \\    make: func() -> string;
+        \\}
+        \\
+        \\world w {
+        \\    export greeter;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "test:g/greeter@0.1.0#make") (result i32) i32.const 0)
+        \\  (func (export "cabi_post_test:g/greeter@0.1.0#make") (param i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    const c = liftOptCounts(loaded);
+    try testing.expectEqual(@as(usize, 1), c.memory);
+    try testing.expectEqual(@as(usize, 0), c.realloc); // no string params
+    try testing.expectEqual(@as(usize, 1), c.string_encoding);
+    try testing.expectEqual(@as(usize, 1), c.post_return); // frees the returned string
+}
+
+test "buildComponent #253: string-in/string-out export lifts with all four opts" {
+    const wit =
+        \\package test:g@0.1.0;
+        \\
+        \\interface greeter {
+        \\    greet: func(name: string) -> string;
+        \\}
+        \\
+        \\world w {
+        \\    export greeter;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "test:g/greeter@0.1.0#greet") (param i32 i32) (result i32) i32.const 0)
+        \\  (func (export "cabi_post_test:g/greeter@0.1.0#greet") (param i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    const c = liftOptCounts(loaded);
+    try testing.expectEqual(@as(usize, 1), c.memory);
+    try testing.expectEqual(@as(usize, 1), c.realloc);
+    try testing.expectEqual(@as(usize, 1), c.string_encoding);
+    try testing.expectEqual(@as(usize, 1), c.post_return);
+}
+
+test "buildComponent #253: resource method taking/returning a string (with #250) builds + lifts opts" {
+    // The motivating case: a guest-defined resource whose method takes
+    // and returns a string. Combines the #250 nested re-export + dtor
+    // shim wiring with #253 lift options (incl. post-return).
+    const wit =
+        \\package test:res@0.1.0;
+        \\
+        \\interface things {
+        \\    resource thing {
+        \\        constructor(name: string);
+        \\        greet: func(greeting: string) -> string;
+        \\    }
+        \\}
+        \\
+        \\world w {
+        \\    export things;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:res/things@0.1.0" "[resource-new]thing" (func (param i32) (result i32)))
+        \\  (import "[export]test:res/things@0.1.0" "[resource-rep]thing" (func (param i32) (result i32)))
+        \\  (func (export "test:res/things@0.1.0#[constructor]thing") (param i32 i32) (result i32) i32.const 0)
+        \\  (func (export "test:res/things@0.1.0#[method]thing.greet") (param i32 i32 i32) (result i32) i32.const 0)
+        \\  (func (export "cabi_post_test:res/things@0.1.0#[method]thing.greet") (param i32))
+        \\  (func (export "test:res/things@0.1.0#[dtor]thing") (param i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(hasResourceTypeDef(loaded, true)); // dtor'd resource
+    try testing.expect(loaded.components.len == 1); // nested re-export
+    const c = liftOptCounts(loaded);
+    try testing.expect(c.memory >= 1);
+    try testing.expect(c.realloc >= 1);
+    try testing.expect(c.string_encoding >= 1);
+    try testing.expect(c.post_return >= 1); // greet's returned string
 }

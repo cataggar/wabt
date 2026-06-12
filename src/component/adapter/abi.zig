@@ -608,6 +608,81 @@ pub fn classifyFunc(ftr: FuncTypeRef) Classification {
     };
 }
 
+/// Canon-*lift* options for an exported func. Distinct from `FuncOpts`
+/// (which is tailored for `canon lower`): on the lift side `realloc`
+/// is needed to lower string/list **params** into guest memory, and
+/// `post_return` is needed to free string/list **results** the guest
+/// allocated. (Lower instead needs `realloc` for its results.)
+pub const LiftOpts = struct {
+    /// `(memory <main_memory>)` — params or results reach memory.
+    memory: bool,
+    /// `(realloc <cabi_realloc>)` — a param contains string/list.
+    realloc: bool,
+    /// `string-encoding=utf8` — any param or result contains string.
+    string_encoding: bool,
+    /// A result contains string/list, so the lift needs a
+    /// `(post-return <cabi_post_…>)` to release it — provided the guest
+    /// actually exports the matching `cabi_post_*` core func.
+    needs_post_return: bool,
+};
+
+/// Classify an exported func for `canon lift`. See `LiftOpts`.
+pub fn classifyFuncLift(ftr: FuncTypeRef) LiftOpts {
+    const ft = ftr.func;
+    const resolver = ftr.resolver;
+
+    var params_flat: u32 = 0;
+    var params_need_memory = false;
+    var params_need_realloc = false;
+    var any_string = false;
+    for (ft.params) |p| {
+        const info = flatten(p.type, resolver);
+        params_flat = saturatingAdd(params_flat, info.flat);
+        if (info.needs_memory) params_need_memory = true;
+        if (info.needs_realloc_alloc) params_need_realloc = true;
+        if (info.contains_string) any_string = true;
+    }
+
+    var results_flat: u32 = 0;
+    var results_need_memory = false;
+    var results_need_cleanup = false;
+    switch (ft.results) {
+        .none => {},
+        .unnamed => |vt| {
+            const info = flatten(vt, resolver);
+            results_flat = info.flat;
+            if (info.needs_memory) results_need_memory = true;
+            if (info.needs_realloc_alloc) results_need_cleanup = true;
+            if (info.contains_string) any_string = true;
+        },
+        .named => |list| for (list) |nv| {
+            const info = flatten(nv.type, resolver);
+            results_flat = saturatingAdd(results_flat, info.flat);
+            if (info.needs_memory) results_need_memory = true;
+            if (info.needs_realloc_alloc) results_need_cleanup = true;
+            if (info.contains_string) any_string = true;
+        },
+    }
+
+    const need_memory =
+        params_need_memory or results_need_memory or
+        params_flat > MAX_FLAT_PARAMS or results_flat > MAX_FLAT_RESULTS;
+
+    return .{
+        .memory = need_memory,
+        .realloc = params_need_realloc,
+        .string_encoding = any_string,
+        .needs_post_return = results_need_cleanup,
+    };
+}
+
+/// True iff lifting this exported func requires any canon-lift option
+/// (and therefore the shim/fixup path, which aliases `memory` /
+/// `cabi_realloc`).
+pub fn liftNeedsOpts(lo: LiftOpts) bool {
+    return lo.memory or lo.realloc or lo.string_encoding or lo.needs_post_return;
+}
+
 /// Compute the flat core-wasm signature an indirect import lowers
 /// to. Used by the splicer when sizing the shim's trampoline slots
 /// (which must match the lowered call's flat repr — params first,
