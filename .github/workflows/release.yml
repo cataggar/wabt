@@ -126,6 +126,8 @@ jobs:
     needs: [build, source]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
@@ -133,6 +135,29 @@ jobs:
       - name: Get version
         id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Sign archives with minisign (per-asset .minisig sidecars)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y minisign expect
+          # Write the secret key to a file with 0600. The runner workspace
+          # is ephemeral; the trap removes it before the step exits.
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
+          trap 'rm -f minisign.key' EXIT
+          shopt -s nullglob
+          for asset in wabt-*.tar.gz wabt-*.tar.xz; do
+            # Trusted comment is printed by `ghr install` on successful
+            # verification, so encode self-identifying metadata in it.
+            comment="timestamp:$(date +%s) file:${asset} commit:${GITHUB_SHA} tag:${GITHUB_REF_NAME}"
+            echo "signing ${asset} (trusted comment: ${comment})"
+            expect scripts/sign-asset.exp "$asset" "$comment"
+          done
+          ls -la wabt-*.minisig
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@c074443f1aee8d4aeeae555aebba3282517141b2 # v2.2.3
@@ -149,11 +174,12 @@ jobs:
             **Install:**
 
             ```
-            ghr install cataggar/wabt@v${{ steps.version.outputs.version }}
+            ghr install cataggar/wabt@v${{ steps.version.outputs.version }} RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
             ```
           files: |
             wabt-*.tar.gz
             wabt-*.tar.xz
             wabt-*.sbom.spdx.json
+            wabt-*.minisig
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}

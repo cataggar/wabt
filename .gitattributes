@@ -9,5 +9,8 @@
 *.wasm binary
 *.wast binary
 
+# Expect scripts must keep LF endings so they run on the Linux CI runners.
+*.exp text eol=lf
+
 # Parser test fixture with intentional mixed CR/LF line endings; keep bytes exact.
 test/parse/bad-crlf.txt -text
