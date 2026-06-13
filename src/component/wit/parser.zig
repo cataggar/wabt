@@ -49,6 +49,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
+const wasi_canon = @import("wasi_canon.zig");
 
 pub const ParseError = lexer.LexError || error{
     OutOfMemory,
@@ -1432,41 +1433,14 @@ test "parse #195: every canonical wasi-* WIT file parses individually" {
     // is missing, since standalone parse is what's exercised here
     // (multi-file primary-package handling is Phase 2 scope).
     const Fixture = struct { path: []const u8, content: []const u8 };
-    const fixtures = [_]Fixture{
-        .{ .path = "cli/command.wit", .content = @embedFile("wasi-canon/cli/command.wit") },
-        .{ .path = "cli/environment.wit", .content = @embedFile("wasi-canon/cli/environment.wit") },
-        .{ .path = "cli/exit.wit", .content = @embedFile("wasi-canon/cli/exit.wit") },
-        .{ .path = "cli/imports.wit", .content = @embedFile("wasi-canon/cli/imports.wit") },
-        .{ .path = "cli/run.wit", .content = @embedFile("wasi-canon/cli/run.wit") },
-        .{ .path = "cli/stdio.wit", .content = @embedFile("wasi-canon/cli/stdio.wit") },
-        .{ .path = "cli/terminal.wit", .content = @embedFile("wasi-canon/cli/terminal.wit") },
-        .{ .path = "clocks/monotonic-clock.wit", .content = @embedFile("wasi-canon/clocks/monotonic-clock.wit") },
-        .{ .path = "clocks/timezone.wit", .content = @embedFile("wasi-canon/clocks/timezone.wit") },
-        .{ .path = "clocks/wall-clock.wit", .content = @embedFile("wasi-canon/clocks/wall-clock.wit") },
-        .{ .path = "clocks/world.wit", .content = @embedFile("wasi-canon/clocks/world.wit") },
-        .{ .path = "filesystem/preopens.wit", .content = @embedFile("wasi-canon/filesystem/preopens.wit") },
-        .{ .path = "filesystem/types.wit", .content = @embedFile("wasi-canon/filesystem/types.wit") },
-        .{ .path = "filesystem/world.wit", .content = @embedFile("wasi-canon/filesystem/world.wit") },
-        .{ .path = "http/handler.wit", .content = @embedFile("wasi-canon/http/handler.wit") },
-        .{ .path = "http/proxy.wit", .content = @embedFile("wasi-canon/http/proxy.wit") },
-        .{ .path = "http/types.wit", .content = @embedFile("wasi-canon/http/types.wit") },
-        .{ .path = "io/error.wit", .content = @embedFile("wasi-canon/io/error.wit") },
-        .{ .path = "io/poll.wit", .content = @embedFile("wasi-canon/io/poll.wit") },
-        .{ .path = "io/streams.wit", .content = @embedFile("wasi-canon/io/streams.wit") },
-        .{ .path = "io/world.wit", .content = @embedFile("wasi-canon/io/world.wit") },
-        .{ .path = "random/insecure-seed.wit", .content = @embedFile("wasi-canon/random/insecure-seed.wit") },
-        .{ .path = "random/insecure.wit", .content = @embedFile("wasi-canon/random/insecure.wit") },
-        .{ .path = "random/random.wit", .content = @embedFile("wasi-canon/random/random.wit") },
-        .{ .path = "random/world.wit", .content = @embedFile("wasi-canon/random/world.wit") },
-        .{ .path = "sockets/instance-network.wit", .content = @embedFile("wasi-canon/sockets/instance-network.wit") },
-        .{ .path = "sockets/ip-name-lookup.wit", .content = @embedFile("wasi-canon/sockets/ip-name-lookup.wit") },
-        .{ .path = "sockets/network.wit", .content = @embedFile("wasi-canon/sockets/network.wit") },
-        .{ .path = "sockets/tcp-create-socket.wit", .content = @embedFile("wasi-canon/sockets/tcp-create-socket.wit") },
-        .{ .path = "sockets/tcp.wit", .content = @embedFile("wasi-canon/sockets/tcp.wit") },
-        .{ .path = "sockets/udp-create-socket.wit", .content = @embedFile("wasi-canon/sockets/udp-create-socket.wit") },
-        .{ .path = "sockets/udp.wit", .content = @embedFile("wasi-canon/sockets/udp.wit") },
-        .{ .path = "sockets/world.wit", .content = @embedFile("wasi-canon/sockets/world.wit") },
-    };
+    var fixture_list: std.ArrayListUnmanaged(Fixture) = .empty;
+    defer fixture_list.deinit(testing.allocator);
+    for (wasi_canon.packages) |pkg| {
+        for (pkg.files) |file| {
+            try fixture_list.append(testing.allocator, .{ .path = file.path, .content = file.content });
+        }
+    }
+    const fixtures = fixture_list.items;
 
     for (fixtures) |f| {
         var arena = std.heap.ArenaAllocator.init(testing.allocator);
