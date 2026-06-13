@@ -27,6 +27,7 @@ const Allocator = std.mem.Allocator;
 
 const ast = @import("ast.zig");
 const parser = @import("parser.zig");
+const wasi_canon = @import("wasi_canon.zig");
 
 pub const ResolveError = parser.ParseError || error{
     /// File or directory IO failure during deps walk.
@@ -290,6 +291,11 @@ pub const WitSource = struct {
     text: []const u8,
 };
 
+/// Result of combining one package's `.wit` files: the concatenated
+/// source buffer and the member file paths in emit order (caller frees
+/// both).
+pub const CombinedWit = struct { text: []u8, paths: [][]const u8 };
+
 /// Read every top-level `*.wit` file under `dir` (sorted, non-recursive)
 /// and concatenate them, separated by '\n'. Returns the concatenated
 /// buffer (caller frees) and the list of file paths included.
@@ -321,7 +327,7 @@ pub fn readWitDir(
     io: std.Io,
     dir_path: []const u8,
     diag: ?*ResolveDiagnostic,
-) ResolveError!struct { text: []u8, paths: [][]const u8 } {
+) ResolveError!CombinedWit {
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch
         return error.FileSystemError;
     defer dir.close(io);
@@ -347,27 +353,15 @@ pub fn readWitDir(
         return .{ .text = try alloc.alloc(u8, 0), .paths = try alloc.alloc([]const u8, 0) };
     }
 
-    // Read every file into memory, scan each for its leading package
-    // decl, and validate consistency.
-    const FileEntry = struct {
-        name: []const u8,
-        full_path: []const u8,
-        buf: []u8,
-        pkg_start: usize,
-        pkg_end: usize,
-        has_pkg: bool,
-    };
-    var files = try alloc.alloc(FileEntry, entries.items.len);
+    // Read every file into memory as a WitSource, then combine.
+    var sources = try alloc.alloc(WitSource, entries.items.len);
     defer {
-        for (files) |f| {
-            alloc.free(f.full_path);
-            alloc.free(f.buf);
+        for (sources) |s| {
+            alloc.free(s.path);
+            alloc.free(s.text);
         }
-        alloc.free(files);
+        alloc.free(sources);
     }
-    var canonical_decl: ?[]const u8 = null;
-    var canonical_path: []const u8 = "";
-    var first_decl_idx: ?usize = null;
     for (entries.items, 0..) |name, i| {
         const full = std.fs.path.join(alloc, &.{ dir_path, name }) catch return error.FileSystemError;
         const buf = std.Io.Dir.cwd().readFileAlloc(
@@ -376,31 +370,59 @@ pub fn readWitDir(
             alloc,
             std.Io.Limit.limited(1 << 20),
         ) catch return error.FileSystemError;
-        files[i] = .{
-            .name = name,
-            .full_path = full,
-            .buf = buf,
-            .pkg_start = 0,
-            .pkg_end = 0,
-            .has_pkg = false,
-        };
-        if (scanForPackageDecl(buf)) |range| {
-            files[i].pkg_start = range.start;
-            files[i].pkg_end = range.end;
-            files[i].has_pkg = true;
-            const decl_text = std.mem.trim(u8, buf[range.start..range.end], " \t\r\n");
+        sources[i] = .{ .path = full, .text = buf };
+    }
+
+    return combineWitSources(alloc, sources, dir_path, diag);
+}
+
+/// Combine multiple `.wit` files belonging to a single package into one
+/// parser-digestible source. `sources` should be sorted by file name
+/// for deterministic output.
+///
+/// Canonical WIT directories carry a single `package <id>;` declaration
+/// inherited by every sibling file. We require the set contain exactly
+/// one DISTINCT decl (`PackageDeclConflict` on mismatch,
+/// `NoPackageDeclInDirectory` if none), emit the decl-bearing file
+/// first (decl intact), then the rest with any duplicate decl stripped.
+///
+/// `dir_label` is used only in the `NoPackageDeclInDirectory`
+/// diagnostic. Returns the concatenated buffer and the file paths in
+/// emit order (caller frees both). Empty `sources` → `text.len == 0`.
+fn combineWitSources(
+    alloc: Allocator,
+    sources: []const WitSource,
+    dir_label: []const u8,
+    diag: ?*ResolveDiagnostic,
+) ResolveError!CombinedWit {
+    if (sources.len == 0) {
+        return .{ .text = try alloc.alloc(u8, 0), .paths = try alloc.alloc([]const u8, 0) };
+    }
+
+    const Scan = struct { has_pkg: bool, start: usize, end: usize };
+    const scans = try alloc.alloc(Scan, sources.len);
+    defer alloc.free(scans);
+
+    var canonical_decl: ?[]const u8 = null;
+    var canonical_path: []const u8 = "";
+    var first_decl_idx: ?usize = null;
+    for (sources, 0..) |src, i| {
+        scans[i] = .{ .has_pkg = false, .start = 0, .end = 0 };
+        if (scanForPackageDecl(src.text)) |range| {
+            scans[i] = .{ .has_pkg = true, .start = range.start, .end = range.end };
+            const decl_text = std.mem.trim(u8, src.text[range.start..range.end], " \t\r\n");
             if (canonical_decl) |canon| {
                 if (!std.mem.eql(u8, canon, decl_text)) {
                     if (diag) |d| d.* = .{
                         .msg = "files in the same WIT directory have differing `package` decls",
                         .path = canonical_path,
-                        .path2 = full,
+                        .path2 = src.path,
                     };
                     return error.PackageDeclConflict;
                 }
             } else {
                 canonical_decl = decl_text;
-                canonical_path = full;
+                canonical_path = src.path;
                 first_decl_idx = i;
             }
         }
@@ -409,7 +431,7 @@ pub fn readWitDir(
     if (first_decl_idx == null) {
         if (diag) |d| d.* = .{
             .msg = "no `package <ns>:<name>[@<ver>];` decl found in any file under this directory",
-            .path = dir_path,
+            .path = dir_label,
         };
         return error.NoPackageDeclInDirectory;
     }
@@ -427,20 +449,20 @@ pub fn readWitDir(
     // stripped.
     const first = first_decl_idx.?;
     {
-        const f = files[first];
-        try combined.appendSlice(alloc, f.buf);
+        const src = sources[first];
+        try combined.appendSlice(alloc, src.text);
         try combined.append(alloc, '\n');
-        try paths.append(alloc, try alloc.dupe(u8, f.full_path));
+        try paths.append(alloc, try alloc.dupe(u8, src.path));
     }
-    for (files, 0..) |f, i| {
+    for (sources, 0..) |src, i| {
         if (i == first) continue;
-        try paths.append(alloc, try alloc.dupe(u8, f.full_path));
-        if (f.has_pkg) {
+        try paths.append(alloc, try alloc.dupe(u8, src.path));
+        if (scans[i].has_pkg) {
             // Strip the duplicate decl; keep surrounding content.
-            try combined.appendSlice(alloc, f.buf[0..f.pkg_start]);
-            try combined.appendSlice(alloc, f.buf[f.pkg_end..]);
+            try combined.appendSlice(alloc, src.text[0..scans[i].start]);
+            try combined.appendSlice(alloc, src.text[scans[i].end..]);
         } else {
-            try combined.appendSlice(alloc, f.buf);
+            try combined.appendSlice(alloc, src.text);
         }
         try combined.append(alloc, '\n');
     }
@@ -488,7 +510,7 @@ pub fn parseLayoutWithDiag(
         ) catch return error.FileSystemError;
         if (buf.len == 0) return error.EmptyWit;
         const main = try parser.parse(arena, buf, null);
-        return Resolver.init(main, &.{});
+        return finishWithEmbedded(arena, main, &.{});
     }
 
     // Read main package.
@@ -499,9 +521,9 @@ pub fn parseLayoutWithDiag(
     // Walk deps/ if present.
     const deps_path = std.fs.path.join(arena, &.{ root, "deps" }) catch return error.FileSystemError;
     const deps_stat = std.Io.Dir.cwd().statFile(io, deps_path, .{}) catch {
-        return Resolver.init(main, &.{});
+        return finishWithEmbedded(arena, main, &.{});
     };
-    if (deps_stat.kind != .directory) return Resolver.init(main, &.{});
+    if (deps_stat.kind != .directory) return finishWithEmbedded(arena, main, &.{});
 
     var dep_docs: std.ArrayListUnmanaged(ast.Document) = .empty;
     var deps_dir = std.Io.Dir.cwd().openDir(io, deps_path, .{ .iterate = true }) catch
@@ -552,7 +574,60 @@ pub fn parseLayoutWithDiag(
         }
     }
 
-    return Resolver.init(main, try dep_docs.toOwnedSlice(arena));
+    return finishWithEmbedded(arena, main, dep_docs.items);
+}
+
+/// Finalize a `Resolver`, appending the embedded canonical WASI 0.2.6
+/// packages as **lowest-priority** deps. An embedded package is skipped
+/// when `main` or any on-disk dep already provides a matching package,
+/// so an on-disk `wit/deps/<pkg>/` always wins and existing projects
+/// see no behavior change. Resolution precedence becomes:
+/// `main` → on-disk deps → embedded wasi-canon.
+fn finishWithEmbedded(
+    arena: Allocator,
+    main: ast.Document,
+    on_disk: []const ast.Document,
+) ResolveError!Resolver {
+    var all: std.ArrayListUnmanaged(ast.Document) = .empty;
+    try all.appendSlice(arena, on_disk);
+
+    const embedded = try embeddedWasiDocs(arena);
+    for (embedded) |edoc| {
+        const epkg = edoc.package orelse continue;
+        var provided = false;
+        if (main.package) |mp| {
+            if (packageMatches(mp, epkg)) provided = true;
+        }
+        if (!provided) {
+            for (on_disk) |d| {
+                if (d.package) |dp| {
+                    if (packageMatches(dp, epkg)) {
+                        provided = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (!provided) try all.append(arena, edoc);
+    }
+
+    return Resolver.init(main, try all.toOwnedSlice(arena));
+}
+
+/// Parse the embedded canonical WASI 0.2.6 packages into one
+/// `ast.Document` per package (cli, clocks, filesystem, http, io,
+/// random, sockets). Documents are allocated into `arena`.
+pub fn embeddedWasiDocs(arena: Allocator) ResolveError![]ast.Document {
+    var docs = try arena.alloc(ast.Document, wasi_canon.packages.len);
+    for (wasi_canon.packages, 0..) |pkg, i| {
+        var sources = try arena.alloc(WitSource, pkg.files.len);
+        for (pkg.files, 0..) |file, j| {
+            sources[j] = .{ .path = file.path, .text = file.content };
+        }
+        const combined = try combineWitSources(arena, sources, pkg.name, null);
+        docs[i] = try parser.parse(arena, combined.text, null);
+    }
+    return docs;
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -888,6 +963,124 @@ test "resolver #195p2: canonical wasi-http proxy world resolves through the layo
     try std.testing.expect(saw_io);
     try std.testing.expect(saw_random);
     try std.testing.expect(saw_sockets);
+}
+
+test "resolver #256: wasi:* refs resolve from embedded set (no on-disk deps)" {
+    // Acceptance for #256: a `wit/` containing ONLY world.wit (no
+    // deps/) resolves wasi:* refs against the embedded wasi-canon set.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/world.wit",
+        .data =
+        \\package example:app@0.1.0;
+        \\world app {
+        \\  import wasi:io/streams@0.2.6;
+        \\  import wasi:http/types@0.2.6;
+        \\  import wasi:http/incoming-handler@0.2.6;
+        \\}
+        ,
+    });
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try parseLayout(allocator, io, tmp_wit);
+
+    const v: []const u8 = "0.2.6";
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = v },
+        .name = "streams",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "http", .version = v },
+        .name = "types",
+    }) != null);
+    // incoming-handler lives in handler.wit, which carries NO package
+    // decl — exercises the embedded multi-file combine.
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "http", .version = v },
+        .name = "incoming-handler",
+    }) != null);
+    // A version-less ref still matches the pinned 0.2.6 embedded set
+    // (relaxed packageMatches).
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "random", .version = null },
+        .name = "random",
+    }) != null);
+}
+
+test "resolver #256: on-disk wasi dep overrides embedded copy" {
+    // An on-disk wit/deps/<pkg>/ takes precedence over the embedded
+    // copy — existing vendored projects see no behavior change.
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.createDirPath(io, "wit/deps/io");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/world.wit",
+        .data =
+        \\package example:app@0.1.0;
+        \\world app { import wasi:io/streams@0.2.6; }
+        ,
+    });
+    // Sentinel on-disk wasi:io: a single-item `streams` interface, very
+    // unlike the rich embedded one.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/deps/io/io.wit",
+        .data =
+        \\package wasi:io@0.2.6;
+        \\interface streams { sentinel-marker: func(); }
+        ,
+    });
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try parseLayout(allocator, io, tmp_wit);
+
+    const streams = res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = "0.2.6" },
+        .name = "streams",
+    });
+    try std.testing.expect(streams != null);
+    // The on-disk copy (one item) wins over the embedded set.
+    try std.testing.expectEqual(@as(usize, 1), streams.?.items.len);
+}
+
+test "resolver #256: unknown wasi:* subinterface resolves to null (no panic)" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/world.wit",
+        .data =
+        \\package example:app@0.1.0;
+        \\world app { import wasi:io/streams@0.2.6; }
+        ,
+    });
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try parseLayout(allocator, io, tmp_wit);
+
+    // Package matches embedded wasi:io, but the sub-interface does not
+    // exist → clean null, not a crash.
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = "0.2.6" },
+        .name = "does-not-exist",
+    }) == null);
 }
 
 test "resolver #216: bundled wasi-cli adapter deps now expose stdin" {
