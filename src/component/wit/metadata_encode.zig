@@ -82,6 +82,53 @@ pub const EncodeError = error{
     IncludeCycle,
 } || writer.EncodeError;
 
+/// Diagnostic channel for the encoder, mirroring `ParseDiagnostic`
+/// (parser.zig) and `ResolveDiagnostic` (resolver.zig). Populated on
+/// `error.UnknownInterface` so callers can name the offending
+/// interface instead of printing a bare error tag.
+///
+/// String fields are allocated with the `allocator` passed to
+/// `encodeWorldFromResolverWithDiag` (NOT the internal arena, which is
+/// freed before the caller reads the diagnostic). Since the typical
+/// caller prints and exits, freeing is optional.
+pub const EncodeDiagnostic = struct {
+    /// Qualified name of the interface that failed to resolve,
+    /// e.g. "wasi:http/types@0.2.6".
+    interface: ?[]const u8 = null,
+    /// What referenced it: the world name, or the qualified name of
+    /// the consuming interface whose `use` clause pulled it in.
+    referenced_by: ?[]const u8 = null,
+    /// Which package-search tiers were tried.
+    searched: ?[]const u8 = null,
+};
+
+/// Populate `diag` (if present) for an unresolved interface `ref` and
+/// return `error.UnknownInterface`. `gpa` must outlive the caller's
+/// read of `diag` (the encoder's internal arena does not).
+fn failUnknownInterface(
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    ref: ast.InterfaceRef,
+    referenced_by: ?[]const u8,
+) EncodeError {
+    if (diag) |d| {
+        d.interface = refQualifiedName(gpa, ref);
+        if (referenced_by) |r| d.referenced_by = gpa.dupe(u8, r) catch r;
+        d.searched = "main package, on-disk deps/, or embedded wasi-canon";
+    }
+    return error.UnknownInterface;
+}
+
+/// Best-effort qualified name for an interface ref, allocated with
+/// `gpa`. Falls back to the bare name when no package qualifier is
+/// present or allocation fails.
+fn refQualifiedName(gpa: Allocator, ref: ast.InterfaceRef) []const u8 {
+    if (ref.package) |p| {
+        return formatQualifiedName(gpa, p.namespace, p.name, ref.name, p.version) catch ref.name;
+    }
+    return gpa.dupe(u8, ref.name) catch ref.name;
+}
+
 /// Encode the named world from `doc` as a `component-type:<world>`
 /// payload. The returned slice is owned by `allocator`.
 pub fn encodeWorld(
@@ -104,6 +151,18 @@ pub fn encodeWorldFromResolver(
     allocator: Allocator,
     resolver: wit_resolver.Resolver,
     world_name: []const u8,
+) EncodeError![]u8 {
+    return encodeWorldFromResolverWithDiag(allocator, resolver, world_name, null);
+}
+
+/// Variant of `encodeWorldFromResolver` that records an
+/// `EncodeDiagnostic` on `error.UnknownInterface` (and leaves it
+/// untouched otherwise). Pass `null` for `diag` to opt out.
+pub fn encodeWorldFromResolverWithDiag(
+    allocator: Allocator,
+    resolver: wit_resolver.Resolver,
+    world_name: []const u8,
+    diag: ?*EncodeDiagnostic,
 ) EncodeError![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -130,7 +189,7 @@ pub fn encodeWorldFromResolver(
     // source interface not already imported or exported. This
     // mirrors `wit-component`'s behaviour and is what makes the
     // canonical `wasi-http/proxy` world encode end-to-end.
-    try addImplicitImports(ar, resolver, pkg_id, &expanded_items);
+    try addImplicitImports(ar, resolver, pkg_id, &expanded_items, allocator, diag, world_name);
 
     // Build the world's body component-type decls.
     var world_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
@@ -163,7 +222,7 @@ pub fn encodeWorldFromResolver(
     for (expanded_items.items) |item| {
         switch (item) {
             .@"export", .import => |we| {
-                try collectUseRequests(ar, resolver, we, &alias_requests);
+                try collectUseRequests(ar, resolver, we, &alias_requests, allocator, diag, world_name);
             },
             .use => {},
             .include, .type => return error.UnsupportedWitFeature,
@@ -184,7 +243,7 @@ pub fn encodeWorldFromResolver(
                 // (see `buildInterfaceBody`'s `.alias` arm / #234).
                 const requested_exports: ?[]const []const u8 =
                     if (alias_requests.get(iface_name)) |l| l.items else null;
-                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map, requested_exports);
+                const iface_decls = try buildInterfaceBody(ar, resolver, ext, world_alias_map, requested_exports, allocator, diag, world_name);
                 const iface_type_idx = world_type_idx;
                 try world_decls.append(ar, .{ .type = .{
                     .instance = .{ .decls = iface_decls },
@@ -290,12 +349,18 @@ fn collectUseRequests(
     resolver: wit_resolver.Resolver,
     we: ast.WorldExtern,
     map: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
 ) EncodeError!void {
     const ref = switch (we) {
         .interface_ref => |ir| ir.ref,
         else => return,
     };
-    const lookup = resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
+    const lookup = resolver.findInterfaceWithPkg(ref) orelse {
+        const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
+        return failUnknownInterface(gpa, diag, ref, ctx);
+    };
     for (lookup.iface.items) |it| {
         if (it != .use) continue;
         const u = it.use;
@@ -303,7 +368,10 @@ fn collectUseRequests(
         // resolving short `use` refs — `use error.{error};` inside
         // `wasi:io/streams` resolves against `wasi:io`, not the
         // world's main package.
-        const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse return error.UnknownInterface;
+        const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse {
+            const consumer = formatQualifiedName(ar, lookup.pkg.namespace, lookup.pkg.name, ref.name, lookup.pkg.version) catch ref.name;
+            return failUnknownInterface(gpa, diag, u.from, consumer);
+        };
         const src_qname = try formatQualifiedName(
             ar,
             src_lookup.pkg.namespace,
@@ -571,6 +639,9 @@ fn addImplicitImports(
     resolver: wit_resolver.Resolver,
     ctx_pkg: ast.PackageId,
     items: *std.ArrayListUnmanaged(ast.WorldItem),
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
 ) EncodeError!void {
     const original = try items.toOwnedSlice(ar);
     items.* = .empty;
@@ -585,6 +656,9 @@ fn addImplicitImports(
             out: *std.ArrayListUnmanaged(ast.WorldItem),
             visited: *std.StringHashMapUnmanaged(void),
             item: ast.WorldItem,
+            enc_gpa: Allocator,
+            enc_diag: ?*EncodeDiagnostic,
+            enc_world: []const u8,
         ) EncodeError!void {
             const we = switch (item) {
                 .import, .@"export" => |w| w,
@@ -605,11 +679,15 @@ fn addImplicitImports(
             try visited.put(arena, qn, {});
 
             // Recurse on the iface's `use` source ifaces first.
-            const lookup = res.findInterfaceWithPkgCtx(ref, ctx) orelse return error.UnknownInterface;
+            const lookup = res.findInterfaceWithPkgCtx(ref, ctx) orelse {
+                const world_ctx = std.fmt.allocPrint(arena, "world '{s}'", .{enc_world}) catch enc_world;
+                return failUnknownInterface(enc_gpa, enc_diag, ref, world_ctx);
+            };
             for (lookup.iface.items) |iface_item| {
                 if (iface_item != .use) continue;
                 const u = iface_item.use;
-                const src_lookup = res.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse return error.UnknownInterface;
+                const src_lookup = res.findInterfaceWithPkgCtx(u.from, lookup.pkg) orelse
+                    return failUnknownInterface(enc_gpa, enc_diag, u.from, qn);
                 const src_qn = try formatQualifiedName(
                     arena,
                     src_lookup.pkg.namespace,
@@ -629,14 +707,14 @@ fn addImplicitImports(
                         .name = u.from.name,
                     },
                 } };
-                try visit(arena, res, ctx, out, visited, .{ .import = synth });
+                try visit(arena, res, ctx, out, visited, .{ .import = synth }, enc_gpa, enc_diag, enc_world);
             }
             try out.append(arena, item);
         }
     };
 
     for (original) |it| {
-        try Helper.visit(ar, resolver, ctx_pkg, items, &seen, it);
+        try Helper.visit(ar, resolver, ctx_pkg, items, &seen, it, gpa, diag, world_name);
     }
 }
 
@@ -685,6 +763,9 @@ fn buildInterfaceBody(
     ext: ast.WorldExtern,
     world_alias_map: std.StringHashMapUnmanaged(u32),
     requested_exports: ?[]const []const u8,
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+    world_name: []const u8,
 ) EncodeError![]const ctypes.Decl {
     const ref = switch (ext) {
         .interface_ref => |ir| ir.ref,
@@ -698,7 +779,10 @@ fn buildInterfaceBody(
     // either way. The returned `pkg` is the consuming interface's
     // own package — used below as fallback context when resolving
     // short `use src.{T};` refs against the dep's sibling files.
-    const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
+    const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse {
+        const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
+        return failUnknownInterface(gpa, diag, ref, ctx);
+    };
     const iface_body = iface_lookup.iface;
 
     // `BodyBuilder` tracks the type-index space inside this
@@ -844,7 +928,10 @@ fn buildInterfaceBody(
                 // canonical wit-component output: consumers of this
                 // iface can pull the type via the export chain
                 // without re-traversing the alias path).
-                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, iface_lookup.pkg) orelse return error.UnknownInterface;
+                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, iface_lookup.pkg) orelse {
+                    const consumer = formatQualifiedName(ar, iface_lookup.pkg.namespace, iface_lookup.pkg.name, ref.name, iface_lookup.pkg.version) catch ref.name;
+                    return failUnknownInterface(gpa, diag, u.from, consumer);
+                };
                 const src_qname = try formatQualifiedName(
                     ar,
                     src_lookup.pkg.namespace,
@@ -1218,6 +1305,40 @@ test "metadata_encode: unknown world reports error" {
     const source = "package docs:adder@0.1.0;\nworld adder { }";
     const r = encodeWorldFromSource(testing.allocator, source, "missing");
     try testing.expectError(error.UnknownWorld, r);
+}
+
+test "metadata_encode #258: unresolvable interface names itself in EncodeDiagnostic" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+
+    // A world importing a qualified `wasi:*` interface with no dep
+    // (and no embedded fallback) cannot resolve it.
+    const main_src =
+        \\package docs:app@0.1.0;
+        \\world app { import wasi:http/types@0.2.6; }
+    ;
+    const main_doc = try parser.parse(ar, main_src, null);
+    const resolver = resolver_mod.Resolver.init(main_doc, &.{});
+
+    var diag: EncodeDiagnostic = .{};
+    const r = encodeWorldFromResolverWithDiag(testing.allocator, resolver, "app", &diag);
+    try testing.expectError(error.UnknownInterface, r);
+
+    // The diagnostic names the offending interface and what referenced it.
+    try testing.expect(diag.interface != null);
+    try testing.expectEqualStrings("wasi:http/types@0.2.6", diag.interface.?);
+    try testing.expect(diag.referenced_by != null);
+    try testing.expectEqualStrings("world 'app'", diag.referenced_by.?);
+    try testing.expect(diag.searched != null);
+
+    // Diag strings are allocated on the caller's allocator (not the
+    // encoder's internal arena), so the caller owns and frees them.
+    testing.allocator.free(diag.interface.?);
+    testing.allocator.free(diag.referenced_by.?);
 }
 
 test "metadata_encode: multi-package resolver — cross-package import" {
