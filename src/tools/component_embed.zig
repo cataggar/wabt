@@ -105,8 +105,15 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 
     const world_name = world_arg orelse resolveSoleWorld(ar, resolver.main, wit_path);
 
-    const ct_payload = wabt.component.wit.metadata_encode.encodeWorldFromResolver(alloc, resolver, world_name) catch |err| {
-        std.debug.print("error: encoding world '{s}': {s}\n", .{ world_name, @errorName(err) });
+    var ediag: wabt.component.wit.metadata_encode.EncodeDiagnostic = .{};
+    const ct_payload = wabt.component.wit.metadata_encode.encodeWorldFromResolverWithDiag(alloc, resolver, world_name, &ediag) catch |err| {
+        if (err == error.UnknownInterface) {
+            std.debug.print("error: encoding world '{s}': unknown interface '{s}'\n", .{ world_name, ediag.interface orelse "?" });
+            if (ediag.referenced_by) |r| std.debug.print("        referenced by {s}\n", .{r});
+            if (ediag.searched) |s| std.debug.print("        not found in {s}\n", .{s});
+        } else {
+            std.debug.print("error: encoding world '{s}': {s}\n", .{ world_name, @errorName(err) });
+        }
         std.process.exit(1);
     };
     defer alloc.free(ct_payload);
