@@ -27,6 +27,12 @@ pub fn build(b: *std.Build) void {
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
     wasi_cli.addImport("wasi_io", wasi_io);
 
+    const wasi_clocks = b.addModule("wasi_clocks", .{ .root_source_file = b.path("src/wasi_clocks.zig") });
+    wasi_clocks.addImport("abi", abi);
+
+    const wasi_random = b.addModule("wasi_random", .{ .root_source_file = b.path("src/wasi_random.zig") });
+    wasi_random.addImport("abi", abi);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
 
@@ -60,6 +66,28 @@ pub fn build(b: *std.Build) void {
         .output = "hello.wasm",
     });
     installAndValidate(b, examples_step, hello, "hello.wasm");
+
+    // sysinfo: prints a monotonic clock reading + a random u64, exercising
+    // the wasi_clocks and wasi_random bindings.
+    const sysinfo_core = compileZigWasm(b, .{
+        .source = "examples/sysinfo/src/main.zig",
+        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
+        .output = "sysinfo.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_clocks", .path = "src/wasi_clocks.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_random", .path = "src/wasi_random.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+        },
+    });
+    const sysinfo = makeComponent(b, .{
+        .core = sysinfo_core,
+        .wit_dir = "examples/sysinfo/wit",
+        .world = "sysinfo",
+        .output = "sysinfo.wasm",
+    });
+    installAndValidate(b, examples_step, sysinfo, "sysinfo.wasm");
 
     // Default `zig build` builds the examples.
     b.getInstallStep().dependOn(examples_step);

@@ -33,9 +33,11 @@ receive results wider than one core value, so a guest may combine several
 |---|---|---|
 | `wasi_io` | `wasi:io@0.2.6` | streams (in/out), poll, error |
 | `wasi_cli` | `wasi:cli@0.2.6` | seed (run/stdout/exit) |
+| `wasi_clocks` | `wasi:clocks@0.2.6` | monotonic + wall clock |
+| `wasi_random` | `wasi:random@0.2.6` | random, insecure, insecure-seed |
 | `wasi_http` | `wasi:http@0.2.6` | seed (incoming-handler) |
 | `wasi_keyvalue` | `wasi:keyvalue@0.2.0-draft` | seed |
-| `wasi_clocks` / `wasi_random` / `wasi_filesystem` / `wasi_sockets` | `@0.2.6` | planned |
+| `wasi_filesystem` / `wasi_sockets` | `@0.2.6` | planned |
 | `wasi_config` / `wasi_nn` / `wasi_tls` | proposals | planned |
 
 Bindings are demand-driven: functions are added as examples need them.
