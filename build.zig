@@ -290,8 +290,9 @@ pub fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
 
 pub const WabtComponent = struct {
     core: std.Build.LazyPath,
-    /// WIT package directory to embed (`--wit`).
-    wit_dir: std.Build.LazyPath,
+    /// WIT package directory to embed (`--wit`). Defaults to `wit/`
+    /// relative to the build root.
+    wit_dir: ?std.Build.LazyPath = null,
     /// World to embed (`--world`).
     world: []const u8,
     /// Output basename for the produced component LazyPath.
@@ -304,14 +305,14 @@ pub const WabtComponent = struct {
 /// on-disk `wit/deps/` copy is needed.
 pub fn makeComponent(b: *std.Build, opts: WabtComponent) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{ "wabt", "component", "new", "--world", opts.world, "--wit" });
-    cmd.addDirectoryArg(opts.wit_dir);
+    cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
     cmd.addFileArg(opts.core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(opts.output);
 }
 
 /// `wabt module validate` the component, then install it under
-/// `zig-out/examples/<basename>`.
+/// `zig-out/<basename>`.
 pub fn installAndValidate(
     b: *std.Build,
     parent: *std.Build.Step,
@@ -322,7 +323,7 @@ pub fn installAndValidate(
     validate.addFileArg(component);
     validate.setName(b.fmt("wabt module validate {s}", .{install_basename}));
 
-    const install = b.addInstallFileWithDir(component, .{ .custom = "examples" }, install_basename);
+    const install = b.addInstallFileWithDir(component, .prefix, install_basename);
     install.step.dependOn(&validate.step);
     parent.dependOn(&install.step);
 }
