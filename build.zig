@@ -182,7 +182,11 @@ pub const ZigBuildWasm = struct {
     /// export is added automatically (see `cabi_realloc`), so list only
     /// the component-specific exports here.
     exports: []const []const u8,
-    output: []const u8,
+    /// Output basename for the emitted core wasm. When null, derived from
+    /// `source`'s basename stem + `.core.wasm` (e.g. `main.zig` →
+    /// `main.core.wasm`). Consumers typically pass their project name from
+    /// `@import("build.zig.zon").name` here.
+    output: ?[]const u8 = null,
     /// Extra modules importable from the root via `@import("<name>")`.
     imports: []const ZigWasmImport = &.{},
     target_triple: []const u8 = "wasm32-freestanding",
@@ -237,8 +241,9 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
             cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), imp.path);
         }
     }
-    const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
-    cmd.setName(b.fmt("zig build-exe {s}", .{opts.output}));
+    const output = opts.output orelse b.fmt("{s}.core.wasm", .{std.fs.path.stem(lazyBasename(opts.source))});
+    const out = cmd.addPrefixedOutputFileArg("-femit-bin=", output);
+    cmd.setName(b.fmt("zig build-exe {s}", .{output}));
     return out;
 }
 
