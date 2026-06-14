@@ -34,26 +34,13 @@
 //! `wasi:cli/exit.exit-with-code` — so every run produces an explicit
 //! return code (0 = success).
 
-const abi = @import("abi");
-
-const retPtr = abi.retPtr;
+const io = @import("wasi_io");
 
 // ── Host imports (canonical-ABI lowered signatures) ────────────────
 
 /// `wasi:cli/stdout.get-stdout() -> own<output-stream>`. The result is a
 /// single core value (the stream handle), returned directly.
 extern "wasi:cli/stdout@0.2.6" fn @"get-stdout"() i32;
-
-/// `wasi:io/streams.[method]output-stream.blocking-write-and-flush(
-///   borrow<output-stream>, list<u8>) -> result<_, stream-error>`.
-/// `list<u8>` lowers to (ptr, len); the result is 2 flat words →
-/// retptr [disc, stream_err_disc]. The helper ignores the result.
-extern "wasi:io/streams@0.2.6" fn @"[method]output-stream.blocking-write-and-flush"(
-    self: i32,
-    contents_ptr: i32,
-    contents_len: i32,
-    retptr: i32,
-) void;
 
 /// `wasi:cli/exit.exit-with-code(status-code: u8)`. `u8` lowers to a
 /// single i32 flat param; the function does not return (it terminates
@@ -68,12 +55,7 @@ extern "wasi:cli/exit@0.2.6" fn @"exit-with-code"(status_code: i32) void;
 /// is ignored). Opens stdout lazily and caches the handle.
 pub fn print(bytes: []const u8) void {
     if (bytes.len == 0) return;
-    @"[method]output-stream.blocking-write-and-flush"(
-        stdout(),
-        @intCast(@intFromPtr(bytes.ptr)),
-        @intCast(bytes.len),
-        retPtr(),
-    );
+    (io.OutputStream{ .handle = stdout() }).writeAll(bytes);
 }
 
 /// Write `bytes` followed by a newline.

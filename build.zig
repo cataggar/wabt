@@ -19,8 +19,13 @@ pub fn build(b: *std.Build) void {
     // sole `cabi_realloc` export and the canonical-ABI ret-area.
     const abi = b.addModule("abi", .{ .root_source_file = b.path("src/abi.zig") });
 
+    // wasi_io is foundational: cli/http/filesystem/sockets hand back
+    // input-stream / output-stream / pollable handles bound here.
+    const wasi_io = b.addModule("wasi_io", .{ .root_source_file = b.path("src/wasi_io.zig") });
+    wasi_io.addImport("abi", abi);
+
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
-    wasi_cli.addImport("abi", abi);
+    wasi_cli.addImport("wasi_io", wasi_io);
 
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
@@ -43,7 +48,8 @@ pub fn build(b: *std.Build) void {
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "hello.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
             .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
         },
     });
