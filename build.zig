@@ -82,20 +82,20 @@ pub fn build(b: *std.Build) void {
     // sysinfo: prints a monotonic clock reading + a random u64, exercising
     // the wasi_clocks and wasi_random bindings.
     const sysinfo_core = compileZigWasm(b, .{
-        .source = "examples/sysinfo/src/main.zig",
+        .source = b.path("examples/sysinfo/src/main.zig"),
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "sysinfo.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_clocks", .path = "src/wasi_clocks.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_random", .path = "src/wasi_random.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_clocks", .path = b.path("src/wasi_clocks.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_random", .path = b.path("src/wasi_random.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     const sysinfo = makeComponent(b, .{
         .core = sysinfo_core,
-        .wit_dir = "examples/sysinfo/wit",
+        .wit_dir = b.path("examples/sysinfo/wit"),
         .world = "sysinfo",
         .output = "sysinfo.wasm",
     });
@@ -104,19 +104,19 @@ pub fn build(b: *std.Build) void {
     // preopens: lists the host's preopened directories, exercising the
     // wasi_filesystem preopens binding.
     const preopens_core = compileZigWasm(b, .{
-        .source = "examples/preopens/src/main.zig",
+        .source = b.path("examples/preopens/src/main.zig"),
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "preopens.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_filesystem", .path = "src/wasi_filesystem.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_filesystem", .path = b.path("src/wasi_filesystem.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     const preopens = makeComponent(b, .{
         .core = preopens_core,
-        .wit_dir = "examples/preopens/wit",
+        .wit_dir = b.path("examples/preopens/wit"),
         .world = "preopens",
         .output = "preopens.wasm",
     });
@@ -125,19 +125,19 @@ pub fn build(b: *std.Build) void {
     // resolve: resolves localhost to IP addresses via the async
     // wasi_sockets ip-name-lookup path (+ wasi_io poll).
     const resolve_core = compileZigWasm(b, .{
-        .source = "examples/resolve/src/main.zig",
+        .source = b.path("examples/resolve/src/main.zig"),
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "resolve.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_sockets", .path = "src/wasi_sockets.zig", .deps = &.{ "abi", "wasi_io" } },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_sockets", .path = b.path("src/wasi_sockets.zig"), .deps = &.{ "abi", "wasi_io" } },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     const resolve = makeComponent(b, .{
         .core = resolve_core,
-        .wit_dir = "examples/resolve/wit",
+        .wit_dir = b.path("examples/resolve/wit"),
         .world = "resolve",
         .output = "resolve.wasm",
     });
@@ -147,19 +147,19 @@ pub fn build(b: *std.Build) void {
     // wasi:config proposal. Builds + validates; running needs a host
     // that implements wasi:config.
     const config_core = compileZigWasm(b, .{
-        .source = "examples/config/src/main.zig",
+        .source = b.path("examples/config/src/main.zig"),
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "config.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_config", .path = "src/wasi_config.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_config", .path = b.path("src/wasi_config.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     const config = makeComponent(b, .{
         .core = config_core,
-        .wit_dir = "examples/config/wit",
+        .wit_dir = b.path("examples/config/wit"),
         .world = "config",
         .output = "config.wasm",
     });
@@ -168,19 +168,19 @@ pub fn build(b: *std.Build) void {
     // nn: constructs + inspects a tensor via the experimental wasi:nn
     // proposal. Builds + validates; running needs a wasi:nn backend.
     const nn_core = compileZigWasm(b, .{
-        .source = "examples/nn/src/main.zig",
+        .source = b.path("examples/nn/src/main.zig"),
         .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
         .output = "nn.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_nn", .path = "src/wasi_nn.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_nn", .path = b.path("src/wasi_nn.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     const nn = makeComponent(b, .{
         .core = nn_core,
-        .wit_dir = "examples/nn/wit",
+        .wit_dir = b.path("examples/nn/wit"),
         .world = "nn",
         .output = "nn.wasm",
     });
@@ -190,15 +190,15 @@ pub fn build(b: *std.Build) void {
     // component example (wasi_http, wasi_keyvalue, wasi_tls). Compiled to
     // a core wasm but not wrapped or run.
     const smoke_core = compileZigWasm(b, .{
-        .source = "examples/smoke/src/main.zig",
+        .source = b.path("examples/smoke/src/main.zig"),
         .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
         .output = "smoke.core.wasm",
         .imports = &.{
-            .{ .name = "wasi_http", .path = "src/wasi_http.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_keyvalue", .path = "src/wasi_keyvalue.zig", .deps = &.{"abi"} },
-            .{ .name = "wasi_tls", .path = "src/wasi_tls.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"} },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+            .{ .name = "wasi_http", .path = b.path("src/wasi_http.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_keyvalue", .path = b.path("src/wasi_keyvalue.zig"), .deps = &.{"abi"} },
+            .{ .name = "wasi_tls", .path = b.path("src/wasi_tls.zig"), .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"} },
+            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
         },
     });
     // Realize the build-exe (type-check) as part of `zig build examples`.
@@ -210,12 +210,19 @@ pub fn build(b: *std.Build) void {
 }
 
 // ── Build helpers (ported from cataggar/wamr) ──────────────────────
+//
+// These are `pub` so dependents can `@import("wasip2")` this build.zig
+// and reuse them (e.g. the `example/hello` branch). Path fields are
+// `LazyPath` so a dependent points at the vendored sources via
+// `dep.path("src/...")`.
 
-const ZigWasmImport = struct {
+pub const ZigWasmImport = struct {
     /// Import name, e.g. `wasi_cli` for `@import("wasi_cli")`.
     name: []const u8,
-    /// Repo-relative path to the module's root source file.
-    path: []const u8,
+    /// The module's root source file. A `LazyPath` so callers in another
+    /// package can point at this dependency's vendored sources via
+    /// `dep.path("src/...")`.
+    path: std.Build.LazyPath,
     /// Names of other modules in the same `imports` list this module
     /// `@import`s (e.g. `&.{"abi"}`). Wired as `--dep` flags before this
     /// module's `-M` entry.
@@ -226,8 +233,8 @@ const ZigWasmImport = struct {
     root_dep: bool = true,
 };
 
-const ZigWasmCompile = struct {
-    source: []const u8,
+pub const ZigWasmCompile = struct {
+    source: std.Build.LazyPath,
     /// Names passed via `--export=<name>`.
     exports: []const []const u8,
     output: []const u8,
@@ -245,7 +252,7 @@ const ZigWasmCompile = struct {
 /// -fno-entry --export=…`, reconstructing the module import graph
 /// (`root` → `wasi_*` → `abi`) via `--dep` / `-M` flags. Captures the
 /// emitted wasm as a build-graph LazyPath.
-fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
+pub fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         b.graph.zig_exe, "build-exe",
         "-target",       opts.target_triple,
@@ -257,7 +264,7 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     for (opts.exports) |sym| cmd.addArg(b.fmt("--export={s}", .{sym}));
 
     if (opts.imports.len == 0) {
-        cmd.addFileArg(b.path(opts.source));
+        cmd.addFileArg(opts.source);
     } else {
         // `--dep` flags attach to the next `-M` module. A `dep` name
         // resolves to the single matching `-M<name>=` module, so a
@@ -267,13 +274,13 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
             cmd.addArg("--dep");
             cmd.addArg(imp.name);
         }
-        cmd.addPrefixedFileArg("-Mroot=", b.path(opts.source));
+        cmd.addPrefixedFileArg("-Mroot=", opts.source);
         for (opts.imports) |imp| {
             for (imp.deps) |dep| {
                 cmd.addArg("--dep");
                 cmd.addArg(dep);
             }
-            cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), b.path(imp.path));
+            cmd.addPrefixedFileArg(b.fmt("-M{s}=", .{imp.name}), imp.path);
         }
     }
     const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
@@ -281,10 +288,10 @@ fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     return out;
 }
 
-const ReactorComponent = struct {
+pub const WabtComponent = struct {
     core: std.Build.LazyPath,
     /// WIT package directory to embed (`--wit`).
-    wit_dir: []const u8,
+    wit_dir: std.Build.LazyPath,
     /// World to embed (`--world`).
     world: []const u8,
     /// Output basename for the produced component LazyPath.
@@ -295,9 +302,9 @@ const ReactorComponent = struct {
 /// WIT, wraps the core into a component, and validates — in one call.
 /// The bundled WASI WIT + wasi-preview1 adapter are auto-attached, so no
 /// on-disk `wit/deps/` copy is needed.
-fn makeComponent(b: *std.Build, opts: ReactorComponent) std.Build.LazyPath {
+pub fn makeComponent(b: *std.Build, opts: WabtComponent) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{ "wabt", "component", "new", "--world", opts.world, "--wit" });
-    cmd.addDirectoryArg(b.path(opts.wit_dir));
+    cmd.addDirectoryArg(opts.wit_dir);
     cmd.addFileArg(opts.core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(opts.output);
@@ -305,7 +312,7 @@ fn makeComponent(b: *std.Build, opts: ReactorComponent) std.Build.LazyPath {
 
 /// `wabt module validate` the component, then install it under
 /// `zig-out/examples/<basename>`.
-fn installAndValidate(
+pub fn installAndValidate(
     b: *std.Build,
     parent: *std.Build.Step,
     component: std.Build.LazyPath,
