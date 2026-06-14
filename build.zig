@@ -176,7 +176,7 @@ pub fn resolveImports(
     return out.toOwnedSlice(b.allocator) catch @panic("OOM");
 }
 
-pub const ZigWasmCompile = struct {
+pub const ZigBuildWasm = struct {
     source: std.Build.LazyPath,
     /// Names passed via `--export=<name>`.
     exports: []const []const u8,
@@ -195,7 +195,7 @@ pub const ZigWasmCompile = struct {
 /// -fno-entry --export=…`, reconstructing the module import graph
 /// (`root` → `wasi_*` → `abi`) via `--dep` / `-M` flags. Captures the
 /// emitted wasm as a build-graph LazyPath.
-pub fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
+pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
         b.graph.zig_exe, "build-exe",
         "-target",       opts.target_triple,
@@ -231,7 +231,7 @@ pub fn compileZigWasm(b: *std.Build, opts: ZigWasmCompile) std.Build.LazyPath {
     return out;
 }
 
-pub const WabtComponent = struct {
+pub const WabtComponentNew = struct {
     core: std.Build.LazyPath,
     /// WIT package directory to embed (`--wit`). Defaults to `wit/`
     /// relative to the build root.
@@ -246,7 +246,7 @@ pub const WabtComponent = struct {
 /// WIT, wraps the core into a component, and validates — in one call.
 /// The bundled WASI WIT + wasi-preview1 adapter are auto-attached, so no
 /// on-disk `wit/deps/` copy is needed.
-pub fn makeComponent(b: *std.Build, opts: WabtComponent) std.Build.LazyPath {
+pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{ "wabt", "component", "new", "--world", opts.world, "--wit" });
     cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
     cmd.addFileArg(opts.core);
@@ -256,7 +256,7 @@ pub fn makeComponent(b: *std.Build, opts: WabtComponent) std.Build.LazyPath {
 
 /// `wabt module validate` the component, then install it under
 /// `zig-out/<basename>`.
-pub fn installAndValidate(
+pub fn wabtModuleValidate(
     b: *std.Build,
     parent: *std.Build.Step,
     component: std.Build.LazyPath,
