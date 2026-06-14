@@ -6,7 +6,7 @@
     .dependencies = .{
         .wasip2 = .{
             .url = "https://github.com/cataggar/wabt/archive/refs/heads/wasip2.tar.gz",
-            .hash = "wasip2-0.2.6-jlr7LYRtAQDhEBc1faOPsf0RPpgZH2bx2F4AhCpAxz67",
+            .hash = "wasip2-0.2.6-jlr7LRBwAQDFlXWB5otL5PVBgL44p6vO3HgxQQM-33vL",
         },
     },
     .paths = .{
