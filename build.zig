@@ -298,6 +298,38 @@ pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
     opts.parent.dependOn(&install.step);
 }
 
+pub const WasmtimeRun = struct {
+    /// Component to run.
+    wasm: std.Build.LazyPath,
+    /// Named step to create (e.g. `zig build run`).
+    step_name: []const u8 = "run",
+    /// Step description shown in `zig build --help`.
+    description: []const u8 = "Run the component with wasmtime",
+    /// `-S <feature>` flags enabling WASI features on `wasmtime run`.
+    /// Defaults to `cli-exit-with-code` so the guest's exit code propagates.
+    wasi: []const []const u8 = &.{"cli-exit-with-code"},
+    /// Extra args passed to the guest after the component path. Args from
+    /// `zig build <step> -- ...` are appended after these.
+    args: []const []const u8 = &.{},
+};
+
+/// Create a named step that runs the component with `wasmtime run`.
+/// Returns the step so callers can wire further dependencies if needed.
+pub fn wasmtimeRun(b: *std.Build, opts: WasmtimeRun) *std.Build.Step {
+    const cmd = b.addSystemCommand(&.{ "wasmtime", "run" });
+    for (opts.wasi) |feature| {
+        cmd.addArg("-S");
+        cmd.addArg(feature);
+    }
+    cmd.addFileArg(opts.wasm);
+    for (opts.args) |arg| cmd.addArg(arg);
+    if (b.args) |forwarded| cmd.addArgs(forwarded);
+
+    const step = b.step(opts.step_name, opts.description);
+    step.dependOn(&cmd.step);
+    return step;
+}
+
 /// The basename of a `LazyPath`. For a generated file produced by a `Run`
 /// output arg (which is how `zigBuildWasm` / `wabtComponentNew` make their
 /// outputs), the basename is recovered from the owning `Run.Output`.
