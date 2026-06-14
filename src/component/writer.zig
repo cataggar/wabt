@@ -456,6 +456,16 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
                 try w.appendByte(0x00);
             }
         },
+        .future => |f| {
+            // `(future t?)` → 0x65 + optional element valtype.
+            try w.appendByte(0x65);
+            try writeOptValType(w, f.element);
+        },
+        .stream => |s| {
+            // `(stream t?)` → 0x66 + optional element valtype.
+            try w.appendByte(0x66);
+            try writeOptValType(w, s.element);
+        },
         .resource => |r| {
             // `(sub resource)` is encoded as `0x3F` followed by the
             // representation core valtype byte, then the destructor
@@ -477,7 +487,8 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
             }
         },
         .func => |f| {
-            try w.appendByte(0x40);
+            // `0x43` for an async function type, `0x40` for sync.
+            try w.appendByte(if (f.is_async) 0x43 else 0x40);
             if (f.params.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(f.params.len));
             for (f.params) |p| {
@@ -708,6 +719,17 @@ fn synthSortIdxFromDesc(desc: ctypes.ExternDesc) ctypes.SortIdx {
 
 // ── Shared encoders for nested forms ───────────────────────────────────────
 
+/// Encode an optional valtype: `0x00` for none, `0x01 <valtype>` for some.
+/// Used by `future` / `stream` element types.
+fn writeOptValType(w: *Writer, vt: ?ctypes.ValType) EncodeError!void {
+    if (vt) |t| {
+        try w.appendByte(0x01);
+        try writeValType(w, t);
+    } else {
+        try w.appendByte(0x00);
+    }
+}
+
 fn writeValType(w: *Writer, vt: ctypes.ValType) EncodeError!void {
     switch (vt) {
         .bool => try w.writeS64Leb(-1), // 0x7F → -1 in s33
@@ -723,6 +745,8 @@ fn writeValType(w: *Writer, vt: ctypes.ValType) EncodeError!void {
         .f64 => try w.writeS64Leb(-11),
         .char => try w.writeS64Leb(-12),
         .string => try w.writeS64Leb(-13),
+        // `error-context` is primvaltype 0x64 → s33 -28 (0x64 - 0x80).
+        .error_context => try w.writeS64Leb(-28),
         .own => |idx| {
             // 0x69 → -23 in s33
             try w.writeS64Leb(-23);

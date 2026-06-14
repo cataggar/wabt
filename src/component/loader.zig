@@ -484,7 +484,7 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
     // Peek the first byte and dispatch without consuming if not recognized.
     const tag = try reader.peekByte();
     return switch (tag) {
-        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x3F, 0x40, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
+        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x66, 0x65, 0x3F, 0x40, 0x43, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
         else => .{ .val = try readValType(reader) },
     };
 }
@@ -558,6 +558,17 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             const err = if (has_err != 0) try readValType(reader) else null;
             break :blk .{ .result = .{ .ok = ok, .err = err } };
         },
+        0x65 => blk: {
+            // future: `0x65` + optional element valtype
+            break :blk .{ .future = .{ .element = try readOptValType(reader) } };
+        },
+        0x66 => blk: {
+            // stream: `0x66` + optional element valtype
+            const elem = try readOptValType(reader);
+            // Spec: `(stream char)` is rejected (temporary).
+            if (elem) |e| if (e == .char) return error.InvalidEncoding;
+            break :blk .{ .stream = .{ .element = elem } };
+        },
         0x3F => blk: {
             // resource: `<rep:CoreValType> <dtor-opt>`. See
             // writer.zig for the symmetric write side; `rep` is
@@ -569,29 +580,8 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             const dtor = if (has_dtor != 0) try reader.readU32() else null;
             break :blk .{ .resource = .{ .destructor = dtor, .rep = rep } };
         },
-        0x40 => blk: {
-            // func type
-            // Current spec (2024): paramlist is a bare vec<labelvaltype>,
-            // resultlist is `0x00 valtype` (one result) | `0x01 0x00` (none).
-            // See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
-            const param_count = try reader.readU32();
-            const params = try allocator.alloc(ctypes.NamedValType, param_count);
-            for (params) |*p| {
-                p.name = try reader.readName();
-                p.type = try readValType(reader);
-            }
-            const result_tag = try reader.readByte();
-            const results: ctypes.FuncType.ResultList = switch (result_tag) {
-                0x00 => .{ .unnamed = try readValType(reader) },
-                0x01 => blk2: {
-                    const zero = try reader.readByte();
-                    if (zero != 0x00) return error.InvalidEncoding;
-                    break :blk2 .none;
-                },
-                else => return error.InvalidEncoding,
-            };
-            break :blk .{ .func = .{ .params = params, .results = results } };
-        },
+        0x40 => try parseFuncTypeBody(reader, allocator, false),
+        0x43 => try parseFuncTypeBody(reader, allocator, true),
         0x41 => blk: {
             // component type
             const count = try reader.readU32();
@@ -670,10 +660,44 @@ fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
         0x75 => .f64,
         0x74 => .char,
         0x73 => .string,
+        0x64 => .error_context,
         0x69 => .{ .own = try reader.readU32() },
         0x68 => .{ .borrow = try reader.readU32() },
         else => error.InvalidEncoding,
     };
+}
+
+/// Read an optional valtype: `0x00` → none, `0x01 <valtype>` → some.
+/// Used by `future` / `stream` element types.
+fn readOptValType(reader: *BinaryReader) LoadError!?ctypes.ValType {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => null,
+        0x01 => try readValType(reader),
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Parse a func type body (paramlist + resultlist) after the `0x40`
+/// (sync) / `0x43` (async) tag has been consumed.
+fn parseFuncTypeBody(reader: *BinaryReader, allocator: std.mem.Allocator, is_async: bool) LoadError!ctypes.TypeDef {
+    const param_count = try reader.readU32();
+    const params = try allocator.alloc(ctypes.NamedValType, param_count);
+    for (params) |*p| {
+        p.name = try reader.readName();
+        p.type = try readValType(reader);
+    }
+    const result_tag = try reader.readByte();
+    const results: ctypes.FuncType.ResultList = switch (result_tag) {
+        0x00 => .{ .unnamed = try readValType(reader) },
+        0x01 => blk: {
+            const zero = try reader.readByte();
+            if (zero != 0x00) return error.InvalidEncoding;
+            break :blk .none;
+        },
+        else => return error.InvalidEncoding,
+    };
+    return .{ .func = .{ .params = params, .results = results, .is_async = is_async } };
 }
 
 fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.Canon {
@@ -897,6 +921,95 @@ test "readValType: rejects unknown negative code" {
     // 0x67 decodes as signed LEB -25, which has no primitive mapping.
     var reader = BinaryReader{ .data = &[_]u8{0x67} };
     try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
+}
+
+test "readValType: error-context (#263)" {
+    var reader = BinaryReader{ .data = &[_]u8{0x64} };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .error_context);
+}
+
+test "parseTypeDef: future / stream (#263)" {
+    // future<u8>: 0x65 0x01 0x7D ; bare future: 0x65 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element == null);
+    }
+    // stream<u8>: 0x66 0x01 0x7D ; bare stream: 0x66 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element == null);
+    }
+}
+
+test "parseTypeDef: rejects (stream char) (#263)" {
+    // 0x66 0x01 0x74 — stream<char> is rejected by the spec.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x74 } };
+    try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "parseTypeDef: async func type (#263)" {
+    // async `() -> ()`: 0x43 + paramcount 0x00 + result `0x01 0x00`.
+    var areader = BinaryReader{ .data = &[_]u8{ 0x43, 0x00, 0x01, 0x00 } };
+    const atd = try parseTypeDef(&areader, std.testing.allocator);
+    try std.testing.expect(atd.func.is_async);
+    // sync uses 0x40.
+    var sreader = BinaryReader{ .data = &[_]u8{ 0x40, 0x00, 0x01, 0x00 } };
+    const std_td = try parseTypeDef(&sreader, std.testing.allocator);
+    try std.testing.expect(!std_td.func.is_async);
+}
+
+test "round-trip P3 type defs through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .val = .error_context },
+        .{ .future = .{ .element = .u8 } },
+        .{ .future = .{ .element = null } },
+        .{ .stream = .{ .element = .u8 } },
+        .{ .stream = .{ .element = null } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = true } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = false } },
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 7), loaded.types.len);
+    try std.testing.expect(loaded.types[0] == .val and loaded.types[0].val == .error_context);
+    try std.testing.expect(loaded.types[1].future.element.? == .u8);
+    try std.testing.expect(loaded.types[2].future.element == null);
+    try std.testing.expect(loaded.types[3].stream.element.? == .u8);
+    try std.testing.expect(loaded.types[4].stream.element == null);
+    try std.testing.expect(loaded.types[5].func.is_async);
+    try std.testing.expect(!loaded.types[6].func.is_async);
 }
 
 test "parseTypeDef: instance type with `sub resource` type decl" {

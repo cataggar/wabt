@@ -31,6 +31,8 @@ pub const ValType = union(enum) {
     f64,
     char,
     string,
+    /// `error-context` — P3 opaque async error value (primvaltype `0x64`).
+    error_context,
 
     // Compound (index into component type index space)
     record: u32,
@@ -97,6 +99,18 @@ pub const ResultType = struct {
     err: ?ValType,
 };
 
+/// `future<T>` — P3 async single-value channel. `element` is null for a
+/// bare `future`.
+pub const FutureType = struct {
+    element: ?ValType,
+};
+
+/// `stream<T>` — P3 async multi-value channel. `element` is null for a
+/// bare `stream`.
+pub const StreamType = struct {
+    element: ?ValType,
+};
+
 pub const ResourceType = struct {
     /// Destructor function index (in the canon function index space), or null.
     destructor: ?u32 = null,
@@ -117,6 +131,9 @@ pub const NamedValType = struct {
 pub const FuncType = struct {
     params: []const NamedValType,
     results: ResultList,
+    /// `(func async …)` — P3 asynchronous function type (binary `0x43`
+    /// vs the synchronous `0x40`).
+    is_async: bool = false,
 
     pub const ResultList = union(enum) {
         /// No result (spec: `0x01 0x00`).
@@ -179,6 +196,9 @@ pub const TypeDef = union(enum) {
     enum_: EnumType,
     option: OptionType,
     result: ResultType,
+    /// P3 async value types (`future<T>` / `stream<T>`).
+    future: FutureType,
+    stream: StreamType,
     resource: ResourceType,
 
     // Function and component/instance types
