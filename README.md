@@ -22,10 +22,13 @@ src/
   wasi_http.zig      wasi:http@0.2.6       wasi_keyvalue.zig wasi:keyvalue@0.2.0-draft
   wasi_nn.zig        wasi:nn@…             wasi_tls.zig      wasi:tls@0.2.0-draft
 examples/
-  hello/  sysinfo/  preopens/  resolve/   (runnable on wasmtime)
-  config/ nn/                             (build + validate; need a proposal host)
-  smoke/                                  (build-only type-check of http/keyvalue/tls)
+  sysinfo/  preopens/  resolve/            (runnable on wasmtime)
+  config/   nn/                            (build + validate; need a proposal host)
+  smoke/                                   (build-only type-check of http/keyvalue/tls)
 ```
+
+> The standalone `hello` command lives on the `example/hello` orphan
+> branch, which consumes this library as a package dependency.
 
 `abi.zig` owns the single `cabi_realloc` export and the ret-area used to
 receive results wider than one core value, so a guest may combine several

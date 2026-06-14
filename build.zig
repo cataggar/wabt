@@ -76,27 +76,8 @@ pub fn build(b: *std.Build) void {
         "Build the WebAssembly Component examples in examples/",
     );
 
-    // hello: native `wasi:cli` command. Exports `wasi:cli/run@0.2.6#run`
-    // and writes a greeting through `wasi:cli/stdout` + `wasi:io/streams`.
-    // Built `wasm32-freestanding`; canonical-ABI plumbing lives in the
-    // shared `wasi_cli` / `abi` guest helpers.
-    const hello_core = compileZigWasm(b, .{
-        .source = "examples/hello/src/main.zig",
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "hello.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
-        },
-    });
-    const hello = makeComponent(b, .{
-        .core = hello_core,
-        .wit_dir = "examples/hello/wit",
-        .world = "hello",
-        .output = "hello.wasm",
-    });
-    installAndValidate(b, examples_step, hello, "hello.wasm");
+    // (The standalone `hello` example moved to the `example/hello` orphan
+    // branch, which depends on this library as a package.)
 
     // sysinfo: prints a monotonic clock reading + a random u64, exercising
     // the wasi_clocks and wasi_random bindings.
