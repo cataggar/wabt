@@ -577,11 +577,12 @@ pub fn parseLayoutWithDiag(
     return finishWithEmbedded(arena, main, dep_docs.items);
 }
 
-/// Finalize a `Resolver`, appending the embedded canonical WASI 0.2.6
-/// packages as **lowest-priority** deps. An embedded package is skipped
-/// when `main` or any on-disk dep already provides a matching package,
-/// so an on-disk `wit/deps/<pkg>/` always wins and existing projects
-/// see no behavior change. Resolution precedence becomes:
+/// Finalize a `Resolver`, appending the embedded canonical WASI
+/// packages (all versions, see `wasi_canon.version_sets`) as
+/// **lowest-priority** deps. An embedded package is skipped when `main`
+/// or any on-disk dep already provides a matching package, so an on-disk
+/// `wit/deps/<pkg>/` always wins and existing projects see no behavior
+/// change. Resolution precedence becomes:
 /// `main` → on-disk deps → embedded wasi-canon.
 fn finishWithEmbedded(
     arena: Allocator,
@@ -614,20 +615,24 @@ fn finishWithEmbedded(
     return Resolver.init(main, try all.toOwnedSlice(arena));
 }
 
-/// Parse the embedded canonical WASI 0.2.6 packages into one
-/// `ast.Document` per package (cli, clocks, filesystem, http, io,
-/// random, sockets). Documents are allocated into `arena`.
+/// Parse every embedded canonical WASI package (across all version
+/// sets) into one `ast.Document` per package. Documents are emitted in
+/// `wasi_canon.version_sets` order (newest version first) so that for an
+/// UNVERSIONED `wasi:*` reference the first matching package — the
+/// newest embedded version — wins. Documents are allocated into `arena`.
 pub fn embeddedWasiDocs(arena: Allocator) ResolveError![]ast.Document {
-    var docs = try arena.alloc(ast.Document, wasi_canon.packages.len);
-    for (wasi_canon.packages, 0..) |pkg, i| {
-        var sources = try arena.alloc(WitSource, pkg.files.len);
-        for (pkg.files, 0..) |file, j| {
-            sources[j] = .{ .path = file.path, .text = file.content };
+    var docs: std.ArrayListUnmanaged(ast.Document) = .empty;
+    for (wasi_canon.version_sets) |vs| {
+        for (vs.packages) |pkg| {
+            var sources = try arena.alloc(WitSource, pkg.files.len);
+            for (pkg.files, 0..) |file, j| {
+                sources[j] = .{ .path = file.path, .text = file.content };
+            }
+            const combined = try combineWitSources(arena, sources, pkg.name, null);
+            try docs.append(arena, try parser.parse(arena, combined.text, null));
         }
-        const combined = try combineWitSources(arena, sources, pkg.name, null);
-        docs[i] = try parser.parse(arena, combined.text, null);
     }
-    return docs;
+    return docs.toOwnedSlice(arena);
 }
 
 // ── tests ───────────────────────────────────────────────────────────────────
@@ -899,13 +904,13 @@ test "resolver #195p2: canonical wasi-http proxy world resolves through the layo
     try tmp.dir.createDirPath(io, "wit/deps");
 
     const pkgs = [_]struct { src_dir: []const u8, dst_rel: []const u8 }{
-        .{ .src_dir = "src/component/wit/wasi-canon/http", .dst_rel = "wit" },
-        .{ .src_dir = "src/component/wit/wasi-canon/cli", .dst_rel = "wit/deps/cli" },
-        .{ .src_dir = "src/component/wit/wasi-canon/clocks", .dst_rel = "wit/deps/clocks" },
-        .{ .src_dir = "src/component/wit/wasi-canon/filesystem", .dst_rel = "wit/deps/filesystem" },
-        .{ .src_dir = "src/component/wit/wasi-canon/io", .dst_rel = "wit/deps/io" },
-        .{ .src_dir = "src/component/wit/wasi-canon/random", .dst_rel = "wit/deps/random" },
-        .{ .src_dir = "src/component/wit/wasi-canon/sockets", .dst_rel = "wit/deps/sockets" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/http", .dst_rel = "wit" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/cli", .dst_rel = "wit/deps/cli" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/clocks", .dst_rel = "wit/deps/clocks" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/filesystem", .dst_rel = "wit/deps/filesystem" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/io", .dst_rel = "wit/deps/io" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/random", .dst_rel = "wit/deps/random" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/sockets", .dst_rel = "wit/deps/sockets" },
     };
 
     for (pkgs) |pkg| {
@@ -939,8 +944,11 @@ test "resolver #195p2: canonical wasi-http proxy world resolves through the layo
     try std.testing.expectEqualStrings("http", res.main.package.?.name);
     try std.testing.expectEqualStrings("0.2.6", res.main.package.?.version.?);
 
-    // All 6 dep packages are present and named.
-    try std.testing.expectEqual(@as(usize, 6), res.deps.len);
+    // The 6 on-disk dep packages are present and named. Resolution now
+    // also appends the embedded multi-version wasi-canon fallback set as
+    // lowest-priority deps (other versions + off-by-default proposals not
+    // provided on disk), so the dep count is >= 6 rather than exactly 6.
+    try std.testing.expect(res.deps.len >= 6);
     var saw_cli = false;
     var saw_clocks = false;
     var saw_filesystem = false;
@@ -1012,6 +1020,74 @@ test "resolver #256: wasi:* refs resolve from embedded set (no on-disk deps)" {
         .package = .{ .namespace = "wasi", .name = "random", .version = null },
         .name = "random",
     }) != null);
+}
+
+test "resolver #261: multi-version embedded set + proposals resolve (no on-disk deps)" {
+    // Acceptance for #261: every embedded wasi-canon version set is
+    // available with no on-disk deps. Versioned refs select the exact
+    // version; an unversioned ref prefers the newest (version_sets order).
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/world.wit",
+        .data =
+        \\package example:app@0.1.0;
+        \\world app {
+        \\  import wasi:io/streams@0.2.12;
+        \\  import wasi:io/streams@0.2.6;
+        \\  import wasi:config/store@0.2.0-rc.1;
+        \\  import wasi:keyvalue/store@0.2.0-draft;
+        \\  import wasi:tls/types@0.2.0-draft;
+        \\  import wasi:nn/tensor@0.2.0-rc-2024-10-28;
+        \\}
+        ,
+    });
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try parseLayout(allocator, io, tmp_wit);
+
+    // Both P2 core versions resolve, selected exactly by version.
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = "0.2.12" },
+        .name = "streams",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = "0.2.6" },
+        .name = "streams",
+    }) != null);
+
+    // Off-by-default proposals resolve from their own version sets.
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "config", .version = "0.2.0-rc.1" },
+        .name = "store",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "keyvalue", .version = "0.2.0-draft" },
+        .name = "store",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "tls", .version = "0.2.0-draft" },
+        .name = "types",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "nn", .version = "0.2.0-rc-2024-10-28" },
+        .name = "tensor",
+    }) != null);
+
+    // An UNVERSIONED wasi:io reference prefers the newest embedded P2
+    // version (0.2.12), per version_sets precedence order.
+    const hit = res.findInterfaceWithPkg(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = null },
+        .name = "streams",
+    });
+    try std.testing.expect(hit != null);
+    try std.testing.expectEqualStrings("0.2.12", hit.?.pkg.version.?);
 }
 
 test "resolver #256: on-disk wasi dep overrides embedded copy" {

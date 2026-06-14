@@ -1435,9 +1435,11 @@ test "parse #195: every canonical wasi-* WIT file parses individually" {
     const Fixture = struct { path: []const u8, content: []const u8 };
     var fixture_list: std.ArrayListUnmanaged(Fixture) = .empty;
     defer fixture_list.deinit(testing.allocator);
-    for (wasi_canon.packages) |pkg| {
-        for (pkg.files) |file| {
-            try fixture_list.append(testing.allocator, .{ .path = file.path, .content = file.content });
+    for (wasi_canon.version_sets) |vs| {
+        for (vs.packages) |pkg| {
+            for (pkg.files) |file| {
+                try fixture_list.append(testing.allocator, .{ .path = file.path, .content = file.content });
+            }
         }
     }
     const fixtures = fixture_list.items;
