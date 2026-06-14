@@ -232,7 +232,7 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
 }
 
 pub const WabtComponentNew = struct {
-    core: std.Build.LazyPath,
+    wasm_core: std.Build.LazyPath,
     /// WIT package directory to embed (`--wit`). Defaults to `wit/`
     /// relative to the build root.
     wit_dir: ?std.Build.LazyPath = null,
@@ -256,7 +256,7 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
     }
     cmd.addArg("--wit");
     cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
-    cmd.addFileArg(opts.core);
+    cmd.addFileArg(opts.wasm_core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(opts.output orelse "component.wasm");
 }
@@ -265,7 +265,7 @@ pub const WabtModuleValidate = struct {
     /// Step to attach the validate (and optional install) to.
     parent: *std.Build.Step,
     /// Component to validate. When null, this is a no-op.
-    component: ?std.Build.LazyPath = null,
+    wasm: ?std.Build.LazyPath = null,
     /// Install basename under `zig-out/`. When null, the component is
     /// validated but not installed.
     install_basename: ?[]const u8 = null,
