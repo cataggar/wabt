@@ -1,14 +1,6 @@
 const std = @import("std");
 
-/// `wasip2` — hand-written Zig **guest** bindings (canonical-ABI `extern`
-/// wrappers) for the P2 WASI packages bundled by `cataggar/wabt`, plus
-/// runnable Component-Model examples.
-///
-/// The `wasi_*` modules are wasm-only (their `extern` host imports link
-/// solely for `wasm32-freestanding` guests), so there is no native
-/// library artifact and no native `zig build test`. The meaningful gate
-/// is `zig build examples`, which compiles each example to a core wasm,
-/// wraps it into a component with the `wabt` CLI, and validates it.
+/// wasip2 guest bindings
 ///
 /// Prerequisites: Zig 0.16, and the `wabt` CLI (cataggar/wabt) on PATH.
 pub fn build(b: *std.Build) void {
