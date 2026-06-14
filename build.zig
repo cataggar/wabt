@@ -102,6 +102,80 @@ pub const ZigWasmImport = struct {
     root_dep: bool = true,
 };
 
+/// The guest-binding module dependency graph. Each module's root source is
+/// `src/<name>.zig`; `deps` lists the other modules it `@import`s. Mirrors
+/// the `addModule` / `addImport` wiring in `build()` above, in one place,
+/// so `resolveImports` can expand a set of roots into the full closure.
+pub const ModuleSpec = struct {
+    name: []const u8,
+    deps: []const []const u8 = &.{},
+};
+
+pub const modules = [_]ModuleSpec{
+    .{ .name = "abi" },
+    .{ .name = "wasi_io", .deps = &.{"abi"} },
+    .{ .name = "wasi_cli", .deps = &.{"wasi_io"} },
+    .{ .name = "wasi_clocks", .deps = &.{"abi"} },
+    .{ .name = "wasi_random", .deps = &.{"abi"} },
+    .{ .name = "wasi_filesystem", .deps = &.{"abi"} },
+    .{ .name = "wasi_sockets", .deps = &.{ "abi", "wasi_io" } },
+    .{ .name = "wasi_config", .deps = &.{"abi"} },
+    .{ .name = "wasi_nn", .deps = &.{"abi"} },
+    .{ .name = "wasi_tls", .deps = &.{"wasi_io"} },
+    .{ .name = "wasi_http", .deps = &.{"abi"} },
+    .{ .name = "wasi_keyvalue", .deps = &.{"abi"} },
+};
+
+fn findSpec(name: []const u8) ModuleSpec {
+    for (modules) |m| {
+        if (std.mem.eql(u8, m.name, name)) return m;
+    }
+    std.debug.panic("unknown wasip2 module: {s}", .{name});
+}
+
+/// Expand a set of root module names — the ones a guest's `main.zig`
+/// `@import`s directly — into the full `ZigWasmImport` closure for
+/// `compileZigWasm`. Pulls in transitive deps (e.g. `wasi_cli` → `wasi_io`
+/// → `abi`), resolves each source against the `wasip2` dependency via
+/// `dep.path("src/<name>.zig")`, and marks transitive-only modules
+/// `root_dep = false`. Lets a consumer name just its leaf imports instead
+/// of restating the whole graph.
+pub fn resolveImports(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    roots: []const []const u8,
+) []const ZigWasmImport {
+    var names: std.ArrayList([]const u8) = .empty;
+    var queue: std.ArrayList([]const u8) = .empty;
+    for (roots) |r| queue.append(b.allocator, r) catch @panic("OOM");
+    while (queue.pop()) |name| {
+        for (names.items) |n| {
+            if (std.mem.eql(u8, n, name)) break;
+        } else {
+            names.append(b.allocator, name) catch @panic("OOM");
+            for (findSpec(name).deps) |d| queue.append(b.allocator, d) catch @panic("OOM");
+        }
+    }
+
+    var out: std.ArrayList(ZigWasmImport) = .empty;
+    for (names.items) |name| {
+        var is_root = false;
+        for (roots) |r| {
+            if (std.mem.eql(u8, r, name)) {
+                is_root = true;
+                break;
+            }
+        }
+        out.append(b.allocator, .{
+            .name = name,
+            .path = dep.path(b.fmt("src/{s}.zig", .{name})),
+            .deps = findSpec(name).deps,
+            .root_dep = is_root,
+        }) catch @panic("OOM");
+    }
+    return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
 pub const ZigWasmCompile = struct {
     source: std.Build.LazyPath,
     /// Names passed via `--export=<name>`.
