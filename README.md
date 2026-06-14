@@ -39,7 +39,8 @@ receive results wider than one core value, so a guest may combine several
 | `wasi_keyvalue` | `wasi:keyvalue@0.2.0-draft` | seed |
 | `wasi_filesystem` | `wasi:filesystem@0.2.6` | preopens (get-directories) |
 | `wasi_sockets` | `wasi:sockets@0.2.6` | ip-name-lookup (resolve) |
-| `wasi_config` / `wasi_nn` / `wasi_tls` | proposals | planned |
+| `wasi_config` | `wasi:config@0.2.0-rc.1` | store (get / get-all) |
+| `wasi_nn` / `wasi_tls` | proposals | planned |
 
 Bindings are demand-driven: functions are added as examples need them.
 

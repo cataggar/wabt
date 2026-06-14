@@ -40,6 +40,9 @@ pub fn build(b: *std.Build) void {
     wasi_sockets.addImport("abi", abi);
     wasi_sockets.addImport("wasi_io", wasi_io);
 
+    const wasi_config = b.addModule("wasi_config", .{ .root_source_file = b.path("src/wasi_config.zig") });
+    wasi_config.addImport("abi", abi);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
 
@@ -137,6 +140,28 @@ pub fn build(b: *std.Build) void {
         .output = "resolve.wasm",
     });
     installAndValidate(b, examples_step, resolve, "resolve.wasm");
+
+    // config: reads runtime configuration via the off-by-default
+    // wasi:config proposal. Builds + validates; running needs a host
+    // that implements wasi:config.
+    const config_core = compileZigWasm(b, .{
+        .source = "examples/config/src/main.zig",
+        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
+        .output = "config.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_config", .path = "src/wasi_config.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+        },
+    });
+    const config = makeComponent(b, .{
+        .core = config_core,
+        .wit_dir = "examples/config/wit",
+        .world = "config",
+        .output = "config.wasm",
+    });
+    installAndValidate(b, examples_step, config, "config.wasm");
 
     // Default `zig build` builds the examples.
     b.getInstallStep().dependOn(examples_step);
