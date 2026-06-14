@@ -135,12 +135,12 @@ fn findSpec(name: []const u8) ModuleSpec {
 
 /// Expand a set of root module names — the ones a guest's `main.zig`
 /// `@import`s directly — into the full `ZigWasmImport` closure for
-/// `compileZigWasm`. Pulls in transitive deps (e.g. `wasi_cli` → `wasi_io`
+/// `zigBuildWasm`. Pulls in transitive deps (e.g. `wasi_cli` → `wasi_io`
 /// → `abi`), resolves each source against the `wasip2` dependency via
 /// `dep.path("src/<name>.zig")`, and marks transitive-only modules
 /// `root_dep = false`. Lets a consumer name just its leaf imports instead
 /// of restating the whole graph.
-pub fn resolveImports(
+pub fn resolveWasmImports(
     b: *std.Build,
     dep: *std.Build.Dependency,
     roots: []const []const u8,
