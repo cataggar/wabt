@@ -38,3 +38,11 @@ zig build run
 ```sh
 wasmtime run -S cli-exit-with-code zig-out/hello.wasm
 ```
+
+## Uninstall
+
+```
+ghr uninstall cataggar/zig
+ghr uninstall cataggar/wabt
+ghr uninstall bytecodealliance/wasmtime
+```
