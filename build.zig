@@ -264,8 +264,8 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
 pub const WabtModuleValidate = struct {
     /// Step to attach the validate (and optional install) to.
     parent: *std.Build.Step,
-    /// Component to validate. When null, this is a no-op.
-    wasm: ?std.Build.LazyPath = null,
+    /// Component to validate.
+    wasm: std.Build.LazyPath,
     /// Install basename under `zig-out/`. When null, the component is
     /// validated but not installed.
     install_basename: ?[]const u8 = null,
@@ -274,7 +274,7 @@ pub const WabtModuleValidate = struct {
 /// `wabt module validate` the component, then (when `install_basename` is
 /// given) install it under `zig-out/<basename>`.
 pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
-    const component = opts.component orelse return;
+    const component = opts.wasm;
 
     const validate = b.addSystemCommand(&.{ "wabt", "module", "validate" });
     validate.addFileArg(component);
