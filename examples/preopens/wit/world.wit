@@ -1,0 +1,14 @@
+package example:preopens;
+
+world preopens {
+    // output-stream + blocking-write-and-flush: the actual stdout write.
+    import wasi:io/streams@0.2.6;
+    // get-stdout: yields the output-stream output is written to.
+    import wasi:cli/stdout@0.2.6;
+    // exit-with-code: reports the u8 process exit code to the host.
+    import wasi:cli/exit@0.2.6;
+    // get-directories: lists the host's preopened directories.
+    import wasi:filesystem/preopens@0.2.6;
+    // run: the command entry point.
+    export wasi:cli/run@0.2.6;
+}
