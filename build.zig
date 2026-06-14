@@ -254,19 +254,30 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
     return cmd.addOutputFileArg(opts.output);
 }
 
-/// `wabt module validate` the component, then install it under
-/// `zig-out/<basename>`.
-pub fn wabtModuleValidate(
-    b: *std.Build,
+pub const WabtModuleValidate = struct {
+    /// Step to attach the validate (and optional install) to.
     parent: *std.Build.Step,
-    component: std.Build.LazyPath,
-    install_basename: []const u8,
-) void {
+    /// Component to validate. When null, this is a no-op.
+    component: ?std.Build.LazyPath = null,
+    /// Install basename under `zig-out/`. When null, the component is
+    /// validated but not installed.
+    install_basename: ?[]const u8 = null,
+};
+
+/// `wabt module validate` the component, then (when `install_basename` is
+/// given) install it under `zig-out/<basename>`.
+pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
+    const component = opts.component orelse return;
+
     const validate = b.addSystemCommand(&.{ "wabt", "module", "validate" });
     validate.addFileArg(component);
-    validate.setName(b.fmt("wabt module validate {s}", .{install_basename}));
+    validate.setName(b.fmt("wabt module validate {s}", .{opts.install_basename orelse "component"}));
 
-    const install = b.addInstallFileWithDir(component, .prefix, install_basename);
-    install.step.dependOn(&validate.step);
-    parent.dependOn(&install.step);
+    if (opts.install_basename) |install_basename| {
+        const install = b.addInstallFileWithDir(component, .prefix, install_basename);
+        install.step.dependOn(&validate.step);
+        opts.parent.dependOn(&install.step);
+    } else {
+        opts.parent.dependOn(&validate.step);
+    }
 }
