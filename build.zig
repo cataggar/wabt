@@ -43,11 +43,32 @@ pub fn build(b: *std.Build) void {
     const wasi_config = b.addModule("wasi_config", .{ .root_source_file = b.path("src/wasi_config.zig") });
     wasi_config.addImport("abi", abi);
 
+    const wasi_nn = b.addModule("wasi_nn", .{ .root_source_file = b.path("src/wasi_nn.zig") });
+    wasi_nn.addImport("abi", abi);
+
+    const wasi_tls = b.addModule("wasi_tls", .{ .root_source_file = b.path("src/wasi_tls.zig") });
+    wasi_tls.addImport("wasi_io", wasi_io);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
 
     const wasi_keyvalue = b.addModule("wasi_keyvalue", .{ .root_source_file = b.path("src/wasi_keyvalue.zig") });
     wasi_keyvalue.addImport("abi", abi);
+
+    // Single-import library surface re-exporting every module.
+    const wasip2 = b.addModule("wasip2", .{ .root_source_file = b.path("src/root.zig") });
+    wasip2.addImport("abi", abi);
+    wasip2.addImport("wasi_io", wasi_io);
+    wasip2.addImport("wasi_cli", wasi_cli);
+    wasip2.addImport("wasi_clocks", wasi_clocks);
+    wasip2.addImport("wasi_random", wasi_random);
+    wasip2.addImport("wasi_filesystem", wasi_filesystem);
+    wasip2.addImport("wasi_sockets", wasi_sockets);
+    wasip2.addImport("wasi_config", wasi_config);
+    wasip2.addImport("wasi_http", wasi_http);
+    wasip2.addImport("wasi_keyvalue", wasi_keyvalue);
+    wasip2.addImport("wasi_nn", wasi_nn);
+    wasip2.addImport("wasi_tls", wasi_tls);
 
     // ── Examples ───────────────────────────────────────────────────
     const examples_step = b.step(
@@ -162,6 +183,46 @@ pub fn build(b: *std.Build) void {
         .output = "config.wasm",
     });
     installAndValidate(b, examples_step, config, "config.wasm");
+
+    // nn: constructs + inspects a tensor via the experimental wasi:nn
+    // proposal. Builds + validates; running needs a wasi:nn backend.
+    const nn_core = compileZigWasm(b, .{
+        .source = "examples/nn/src/main.zig",
+        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
+        .output = "nn.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_nn", .path = "src/wasi_nn.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+        },
+    });
+    const nn = makeComponent(b, .{
+        .core = nn_core,
+        .wit_dir = "examples/nn/wit",
+        .world = "nn",
+        .output = "nn.wasm",
+    });
+    installAndValidate(b, examples_step, nn, "nn.wasm");
+
+    // smoke: build-only type-check for the modules with no runnable
+    // component example (wasi_http, wasi_keyvalue, wasi_tls). Compiled to
+    // a core wasm but not wrapped or run.
+    const smoke_core = compileZigWasm(b, .{
+        .source = "examples/smoke/src/main.zig",
+        .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
+        .output = "smoke.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_http", .path = "src/wasi_http.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_keyvalue", .path = "src/wasi_keyvalue.zig", .deps = &.{"abi"} },
+            .{ .name = "wasi_tls", .path = "src/wasi_tls.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"} },
+            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+        },
+    });
+    // Realize the build-exe (type-check) as part of `zig build examples`.
+    const smoke_install = b.addInstallFileWithDir(smoke_core, .{ .custom = "examples" }, "smoke.core.wasm");
+    examples_step.dependOn(&smoke_install.step);
 
     // Default `zig build` builds the examples.
     b.getInstallStep().dependOn(examples_step);
