@@ -239,8 +239,9 @@ pub const WabtComponentNew = struct {
     /// World to embed (`--world`). When null, `--world` is omitted and
     /// `wabt` infers the single world in the WIT package.
     world: ?[]const u8 = null,
-    /// Output basename for the produced component LazyPath. Defaults to
-    /// `component.wasm`.
+    /// Output basename for the produced component LazyPath. When null,
+    /// derived from `wasm_core`'s basename: a `.core.wasm` suffix becomes
+    /// `.wasm` (so `hello.core.wasm` → `hello.wasm`).
     output: ?[]const u8 = null,
 };
 
@@ -258,7 +259,7 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
     cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
     cmd.addFileArg(opts.wasm_core);
     cmd.addArg("-o");
-    return cmd.addOutputFileArg(opts.output orelse "component.wasm");
+    return cmd.addOutputFileArg(opts.output orelse componentBasename(b, lazyBasename(opts.wasm_core)));
 }
 
 pub const WabtModuleValidate = struct {
@@ -266,14 +267,15 @@ pub const WabtModuleValidate = struct {
     parent: *std.Build.Step,
     /// Component to validate.
     wasm: std.Build.LazyPath,
-    /// Install basename under `zig-out/`. Defaults to `component.wasm`.
+    /// Install basename under `zig-out/`. When null, defaults to `wasm`'s
+    /// own basename (e.g. `hello.wasm`).
     install_basename: ?[]const u8 = null,
 };
 
 /// `wabt module validate` the component, then install it under
 /// `zig-out/<basename>`.
 pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
-    const install_basename = opts.install_basename orelse "component.wasm";
+    const install_basename = opts.install_basename orelse lazyBasename(opts.wasm);
 
     const validate = b.addSystemCommand(&.{ "wabt", "module", "validate" });
     validate.addFileArg(opts.wasm);
@@ -282,4 +284,31 @@ pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
     const install = b.addInstallFileWithDir(opts.wasm, .prefix, install_basename);
     install.step.dependOn(&validate.step);
     opts.parent.dependOn(&install.step);
+}
+
+/// The basename of a `LazyPath`. For a generated file produced by a `Run`
+/// output arg (which is how `zigBuildWasm` / `wabtComponentNew` make their
+/// outputs), the basename is recovered from the owning `Run.Output`.
+fn lazyBasename(lp: std.Build.LazyPath) []const u8 {
+    return switch (lp) {
+        .src_path => |sp| std.fs.path.basename(sp.sub_path),
+        .cwd_relative => |p| std.fs.path.basename(p),
+        .dependency => |d| std.fs.path.basename(d.sub_path),
+        .generated => |gen| if (gen.sub_path.len > 0)
+            std.fs.path.basename(gen.sub_path)
+        else basename: {
+            const output: *const std.Build.Step.Run.Output = @fieldParentPtr("generated_file", gen.file);
+            break :basename output.basename;
+        },
+    };
+}
+
+/// Component basename derived from a core-wasm basename: a `.core.wasm`
+/// suffix becomes `.wasm` (`hello.core.wasm` → `hello.wasm`); otherwise the
+/// extension is replaced with `.wasm`.
+fn componentBasename(b: *std.Build, core: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, core, ".core.wasm"))
+        return b.fmt("{s}.wasm", .{core[0 .. core.len - ".core.wasm".len]});
+    const stem = core[0 .. core.len - std.fs.path.extension(core).len];
+    return b.fmt("{s}.wasm", .{stem});
 }
