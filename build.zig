@@ -178,12 +178,18 @@ pub fn resolveWasmImports(
 
 pub const ZigBuildWasm = struct {
     source: std.Build.LazyPath,
-    /// Names passed via `--export=<name>`.
+    /// Names passed via `--export=<name>`. The universal `cabi_realloc`
+    /// export is added automatically (see `cabi_realloc`), so list only
+    /// the component-specific exports here.
     exports: []const []const u8,
     output: []const u8,
     /// Extra modules importable from the root via `@import("<name>")`.
     imports: []const ZigWasmImport = &.{},
     target_triple: []const u8 = "wasm32-freestanding",
+    /// Auto-add `--export=cabi_realloc`, the canonical-ABI allocator every
+    /// wasip2 component needs (exported by `abi.zig`). Set false for a core
+    /// module that doesn't link `abi`.
+    cabi_realloc: bool = true,
     /// `-fno-llvm` (self-hosted wasm codegen). Off: LLVM/LLD is required
     /// because Zig 0.16's self-hosted wasm linker mis-sets
     /// `__stack_pointer` (cataggar/wamr#843).
@@ -205,6 +211,11 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
     if (opts.no_llvm) cmd.addArg("-fno-llvm");
     if (opts.no_lld) cmd.addArg("-fno-lld");
     for (opts.exports) |sym| cmd.addArg(b.fmt("--export={s}", .{sym}));
+    if (opts.cabi_realloc) {
+        for (opts.exports) |sym| {
+            if (std.mem.eql(u8, sym, "cabi_realloc")) break;
+        } else cmd.addArg("--export=cabi_realloc");
+    }
 
     if (opts.imports.len == 0) {
         cmd.addFileArg(opts.source);
