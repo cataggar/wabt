@@ -266,18 +266,20 @@ pub const WabtModuleValidate = struct {
     parent: *std.Build.Step,
     /// Component to validate.
     wasm: std.Build.LazyPath,
-    /// Install basename under `zig-out/`.
-    install_basename: []const u8,
+    /// Install basename under `zig-out/`. Defaults to `component.wasm`.
+    install_basename: ?[]const u8 = null,
 };
 
 /// `wabt module validate` the component, then install it under
 /// `zig-out/<basename>`.
 pub fn wabtModuleValidate(b: *std.Build, opts: WabtModuleValidate) void {
+    const install_basename = opts.install_basename orelse "component.wasm";
+
     const validate = b.addSystemCommand(&.{ "wabt", "module", "validate" });
     validate.addFileArg(opts.wasm);
-    validate.setName(b.fmt("wabt module validate {s}", .{opts.install_basename}));
+    validate.setName(b.fmt("wabt module validate {s}", .{install_basename}));
 
-    const install = b.addInstallFileWithDir(opts.wasm, .prefix, opts.install_basename);
+    const install = b.addInstallFileWithDir(opts.wasm, .prefix, install_basename);
     install.step.dependOn(&validate.step);
     opts.parent.dependOn(&install.step);
 }
