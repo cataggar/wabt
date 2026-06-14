@@ -4031,13 +4031,13 @@ test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
     try tmp.dir.createDirPath(io, "wit/deps");
 
     const pkgs = [_]struct { src_dir: []const u8, dst_rel: []const u8 }{
-        .{ .src_dir = "src/component/wit/wasi-canon/http", .dst_rel = "wit" },
-        .{ .src_dir = "src/component/wit/wasi-canon/cli", .dst_rel = "wit/deps/cli" },
-        .{ .src_dir = "src/component/wit/wasi-canon/clocks", .dst_rel = "wit/deps/clocks" },
-        .{ .src_dir = "src/component/wit/wasi-canon/filesystem", .dst_rel = "wit/deps/filesystem" },
-        .{ .src_dir = "src/component/wit/wasi-canon/io", .dst_rel = "wit/deps/io" },
-        .{ .src_dir = "src/component/wit/wasi-canon/random", .dst_rel = "wit/deps/random" },
-        .{ .src_dir = "src/component/wit/wasi-canon/sockets", .dst_rel = "wit/deps/sockets" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/http", .dst_rel = "wit" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/cli", .dst_rel = "wit/deps/cli" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/clocks", .dst_rel = "wit/deps/clocks" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/filesystem", .dst_rel = "wit/deps/filesystem" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/io", .dst_rel = "wit/deps/io" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/random", .dst_rel = "wit/deps/random" },
+        .{ .src_dir = "src/component/wit/wasi-canon/0.2.6/sockets", .dst_rel = "wit/deps/sockets" },
     };
     for (pkgs) |pkg| {
         try tmp.dir.createDirPath(io, pkg.dst_rel);

@@ -51,6 +51,16 @@ pub const Type = union(enum) {
         err: ?*const Type,
     },
     tuple: []const Type,
+    /// `future<T>` — async single-value channel. Payload is `null` for
+    /// a bare `future`. WASI 0.3 (P3) only; not yet lowerable to a
+    /// component (the encoder rejects it).
+    future: ?*const Type,
+    /// `stream<T>` — async multi-value channel. Payload is `null` for a
+    /// bare `stream`. WASI 0.3 (P3) only; see `future`.
+    stream: ?*const Type,
+    /// `error-context` — opaque async error value. WASI 0.3 (P3) only;
+    /// see `future`.
+    error_context,
     /// `borrow<R>` handle type — R is a resource declared elsewhere
     /// in scope. Resolved by the encoder when emitting the body.
     borrow: []const u8,
@@ -76,6 +86,9 @@ pub const Func = struct {
     /// results (legacy form, still accepted by the spec but no
     /// longer emitted).
     result: ?Type,
+    /// `async func(...)` — WASI 0.3 (P3) asynchronous function. Parsed
+    /// and represented, but not yet lowerable to a component.
+    is_async: bool = false,
 };
 
 pub const Field = struct {
