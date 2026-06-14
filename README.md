@@ -31,11 +31,8 @@ cd hello
 zig build run
 ```
 
-## Run
+## Run Directly
 
 ```sh
-zig build run
-
-# wasmtime
 wasmtime run -S cli-exit-with-code zig-out/hello.wasm
 ```
