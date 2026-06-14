@@ -236,10 +236,12 @@ pub const WabtComponentNew = struct {
     /// WIT package directory to embed (`--wit`). Defaults to `wit/`
     /// relative to the build root.
     wit_dir: ?std.Build.LazyPath = null,
-    /// World to embed (`--world`).
-    world: []const u8,
-    /// Output basename for the produced component LazyPath.
-    output: []const u8,
+    /// World to embed (`--world`). When null, `--world` is omitted and
+    /// `wabt` infers the single world in the WIT package.
+    world: ?[]const u8 = null,
+    /// Output basename for the produced component LazyPath. Defaults to
+    /// `component.wasm`.
+    output: ?[]const u8 = null,
 };
 
 /// One-step `wabt component new --world <world> --wit <dir>`: embeds the
@@ -247,11 +249,16 @@ pub const WabtComponentNew = struct {
 /// The bundled WASI WIT + wasi-preview1 adapter are auto-attached, so no
 /// on-disk `wit/deps/` copy is needed.
 pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new", "--world", opts.world, "--wit" });
+    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new" });
+    if (opts.world) |world| {
+        cmd.addArg("--world");
+        cmd.addArg(world);
+    }
+    cmd.addArg("--wit");
     cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
     cmd.addFileArg(opts.core);
     cmd.addArg("-o");
-    return cmd.addOutputFileArg(opts.output);
+    return cmd.addOutputFileArg(opts.output orelse "component.wasm");
 }
 
 pub const WabtModuleValidate = struct {
