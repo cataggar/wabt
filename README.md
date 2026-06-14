@@ -2,7 +2,7 @@
 
 Hand-written Zig **guest** bindings for the WASI Preview 2 (and bundled
 proposal) packages that [`cataggar/wabt`](https://github.com/cataggar/wabt)
-embeds, plus runnable Component-Model examples.
+embeds.
 
 Each `wasi:*` interface is exposed as a thin, typed Zig wrapper over
 canonical-ABI `extern` host imports — no `wit-bindgen`. A guest links these
@@ -21,14 +21,7 @@ src/
   wasi_sockets.zig   wasi:sockets@0.2.6    wasi_config.zig   wasi:config@0.2.0-rc.1
   wasi_http.zig      wasi:http@0.2.6       wasi_keyvalue.zig wasi:keyvalue@0.2.0-draft
   wasi_nn.zig        wasi:nn@…             wasi_tls.zig      wasi:tls@0.2.0-draft
-examples/
-  sysinfo/  preopens/  resolve/            (runnable on wasmtime)
-  config/   nn/                            (build + validate; need a proposal host)
-  smoke/                                   (build-only type-check of http/keyvalue/tls)
 ```
-
-> The standalone `hello` command lives on the `example/hello` orphan
-> branch, which consumes this library as a package dependency.
 
 `abi.zig` owns the single `cabi_realloc` export and the ret-area used to
 receive results wider than one core value, so a guest may combine several
@@ -50,26 +43,23 @@ receive results wider than one core value, so a guest may combine several
 | `wasi_nn` | `wasi:nn@0.2.0-rc-2024-10-28` | tensor |
 | `wasi_tls` | `wasi:tls@0.2.0-draft` | types (handshake handles) |
 
-Bindings are demand-driven: functions are added as examples need them. Every
-P2 package that wabt bundles now has a guest binding module.
+Every P2 package that wabt bundles now has a guest binding module.
 
 ## Prerequisites
 
 - Zig `0.16.0`.
 - The `wabt` CLI (cataggar/wabt) on `PATH` — provides `component new` and
   `module validate`.
-- Optional: `wamr` and/or `wasmtime` to run the produced components.
 
-## Build
+## Test
 
 ```sh
-zig build examples
+zig build test
 ```
 
-Builds every example core (`zig build-exe -target wasm32-freestanding`),
-wraps it with `wabt component new`, validates it, and installs the result
-under `zig-out/examples/`.
+Runs native unit tests for the host-import-free canonical-ABI core in
+`abi.zig` (the `cabi_realloc` bump arena, alignment, and ret-area decoders).
 
-The `wasi_*` modules are wasm-only (their `extern` host imports link solely
-for `wasm32-freestanding`), so there is no native library artifact and no
-native `zig build test`; `zig build examples` is the validation gate.
+The `wasi_*` wrappers are wasm-only: their public functions call `extern`
+host imports that resolve solely under `wasm32-freestanding`, so they have
+no native artifact and can't be unit-tested natively.

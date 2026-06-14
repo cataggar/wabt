@@ -117,3 +117,62 @@ pub inline fn readOptionBytes() ?[]const u8 {
     const p: [*]const u8 = @ptrFromInt(w[1]);
     return p[0..w[2]];
 }
+
+// ── Tests ──────────────────────────────────────────────────────────
+//
+// These exercise the pure, host-import-free core: the alignment helper,
+// the `cabi_realloc` bump arena, and the ret-area decoders. They link
+// and run natively (`zig build test`); the `wasi_*` wrappers can't be
+// tested this way because every public function calls an `extern` host
+// import that only resolves under `wasm32-freestanding`.
+
+const testing = std.testing;
+
+test alignUp {
+    try testing.expectEqual(@as(usize, 0), alignUp(0, 8));
+    try testing.expectEqual(@as(usize, 8), alignUp(1, 8));
+    try testing.expectEqual(@as(usize, 8), alignUp(8, 8));
+    try testing.expectEqual(@as(usize, 16), alignUp(9, 8));
+    try testing.expectEqual(@as(usize, 16), alignUp(16, 16));
+    try testing.expectEqual(@as(usize, 5), alignUp(5, 1));
+}
+
+test "cabi_realloc bumps, aligns, and grows monotonically" {
+    resetScratch();
+
+    const a = cabi_realloc(0, 0, 16, 32);
+    try testing.expect(a != 0);
+    try testing.expectEqual(@as(usize, 0), a % 16);
+
+    // Next allocation is past the first and respects its alignment.
+    const b = cabi_realloc(0, 0, 8, 8);
+    try testing.expect(b >= a + 32);
+    try testing.expectEqual(@as(usize, 0), b % 8);
+}
+
+test "cabi_realloc: zero size returns 0, oversize fails, reset reclaims" {
+    resetScratch();
+
+    try testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, 0));
+
+    // A request larger than the whole arena cannot be satisfied.
+    try testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, arena_buf.len + 1));
+
+    // Fill the arena, then confirm reset makes room again.
+    const full = cabi_realloc(0, 0, 1, arena_buf.len);
+    try testing.expect(full != 0);
+    try testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, 1));
+    resetScratch();
+    try testing.expect(cabi_realloc(0, 0, 1, 1) != 0);
+}
+
+test "readResultHandle decodes the ok and err arms" {
+    const w = retWords();
+
+    w[0] = 0; // ok
+    w[1] = @bitCast(@as(i32, 42));
+    try testing.expectEqual(@as(?i32, 42), readResultHandle());
+
+    w[0] = 1; // err
+    try testing.expectEqual(@as(?i32, null), readResultHandle());
+}

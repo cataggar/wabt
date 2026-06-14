@@ -62,143 +62,20 @@ pub fn build(b: *std.Build) void {
     wasip2.addImport("wasi_nn", wasi_nn);
     wasip2.addImport("wasi_tls", wasi_tls);
 
-    // ── Examples ───────────────────────────────────────────────────
-    const examples_step = b.step(
-        "examples",
-        "Build the WebAssembly Component examples in examples/",
-    );
-
-    // (The standalone `hello` example moved to the `example/hello` orphan
-    // branch, which depends on this library as a package.)
-
-    // sysinfo: prints a monotonic clock reading + a random u64, exercising
-    // the wasi_clocks and wasi_random bindings.
-    const sysinfo_core = compileZigWasm(b, .{
-        .source = b.path("examples/sysinfo/src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "sysinfo.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_clocks", .path = b.path("src/wasi_clocks.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_random", .path = b.path("src/wasi_random.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
+    // ── Tests ──────────────────────────────────────────────────────
+    // Native unit tests for the host-import-free canonical-ABI core in
+    // `abi.zig` (bump arena + ret-area decoders). The `wasi_*` wrappers
+    // can't be tested natively — their public functions call `extern`
+    // host imports that only link for `wasm32-freestanding`.
+    const abi_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/abi.zig"),
+            .target = b.graph.host,
+        }),
     });
-    const sysinfo = makeComponent(b, .{
-        .core = sysinfo_core,
-        .wit_dir = b.path("examples/sysinfo/wit"),
-        .world = "sysinfo",
-        .output = "sysinfo.wasm",
-    });
-    installAndValidate(b, examples_step, sysinfo, "sysinfo.wasm");
-
-    // preopens: lists the host's preopened directories, exercising the
-    // wasi_filesystem preopens binding.
-    const preopens_core = compileZigWasm(b, .{
-        .source = b.path("examples/preopens/src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "preopens.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_filesystem", .path = b.path("src/wasi_filesystem.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
-    });
-    const preopens = makeComponent(b, .{
-        .core = preopens_core,
-        .wit_dir = b.path("examples/preopens/wit"),
-        .world = "preopens",
-        .output = "preopens.wasm",
-    });
-    installAndValidate(b, examples_step, preopens, "preopens.wasm");
-
-    // resolve: resolves localhost to IP addresses via the async
-    // wasi_sockets ip-name-lookup path (+ wasi_io poll).
-    const resolve_core = compileZigWasm(b, .{
-        .source = b.path("examples/resolve/src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "resolve.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_sockets", .path = b.path("src/wasi_sockets.zig"), .deps = &.{ "abi", "wasi_io" } },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
-    });
-    const resolve = makeComponent(b, .{
-        .core = resolve_core,
-        .wit_dir = b.path("examples/resolve/wit"),
-        .world = "resolve",
-        .output = "resolve.wasm",
-    });
-    installAndValidate(b, examples_step, resolve, "resolve.wasm");
-
-    // config: reads runtime configuration via the off-by-default
-    // wasi:config proposal. Builds + validates; running needs a host
-    // that implements wasi:config.
-    const config_core = compileZigWasm(b, .{
-        .source = b.path("examples/config/src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "config.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_config", .path = b.path("src/wasi_config.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
-    });
-    const config = makeComponent(b, .{
-        .core = config_core,
-        .wit_dir = b.path("examples/config/wit"),
-        .world = "config",
-        .output = "config.wasm",
-    });
-    installAndValidate(b, examples_step, config, "config.wasm");
-
-    // nn: constructs + inspects a tensor via the experimental wasi:nn
-    // proposal. Builds + validates; running needs a wasi:nn backend.
-    const nn_core = compileZigWasm(b, .{
-        .source = b.path("examples/nn/src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
-        .output = "nn.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = b.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_nn", .path = b.path("src/wasi_nn.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
-    });
-    const nn = makeComponent(b, .{
-        .core = nn_core,
-        .wit_dir = b.path("examples/nn/wit"),
-        .world = "nn",
-        .output = "nn.wasm",
-    });
-    installAndValidate(b, examples_step, nn, "nn.wasm");
-
-    // smoke: build-only type-check for the modules with no runnable
-    // component example (wasi_http, wasi_keyvalue, wasi_tls). Compiled to
-    // a core wasm but not wrapped or run.
-    const smoke_core = compileZigWasm(b, .{
-        .source = b.path("examples/smoke/src/main.zig"),
-        .exports = &.{ "wasi:http/incoming-handler@0.2.6#handle", "cabi_realloc" },
-        .output = "smoke.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_http", .path = b.path("src/wasi_http.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_keyvalue", .path = b.path("src/wasi_keyvalue.zig"), .deps = &.{"abi"} },
-            .{ .name = "wasi_tls", .path = b.path("src/wasi_tls.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_io", .path = b.path("src/wasi_io.zig"), .deps = &.{"abi"} },
-            .{ .name = "abi", .path = b.path("src/abi.zig"), .root_dep = false },
-        },
-    });
-    // Realize the build-exe (type-check) as part of `zig build examples`.
-    const smoke_install = b.addInstallFileWithDir(smoke_core, .{ .custom = "examples" }, "smoke.core.wasm");
-    examples_step.dependOn(&smoke_install.step);
-
-    // Default `zig build` builds the examples.
-    b.getInstallStep().dependOn(examples_step);
+    const run_abi_tests = b.addRunArtifact(abi_tests);
+    const test_step = b.step("test", "Run native unit tests");
+    test_step.dependOn(&run_abi_tests.step);
 }
 
 // ── Build helpers (ported from cataggar/wamr) ──────────────────────
