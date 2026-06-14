@@ -36,6 +36,10 @@ pub fn build(b: *std.Build) void {
     const wasi_filesystem = b.addModule("wasi_filesystem", .{ .root_source_file = b.path("src/wasi_filesystem.zig") });
     wasi_filesystem.addImport("abi", abi);
 
+    const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
+    wasi_sockets.addImport("abi", abi);
+    wasi_sockets.addImport("wasi_io", wasi_io);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
 
@@ -112,6 +116,27 @@ pub fn build(b: *std.Build) void {
         .output = "preopens.wasm",
     });
     installAndValidate(b, examples_step, preopens, "preopens.wasm");
+
+    // resolve: resolves localhost to IP addresses via the async
+    // wasi_sockets ip-name-lookup path (+ wasi_io poll).
+    const resolve_core = compileZigWasm(b, .{
+        .source = "examples/resolve/src/main.zig",
+        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
+        .output = "resolve.core.wasm",
+        .imports = &.{
+            .{ .name = "wasi_cli", .path = "src/wasi_cli.zig", .deps = &.{"wasi_io"} },
+            .{ .name = "wasi_sockets", .path = "src/wasi_sockets.zig", .deps = &.{ "abi", "wasi_io" } },
+            .{ .name = "wasi_io", .path = "src/wasi_io.zig", .deps = &.{"abi"}, .root_dep = false },
+            .{ .name = "abi", .path = "src/abi.zig", .root_dep = false },
+        },
+    });
+    const resolve = makeComponent(b, .{
+        .core = resolve_core,
+        .wit_dir = "examples/resolve/wit",
+        .world = "resolve",
+        .output = "resolve.wasm",
+    });
+    installAndValidate(b, examples_step, resolve, "resolve.wasm");
 
     // Default `zig build` builds the examples.
     b.getInstallStep().dependOn(examples_step);
