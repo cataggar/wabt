@@ -5,6 +5,6 @@ comptime {
 }
 
 fn run() u8 {
-    cli.println("hello from zig component");
+    cli.println("Life is not a malfunction.");
     return 0;
 }

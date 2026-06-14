@@ -3,22 +3,18 @@ const wasip2_build = @import("wasip2");
 
 pub fn build(b: *std.Build) void {
     const wasip2 = b.dependency("wasip2", .{});
-
-    const core = wasip2_build.compileZigWasm(b, .{
+    const wasm_core = wasip2_build.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
-        .exports = &.{ "wasi:cli/run@0.2.6#run", "cabi_realloc" },
+        .exports = &.{"wasi:cli/run@0.2.6#run"},
         .output = "hello.core.wasm",
-        .imports = &.{
-            .{ .name = "wasi_cli", .path = wasip2.path("src/wasi_cli.zig"), .deps = &.{"wasi_io"} },
-            .{ .name = "wasi_io", .path = wasip2.path("src/wasi_io.zig"), .deps = &.{"abi"}, .root_dep = false },
-            .{ .name = "abi", .path = wasip2.path("src/abi.zig"), .root_dep = false },
-        },
+        .imports = wasip2_build.resolveWasmImports(b, wasip2, &.{"wasi_cli"}),
     });
-    const hello = wasip2_build.makeComponent(b, .{
-        .core = core,
-        .wit_dir = b.path("wit"),
-        .world = "hello",
-        .output = "hello.wasm",
+    const wasm = wasip2_build.wabtComponentNew(b, .{
+        .wasm_core = wasm_core,
     });
-    wasip2_build.installAndValidate(b, b.getInstallStep(), hello, "hello.wasm");
+    wasip2_build.wabtModuleValidate(b, .{
+        .parent = b.getInstallStep(),
+        .wasm = wasm,
+    });
+    _ = wasip2_build.wasmtimeRun(b, .{ .wasm = wasm });
 }

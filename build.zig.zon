@@ -1,12 +1,12 @@
 .{
-    .name = .example_hello,
+    .name = .hello,
     .version = "0.1.0",
-    .fingerprint = 0x282ee0278d879795,
+    .fingerprint = 0x3610a686ecb25f65,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .wasip2 = .{
             .url = "https://github.com/cataggar/wabt/archive/refs/heads/wasip2.tar.gz",
-            .hash = "wasip2-0.2.6-jlr7LRBwAQDFlXWB5otL5PVBgL44p6vO3HgxQQM-33vL",
+            .hash = "wasip2-0.2.6-jlr7LRIyAQAXk28IXgoXgVRrgYNmnHzBMlQrEDvmgGLQ",
         },
     },
     .paths = .{

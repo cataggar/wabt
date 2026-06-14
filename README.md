@@ -10,8 +10,14 @@ depends on lives on the orphan branch `wasip2` of the same repository.
 
 ## Prerequisites
 
-- Zig `0.16.0`.
-- The `wabt` CLI (cataggar/wabt) on `PATH`.
+- `zig`, `wabt`, and `wasmtime` on `PATH`.
+
+An easy way to install using [ghr](https://github.com/cataggar/ghr):
+```
+ghr install cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+ghr install cataggar/wabt@v3.0.0-dev.18 RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
+ghr install bytecodealliance/wasmtime@v45.0.1
+```
 
 ## Build
 
@@ -19,11 +25,11 @@ depends on lives on the orphan branch `wasip2` of the same repository.
 zig build
 ```
 
-Produces `zig-out/examples/hello.wasm`.
-
 ## Run
 
 ```sh
+zig build run
+
 # wasmtime
-wasmtime run -S cli-exit-with-code zig-out/examples/hello.wasm
+wasmtime run -S cli-exit-with-code zig-out/hello.wasm
 ```
