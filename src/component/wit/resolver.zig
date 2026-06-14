@@ -1090,6 +1090,62 @@ test "resolver #261: multi-version embedded set + proposals resolve (no on-disk 
     try std.testing.expectEqualStrings("0.2.12", hit.?.pkg.version.?);
 }
 
+test "resolver #261: WASI 0.3.0 (P3) packages resolve from embedded set" {
+    // Acceptance for #261 phase 2: the embedded 0.3.0 set — whose
+    // interfaces use `future<T>`/`stream<T>` — parses and resolves with
+    // no on-disk deps, and an unversioned ref to a package that exists in
+    // 0.3.0 prefers it (version_sets lists 0.3.0 first).
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const allocator = ar.allocator();
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "wit");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "wit/world.wit",
+        .data =
+        \\package example:app@0.1.0;
+        \\world app {
+        \\  import wasi:cli/run@0.3.0;
+        \\  import wasi:filesystem/types@0.3.0;
+        \\}
+        ,
+    });
+
+    const tmp_wit = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/wit", .{tmp.sub_path});
+    const res = try parseLayout(allocator, io, tmp_wit);
+
+    // `wasi:filesystem/types@0.3.0` exercises an interface whose
+    // functions use `stream<u8>` / `future<result<...>>`.
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "filesystem", .version = "0.3.0" },
+        .name = "types",
+    }) != null);
+    try std.testing.expect(res.findInterface(.{
+        .package = .{ .namespace = "wasi", .name = "cli", .version = "0.3.0" },
+        .name = "run",
+    }) != null);
+
+    // Unversioned `wasi:cli` prefers the newest embedded version (0.3.0).
+    const cli_hit = res.findInterfaceWithPkg(.{
+        .package = .{ .namespace = "wasi", .name = "cli", .version = null },
+        .name = "run",
+    });
+    try std.testing.expect(cli_hit != null);
+    try std.testing.expectEqualStrings("0.3.0", cli_hit.?.pkg.version.?);
+
+    // 0.3.0 has no `wasi:io`, so an unversioned `wasi:io` falls through
+    // to the newest version that provides it (0.2.12).
+    const io_hit = res.findInterfaceWithPkg(.{
+        .package = .{ .namespace = "wasi", .name = "io", .version = null },
+        .name = "streams",
+    });
+    try std.testing.expect(io_hit != null);
+    try std.testing.expectEqualStrings("0.2.12", io_hit.?.pkg.version.?);
+}
+
 test "resolver #256: on-disk wasi dep overrides embedded copy" {
     // An on-disk wit/deps/<pkg>/ takes precedence over the embedded
     // copy — existing vendored projects see no behavior change.

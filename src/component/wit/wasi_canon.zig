@@ -20,11 +20,6 @@
 //! (`wasi:io@0.2.6`) select the exact matching version regardless of
 //! order via the resolver's version-aware `packageMatches`.
 //!
-//! NOTE: WASI 0.3.0 (P3) is vendored under `wasi-canon/0.3.0/` but is
-//! NOT yet listed in `version_sets`: its `future<T>`/`stream<T>`/
-//! `error-context` types are not yet accepted by the parser. It is
-//! wired in once parser support lands.
-//!
 //! This module is the single source of truth for the embedded set: both
 //! the resolver (embedded-fallback docs) and the parser acceptance test
 //! consume `version_sets` from here.
@@ -105,7 +100,26 @@ fn coreP2(comptime version: []const u8) []const Package {
 
 /// Every embedded version set, in resolution-precedence order (newest
 /// first) so unversioned `wasi:*` references prefer the newest version.
+/// 0.3.0 (P3) is listed first; it has no `wasi:io` (streams/pollable
+/// roles moved into the canonical ABI), so an unversioned `wasi:io`
+/// falls through to 0.2.12.
 pub const version_sets = [_]VersionSet{
+    .{ .version = "0.3.0", .packages = &.{
+        pkg("0.3.0", "cli", &.{
+            "command.wit", "environment.wit", "exit.wit", "imports.wit",
+            "run.wit",     "stdio.wit",       "terminal.wit",
+        }),
+        pkg("0.3.0", "clocks", &.{
+            "monotonic-clock.wit", "system-clock.wit", "timezone.wit",
+            "types.wit",           "world.wit",
+        }),
+        pkg("0.3.0", "filesystem", &.{ "preopens.wit", "types.wit", "world.wit" }),
+        pkg("0.3.0", "http", &.{ "types.wit", "worlds.wit" }),
+        pkg("0.3.0", "random", &.{
+            "insecure-seed.wit", "insecure.wit", "random.wit", "world.wit",
+        }),
+        pkg("0.3.0", "sockets", &.{ "ip-name-lookup.wit", "types.wit", "world.wit" }),
+    } },
     .{ .version = "0.2.12", .packages = coreP2("0.2.12") },
     .{ .version = "0.2.6", .packages = coreP2("0.2.6") },
     .{ .version = "0.2.0-rc.1", .packages = &.{

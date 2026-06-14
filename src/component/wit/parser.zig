@@ -402,11 +402,12 @@ const Parser = struct {
                 return self.failTok(head, "feature not yet supported");
             },
             .id, .explicit_id => {
-                // `name: func(...) [-> result];`
+                // `name: [async] func(...) [-> result];`
                 const name = try self.identText(head);
                 _ = try self.expect(.colon);
+                const is_async = try self.eatIf(.kw_async);
                 _ = try self.expect(.kw_func);
-                const f = try self.parseFuncSignature();
+                const f = try self.parseFuncSignature(is_async);
                 _ = try self.expect(.semicolon);
                 return .{ .func = .{ .docs = docs, .name = name, .func = f } };
             },
@@ -529,7 +530,7 @@ const Parser = struct {
             const m_docs = self.takeDocs();
             switch (t.tag) {
                 .kw_constructor => {
-                    const f = try self.parseFuncSignature();
+                    const f = try self.parseFuncSignature(false);
                     _ = try self.expect(.semicolon);
                     try methods.append(self.allocator, .{
                         .docs = m_docs,
@@ -541,17 +542,19 @@ const Parser = struct {
                 .id, .explicit_id => {
                     const m_name = try self.identText(t);
                     _ = try self.expect(.colon);
-                    // Optional `static` modifier before `func`.
+                    // Optional `static` / `async` modifiers before `func`
+                    // (either order).
                     var kind: ast.ResourceMethodKind = .method;
+                    var is_async = false;
                     var head = try self.nextNonDoc();
-                    if (head.tag == .kw_static) {
-                        kind = .static;
+                    while (head.tag == .kw_static or head.tag == .kw_async) {
+                        if (head.tag == .kw_static) kind = .static else is_async = true;
                         head = try self.nextNonDoc();
                     }
                     if (head.tag != .kw_func) {
                         return self.failTok(head, "expected `func`");
                     }
-                    const f = try self.parseFuncSignature();
+                    const f = try self.parseFuncSignature(is_async);
                     _ = try self.expect(.semicolon);
                     try methods.append(self.allocator, .{
                         .docs = m_docs,
@@ -570,7 +573,7 @@ const Parser = struct {
         };
     }
 
-    fn parseFuncSignature(self: *Parser) ParseError!ast.Func {
+    fn parseFuncSignature(self: *Parser, is_async: bool) ParseError!ast.Func {
         _ = try self.expect(.lparen);
         var params = std.ArrayListUnmanaged(ast.Param).empty;
         if (!(try self.eatIf(.rparen))) {
@@ -599,6 +602,7 @@ const Parser = struct {
         return .{
             .params = try params.toOwnedSlice(self.allocator),
             .result = result,
+            .is_async = is_async,
         };
     }
 
@@ -681,7 +685,25 @@ const Parser = struct {
                 _ = try self.expect(.gt);
                 break :blk if (t.tag == .kw_own) ast.Type{ .own = name } else ast.Type{ .borrow = name };
             },
-            .kw_stream, .kw_future, .kw_error_context => return self.failTok(t, "feature not yet supported"),
+            .kw_future => blk: {
+                // `future` (no payload) or `future<T>`.
+                if (!(try self.eatIf(.lt))) break :blk ast.Type{ .future = null };
+                const inner = try self.parseType();
+                const heap = try self.allocator.create(ast.Type);
+                heap.* = inner;
+                _ = try self.expect(.gt);
+                break :blk ast.Type{ .future = heap };
+            },
+            .kw_stream => blk: {
+                // `stream` (no payload) or `stream<T>`.
+                if (!(try self.eatIf(.lt))) break :blk ast.Type{ .stream = null };
+                const inner = try self.parseType();
+                const heap = try self.allocator.create(ast.Type);
+                heap.* = inner;
+                _ = try self.expect(.gt);
+                break :blk ast.Type{ .stream = heap };
+            },
+            .kw_error_context => ast.Type{ .error_context = {} },
             .id, .explicit_id => .{ .name = try self.identText(t) },
             else => return self.failTok(t, "expected a type"),
         };
@@ -811,7 +833,13 @@ const Parser = struct {
                 const after_colon = try self.nextNonDoc();
                 switch (after_colon.tag) {
                     .kw_func => {
-                        const f = try self.parseFuncSignature();
+                        const f = try self.parseFuncSignature(false);
+                        _ = try self.expect(.semicolon);
+                        return .{ .named_func = .{ .docs = docs, .name = head_text, .func = f } };
+                    },
+                    .kw_async => {
+                        _ = try self.expect(.kw_func);
+                        const f = try self.parseFuncSignature(true);
                         _ = try self.expect(.semicolon);
                         return .{ .named_func = .{ .docs = docs, .name = head_text, .func = f } };
                     },
@@ -1228,6 +1256,60 @@ test "parse: resource with method, static, constructor" {
     try testing.expectEqualStrings("blocking-write-and-flush", methods[1].name);
     try testing.expectEqual(ast.ResourceMethodKind.static, methods[2].kind);
     try testing.expectEqualStrings("check-write", methods[2].name);
+}
+
+test "parse #261: async func, future, stream, error-context (P3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    run: async func() -> result;
+        \\    read: func() -> tuple<stream<u8>, future<result<_, u32>>>;
+        \\    bare: func() -> future;
+        \\    ec: func() -> error-context;
+        \\}
+    );
+    const items = doc.items[0].interface.items;
+
+    // `async func` sets is_async; a plain func does not.
+    try testing.expect(items[0].func.func.is_async);
+    try testing.expect(!items[1].func.func.is_async);
+
+    // tuple<stream<u8>, future<result<_, u32>>>
+    const read_res = items[1].func.func.result.?;
+    try testing.expect(read_res == .tuple);
+    try testing.expect(read_res.tuple[0] == .stream);
+    try testing.expect(read_res.tuple[0].stream.?.* == .u8);
+    try testing.expect(read_res.tuple[1] == .future);
+    try testing.expect(read_res.tuple[1].future.?.* == .result);
+
+    // Bare `future` (no payload).
+    const bare_res = items[2].func.func.result.?;
+    try testing.expect(bare_res == .future);
+    try testing.expect(bare_res.future == null);
+
+    // `error-context`.
+    try testing.expect(items[3].func.func.result.? == .error_context);
+}
+
+test "parse #261: async resource method (P3)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const doc = try parseInto(&arena,
+        \\interface i {
+        \\    resource r {
+        \\        m: async func() -> result;
+        \\        s: static async func(data: stream<u8>) -> future<result>;
+        \\        plain: func();
+        \\    }
+        \\}
+    );
+    const methods = doc.items[0].interface.items[0].type.kind.resource;
+    try testing.expectEqual(ast.ResourceMethodKind.method, methods[0].kind);
+    try testing.expect(methods[0].func.is_async);
+    try testing.expectEqual(ast.ResourceMethodKind.static, methods[1].kind);
+    try testing.expect(methods[1].func.is_async);
+    try testing.expect(!methods[2].func.is_async);
 }
 
 test "parse: borrow<R> and own<R> type syntax" {

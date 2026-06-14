@@ -541,6 +541,10 @@ fn typeAllDepsBound(t: ast.Type, bound: std.StringHashMapUnmanaged(void), self_n
             for (ts) |t2| if (!typeAllDepsBound(t2, bound, self_name)) break :blk false;
             break :blk true;
         },
+        // P3 async types: `future<T>`/`stream<T>` depend on their
+        // payload (if any); `error-context` has no type dependency.
+        .future, .stream => |inner| if (inner) |p| typeAllDepsBound(p.*, bound, self_name) else true,
+        .error_context => true,
         .name, .borrow, .own => |n| (self_name.len > 0 and std.mem.eql(u8, n, self_name)) or bound.contains(n),
     };
 }
@@ -1085,6 +1089,9 @@ const BodyBuilder = struct {
             },
             .borrow => |n| try self.handleValType(n, .borrow),
             .own => |n| try self.handleValType(n, .own),
+            // WASI 0.3 (P3) async types are parsed and resolvable but
+            // cannot yet be lowered into a component value type.
+            .future, .stream, .error_context => error.UnsupportedWitFeature,
         };
     }
 
