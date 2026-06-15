@@ -676,6 +676,19 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
             try writeResultList(w, t.results);
             try writeCanonOpts(w, t.opts);
         },
+        .waitable_set_new => try w.appendByte(0x1F),
+        .waitable_set_wait => |ws| {
+            try w.appendByte(0x20);
+            try w.appendByte(if (ws.cancellable) 0x01 else 0x00);
+            try w.writeU32Leb(ws.memory);
+        },
+        .waitable_set_poll => |ws| {
+            try w.appendByte(0x21);
+            try w.appendByte(if (ws.cancellable) 0x01 else 0x00);
+            try w.writeU32Leb(ws.memory);
+        },
+        .waitable_set_drop => try w.appendByte(0x22),
+        .waitable_join => try w.appendByte(0x23),
     }
 }
 
