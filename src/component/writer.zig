@@ -487,7 +487,11 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
             }
         },
         .func => |f| {
-            // `0x43` for an async function type, `0x40` for sync.
+            // `0x43` for an async function type, `0x40` for sync. The
+            // async-functype byte is what wasmtime 46 (wasmparser 0.251)
+            // reads to mark a `ComponentFuncType` async — required for the
+            // `async` canon lift/lower option to validate. (The older
+            // wasm-tools 1.239 CLI / wasmparser 0.227 predates 0x43.)
             try w.appendByte(if (f.is_async) 0x43 else 0x40);
             if (f.params.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(f.params.len));

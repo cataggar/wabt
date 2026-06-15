@@ -132,7 +132,9 @@ pub const FuncType = struct {
     params: []const NamedValType,
     results: ResultList,
     /// `(func async …)` — P3 asynchronous function type (binary `0x43`
-    /// vs the synchronous `0x40`).
+    /// vs the synchronous `0x40`). wasmtime 46 (wasmparser 0.251) reads
+    /// this byte to mark a func type async, which the `async` canon
+    /// lift/lower option requires.
     is_async: bool = false,
 
     pub const ResultList = union(enum) {

@@ -1192,6 +1192,83 @@ fn buildExportInterfaceComponent(
     return comp;
 }
 
+/// Synthetic core-import module prefixes that name a component-model
+/// async built-in family (cataggar/wabt#263). These are wired to `canon`
+/// core funcs in a dedicated pre-pass, distinct from real interface
+/// imports (and from the `[export]<iface>` resource-intrinsic modules).
+const async_intrinsic_prefixes = [_][]const u8{
+    "[task-return]",
+    "[stream]",
+    "[future]",
+    "[error-context]",
+    "[waitable-set]",
+    "[waitable]",
+};
+
+fn isAsyncIntrinsicModule(module: []const u8) bool {
+    for (async_intrinsic_prefixes) |p| {
+        if (std.mem.startsWith(u8, module, p)) return true;
+    }
+    return false;
+}
+
+/// True if an import interface's instance-type body exports a named type
+/// (e.g. a `use`d enum like `wasi:cli/types`'s `error-code`). Such
+/// type-only imports define types other imports' bodies reference via
+/// cross-iface aliases, so they must be imported (not skipped) for the
+/// rebase to resolve.
+fn instProvidesType(decls: []const ctypes.Decl) bool {
+    for (decls) |d| switch (d) {
+        .@"export" => |e| if (e.desc == .type) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// Map a WIT primitive type name to a component `ValType`. Returns null
+/// for non-primitive / unknown names.
+fn primValType(name: []const u8) ?ctypes.ValType {
+    const Pair = struct { n: []const u8, v: ctypes.ValType };
+    const prims = [_]Pair{
+        .{ .n = "bool", .v = .bool },   .{ .n = "s8", .v = .s8 },     .{ .n = "u8", .v = .u8 },
+        .{ .n = "s16", .v = .s16 },     .{ .n = "u16", .v = .u16 },   .{ .n = "s32", .v = .s32 },
+        .{ .n = "u32", .v = .u32 },     .{ .n = "s64", .v = .s64 },   .{ .n = "u64", .v = .u64 },
+        .{ .n = "f32", .v = .f32 },     .{ .n = "f64", .v = .f64 },   .{ .n = "char", .v = .char },
+        .{ .n = "string", .v = .string },
+    };
+    for (prims) |p| if (std.mem.eql(u8, p.n, name)) return p.v;
+    return null;
+}
+
+/// Parse the element type from a `stream<T>` / `future<T>` spec (the part
+/// of a `[stream]`/`[future]` import module after the family prefix).
+/// Only primitive element types are supported for now; returns null
+/// otherwise so the caller can reject the intrinsic with a clear error.
+fn parseAsyncElement(spec: []const u8) ?ctypes.ValType {
+    const lt = std.mem.indexOfScalar(u8, spec, '<') orelse return null;
+    const gt = std.mem.lastIndexOfScalar(u8, spec, '>') orelse return null;
+    if (gt <= lt + 1) return null;
+    return primValType(spec[lt + 1 .. gt]);
+}
+
+/// True if the core imports any memory-opt async intrinsic
+/// (`stream.read`/`.write`) — these need `(memory)`/`(realloc)` canon
+/// opts pointing at the main instance, forcing the shim/fixup path.
+fn coreNeedsAsyncMemOpShim(ar: std.mem.Allocator, core_bytes: []const u8) bool {
+    if (core_imports.extract(ar, core_bytes)) |oi| {
+        for (oi.interface.imports) |im| {
+            if (im.kind != .func) continue;
+            if (std.mem.startsWith(u8, im.module_name, "[stream]") and
+                (std.mem.eql(u8, im.field_name, "read") or std.mem.eql(u8, im.field_name, "write")))
+                return true;
+            if (std.mem.eql(u8, im.module_name, "[error-context]") and
+                (std.mem.eql(u8, im.field_name, "new") or std.mem.eql(u8, im.field_name, "debug-message")))
+                return true;
+        }
+    } else |_| {}
+    return false;
+}
+
 /// Construct the wrapping component bytes from a core module that
 /// has an embedded `component-type:<world>` custom section.
 pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
@@ -1328,7 +1405,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         }
     }
 
-    if (any_func_needs_opts or any_exported_dtor) {
+    if (any_func_needs_opts or any_exported_dtor or coreNeedsAsyncMemOpShim(ar, stripped_core)) {
         return try buildComponentShimFixup(alloc, ar, decoded, stripped_core);
     }
 
@@ -1643,6 +1720,154 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         });
     }
 
+    // ── P3 async-intrinsic bundles (cataggar/wabt#263).
+    //    Synthetic intrinsic import modules the guest core uses for the
+    //    component-model async built-ins, each wired to `canon` core funcs
+    //    in a bundle fed to the main instance under the module name —
+    //    mirroring the resource-intrinsic bundles above but keyed by the
+    //    synthetic module rather than an imported interface. The bundle +
+    //    canons must precede the main instance so its `(with …)` arg can
+    //    reference the bundle.
+    //
+    //    Handled now: `[task-return]<export>` → `canon task.return`;
+    //    `[stream]stream<T>` → `canon stream.{new,drop-readable,drop-
+    //    writable}` over a hoisted `(stream T)` type. Ops needing
+    //    `(memory)`/`(realloc)` opts (`stream.read`/`.write`,
+    //    `error-context.*`) require the main instance's memory — a
+    //    forward-reference that needs the shim/fixup path — and are
+    //    rejected for now with `error.UnsupportedAsyncIntrinsic`.
+    const AsyncBundle = struct { module: []const u8, core_inst_idx: u32 };
+    var async_bundles = std.ArrayListUnmanaged(AsyncBundle).empty;
+    {
+        // lift_types builder ctx: hoists result typedefs into the
+        // component type section.
+        const AsyncTypeCtx = struct {
+            ar: std.mem.Allocator,
+            types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+            order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+            comp_type_idx: *u32,
+            pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+                try self.types.append(self.ar, td);
+                try Section.appendType(self.order, self.ar, self.types.items.len);
+                const idx = self.comp_type_idx.*;
+                self.comp_type_idx.* += 1;
+                return idx;
+            }
+            pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
+                _ = self;
+                return v;
+            }
+        };
+
+        // Group intrinsic imports by synthetic module (preserving first-
+        // seen order); a module like `[stream]stream<u8>` carries several
+        // fields (`new`, `drop-writable`, …) that share one bundle.
+        const ModuleGroup = struct {
+            module: []const u8,
+            fields: std.ArrayListUnmanaged([]const u8),
+        };
+        var groups = std.ArrayListUnmanaged(ModuleGroup).empty;
+        if (core_imports.extract(ar, stripped_core)) |oi| {
+            for (oi.interface.imports) |im| {
+                if (im.kind != .func) continue;
+                if (!isAsyncIntrinsicModule(im.module_name)) continue;
+                var gi: ?usize = null;
+                for (groups.items, 0..) |grp, k| {
+                    if (std.mem.eql(u8, grp.module, im.module_name)) {
+                        gi = k;
+                        break;
+                    }
+                }
+                if (gi == null) {
+                    try groups.append(ar, .{ .module = try ar.dupe(u8, im.module_name), .fields = .empty });
+                    gi = groups.items.len - 1;
+                }
+                try groups.items[gi.?].fields.append(ar, try ar.dupe(u8, im.field_name));
+            }
+        } else |_| {}
+
+        // `stream<T>` spec → component `(stream T)` type idx (shared by all
+        // canons over the same element type).
+        var stream_type_idx = std.StringHashMapUnmanaged(u32).empty;
+
+        for (groups.items) |grp| {
+            var bundle_exports = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
+
+            if (std.mem.startsWith(u8, grp.module, "[task-return]")) {
+                // `[task-return]<iface>#<fn>` → result types of that export.
+                const export_ref = grp.module["[task-return]".len..];
+                const hash = std.mem.lastIndexOfScalar(u8, export_ref, '#') orelse
+                    return error.UnsupportedAsyncIntrinsic;
+                const iface_name = export_ref[0..hash];
+                const fn_name = export_ref[hash + 1 ..];
+                const ctx = AsyncTypeCtx{ .ar = ar, .types = &types, .order = &order, .comp_type_idx = &comp_type_idx };
+                var results: ctypes.FuncType.ResultList = .none;
+                var found_export = false;
+                find: for (decoded.externs) |ext| {
+                    if (!ext.is_export) continue;
+                    if (!std.mem.eql(u8, ext.qualified_name, iface_name)) continue;
+                    for (ext.funcs) |fn_ref| {
+                        if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
+                        results = switch (fn_ref.sig.results) {
+                            .none => .none,
+                            .unnamed => |v| .{ .unnamed = try lift_types.transcribeValType(ar, ctx, ext.type_slots, v) },
+                            .named => |named| n: {
+                                const dst = try ar.alloc(ctypes.NamedValType, named.len);
+                                for (named, 0..) |nv, k| dst[k] = .{
+                                    .name = nv.name,
+                                    .type = try lift_types.transcribeValType(ar, ctx, ext.type_slots, nv.type),
+                                };
+                                break :n .{ .named = dst };
+                            },
+                        };
+                        found_export = true;
+                        break :find;
+                    }
+                }
+                if (!found_export) return error.UnsupportedAsyncIntrinsic;
+                for (grp.fields.items) |field| {
+                    try canons.append(ar, .{ .task_return = .{ .results = results, .opts = &.{} } });
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
+            } else if (std.mem.startsWith(u8, grp.module, "[stream]")) {
+                const spec = grp.module["[stream]".len..]; // e.g. `stream<u8>`
+                const elem = parseAsyncElement(spec) orelse return error.UnsupportedAsyncIntrinsic;
+                const ty_idx = stream_type_idx.get(spec) orelse blk: {
+                    try types.append(ar, .{ .stream = .{ .element = elem } });
+                    try Section.appendType(&order, ar, types.items.len);
+                    const idx = comp_type_idx;
+                    comp_type_idx += 1;
+                    try stream_type_idx.put(ar, spec, idx);
+                    break :blk idx;
+                };
+                for (grp.fields.items) |field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field, "new"))
+                        .{ .stream_new = ty_idx }
+                    else if (std.mem.eql(u8, field, "drop-readable"))
+                        .{ .stream_drop_readable = ty_idx }
+                    else if (std.mem.eql(u8, field, "drop-writable"))
+                        .{ .stream_drop_writable = ty_idx }
+                    else
+                        // `read`/`write`/`cancel-*` need `(memory)` opts.
+                        return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
+            } else {
+                // `[error-context]` / `[future]` / `[waitable-set]` /
+                // `[waitable]`: not yet wired (memory opts / IR work).
+                return error.UnsupportedAsyncIntrinsic;
+            }
+
+            try core_instances.append(ar, .{ .exports = try bundle_exports.toOwnedSlice(ar) });
+            try async_bundles.append(ar, .{ .module = grp.module, .core_inst_idx = @intCast(core_instances.items.len - 1) });
+        }
+    }
+
     // ── Main core_module + main core_instance.instantiate.
     //
     // The main instance's index in the core-instance indexspace is
@@ -1662,6 +1887,9 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     }
     for (export_bundles.items) |eb| {
         try main_args.append(ar, .{ .name = eb.module, .instance_idx = eb.core_inst_idx });
+    }
+    for (async_bundles.items) |ab| {
+        try main_args.append(ar, .{ .name = ab.module, .instance_idx = ab.core_inst_idx });
     }
     try core_instances.append(ar, .{ .instantiate = .{
         .module_idx = 0,
@@ -1792,7 +2020,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     break :n .{ .named = dst };
                 },
             };
-            return .{ .params = params, .results = results };
+            return .{ .params = params, .results = results, .is_async = sig.is_async };
         }
     };
 
@@ -1814,6 +2042,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         fn_name: []const u8,
         func_type_idx: u32,
         core_func_alias_idx: u32,
+        is_async: bool,
     };
     var captured_funcs = std.ArrayListUnmanaged(CapturedFunc).empty;
     var ext_export_start = std.ArrayListUnmanaged(struct {
@@ -1868,6 +2097,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                 .fn_name = fn_ref.name,
                 .func_type_idx = func_type_idx,
                 .core_func_alias_idx = cf_idx,
+                .is_async = fn_ref.sig.is_async,
             });
         }
         try ext_export_start.append(ar, .{ .ext = ext, .start = start });
@@ -1877,10 +2107,17 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     //    section_order entries appended after.
     const lifts_start: u32 = @intCast(canons.items.len);
     for (captured_funcs.items) |cf| {
+        // An `async func` export lifts with the `async` canon option;
+        // its async-ness reached us via the `[async]` declarator name
+        // (see metadata_decode), surfaced as `fn_ref.sig.is_async`.
+        const opts: []const ctypes.CanonOpt = if (cf.is_async)
+            try ar.dupe(ctypes.CanonOpt, &.{.async_})
+        else
+            &.{};
         try canons.append(ar, .{ .lift = .{
             .core_func_idx = cf.core_func_alias_idx,
             .type_idx = cf.func_type_idx,
-            .opts = &.{},
+            .opts = opts,
         } });
     }
     const lifts_count: u32 = @as(u32, @intCast(canons.items.len)) - lifts_start;
@@ -1983,7 +2220,12 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 /// Shim/fixup path of `buildComponent`: emitted when at least one
 /// imported func needs `(memory)` + `(realloc)` canon-lower opts to
 /// lower its string / list / multi-result params or results
-/// (cataggar/wabt#203).
+/// (cataggar/wabt#203), a guest-defined resource has a destructor
+/// (#250), or the guest imports a memory-opt P3 async intrinsic
+/// (`stream.read`/`.write`, `error-context.new`/`.debug-message` — #263).
+/// All three share the same forward-reference cycle (the canon needs
+/// main's `memory`/`realloc`, but main needs the canon's core func as a
+/// `(with …)` arg) and are broken with the same trampoline pattern.
 ///
 /// The forward-reference cycle — canon.lower needs the main
 /// instance's `memory` / `cabi_realloc` exports, but the main
@@ -2052,7 +2294,7 @@ fn buildComponentShimFixup(
             .sub_resource => |name| try rs.append(ar, name),
             else => {},
         };
-        if (rs.items.len == 0 and ext.funcs.len == 0) continue;
+        if (rs.items.len == 0 and ext.funcs.len == 0 and !instProvidesType(ext.inst_decls)) continue;
         const owned = try rs.toOwnedSlice(ar);
         try import_shapes.append(ar, .{
             .qualified_name = ext.qualified_name,
@@ -2138,11 +2380,123 @@ fn buildComponentShimFixup(
     }
     const dtor_count: u32 = @intCast(dtor_resources.items.len);
 
+    // ── #263: async-intrinsic analysis. Group the synthetic intrinsic
+    //    import modules (`[task-return]<export>`, `[stream]stream<T>`)
+    //    and classify each field as no-memory (task.return, stream.new /
+    //    drop-readable / drop-writable — direct canons) or memory-opt
+    //    (stream.read / .write — need `(memory)`/`(realloc)` opts, so they
+    //    route through a shim trampoline like the lowered imports). The
+    //    mem-op fields contribute extra shim slots after the dtor slots.
+    const AsyncField = struct {
+        name: []const u8,
+        is_mem_op: bool,
+        mem_op_slot: u32 = 0,
+        satisfy_core_idx: u32 = 0,
+    };
+    const AsyncFamily = enum { task_return, stream, error_context };
+    const AsyncGroup = struct {
+        module: []const u8,
+        family: AsyncFamily,
+        elem: ctypes.ValType,
+        export_ref: []const u8,
+        fields: []AsyncField,
+        stream_type_idx: u32 = 0,
+        results: ctypes.FuncType.ResultList = .none,
+    };
+    const stream_rw_params = [_]wtypes.ValType{ .i32, .i32, .i32 };
+    const i32x2_params = [_]wtypes.ValType{ .i32, .i32 };
+    const i32_results = [_]wtypes.ValType{.i32};
+    var async_group_list = std.ArrayListUnmanaged(AsyncGroup).empty;
+    var async_memop_slots = std.ArrayListUnmanaged(shim_mod.Slot).empty;
+    if (core_imports.extract(ar, stripped_core)) |oi| {
+        var modnames = std.ArrayListUnmanaged([]const u8).empty;
+        var modfields = std.ArrayListUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
+        for (oi.interface.imports) |im| {
+            if (im.kind != .func) continue;
+            if (!isAsyncIntrinsicModule(im.module_name)) continue;
+            var gi: ?usize = null;
+            for (modnames.items, 0..) |m, k| if (std.mem.eql(u8, m, im.module_name)) {
+                gi = k;
+                break;
+            };
+            if (gi == null) {
+                try modnames.append(ar, try ar.dupe(u8, im.module_name));
+                try modfields.append(ar, .empty);
+                gi = modnames.items.len - 1;
+            }
+            try modfields.items[gi.?].append(ar, try ar.dupe(u8, im.field_name));
+        }
+        for (modnames.items, 0..) |module, mi| {
+            const fsrc = modfields.items[mi].items;
+            const fields = try ar.alloc(AsyncField, fsrc.len);
+            if (std.mem.startsWith(u8, module, "[task-return]")) {
+                for (fsrc, 0..) |f, k| fields[k] = .{ .name = f, .is_mem_op = false };
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .task_return,
+                    .elem = .u8,
+                    .export_ref = module["[task-return]".len..],
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[stream]")) {
+                const elem = parseAsyncElement(module["[stream]".len..]) orelse
+                    return error.UnsupportedAsyncIntrinsic;
+                for (fsrc, 0..) |f, k| {
+                    const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
+                    const no_mem = std.mem.eql(u8, f, "new") or
+                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable");
+                    if (!mem_op and !no_mem) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = mem_op };
+                    if (mem_op) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        try async_memop_slots.append(ar, .{ .params = &stream_rw_params, .results = &i32_results });
+                    }
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .stream,
+                    .elem = elem,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.eql(u8, module, "[error-context]")) {
+                for (fsrc, 0..) |f, k| {
+                    // new(ptr,len)->handle and debug-message(handle,retptr)
+                    // read/write guest memory → mem-op; drop is no-memory.
+                    const is_new = std.mem.eql(u8, f, "new");
+                    const is_dm = std.mem.eql(u8, f, "debug-message");
+                    const is_drop = std.mem.eql(u8, f, "drop");
+                    if (!is_new and !is_dm and !is_drop) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = is_new or is_dm };
+                    if (is_new) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        try async_memop_slots.append(ar, .{ .params = &i32x2_params, .results = &i32_results });
+                    } else if (is_dm) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        try async_memop_slots.append(ar, .{ .params = &i32x2_params, .results = &.{} });
+                    }
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .error_context,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else {
+                // [future] / [waitable-set] / [waitable]
+                return error.UnsupportedAsyncIntrinsic;
+            }
+        }
+    } else |_| {}
+    const async_groups = try async_group_list.toOwnedSlice(ar);
+    const async_memop_count: u32 = @intCast(async_memop_slots.items.len);
+
     // ── Phase 3: build shim + fixup core wasm bytes. Slots are the
     //    wired imported funcs followed by one trampoline per dtor'd
     //    exported resource.
     const i32_slot = [_]wtypes.ValType{.i32};
-    const shim_slots = try ar.alloc(shim_mod.Slot, total_wired + dtor_count);
+    const shim_slots = try ar.alloc(shim_mod.Slot, total_wired + dtor_count + async_memop_count);
     {
         var k: usize = 0;
         for (wired_by_shape) |wired| for (wired) |w| {
@@ -2152,6 +2506,11 @@ fn buildComponentShimFixup(
         var d: usize = 0;
         while (d < dtor_count) : (d += 1) {
             shim_slots[total_wired + d] = .{ .params = &i32_slot, .results = &.{} };
+        }
+        // #263: async mem-op intrinsic slots follow the dtor slots, in
+        // the order assigned during the async analysis above.
+        for (async_memop_slots.items, 0..) |slot, j| {
+            shim_slots[total_wired + dtor_count + j] = slot;
         }
     }
     const shim_bytes = try shim_mod.build(ar, shim_slots);
@@ -2427,7 +2786,7 @@ fn buildComponentShimFixup(
     const shim_stub_core_idx_base = core_func_idx;
     {
         var k: u32 = 0;
-        while (k < total_wired + dtor_count) : (k += 1) {
+        while (k < total_wired + dtor_count + async_memop_count) : (k += 1) {
             const name = try std.fmt.allocPrint(ar, "{d}", .{k});
             try aliases.append(ar, .{ .instance_export = .{
                 .sort = .{ .core = .func },
@@ -2439,6 +2798,8 @@ fn buildComponentShimFixup(
         }
     }
     const dtor_stub_core_base = shim_stub_core_idx_base + total_wired;
+    // #263: async mem-op stub core funcs follow the dtor stubs.
+    const async_memop_stub_core_base = dtor_stub_core_base + dtor_count;
 
     // ── #250 Step 2.5: declare each guest-defined (exported) resource
     //    type. A dtor'd resource references its shim destructor stub
@@ -2511,6 +2872,107 @@ fn buildComponentShimFixup(
         export_group_core_idxs[gi] = idxs;
     }
 
+    // ── #263: async-intrinsic canons. No-memory ops (task.return,
+    //    stream.{new,drop-readable,drop-writable}) are emitted now as
+    //    direct core funcs; memory-opt ops (stream.read/.write) are
+    //    satisfied by their shim stub here, with the real `(memory)`
+    //    canon emitted in Phase 4f.2 and patched in by the fixup.
+    const AsyncTypeCtx = struct {
+        ar: std.mem.Allocator,
+        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+        comp_type_idx: *u32,
+        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+            try self.types.append(self.ar, td);
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const idx = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            return idx;
+        }
+        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
+            _ = self;
+            return v;
+        }
+    };
+    for (async_groups) |*grp| {
+        switch (grp.family) {
+            .stream => {
+                try types.append(ar, .{ .stream = .{ .element = grp.elem } });
+                try Section.appendType(&order, ar, types.items.len);
+                grp.stream_type_idx = comp_type_idx;
+                comp_type_idx += 1;
+                for (grp.fields) |*field| {
+                    if (field.is_mem_op) {
+                        field.satisfy_core_idx = async_memop_stub_core_base + field.mem_op_slot;
+                        continue;
+                    }
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field.name, "new"))
+                        .{ .stream_new = grp.stream_type_idx }
+                    else if (std.mem.eql(u8, field.name, "drop-readable"))
+                        .{ .stream_drop_readable = grp.stream_type_idx }
+                    else
+                        .{ .stream_drop_writable = grp.stream_type_idx };
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+            .error_context => {
+                for (grp.fields) |*field| {
+                    if (field.is_mem_op) {
+                        field.satisfy_core_idx = async_memop_stub_core_base + field.mem_op_slot;
+                        continue;
+                    }
+                    // only `drop` is no-memory.
+                    try canons.append(ar, .error_context_drop);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+            .task_return => {
+                const export_ref = grp.export_ref;
+                const hash = std.mem.lastIndexOfScalar(u8, export_ref, '#') orelse
+                    return error.UnsupportedAsyncIntrinsic;
+                const iface_name = export_ref[0..hash];
+                const fn_name = export_ref[hash + 1 ..];
+                const ctx = AsyncTypeCtx{ .ar = ar, .types = &types, .order = &order, .comp_type_idx = &comp_type_idx };
+                var results: ctypes.FuncType.ResultList = .none;
+                var found_export = false;
+                find2: for (decoded.externs) |ext| {
+                    if (!ext.is_export) continue;
+                    if (!std.mem.eql(u8, ext.qualified_name, iface_name)) continue;
+                    for (ext.funcs) |fn_ref| {
+                        if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
+                        results = switch (fn_ref.sig.results) {
+                            .none => .none,
+                            .unnamed => |v| .{ .unnamed = try lift_types.transcribeValType(ar, ctx, ext.type_slots, v) },
+                            .named => |named| nb: {
+                                const dst = try ar.alloc(ctypes.NamedValType, named.len);
+                                for (named, 0..) |nv, kk| dst[kk] = .{
+                                    .name = nv.name,
+                                    .type = try lift_types.transcribeValType(ar, ctx, ext.type_slots, nv.type),
+                                };
+                                break :nb .{ .named = dst };
+                            },
+                        };
+                        found_export = true;
+                        break :find2;
+                    }
+                }
+                if (!found_export) return error.UnsupportedAsyncIntrinsic;
+                grp.results = results;
+                for (grp.fields) |*field| {
+                    try canons.append(ar, .{ .task_return = .{ .results = results, .opts = &.{} } });
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+        }
+    }
+
     // Step 3: per import shape, build an inline-exports bundle
     // mapping each wired func's canonical method name to its shim
     // stub (plus any #248 resource intrinsics to their direct core
@@ -2555,6 +3017,20 @@ fn buildComponentShimFixup(
             try core_instances.append(ar, .{ .exports = bundle_exports });
             try bundle_for_main_args.append(ar, .{
                 .name = group[0].module,
+                .instance_idx = @intCast(core_instances.items.len - 1),
+            });
+        }
+        // #263: one bundle per async-intrinsic module; each field maps to
+        // its satisfying core func (a direct canon for no-memory ops, a
+        // shim stub for memory-opt ops).
+        for (async_groups) |grp| {
+            const be = try ar.alloc(ctypes.CoreInlineExport, grp.fields.len);
+            for (grp.fields, 0..) |field, k| {
+                be[k] = .{ .name = field.name, .sort_idx = .{ .sort = .func, .idx = field.satisfy_core_idx } };
+            }
+            try core_instances.append(ar, .{ .exports = be });
+            try bundle_for_main_args.append(ar, .{
+                .name = grp.module,
                 .instance_idx = @intCast(core_instances.items.len - 1),
             });
         }
@@ -2631,7 +3107,44 @@ fn buildComponentShimFixup(
         }
     }
 
-    // ── #250 Phase 4f.5: alias main's real destructor exports
+    // ── #263 Phase 4f.2: real memory-opt async canons (stream.read /
+    //    .write, error-context.new / .debug-message) with `(memory)` /
+    //    `(realloc)` opts pointing at main. Emitted in mem-op-slot order
+    //    so slot j ↔ `async_memop_real_core_base + j`; the fixup (Phase
+    //    4g) patches each shim stub to call these.
+    const async_memop_real_core_base = core_func_idx;
+    {
+        const memop_start: u32 = @intCast(canons.items.len);
+        const mem_realloc = [_]ctypes.CanonOpt{ .{ .memory = memory_core_idx }, .{ .realloc = realloc_core_idx } };
+        for (async_groups) |grp| {
+            for (grp.fields) |field| {
+                if (!field.is_mem_op) continue;
+                const canon: ctypes.Canon = switch (grp.family) {
+                    .stream => blk: {
+                        const opts = try ar.dupe(ctypes.CanonOpt, &.{.{ .memory = memory_core_idx }});
+                        break :blk if (std.mem.eql(u8, field.name, "write"))
+                            .{ .stream_write = .{ .type_idx = grp.stream_type_idx, .opts = opts } }
+                        else
+                            .{ .stream_read = .{ .type_idx = grp.stream_type_idx, .opts = opts } };
+                    },
+                    .error_context => blk: {
+                        const opts = try ar.dupe(ctypes.CanonOpt, &mem_realloc);
+                        break :blk if (std.mem.eql(u8, field.name, "new"))
+                            .{ .error_context_new = opts }
+                        else
+                            .{ .error_context_debug_message = opts };
+                    },
+                    .task_return => unreachable, // task.return is never mem-op
+                };
+                try canons.append(ar, canon);
+                core_func_idx += 1;
+            }
+        }
+        const memop_count: u32 = @as(u32, @intCast(canons.items.len)) - memop_start;
+        if (memop_count > 0) {
+            try order.append(ar, .{ .kind = .canon, .start = memop_start, .count = memop_count });
+        }
+    }
     //    `<iface>#[dtor]<R>` as core funcs. The fixup writes these into
     //    the shim table slots so the destructor trampolines forward to
     //    the guest's real destructors.
@@ -2652,7 +3165,7 @@ fn buildComponentShimFixup(
     //    main's real dtor export), plus `$imports` → the shim's
     //    table. Then instantiate fixup with this bundle.
     {
-        const bundle_size = total_wired + dtor_count + 1;
+        const bundle_size = total_wired + dtor_count + async_memop_count + 1;
         const bundle = try ar.alloc(ctypes.CoreInlineExport, bundle_size);
         var k: u32 = 0;
         while (k < total_wired) : (k += 1) {
@@ -2670,7 +3183,16 @@ fn buildComponentShimFixup(
                 .sort_idx = .{ .sort = .func, .idx = dtor_main_core_base + d },
             };
         }
-        bundle[total_wired + dtor_count] = .{
+        // #263: async mem-op slots → their real `(memory)` canon funcs.
+        var a: u32 = 0;
+        while (a < async_memop_count) : (a += 1) {
+            const name = try std.fmt.allocPrint(ar, "{d}", .{total_wired + dtor_count + a});
+            bundle[total_wired + dtor_count + a] = .{
+                .name = name,
+                .sort_idx = .{ .sort = .func, .idx = async_memop_real_core_base + a },
+            };
+        }
+        bundle[total_wired + dtor_count + async_memop_count] = .{
             .name = "$imports",
             .sort_idx = .{ .sort = .table, .idx = shim_table_core_idx },
         };
@@ -2809,7 +3331,7 @@ fn buildComponentShimFixup(
                     break :n .{ .named = dst };
                 },
             };
-            return .{ .params = params, .results = results };
+            return .{ .params = params, .results = results, .is_async = sig.is_async };
         }
     };
 
@@ -2820,6 +3342,7 @@ fn buildComponentShimFixup(
         core_func_alias_idx: u32,
         lift_opts: abi.LiftOpts,
         post_return_core_idx: ?u32,
+        is_async: bool,
     };
     var captured_funcs = std.ArrayListUnmanaged(CapturedFunc).empty;
     var ext_export_start = std.ArrayListUnmanaged(struct {
@@ -2892,6 +3415,7 @@ fn buildComponentShimFixup(
                 .core_func_alias_idx = cf_idx,
                 .lift_opts = lift_opts,
                 .post_return_core_idx = post_idx,
+                .is_async = fn_ref.sig.is_async,
             });
         }
         try ext_export_start.append(ar, .{ .ext = ext, .start = start });
@@ -2899,13 +3423,20 @@ fn buildComponentShimFixup(
 
     const lifts_start: u32 = @intCast(canons.items.len);
     for (captured_funcs.items) |cf| {
-        const opts = try wabt.component.adapter.adapter.buildCanonLiftOpts(
+        var opts = try wabt.component.adapter.adapter.buildCanonLiftOpts(
             ar,
             cf.lift_opts,
             memory_core_idx,
             realloc_core_idx,
             cf.post_return_core_idx,
         );
+        // #263: async exports lift with the `async` canon option.
+        if (cf.is_async) {
+            const ext_opts = try ar.alloc(ctypes.CanonOpt, opts.len + 1);
+            @memcpy(ext_opts[0..opts.len], opts);
+            ext_opts[opts.len] = .async_;
+            opts = ext_opts;
+        }
         try canons.append(ar, .{ .lift = .{
             .core_func_idx = cf.core_func_alias_idx,
             .type_idx = cf.func_type_idx,
@@ -4731,6 +5262,297 @@ fn mainWithArgFor(loaded: anytype, name: []const u8) bool {
         else => {},
     };
     return false;
+}
+
+fn countTaskReturns(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .task_return => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn anyAsyncLift(loaded: anytype) bool {
+    for (loaded.canons) |c| switch (c) {
+        .lift => |l| for (l.opts) |o| switch (o) {
+            .async_ => return true,
+            else => {},
+        },
+        else => {},
+    };
+    return false;
+}
+
+test "buildComponent #263: async run export wires task.return + async lift" {
+    // A guest exporting `wasi:cli/run`-style `run: async func() -> result`
+    // and importing the `[task-return]<export>` async intrinsic must get
+    // (1) an async `canon lift` for the export, (2) a `canon task.return`
+    // whose result type is the export's, and (3) a `(with …)` arg feeding
+    // the task.return bundle to the main core instance under the intrinsic
+    // module name. Validated at runtime on wasmtime 46.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run") (call 0 (i32.const 0)))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), countTaskReturns(loaded));
+    try testing.expect(anyAsyncLift(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
+    try testing.expect(bundleExportsFunc(loaded, "task-return"));
+}
+
+fn countStreamCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .stream_new, .stream_drop_readable, .stream_drop_writable => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn anyStreamType(loaded: anytype) bool {
+    for (loaded.types) |t| switch (t) {
+        .stream => |s| if (s.element != null and s.element.? == .u8) return true,
+        else => {},
+    };
+    return false;
+}
+
+test "buildComponent #263: [stream]stream<u8> wires stream.new/drop canons + a stream type" {
+    // A guest exporting an async `run` that creates a `stream<u8>` and
+    // drops both ends imports the no-memory `[stream]stream<u8>`
+    // intrinsics. wabt must hoist a `(stream u8)` type, emit `canon
+    // stream.{new,drop-readable,drop-writable}` over it, and feed the
+    // bundle under the `[stream]stream<u8>` module. Runs on wasmtime 46.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[stream]stream<u8>" "new" (func (result i64)))
+        \\  (import "[stream]stream<u8>" "drop-readable" (func (param i32)))
+        \\  (import "[stream]stream<u8>" "drop-writable" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expect(anyStreamType(loaded));
+    try testing.expectEqual(@as(usize, 3), countStreamCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[stream]stream<u8>"));
+    try testing.expect(bundleExportsFunc(loaded, "new"));
+    try testing.expect(bundleExportsFunc(loaded, "drop-writable"));
+}
+
+fn countStreamWrite(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .stream_write => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #263: stream.write routes through shim/fixup (memory-opt)" {
+    // `stream.write` needs `(memory)` opts pointing at the main instance
+    // — a forward-reference broken by the shim/fixup trampoline. The
+    // produced component must have 3 core modules (main + shim + fixup),
+    // a `canon stream.write` over the hoisted `(stream u8)` type, and the
+    // `[stream]stream<u8>` bundle fed to main. Runs on wasmtime 46.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[stream]stream<u8>" "new" (func (result i64)))
+        \\  (import "[stream]stream<u8>" "write" (func (param i32 i32 i32) (result i32)))
+        \\  (import "[stream]stream<u8>" "drop-writable" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(anyStreamType(loaded));
+    try testing.expectEqual(@as(usize, 1), countStreamWrite(loaded));
+    try testing.expect(anyAsyncLift(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[stream]stream<u8>"));
+    try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
+}
+
+test "buildComponent #263: full streaming hello (stdout write-via-stream + cross-iface)" {
+    // The end-to-end wasip3 command shape: an async `run` that writes to
+    // stdout via `write-via-stream(stream<u8>) -> future<result<_,
+    // error-code>>`. Exercises (1) a type-only `types` import providing
+    // the `use`d `error-code` enum (cross-iface alias rebasing), (2) a
+    // future-returning import func lowered through the shim, and (3) the
+    // `[stream]`/`[task-return]` intrinsics. This exact shape prints
+    // "hello from wasi 0.3" on wasmtime 46.
+    const wit =
+        \\package local:io@0.1.0;
+        \\
+        \\interface types {
+        \\    enum error-code { oops }
+        \\}
+        \\
+        \\interface out {
+        \\    use types.{error-code};
+        \\    write-via-stream: func(data: stream<u8>) -> future<result<_, error-code>>;
+        \\}
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    import out;
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[stream]stream<u8>" "new" (func (result i64)))
+        \\  (import "[stream]stream<u8>" "write" (func (param i32 i32 i32) (result i32)))
+        \\  (import "[stream]stream<u8>" "drop-writable" (func (param i32)))
+        \\  (import "local:io/out@0.1.0" "write-via-stream" (func (param i32) (result i32)))
+        \\  (import "[task-return]local:io/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:io/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // shim/fixup (stream.write is memory-opt).
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(anyStreamType(loaded));
+    try testing.expectEqual(@as(usize, 1), countStreamWrite(loaded));
+    try testing.expect(anyAsyncLift(loaded));
+    // The future-returning stdout import is lowered + wired.
+    try testing.expect(mainWithArgFor(loaded, "local:io/out@0.1.0"));
+    // The type-only `types` import is included so error-code resolves.
+    try testing.expect(mainWithArgFor(loaded, "[stream]stream<u8>"));
+}
+
+fn countErrorContextCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .error_context_new, .error_context_debug_message, .error_context_drop => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #263: error-context.new routes through shim/fixup; drop direct" {
+    // `error-context.new` reads a message from guest memory ⇒ memory-opt    // ⇒ shim/fixup; `error-context.drop` is no-memory ⇒ a direct canon.
+    // Runs on wasmtime 46.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[error-context]" "new" (func (param i32 i32) (result i32)))
+        \\  (import "[error-context]" "drop" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    // one error-context.new + one error-context.drop.
+    try testing.expectEqual(@as(usize, 2), countErrorContextCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[error-context]"));
 }
 
 test "buildComponent #248: drop-only namespace wires canon resource.drop into the bundle" {
