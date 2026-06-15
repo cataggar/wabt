@@ -1265,6 +1265,9 @@ fn coreNeedsAsyncMemOpShim(ar: std.mem.Allocator, core_bytes: []const u8) bool {
             if (std.mem.startsWith(u8, im.module_name, "[future]") and
                 (std.mem.eql(u8, im.field_name, "read") or std.mem.eql(u8, im.field_name, "write")))
                 return true;
+            if (std.mem.startsWith(u8, im.module_name, "[waitable-set]") and
+                (std.mem.eql(u8, im.field_name, "wait") or std.mem.eql(u8, im.field_name, "poll")))
+                return true;
             if (std.mem.eql(u8, im.module_name, "[error-context]") and
                 (std.mem.eql(u8, im.field_name, "new") or std.mem.eql(u8, im.field_name, "debug-message")))
                 return true;
@@ -1891,9 +1894,32 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
                     core_func_idx += 1;
                 }
+            } else if (std.mem.startsWith(u8, grp.module, "[waitable-set]")) {
+                // `new` / `drop` are no-memory; `wait`/`poll` need
+                // `(memory)` opts and so only reach the shim/fixup path.
+                for (grp.fields.items) |field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field, "new"))
+                        .waitable_set_new
+                    else if (std.mem.eql(u8, field, "drop"))
+                        .waitable_set_drop
+                    else
+                        return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
+            } else if (std.mem.startsWith(u8, grp.module, "[waitable]")) {
+                for (grp.fields.items) |field| {
+                    if (!std.mem.eql(u8, field, "join")) return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, .waitable_join);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
             } else {
-                // `[error-context]` / `[waitable-set]` / `[waitable]`: not
-                // yet wired here (memory opts / IR work).
+                // `[error-context]` (always needs the shim path for its
+                // memory ops): not wired in this no-shim path.
                 return error.UnsupportedAsyncIntrinsic;
             }
 
@@ -2427,7 +2453,7 @@ fn buildComponentShimFixup(
         mem_op_slot: u32 = 0,
         satisfy_core_idx: u32 = 0,
     };
-    const AsyncFamily = enum { task_return, stream, future, error_context };
+    const AsyncFamily = enum { task_return, stream, future, error_context, waitable_set, waitable };
     const AsyncGroup = struct {
         module: []const u8,
         family: AsyncFamily,
@@ -2536,6 +2562,39 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .error_context,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[waitable-set]")) {
+                for (fsrc, 0..) |f, k| {
+                    // wait/poll write an event payload to a retptr → mem-op;
+                    // new/drop are no-memory.
+                    const mem_op = std.mem.eql(u8, f, "wait") or std.mem.eql(u8, f, "poll");
+                    const no_mem = std.mem.eql(u8, f, "new") or std.mem.eql(u8, f, "drop");
+                    if (!mem_op and !no_mem) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = mem_op };
+                    if (mem_op) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        // waitable-set.wait/poll lower to (set, event-ptr)->i32.
+                        try async_memop_slots.append(ar, .{ .params = &i32x2_params, .results = &i32_results });
+                    }
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .waitable_set,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[waitable]")) {
+                for (fsrc, 0..) |f, k| {
+                    if (!std.mem.eql(u8, f, "join")) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = false };
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .waitable,
                     .elem = .u8,
                     .export_ref = "",
                     .fields = fields,
@@ -2997,6 +3056,32 @@ fn buildComponentShimFixup(
                     core_func_idx += 1;
                 }
             },
+            .waitable_set => {
+                for (grp.fields) |*field| {
+                    if (field.is_mem_op) {
+                        field.satisfy_core_idx = async_memop_stub_core_base + field.mem_op_slot;
+                        continue;
+                    }
+                    // `new` / `drop` are no-memory; `wait`/`poll` are mem-op.
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field.name, "new"))
+                        .waitable_set_new
+                    else
+                        .waitable_set_drop;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+            .waitable => {
+                for (grp.fields) |*field| {
+                    // only `join`, no-memory.
+                    try canons.append(ar, .waitable_join);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
             .error_context => {
                 for (grp.fields) |*field| {
                     if (field.is_mem_op) {
@@ -3220,6 +3305,13 @@ fn buildComponentShimFixup(
                         else
                             .{ .error_context_debug_message = opts };
                     },
+                    .waitable_set => if (std.mem.eql(u8, field.name, "poll"))
+                        // wait/poll carry a bare memory index (not a CanonOpt
+                        // list); cancellable=false for a plain blocking wait.
+                        .{ .waitable_set_poll = .{ .cancellable = false, .memory = memory_core_idx } }
+                    else
+                        .{ .waitable_set_wait = .{ .cancellable = false, .memory = memory_core_idx } },
+                    .waitable => unreachable, // waitable.join is never mem-op
                     .task_return => unreachable, // task.return is never mem-op
                 };
                 try canons.append(ar, canon);
@@ -5758,6 +5850,74 @@ test "buildComponent #263: error-context.new routes through shim/fixup; drop dir
     // one error-context.new + one error-context.drop.
     try testing.expectEqual(@as(usize, 2), countErrorContextCanons(loaded));
     try testing.expect(mainWithArgFor(loaded, "[error-context]"));
+}
+
+fn countWaitableCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .waitable_set_new, .waitable_set_wait, .waitable_set_poll, .waitable_set_drop, .waitable_join => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn countWaitableSetWait(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .waitable_set_wait => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #265: [waitable-set] new/wait/drop + [waitable] join wires canons" {
+    // Awaiting an async op: `waitable-set.new`/`.drop` and `waitable.join`
+    // are no-memory direct canons; `waitable-set.wait` writes an event to a
+    // retptr ⇒ memory-opt ⇒ shim/fixup. The component must have 3 core
+    // modules (main + shim + fixup), all four waitable canons, and the
+    // `[waitable-set]`/`[waitable]` bundles fed to main.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[waitable-set]" "new" (func (result i32)))
+        \\  (import "[waitable-set]" "wait" (func (param i32 i32) (result i32)))
+        \\  (import "[waitable-set]" "drop" (func (param i32)))
+        \\  (import "[waitable]" "join" (func (param i32 i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // main + shim + fixup (waitable-set.wait is memory-opt).
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    // new + wait + drop + join.
+    try testing.expectEqual(@as(usize, 4), countWaitableCanons(loaded));
+    try testing.expectEqual(@as(usize, 1), countWaitableSetWait(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[waitable-set]"));
+    try testing.expect(mainWithArgFor(loaded, "[waitable]"));
+    try testing.expect(bundleExportsFunc(loaded, "wait"));
+    try testing.expect(bundleExportsFunc(loaded, "join"));
 }
 
 test "buildComponent #248: drop-only namespace wires canon resource.drop into the bundle" {

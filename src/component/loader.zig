@@ -256,7 +256,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return => true,
+                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return, .waitable_set_new, .waitable_set_wait, .waitable_set_poll, .waitable_set_drop, .waitable_join => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -777,6 +777,19 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
             const opts = try readCanonOpts(reader, allocator);
             break :blk .{ .task_return = .{ .results = results, .opts = opts } };
         },
+        0x1F => .waitable_set_new,
+        0x20 => blk: {
+            const cancellable = (try reader.readByte()) != 0;
+            const memory = try reader.readU32();
+            break :blk .{ .waitable_set_wait = .{ .cancellable = cancellable, .memory = memory } };
+        },
+        0x21 => blk: {
+            const cancellable = (try reader.readByte()) != 0;
+            const memory = try reader.readU32();
+            break :blk .{ .waitable_set_poll = .{ .cancellable = cancellable, .memory = memory } };
+        },
+        0x22 => .waitable_set_drop,
+        0x23 => .waitable_join,
         else => error.InvalidEncoding,
     };
 }
@@ -1332,6 +1345,47 @@ test "round-trip future-family canons + task.return through writer + loader (#26
     try std.testing.expect(loaded.canons[5] == .future_drop_readable);
     try std.testing.expect(loaded.canons[6] == .future_drop_writable);
     try std.testing.expect(loaded.canons[7].task_return.opts[0] == .async_);
+}
+
+test "round-trip waitable-set/waitable canons through writer + loader (#265)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Distinguishing field values catch a writer/loader field-order bug:
+    // `wait` is cancellable with memory 0, `poll` is non-cancellable with
+    // memory 0 — a swapped (memory, cancellable) order would not round-trip.
+    const canons = [_]ctypes.Canon{
+        .waitable_set_new,
+        .{ .waitable_set_wait = .{ .cancellable = true, .memory = 0 } },
+        .{ .waitable_set_poll = .{ .cancellable = false, .memory = 0 } },
+        .waitable_set_drop,
+        .waitable_join,
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 5), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .waitable_set_new);
+    try std.testing.expect(loaded.canons[1].waitable_set_wait.cancellable);
+    try std.testing.expectEqual(@as(u32, 0), loaded.canons[1].waitable_set_wait.memory);
+    try std.testing.expect(!loaded.canons[2].waitable_set_poll.cancellable);
+    try std.testing.expect(loaded.canons[3] == .waitable_set_drop);
+    try std.testing.expect(loaded.canons[4] == .waitable_join);
 }
 
 test "round-trip stream-family + error-context canons through writer + loader (#263)" {

@@ -363,6 +363,14 @@ pub const CanonTaskReturn = struct {
     opts: []const CanonOpt,
 };
 
+/// `{ cancellable, memory }` payload for `waitable-set.wait`/`.poll`.
+/// Note: the binary form carries `memory` as a bare u32 index (not the
+/// canon-opts list used by stream/future read/write).
+pub const CanonWaitableSet = struct {
+    cancellable: bool,
+    memory: u32,
+};
+
 /// Canonical function definitions.
 pub const Canon = union(enum) {
     /// Lift a core function to a component function.
@@ -420,6 +428,16 @@ pub const Canon = union(enum) {
     error_context_drop,
     /// `task.return <results> <opts>` (binary `0x09`).
     task_return: CanonTaskReturn,
+    /// `waitable-set.new` (binary `0x1f`).
+    waitable_set_new,
+    /// `waitable-set.wait <cancellable> <memory>` (binary `0x20`).
+    waitable_set_wait: CanonWaitableSet,
+    /// `waitable-set.poll <cancellable> <memory>` (binary `0x21`).
+    waitable_set_poll: CanonWaitableSet,
+    /// `waitable-set.drop` (binary `0x22`).
+    waitable_set_drop,
+    /// `waitable.join` (binary `0x23`).
+    waitable_join,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────
