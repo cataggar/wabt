@@ -31,6 +31,8 @@ pub const ValType = union(enum) {
     f64,
     char,
     string,
+    /// `error-context` — P3 opaque async error value (primvaltype `0x64`).
+    error_context,
 
     // Compound (index into component type index space)
     record: u32,
@@ -97,6 +99,18 @@ pub const ResultType = struct {
     err: ?ValType,
 };
 
+/// `future<T>` — P3 async single-value channel. `element` is null for a
+/// bare `future`.
+pub const FutureType = struct {
+    element: ?ValType,
+};
+
+/// `stream<T>` — P3 async multi-value channel. `element` is null for a
+/// bare `stream`.
+pub const StreamType = struct {
+    element: ?ValType,
+};
+
 pub const ResourceType = struct {
     /// Destructor function index (in the canon function index space), or null.
     destructor: ?u32 = null,
@@ -117,6 +131,11 @@ pub const NamedValType = struct {
 pub const FuncType = struct {
     params: []const NamedValType,
     results: ResultList,
+    /// `(func async …)` — P3 asynchronous function type (binary `0x43`
+    /// vs the synchronous `0x40`). wasmtime 46 (wasmparser 0.251) reads
+    /// this byte to mark a func type async, which the `async` canon
+    /// lift/lower option requires.
+    is_async: bool = false,
 
     pub const ResultList = union(enum) {
         /// No result (spec: `0x01 0x00`).
@@ -179,6 +198,9 @@ pub const TypeDef = union(enum) {
     enum_: EnumType,
     option: OptionType,
     result: ResultType,
+    /// P3 async value types (`future<T>` / `stream<T>`).
+    future: FutureType,
+    stream: StreamType,
     resource: ResourceType,
 
     // Function and component/instance types
@@ -314,6 +336,31 @@ pub const CanonOpt = union(enum) {
     post_return: u32, // core func index
     /// String encoding to use.
     string_encoding: StringEncoding,
+    /// `async` lift/lower option (P3, binary `0x06`). Named with a
+    /// trailing underscore because `async` is reserved.
+    async_,
+    /// `(callback f)` option (P3, binary `0x07`) — core func index.
+    callback: u32,
+};
+
+/// `{ type-index, opts }` payload shared by `future.read`/`.write` (and
+/// later `stream.read`/`.write`).
+pub const CanonRW = struct {
+    type_idx: u32,
+    opts: []const CanonOpt,
+};
+
+/// `{ type-index, async? }` payload for `future.cancel-*` (and later
+/// `stream.cancel-*`).
+pub const CanonCancel = struct {
+    type_idx: u32,
+    is_async: bool,
+};
+
+/// `{ results, opts }` payload for `task.return`.
+pub const CanonTaskReturn = struct {
+    results: FuncType.ResultList,
+    opts: []const CanonOpt,
 };
 
 /// Canonical function definitions.
@@ -335,6 +382,44 @@ pub const Canon = union(enum) {
     resource_drop: u32, // resource type index
     /// Get the representation of a resource handle.
     resource_rep: u32, // resource type index
+
+    // ── P3 component-model-async built-ins (added demand-driven) ──
+    /// `future.new <ty>` (binary `0x15`).
+    future_new: u32,
+    /// `future.read <ty> <opts>` (binary `0x16`).
+    future_read: CanonRW,
+    /// `future.write <ty> <opts>` (binary `0x17`).
+    future_write: CanonRW,
+    /// `future.cancel-read <ty> <async?>` (binary `0x18`).
+    future_cancel_read: CanonCancel,
+    /// `future.cancel-write <ty> <async?>` (binary `0x19`).
+    future_cancel_write: CanonCancel,
+    /// `future.drop-readable <ty>` (binary `0x1a`).
+    future_drop_readable: u32,
+    /// `future.drop-writable <ty>` (binary `0x1b`).
+    future_drop_writable: u32,
+    /// `stream.new <ty>` (binary `0x0e`).
+    stream_new: u32,
+    /// `stream.read <ty> <opts>` (binary `0x0f`).
+    stream_read: CanonRW,
+    /// `stream.write <ty> <opts>` (binary `0x10`).
+    stream_write: CanonRW,
+    /// `stream.cancel-read <ty> <async?>` (binary `0x11`).
+    stream_cancel_read: CanonCancel,
+    /// `stream.cancel-write <ty> <async?>` (binary `0x12`).
+    stream_cancel_write: CanonCancel,
+    /// `stream.drop-readable <ty>` (binary `0x13`).
+    stream_drop_readable: u32,
+    /// `stream.drop-writable <ty>` (binary `0x14`).
+    stream_drop_writable: u32,
+    /// `error-context.new <opts>` (binary `0x1c`).
+    error_context_new: []const CanonOpt,
+    /// `error-context.debug-message <opts>` (binary `0x1d`).
+    error_context_debug_message: []const CanonOpt,
+    /// `error-context.drop` (binary `0x1e`).
+    error_context_drop,
+    /// `task.return <results> <opts>` (binary `0x09`).
+    task_return: CanonTaskReturn,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────

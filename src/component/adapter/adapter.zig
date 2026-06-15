@@ -1156,7 +1156,7 @@ const Builder = struct {
                 self.func_cursor += 1;
                 return i;
             },
-            .lower, .resource_drop, .resource_new, .resource_rep => {
+            .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return => {
                 const i = self.core_func_cursor;
                 self.core_func_cursor += 1;
                 return i;

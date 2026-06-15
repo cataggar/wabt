@@ -97,6 +97,8 @@ fn transcribeTypeDef(
 ) Error!ctypes.TypeDef {
     return switch (td) {
         .val => |vt| .{ .val = try transcribeValType(arena, ctx, ext_slots, vt) },
+        .future => |f| .{ .future = .{ .element = if (f.element) |e| try transcribeValType(arena, ctx, ext_slots, e) else null } },
+        .stream => |s| .{ .stream = .{ .element = if (s.element) |e| try transcribeValType(arena, ctx, ext_slots, e) else null } },
         .option => |o| .{ .option = .{ .inner = try transcribeValType(arena, ctx, ext_slots, o.inner) } },
         .list => |l| .{ .list = .{ .element = try transcribeValType(arena, ctx, ext_slots, l.element) } },
         .result => |r| .{ .result = .{

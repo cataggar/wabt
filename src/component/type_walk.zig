@@ -75,6 +75,12 @@ pub fn collectTypeDefRefs(
             if (r.err) |vt| try collectValTypeRefs(arena, vt, out, depth);
         },
         .resource => {},
+        .future => |f| {
+            if (f.element) |vt| try collectValTypeRefs(arena, vt, out, depth);
+        },
+        .stream => |s| {
+            if (s.element) |vt| try collectValTypeRefs(arena, vt, out, depth);
+        },
         .func => |f| {
             for (f.params) |p| try collectValTypeRefs(arena, p.type, out, depth);
             switch (f.results) {
@@ -99,7 +105,7 @@ pub fn collectValTypeRefs(
 ) Error!void {
     if (depth != 0) return;
     switch (vt) {
-        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .string => {},
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .string, .error_context => {},
         .own => |idx| try out.append(arena, idx),
         .borrow => |idx| try out.append(arena, idx),
         .type_idx => |idx| try out.append(arena, idx),
@@ -277,6 +283,8 @@ pub fn cloneTypeDef(
             .err = if (r.err) |t| try cloneValType(arena, t, type_remap, depth) else null,
         } },
         .resource => |r| .{ .resource = r },
+        .future => |f| .{ .future = .{ .element = if (f.element) |t| try cloneValType(arena, t, type_remap, depth) else null } },
+        .stream => |s| .{ .stream = .{ .element = if (s.element) |t| try cloneValType(arena, t, type_remap, depth) else null } },
         .func => |f| blk: {
             const params = try arena.alloc(ctypes.NamedValType, f.params.len);
             for (f.params, params) |src, *dst| dst.* = .{
@@ -387,6 +395,7 @@ pub fn cloneValType(
     if (depth != 0) return vt;
     return switch (vt) {
         .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char, .string => vt,
+        .error_context => vt,
         .own => |idx| .{ .own = remap(type_remap, idx) },
         .borrow => |idx| .{ .borrow = remap(type_remap, idx) },
         .type_idx => |idx| .{ .type_idx = remap(type_remap, idx) },

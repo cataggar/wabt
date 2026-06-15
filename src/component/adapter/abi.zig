@@ -394,6 +394,8 @@ fn flattenInner(vt: ctypes.ValType, resolver: TypeResolver, depth: u32) FlatInfo
         .s64, .u64 => .{ .flat = 1 },
         .f32, .f64 => .{ .flat = 1 },
         .own, .borrow => .{ .flat = 1 },
+        // P3 async handle (`error-context`) flattens to a single i32 index.
+        .error_context => .{ .flat = 1 },
         .string => .{
             .flat = 2,
             .needs_memory = true,
@@ -517,6 +519,8 @@ fn flattenTypeDef(td: ctypes.TypeDef, resolver: TypeResolver, depth: u32) FlatIn
             break :blk info;
         },
         .resource => .{ .flat = 1 },
+        // P3 async channels are owned handles → a single i32 index.
+        .future, .stream => .{ .flat = 1 },
         // Func / component / instance are not value types; reaching
         // them through a `.type_idx` is malformed but treat as scalar.
         .func, .component, .instance => .{ .flat = 1 },
@@ -756,6 +760,7 @@ fn flattenSlots(
         .f32 => try out.append(arena, .f32),
         .f64 => try out.append(arena, .f64),
         .own, .borrow => try out.append(arena, .i32),
+        .error_context => try out.append(arena, .i32),
         .string => {
             try out.append(arena, .i32);
             try out.append(arena, .i32);
@@ -848,6 +853,7 @@ fn flattenTypeDefSlots(
             _ = l;
         },
         .resource => try out.append(arena, .i32),
+        .future, .stream => try out.append(arena, .i32),
         .func, .component, .instance => try out.append(arena, .i32),
     }
 }

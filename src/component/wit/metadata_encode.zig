@@ -1089,9 +1089,16 @@ const BodyBuilder = struct {
             },
             .borrow => |n| try self.handleValType(n, .borrow),
             .own => |n| try self.handleValType(n, .own),
-            // WASI 0.3 (P3) async types are parsed and resolvable but
-            // cannot yet be lowered into a component value type.
-            .future, .stream, .error_context => error.UnsupportedWitFeature,
+            // WASI 0.3 (P3) async value types.
+            .error_context => .error_context,
+            .future => |inner| blk: {
+                const elem: ?ctypes.ValType = if (inner) |p| try self.lowerType(p.*) else null;
+                break :blk try self.appendCompound(.{ .future = .{ .element = elem } });
+            },
+            .stream => |inner| blk: {
+                const elem: ?ctypes.ValType = if (inner) |p| try self.lowerType(p.*) else null;
+                break :blk try self.appendCompound(.{ .stream = .{ .element = elem } });
+            },
         };
     }
 
@@ -1173,6 +1180,7 @@ const BodyBuilder = struct {
         try self.decls.append(self.ar, .{ .type = .{ .func = .{
             .params = params,
             .results = results,
+            .is_async = func.is_async,
         } } });
         self.type_idx += 1;
 
@@ -1451,6 +1459,84 @@ test "metadata_encode: bare `result` return is hoisted into a TypeDef + idx ref"
     try testing.expectEqualStrings("run", iface.decls[2].@"export".name);
     try testing.expect(iface.decls[2].@"export".desc == .func);
     try testing.expectEqual(@as(u32, 1), iface.decls[2].@"export".desc.func);
+}
+
+test "metadata_encode #263: lower P3 stream/future/error-context/async func" {
+    // P2 acceptance for #263: a 0.3.0-style interface using stream<T>,
+    // future<T>, error-context, and an async func lowers + encodes (no
+    // longer `UnsupportedWitFeature`) and round-trips through the loader.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    make-stream: func() -> stream<u8>;
+        \\    make-future: func() -> future<u32>;
+        \\    run: async func();
+        \\    fail: func() -> error-context;
+        \\}
+        \\world app {
+        \\    export things;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    const iface = world.decls[0].type.instance;
+
+    var saw_stream = false;
+    var saw_future = false;
+    var saw_async_func = false;
+    var saw_error_context = false;
+    for (iface.decls) |d| {
+        if (d != .type) continue;
+        switch (d.type) {
+            .stream => saw_stream = true,
+            .future => saw_future = true,
+            .func => |f| {
+                if (f.is_async) saw_async_func = true;
+                if (f.results == .unnamed and f.results.unnamed == .error_context) saw_error_context = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_stream);
+    try testing.expect(saw_future);
+    try testing.expect(saw_async_func);
+    try testing.expect(saw_error_context);
+}
+
+test "metadata_encode #263: embed real wasi:filesystem@0.3.0 (stream/future)" {
+    // Stronger P2 acceptance: encode a world importing the embedded
+    // wasi:filesystem/types@0.3.0 interface, whose functions use
+    // `tuple<stream<u8>, future<result<_, error-code>>>` etc. Exercises the
+    // P3 lowering against the real 0.3.0 WIT (not a hand-written stub).
+    const parser = @import("parser.zig");
+    const resolver_mod = @import("resolver.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const main_doc = try parser.parse(ar,
+        \\package example:app@0.1.0;
+        \\world app {
+        \\  import wasi:filesystem/types@0.3.0;
+        \\}
+    , null);
+    const embedded = try resolver_mod.embeddedWasiDocs(ar);
+    const res = resolver_mod.Resolver.init(main_doc, embedded);
+
+    const bytes = try encodeWorldFromResolver(testing.allocator, res, "app");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    const comp = try loader.load(bytes, ar);
+    try testing.expect(comp.types.len >= 1);
 }
 
 test "metadata_encode: `result<u32, string>` payloads hoist correctly" {

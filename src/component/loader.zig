@@ -256,7 +256,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep => true,
+                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -484,7 +484,7 @@ fn parseTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!c
     // Peek the first byte and dispatch without consuming if not recognized.
     const tag = try reader.peekByte();
     return switch (tag) {
-        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x3F, 0x40, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
+        0x72, 0x71, 0x70, 0x6F, 0x6E, 0x6D, 0x6B, 0x6A, 0x66, 0x65, 0x3F, 0x40, 0x43, 0x41, 0x42 => parseCompoundTypeDef(reader, allocator),
         else => .{ .val = try readValType(reader) },
     };
 }
@@ -558,6 +558,17 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             const err = if (has_err != 0) try readValType(reader) else null;
             break :blk .{ .result = .{ .ok = ok, .err = err } };
         },
+        0x65 => blk: {
+            // future: `0x65` + optional element valtype
+            break :blk .{ .future = .{ .element = try readOptValType(reader) } };
+        },
+        0x66 => blk: {
+            // stream: `0x66` + optional element valtype
+            const elem = try readOptValType(reader);
+            // Spec: `(stream char)` is rejected (temporary).
+            if (elem) |e| if (e == .char) return error.InvalidEncoding;
+            break :blk .{ .stream = .{ .element = elem } };
+        },
         0x3F => blk: {
             // resource: `<rep:CoreValType> <dtor-opt>`. See
             // writer.zig for the symmetric write side; `rep` is
@@ -569,29 +580,8 @@ fn parseCompoundTypeDef(reader: *BinaryReader, allocator: std.mem.Allocator) Loa
             const dtor = if (has_dtor != 0) try reader.readU32() else null;
             break :blk .{ .resource = .{ .destructor = dtor, .rep = rep } };
         },
-        0x40 => blk: {
-            // func type
-            // Current spec (2024): paramlist is a bare vec<labelvaltype>,
-            // resultlist is `0x00 valtype` (one result) | `0x01 0x00` (none).
-            // See: <https://github.com/WebAssembly/component-model/blob/main/design/mvp/Binary.md#type-definitions>
-            const param_count = try reader.readU32();
-            const params = try allocator.alloc(ctypes.NamedValType, param_count);
-            for (params) |*p| {
-                p.name = try reader.readName();
-                p.type = try readValType(reader);
-            }
-            const result_tag = try reader.readByte();
-            const results: ctypes.FuncType.ResultList = switch (result_tag) {
-                0x00 => .{ .unnamed = try readValType(reader) },
-                0x01 => blk2: {
-                    const zero = try reader.readByte();
-                    if (zero != 0x00) return error.InvalidEncoding;
-                    break :blk2 .none;
-                },
-                else => return error.InvalidEncoding,
-            };
-            break :blk .{ .func = .{ .params = params, .results = results } };
-        },
+        0x40 => try parseFuncTypeBody(reader, allocator, false),
+        0x43 => try parseFuncTypeBody(reader, allocator, true),
         0x41 => blk: {
             // component type
             const count = try reader.readU32();
@@ -670,10 +660,44 @@ fn readValType(reader: *BinaryReader) LoadError!ctypes.ValType {
         0x75 => .f64,
         0x74 => .char,
         0x73 => .string,
+        0x64 => .error_context,
         0x69 => .{ .own = try reader.readU32() },
         0x68 => .{ .borrow = try reader.readU32() },
         else => error.InvalidEncoding,
     };
+}
+
+/// Read an optional valtype: `0x00` → none, `0x01 <valtype>` → some.
+/// Used by `future` / `stream` element types.
+fn readOptValType(reader: *BinaryReader) LoadError!?ctypes.ValType {
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => null,
+        0x01 => try readValType(reader),
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Parse a func type body (paramlist + resultlist) after the `0x40`
+/// (sync) / `0x43` (async) tag has been consumed.
+fn parseFuncTypeBody(reader: *BinaryReader, allocator: std.mem.Allocator, is_async: bool) LoadError!ctypes.TypeDef {
+    const param_count = try reader.readU32();
+    const params = try allocator.alloc(ctypes.NamedValType, param_count);
+    for (params) |*p| {
+        p.name = try reader.readName();
+        p.type = try readValType(reader);
+    }
+    const result_tag = try reader.readByte();
+    const results: ctypes.FuncType.ResultList = switch (result_tag) {
+        0x00 => .{ .unnamed = try readValType(reader) },
+        0x01 => blk: {
+            const zero = try reader.readByte();
+            if (zero != 0x00) return error.InvalidEncoding;
+            break :blk .none;
+        },
+        else => return error.InvalidEncoding,
+    };
+    return .{ .func = .{ .params = params, .results = results, .is_async = is_async } };
 }
 
 fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.Canon {
@@ -703,6 +727,82 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         0x02 => .{ .resource_new = try reader.readU32() },
         0x03 => .{ .resource_drop = try reader.readU32() },
         0x04 => .{ .resource_rep = try reader.readU32() },
+        0x15 => .{ .future_new = try reader.readU32() },
+        0x16 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .future_read = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x17 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .future_write = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x18 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .future_cancel_read = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x19 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .future_cancel_write = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x1A => .{ .future_drop_readable = try reader.readU32() },
+        0x1B => .{ .future_drop_writable = try reader.readU32() },
+        0x0E => .{ .stream_new = try reader.readU32() },
+        0x0F => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_read = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x10 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_write = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x11 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_read = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x12 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_write = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x13 => .{ .stream_drop_readable = try reader.readU32() },
+        0x14 => .{ .stream_drop_writable = try reader.readU32() },
+        0x1C => .{ .error_context_new = try readCanonOpts(reader, allocator) },
+        0x1D => .{ .error_context_debug_message = try readCanonOpts(reader, allocator) },
+        0x1E => .error_context_drop,
+        0x09 => blk: {
+            const results = try readResultList(reader, allocator);
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .task_return = .{ .results = results, .opts = opts } };
+        },
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read an `async?` immediate: `0x00` → false, `0x01` → true.
+fn readAsyncFlag(reader: *BinaryReader) LoadError!bool {
+    return switch (try reader.readByte()) {
+        0x00 => false,
+        0x01 => true,
+        else => error.InvalidEncoding,
+    };
+}
+
+/// Read a `resultlist`: `0x00 <valtype>` (one result) | `0x01 0x00`
+/// (none). Mirrors `parseFuncTypeBody`'s result handling; used by
+/// `task.return`.
+fn readResultList(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!ctypes.FuncType.ResultList {
+    _ = allocator;
+    const tag = try reader.readByte();
+    return switch (tag) {
+        0x00 => .{ .unnamed = try readValType(reader) },
+        0x01 => blk: {
+            const zero = try reader.readByte();
+            if (zero != 0x00) return error.InvalidEncoding;
+            break :blk .none;
+        },
         else => error.InvalidEncoding,
     };
 }
@@ -720,6 +820,8 @@ fn readCanonOpts(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             0x03 => .{ .memory = try reader.readU32() },
             0x04 => .{ .realloc = try reader.readU32() },
             0x05 => .{ .post_return = try reader.readU32() },
+            0x06 => .async_,
+            0x07 => .{ .callback = try reader.readU32() },
             else => return error.InvalidEncoding,
         };
     }
@@ -899,6 +1001,95 @@ test "readValType: rejects unknown negative code" {
     try std.testing.expectError(error.InvalidEncoding, readValType(&reader));
 }
 
+test "readValType: error-context (#263)" {
+    var reader = BinaryReader{ .data = &[_]u8{0x64} };
+    const v = try readValType(&reader);
+    try std.testing.expect(v == .error_context);
+}
+
+test "parseTypeDef: future / stream (#263)" {
+    // future<u8>: 0x65 0x01 0x7D ; bare future: 0x65 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x65, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.future.element == null);
+    }
+    // stream<u8>: 0x66 0x01 0x7D ; bare stream: 0x66 0x00
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x7D } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element.? == .u8);
+    }
+    {
+        var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x00 } };
+        const td = try parseTypeDef(&reader, std.testing.allocator);
+        try std.testing.expect(td.stream.element == null);
+    }
+}
+
+test "parseTypeDef: rejects (stream char) (#263)" {
+    // 0x66 0x01 0x74 — stream<char> is rejected by the spec.
+    var reader = BinaryReader{ .data = &[_]u8{ 0x66, 0x01, 0x74 } };
+    try std.testing.expectError(error.InvalidEncoding, parseTypeDef(&reader, std.testing.allocator));
+}
+
+test "parseTypeDef: async func type (#263)" {
+    // async `() -> ()`: 0x43 + paramcount 0x00 + result `0x01 0x00`.
+    var areader = BinaryReader{ .data = &[_]u8{ 0x43, 0x00, 0x01, 0x00 } };
+    const atd = try parseTypeDef(&areader, std.testing.allocator);
+    try std.testing.expect(atd.func.is_async);
+    // sync uses 0x40.
+    var sreader = BinaryReader{ .data = &[_]u8{ 0x40, 0x00, 0x01, 0x00 } };
+    const std_td = try parseTypeDef(&sreader, std.testing.allocator);
+    try std.testing.expect(!std_td.func.is_async);
+}
+
+test "round-trip P3 type defs through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const type_defs = [_]ctypes.TypeDef{
+        .{ .val = .error_context },
+        .{ .future = .{ .element = .u8 } },
+        .{ .future = .{ .element = null } },
+        .{ .stream = .{ .element = .u8 } },
+        .{ .stream = .{ .element = null } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = true } },
+        .{ .func = .{ .params = &.{}, .results = .none, .is_async = false } },
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 7), loaded.types.len);
+    try std.testing.expect(loaded.types[0] == .val and loaded.types[0].val == .error_context);
+    try std.testing.expect(loaded.types[1].future.element.? == .u8);
+    try std.testing.expect(loaded.types[2].future.element == null);
+    try std.testing.expect(loaded.types[3].stream.element.? == .u8);
+    try std.testing.expect(loaded.types[4].stream.element == null);
+    try std.testing.expect(loaded.types[5].func.is_async);
+    try std.testing.expect(!loaded.types[6].func.is_async);
+}
+
 test "parseTypeDef: instance type with `sub resource` type decl" {
     // Mirrors the first type definition in every Rust wasm32-wasip2 component:
     //   (type (instance
@@ -1013,4 +1204,180 @@ test "load: real wasm32-wasip2 Rust component (stdio-echo)" {
             return err;
         };
     }
+}
+
+test "load: real P3 (component-model-async) component (#263)" {
+    // `fixtures/p3-future.wasm` — a minimal component assembled with
+    // `wasm-tools` from a hand-written .wat that uses `(future)`,
+    // `canon future.new`, `canon future.read` (memory opt), and an
+    // `async` `canon lift`. Ground-truth for wabt's P3 canon decoding;
+    // `wasm-tools validate --features=cm-async,cm-async-builtins,
+    // cm-async-stackful` accepts it.
+    const data = @embedFile("fixtures/p3-future.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+
+    var saw_future_new = false;
+    var saw_future_read = false;
+    var saw_async_lift = false;
+    for (comp.canons) |c| switch (c) {
+        .future_new => saw_future_new = true,
+        .future_read => |rw| {
+            saw_future_read = true;
+            // `future.read` carries a `(memory 0)` option.
+            try std.testing.expect(rw.opts.len == 1 and rw.opts[0] == .memory);
+        },
+        .lift => |l| for (l.opts) |o| {
+            if (o == .async_) saw_async_lift = true;
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_future_new);
+    try std.testing.expect(saw_future_read);
+    try std.testing.expect(saw_async_lift);
+
+    // Round-trip: re-encode and re-load; the canon kinds must survive.
+    const writer = @import("writer.zig");
+    const bytes2 = try writer.encode(arena.allocator(), &comp);
+    const comp2 = try load(bytes2, arena.allocator());
+    try std.testing.expectEqual(comp.canons.len, comp2.canons.len);
+    var fnew2 = false;
+    var fread2 = false;
+    for (comp2.canons) |c| switch (c) {
+        .future_new => fnew2 = true,
+        .future_read => fread2 = true,
+        else => {},
+    };
+    try std.testing.expect(fnew2 and fread2);
+}
+
+test "load: real P3 stream component (#263)" {
+    // `fixtures/p3-stream.wasm`: (stream u8) + stream.new + stream.read.
+    const data = @embedFile("fixtures/p3-stream.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_read = false;
+    for (comp.canons) |c| switch (c) {
+        .stream_new => saw_new = true,
+        .stream_read => |rw| {
+            saw_read = true;
+            try std.testing.expect(rw.opts.len == 1 and rw.opts[0] == .memory);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_read);
+}
+
+test "load: real P3 error-context component (#263)" {
+    // `fixtures/p3-error-context.wasm`: error-context.new / .debug-message / .drop.
+    const data = @embedFile("fixtures/p3-error-context.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_dbg = false;
+    var saw_drop = false;
+    for (comp.canons) |c| switch (c) {
+        .error_context_new => saw_new = true,
+        .error_context_debug_message => saw_dbg = true,
+        .error_context_drop => saw_drop = true,
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_dbg and saw_drop);
+}
+
+test "round-trip future-family canons + task.return through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const canons = [_]ctypes.Canon{
+        .{ .future_new = 0 },
+        .{ .future_read = .{ .type_idx = 0, .opts = &.{.{ .memory = 0 }} } },
+        .{ .future_write = .{ .type_idx = 0, .opts = &.{} } },
+        .{ .future_cancel_read = .{ .type_idx = 0, .is_async = true } },
+        .{ .future_cancel_write = .{ .type_idx = 0, .is_async = false } },
+        .{ .future_drop_readable = 0 },
+        .{ .future_drop_writable = 0 },
+        .{ .task_return = .{ .results = .none, .opts = &.{.async_} } },
+    };
+    // A single `(future)` type so the canons' type indices resolve.
+    const type_defs = [_]ctypes.TypeDef{.{ .future = .{ .element = null } }};
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 8), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .future_new);
+    try std.testing.expect(loaded.canons[1].future_read.opts[0] == .memory);
+    try std.testing.expect(loaded.canons[2] == .future_write);
+    try std.testing.expect(loaded.canons[3].future_cancel_read.is_async);
+    try std.testing.expect(!loaded.canons[4].future_cancel_write.is_async);
+    try std.testing.expect(loaded.canons[5] == .future_drop_readable);
+    try std.testing.expect(loaded.canons[6] == .future_drop_writable);
+    try std.testing.expect(loaded.canons[7].task_return.opts[0] == .async_);
+}
+
+test "round-trip stream-family + error-context canons through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const canons = [_]ctypes.Canon{
+        .{ .stream_new = 0 },
+        .{ .stream_read = .{ .type_idx = 0, .opts = &.{.{ .memory = 0 }} } },
+        .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } },
+        .{ .stream_cancel_read = .{ .type_idx = 0, .is_async = true } },
+        .{ .stream_cancel_write = .{ .type_idx = 0, .is_async = false } },
+        .{ .stream_drop_readable = 0 },
+        .{ .stream_drop_writable = 0 },
+        .{ .error_context_new = &.{.{ .memory = 0 }} },
+        .{ .error_context_debug_message = &.{.{ .realloc = 0 }} },
+        .error_context_drop,
+    };
+    const type_defs = [_]ctypes.TypeDef{.{ .stream = .{ .element = .u8 } }};
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 10), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .stream_new);
+    try std.testing.expect(loaded.canons[1].stream_read.opts[0] == .memory);
+    try std.testing.expect(loaded.canons[2] == .stream_write);
+    try std.testing.expect(loaded.canons[3].stream_cancel_read.is_async);
+    try std.testing.expect(!loaded.canons[4].stream_cancel_write.is_async);
+    try std.testing.expect(loaded.canons[5] == .stream_drop_readable);
+    try std.testing.expect(loaded.canons[6] == .stream_drop_writable);
+    try std.testing.expect(loaded.canons[7].error_context_new[0] == .memory);
+    try std.testing.expect(loaded.canons[8].error_context_debug_message[0] == .realloc);
+    try std.testing.expect(loaded.canons[9] == .error_context_drop);
 }

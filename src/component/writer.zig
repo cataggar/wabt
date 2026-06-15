@@ -456,6 +456,16 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
                 try w.appendByte(0x00);
             }
         },
+        .future => |f| {
+            // `(future t?)` → 0x65 + optional element valtype.
+            try w.appendByte(0x65);
+            try writeOptValType(w, f.element);
+        },
+        .stream => |s| {
+            // `(stream t?)` → 0x66 + optional element valtype.
+            try w.appendByte(0x66);
+            try writeOptValType(w, s.element);
+        },
         .resource => |r| {
             // `(sub resource)` is encoded as `0x3F` followed by the
             // representation core valtype byte, then the destructor
@@ -477,7 +487,12 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
             }
         },
         .func => |f| {
-            try w.appendByte(0x40);
+            // `0x43` for an async function type, `0x40` for sync. The
+            // async-functype byte is what wasmtime 46 (wasmparser 0.251)
+            // reads to mark a `ComponentFuncType` async — required for the
+            // `async` canon lift/lower option to validate. (The older
+            // wasm-tools 1.239 CLI / wasmparser 0.227 predates 0x43.)
+            try w.appendByte(if (f.is_async) 0x43 else 0x40);
             if (f.params.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(f.params.len));
             for (f.params) |p| {
@@ -583,6 +598,84 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
             try w.appendByte(0x04);
             try w.writeU32Leb(idx);
         },
+        .future_new => |idx| {
+            try w.appendByte(0x15);
+            try w.writeU32Leb(idx);
+        },
+        .future_read => |rw| {
+            try w.appendByte(0x16);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .future_write => |rw| {
+            try w.appendByte(0x17);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .future_cancel_read => |cancel| {
+            try w.appendByte(0x18);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .future_cancel_write => |cancel| {
+            try w.appendByte(0x19);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .future_drop_readable => |idx| {
+            try w.appendByte(0x1A);
+            try w.writeU32Leb(idx);
+        },
+        .future_drop_writable => |idx| {
+            try w.appendByte(0x1B);
+            try w.writeU32Leb(idx);
+        },
+        .stream_new => |idx| {
+            try w.appendByte(0x0E);
+            try w.writeU32Leb(idx);
+        },
+        .stream_read => |rw| {
+            try w.appendByte(0x0F);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .stream_write => |rw| {
+            try w.appendByte(0x10);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .stream_cancel_read => |cancel| {
+            try w.appendByte(0x11);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .stream_cancel_write => |cancel| {
+            try w.appendByte(0x12);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .stream_drop_readable => |idx| {
+            try w.appendByte(0x13);
+            try w.writeU32Leb(idx);
+        },
+        .stream_drop_writable => |idx| {
+            try w.appendByte(0x14);
+            try w.writeU32Leb(idx);
+        },
+        .error_context_new => |opts| {
+            try w.appendByte(0x1C);
+            try writeCanonOpts(w, opts);
+        },
+        .error_context_debug_message => |opts| {
+            try w.appendByte(0x1D);
+            try writeCanonOpts(w, opts);
+        },
+        .error_context_drop => try w.appendByte(0x1E),
+        .task_return => |t| {
+            try w.appendByte(0x09);
+            try writeResultList(w, t.results);
+            try writeCanonOpts(w, t.opts);
+        },
     }
 }
 
@@ -608,7 +701,37 @@ fn writeCanonOpts(w: *Writer, opts: []const ctypes.CanonOpt) EncodeError!void {
                 try w.appendByte(0x05);
                 try w.writeU32Leb(idx);
             },
+            .async_ => try w.appendByte(0x06),
+            .callback => |idx| {
+                try w.appendByte(0x07);
+                try w.writeU32Leb(idx);
+            },
         }
+    }
+}
+
+/// Encode a func/task result list: `0x00 <valtype>` for one result,
+/// `0x01 0x00` for none. (Matches the `resultlist` grammar; reused by
+/// `task.return`.)
+fn writeResultList(w: *Writer, results: ctypes.FuncType.ResultList) EncodeError!void {
+    switch (results) {
+        .none => {
+            try w.appendByte(0x01);
+            try w.appendByte(0x00);
+        },
+        .unnamed => |vt| {
+            try w.appendByte(0x00);
+            try writeValType(w, vt);
+        },
+        .named => |list| {
+            try w.appendByte(0x01);
+            if (list.len > std.math.maxInt(u32)) return error.ValueTooLarge;
+            try w.writeU32Leb(@intCast(list.len));
+            for (list) |nv| {
+                try w.writeName(nv.name);
+                try writeValType(w, nv.type);
+            }
+        },
     }
 }
 
@@ -708,6 +831,17 @@ fn synthSortIdxFromDesc(desc: ctypes.ExternDesc) ctypes.SortIdx {
 
 // ── Shared encoders for nested forms ───────────────────────────────────────
 
+/// Encode an optional valtype: `0x00` for none, `0x01 <valtype>` for some.
+/// Used by `future` / `stream` element types.
+fn writeOptValType(w: *Writer, vt: ?ctypes.ValType) EncodeError!void {
+    if (vt) |t| {
+        try w.appendByte(0x01);
+        try writeValType(w, t);
+    } else {
+        try w.appendByte(0x00);
+    }
+}
+
 fn writeValType(w: *Writer, vt: ctypes.ValType) EncodeError!void {
     switch (vt) {
         .bool => try w.writeS64Leb(-1), // 0x7F → -1 in s33
@@ -723,6 +857,8 @@ fn writeValType(w: *Writer, vt: ctypes.ValType) EncodeError!void {
         .f64 => try w.writeS64Leb(-11),
         .char => try w.writeS64Leb(-12),
         .string => try w.writeS64Leb(-13),
+        // `error-context` is primvaltype 0x64 → s33 -28 (0x64 - 0x80).
+        .error_context => try w.writeS64Leb(-28),
         .own => |idx| {
             // 0x69 → -23 in s33
             try w.writeS64Leb(-23);

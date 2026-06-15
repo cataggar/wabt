@@ -352,7 +352,9 @@ fn resolveFuncSig(arena: Allocator, slots: []const TypeSlot, sig: ctypes.FuncTyp
             break :blk .{ .named = dst };
         },
     };
-    return .{ .params = params, .results = results };
+    // Preserve async-ness from the func type (`0x43`); the original
+    // resolver dropped it, which hid `async func` from generation.
+    return .{ .params = params, .results = results, .is_async = sig.is_async };
 }
 
 fn resolveValType(slots: []const TypeSlot, vt: ctypes.ValType) ctypes.ValType {
