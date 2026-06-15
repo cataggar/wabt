@@ -334,6 +334,31 @@ pub const CanonOpt = union(enum) {
     post_return: u32, // core func index
     /// String encoding to use.
     string_encoding: StringEncoding,
+    /// `async` lift/lower option (P3, binary `0x06`). Named with a
+    /// trailing underscore because `async` is reserved.
+    async_,
+    /// `(callback f)` option (P3, binary `0x07`) — core func index.
+    callback: u32,
+};
+
+/// `{ type-index, opts }` payload shared by `future.read`/`.write` (and
+/// later `stream.read`/`.write`).
+pub const CanonRW = struct {
+    type_idx: u32,
+    opts: []const CanonOpt,
+};
+
+/// `{ type-index, async? }` payload for `future.cancel-*` (and later
+/// `stream.cancel-*`).
+pub const CanonCancel = struct {
+    type_idx: u32,
+    is_async: bool,
+};
+
+/// `{ results, opts }` payload for `task.return`.
+pub const CanonTaskReturn = struct {
+    results: FuncType.ResultList,
+    opts: []const CanonOpt,
 };
 
 /// Canonical function definitions.
@@ -355,6 +380,24 @@ pub const Canon = union(enum) {
     resource_drop: u32, // resource type index
     /// Get the representation of a resource handle.
     resource_rep: u32, // resource type index
+
+    // ── P3 component-model-async built-ins (added demand-driven) ──
+    /// `future.new <ty>` (binary `0x15`).
+    future_new: u32,
+    /// `future.read <ty> <opts>` (binary `0x16`).
+    future_read: CanonRW,
+    /// `future.write <ty> <opts>` (binary `0x17`).
+    future_write: CanonRW,
+    /// `future.cancel-read <ty> <async?>` (binary `0x18`).
+    future_cancel_read: CanonCancel,
+    /// `future.cancel-write <ty> <async?>` (binary `0x19`).
+    future_cancel_write: CanonCancel,
+    /// `future.drop-readable <ty>` (binary `0x1a`).
+    future_drop_readable: u32,
+    /// `future.drop-writable <ty>` (binary `0x1b`).
+    future_drop_writable: u32,
+    /// `task.return <results> <opts>` (binary `0x09`).
+    task_return: CanonTaskReturn,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────

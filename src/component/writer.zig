@@ -594,6 +594,43 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
             try w.appendByte(0x04);
             try w.writeU32Leb(idx);
         },
+        .future_new => |idx| {
+            try w.appendByte(0x15);
+            try w.writeU32Leb(idx);
+        },
+        .future_read => |rw| {
+            try w.appendByte(0x16);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .future_write => |rw| {
+            try w.appendByte(0x17);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .future_cancel_read => |cancel| {
+            try w.appendByte(0x18);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .future_cancel_write => |cancel| {
+            try w.appendByte(0x19);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .future_drop_readable => |idx| {
+            try w.appendByte(0x1A);
+            try w.writeU32Leb(idx);
+        },
+        .future_drop_writable => |idx| {
+            try w.appendByte(0x1B);
+            try w.writeU32Leb(idx);
+        },
+        .task_return => |t| {
+            try w.appendByte(0x09);
+            try writeResultList(w, t.results);
+            try writeCanonOpts(w, t.opts);
+        },
     }
 }
 
@@ -619,7 +656,37 @@ fn writeCanonOpts(w: *Writer, opts: []const ctypes.CanonOpt) EncodeError!void {
                 try w.appendByte(0x05);
                 try w.writeU32Leb(idx);
             },
+            .async_ => try w.appendByte(0x06),
+            .callback => |idx| {
+                try w.appendByte(0x07);
+                try w.writeU32Leb(idx);
+            },
         }
+    }
+}
+
+/// Encode a func/task result list: `0x00 <valtype>` for one result,
+/// `0x01 0x00` for none. (Matches the `resultlist` grammar; reused by
+/// `task.return`.)
+fn writeResultList(w: *Writer, results: ctypes.FuncType.ResultList) EncodeError!void {
+    switch (results) {
+        .none => {
+            try w.appendByte(0x01);
+            try w.appendByte(0x00);
+        },
+        .unnamed => |vt| {
+            try w.appendByte(0x00);
+            try writeValType(w, vt);
+        },
+        .named => |list| {
+            try w.appendByte(0x01);
+            if (list.len > std.math.maxInt(u32)) return error.ValueTooLarge;
+            try w.writeU32Leb(@intCast(list.len));
+            for (list) |nv| {
+                try w.writeName(nv.name);
+                try writeValType(w, nv.type);
+            }
+        },
     }
 }
 

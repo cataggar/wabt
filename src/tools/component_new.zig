@@ -4952,6 +4952,7 @@ fn liftOptCounts(loaded: anytype) LiftOptCounts {
             .realloc => c.realloc += 1,
             .string_encoding => c.string_encoding += 1,
             .post_return => c.post_return += 1,
+            .async_, .callback => {},
         },
         else => {},
     };
