@@ -396,6 +396,26 @@ pub const Canon = union(enum) {
     future_drop_readable: u32,
     /// `future.drop-writable <ty>` (binary `0x1b`).
     future_drop_writable: u32,
+    /// `stream.new <ty>` (binary `0x0e`).
+    stream_new: u32,
+    /// `stream.read <ty> <opts>` (binary `0x0f`).
+    stream_read: CanonRW,
+    /// `stream.write <ty> <opts>` (binary `0x10`).
+    stream_write: CanonRW,
+    /// `stream.cancel-read <ty> <async?>` (binary `0x11`).
+    stream_cancel_read: CanonCancel,
+    /// `stream.cancel-write <ty> <async?>` (binary `0x12`).
+    stream_cancel_write: CanonCancel,
+    /// `stream.drop-readable <ty>` (binary `0x13`).
+    stream_drop_readable: u32,
+    /// `stream.drop-writable <ty>` (binary `0x14`).
+    stream_drop_writable: u32,
+    /// `error-context.new <opts>` (binary `0x1c`).
+    error_context_new: []const CanonOpt,
+    /// `error-context.debug-message <opts>` (binary `0x1d`).
+    error_context_debug_message: []const CanonOpt,
+    /// `error-context.drop` (binary `0x1e`).
+    error_context_drop,
     /// `task.return <results> <opts>` (binary `0x09`).
     task_return: CanonTaskReturn,
 };

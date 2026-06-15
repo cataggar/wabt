@@ -626,6 +626,47 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
             try w.appendByte(0x1B);
             try w.writeU32Leb(idx);
         },
+        .stream_new => |idx| {
+            try w.appendByte(0x0E);
+            try w.writeU32Leb(idx);
+        },
+        .stream_read => |rw| {
+            try w.appendByte(0x0F);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .stream_write => |rw| {
+            try w.appendByte(0x10);
+            try w.writeU32Leb(rw.type_idx);
+            try writeCanonOpts(w, rw.opts);
+        },
+        .stream_cancel_read => |cancel| {
+            try w.appendByte(0x11);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .stream_cancel_write => |cancel| {
+            try w.appendByte(0x12);
+            try w.writeU32Leb(cancel.type_idx);
+            try w.appendByte(if (cancel.is_async) 0x01 else 0x00);
+        },
+        .stream_drop_readable => |idx| {
+            try w.appendByte(0x13);
+            try w.writeU32Leb(idx);
+        },
+        .stream_drop_writable => |idx| {
+            try w.appendByte(0x14);
+            try w.writeU32Leb(idx);
+        },
+        .error_context_new => |opts| {
+            try w.appendByte(0x1C);
+            try writeCanonOpts(w, opts);
+        },
+        .error_context_debug_message => |opts| {
+            try w.appendByte(0x1D);
+            try writeCanonOpts(w, opts);
+        },
+        .error_context_drop => try w.appendByte(0x1E),
         .task_return => |t| {
             try w.appendByte(0x09);
             try writeResultList(w, t.results);

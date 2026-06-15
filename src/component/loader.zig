@@ -256,7 +256,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .task_return => true,
+                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -748,6 +748,30 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         },
         0x1A => .{ .future_drop_readable = try reader.readU32() },
         0x1B => .{ .future_drop_writable = try reader.readU32() },
+        0x0E => .{ .stream_new = try reader.readU32() },
+        0x0F => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_read = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x10 => blk: {
+            const ty = try reader.readU32();
+            const opts = try readCanonOpts(reader, allocator);
+            break :blk .{ .stream_write = .{ .type_idx = ty, .opts = opts } };
+        },
+        0x11 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_read = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x12 => blk: {
+            const ty = try reader.readU32();
+            break :blk .{ .stream_cancel_write = .{ .type_idx = ty, .is_async = try readAsyncFlag(reader) } };
+        },
+        0x13 => .{ .stream_drop_readable = try reader.readU32() },
+        0x14 => .{ .stream_drop_writable = try reader.readU32() },
+        0x1C => .{ .error_context_new = try readCanonOpts(reader, allocator) },
+        0x1D => .{ .error_context_debug_message = try readCanonOpts(reader, allocator) },
+        0x1E => .error_context_drop,
         0x09 => blk: {
             const results = try readResultList(reader, allocator);
             const opts = try readCanonOpts(reader, allocator);
@@ -1228,6 +1252,43 @@ test "load: real P3 (component-model-async) component (#263)" {
     try std.testing.expect(fnew2 and fread2);
 }
 
+test "load: real P3 stream component (#263)" {
+    // `fixtures/p3-stream.wasm`: (stream u8) + stream.new + stream.read.
+    const data = @embedFile("fixtures/p3-stream.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_read = false;
+    for (comp.canons) |c| switch (c) {
+        .stream_new => saw_new = true,
+        .stream_read => |rw| {
+            saw_read = true;
+            try std.testing.expect(rw.opts.len == 1 and rw.opts[0] == .memory);
+        },
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_read);
+}
+
+test "load: real P3 error-context component (#263)" {
+    // `fixtures/p3-error-context.wasm`: error-context.new / .debug-message / .drop.
+    const data = @embedFile("fixtures/p3-error-context.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const comp = try load(data, arena.allocator());
+    var saw_new = false;
+    var saw_dbg = false;
+    var saw_drop = false;
+    for (comp.canons) |c| switch (c) {
+        .error_context_new => saw_new = true,
+        .error_context_debug_message => saw_dbg = true,
+        .error_context_drop => saw_drop = true,
+        else => {},
+    };
+    try std.testing.expect(saw_new and saw_dbg and saw_drop);
+}
+
 test "round-trip future-family canons + task.return through writer + loader (#263)" {
     const writer = @import("writer.zig");
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1271,4 +1332,52 @@ test "round-trip future-family canons + task.return through writer + loader (#26
     try std.testing.expect(loaded.canons[5] == .future_drop_readable);
     try std.testing.expect(loaded.canons[6] == .future_drop_writable);
     try std.testing.expect(loaded.canons[7].task_return.opts[0] == .async_);
+}
+
+test "round-trip stream-family + error-context canons through writer + loader (#263)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const canons = [_]ctypes.Canon{
+        .{ .stream_new = 0 },
+        .{ .stream_read = .{ .type_idx = 0, .opts = &.{.{ .memory = 0 }} } },
+        .{ .stream_write = .{ .type_idx = 0, .opts = &.{} } },
+        .{ .stream_cancel_read = .{ .type_idx = 0, .is_async = true } },
+        .{ .stream_cancel_write = .{ .type_idx = 0, .is_async = false } },
+        .{ .stream_drop_readable = 0 },
+        .{ .stream_drop_writable = 0 },
+        .{ .error_context_new = &.{.{ .memory = 0 }} },
+        .{ .error_context_debug_message = &.{.{ .realloc = 0 }} },
+        .error_context_drop,
+    };
+    const type_defs = [_]ctypes.TypeDef{.{ .stream = .{ .element = .u8 } }};
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &type_defs,
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 10), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .stream_new);
+    try std.testing.expect(loaded.canons[1].stream_read.opts[0] == .memory);
+    try std.testing.expect(loaded.canons[2] == .stream_write);
+    try std.testing.expect(loaded.canons[3].stream_cancel_read.is_async);
+    try std.testing.expect(!loaded.canons[4].stream_cancel_write.is_async);
+    try std.testing.expect(loaded.canons[5] == .stream_drop_readable);
+    try std.testing.expect(loaded.canons[6] == .stream_drop_writable);
+    try std.testing.expect(loaded.canons[7].error_context_new[0] == .memory);
+    try std.testing.expect(loaded.canons[8].error_context_debug_message[0] == .realloc);
+    try std.testing.expect(loaded.canons[9] == .error_context_drop);
 }
