@@ -1252,13 +1252,17 @@ fn parseAsyncElement(spec: []const u8) ?ctypes.ValType {
 }
 
 /// True if the core imports any memory-opt async intrinsic
-/// (`stream.read`/`.write`) — these need `(memory)`/`(realloc)` canon
-/// opts pointing at the main instance, forcing the shim/fixup path.
+/// (`stream.read`/`.write`, `future.read`/`.write`) — these need
+/// `(memory)`/`(realloc)` canon opts pointing at the main instance,
+/// forcing the shim/fixup path.
 fn coreNeedsAsyncMemOpShim(ar: std.mem.Allocator, core_bytes: []const u8) bool {
     if (core_imports.extract(ar, core_bytes)) |oi| {
         for (oi.interface.imports) |im| {
             if (im.kind != .func) continue;
             if (std.mem.startsWith(u8, im.module_name, "[stream]") and
+                (std.mem.eql(u8, im.field_name, "read") or std.mem.eql(u8, im.field_name, "write")))
+                return true;
+            if (std.mem.startsWith(u8, im.module_name, "[future]") and
                 (std.mem.eql(u8, im.field_name, "read") or std.mem.eql(u8, im.field_name, "write")))
                 return true;
             if (std.mem.eql(u8, im.module_name, "[error-context]") and
@@ -1731,11 +1735,13 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     //
     //    Handled now: `[task-return]<export>` → `canon task.return`;
     //    `[stream]stream<T>` → `canon stream.{new,drop-readable,drop-
-    //    writable}` over a hoisted `(stream T)` type. Ops needing
-    //    `(memory)`/`(realloc)` opts (`stream.read`/`.write`,
+    //    writable}` over a hoisted `(stream T)` type; `[future]future<T>`
+    //    → `canon future.{new,drop-readable,drop-writable}` over a hoisted
+    //    `(future T)` type. Ops needing `(memory)`/`(realloc)` opts
+    //    (`stream.read`/`.write`, `future.read`/`.write`,
     //    `error-context.*`) require the main instance's memory — a
     //    forward-reference that needs the shim/fixup path — and are
-    //    rejected for now with `error.UnsupportedAsyncIntrinsic`.
+    //    rejected here with `error.UnsupportedAsyncIntrinsic`.
     const AsyncBundle = struct { module: []const u8, core_inst_idx: u32 };
     var async_bundles = std.ArrayListUnmanaged(AsyncBundle).empty;
     {
@@ -1789,6 +1795,8 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         // `stream<T>` spec → component `(stream T)` type idx (shared by all
         // canons over the same element type).
         var stream_type_idx = std.StringHashMapUnmanaged(u32).empty;
+        // `future<T>` spec → component `(future T)` type idx (same sharing).
+        var future_type_idx = std.StringHashMapUnmanaged(u32).empty;
 
         for (groups.items) |grp| {
             var bundle_exports = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
@@ -1857,9 +1865,35 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
                     core_func_idx += 1;
                 }
+            } else if (std.mem.startsWith(u8, grp.module, "[future]")) {
+                const spec = grp.module["[future]".len..]; // e.g. `future<u8>`
+                const elem = parseAsyncElement(spec) orelse return error.UnsupportedAsyncIntrinsic;
+                const ty_idx = future_type_idx.get(spec) orelse blk: {
+                    try types.append(ar, .{ .future = .{ .element = elem } });
+                    try Section.appendType(&order, ar, types.items.len);
+                    const idx = comp_type_idx;
+                    comp_type_idx += 1;
+                    try future_type_idx.put(ar, spec, idx);
+                    break :blk idx;
+                };
+                for (grp.fields.items) |field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field, "new"))
+                        .{ .future_new = ty_idx }
+                    else if (std.mem.eql(u8, field, "drop-readable"))
+                        .{ .future_drop_readable = ty_idx }
+                    else if (std.mem.eql(u8, field, "drop-writable"))
+                        .{ .future_drop_writable = ty_idx }
+                    else
+                        // `read`/`write`/`cancel-*` need `(memory)` opts.
+                        return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
             } else {
-                // `[error-context]` / `[future]` / `[waitable-set]` /
-                // `[waitable]`: not yet wired (memory opts / IR work).
+                // `[error-context]` / `[waitable-set]` / `[waitable]`: not
+                // yet wired here (memory opts / IR work).
                 return error.UnsupportedAsyncIntrinsic;
             }
 
@@ -2393,7 +2427,7 @@ fn buildComponentShimFixup(
         mem_op_slot: u32 = 0,
         satisfy_core_idx: u32 = 0,
     };
-    const AsyncFamily = enum { task_return, stream, error_context };
+    const AsyncFamily = enum { task_return, stream, future, error_context };
     const AsyncGroup = struct {
         module: []const u8,
         family: AsyncFamily,
@@ -2455,6 +2489,29 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .stream,
+                    .elem = elem,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[future]")) {
+                const elem = parseAsyncElement(module["[future]".len..]) orelse
+                    return error.UnsupportedAsyncIntrinsic;
+                for (fsrc, 0..) |f, k| {
+                    const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
+                    const no_mem = std.mem.eql(u8, f, "new") or
+                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable");
+                    if (!mem_op and !no_mem) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = mem_op };
+                    if (mem_op) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        // future.read/write lower to (handle, ptr)->i32 — no
+                        // count param (a future carries a single value).
+                        try async_memop_slots.append(ar, .{ .params = &i32x2_params, .results = &i32_results });
+                    }
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .future,
                     .elem = elem,
                     .export_ref = "",
                     .fields = fields,
@@ -2918,6 +2975,28 @@ fn buildComponentShimFixup(
                     core_func_idx += 1;
                 }
             },
+            .future => {
+                try types.append(ar, .{ .future = .{ .element = grp.elem } });
+                try Section.appendType(&order, ar, types.items.len);
+                grp.stream_type_idx = comp_type_idx;
+                comp_type_idx += 1;
+                for (grp.fields) |*field| {
+                    if (field.is_mem_op) {
+                        field.satisfy_core_idx = async_memop_stub_core_base + field.mem_op_slot;
+                        continue;
+                    }
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field.name, "new"))
+                        .{ .future_new = grp.stream_type_idx }
+                    else if (std.mem.eql(u8, field.name, "drop-readable"))
+                        .{ .future_drop_readable = grp.stream_type_idx }
+                    else
+                        .{ .future_drop_writable = grp.stream_type_idx };
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
             .error_context => {
                 for (grp.fields) |*field| {
                     if (field.is_mem_op) {
@@ -3108,10 +3187,10 @@ fn buildComponentShimFixup(
     }
 
     // ── #263 Phase 4f.2: real memory-opt async canons (stream.read /
-    //    .write, error-context.new / .debug-message) with `(memory)` /
-    //    `(realloc)` opts pointing at main. Emitted in mem-op-slot order
-    //    so slot j ↔ `async_memop_real_core_base + j`; the fixup (Phase
-    //    4g) patches each shim stub to call these.
+    //    .write, future.read / .write, error-context.new / .debug-message)
+    //    with `(memory)` / `(realloc)` opts pointing at main. Emitted in
+    //    mem-op-slot order so slot j ↔ `async_memop_real_core_base + j`;
+    //    the fixup (Phase 4g) patches each shim stub to call these.
     const async_memop_real_core_base = core_func_idx;
     {
         const memop_start: u32 = @intCast(canons.items.len);
@@ -3126,6 +3205,13 @@ fn buildComponentShimFixup(
                             .{ .stream_write = .{ .type_idx = grp.stream_type_idx, .opts = opts } }
                         else
                             .{ .stream_read = .{ .type_idx = grp.stream_type_idx, .opts = opts } };
+                    },
+                    .future => blk: {
+                        const opts = try ar.dupe(ctypes.CanonOpt, &.{.{ .memory = memory_core_idx }});
+                        break :blk if (std.mem.eql(u8, field.name, "write"))
+                            .{ .future_write = .{ .type_idx = grp.stream_type_idx, .opts = opts } }
+                        else
+                            .{ .future_read = .{ .type_idx = grp.stream_type_idx, .opts = opts } };
                     },
                     .error_context => blk: {
                         const opts = try ar.dupe(ctypes.CanonOpt, &mem_realloc);
@@ -5441,6 +5527,125 @@ test "buildComponent #263: stream.write routes through shim/fixup (memory-opt)" 
     try testing.expectEqual(@as(usize, 1), countStreamWrite(loaded));
     try testing.expect(anyAsyncLift(loaded));
     try testing.expect(mainWithArgFor(loaded, "[stream]stream<u8>"));
+    try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
+}
+
+fn countFutureCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .future_new, .future_drop_readable, .future_drop_writable => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+fn anyFutureType(loaded: anytype) bool {
+    for (loaded.types) |t| switch (t) {
+        .future => |f| if (f.element != null and f.element.? == .u8) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn countFutureWrite(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .future_write => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #264: [future]future<u8> wires future.new/drop canons + a future type" {
+    // Mirror of the `[stream]` no-memory case (#263): a guest creating a
+    // `future<u8>` and dropping both ends imports the no-memory
+    // `[future]future<u8>` intrinsics. wabt must hoist a `(future u8)`
+    // type, emit `canon future.{new,drop-readable,drop-writable}` over it,
+    // and feed the bundle under the `[future]future<u8>` module.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[future]future<u8>" "new" (func (result i64)))
+        \\  (import "[future]future<u8>" "drop-readable" (func (param i32)))
+        \\  (import "[future]future<u8>" "drop-writable" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expect(anyFutureType(loaded));
+    try testing.expectEqual(@as(usize, 3), countFutureCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[future]future<u8>"));
+    try testing.expect(bundleExportsFunc(loaded, "new"));
+    try testing.expect(bundleExportsFunc(loaded, "drop-writable"));
+}
+
+test "buildComponent #264: future.write routes through shim/fixup (memory-opt)" {
+    // `future.write` needs `(memory)` opts pointing at the main instance
+    // — the same forward-reference broken by the shim/fixup trampoline as
+    // `stream.write`. Its lowered core sig is `(param i32 i32) (result
+    // i32)` (handle, ptr; no count). The produced component must have 3
+    // core modules (main + shim + fixup), a `canon future.write` over the
+    // hoisted `(future u8)` type, and the `[future]future<u8>` bundle.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[future]future<u8>" "new" (func (result i64)))
+        \\  (import "[future]future<u8>" "write" (func (param i32 i32) (result i32)))
+        \\  (import "[future]future<u8>" "drop-writable" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(anyFutureType(loaded));
+    try testing.expectEqual(@as(usize, 1), countFutureWrite(loaded));
+    try testing.expect(anyAsyncLift(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[future]future<u8>"));
     try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
 }
 
