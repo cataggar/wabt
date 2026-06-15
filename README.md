@@ -1,65 +1,79 @@
-# wasip2
+# wasip3
 
-Hand-written Zig **guest** bindings for the WASI Preview 2 (and bundled
-proposal) packages that [`cataggar/wabt`](https://github.com/cataggar/wabt)
-embeds.
+Hand-written Zig **guest** bindings for **WASI 0.3** (Component-Model
+**async**). Sibling to the [`wasip2`](https://github.com/cataggar/wabt/tree/wasip2)
+branch (from which this one is forked), retargeted to the 0.3 async ABI.
 
-Each `wasi:*` interface is exposed as a thin, typed Zig wrapper over
-canonical-ABI `extern` host imports — no `wit-bindgen`. A guest links these
-for `wasm32-freestanding`, then `wabt component new` wraps the core module
-into a component (auto-embedding the WIT and the wasi-preview1 adapter).
+## What changed from 0.2
+
+WASI 0.3 rebases WASI onto the Component Model's native async primitives:
+
+- **No `wasi:io`.** `pollable` / `input-stream` / `output-stream` are gone;
+  their roles are now the canonical-ABI types `future<T>` / `stream<T>` and
+  the `async` lift/lower convention. These live in **`cm_async`** here, not a
+  `wasi:io` wrapper.
+- **`async func`.** Functions like `wasi:cli/run@0.3.0#run`
+  (`async func() -> result`) are async; the guest reports results via
+  `task.return`.
+- **Streams as values.** Stdout is `wasi:cli/stdout@0.3.0.write-via-stream(data:
+  stream<u8>) -> future<...>` — you create a `stream<u8>`, hand the readable end
+  to the host, and write to the writable end.
+
+## The guest ⇄ wrapper async ABI contract
+
+`cm_async` declares the **async built-in intrinsics** the guest core imports;
+the component wrapper (`wabt component new`, once it grows P3 generation —
+[cataggar/wabt#263](https://github.com/cataggar/wabt/issues/263)) supplies them
+via `canon` defs (`canon stream.write`, `canon task.return`, …). A compiled
+`wasi:cli` guest imports exactly:
+
+```
+[stream]stream<u8>            { new, write, read, drop-readable, drop-writable }
+[error-context]              { new, debug-message, drop }
+[waitable-set] / [waitable]  { new, wait, drop, join }
+[task-return]<export>        { task-return }
+wasi:cli/stdout@0.3.0        { write-via-stream }
+```
+
+The import **module** names the built-in family + operand type (so the wrapper
+picks the right component type index); the **field** is the bare op. This naming
+is **provisional** — to be finalized with wabt's P3 generation and reconciled
+with `wit-bindgen`'s convention for cross-toolchain interop.
 
 ## Layout
 
 ```
 src/
-  root.zig           `wasip2` index re-exporting every module
-  abi.zig            shared canonical-ABI infra (cabi_realloc, ret-area)
-  wasi_io.zig        wasi:io@0.2.6 (error, poll, streams) — foundational
-  wasi_cli.zig       wasi:cli@0.2.6        wasi_clocks.zig   wasi:clocks@0.2.6
-  wasi_random.zig    wasi:random@0.2.6     wasi_filesystem.zig  wasi:filesystem@0.2.6
-  wasi_sockets.zig   wasi:sockets@0.2.6    wasi_config.zig   wasi:config@0.2.0-rc.1
-  wasi_http.zig      wasi:http@0.2.6       wasi_keyvalue.zig wasi:keyvalue@0.2.0-draft
-  wasi_nn.zig        wasi:nn@…             wasi_tls.zig      wasi:tls@0.2.0-draft
+  abi.zig        shared canonical-ABI core (cabi_realloc, ret-area) — unchanged from 0.2
+  cm_async.zig   WASI 0.3 async primitives contract (future/stream/error-context/waitable-set)
+  wasi_cli.zig   wasi:cli@0.3.0 (async run + stdout via write-via-stream(stream<u8>))
+  root.zig       `wasip3` re-export index
 ```
 
-`abi.zig` owns the single `cabi_realloc` export and the ret-area used to
-receive results wider than one core value, so a guest may combine several
-`wasi_*` modules without duplicate exports or competing scratch state.
+The other 0.2 modules (`wasi_clocks`/`random`/`filesystem`/`sockets`/`http` and
+the proposals) were removed; they will be re-added as 0.3 bindings as the
+generation work lands.
 
-## Coverage
+## Status
 
-| Module | Package | Status |
-|---|---|---|
-| `wasi_io` | `wasi:io@0.2.6` | streams (in/out), poll, error |
-| `wasi_cli` | `wasi:cli@0.2.6` | seed (run/stdout/exit) |
-| `wasi_clocks` | `wasi:clocks@0.2.6` | monotonic + wall clock |
-| `wasi_random` | `wasi:random@0.2.6` | random, insecure, insecure-seed |
-| `wasi_http` | `wasi:http@0.2.6` | seed (incoming-handler) |
-| `wasi_keyvalue` | `wasi:keyvalue@0.2.0-draft` | seed (bucket get/set/delete/exists) |
-| `wasi_filesystem` | `wasi:filesystem@0.2.6` | preopens (get-directories) |
-| `wasi_sockets` | `wasi:sockets@0.2.6` | ip-name-lookup (resolve) |
-| `wasi_config` | `wasi:config@0.2.0-rc.1` | store (get / get-all) |
-| `wasi_nn` | `wasi:nn@0.2.0-rc-2024-10-28` | tensor |
-| `wasi_tls` | `wasi:tls@0.2.0-draft` | types (handshake handles) |
-
-Every P2 package that wabt bundles now has a guest binding module.
+**Design-stage.** The bindings **type-check** and compile to a
+`wasm32-freestanding` core module exporting `wasi:cli/run@0.3.0#run` with the
+intrinsic imports above — i.e. the contract is concrete. They do **not** yet
+wrap into a runnable component: that needs wabt's P3 generation to emit the
+matching `canon` glue. The validation target is the local **wasmtime 46** build
+(`-S p3 -W component-model-async -W component-model-error-context`).
 
 ## Prerequisites
 
 - Zig `0.16.0`.
-- The `wabt` CLI (cataggar/wabt) on `PATH` — provides `component new` and
-  `module validate`.
+- (Later, for end-to-end) a `wabt` with P3 generation, and wasmtime 46.
 
-## Test
+## Build
 
 ```sh
-zig build test
+zig build test     # native unit tests for abi.zig (cabi_realloc + ret-area)
 ```
 
-Runs native unit tests for the host-import-free canonical-ABI core in
-`abi.zig` (the `cabi_realloc` bump arena, alignment, and ret-area decoders).
-
-The `wasi_*` wrappers are wasm-only: their public functions call `extern`
-host imports that resolve solely under `wasm32-freestanding`, so they have
-no native artifact and can't be unit-tested natively.
+The `wasi_*` / `cm_async` wrappers are wasm-only (their `extern` host imports
+link only for `wasm32-freestanding`), so they are type-checked by compiling a
+guest, not by native tests.

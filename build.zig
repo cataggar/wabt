@@ -1,71 +1,32 @@
 const std = @import("std");
 
-/// wasip2 guest bindings
+/// wasip3 guest bindings (WASI 0.3 / Component-Model async).
 ///
 /// Prerequisites: Zig 0.16, and the `wabt` CLI (cataggar/wabt) on PATH.
 pub fn build(b: *std.Build) void {
-    // ── Library modules (guest bindings) ───────────────────────────
-    // Public modules so dependents (and the examples below) can
-    // `@import` them when compiling a `wasm32-freestanding` guest. Each
-    // `wasi_*` helper depends on the shared `abi` module, which owns the
-    // sole `cabi_realloc` export and the canonical-ABI ret-area.
+    // ?? Library modules (guest bindings) ???????????????????????????
+    // Public modules so dependents can `@import` them when compiling a
+    // `wasm32-freestanding` guest. `abi` owns the sole `cabi_realloc`
+    // export + ret-area; `cm_async` declares the canonical-ABI async
+    // intrinsics (the WASI 0.3 replacement for `wasi:io`).
     const abi = b.addModule("abi", .{ .root_source_file = b.path("src/abi.zig") });
 
-    // wasi_io is foundational: cli/http/filesystem/sockets hand back
-    // input-stream / output-stream / pollable handles bound here.
-    const wasi_io = b.addModule("wasi_io", .{ .root_source_file = b.path("src/wasi_io.zig") });
-    wasi_io.addImport("abi", abi);
+    const cm_async = b.addModule("cm_async", .{ .root_source_file = b.path("src/cm_async.zig") });
+    cm_async.addImport("abi", abi);
 
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
-    wasi_cli.addImport("wasi_io", wasi_io);
-
-    const wasi_clocks = b.addModule("wasi_clocks", .{ .root_source_file = b.path("src/wasi_clocks.zig") });
-    wasi_clocks.addImport("abi", abi);
-
-    const wasi_random = b.addModule("wasi_random", .{ .root_source_file = b.path("src/wasi_random.zig") });
-    wasi_random.addImport("abi", abi);
-
-    const wasi_filesystem = b.addModule("wasi_filesystem", .{ .root_source_file = b.path("src/wasi_filesystem.zig") });
-    wasi_filesystem.addImport("abi", abi);
-
-    const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
-    wasi_sockets.addImport("abi", abi);
-    wasi_sockets.addImport("wasi_io", wasi_io);
-
-    const wasi_config = b.addModule("wasi_config", .{ .root_source_file = b.path("src/wasi_config.zig") });
-    wasi_config.addImport("abi", abi);
-
-    const wasi_nn = b.addModule("wasi_nn", .{ .root_source_file = b.path("src/wasi_nn.zig") });
-    wasi_nn.addImport("abi", abi);
-
-    const wasi_tls = b.addModule("wasi_tls", .{ .root_source_file = b.path("src/wasi_tls.zig") });
-    wasi_tls.addImport("wasi_io", wasi_io);
-
-    const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
-    wasi_http.addImport("abi", abi);
-
-    const wasi_keyvalue = b.addModule("wasi_keyvalue", .{ .root_source_file = b.path("src/wasi_keyvalue.zig") });
-    wasi_keyvalue.addImport("abi", abi);
+    wasi_cli.addImport("cm_async", cm_async);
 
     // Single-import library surface re-exporting every module.
-    const wasip2 = b.addModule("wasip2", .{ .root_source_file = b.path("src/root.zig") });
-    wasip2.addImport("abi", abi);
-    wasip2.addImport("wasi_io", wasi_io);
-    wasip2.addImport("wasi_cli", wasi_cli);
-    wasip2.addImport("wasi_clocks", wasi_clocks);
-    wasip2.addImport("wasi_random", wasi_random);
-    wasip2.addImport("wasi_filesystem", wasi_filesystem);
-    wasip2.addImport("wasi_sockets", wasi_sockets);
-    wasip2.addImport("wasi_config", wasi_config);
-    wasip2.addImport("wasi_http", wasi_http);
-    wasip2.addImport("wasi_keyvalue", wasi_keyvalue);
-    wasip2.addImport("wasi_nn", wasi_nn);
-    wasip2.addImport("wasi_tls", wasi_tls);
+    const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
+    wasip3.addImport("abi", abi);
+    wasip3.addImport("cm_async", cm_async);
+    wasip3.addImport("wasi_cli", wasi_cli);
 
-    // ── Tests ──────────────────────────────────────────────────────
+    // ?? Tests ??????????????????????????????????????????????????????
     // Native unit tests for the host-import-free canonical-ABI core in
     // `abi.zig` (bump arena + ret-area decoders). The `wasi_*` wrappers
-    // can't be tested natively — their public functions call `extern`
+    // can't be tested natively ? their public functions call `extern`
     // host imports that only link for `wasm32-freestanding`.
     const abi_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -78,12 +39,11 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_abi_tests.step);
 }
 
-// ── Build helpers (ported from cataggar/wamr) ──────────────────────
+// ?? Build helpers (ported from cataggar/wamr) ??????????????????????
 //
-// These are `pub` so dependents can `@import("wasip2")` this build.zig
-// and reuse them (e.g. the `example/hello` branch). Path fields are
-// `LazyPath` so a dependent points at the vendored sources via
-// `dep.path("src/...")`.
+// These are `pub` so dependents can `@import("wasip3")` this build.zig
+// and reuse them. Path fields are `LazyPath` so a dependent points at the
+// vendored sources via `dep.path("src/...")`.
 
 pub const ZigWasmImport = struct {
     /// Import name, e.g. `wasi_cli` for `@import("wasi_cli")`.
@@ -113,30 +73,21 @@ pub const ModuleSpec = struct {
 
 pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
-    .{ .name = "wasi_io", .deps = &.{"abi"} },
-    .{ .name = "wasi_cli", .deps = &.{"wasi_io"} },
-    .{ .name = "wasi_clocks", .deps = &.{"abi"} },
-    .{ .name = "wasi_random", .deps = &.{"abi"} },
-    .{ .name = "wasi_filesystem", .deps = &.{"abi"} },
-    .{ .name = "wasi_sockets", .deps = &.{ "abi", "wasi_io" } },
-    .{ .name = "wasi_config", .deps = &.{"abi"} },
-    .{ .name = "wasi_nn", .deps = &.{"abi"} },
-    .{ .name = "wasi_tls", .deps = &.{"wasi_io"} },
-    .{ .name = "wasi_http", .deps = &.{"abi"} },
-    .{ .name = "wasi_keyvalue", .deps = &.{"abi"} },
+    .{ .name = "cm_async", .deps = &.{"abi"} },
+    .{ .name = "wasi_cli", .deps = &.{"cm_async"} },
 };
 
 fn findSpec(name: []const u8) ModuleSpec {
     for (modules) |m| {
         if (std.mem.eql(u8, m.name, name)) return m;
     }
-    std.debug.panic("unknown wasip2 module: {s}", .{name});
+    std.debug.panic("unknown wasip3 module: {s}", .{name});
 }
 
-/// Expand a set of root module names — the ones a guest's `main.zig`
-/// `@import`s directly — into the full `ZigWasmImport` closure for
-/// `zigBuildWasm`. Pulls in transitive deps (e.g. `wasi_cli` → `wasi_io`
-/// → `abi`), resolves each source against the `wasip2` dependency via
+/// Expand a set of root module names ? the ones a guest's `main.zig`
+/// `@import`s directly ? into the full `ZigWasmImport` closure for
+/// `zigBuildWasm`. Pulls in transitive deps (e.g. `wasi_cli` ? `wasi_io`
+/// ? `abi`), resolves each source against the `wasip3` dependency via
 /// `dep.path("src/<name>.zig")`, and marks transitive-only modules
 /// `root_dep = false`. Lets a consumer name just its leaf imports instead
 /// of restating the whole graph.
@@ -188,7 +139,7 @@ pub const ZigBuildWasm = struct {
     imports: []const ZigWasmImport = &.{},
     target_triple: []const u8 = "wasm32-freestanding",
     /// Auto-add `--export=cabi_realloc`, the canonical-ABI allocator every
-    /// wasip2 component needs (exported by `abi.zig`). Set false for a core
+    /// wasip3 component needs (exported by `abi.zig`). Set false for a core
     /// module that doesn't link `abi`.
     cabi_realloc: bool = true,
     /// `-fno-llvm` (self-hosted wasm codegen). Off: LLVM/LLD is required
@@ -199,8 +150,8 @@ pub const ZigBuildWasm = struct {
 };
 
 /// Invoke `zig build-exe -target wasm32-freestanding -O ReleaseSmall
-/// -fno-entry --export=…`, reconstructing the module import graph
-/// (`root` → `wasi_*` → `abi`) via `--dep` / `-M` flags. Captures the
+/// -fno-entry --export=?`, reconstructing the module import graph
+/// (`root` ? `wasi_*` ? `abi`) via `--dep` / `-M` flags. Captures the
 /// emitted wasm as a build-graph LazyPath.
 pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{
@@ -253,12 +204,12 @@ pub const WabtComponentNew = struct {
     world: ?[]const u8 = null,
     /// Output basename for the produced component LazyPath. When null,
     /// derived from `wasm_core`'s basename: a `.core.wasm` suffix becomes
-    /// `.wasm` (so `hello.core.wasm` → `hello.wasm`).
+    /// `.wasm` (so `hello.core.wasm` ? `hello.wasm`).
     output: ?[]const u8 = null,
 };
 
 /// One-step `wabt component new --world <world> --wit <dir>`: embeds the
-/// WIT, wraps the core into a component, and validates — in one call.
+/// WIT, wraps the core into a component, and validates ? in one call.
 /// The bundled WASI WIT + wasi-preview1 adapter are auto-attached, so no
 /// on-disk `wit/deps/` copy is needed.
 pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPath {
@@ -348,7 +299,7 @@ fn lazyBasename(lp: std.Build.LazyPath) []const u8 {
 }
 
 /// Component basename derived from a core-wasm basename: a `.core.wasm`
-/// suffix becomes `.wasm` (`hello.core.wasm` → `hello.wasm`); otherwise the
+/// suffix becomes `.wasm` (`hello.core.wasm` ? `hello.wasm`); otherwise the
 /// extension is replaced with `.wasm`.
 fn componentBasename(b: *std.Build, core: []const u8) []const u8 {
     if (std.mem.endsWith(u8, core, ".core.wasm"))

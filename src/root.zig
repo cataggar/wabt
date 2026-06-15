@@ -1,19 +1,11 @@
-//! `wasip2` — re-export index of every guest binding module, giving a
-//! single import surface for consumers that prefer
-//! `@import("wasip2").wasi_cli` over importing each module by name.
+//! `wasip3` — re-export index of the WASI 0.3 guest binding modules.
 //!
-//! A guest can still `@import("wasi_cli")` directly; this index exists
-//! mainly to document the full coverage in one place.
+//! A guest can still `@import("wasi_cli")` / `@import("cm_async")`
+//! directly; this index gives a single `@import("wasip3").wasi_cli`
+//! surface and documents coverage in one place.
 
 pub const abi = @import("abi");
-pub const wasi_io = @import("wasi_io");
+/// Component-Model async canonical primitives (future/stream/error-context/
+/// waitable-set) — the WASI 0.3 replacement for `wasi:io`.
+pub const cm_async = @import("cm_async");
 pub const wasi_cli = @import("wasi_cli");
-pub const wasi_clocks = @import("wasi_clocks");
-pub const wasi_random = @import("wasi_random");
-pub const wasi_filesystem = @import("wasi_filesystem");
-pub const wasi_sockets = @import("wasi_sockets");
-pub const wasi_config = @import("wasi_config");
-pub const wasi_http = @import("wasi_http");
-pub const wasi_keyvalue = @import("wasi_keyvalue");
-pub const wasi_nn = @import("wasi_nn");
-pub const wasi_tls = @import("wasi_tls");

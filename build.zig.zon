@@ -1,7 +1,7 @@
 .{
-    .name = .wasip2,
+    .name = .wasip3,
     .version = "0.2.6",
-    .fingerprint = 0xdad3158c2dfb5a8e,
+    .fingerprint = 0xadd4251ada326c2a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
