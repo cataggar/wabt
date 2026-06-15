@@ -337,7 +337,138 @@ pub fn encodeWorldFromResolverWithDiag(
         .exports = exports,
         .custom_sections = custom_sections,
     };
+
+    // Reject `borrow<R>` reachable (transitively) from a `stream`/`future`
+    // element type or a function result, before it can be encoded into a
+    // world that the host would only reject later. See #266.
+    try validateNoBorrowInAsyncOrResults(ar, types);
+
     return writer.encode(allocator, &component);
+}
+
+// ── #266: transitive-borrow validation ──────────────────────────────────────
+//
+// The component-model spec forbids a `borrow<R>` handle from appearing,
+// transitively, inside a `stream<T>` / `future<T>` element type or a function
+// result (a borrow is only valid for the duration of the call, so it must not
+// outlive it via a result or an async channel). wasmparser 0.251 enforces the
+// result rule for *every* function — sync or async — so we do the same; valid
+// WIT never returns a borrow (constructors return `own<R>`, methods take
+// `borrow<R>` as a *param*), so this never rejects a legitimate world.
+//
+// The encoder hoists every compound type into a typedef slot and references it
+// via `ValType.type_idx`, so a transitive borrow always bottoms out as a
+// `TypeDef.val{ .borrow }` slot reachable through those indices. The pass walks
+// the fully-lowered `ctypes` tree, resolving type indices per scope.
+
+/// Per-scope view of the type-index space: `map[i]` is the `TypeDef` occupying
+/// type-index `i`, or null for an opaque slot (an alias / import / sub-resource
+/// we can't and needn't see into — a borrow can't hide inside one).
+const TypeScope = []const ?*const ctypes.TypeDef;
+
+/// Validate the whole assembled component by walking every component-type and
+/// instance-type body.
+fn validateNoBorrowInAsyncOrResults(ar: Allocator, types: []const ctypes.TypeDef) EncodeError!void {
+    for (types) |td| switch (td) {
+        .component => |c| try walkBodyForBorrow(ar, c.decls),
+        .instance => |i| try walkBodyForBorrow(ar, i.decls),
+        else => {},
+    };
+}
+
+/// Walk one component-type / instance-type body: build its type-index map, then
+/// check every `stream`/`future` element and function result, recursing into
+/// nested component/instance bodies (each a fresh scope).
+fn walkBodyForBorrow(ar: Allocator, decls: []const ctypes.Decl) EncodeError!void {
+    var map: std.ArrayListUnmanaged(?*const ctypes.TypeDef) = .empty;
+    for (decls) |*d| {
+        switch (d.*) {
+            .type => |*td| try map.append(ar, td),
+            .alias => |a| {
+                const sort = switch (a) {
+                    .instance_export => |ie| ie.sort,
+                    .outer => |o| o.sort,
+                };
+                if (sort == .type) try map.append(ar, null);
+            },
+            .import => |im| if (im.desc == .type) try map.append(ar, null),
+            .@"export" => |ex| if (ex.desc == .type) switch (ex.desc.type) {
+                // An `(eq j)` type export aliases an earlier type slot.
+                .eq => |j| try map.append(ar, if (@as(usize, j) < map.items.len) map.items[@as(usize, j)] else null),
+                .sub_resource => try map.append(ar, null),
+            },
+            .core_type => {},
+        }
+    }
+
+    const scope: TypeScope = map.items;
+    for (decls) |d| {
+        if (d != .type) continue;
+        switch (d.type) {
+            .func => |f| switch (f.results) {
+                .none => {},
+                .unnamed => |vt| try checkValTypeRootForBorrow(ar, scope, vt),
+                .named => |list| for (list) |nv| try checkValTypeRootForBorrow(ar, scope, nv.type),
+            },
+            .future => |fut| if (fut.element) |e| try checkValTypeRootForBorrow(ar, scope, e),
+            .stream => |s| if (s.element) |e| try checkValTypeRootForBorrow(ar, scope, e),
+            .component => |c| try walkBodyForBorrow(ar, c.decls),
+            .instance => |i| try walkBodyForBorrow(ar, i.decls),
+            else => {},
+        }
+    }
+}
+
+/// Entry point for one element/result check: allocate a fresh `visited` set
+/// (keyed by type-index, to break cycles) and walk `vt`.
+fn checkValTypeRootForBorrow(ar: Allocator, scope: TypeScope, vt: ctypes.ValType) EncodeError!void {
+    var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    try checkValTypeForBorrow(ar, scope, vt, &visited);
+}
+
+fn checkValTypeForBorrow(
+    ar: Allocator,
+    scope: TypeScope,
+    vt: ctypes.ValType,
+    visited: *std.AutoHashMapUnmanaged(u32, void),
+) EncodeError!void {
+    switch (vt) {
+        .borrow => return error.InvalidWit,
+        // Every index-carrying valtype references a type slot in this scope.
+        .type_idx, .record, .variant, .list, .tuple, .flags, .enum_, .option, .result => |i| {
+            if (@as(usize, i) >= scope.len) return;
+            if ((try visited.getOrPut(ar, i)).found_existing) return;
+            const td = scope[@as(usize, i)] orelse return;
+            try checkTypeDefForBorrow(ar, scope, td.*, visited);
+        },
+        // Primitives, `own`, and `error-context` are borrow-free leaves.
+        else => {},
+    }
+}
+
+fn checkTypeDefForBorrow(
+    ar: Allocator,
+    scope: TypeScope,
+    td: ctypes.TypeDef,
+    visited: *std.AutoHashMapUnmanaged(u32, void),
+) EncodeError!void {
+    switch (td) {
+        .val => |v| try checkValTypeForBorrow(ar, scope, v, visited),
+        .record => |r| for (r.fields) |f| try checkValTypeForBorrow(ar, scope, f.type, visited),
+        .variant => |v| for (v.cases) |c| if (c.type) |t| try checkValTypeForBorrow(ar, scope, t, visited),
+        .list => |l| try checkValTypeForBorrow(ar, scope, l.element, visited),
+        .tuple => |t| for (t.fields) |f| try checkValTypeForBorrow(ar, scope, f, visited),
+        .option => |o| try checkValTypeForBorrow(ar, scope, o.inner, visited),
+        .result => |r| {
+            if (r.ok) |ok| try checkValTypeForBorrow(ar, scope, ok, visited);
+            if (r.err) |e| try checkValTypeForBorrow(ar, scope, e, visited);
+        },
+        .future => |f| if (f.element) |e| try checkValTypeForBorrow(ar, scope, e, visited),
+        .stream => |s| if (s.element) |e| try checkValTypeForBorrow(ar, scope, e, visited),
+        // flags / enum_ / resource / func / component / instance carry no
+        // borrow-bearing value types reachable from this position.
+        else => {},
+    }
 }
 
 /// Pre-pass: walk every `use src.{T};` clause inside `we`'s interface
@@ -1509,6 +1640,102 @@ test "metadata_encode #263: lower P3 stream/future/error-context/async func" {
     try testing.expect(saw_future);
     try testing.expect(saw_async_func);
     try testing.expect(saw_error_context);
+}
+
+test "metadata_encode #266: stream<borrow<r>> element is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    make: func() -> stream<borrow<r>>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: async func result with transitive borrow is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    run: async func() -> tuple<borrow<r>, u8>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: alias-hidden borrow inside a stream is rejected" {
+    // The borrow is buried behind a `type` alias — the walk must follow
+    // the hoisted typedef slot, not just the immediate element type.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    type bad = tuple<borrow<r>, u8>;
+        \\    make: func() -> stream<bad>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow in a sync func result is rejected" {
+    // wasmparser/wasmtime reject a `borrow` in *any* function result, not
+    // only async ones — so the encoder does too.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    peek: func() -> borrow<r>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow nested in future<list<...>> is rejected" {
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    make: func() -> future<list<borrow<r>>>;
+        \\}
+        \\world app { export things; }
+    ;
+    try testing.expectError(error.InvalidWit, encodeWorldFromSource(testing.allocator, source, "app"));
+}
+
+test "metadata_encode #266: borrow as a func *param* is still accepted" {
+    // The restriction is on results / stream / future elements — a borrow
+    // parameter is the normal, valid case and must keep encoding.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    use-it: func(h: borrow<r>);
+        \\}
+        \\world app { export things; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
+}
+
+test "metadata_encode #266: own<r> in a stream element is still accepted" {
+    // Only `borrow` is forbidden — `own` (and plain value types) must pass.
+    const source =
+        \\package example:p3@0.3.0;
+        \\interface things {
+        \\    resource r { }
+        \\    plain: func() -> stream<u8>;
+        \\    owned: func() -> stream<own<r>>;
+        \\    open: func() -> own<r>;
+        \\}
+        \\world app { export things; }
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "app");
+    defer testing.allocator.free(bytes);
 }
 
 test "metadata_encode #263: embed real wasi:filesystem@0.3.0 (stream/future)" {
