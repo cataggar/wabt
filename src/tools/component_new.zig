@@ -1242,6 +1242,21 @@ fn parseContextField(field: []const u8) ?ContextField {
     return .{ .is_set = is_set, .ty = ty, .slot = slot };
 }
 
+/// Decoded `[stream]`/`[future]` cancel intrinsic field. `is_write` selects
+/// `cancel-write` over `cancel-read`; `is_async` is the cancellable flag
+/// (field suffix `-async`, which Wasmtime gates behind
+/// `component-model-more-async-builtins`). `cancel-{read,write}` are
+/// no-memory direct canons (type index + async byte, no `(memory)` opt).
+const StreamCancelField = struct { is_write: bool, is_async: bool };
+
+fn parseStreamCancelField(field: []const u8) ?StreamCancelField {
+    if (std.mem.eql(u8, field, "cancel-read")) return .{ .is_write = false, .is_async = false };
+    if (std.mem.eql(u8, field, "cancel-read-async")) return .{ .is_write = false, .is_async = true };
+    if (std.mem.eql(u8, field, "cancel-write")) return .{ .is_write = true, .is_async = false };
+    if (std.mem.eql(u8, field, "cancel-write-async")) return .{ .is_write = true, .is_async = true };
+    return null;
+}
+
 /// True if an import interface's instance-type body exports a named type
 /// (e.g. a `use`d enum like `wasi:cli/types`'s `error-code`). Such
 /// type-only imports define types other imports' bodies reference via
@@ -1890,8 +1905,13 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                         .{ .stream_drop_readable = ty_idx }
                     else if (std.mem.eql(u8, field, "drop-writable"))
                         .{ .stream_drop_writable = ty_idx }
+                    else if (parseStreamCancelField(field)) |cc|
+                        (if (cc.is_write)
+                            ctypes.Canon{ .stream_cancel_write = .{ .type_idx = ty_idx, .is_async = cc.is_async } }
+                        else
+                            ctypes.Canon{ .stream_cancel_read = .{ .type_idx = ty_idx, .is_async = cc.is_async } })
                     else
-                        // `read`/`write`/`cancel-*` need `(memory)` opts.
+                        // `read`/`write` need `(memory)` opts (shim path).
                         return error.UnsupportedAsyncIntrinsic;
                     try canons.append(ar, canon);
                     try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
@@ -1916,8 +1936,13 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                         .{ .future_drop_readable = ty_idx }
                     else if (std.mem.eql(u8, field, "drop-writable"))
                         .{ .future_drop_writable = ty_idx }
+                    else if (parseStreamCancelField(field)) |cc|
+                        (if (cc.is_write)
+                            ctypes.Canon{ .future_cancel_write = .{ .type_idx = ty_idx, .is_async = cc.is_async } }
+                        else
+                            ctypes.Canon{ .future_cancel_read = .{ .type_idx = ty_idx, .is_async = cc.is_async } })
                     else
-                        // `read`/`write`/`cancel-*` need `(memory)` opts.
+                        // `read`/`write` need `(memory)` opts (shim path).
                         return error.UnsupportedAsyncIntrinsic;
                     try canons.append(ar, canon);
                     try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
@@ -2582,7 +2607,8 @@ fn buildComponentShimFixup(
                 for (fsrc, 0..) |f, k| {
                     const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
                     const no_mem = std.mem.eql(u8, f, "new") or
-                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable");
+                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable") or
+                        parseStreamCancelField(f) != null;
                     if (!mem_op and !no_mem) return error.UnsupportedAsyncIntrinsic;
                     fields[k] = .{ .name = f, .is_mem_op = mem_op };
                     if (mem_op) {
@@ -2603,7 +2629,8 @@ fn buildComponentShimFixup(
                 for (fsrc, 0..) |f, k| {
                     const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
                     const no_mem = std.mem.eql(u8, f, "new") or
-                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable");
+                        std.mem.eql(u8, f, "drop-readable") or std.mem.eql(u8, f, "drop-writable") or
+                        parseStreamCancelField(f) != null;
                     if (!mem_op and !no_mem) return error.UnsupportedAsyncIntrinsic;
                     fields[k] = .{ .name = f, .is_mem_op = mem_op };
                     if (mem_op) {
@@ -3156,8 +3183,15 @@ fn buildComponentShimFixup(
                         .{ .stream_new = grp.stream_type_idx }
                     else if (std.mem.eql(u8, field.name, "drop-readable"))
                         .{ .stream_drop_readable = grp.stream_type_idx }
+                    else if (std.mem.eql(u8, field.name, "drop-writable"))
+                        .{ .stream_drop_writable = grp.stream_type_idx }
+                    else if (parseStreamCancelField(field.name)) |cc|
+                        (if (cc.is_write)
+                            ctypes.Canon{ .stream_cancel_write = .{ .type_idx = grp.stream_type_idx, .is_async = cc.is_async } }
+                        else
+                            ctypes.Canon{ .stream_cancel_read = .{ .type_idx = grp.stream_type_idx, .is_async = cc.is_async } })
                     else
-                        .{ .stream_drop_writable = grp.stream_type_idx };
+                        unreachable;
                     try canons.append(ar, canon);
                     try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
                     field.satisfy_core_idx = core_func_idx;
@@ -3178,8 +3212,15 @@ fn buildComponentShimFixup(
                         .{ .future_new = grp.stream_type_idx }
                     else if (std.mem.eql(u8, field.name, "drop-readable"))
                         .{ .future_drop_readable = grp.stream_type_idx }
+                    else if (std.mem.eql(u8, field.name, "drop-writable"))
+                        .{ .future_drop_writable = grp.stream_type_idx }
+                    else if (parseStreamCancelField(field.name)) |cc|
+                        (if (cc.is_write)
+                            ctypes.Canon{ .future_cancel_write = .{ .type_idx = grp.stream_type_idx, .is_async = cc.is_async } }
+                        else
+                            ctypes.Canon{ .future_cancel_read = .{ .type_idx = grp.stream_type_idx, .is_async = cc.is_async } })
                     else
-                        .{ .future_drop_writable = grp.stream_type_idx };
+                        unreachable;
                     try canons.append(ar, canon);
                     try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
                     field.satisfy_core_idx = core_func_idx;
@@ -5921,6 +5962,130 @@ test "buildComponent #264: future.write routes through shim/fixup (memory-opt)" 
     try testing.expect(anyAsyncLift(loaded));
     try testing.expect(mainWithArgFor(loaded, "[future]future<u8>"));
     try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
+}
+
+fn countStreamFutureCancelCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .stream_cancel_read, .stream_cancel_write, .future_cancel_read, .future_cancel_write => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #263: stream/future cancel-read/write wire as no-mem direct canons (fast path)" {
+    // `stream.cancel-{read,write}` / `future.cancel-{read,write}` carry a type
+    // index + an async? flag (field suffix `-async`) and need NO `(memory)`
+    // opt, so they are direct canons (like new/drop) and keep the build on the
+    // fast path. Lowered core sig is `(param i32) (result i32)`. Validated on
+    // wasmtime 46 (`-W component-model-async{,-stackful,-more-async-builtins}`).
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[stream]stream<u8>" "new" (func (result i64)))
+        \\  (import "[stream]stream<u8>" "cancel-read" (func (param i32) (result i32)))
+        \\  (import "[stream]stream<u8>" "cancel-write-async" (func (param i32) (result i32)))
+        \\  (import "[future]future<u8>" "new" (func (result i64)))
+        \\  (import "[future]future<u8>" "cancel-read" (func (param i32) (result i32)))
+        \\  (import "[future]future<u8>" "cancel-write" (func (param i32) (result i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // No mem-op intrinsic ⇒ fast path ⇒ a single (main) core module.
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // 2 stream-cancel + 2 future-cancel canons.
+    try testing.expectEqual(@as(usize, 4), countStreamFutureCancelCanons(loaded));
+
+    var s_read_sync = false;
+    var s_write_async = false;
+    var f_read_sync = false;
+    var f_write_sync = false;
+    for (loaded.canons) |c| switch (c) {
+        .stream_cancel_read => |cc| if (!cc.is_async) {
+            s_read_sync = true;
+        },
+        .stream_cancel_write => |cc| if (cc.is_async) {
+            s_write_async = true;
+        },
+        .future_cancel_read => |cc| if (!cc.is_async) {
+            f_read_sync = true;
+        },
+        .future_cancel_write => |cc| if (!cc.is_async) {
+            f_write_sync = true;
+        },
+        else => {},
+    };
+    try testing.expect(s_read_sync);
+    try testing.expect(s_write_async);
+    try testing.expect(f_read_sync);
+    try testing.expect(f_write_sync);
+    try testing.expect(bundleExportsFunc(loaded, "cancel-read"));
+    try testing.expect(bundleExportsFunc(loaded, "cancel-write-async"));
+}
+
+test "buildComponent #263: stream/future cancel-* also wire through the shim/fixup path" {
+    // A mem-op intrinsic (stream.write) forces the shim/fixup path; the no-mem
+    // cancel-* canons must still wire there (classification + emission arms).
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[stream]stream<u8>" "new" (func (result i64)))
+        \\  (import "[stream]stream<u8>" "write" (func (param i32 i32 i32) (result i32)))
+        \\  (import "[stream]stream<u8>" "cancel-write" (func (param i32) (result i32)))
+        \\  (import "[future]future<u8>" "cancel-read" (func (param i32) (result i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // stream.write is mem-op ⇒ main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    // stream.cancel-write + future.cancel-read.
+    try testing.expectEqual(@as(usize, 2), countStreamFutureCancelCanons(loaded));
 }
 
 test "buildComponent #263: full streaming hello (stdout write-via-stream + cross-iface)" {
