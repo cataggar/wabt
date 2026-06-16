@@ -368,6 +368,31 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(&dash_help.step);
         }
     }
+
+    // ── WASI Preview 3 conformance gate (#267 Phase 3) ────────────────
+    // wabt is a toolkit, not a runtime: this gate drives the hand-authored
+    // `tests/p3/*.wat` guests through `wabt component new`, then validates
+    // each produced component on upstream Wasmtime (resolved from the
+    // `WASMTIME` env var; needs P3 feature flags, e.g. wasmtime >= 46). Not
+    // wired into the default `test` aggregate — it requires Python 3 + an
+    // external Wasmtime, and skips cleanly when none is found. CI gates
+    // regressions in a follow-up. Run locally with `zig build p3-conformance`
+    // (optionally `WASMTIME=/path/to/wasmtime`).
+    const p3_runner = b.addSystemCommand(&.{
+        "python3",
+        "scripts/p3_conformance.py",
+        "--fixtures",
+        "tests/p3",
+        "--skip",
+        "tests/p3-conformance-skip.json",
+        "--wabt",
+    });
+    p3_runner.addArtifactArg(wabt_exe);
+    const p3_step = b.step(
+        "p3-conformance",
+        "Validate wabt-produced P3 components against Wasmtime (set WASMTIME)",
+    );
+    p3_step.dependOn(&p3_runner.step);
 }
 
 /// Adapter shape selector used by `buildAdapterArtifact` to pick
