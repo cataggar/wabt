@@ -689,6 +689,24 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
         },
         .waitable_set_drop => try w.appendByte(0x22),
         .waitable_join => try w.appendByte(0x23),
+        .task_cancel => try w.appendByte(0x05),
+        .subtask_cancel => |is_async| {
+            try w.appendByte(0x06);
+            try w.appendByte(if (is_async) 0x01 else 0x00);
+        },
+        .subtask_drop => try w.appendByte(0x0D),
+        .context_get => |cx| {
+            try w.appendByte(0x0A);
+            try w.appendByte(@intFromEnum(cx.ty));
+            try w.writeU32Leb(cx.slot);
+        },
+        .context_set => |cx| {
+            try w.appendByte(0x0B);
+            try w.appendByte(@intFromEnum(cx.ty));
+            try w.writeU32Leb(cx.slot);
+        },
+        .backpressure_inc => try w.appendByte(0x24),
+        .backpressure_dec => try w.appendByte(0x25),
     }
 }
 

@@ -371,6 +371,14 @@ pub const CanonWaitableSet = struct {
     memory: u32,
 };
 
+/// `{ ty, slot }` payload for `context.get` / `context.set`. `ty` is the
+/// core valtype of the task-local storage slot (the component-model
+/// validator currently accepts `i32`/`i64`); `slot` is the slot index.
+pub const CanonContext = struct {
+    ty: CoreValType,
+    slot: u32,
+};
+
 /// Canonical function definitions.
 pub const Canon = union(enum) {
     /// Lift a core function to a component function.
@@ -438,6 +446,20 @@ pub const Canon = union(enum) {
     waitable_set_drop,
     /// `waitable.join` (binary `0x23`).
     waitable_join,
+    /// `task.cancel` (binary `0x05`).
+    task_cancel,
+    /// `subtask.cancel <async?>` (binary `0x06`).
+    subtask_cancel: bool,
+    /// `subtask.drop` (binary `0x0d`).
+    subtask_drop,
+    /// `context.get <ty> <slot>` (binary `0x0a`).
+    context_get: CanonContext,
+    /// `context.set <ty> <slot>` (binary `0x0b`).
+    context_set: CanonContext,
+    /// `backpressure.inc` (binary `0x24`).
+    backpressure_inc,
+    /// `backpressure.dec` (binary `0x25`).
+    backpressure_dec,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────
