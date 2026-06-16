@@ -1207,6 +1207,7 @@ const async_intrinsic_prefixes = [_][]const u8{
     "[task]",
     "[subtask]",
     "[context]",
+    "[yield]",
 };
 
 fn isAsyncIntrinsicModule(module: []const u8) bool {
@@ -2020,6 +2021,19 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
                     core_func_idx += 1;
                 }
+            } else if (std.mem.startsWith(u8, grp.module, "[yield]")) {
+                for (grp.fields.items) |field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field, "yield"))
+                        .{ .thread_yield = false }
+                    else if (std.mem.eql(u8, field, "yield-cancellable"))
+                        .{ .thread_yield = true }
+                    else
+                        return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
             } else {
                 // `[error-context]` (always needs the shim path for its
                 // memory ops): not wired in this no-shim path.
@@ -2556,7 +2570,7 @@ fn buildComponentShimFixup(
         mem_op_slot: u32 = 0,
         satisfy_core_idx: u32 = 0,
     };
-    const AsyncFamily = enum { task_return, stream, future, error_context, waitable_set, waitable, backpressure, task, subtask, context };
+    const AsyncFamily = enum { task_return, stream, future, error_context, waitable_set, waitable, backpressure, task, subtask, context, yield };
     const AsyncGroup = struct {
         module: []const u8,
         family: AsyncFamily,
@@ -2752,6 +2766,20 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .context,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[yield]")) {
+                for (fsrc, 0..) |f, k| {
+                    if (!std.mem.eql(u8, f, "yield") and
+                        !std.mem.eql(u8, f, "yield-cancellable"))
+                        return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = false };
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .yield,
                     .elem = .u8,
                     .export_ref = "",
                     .fields = fields,
@@ -3353,6 +3381,18 @@ fn buildComponentShimFixup(
                     core_func_idx += 1;
                 }
             },
+            .yield => {
+                for (grp.fields) |*field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field.name, "yield-cancellable"))
+                        .{ .thread_yield = true }
+                    else
+                        .{ .thread_yield = false };
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
         }
     }
 
@@ -3536,6 +3576,7 @@ fn buildComponentShimFixup(
                     .task => unreachable, // task.cancel is never mem-op
                     .subtask => unreachable, // subtask.drop/cancel are never mem-op
                     .context => unreachable, // context.get/set are never mem-op
+                    .yield => unreachable, // thread.yield is never mem-op
                 };
                 try canons.append(ar, canon);
                 core_func_idx += 1;
@@ -6510,6 +6551,116 @@ test "buildComponent #267: operand-carrying canons also wire through the shim/fi
     try testing.expect(saw_set);
     try testing.expect(mainWithArgFor(loaded, "[subtask]"));
     try testing.expect(mainWithArgFor(loaded, "[context]"));
+}
+
+fn countThreadYieldCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .thread_yield => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #278: [yield] thread.yield no-mem control canons wire (fast path)" {
+    // thread.yield (binary 0x0c) is a no-memory direct canon carrying a
+    // cancellable flag (field `yield` ⇒ blocking, `yield-cancellable` ⇒
+    // cancellable). It lowers to a core func of type `(func (result i32))`.
+    // With no mem-op intrinsic and no exported destructor the guest stays on
+    // the fast path: a single (main) core module.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[yield]" "yield" (func (result i32)))
+        \\  (import "[yield]" "yield-cancellable" (func (result i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run") (call 0 (i32.const 0)))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // `yield` (cancellable=false) + `yield-cancellable` (cancellable=true).
+    try testing.expectEqual(@as(usize, 2), countThreadYieldCanons(loaded));
+
+    var saw_plain = false;
+    var saw_cancellable = false;
+    for (loaded.canons) |c| switch (c) {
+        .thread_yield => |cancellable| if (cancellable) {
+            saw_cancellable = true;
+        } else {
+            saw_plain = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_plain);
+    try testing.expect(saw_cancellable);
+
+    try testing.expect(mainWithArgFor(loaded, "[yield]"));
+    try testing.expect(bundleExportsFunc(loaded, "yield"));
+    try testing.expect(bundleExportsFunc(loaded, "yield-cancellable"));
+}
+
+test "buildComponent #278: thread.yield also wires through the shim/fixup path" {
+    // A mem-op intrinsic (waitable-set.wait) forces the shim/fixup path; the
+    // no-mem thread.yield canon must still wire there (classification +
+    // emission arms), alongside main+shim+fixup.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[yield]" "yield" (func (result i32)))
+        \\  (import "[waitable-set]" "wait" (func (param i32 i32) (result i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // waitable-set.wait is mem-op ⇒ main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expectEqual(@as(usize, 1), countThreadYieldCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[yield]"));
+    try testing.expect(bundleExportsFunc(loaded, "yield"));
 }
 
 test "buildComponent #248: drop-only namespace wires canon resource.drop into the bundle" {

@@ -460,6 +460,9 @@ pub const Canon = union(enum) {
     backpressure_inc,
     /// `backpressure.dec` (binary `0x25`).
     backpressure_dec,
+    /// `thread.yield <cancellable>` (binary `0x0c`). Lowers to a core func
+    /// of type `(func (result i32))`.
+    thread_yield: bool,
 };
 
 // ── Imports and exports ─────────────────────────────────────────────────────

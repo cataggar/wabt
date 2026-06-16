@@ -707,6 +707,10 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
         },
         .backpressure_inc => try w.appendByte(0x24),
         .backpressure_dec => try w.appendByte(0x25),
+        .thread_yield => |cancellable| {
+            try w.appendByte(0x0C);
+            try w.appendByte(if (cancellable) 0x01 else 0x00);
+        },
     }
 }
 
