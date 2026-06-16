@@ -147,6 +147,21 @@ pub fn resourceNameForSlot(slots: []const TypeSlot, slot: u32) ?[]const u8 {
     };
 }
 
+/// Return the WIT-visible name of the named (non-resource) type bound at
+/// `slot` — a `.export_eq` (a `use`d or interface-exported named type such
+/// as `error-code`) or a named `.alias_instance_export`. Used to alias such
+/// types out of their providing import instance when a transcribed top-level
+/// type (e.g. a `future`/`stream` element, or a lifted export result)
+/// references them. Returns null for anonymous / unnamed slots.
+pub fn typeNameForSlot(slots: []const TypeSlot, slot: u32) ?[]const u8 {
+    if (slot >= slots.len) return null;
+    return switch (slots[slot]) {
+        .export_eq => |e| e.name,
+        .alias_instance_export => |a| a.name,
+        else => null,
+    };
+}
+
 /// Decode the given `component-type` custom-section payload.
 /// All returned slices borrow from `arena`.
 pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld {

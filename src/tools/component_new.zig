@@ -1297,6 +1297,177 @@ fn parseAsyncElement(spec: []const u8) ?ctypes.ValType {
     return primValType(spec[lt + 1 .. gt]);
 }
 
+// ── #280: non-primitive (complex / resource-bearing) async element types ────
+//
+// A `stream<u8>` element is a primitive (`parseAsyncElement` handles it). But
+// `wasi:http`'s `response.new` needs a
+// `future<result<option<trailers>, error-code>>` whose element carries the
+// `trailers` (= `fields`) RESOURCE handle — a nominal type that must share
+// identity with the `wasi:http/types` import. A bare structural spell-out in
+// the import module string is both ambiguous (`error-code` exists in several
+// interfaces) and unwieldy, so the guest⇄wabt contract for a complex element
+// is a **function reference**: `[future]<iface>@<ver>#<fn>#<async-idx>` (and
+// `[stream]…`), naming the function whose signature already contains the type.
+// wabt walks `<fn>`'s sig, takes the `<async-idx>`-th stream/future (in
+// appearance order — params then results, depth-first), and transcribes its
+// element resource-aware. This mirrors `[task-return]<iface>#<fn>`, and the
+// numbering matches wit-bindgen's `[<op>-N][static]<fn>` intrinsic indices.
+
+/// A stream/future type located while walking a function signature, plus the
+/// element value type (in the enclosing extern's `type_slots` space).
+const AsyncTypeRef = struct {
+    is_future: bool,
+    element: ?ctypes.ValType,
+};
+
+/// Append every stream/future reachable from `v` (already in resolved
+/// `FuncRef.sig` form: a compound is a `.type_idx` pointing at a
+/// `TypeSlot.typedef`), depth-first in appearance order.
+fn collectAsyncInValType(
+    ar: std.mem.Allocator,
+    slots: []const metadata_decode.TypeSlot,
+    v: ctypes.ValType,
+    out: *std.ArrayListUnmanaged(AsyncTypeRef),
+) error{OutOfMemory}!void {
+    switch (v) {
+        .type_idx => |slot| {
+            if (slot >= slots.len) return;
+            switch (slots[slot]) {
+                .val => |vv| try collectAsyncInValType(ar, slots, vv, out),
+                .typedef => |td| switch (td) {
+                    .future => |f| {
+                        try out.append(ar, .{ .is_future = true, .element = f.element });
+                        if (f.element) |e| try collectAsyncInValType(ar, slots, e, out);
+                    },
+                    .stream => |s| {
+                        try out.append(ar, .{ .is_future = false, .element = s.element });
+                        if (s.element) |e| try collectAsyncInValType(ar, slots, e, out);
+                    },
+                    .option => |o| try collectAsyncInValType(ar, slots, o.inner, out),
+                    .result => |r| {
+                        if (r.ok) |okv| try collectAsyncInValType(ar, slots, okv, out);
+                        if (r.err) |errv| try collectAsyncInValType(ar, slots, errv, out);
+                    },
+                    .list => |l| try collectAsyncInValType(ar, slots, l.element, out),
+                    .tuple => |t| for (t.fields) |fty| try collectAsyncInValType(ar, slots, fty, out),
+                    .record => |rec| for (rec.fields) |fld| try collectAsyncInValType(ar, slots, fld.type, out),
+                    .variant => |vv| for (vv.cases) |c| {
+                        if (c.type) |ct| try collectAsyncInValType(ar, slots, ct, out);
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        },
+        else => {},
+    }
+}
+
+/// All stream/future types in a function signature (params then results),
+/// in appearance order.
+fn collectAsyncInSig(
+    ar: std.mem.Allocator,
+    slots: []const metadata_decode.TypeSlot,
+    sig: ctypes.FuncType,
+) error{OutOfMemory}![]AsyncTypeRef {
+    var out = std.ArrayListUnmanaged(AsyncTypeRef).empty;
+    for (sig.params) |p| try collectAsyncInValType(ar, slots, p.type, &out);
+    switch (sig.results) {
+        .none => {},
+        .unnamed => |v| try collectAsyncInValType(ar, slots, v, &out),
+        .named => |named| for (named) |nv| try collectAsyncInValType(ar, slots, nv.type, &out),
+    }
+    return out.toOwnedSlice(ar);
+}
+
+/// A resolved complex async element: its element value type still references
+/// `slots`, so a caller transcribes it (resource-aware) with that slot space.
+const AsyncElemRef = struct {
+    is_future: bool,
+    element: ?ctypes.ValType,
+    slots: []const metadata_decode.TypeSlot,
+};
+
+/// Resolve a function-reference async spec `<iface>#<fn>#<idx>` (the part of a
+/// `[future]`/`[stream]` module after the family prefix) against the decoded
+/// world externs to the `<idx>`-th stream/future of `<fn>`. Returns null when
+/// the spec isn't a function reference (no `#`) or doesn't resolve.
+fn resolveAsyncRef(
+    ar: std.mem.Allocator,
+    externs: []const metadata_decode.WorldExtern,
+    spec: []const u8,
+) error{OutOfMemory}!?AsyncElemRef {
+    const h1 = std.mem.indexOfScalar(u8, spec, '#') orelse return null;
+    const tail = spec[h1 + 1 ..];
+    const h2 = std.mem.lastIndexOfScalar(u8, tail, '#') orelse return null;
+    const iface = spec[0..h1];
+    const fn_name = tail[0..h2];
+    const idx = std.fmt.parseInt(u32, tail[h2 + 1 ..], 10) catch return null;
+    for (externs) |ext| {
+        if (!std.mem.eql(u8, ext.qualified_name, iface)) continue;
+        for (ext.funcs) |fn_ref| {
+            if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
+            const list = try collectAsyncInSig(ar, ext.type_slots, fn_ref.sig);
+            if (idx >= list.len) return null;
+            return .{ .is_future = list[idx].is_future, .element = list[idx].element, .slots = ext.type_slots };
+        }
+    }
+    return null;
+}
+
+/// An async element spec resolved to either a primitive `elem` (no slots) or a
+/// complex `elem_raw` + `elem_slots` pair needing deferred resource-aware
+/// transcription at the canon site.
+const ResolvedElem = struct {
+    elem: ctypes.ValType = .u8,
+    elem_raw: ?ctypes.ValType = null,
+    elem_slots: ?[]const metadata_decode.TypeSlot = null,
+};
+
+/// Resolve a `[stream]`/`[future]` element spec (the part after the family
+/// prefix): a function reference (`<iface>#<fn>#<idx>`, contains `#`) yields a
+/// complex element; otherwise a primitive `stream<T>`/`future<T>`. Returns
+/// null when neither resolves so the caller rejects the intrinsic.
+fn resolveElemSpec(
+    ar: std.mem.Allocator,
+    externs: []const metadata_decode.WorldExtern,
+    spec: []const u8,
+) error{OutOfMemory}!?ResolvedElem {
+    if (std.mem.indexOfScalar(u8, spec, '#') != null) {
+        const r = (try resolveAsyncRef(ar, externs, spec)) orelse return null;
+        return .{ .elem_raw = r.element, .elem_slots = r.slots };
+    }
+    const e = parseAsyncElement(spec) orelse return null;
+    return .{ .elem = e };
+}
+
+/// #280: true if the export func named by `export_ref` (`<iface>#<fn>`) has a
+/// result whose lowering needs memory, so its `[task-return]` canon must carry
+/// the `(memory)` + `string-encoding` options (matching wit-bindgen). Reuses
+/// `abi.classifyFuncLift` (the same classifier the export lift uses) over a
+/// synthetic params-less sig, so cross-instance named types (e.g. a `use`d
+/// `error-code` whose variant lives in another instance) resolve correctly.
+fn taskReturnNeedsMemory(
+    externs: []const metadata_decode.WorldExtern,
+    world_decls: []const ctypes.Decl,
+    export_ref: []const u8,
+) bool {
+    const hash = std.mem.lastIndexOfScalar(u8, export_ref, '#') orelse return false;
+    const iface = export_ref[0..hash];
+    const fn_name = export_ref[hash + 1 ..];
+    for (externs) |ext| {
+        if (!ext.is_export) continue;
+        if (!std.mem.eql(u8, ext.qualified_name, iface)) continue;
+        for (ext.funcs) |fn_ref| {
+            if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
+            const resolver = wabt.component.adapter.abi.TypeResolver{ .inst_decls = ext.inst_decls, .world_decls = world_decls };
+            const synth = ctypes.FuncType{ .params = &.{}, .results = fn_ref.sig.results, .is_async = fn_ref.sig.is_async };
+            return wabt.component.adapter.abi.classifyFuncLift(.{ .func = synth, .resolver = resolver }).memory;
+        }
+    }
+    return false;
+}
+
 /// True if the core imports any memory-opt async intrinsic
 /// (`stream.read`/`.write`, `future.read`/`.write`) — these need
 /// `(memory)`/`(realloc)` canon opts pointing at the main instance,
@@ -2456,6 +2627,11 @@ fn buildComponentShimFixup(
 
     // ── Phase 1: re-collect import shapes (same as the fast path).
     var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    // #280: name → owning import-instance qname for named (non-resource)
+    // types (e.g. `error-code`, `method`). Used to alias such a type out of
+    // its providing import instance when a transcribed top-level type
+    // references it. First-writer wins on a name collision across imports.
+    var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
     const ImportShape = struct {
         qualified_name: []const u8,
         resources: []const []const u8,
@@ -2485,6 +2661,16 @@ fn buildComponentShimFixup(
             if (gop.found_existing) return error.AmbiguousResourceName;
             gop.value_ptr.* = ext.qualified_name;
         }
+        // #280: register this instance's named-type exports (export_eq
+        // slots) so they can be aliased to top level when referenced by a
+        // transcribed future/stream element or lifted export result.
+        for (ext.type_slots) |slot| switch (slot) {
+            .export_eq => |e| {
+                const gop = try type_owner.getOrPut(ar, e.name);
+                if (!gop.found_existing) gop.value_ptr.* = ext.qualified_name;
+            },
+            else => {},
+        };
     }
 
     // ── Phase 2: classify each imported func + compute its lowered
@@ -2579,6 +2765,10 @@ fn buildComponentShimFixup(
         fields: []AsyncField,
         stream_type_idx: u32 = 0,
         results: ctypes.FuncType.ResultList = .none,
+        /// #280: complex (resource-bearing) element — transcribed
+        /// resource-aware at the canon site. Null `elem_slots` ⇒ use `elem`.
+        elem_raw: ?ctypes.ValType = null,
+        elem_slots: ?[]const metadata_decode.TypeSlot = null,
     };
     const stream_rw_params = [_]wtypes.ValType{ .i32, .i32, .i32 };
     const i32x2_params = [_]wtypes.ValType{ .i32, .i32 };
@@ -2607,16 +2797,42 @@ fn buildComponentShimFixup(
             const fsrc = modfields.items[mi].items;
             const fields = try ar.alloc(AsyncField, fsrc.len);
             if (std.mem.startsWith(u8, module, "[task-return]")) {
-                for (fsrc, 0..) |f, k| fields[k] = .{ .name = f, .is_mem_op = false };
+                const export_ref = module["[task-return]".len..];
+                // #280: a result whose lowering touches memory (string/list,
+                // e.g. http's `result<response, error-code>`) makes task.return
+                // a mem-op needing `(memory)` — routed via the shim/fixup like
+                // stream.write. A flat result (e.g. wasi:cli/run) stays no-mem.
+                const needs_mem = taskReturnNeedsMemory(decoded.externs, decoded.world_decls, export_ref);
+                for (fsrc, 0..) |f, k| {
+                    fields[k] = .{ .name = f, .is_mem_op = needs_mem };
+                    if (needs_mem) {
+                        fields[k].mem_op_slot = @intCast(async_memop_slots.items.len);
+                        // The shim slot's core sig is the task.return import's
+                        // declared sig (flattened result params; no results).
+                        var params: []const wtypes.ValType = &.{};
+                        var results: []const wtypes.ValType = &.{};
+                        for (oi.interface.imports) |im2| {
+                            if (im2.kind != .func) continue;
+                            if (!std.mem.eql(u8, im2.module_name, module)) continue;
+                            if (!std.mem.eql(u8, im2.field_name, f)) continue;
+                            if (im2.sig) |s| {
+                                params = s.params;
+                                results = s.results;
+                            }
+                            break;
+                        }
+                        try async_memop_slots.append(ar, .{ .params = params, .results = results });
+                    }
+                }
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .task_return,
                     .elem = .u8,
-                    .export_ref = module["[task-return]".len..],
+                    .export_ref = export_ref,
                     .fields = fields,
                 });
             } else if (std.mem.startsWith(u8, module, "[stream]")) {
-                const elem = parseAsyncElement(module["[stream]".len..]) orelse
+                const re = (try resolveElemSpec(ar, decoded.externs, module["[stream]".len..])) orelse
                     return error.UnsupportedAsyncIntrinsic;
                 for (fsrc, 0..) |f, k| {
                     const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
@@ -2633,12 +2849,14 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .stream,
-                    .elem = elem,
+                    .elem = re.elem,
+                    .elem_raw = re.elem_raw,
+                    .elem_slots = re.elem_slots,
                     .export_ref = "",
                     .fields = fields,
                 });
             } else if (std.mem.startsWith(u8, module, "[future]")) {
-                const elem = parseAsyncElement(module["[future]".len..]) orelse
+                const re = (try resolveElemSpec(ar, decoded.externs, module["[future]".len..])) orelse
                     return error.UnsupportedAsyncIntrinsic;
                 for (fsrc, 0..) |f, k| {
                     const mem_op = std.mem.eql(u8, f, "read") or std.mem.eql(u8, f, "write");
@@ -2657,7 +2875,9 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .future,
-                    .elem = elem,
+                    .elem = re.elem,
+                    .elem_raw = re.elem_raw,
+                    .elem_slots = re.elem_slots,
                     .export_ref = "",
                     .fields = fields,
                 });
@@ -3037,6 +3257,153 @@ fn buildComponentShimFixup(
     // resource type declared below (Step 2.5).
     var exported_resource_type_idx = std.StringHashMapUnmanaged(u32).empty;
 
+    // #280: resource-aware handle resolver — defined here (before the async
+    // canon loop) so `[future]`/`[stream]` complex element transcription and
+    // `[task-return]` resource results share the same resource aliases as the
+    // export-side sig lifting below. Dedup maps are function-level.
+    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    // #280: named non-resource type alias dedup (name → top-level type idx).
+    var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    const HandleKind = enum { own, borrow };
+    const HandleKey = struct { name: []const u8, kind: HandleKind };
+    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
+    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
+
+    const HandleResolver = struct {
+        ar: std.mem.Allocator,
+        ext_slots: []const metadata_decode.TypeSlot,
+        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
+        aliases: *std.ArrayListUnmanaged(ctypes.Alias),
+        resource_owner: *std.StringHashMapUnmanaged([]const u8),
+        import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
+        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        type_owner: *std.StringHashMapUnmanaged([]const u8),
+        type_alias_idx: *std.StringHashMapUnmanaged(u32),
+        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
+        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
+        hoist_idxs: *std.ArrayListUnmanaged(u32),
+        comp_type_idx: *u32,
+        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+
+        fn resourceAlias(self: @This(), name: []const u8) !u32 {
+            // #250: guest-defined (exported) resource → its declared
+            // resource type in this component.
+            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
+            if (self.resource_alias_idx.get(name)) |idx| return idx;
+            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
+            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
+            try self.aliases.append(self.ar, .{ .instance_export = .{
+                .sort = .type,
+                .instance_idx = inst_idx,
+                .name = name,
+            } });
+            try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.resource_alias_idx.put(self.ar, name, slot);
+            return slot;
+        }
+
+        /// #280: alias a named (non-resource) type (e.g. `error-code`) out of
+        /// its providing import instance to a top-level type index, deduped by
+        /// name. Returns null when `name` isn't an import-provided named type,
+        /// so the caller leaves the leaf reference unchanged.
+        fn typeAlias(self: @This(), name: []const u8) error{OutOfMemory}!?u32 {
+            if (self.type_alias_idx.get(name)) |idx| return idx;
+            const owner = self.type_owner.get(name) orelse return null;
+            const inst_idx = self.import_inst_idx_for.get(owner) orelse return null;
+            try self.aliases.append(self.ar, .{ .instance_export = .{
+                .sort = .type,
+                .instance_idx = inst_idx,
+                .name = name,
+            } });
+            try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.type_alias_idx.put(self.ar, name, slot);
+            return slot;
+        }
+
+        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
+            for (self.hoist_keys.items, 0..) |k, i| {
+                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
+                    return self.hoist_idxs.items[i];
+                }
+            }
+            const alias_slot = try self.resourceAlias(name);
+            const vt: ctypes.ValType = switch (kind) {
+                .own => .{ .own = alias_slot },
+                .borrow => .{ .borrow = alias_slot },
+            };
+            try self.types.append(self.ar, .{ .val = vt });
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
+            try self.hoist_idxs.append(self.ar, slot);
+            return slot;
+        }
+
+        fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
+            return lift_types.transcribeValType(self.ar, self, self.ext_slots, v);
+        }
+
+        /// Append a defined type to the component type section and
+        /// return its component-level type index. Used by the shared
+        /// `lift_types` transcriber to hoist compound value types.
+        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
+            try self.types.append(self.ar, td);
+            try Section.appendType(self.order, self.ar, self.types.items.len);
+            const slot = self.comp_type_idx.*;
+            self.comp_type_idx.* += 1;
+            return slot;
+        }
+
+        /// Resolve a leaf value type the transcriber doesn't hoist:
+        /// resource handles become defined handle types via `hoistHandle`;
+        /// a named non-resource type referenced via an alias/export_eq slot
+        /// (#280, e.g. `error-code`) is aliased out of its import instance;
+        /// anything else passes through unchanged.
+        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
+            return switch (v) {
+                .own => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
+                },
+                .borrow => |k| blk: {
+                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
+                },
+                .type_idx => |slot| blk: {
+                    if (metadata_decode.typeNameForSlot(self.ext_slots, slot)) |name| {
+                        if (try self.typeAlias(name)) |idx| break :blk .{ .type_idx = idx };
+                    }
+                    break :blk v;
+                },
+                else => v,
+            };
+        }
+
+        fn rewriteSig(self: @This(), sig: ctypes.FuncType) !ctypes.FuncType {
+            const params = try self.ar.alloc(ctypes.NamedValType, sig.params.len);
+            for (sig.params, 0..) |p, i| {
+                params[i] = .{ .name = p.name, .type = try self.rewriteValType(p.type) };
+            }
+            const results: ctypes.FuncType.ResultList = switch (sig.results) {
+                .none => .none,
+                .unnamed => |v| .{ .unnamed = try self.rewriteValType(v) },
+                .named => |named| n: {
+                    const dst = try self.ar.alloc(ctypes.NamedValType, named.len);
+                    for (named, 0..) |nv, i| {
+                        dst[i] = .{ .name = nv.name, .type = try self.rewriteValType(nv.type) };
+                    }
+                    break :n .{ .named = dst };
+                },
+            };
+            return .{ .params = params, .results = results, .is_async = sig.is_async };
+        }
+    };
+
     // ── Phase 4b: alias each wired imported func into the
     //    component-level func indexspace. These slots become the
     //    `func_idx` operand of `canon.lower` in Phase 4f.
@@ -3178,27 +3545,27 @@ fn buildComponentShimFixup(
     //    direct core funcs; memory-opt ops (stream.read/.write) are
     //    satisfied by their shim stub here, with the real `(memory)`
     //    canon emitted in Phase 4f.2 and patched in by the fixup.
-    const AsyncTypeCtx = struct {
-        ar: std.mem.Allocator,
-        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
-        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
-        comp_type_idx: *u32,
-        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
-            try self.types.append(self.ar, td);
-            try Section.appendType(self.order, self.ar, self.types.items.len);
-            const idx = self.comp_type_idx.*;
-            self.comp_type_idx.* += 1;
-            return idx;
-        }
-        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
-            _ = self;
-            return v;
-        }
-    };
+    //    #280: complex/resource-bearing stream/future elements and
+    //    `[task-return]` resource results transcribe via `HandleResolver`.
     for (async_groups) |*grp| {
         switch (grp.family) {
             .stream => {
-                try types.append(ar, .{ .stream = .{ .element = grp.elem } });
+                const element: ?ctypes.ValType = if (grp.elem_slots) |eslots| blk: {
+                    if (grp.elem_raw) |raw| {
+                        const er = HandleResolver{
+                            .ar = ar,                          .ext_slots = eslots,
+                            .types = &types,                   .aliases = &aliases,
+                            .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                            .resource_alias_idx = &resource_alias_idx,
+                            .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .exported_resource_type_idx = &exported_resource_type_idx,
+                            .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
+                            .comp_type_idx = &comp_type_idx,   .order = &order,
+                        };
+                        break :blk try er.rewriteValType(raw);
+                    } else break :blk null;
+                } else grp.elem;
+                try types.append(ar, .{ .stream = .{ .element = element } });
                 try Section.appendType(&order, ar, types.items.len);
                 grp.stream_type_idx = comp_type_idx;
                 comp_type_idx += 1;
@@ -3227,7 +3594,22 @@ fn buildComponentShimFixup(
                 }
             },
             .future => {
-                try types.append(ar, .{ .future = .{ .element = grp.elem } });
+                const element: ?ctypes.ValType = if (grp.elem_slots) |eslots| blk: {
+                    if (grp.elem_raw) |raw| {
+                        const er = HandleResolver{
+                            .ar = ar,                          .ext_slots = eslots,
+                            .types = &types,                   .aliases = &aliases,
+                            .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                            .resource_alias_idx = &resource_alias_idx,
+                            .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .exported_resource_type_idx = &exported_resource_type_idx,
+                            .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
+                            .comp_type_idx = &comp_type_idx,   .order = &order,
+                        };
+                        break :blk try er.rewriteValType(raw);
+                    } else break :blk null;
+                } else grp.elem;
+                try types.append(ar, .{ .future = .{ .element = element } });
                 try Section.appendType(&order, ar, types.items.len);
                 grp.stream_type_idx = comp_type_idx;
                 comp_type_idx += 1;
@@ -3300,22 +3682,34 @@ fn buildComponentShimFixup(
                     return error.UnsupportedAsyncIntrinsic;
                 const iface_name = export_ref[0..hash];
                 const fn_name = export_ref[hash + 1 ..];
-                const ctx = AsyncTypeCtx{ .ar = ar, .types = &types, .order = &order, .comp_type_idx = &comp_type_idx };
                 var results: ctypes.FuncType.ResultList = .none;
                 var found_export = false;
                 find2: for (decoded.externs) |ext| {
                     if (!ext.is_export) continue;
                     if (!std.mem.eql(u8, ext.qualified_name, iface_name)) continue;
+                    // #280: resource-aware so a `result<response, error-code>`
+                    // (handler.handle) aliases the `response` resource instead
+                    // of leaking a metadata-local slot index.
+                    const er = HandleResolver{
+                        .ar = ar,                          .ext_slots = ext.type_slots,
+                        .types = &types,                   .aliases = &aliases,
+                        .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                        .resource_alias_idx = &resource_alias_idx,
+                        .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                        .exported_resource_type_idx = &exported_resource_type_idx,
+                        .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
+                        .comp_type_idx = &comp_type_idx,   .order = &order,
+                    };
                     for (ext.funcs) |fn_ref| {
                         if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
                         results = switch (fn_ref.sig.results) {
                             .none => .none,
-                            .unnamed => |v| .{ .unnamed = try lift_types.transcribeValType(ar, ctx, ext.type_slots, v) },
+                            .unnamed => |v| .{ .unnamed = try er.rewriteValType(v) },
                             .named => |named| nb: {
                                 const dst = try ar.alloc(ctypes.NamedValType, named.len);
                                 for (named, 0..) |nv, kk| dst[kk] = .{
                                     .name = nv.name,
-                                    .type = try lift_types.transcribeValType(ar, ctx, ext.type_slots, nv.type),
+                                    .type = try er.rewriteValType(nv.type),
                                 };
                                 break :nb .{ .named = dst };
                             },
@@ -3327,6 +3721,12 @@ fn buildComponentShimFixup(
                 if (!found_export) return error.UnsupportedAsyncIntrinsic;
                 grp.results = results;
                 for (grp.fields) |*field| {
+                    if (field.is_mem_op) {
+                        // #280: memory-needing task.return → real `(memory)`
+                        // canon emitted in the fixup (Phase 4f.2).
+                        field.satisfy_core_idx = async_memop_stub_core_base + field.mem_op_slot;
+                        continue;
+                    }
                     try canons.append(ar, .{ .task_return = .{ .results = results, .opts = &.{} } });
                     try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
                     field.satisfy_core_idx = core_func_idx;
@@ -3571,7 +3971,15 @@ fn buildComponentShimFixup(
                     else
                         .{ .waitable_set_wait = .{ .cancellable = false, .memory = memory_core_idx } },
                     .waitable => unreachable, // waitable.join is never mem-op
-                    .task_return => unreachable, // task.return is never mem-op
+                    .task_return => blk: {
+                        // #280: real task.return canon with `(memory)` +
+                        // string-encoding for a result that lowers via memory.
+                        const opts = try ar.dupe(ctypes.CanonOpt, &.{
+                            .{ .memory = memory_core_idx },
+                            .{ .string_encoding = .utf8 },
+                        });
+                        break :blk .{ .task_return = .{ .results = grp.results, .opts = opts } };
+                    },
                     .backpressure => unreachable, // backpressure.inc/dec are never mem-op
                     .task => unreachable, // task.cancel is never mem-op
                     .subtask => unreachable, // subtask.drop/cancel are never mem-op
@@ -3666,116 +4074,6 @@ fn buildComponentShimFixup(
     //    that `instance_idx` for the `alias instance_export
     //    sort=core(.func)` calls is `main_core_inst_idx` (not
     //    literal 0) — same generalisation as #202.
-    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
-    const HandleKind = enum { own, borrow };
-    const HandleKey = struct { name: []const u8, kind: HandleKind };
-    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
-    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
-
-    const HandleResolver = struct {
-        ar: std.mem.Allocator,
-        ext_slots: []const metadata_decode.TypeSlot,
-        types: *std.ArrayListUnmanaged(ctypes.TypeDef),
-        aliases: *std.ArrayListUnmanaged(ctypes.Alias),
-        resource_owner: *std.StringHashMapUnmanaged([]const u8),
-        import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
-        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
-        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
-        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
-        hoist_idxs: *std.ArrayListUnmanaged(u32),
-        comp_type_idx: *u32,
-        order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
-
-        fn resourceAlias(self: @This(), name: []const u8) !u32 {
-            // #250: guest-defined (exported) resource → its declared
-            // resource type in this component.
-            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
-            if (self.resource_alias_idx.get(name)) |idx| return idx;
-            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
-            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
-            try self.aliases.append(self.ar, .{ .instance_export = .{
-                .sort = .type,
-                .instance_idx = inst_idx,
-                .name = name,
-            } });
-            try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
-            const slot = self.comp_type_idx.*;
-            self.comp_type_idx.* += 1;
-            try self.resource_alias_idx.put(self.ar, name, slot);
-            return slot;
-        }
-
-        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
-            for (self.hoist_keys.items, 0..) |k, i| {
-                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
-                    return self.hoist_idxs.items[i];
-                }
-            }
-            const alias_slot = try self.resourceAlias(name);
-            const vt: ctypes.ValType = switch (kind) {
-                .own => .{ .own = alias_slot },
-                .borrow => .{ .borrow = alias_slot },
-            };
-            try self.types.append(self.ar, .{ .val = vt });
-            try Section.appendType(self.order, self.ar, self.types.items.len);
-            const slot = self.comp_type_idx.*;
-            self.comp_type_idx.* += 1;
-            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
-            try self.hoist_idxs.append(self.ar, slot);
-            return slot;
-        }
-
-        fn rewriteValType(self: @This(), v: ctypes.ValType) !ctypes.ValType {
-            return lift_types.transcribeValType(self.ar, self, self.ext_slots, v);
-        }
-
-        /// Append a defined type to the component type section and
-        /// return its component-level type index. Used by the shared
-        /// `lift_types` transcriber to hoist compound value types.
-        pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
-            try self.types.append(self.ar, td);
-            try Section.appendType(self.order, self.ar, self.types.items.len);
-            const slot = self.comp_type_idx.*;
-            self.comp_type_idx.* += 1;
-            return slot;
-        }
-
-        /// Resolve a leaf value type the transcriber doesn't hoist:
-        /// resource handles become defined handle types via
-        /// `hoistHandle`; anything else passes through unchanged.
-        pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
-            return switch (v) {
-                .own => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
-                },
-                .borrow => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
-                },
-                else => v,
-            };
-        }
-
-        fn rewriteSig(self: @This(), sig: ctypes.FuncType) !ctypes.FuncType {
-            const params = try self.ar.alloc(ctypes.NamedValType, sig.params.len);
-            for (sig.params, 0..) |p, i| {
-                params[i] = .{ .name = p.name, .type = try self.rewriteValType(p.type) };
-            }
-            const results: ctypes.FuncType.ResultList = switch (sig.results) {
-                .none => .none,
-                .unnamed => |v| .{ .unnamed = try self.rewriteValType(v) },
-                .named => |named| n: {
-                    const dst = try self.ar.alloc(ctypes.NamedValType, named.len);
-                    for (named, 0..) |nv, i| {
-                        dst[i] = .{ .name = nv.name, .type = try self.rewriteValType(nv.type) };
-                    }
-                    break :n .{ .named = dst };
-                },
-            };
-            return .{ .params = params, .results = results, .is_async = sig.is_async };
-        }
-    };
 
     const CapturedFunc = struct {
         ext_qualified: []const u8,
@@ -3802,6 +4100,8 @@ fn buildComponentShimFixup(
             .resource_owner = &resource_owner,
             .import_inst_idx_for = &import_inst_idx_for,
             .resource_alias_idx = &resource_alias_idx,
+            .type_owner = &type_owner,
+            .type_alias_idx = &type_alias_idx,
             .exported_resource_type_idx = &exported_resource_type_idx,
             .hoist_keys = &hoist_keys,
             .hoist_idxs = &hoist_idxs,
