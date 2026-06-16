@@ -103,61 +103,67 @@ fn ensureSeeded() void {
     }
 }
 
-// ── JSON helpers ────────────────────────────────────────────────────
+// ── JSON model types (serialized with std.json) ─────────────────────
 
-fn writeJsonString(res: *http.Responder, s: []const u8) void {
-    res.writeAll("\"");
-    for (s) |c| switch (c) {
-        '"' => res.writeAll("\\\""),
-        '\\' => res.writeAll("\\\\"),
-        '\n' => res.writeAll("\\n"),
-        '\r' => res.writeAll("\\r"),
-        '\t' => res.writeAll("\\t"),
-        else => res.writeAll(&[_]u8{c}),
-    };
-    res.writeAll("\"");
+const json_opts = std.json.Stringify.Options{ .emit_null_optional_fields = false };
+
+/// Wire shape of a pet. `id` augments the TypeSpec `Pet` so clients can address
+/// `/pets/{id}`; `tag` is omitted when absent (`emit_null_optional_fields`).
+const PetJson = struct {
+    id: i32,
+    name: []const u8,
+    tag: ?[]const u8 = null,
+    age: i32,
+};
+
+const ToyJson = struct {
+    id: i64,
+    petId: i64,
+    name: []const u8,
+};
+
+const ErrorJson = struct {
+    code: i32,
+    message: []const u8,
+};
+
+/// The `Pet` shape accepted by `POST /pets`.
+const PetInput = struct {
+    name: []const u8,
+    tag: ?[]const u8 = null,
+    age: i32,
+};
+
+fn petJson(p: *const StoredPet) PetJson {
+    return .{ .id = p.id, .name = p.name(), .tag = p.tag(), .age = p.age };
 }
 
-fn writePet(res: *http.Responder, p: *const StoredPet) void {
-    res.print("{{\"id\":{d},\"name\":", .{p.id});
-    writeJsonString(res, p.name());
-    if (p.tag()) |t| {
-        res.writeAll(",\"tag\":");
-        writeJsonString(res, t);
-    }
-    res.print(",\"age\":{d}}}", .{p.age});
-}
-
-fn writeToy(res: *http.Responder, t: *const StoredToy) void {
-    res.print("{{\"id\":{d},\"petId\":{d},\"name\":", .{ t.id, t.pet_id });
-    writeJsonString(res, t.name());
-    res.writeAll("}");
+/// Serialize `value` as minified JSON into the response buffer via std.json.
+fn writeJson(res: *http.Responder, value: anytype) void {
+    res.print("{f}", .{std.json.fmt(value, json_opts)});
 }
 
 fn writeError(res: *http.Responder, status: u16, code: i32, message: []const u8) void {
     res.setStatus(status);
-    res.print("{{\"code\":{d},\"message\":", .{code});
-    writeJsonString(res, message);
-    res.writeAll("}");
+    writeJson(res, ErrorJson{ .code = code, .message = message });
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
 
 fn listPets(res: *http.Responder) void {
-    res.writeAll("{\"items\":[");
-    var first = true;
+    var items: [pets.len]PetJson = undefined;
+    var n: usize = 0;
     for (&pets) |*p| {
         if (!p.used) continue;
-        if (!first) res.writeAll(",");
-        first = false;
-        writePet(res, p);
+        items[n] = petJson(p);
+        n += 1;
     }
-    res.writeAll("]}");
+    writeJson(res, .{ .items = items[0..n] });
 }
 
 fn readPet(id: i32, res: *http.Responder) void {
     if (findPet(id)) |p| {
-        writePet(res, p);
+        writeJson(res, petJson(p));
     } else {
         writeError(res, 404, 404, "pet not found");
     }
@@ -166,30 +172,22 @@ fn readPet(id: i32, res: *http.Responder) void {
 fn deletePet(id: i32, res: *http.Responder) void {
     if (findPet(id)) |p| {
         p.used = false;
-        res.setStatus(200);
-        res.writeAll("{\"message\":\"deleted\"}");
+        writeJson(res, .{ .message = "deleted" });
     } else {
         writeError(res, 404, 404, "pet not found");
     }
 }
 
 fn listToys(pet_id: i64, res: *http.Responder) void {
-    res.writeAll("{\"items\":[");
-    var first = true;
+    var items: [toys.len]ToyJson = undefined;
+    var n: usize = 0;
     for (&toys) |*t| {
         if (!t.used or t.pet_id != pet_id) continue;
-        if (!first) res.writeAll(",");
-        first = false;
-        writeToy(res, t);
+        items[n] = .{ .id = t.id, .petId = t.pet_id, .name = t.name() };
+        n += 1;
     }
-    res.writeAll("]}");
+    writeJson(res, .{ .items = items[0..n] });
 }
-
-const PetInput = struct {
-    name: []const u8,
-    tag: ?[]const u8 = null,
-    age: i32,
-};
 
 fn createPet(req: *const http.Request, res: *http.Responder) void {
     if (req.body.len == 0) return writeError(res, 400, 400, "request body required");
@@ -201,8 +199,7 @@ fn createPet(req: *const http.Request, res: *http.Responder) void {
     if (parsed.age < 0 or parsed.age > 20) return writeError(res, 400, 400, "age must be 0..20");
     const p = addPet(parsed.name, parsed.tag, parsed.age) orelse
         return writeError(res, 507, 507, "store full");
-    res.setStatus(200);
-    writePet(res, p);
+    writeJson(res, petJson(p));
 }
 
 // ── Routing ─────────────────────────────────────────────────────────
