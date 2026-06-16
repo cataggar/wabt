@@ -1,0 +1,8 @@
+package example:http;
+
+// A `wasi:http/service`-shaped world: import the http types (to build a
+// `response`) and export the async `handler` the host calls per request.
+world svc {
+    import wasi:http/types@0.3.0;
+    export wasi:http/handler@0.3.0;
+}
