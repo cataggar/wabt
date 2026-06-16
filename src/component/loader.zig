@@ -256,7 +256,7 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                     // Every canon kind except `.lift` contributes a slot
                     // to the core-func indexspace.
                     const contributes = switch (c) {
-                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return, .waitable_set_new, .waitable_set_wait, .waitable_set_poll, .waitable_set_drop, .waitable_join => true,
+                        .lower, .resource_drop, .resource_new, .resource_rep, .future_new, .future_read, .future_write, .future_cancel_read, .future_cancel_write, .future_drop_readable, .future_drop_writable, .stream_new, .stream_read, .stream_write, .stream_cancel_read, .stream_cancel_write, .stream_drop_readable, .stream_drop_writable, .error_context_new, .error_context_debug_message, .error_context_drop, .task_return, .waitable_set_new, .waitable_set_wait, .waitable_set_poll, .waitable_set_drop, .waitable_join, .task_cancel, .subtask_cancel, .subtask_drop, .context_get, .context_set, .backpressure_inc, .backpressure_dec => true,
                         .lift => false,
                     };
                     if (contributes) try core_func_indexspace.append(allocator, .{ .canon = local_idx });
@@ -790,6 +790,21 @@ fn parseCanon(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!cty
         },
         0x22 => .waitable_set_drop,
         0x23 => .waitable_join,
+        0x05 => .task_cancel,
+        0x06 => .{ .subtask_cancel = (try reader.readByte()) != 0 },
+        0x0D => .subtask_drop,
+        0x0A => blk: {
+            const ty = try readCoreValType(reader);
+            const slot = try reader.readU32();
+            break :blk .{ .context_get = .{ .ty = ty, .slot = slot } };
+        },
+        0x0B => blk: {
+            const ty = try readCoreValType(reader);
+            const slot = try reader.readU32();
+            break :blk .{ .context_set = .{ .ty = ty, .slot = slot } };
+        },
+        0x24 => .backpressure_inc,
+        0x25 => .backpressure_dec,
         else => error.InvalidEncoding,
     };
 }
@@ -1386,6 +1401,54 @@ test "round-trip waitable-set/waitable canons through writer + loader (#265)" {
     try std.testing.expect(!loaded.canons[2].waitable_set_poll.cancellable);
     try std.testing.expect(loaded.canons[3] == .waitable_set_drop);
     try std.testing.expect(loaded.canons[4] == .waitable_join);
+}
+
+test "round-trip subtask/task-cancel/backpressure/context canons through writer + loader (#267)" {
+    const writer = @import("writer.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // Distinguishing payloads catch field-order / operand bugs: the two
+    // `context.*` canons carry different (ty, slot) pairs, and
+    // `subtask.cancel` carries an async? flag.
+    const canons = [_]ctypes.Canon{
+        .task_cancel,
+        .{ .subtask_cancel = true },
+        .subtask_drop,
+        .{ .context_get = .{ .ty = .i32, .slot = 0 } },
+        .{ .context_set = .{ .ty = .i64, .slot = 3 } },
+        .backpressure_inc,
+        .backpressure_dec,
+    };
+    const component: ctypes.Component = .{
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &canons,
+        .imports = &.{},
+        .exports = &.{},
+        .custom_sections = &.{},
+    };
+    const bytes = try writer.encode(ar, &component);
+    const loaded = try load(bytes, ar);
+
+    try std.testing.expectEqual(@as(usize, 7), loaded.canons.len);
+    try std.testing.expect(loaded.canons[0] == .task_cancel);
+    try std.testing.expect(loaded.canons[1].subtask_cancel);
+    try std.testing.expect(loaded.canons[2] == .subtask_drop);
+    try std.testing.expect(loaded.canons[3] == .context_get);
+    try std.testing.expectEqual(ctypes.CoreValType.i32, loaded.canons[3].context_get.ty);
+    try std.testing.expectEqual(@as(u32, 0), loaded.canons[3].context_get.slot);
+    try std.testing.expect(loaded.canons[4] == .context_set);
+    try std.testing.expectEqual(ctypes.CoreValType.i64, loaded.canons[4].context_set.ty);
+    try std.testing.expectEqual(@as(u32, 3), loaded.canons[4].context_set.slot);
+    try std.testing.expect(loaded.canons[5] == .backpressure_inc);
+    try std.testing.expect(loaded.canons[6] == .backpressure_dec);
 }
 
 test "round-trip stream-family + error-context canons through writer + loader (#263)" {
