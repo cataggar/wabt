@@ -1203,6 +1203,9 @@ const async_intrinsic_prefixes = [_][]const u8{
     "[error-context]",
     "[waitable-set]",
     "[waitable]",
+    "[backpressure]",
+    "[task]",
+    "[subtask]",
 };
 
 fn isAsyncIntrinsicModule(module: []const u8) bool {
@@ -1917,6 +1920,35 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                     try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
                     core_func_idx += 1;
                 }
+            } else if (std.mem.startsWith(u8, grp.module, "[backpressure]")) {
+                for (grp.fields.items) |field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field, "inc"))
+                        .backpressure_inc
+                    else if (std.mem.eql(u8, field, "dec"))
+                        .backpressure_dec
+                    else
+                        return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
+            } else if (std.mem.startsWith(u8, grp.module, "[task]")) {
+                for (grp.fields.items) |field| {
+                    if (!std.mem.eql(u8, field, "cancel")) return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, .task_cancel);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
+            } else if (std.mem.startsWith(u8, grp.module, "[subtask]")) {
+                for (grp.fields.items) |field| {
+                    if (!std.mem.eql(u8, field, "drop")) return error.UnsupportedAsyncIntrinsic;
+                    try canons.append(ar, .subtask_drop);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    try bundle_exports.append(ar, .{ .name = field, .sort_idx = .{ .sort = .func, .idx = core_func_idx } });
+                    core_func_idx += 1;
+                }
             } else {
                 // `[error-context]` (always needs the shim path for its
                 // memory ops): not wired in this no-shim path.
@@ -2453,7 +2485,7 @@ fn buildComponentShimFixup(
         mem_op_slot: u32 = 0,
         satisfy_core_idx: u32 = 0,
     };
-    const AsyncFamily = enum { task_return, stream, future, error_context, waitable_set, waitable };
+    const AsyncFamily = enum { task_return, stream, future, error_context, waitable_set, waitable, backpressure, task, subtask };
     const AsyncGroup = struct {
         module: []const u8,
         family: AsyncFamily,
@@ -2595,6 +2627,43 @@ fn buildComponentShimFixup(
                 try async_group_list.append(ar, .{
                     .module = module,
                     .family = .waitable,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[backpressure]")) {
+                for (fsrc, 0..) |f, k| {
+                    if (!std.mem.eql(u8, f, "inc") and !std.mem.eql(u8, f, "dec"))
+                        return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = false };
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .backpressure,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[task]")) {
+                for (fsrc, 0..) |f, k| {
+                    if (!std.mem.eql(u8, f, "cancel")) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = false };
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .task,
+                    .elem = .u8,
+                    .export_ref = "",
+                    .fields = fields,
+                });
+            } else if (std.mem.startsWith(u8, module, "[subtask]")) {
+                for (fsrc, 0..) |f, k| {
+                    if (!std.mem.eql(u8, f, "drop")) return error.UnsupportedAsyncIntrinsic;
+                    fields[k] = .{ .name = f, .is_mem_op = false };
+                }
+                try async_group_list.append(ar, .{
+                    .module = module,
+                    .family = .subtask,
                     .elem = .u8,
                     .export_ref = "",
                     .fields = fields,
@@ -3134,6 +3203,36 @@ fn buildComponentShimFixup(
                     core_func_idx += 1;
                 }
             },
+            .backpressure => {
+                for (grp.fields) |*field| {
+                    const canon: ctypes.Canon = if (std.mem.eql(u8, field.name, "inc"))
+                        .backpressure_inc
+                    else
+                        .backpressure_dec;
+                    try canons.append(ar, canon);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+            .task => {
+                for (grp.fields) |*field| {
+                    // only `cancel`, no-memory.
+                    try canons.append(ar, .task_cancel);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
+            .subtask => {
+                for (grp.fields) |*field| {
+                    // only `drop`, no-memory.
+                    try canons.append(ar, .subtask_drop);
+                    try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
+                    field.satisfy_core_idx = core_func_idx;
+                    core_func_idx += 1;
+                }
+            },
         }
     }
 
@@ -3313,6 +3412,9 @@ fn buildComponentShimFixup(
                         .{ .waitable_set_wait = .{ .cancellable = false, .memory = memory_core_idx } },
                     .waitable => unreachable, // waitable.join is never mem-op
                     .task_return => unreachable, // task.return is never mem-op
+                    .backpressure => unreachable, // backpressure.inc/dec are never mem-op
+                    .task => unreachable, // task.cancel is never mem-op
+                    .subtask => unreachable, // subtask.drop is never mem-op
                 };
                 try canons.append(ar, canon);
                 core_func_idx += 1;
@@ -5918,6 +6020,116 @@ test "buildComponent #265: [waitable-set] new/wait/drop + [waitable] join wires 
     try testing.expect(mainWithArgFor(loaded, "[waitable]"));
     try testing.expect(bundleExportsFunc(loaded, "wait"));
     try testing.expect(bundleExportsFunc(loaded, "join"));
+}
+
+fn countControlCanons(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.canons) |c| switch (c) {
+        .backpressure_inc, .backpressure_dec, .task_cancel, .subtask_drop => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+test "buildComponent #267: [backpressure]/[task]/[subtask] no-mem control canons wire (fast path)" {
+    // backpressure.inc/.dec, task.cancel, and subtask.drop are all no-memory
+    // direct canons (like waitable.join). With no mem-op intrinsic and no
+    // exported destructor the guest stays on the fast path: one core module,
+    // each intrinsic bundle fed to main under its synthetic module name.
+    // This exact shape was validated on wasmtime 46 (`wasmtime compile` with
+    // `-W component-model-async{,-stackful,-more-async-builtins}`).
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[backpressure]" "inc" (func))
+        \\  (import "[backpressure]" "dec" (func))
+        \\  (import "[task]" "cancel" (func))
+        \\  (import "[subtask]" "drop" (func (param i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run") (call 0 (i32.const 0)))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // No mem-op / dtor ⇒ fast path ⇒ a single (main) core module.
+    try testing.expectEqual(@as(usize, 1), loaded.core_modules.len);
+    // backpressure.inc + backpressure.dec + task.cancel + subtask.drop.
+    try testing.expectEqual(@as(usize, 4), countControlCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[backpressure]"));
+    try testing.expect(mainWithArgFor(loaded, "[task]"));
+    try testing.expect(mainWithArgFor(loaded, "[subtask]"));
+    try testing.expect(bundleExportsFunc(loaded, "inc"));
+    try testing.expect(bundleExportsFunc(loaded, "dec"));
+    try testing.expect(bundleExportsFunc(loaded, "cancel"));
+    try testing.expect(bundleExportsFunc(loaded, "drop"));
+}
+
+test "buildComponent #267: control canons also wire through the shim/fixup path" {
+    // Adding a memory-opt intrinsic (waitable-set.wait) routes the build
+    // through the shim/fixup path; the no-mem control canons must still wire
+    // there (classification + emission arms), alongside main+shim+fixup.
+    const wit =
+        \\package local:p@0.1.0;
+        \\
+        \\interface run {
+        \\    run: async func() -> result;
+        \\}
+        \\
+        \\world hello {
+        \\    export run;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[task-return]local:p/run@0.1.0#run" "task-return" (func (param i32)))
+        \\  (import "[backpressure]" "inc" (func))
+        \\  (import "[task]" "cancel" (func))
+        \\  (import "[subtask]" "drop" (func (param i32)))
+        \\  (import "[waitable-set]" "wait" (func (param i32 i32) (result i32)))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+        \\  (func (export "local:p/run@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "hello");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // waitable-set.wait is mem-op ⇒ main + shim + fixup.
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    // backpressure.inc + task.cancel + subtask.drop.
+    try testing.expectEqual(@as(usize, 3), countControlCanons(loaded));
+    try testing.expect(mainWithArgFor(loaded, "[backpressure]"));
+    try testing.expect(mainWithArgFor(loaded, "[task]"));
+    try testing.expect(mainWithArgFor(loaded, "[subtask]"));
+    try testing.expect(bundleExportsFunc(loaded, "inc"));
+    try testing.expect(bundleExportsFunc(loaded, "cancel"));
 }
 
 test "buildComponent #248: drop-only namespace wires canon resource.drop into the bundle" {
