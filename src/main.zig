@@ -9,99 +9,14 @@
 //!   DELETE /pets/{id}            -> 200 | 404 Error
 //!   GET    /pets/{id}/toys       -> { items: Toy[] }
 //!
-//! Concurrency: the store is static global state mutated only by synchronous,
-//! await-free operations, so cooperatively-interleaved request tasks never
-//! observe a torn read/write. Per-request data lives in `wasi_http`'s per-task
-//! stack buffers.
+//! Concurrency: per-request data lives in `wasi_http`'s per-task stack buffers;
+//! the pet/toy data lives in a separate storage component (see
+//! `src/store_backend.zig`) reached through the imported `example:petstore/store`
+//! interface. `wabt component compose` links the two into one component.
 
 const std = @import("std");
 const http = @import("wasi_http");
-
-// ── In-memory store ─────────────────────────────────────────────────
-
-const StoredPet = struct {
-    used: bool = false,
-    id: i32 = 0,
-    age: i32 = 0,
-    name_buf: [64]u8 = undefined,
-    name_len: u8 = 0,
-    has_tag: bool = false,
-    tag_buf: [64]u8 = undefined,
-    tag_len: u8 = 0,
-
-    fn name(self: *const StoredPet) []const u8 {
-        return self.name_buf[0..self.name_len];
-    }
-    fn tag(self: *const StoredPet) ?[]const u8 {
-        return if (self.has_tag) self.tag_buf[0..self.tag_len] else null;
-    }
-};
-
-const StoredToy = struct {
-    used: bool = false,
-    id: i64 = 0,
-    pet_id: i64 = 0,
-    name_buf: [64]u8 = undefined,
-    name_len: u8 = 0,
-
-    fn name(self: *const StoredToy) []const u8 {
-        return self.name_buf[0..self.name_len];
-    }
-};
-
-var pets = [_]StoredPet{.{}} ** 128;
-var toys = [_]StoredToy{.{}} ** 128;
-var next_id: i32 = 1;
-var seeded: bool = false;
-
-fn setField(buf: []u8, len: *u8, value: []const u8) void {
-    const n: u8 = @intCast(@min(value.len, buf.len));
-    @memcpy(buf[0..n], value[0..n]);
-    len.* = n;
-}
-
-fn addPet(name: []const u8, tag: ?[]const u8, age: i32) ?*StoredPet {
-    for (&pets) |*p| {
-        if (p.used) continue;
-        p.* = .{ .used = true, .id = next_id, .age = age };
-        next_id += 1;
-        setField(&p.name_buf, &p.name_len, name);
-        if (tag) |t| {
-            p.has_tag = true;
-            setField(&p.tag_buf, &p.tag_len, t);
-        }
-        return p;
-    }
-    return null;
-}
-
-fn addToy(pet_id: i64, id: i64, name: []const u8) void {
-    for (&toys) |*t| {
-        if (t.used) continue;
-        t.* = .{ .used = true, .id = id, .pet_id = pet_id };
-        setField(&t.name_buf, &t.name_len, name);
-        return;
-    }
-}
-
-fn findPet(id: i32) ?*StoredPet {
-    for (&pets) |*p| {
-        if (p.used and p.id == id) return p;
-    }
-    return null;
-}
-
-fn ensureSeeded() void {
-    if (seeded) return;
-    seeded = true;
-    const p1 = addPet("Fluffy", "cat", 3);
-    _ = addPet("Rex", "dog", 5);
-    _ = addPet("Bubbles", null, 1);
-    if (p1) |p| {
-        addToy(p.id, 100, "Yarn Ball");
-        addToy(p.id, 101, "Feather Wand");
-    }
-}
+const store = @import("store");
 
 // ── JSON model types (serialized with std.json) ─────────────────────
 
@@ -134,8 +49,8 @@ const PetInput = struct {
     age: i32,
 };
 
-fn petJson(p: *const StoredPet) PetJson {
-    return .{ .id = p.id, .name = p.name(), .tag = p.tag(), .age = p.age };
+fn petJson(p: store.Pet) PetJson {
+    return .{ .id = @intCast(p.id), .name = p.name, .tag = p.tag, .age = @intCast(p.age) };
 }
 
 /// Serialize `value` as minified JSON into the response buffer via std.json.
@@ -151,40 +66,45 @@ fn writeError(res: *http.Responder, status: u16, code: i32, message: []const u8)
 // ── Handlers ────────────────────────────────────────────────────────
 
 fn listPets(res: *http.Responder) void {
-    var items: [pets.len]PetJson = undefined;
+    var items: [128]PetJson = undefined;
     var n: usize = 0;
-    for (&pets) |*p| {
-        if (!p.used) continue;
-        items[n] = petJson(p);
-        n += 1;
+    const count = store.petCount();
+    var i: u32 = 0;
+    while (i < count and n < items.len) : (i += 1) {
+        if (store.petAt(i)) |p| {
+            items[n] = petJson(p);
+            n += 1;
+        }
     }
     writeJson(res, .{ .items = items[0..n] });
 }
 
-fn readPet(id: i32, res: *http.Responder) void {
-    if (findPet(id)) |p| {
+fn readPet(id: u32, res: *http.Responder) void {
+    if (store.getPet(id)) |p| {
         writeJson(res, petJson(p));
     } else {
         writeError(res, 404, 404, "pet not found");
     }
 }
 
-fn deletePet(id: i32, res: *http.Responder) void {
-    if (findPet(id)) |p| {
-        p.used = false;
+fn deletePet(id: u32, res: *http.Responder) void {
+    if (store.deletePet(id)) {
         writeJson(res, .{ .message = "deleted" });
     } else {
         writeError(res, 404, 404, "pet not found");
     }
 }
 
-fn listToys(pet_id: i64, res: *http.Responder) void {
-    var items: [toys.len]ToyJson = undefined;
+fn listToys(pet_id: u32, res: *http.Responder) void {
+    var items: [128]ToyJson = undefined;
     var n: usize = 0;
-    for (&toys) |*t| {
-        if (!t.used or t.pet_id != pet_id) continue;
-        items[n] = .{ .id = t.id, .petId = t.pet_id, .name = t.name() };
-        n += 1;
+    const count = store.toyCount(pet_id);
+    var i: u32 = 0;
+    while (i < count and n < items.len) : (i += 1) {
+        if (store.toyAt(pet_id, i)) |t| {
+            items[n] = .{ .id = @intCast(t.id), .petId = @intCast(t.pet_id), .name = t.name };
+            n += 1;
+        }
     }
     writeJson(res, .{ .items = items[0..n] });
 }
@@ -197,7 +117,7 @@ fn createPet(req: *const http.Request, res: *http.Responder) void {
         .ignore_unknown_fields = true,
     }) catch return writeError(res, 400, 400, "invalid pet json");
     if (parsed.age < 0 or parsed.age > 20) return writeError(res, 400, 400, "age must be 0..20");
-    const p = addPet(parsed.name, parsed.tag, parsed.age) orelse
+    const p = store.createPet(parsed.name, parsed.tag, @intCast(parsed.age)) orelse
         return writeError(res, 507, 507, "store full");
     writeJson(res, petJson(p));
 }
@@ -205,8 +125,6 @@ fn createPet(req: *const http.Request, res: *http.Responder) void {
 // ── Routing ─────────────────────────────────────────────────────────
 
 fn handle(req: *const http.Request, res: *http.Responder) void {
-    ensureSeeded();
-
     const q = std.mem.indexOfScalar(u8, req.path, '?');
     const path = if (q) |i| req.path[0..i] else req.path;
 
@@ -225,14 +143,14 @@ fn handle(req: *const http.Request, res: *http.Responder) void {
             const id_str = rest[0..slash];
             const tail = rest[slash + 1 ..];
             if (std.mem.eql(u8, tail, "toys") and req.method == .get) {
-                const pid = std.fmt.parseInt(i64, id_str, 10) catch return writeError(res, 400, 400, "invalid pet id");
+                const pid = std.fmt.parseInt(u32, id_str, 10) catch return writeError(res, 400, 400, "invalid pet id");
                 listToys(pid, res);
                 return;
             }
             writeError(res, 404, 404, "not found");
             return;
         }
-        const id = std.fmt.parseInt(i32, rest, 10) catch return writeError(res, 400, 400, "invalid pet id");
+        const id = std.fmt.parseInt(u32, rest, 10) catch return writeError(res, 400, 400, "invalid pet id");
         switch (req.method) {
             .get => readPet(id, res),
             .delete => deletePet(id, res),

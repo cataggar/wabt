@@ -1,35 +1,66 @@
 const std = @import("std");
 const wasip3 = @import("wasip3");
 
-/// A standalone `wasi:http@0.3.0` service component written in Zig: it exports
-/// the async `wasi:http/handler@0.3.0#handle`, builds a `200` response, and
-/// streams `Hello, WASI!` as the body. Built `wasm32-freestanding`, then
-/// wrapped into a component with `wabt component new`.
+/// A composed `wasi:http@0.3.0` petstore: an HTTP **frontend** component that
+/// imports `example:petstore/store`, and a separate **storage** component that
+/// exports it. Each is built `wasm32-freestanding`, wrapped with
+/// `wabt component new`, then linked with `wabt component compose` into one
+/// servable component.
 ///
 /// `WABT` / `WASMTIME` env vars override the tool binaries (point them at a P3
 /// wabt and a wasmtime >= 46); otherwise `wabt` / `wasmtime` from `PATH`.
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
 
-    const core = wasip3.zigBuildWasm(b, .{
-        .source = b.path("src/main.zig"),
-        .exports = &.{"wasi:http/handler@0.3.0#handle"},
-        .output = "http.core.wasm",
-        .imports = wasip3.resolveWasmImports(b, dep, &.{"wasi_http"}),
-    });
-
     const wabt_bin = b.graph.environ_map.get("WABT") orelse "wabt";
     const wasmtime_bin = b.graph.environ_map.get("WASMTIME") orelse "wasmtime";
 
-    // wabt component new --wit wit http.core.wasm -o http.wasm
-    const new_cmd = b.addSystemCommand(&.{ wabt_bin, "component", "new" });
-    new_cmd.addArg("--wit");
-    new_cmd.addDirectoryArg(b.path("wit"));
-    new_cmd.addFileArg(core);
-    new_cmd.addArg("-o");
-    const component = new_cmd.addOutputFileArg("http.wasm");
+    // ── Frontend: wasi:http handler importing example:petstore/store ──
+    const fe_base = wasip3.resolveWasmImports(b, dep, &.{"wasi_http"});
+    const fe_imports = b.allocator.alloc(wasip3.ZigWasmImport, fe_base.len + 1) catch @panic("OOM");
+    @memcpy(fe_imports[0..fe_base.len], fe_base);
+    fe_imports[fe_base.len] = .{
+        .name = "store",
+        .path = b.path("src/store_client.zig"),
+        .deps = &.{"abi"},
+        .root_dep = true,
+    };
 
-    const install = b.addInstallFileWithDir(component, .prefix, "http.wasm");
+    const fe_core = wasip3.zigBuildWasm(b, .{
+        .source = b.path("src/main.zig"),
+        .exports = &.{"wasi:http/handler@0.3.0#handle"},
+        .output = "http.core.wasm",
+        .imports = fe_imports,
+    });
+    const frontend = componentNew(b, wabt_bin, fe_core, "svc", "http.wasm");
+
+    // ── Backend: example:petstore/store provider ──────────────────────
+    const be_core = wasip3.zigBuildWasm(b, .{
+        .source = b.path("src/store_backend.zig"),
+        .exports = &.{
+            "example:petstore/store#pet-count",
+            "example:petstore/store#pet-at",
+            "example:petstore/store#get-pet",
+            "example:petstore/store#create-pet",
+            "example:petstore/store#delete-pet",
+            "example:petstore/store#toy-count",
+            "example:petstore/store#toy-at",
+        },
+        .output = "store.core.wasm",
+        .imports = wasip3.resolveWasmImports(b, dep, &.{"abi"}),
+    });
+    const backend = componentNew(b, wabt_bin, be_core, "store-provider", "store.wasm");
+
+    // ── Compose: bind the consumer's `store` import to the provider ───
+    // wabt component compose -d <provider> -o <out> <consumer>
+    const compose = b.addSystemCommand(&.{ wabt_bin, "component", "compose" });
+    compose.addArg("-d");
+    compose.addFileArg(backend);
+    compose.addArg("-o");
+    const component = compose.addOutputFileArg("petstore.wasm");
+    compose.addFileArg(frontend);
+
+    const install = b.addInstallFileWithDir(component, .prefix, "petstore.wasm");
     b.getInstallStep().dependOn(&install.step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
@@ -43,6 +74,24 @@ pub fn build(b: *std.Build) void {
     });
     serve.addFileArg(component);
     if (b.args) |extra| serve.addArgs(extra);
-    const serve_step = b.step("serve", "Serve the wasi:http component with wasmtime (P3)");
+    const serve_step = b.step("serve", "Serve the composed petstore component with wasmtime (P3)");
     serve_step.dependOn(&serve.step);
+}
+
+/// `wabt component new --world <world> --wit wit <core> -o <out>`.
+fn componentNew(
+    b: *std.Build,
+    wabt_bin: []const u8,
+    core: std.Build.LazyPath,
+    world: []const u8,
+    out: []const u8,
+) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{ wabt_bin, "component", "new" });
+    cmd.addArg("--world");
+    cmd.addArg(world);
+    cmd.addArg("--wit");
+    cmd.addDirectoryArg(b.path("wit"));
+    cmd.addFileArg(core);
+    cmd.addArg("-o");
+    return cmd.addOutputFileArg(out);
 }

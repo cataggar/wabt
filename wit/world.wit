@@ -1,8 +1,51 @@
-package example:http;
+package example:petstore;
 
-// A `wasi:http/service`-shaped world: import the http types (to build a
-// `response`) and export the async `handler` the host calls per request.
+/// A typed data-access boundary for the petstore. The HTTP frontend
+/// (`svc`) imports it; a separate storage component (`store-provider`)
+/// exports it. `wabt component compose` links the two into one component.
+///
+/// Lists are exposed as `count` + indexed `*-at` accessors (rather than
+/// `list<record>`) so the canonical-ABI marshalling stays hand-writable on
+/// both sides; failures collapse to `option`/`bool` for the same reason.
+interface store {
+    record pet {
+        id: u32,
+        name: string,
+        tag: option<string>,
+        age: u32,
+    }
+
+    record toy {
+        id: u32,
+        pet-id: u32,
+        name: string,
+    }
+
+    /// Number of pets currently stored.
+    pet-count: func() -> u32;
+    /// The pet at a 0-based dense index `0..pet-count`, or none.
+    pet-at: func(index: u32) -> option<pet>;
+    /// The pet with the given id, or none.
+    get-pet: func(id: u32) -> option<pet>;
+    /// Create a pet; none when the store is full.
+    create-pet: func(name: string, tag: option<string>, age: u32) -> option<pet>;
+    /// Delete a pet; true when it existed.
+    delete-pet: func(id: u32) -> bool;
+    /// Number of toys belonging to a pet.
+    toy-count: func(pet-id: u32) -> u32;
+    /// The `index`-th toy of a pet, or none.
+    toy-at: func(pet-id: u32, index: u32) -> option<toy>;
+}
+
+// A `wasi:http/service`-shaped world that also imports the `store`
+// data-access interface; exports the async `handler` the host calls.
 world svc {
     import wasi:http/types@0.3.0;
+    import store;
     export wasi:http/handler@0.3.0;
+}
+
+// The storage component: exports the `store` interface.
+world store-provider {
+    export store;
 }
