@@ -1,0 +1,3 @@
+{
+    "_comment": "Skip-list for `zig build p3-conformance` (scripts/p3_conformance.py). Keys are tests/p3/<name> fixture stems; each value MUST be a rationale ending in a tracking issue (e.g. '... (#NNN)'). Empty = every fixture is expected to validate on the pinned Wasmtime. Mirrors wamr's tests/wasi-p3-testsuite-skip.json convention."
+}

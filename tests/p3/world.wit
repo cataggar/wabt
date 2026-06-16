@@ -1,0 +1,9 @@
+package local:p@0.1.0;
+
+interface run {
+    run: async func() -> result;
+}
+
+world hello {
+    export run;
+}
