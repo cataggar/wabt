@@ -17,11 +17,17 @@ pub fn build(b: *std.Build) void {
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
     wasi_cli.addImport("cm_async", cm_async);
 
+    const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
+    wasi_http.addImport("abi", abi);
+    wasi_http.addImport("cm_async", cm_async);
+
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
     wasip3.addImport("abi", abi);
     wasip3.addImport("cm_async", cm_async);
     wasip3.addImport("wasi_cli", wasi_cli);
+    wasip3.addImport("wasi_http", wasi_http);
+
 
     // ?? Tests ??????????????????????????????????????????????????????
     // Native unit tests for the host-import-free canonical-ABI core in
@@ -75,6 +81,7 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
     .{ .name = "cm_async", .deps = &.{"abi"} },
     .{ .name = "wasi_cli", .deps = &.{"cm_async"} },
+    .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
 };
 
 fn findSpec(name: []const u8) ModuleSpec {

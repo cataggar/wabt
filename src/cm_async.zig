@@ -34,6 +34,14 @@
 
 const abi = @import("abi");
 
+// Keep `abi` alive so its `cabi_realloc` export survives even when a guest
+// only touches the `stream<u8>` path (e.g. a pure-output `wasi:cli` command
+// that never calls an `abi.retPtr`-using helper). Without this, `abi` is
+// tree-shaken and the canonical-ABI allocator the component needs vanishes.
+comptime {
+    _ = abi;
+}
+
 /// The two ends of a freshly created `future` / `stream`. `new` returns a
 /// packed `i64`: **readable** in the low 32 bits, **writable** in the high.
 pub const Ends = struct {
@@ -47,6 +55,12 @@ inline fn unpackEnds(handles: i64) Ends {
         .readable = @bitCast(@as(u32, @truncate(u))),
         .writable = @bitCast(@as(u32, @truncate(u >> 32))),
     };
+}
+
+/// Public unpack of a `new()` `i64` (readable low / writable high) — reused by
+/// per-type `future`/`stream` bindings that declare their own intrinsics.
+pub inline fn unpack(handles: i64) Ends {
+    return unpackEnds(handles);
 }
 
 // ── stream<u8> intrinsics ──────────────────────────────────────────

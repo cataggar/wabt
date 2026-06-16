@@ -67,12 +67,11 @@ pub fn println(bytes: []const u8) void {
 /// `result::err`); the wrapper reports it via `task.return`.
 pub fn exportRun(comptime entry: fn () u8) void {
     const Wrapper = struct {
-        fn run() callconv(.c) i32 {
+        fn run() callconv(.c) void {
             const code = entry();
             run_task.@"task-return"(if (code == 0) 0 else 1);
-            // Async-lift "completed synchronously" status (provisional —
-            // finalized with wabt P3 generation).
-            return 0;
+            // No-callback (stackful) async lift: the core export returns
+            // nothing; completion is signalled by `task-return` + return.
         }
     };
     @export(&Wrapper.run, .{ .name = "wasi:cli/run@0.3.0#run" });

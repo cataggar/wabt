@@ -9,3 +9,4 @@ pub const abi = @import("abi");
 /// waitable-set) — the WASI 0.3 replacement for `wasi:io`.
 pub const cm_async = @import("cm_async");
 pub const wasi_cli = @import("wasi_cli");
+pub const wasi_http = @import("wasi_http");
