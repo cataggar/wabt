@@ -3264,6 +3264,10 @@ fn buildComponentShimFixup(
     var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
     // #280: named non-resource type alias dedup (name → top-level type idx).
     var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    // Locally-defined named value types (e.g. a `record` declared in an
+    // exported interface and referenced by name) hoisted into the component
+    // type space, deduped by name so repeated references share one type.
+    var local_named_idx = std.StringHashMapUnmanaged(u32).empty;
     const HandleKind = enum { own, borrow };
     const HandleKey = struct { name: []const u8, kind: HandleKind };
     var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
@@ -3279,6 +3283,7 @@ fn buildComponentShimFixup(
         resource_alias_idx: *std.StringHashMapUnmanaged(u32),
         type_owner: *std.StringHashMapUnmanaged([]const u8),
         type_alias_idx: *std.StringHashMapUnmanaged(u32),
+        local_named_idx: *std.StringHashMapUnmanaged(u32),
         exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
         hoist_keys: *std.ArrayListUnmanaged(HandleKey),
         hoist_idxs: *std.ArrayListUnmanaged(u32),
@@ -3322,6 +3327,36 @@ fn buildComponentShimFixup(
             self.comp_type_idx.* += 1;
             try self.type_alias_idx.put(self.ar, name, slot);
             return slot;
+        }
+
+        /// Hoist a locally-defined named value type — e.g. a `record`
+        /// declared in this exported interface and referenced by name (as in
+        /// `option<pet>`). The interface body exports it as
+        /// `(export "name" (type (eq K)))`, so `slot` is an `.export_eq`
+        /// whose `target` is the underlying typedef: transcribe and define
+        /// that typedef, deduped by name so repeated references share one
+        /// component-level type. Returns null when `slot` isn't such a
+        /// locally-defined named typedef (e.g. a `use`d type aliased from
+        /// another interface — handled by `typeAlias` instead).
+        fn hoistLocalNamed(self: @This(), name: []const u8, slot: u32) lift_types.Error!?u32 {
+            if (self.local_named_idx.get(name)) |idx| return idx;
+            if (slot >= self.ext_slots.len) return null;
+            const target = switch (self.ext_slots[slot]) {
+                .export_eq => |e| e.target,
+                else => return null,
+            };
+            if (target >= self.ext_slots.len) return null;
+            switch (self.ext_slots[target]) {
+                .typedef => {},
+                else => return null,
+            }
+            const hoisted = try self.rewriteValType(.{ .type_idx = target });
+            const idx = switch (hoisted) {
+                .type_idx => |i| i,
+                else => return null,
+            };
+            try self.local_named_idx.put(self.ar, name, idx);
+            return idx;
         }
 
         fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
@@ -3377,6 +3412,7 @@ fn buildComponentShimFixup(
                 .type_idx => |slot| blk: {
                     if (metadata_decode.typeNameForSlot(self.ext_slots, slot)) |name| {
                         if (try self.typeAlias(name)) |idx| break :blk .{ .type_idx = idx };
+                        if (try self.hoistLocalNamed(name, slot)) |idx| break :blk .{ .type_idx = idx };
                     }
                     break :blk v;
                 },
@@ -3558,6 +3594,7 @@ fn buildComponentShimFixup(
                             .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
                             .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
                             .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
                             .comp_type_idx = &comp_type_idx,   .order = &order,
@@ -3602,6 +3639,7 @@ fn buildComponentShimFixup(
                             .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
                             .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
                             .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
                             .comp_type_idx = &comp_type_idx,   .order = &order,
@@ -3696,6 +3734,7 @@ fn buildComponentShimFixup(
                         .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
                         .resource_alias_idx = &resource_alias_idx,
                         .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                        .local_named_idx = &local_named_idx,
                         .exported_resource_type_idx = &exported_resource_type_idx,
                         .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
                         .comp_type_idx = &comp_type_idx,   .order = &order,
@@ -4102,6 +4141,7 @@ fn buildComponentShimFixup(
             .resource_alias_idx = &resource_alias_idx,
             .type_owner = &type_owner,
             .type_alias_idx = &type_alias_idx,
+            .local_named_idx = &local_named_idx,
             .exported_resource_type_idx = &exported_resource_type_idx,
             .hoist_keys = &hoist_keys,
             .hoist_idxs = &hoist_idxs,
@@ -4207,10 +4247,34 @@ fn buildComponentShimFixup(
         }
 
         if (res_names.items.len == 0) {
-            var inline_exports = try ar.alloc(ctypes.InlineExport, fn_count);
+            // Export each locally-defined named type (e.g. a `record`) this
+            // interface declares, before its funcs, so the instance is
+            // self-contained: the lifted funcs reference these types, and an
+            // exported instance that didn't also export them would be invalid
+            // ("instance not valid to be used as export").
+            var type_exports = std.ArrayListUnmanaged(ctypes.InlineExport).empty;
+            for (es.ext.type_slots) |ts| {
+                const e = switch (ts) {
+                    .export_eq => |x| x,
+                    else => continue,
+                };
+                if (e.target >= es.ext.type_slots.len) continue;
+                switch (es.ext.type_slots[e.target]) {
+                    .typedef => {},
+                    else => continue,
+                }
+                const idx = local_named_idx.get(e.name) orelse continue;
+                try type_exports.append(ar, .{
+                    .name = e.name,
+                    .sort_idx = .{ .sort = .type, .idx = idx },
+                });
+            }
+            const type_count = type_exports.items.len;
+            var inline_exports = try ar.alloc(ctypes.InlineExport, type_count + fn_count);
+            @memcpy(inline_exports[0..type_count], type_exports.items);
             for (0..fn_count) |i| {
                 const cf = captured_funcs.items[es.start + i];
-                inline_exports[i] = .{
+                inline_exports[type_count + i] = .{
                     .name = cf.fn_name,
                     .sort_idx = .{ .sort = .func, .idx = func_comp_idx[i] },
                 };
