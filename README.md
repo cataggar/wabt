@@ -1,6 +1,6 @@
 # wasip2
 
-Hand-written Zig **guest** bindings for the WASI Preview 2 (and bundled
+Zig **guest** bindings for the WASI Preview 2 (and bundled
 proposal) packages that [`cataggar/wabt`](https://github.com/cataggar/wabt)
 embeds.
 
