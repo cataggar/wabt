@@ -7,7 +7,7 @@
 //! declarations here lets those wrappers share one set (and one
 //! `[resource-drop]`) instead of each re-declaring its own.
 //!
-//! Like the sibling `wasi_*` modules these are hand-written canonical-ABI
+//! Like the sibling `wasi_*` modules these are canonical-ABI
 //! `extern`s over a thin typed API; the shared ret-area + `cabi_realloc`
 //! live in `abi`, so a guest may combine this with other wrappers without
 //! duplicate exports.

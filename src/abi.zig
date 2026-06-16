@@ -1,7 +1,7 @@
 //! `abi` — shared guest-side Component Model canonical-ABI primitives.
 //!
 //! The `wasi_*` helper modules in this directory (`wasi_http`,
-//! `wasi_keyvalue`, …) are thin typed wrappers over hand-written
+//! `wasi_keyvalue`, …) are thin typed wrappers over
 //! `extern` declarations of host imports. Everything those wrappers
 //! share — the `cabi_realloc` scratch arena and the "ret-area" used to
 //! receive results wider than one core value — lives here, exactly once,
