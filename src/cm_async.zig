@@ -5,7 +5,7 @@
 //! `input-stream` / `output-stream` played in 0.2 moved into the
 //! canonical ABI as the first-class `future<T>` / `stream<T>` types and
 //! the `async` lift/lower convention. This module is the guest side of
-//! that contract: hand-written `extern` declarations of the canonical
+//! that contract: `extern` declarations of the canonical
 //! **async built-in intrinsics** the guest core imports, plus thin typed
 //! wrappers. The component wrapper (`wabt component new`, once it grows
 //! P3 generation — cataggar/wabt#263) supplies these imports via the
