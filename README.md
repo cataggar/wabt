@@ -1,6 +1,6 @@
 # wasip3
 
-Hand-written Zig **guest** bindings for **WASI 0.3** (Component-Model
+Zig **guest** bindings for **WASI 0.3** (Component-Model
 **async**). Sibling to the [`wasip2`](https://github.com/cataggar/wabt/tree/wasip2)
 branch (from which this one is forked), retargeted to the 0.3 async ABI.
 
