@@ -81,6 +81,21 @@ pub fn wasmtimeBin(b: *std.Build) []const u8 {
     return b.graph.environ_map.get("WASMTIME") orelse "wasmtime";
 }
 
+/// Wrap a source WIT directory so edits to its files invalidate the build
+/// cache of the `Run` steps that consume it. `Run.addDirectoryArg` hashes only
+/// the directory *path* into the cache manifest (std `Run.zig`'s
+/// `decorated_directory` arm hashes the resolved arg bytes, never the
+/// contents), so a plain `b.path("wit")` would let `wabt component new` /
+/// `bindgen` serve stale output after a WIT edit. Routing the dir through
+/// `addWriteFiles().addCopyDirectory` — which *does* content-hash every copied
+/// file — yields a content-addressed generated directory whose path changes
+/// when the WIT changes, busting the consumer's cache correctly. The copy step
+/// is itself cached, so steady-state builds pay nothing.
+pub fn trackedWit(b: *std.Build, wit: std.Build.LazyPath) std.Build.LazyPath {
+    const wf = b.addWriteFiles();
+    return wf.addCopyDirectory(wit, "wit", .{});
+}
+
 pub const ZigWasmImport = struct {
     /// Import name, e.g. `wasi_cli` for `@import("wasi_cli")`.
     name: []const u8,
@@ -282,7 +297,7 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
         cmd.addArg(world);
     }
     cmd.addArg("--wit");
-    cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
+    cmd.addDirectoryArg(trackedWit(b, opts.wit_dir orelse b.path("wit")));
     cmd.addFileArg(opts.wasm_core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(opts.output orelse componentBasename(b, lazyBasename(opts.wasm_core)));
@@ -306,7 +321,7 @@ pub const WabtComponentBindgen = struct {
 /// `export fn` shells) for a world as a Zig source `LazyPath`.
 pub fn wabtComponentBindgen(b: *std.Build, opts: WabtComponentBindgen) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{ wabtBin(b), "component", "bindgen", "--wit" });
-    cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
+    cmd.addDirectoryArg(trackedWit(b, opts.wit_dir orelse b.path("wit")));
     cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl, "-o" });
     cmd.setName(b.fmt("wabt component bindgen {s}", .{opts.world}));
     return cmd.addOutputFileArg(opts.output);
