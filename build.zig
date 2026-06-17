@@ -50,6 +50,7 @@ pub fn build(b: *std.Build) void {
         "src/tools/component_new.zig",
         "src/tools/component_compose.zig",
         "src/tools/component_objdump.zig",
+        "src/tools/component_bindgen.zig",
         // Subject dispatchers (added by #137 — six conceptual roots).
         "src/tools/text.zig",
         "src/tools/module.zig",
