@@ -10,8 +10,8 @@ pub fn build(b: *std.Build) void {
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
-        .imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_http", "canon" }, &.{
-            .{ .name = "store_consumer", .path = store_consumer, .deps = &.{ "abi", "canon" } },
+        .imports = wasip3.guestImports(b, dep, &.{"wasi_http"}, &.{
+            .{ .name = "store_consumer", .bindings = store_consumer },
         }),
     });
     const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
@@ -19,11 +19,9 @@ pub fn build(b: *std.Build) void {
     const store_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
-        .imports = &.{
-            .{ .name = "store_provider", .path = store_provider, .deps = &.{ "canon", "abi" } },
-            .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
-            .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
-        },
+        .imports = wasip3.guestImports(b, dep, &.{}, &.{
+            .{ .name = "store_provider", .bindings = store_provider },
+        }),
     });
     const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "store-provider" });
 
