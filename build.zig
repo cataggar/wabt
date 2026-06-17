@@ -212,6 +212,60 @@ pub fn resolveWasmImportsWith(
     return out;
 }
 
+/// A generated WIT-binding module (the `LazyPath` produced by
+/// `wabtComponentBindgen`) and the name the guest `@import`s it under.
+pub const GeneratedImport = struct {
+    /// `@import("<name>")` in the guest source.
+    name: []const u8,
+    /// The `wabtComponentBindgen` output for this binding.
+    bindings: std.Build.LazyPath,
+};
+
+/// Resolve the full import closure for a guest that uses generated WIT
+/// bindings, hiding the canonical-ABI runtime modules the consumer shouldn't
+/// have to know about. `roots` are the wasip3 modules the guest's root source
+/// `@import`s directly (e.g. `"wasi_http"`); `generated` are the
+/// `wabtComponentBindgen` outputs. Every generated binding lowers/lifts via
+/// `canon` and allocates via `abi`, so those two wasip3 modules are pulled into
+/// the closure automatically and wired as each binding's deps — the build.zig
+/// author never spells `canon` / `abi` (nor `dep.path("src/...")`).
+pub fn guestImports(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    roots: []const []const u8,
+    generated: []const GeneratedImport,
+) []const ZigWasmImport {
+    var list: std.ArrayList(ZigWasmImport) = .empty;
+    for (resolveWasmImports(b, dep, roots)) |imp| {
+        list.append(b.allocator, imp) catch @panic("OOM");
+    }
+
+    // The generated bindings always need the canonical-ABI runtime. Ensure
+    // `canon` + `abi` are present as (transitive-only) modules so the bindings
+    // can dep on them.
+    const runtime = [_][]const u8{ "canon", "abi" };
+    for (runtime) |name| {
+        for (list.items) |imp| {
+            if (std.mem.eql(u8, imp.name, name)) break;
+        } else list.append(b.allocator, .{
+            .name = name,
+            .path = dep.path(b.fmt("src/{s}.zig", .{name})),
+            .deps = findSpec(name).deps,
+            .root_dep = false,
+        }) catch @panic("OOM");
+    }
+
+    for (generated) |g| {
+        list.append(b.allocator, .{
+            .name = g.name,
+            .path = g.bindings,
+            .deps = &runtime,
+            .root_dep = true,
+        }) catch @panic("OOM");
+    }
+    return list.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
 pub const ZigBuildWasm = struct {
     source: std.Build.LazyPath,
     /// Additional names force-exported via `--export=<name>`. Usually empty:
