@@ -23,21 +23,21 @@ pub fn build(b: *std.Build) void {
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
         .imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_http", "canon" }, &.{
-            .{ .name = "store", .path = store_imports, .deps = &.{ "abi", "canon" } },
+            .{ .name = "store_consumer", .path = store_imports, .deps = &.{ "abi", "canon" } },
         }),
     });
     const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
 
     // ── Store backend: example:petstore/store provider ────────────────
     // `src/memory_store.zig` (the in-memory store) is the root; the generated
-    // export shells (`store`) reach it via `@import("root")` and use it for the
-    // `Pet`/`Toy` types. `-rdynamic` exports the shells, so no export list is
-    // needed.
+    // export shells (`store_provider`) reach it via `@import("root")` and use it
+    // for the `Pet`/`Toy` types. `-rdynamic` exports the shells, so no export
+    // list is needed.
     const store_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = &.{
-            .{ .name = "store", .path = store_exports, .deps = &.{ "canon", "abi" } },
+            .{ .name = "store_provider", .path = store_exports, .deps = &.{ "canon", "abi" } },
             .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
             .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
         },
