@@ -266,6 +266,11 @@ const Gen = struct {
             .string => "[]const u8",
             .list => |e| try std.fmt.allocPrint(self.ar, "[]const {s}", .{try self.zigType(e.*)}),
             .option => |e| try std.fmt.allocPrint(self.ar, "?{s}", .{try self.zigType(e.*)}),
+            .result => |r| blk: {
+                const ok = if (r.ok) |t| try self.zigType(t.*) else "void";
+                const err = if (r.err) |t| try self.zigType(t.*) else "void";
+                break :blk try std.fmt.allocPrint(self.ar, "canon.Result({s}, {s})", .{ ok, err });
+            },
             .name => |n| try pascal(self.ar, n),
             else => error.UnsupportedWitType,
         };
@@ -277,6 +282,13 @@ const Gen = struct {
         return switch (ty) {
             .string, .list => 2,
             .option => |e| 1 + try self.flatCount(e.*),
+            .result => |r| blk: {
+                // discriminant + the wider of the ok/err payloads (the canonical
+                // ABI joins case payloads; the count is the max). `_` arms = 0.
+                const ok = if (r.ok) |t| try self.flatCount(t.*) else 0;
+                const err = if (r.err) |t| try self.flatCount(t.*) else 0;
+                break :blk 1 + @max(ok, err);
+            },
             .name => |n| blk: {
                 const kind = self.types.get(n) orelse return error.UnknownType;
                 break :blk switch (kind) {
@@ -318,9 +330,11 @@ const Gen = struct {
         self.print(") canon.CoreReturn({s}) {{\n", .{result_zig});
         self.raw("    abi.resetScratch();\n");
 
-        // Lift params into a typed struct via canon.
+        // Lift params into a typed struct via canon. The local is named
+        // `__params` (not a WIT-spellable identifier) so it can't shadow a
+        // function parameter that happens to be named `a`/`p`/etc.
         if (func.params.len > 0) {
-            self.raw("    const a = canon.liftParams(struct {\n");
+            self.raw("    const __params = canon.liftParams(struct {\n");
             for (func.params) |p| {
                 self.print("        {s}: {s},\n", .{ try snake(self.ar, p.name), try self.zigType(p.type) });
             }
@@ -347,7 +361,7 @@ const Gen = struct {
         var buf = std.ArrayListUnmanaged(u8).empty;
         for (params, 0..) |p, idx| {
             if (idx != 0) try buf.appendSlice(self.ar, ", ");
-            try buf.appendSlice(self.ar, "a.");
+            try buf.appendSlice(self.ar, "__params.");
             try buf.appendSlice(self.ar, try snake(self.ar, p.name));
         }
         return buf.items;
@@ -358,21 +372,32 @@ const Gen = struct {
     fn emitImportIface(self: *Gen, u: Use) GenError!void {
         const mod = try snake(self.ar, lastSegment(u.id));
         self.print("pub const {s} = struct {{\n", .{mod});
+        // The flattened `extern` import decls live in a private `imp`
+        // namespace: their names are the exact WIT function names, which would
+        // otherwise collide with the typed wrappers below for single-word
+        // functions (e.g. `ack` → both `@"ack"` and `pub fn ack`). Nesting
+        // keeps the canonical wasm import (module + field) intact.
+        self.raw("    const imp = struct {\n");
         for (u.iface.items) |it| switch (it) {
-            .func => |fd| try self.emitImportFunc(u.id, fd.name, fd.func),
+            .func => |fd| try self.emitImportExtern(u.id, fd.name, fd.func),
+            else => {},
+        };
+        self.raw("    };\n\n");
+        for (u.iface.items) |it| switch (it) {
+            .func => |fd| try self.emitImportWrapper(fd.name, fd.func),
             else => {},
         };
         self.raw("};\n\n");
     }
 
-    fn emitImportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
+    /// Emit the flattened `extern` import declaration (inside the `imp`
+    /// namespace) for one imported function.
+    fn emitImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
         if (func.is_async) return error.UnsupportedWitType;
-        const result_zig = try self.resultZig(func);
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
         const indirect = rcount > 1;
 
-        // extern decl
-        self.print("    extern \"{s}\" fn @\"{s}\"(", .{ iface_id, name });
+        self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, name });
         try self.emitFlatParamDecls(func.params);
         if (indirect) {
             if (func.params.len > 0) self.raw(", ");
@@ -383,8 +408,16 @@ const Gen = struct {
         } else {
             self.raw(") void;\n");
         }
+    }
 
-        // typed wrapper
+    /// Emit the typed wrapper that lowers params, calls the `imp.@"…"` extern,
+    /// and lifts the result.
+    fn emitImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
+        if (func.is_async) return error.UnsupportedWitType;
+        const result_zig = try self.resultZig(func);
+        const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
+        const indirect = rcount > 1;
+
         self.print("    pub fn {s}(", .{try camel(self.ar, name)});
         try self.emitTypedParamDecls(func.params);
         self.print(") {s} {{\n", .{result_zig});
@@ -394,16 +427,16 @@ const Gen = struct {
 
         if (indirect) {
             if (call_args.len > 0) {
-                self.print("        @\"{s}\"({s}, abi.retPtr());\n", .{ name, call_args });
+                self.print("        imp.@\"{s}\"({s}, abi.retPtr());\n", .{ name, call_args });
             } else {
-                self.print("        @\"{s}\"(abi.retPtr());\n", .{name});
+                self.print("        imp.@\"{s}\"(abi.retPtr());\n", .{name});
             }
             self.print("        return canon.lift({s}, abi.retArea());\n", .{result_zig});
         } else if (func.result == null) {
-            self.print("        @\"{s}\"({s});\n", .{ name, call_args });
+            self.print("        imp.@\"{s}\"({s});\n", .{ name, call_args });
         } else {
             self.print(
-                "        return canon.liftResultFlat({s}, @\"{s}\"({s}));\n",
+                "        return canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n",
                 .{ result_zig, name, call_args },
             );
         }
@@ -519,6 +552,9 @@ const Gen = struct {
     }
 
     fn coreOfResult(self: *Gen, ty: ast.Type) GenError!Core {
+        // A flat (single-core) `result<_, _>` flattens to its bare i32
+        // discriminant; aggregate results take the indirect (memory) path.
+        if (ty == .result) return .i32;
         return self.coreOf(ty);
     }
 };
@@ -631,7 +667,7 @@ test "generate: export shells + import wrappers" {
         const out = g.out.items;
         try testing.expect(std.mem.indexOf(u8, out, "pub const Pet = struct {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#ping\"(x: i32) canon.CoreReturn(u32)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(u32, Impl.ping(a.x), &abi.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(u32, Impl.ping(__params.x), &abi.alloc)") != null);
         try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#get\"(id: i32) canon.CoreReturn(?Pet)") != null);
     }
     {
@@ -640,9 +676,113 @@ test "generate: export shells + import wrappers" {
         const out = g.out.items;
         try testing.expect(std.mem.indexOf(u8, out, "pub const store = struct {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:t/store\" fn @\"ping\"(x: i32) i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(u32, @\"ping\"(@bitCast(x)));") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(u32, imp.@\"ping\"(@bitCast(x)));") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:t/store\" fn @\"get\"(id: i32, retptr: i32) void;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(?Pet, abi.retArea());") != null);
+    }
+}
+
+test "generate: result<T,E> returns (indirect + flat all-void)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // make: func() -> result<u32, string>   (flatCount 3 → indirect)
+    // flag: func() -> result                (flatCount 1 → flat discriminant)
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const res_u32_str = ast.Type{ .result = .{ .ok = &u32_ty, .err = &str_ty } };
+    const res_void = ast.Type{ .result = .{ .ok = null, .err = null } };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "make", .func = .{ .params = &.{}, .result = res_u32_str } } },
+        .{ .func = .{ .name = "flag", .func = .{ .params = &.{}, .result = res_void } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "r" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = exp_world },
+            .{ .world = imp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#make\"() canon.CoreReturn(canon.Result(u32, []const u8))") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(canon.Result(u32, []const u8), Impl.make(), &abi.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#flag\"() canon.CoreReturn(canon.Result(void, void))") != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(imp_world, "guest");
+        const out = g.out.items;
+        // indirect result: extern takes a retptr, wrapper lifts from the ret area.
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:r/api\" fn @\"make\"(retptr: i32) void;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(canon.Result(u32, []const u8), abi.retArea());") != null);
+        // flat all-void result: extern returns the i32 discriminant directly.
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:r/api\" fn @\"flag\"() i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(canon.Result(void, void), imp.@\"flag\"());") != null);
+    }
+}
+
+test "generate: identifier hygiene (param named `a`, single-word import name)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // pick: func(a: u32) -> u32   — param `a` must not be shadowed by the
+    //                               lifted-params local.
+    // ack:  func() -> u32         — single-word name: the extern and the
+    //                               wrapper must not collide.
+    const edge_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "pick", .func = .{ .params = &.{.{ .name = "a", .type = .u32 }}, .result = .u32 } } },
+        .{ .func = .{ .name = "ack", .func = .{ .params = &.{}, .result = .u32 } } },
+    };
+    const iface = ast.Interface{ .name = "edge", .items = &edge_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "edge" } } } },
+    } };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "edge" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "e" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = exp_world },
+            .{ .world = imp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        // The export param is still `a`; the lifted-params local is `__params`.
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:e/edge#pick\"(a: i32)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const __params = canon.liftParams(struct {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Impl.pick(__params.a)") != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(imp_world, "guest");
+        const out = g.out.items;
+        // Externs are nested in a private namespace, referenced as `imp.@"…"`.
+        try testing.expect(std.mem.indexOf(u8, out, "const imp = struct {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:e/edge\" fn @\"ack\"() i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"ack\"()") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn ack()") != null);
     }
 }
 
