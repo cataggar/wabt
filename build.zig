@@ -1,71 +1,56 @@
 const std = @import("std");
 const wasip3 = @import("wasip3");
 
-/// A composed `wasi:http@0.3.0` petstore: an HTTP **frontend** component that
-/// imports `example:petstore/store`, and a separate **storage** component that
+/// A composed `wasi:http@0.3.0` petstore: an HTTP **web** component that
+/// imports `example:petstore/store`, and a separate **store** component that
 /// exports it. Each is built `wasm32-freestanding`, wrapped with
 /// `wabt component new`, then linked with `wabt component compose` into one
-/// servable component.
+/// servable component. All the tool plumbing lives in `wasip3`'s build helpers.
 ///
 /// `WABT` / `WASMTIME` env vars override the tool binaries (point them at a P3
 /// wabt and a wasmtime >= 46); otherwise `wabt` / `wasmtime` from `PATH`.
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
 
-    const wabt_bin = b.graph.environ_map.get("WABT") orelse "wabt";
-    const wasmtime_bin = b.graph.environ_map.get("WASMTIME") orelse "wasmtime";
+    // Generate the store bindings from WIT: import wrappers for the web side
+    // (store-consumer world) and `export fn` shells for the store side
+    // (store-provider world). Both delegate all marshalling to `canon`.
+    const store_imports = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer", .impl = "memory_store", .output = "store_imports.zig" });
+    const store_exports = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider", .impl = "root", .output = "store_exports.zig" });
 
-    // ── Generate the store bindings from WIT via `wabt component bindgen` ──
-    // Import wrappers for the frontend (store-consumer world) and export shells
-    // for the backend (store-provider world); both delegate marshalling to `canon`.
-    const store_imports = bindgen(b, wabt_bin, "store-consumer", "memory_store", "store_imports.zig");
-    const store_exports = bindgen(b, wabt_bin, "store-provider", "root", "store_exports.zig");
-
-    // ── Frontend: wasi:http handler importing example:petstore/store ──
-    const fe_base = wasip3.resolveWasmImports(b, dep, &.{ "wasi_http", "canon" });
-    const fe_imports = b.allocator.alloc(wasip3.ZigWasmImport, fe_base.len + 1) catch @panic("OOM");
-    @memcpy(fe_imports[0..fe_base.len], fe_base);
-    fe_imports[fe_base.len] = .{
-        .name = "store",
-        .path = store_imports,
-        .deps = &.{ "abi", "canon" },
-        .root_dep = true,
-    };
-
-    const fe_core = wasip3.zigBuildWasm(b, .{
+    // ── Web frontend: wasi:http handler importing example:petstore/store ──
+    const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
-        .imports = fe_imports,
+        .imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_http", "canon" }, &.{
+            .{ .name = "store", .path = store_imports, .deps = &.{ "abi", "canon" } },
+        }),
     });
-    const frontend = componentNew(b, wabt_bin, fe_core, "svc", "http.wasm");
+    const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
 
-    // ── Backend: example:petstore/store provider ──────────────────────
+    // ── Store backend: example:petstore/store provider ────────────────
     // `src/memory_store.zig` (the in-memory store) is the root; the generated
-    // export shells (`store`) reach it via `@import("root")` as their
-    // `Impl`, and use it for the `Pet`/`Toy` types. `-rdynamic` exports the
-    // shells, so no separate root or export list is needed.
-    const be_core = wasip3.zigBuildWasm(b, .{
+    // export shells (`store`) reach it via `@import("root")` and use it for the
+    // `Pet`/`Toy` types. `-rdynamic` exports the shells, so no export list is
+    // needed.
+    const store_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = &.{
-            .{ .name = "store", .path = store_exports, .deps = &.{ "canon", "abi" }, .root_dep = true },
+            .{ .name = "store", .path = store_exports, .deps = &.{ "canon", "abi" } },
             .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
             .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
         },
     });
-    const backend = componentNew(b, wabt_bin, be_core, "store-provider", "store.wasm");
+    const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "store-provider" });
 
-    // ── Compose: bind the consumer's `store` import to the provider ───
-    // wabt component compose -d <provider> -o <out> <consumer>
-    const compose = b.addSystemCommand(&.{ wabt_bin, "component", "compose" });
-    compose.addArg("-d");
-    compose.addFileArg(backend);
-    compose.addArg("-o");
-    const component = compose.addOutputFileArg("petstore.wasm");
-    compose.addFileArg(frontend);
-
-    const install = b.addInstallFileWithDir(component, .prefix, "petstore.wasm");
-    b.getInstallStep().dependOn(&install.step);
+    // ── Compose: bind the web component's `store` import to the provider ──
+    const component = wasip3.wabtComponentCompose(b, .{
+        .consumer = web,
+        .dependencies = &.{store},
+        .output = "petstore.wasm",
+    });
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(component, .prefix, "petstore.wasm").step);
 
     // `zig build bindgen` — write the generated store bindings to
     // zig-out/generated/ so they can be inspected.
@@ -74,48 +59,5 @@ pub fn build(b: *std.Build) void {
     gen_step.dependOn(&b.addInstallFileWithDir(store_exports, .prefix, "generated/store_exports.zig").step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
-    const serve = b.addSystemCommand(&.{
-        wasmtime_bin,                          "serve",
-        "-W",                                  "component-model-async",
-        "-W",                                  "component-model-async-stackful",
-        "-W",                                  "component-model-more-async-builtins",
-        "-W",                                  "component-model-error-context",
-        "-S",                                  "p3,cli",
-    });
-    serve.addFileArg(component);
-    if (b.args) |extra| serve.addArgs(extra);
-    const serve_step = b.step("serve", "Serve the composed petstore component with wasmtime (P3)");
-    serve_step.dependOn(&serve.step);
-}
-
-/// `wabt component new --world <world> --wit wit <core> -o <out>`.
-fn componentNew(
-    b: *std.Build,
-    wabt_bin: []const u8,
-    core: std.Build.LazyPath,
-    world: []const u8,
-    out: []const u8,
-) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ wabt_bin, "component", "new" });
-    cmd.addArg("--world");
-    cmd.addArg(world);
-    cmd.addArg("--wit");
-    cmd.addDirectoryArg(b.path("wit"));
-    cmd.addFileArg(core);
-    cmd.addArg("-o");
-    return cmd.addOutputFileArg(out);
-}
-
-/// `wabt component bindgen --wit wit --world <world> --impl <impl> -o <out>`.
-fn bindgen(
-    b: *std.Build,
-    wabt_bin: []const u8,
-    world: []const u8,
-    impl: []const u8,
-    out: []const u8,
-) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ wabt_bin, "component", "bindgen", "--wit" });
-    cmd.addDirectoryArg(b.path("wit"));
-    cmd.addArgs(&.{ "--world", world, "--impl", impl, "-o" });
-    return cmd.addOutputFileArg(out);
+    _ = wasip3.wasmtimeServe(b, .{ .wasm = component, .description = "Serve the composed petstore component with wasmtime (P3)" });
 }
