@@ -49,3 +49,10 @@ world svc {
 world store-provider {
     export store;
 }
+
+// Import-only world used by `wabt component bindgen` to generate the
+// frontend's `store` client wrappers (the `svc` world also imports
+// wasi:http, which bindgen v1 does not handle).
+world store-consumer {
+    import store;
+}

@@ -36,26 +36,26 @@ on lives on the orphan branch `wasip3` of the same repository.
 
 `interface store` is a typed data-access API: `pet` / `toy` **records**, with
 `option<record>` results and `count` + indexed `*-at` accessors (instead of
-`list<record>`). Two worlds use it: `svc` (the frontend) `import`s `store`;
-`store-provider` (the backend) `export`s it.
+`list<record>`). Worlds: `svc` (the frontend) `import`s `store` and wasi:http;
+`store-provider` (the backend) `export`s `store`; `store-consumer` is an
+import-only world used by bindgen.
 
-Both sides marshal records/options/strings across the boundary with the
-**comptime canonical-ABI marshaller** in `wasip3`'s `canon` module: `canon`
-derives the canonical memory layout *and* the core function result shape from
-the plain Zig `Pet` / `Toy` types — no hand-written `extern struct` layouts and
-no hand-coded flat-vs-indirect result handling.
+Both sides' canonical-ABI glue is **generated at build time** by
+`wabt component bindgen`, which emits the flattened `extern`/`export` shells and
+the `Pet` / `Toy` Zig types and delegates all marshalling to `wasip3`'s comptime
+`canon` library. There is no hand-written `extern struct`, flat-vs-indirect
+logic, or lower/lift code on either side.
 
-- **Backend** (`src/store_backend.zig`) owns the static pets/toys store; each
-  export decodes its params with `canon.liftParams`, declares its core return
-  type as `canon.CoreReturn(R)`, and encodes the result with
-  `canon.returnResult` — `canon` picks flat (a scalar, e.g.
-  `pet-count`/`delete-pet`) vs. indirect (a pointer to the `option<record>` it
-  lowers into a static return area) from `R` at comptime.
-- **Frontend** (`src/store_client.zig`) calls the imports and decodes results
-  with `canon` (`liftResultFlat` for scalars, `lift` for the spilled records);
-  `src/main.zig` builds `PetJson` /
-  `ToyJson` from them and serializes with `std.json` (`emit_null_optional_fields
-  = false`, so an absent `tag` is omitted).
+- **Backend** — `build.zig` runs `bindgen` on `store-provider` to generate the
+  `export fn` shells (params lifted with `canon.liftParams`, return type
+  `canon.CoreReturn(R)`, result encoded with `canon.returnResult`). The shells
+  call **`src/store_impl.zig`** — the in-memory pets/toys store, pure business
+  logic returning the generated `Pet` / `Toy` types.
+- **Frontend** — `bindgen` on `store-consumer` generates the `store.*` import
+  wrappers (results decoded with `canon.liftResultFlat` / `canon.lift`).
+  `src/main.zig` calls them and builds `PetJson` / `ToyJson`, serializing with
+  `std.json` (`emit_null_optional_fields = false`, so an absent `tag` is
+  omitted).
 
 ### The HTTP request (WASI 0.3 has no `wasi:io`)
 
@@ -79,9 +79,9 @@ corrupt each other.
 ## Prerequisites
 
 - `zig` 0.16, a **P3-capable `wabt`** (with non-primitive stream/future element
-  support, and value-typed export interfaces — see cataggar/wabt#282), and
-  **`wasmtime` >= 46** on `PATH` — or pointed to via the `WABT` and `WASMTIME`
-  environment variables.
+  support, value-typed export interfaces, and the `component bindgen` subcommand
+  — see cataggar/wabt #281/#282/#283), and **`wasmtime` >= 46** on `PATH` — or
+  pointed to via the `WABT` and `WASMTIME` environment variables.
 
 ## Build and serve
 
