@@ -215,10 +215,14 @@ pub fn resolveWasmImportsWith(
 /// A generated WIT-binding module (the `LazyPath` produced by
 /// `wabtComponentBindgen`) and the name the guest `@import`s it under.
 pub const GeneratedImport = struct {
-    /// `@import("<name>")` in the guest source.
-    name: []const u8,
     /// The `wabtComponentBindgen` output for this binding.
     bindings: std.Build.LazyPath,
+    /// `@import("<name>")` in the guest source. Defaults to the binding file's
+    /// basename without `.zig` — and since `wabtComponentBindgen` names that
+    /// file after the world (snake_case), the import name matches the world by
+    /// default too (e.g. the `store-consumer` world → `store_consumer.zig` →
+    /// `@import("store_consumer")`). Set only to override.
+    name: ?[]const u8 = null,
 };
 
 /// Resolve the full import closure for a guest that uses generated WIT
@@ -256,8 +260,12 @@ pub fn guestImports(
     }
 
     for (generated) |g| {
+        const name = g.name orelse blk: {
+            const base = lazyBasename(g.bindings);
+            break :blk if (std.mem.endsWith(u8, base, ".zig")) base[0 .. base.len - ".zig".len] else base;
+        };
         list.append(b.allocator, .{
-            .name = g.name,
+            .name = name,
             .path = g.bindings,
             .deps = &runtime,
             .root_dep = true,
