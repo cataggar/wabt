@@ -60,6 +60,49 @@ fn DiscInt(comptime n: usize) type {
     return if (n <= 0x100) u8 else if (n <= 0x10000) u16 else u32;
 }
 
+// ── Variant / result (Zig `union(enum)`) helpers ────────────────────
+//
+// A WIT `variant` / `result<T, E>` lowers to a tagged union: a discriminant
+// (the case index) followed by the active case's payload. A Zig `union(enum)`
+// with `void` payloads for no-data cases models it exactly. The payload sits at
+// the discriminant's end, padded to the widest case alignment.
+
+/// Max canonical alignment among a union's case payloads (1 if all `void`).
+fn unionPayloadAlign(comptime T: type) usize {
+    var a: usize = 1;
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        if (f.type != void) a = @max(a, alignOf(f.type));
+    }
+    return a;
+}
+
+/// Max canonical size among a union's case payloads (0 if all `void`).
+fn unionPayloadSize(comptime T: type) usize {
+    var s: usize = 0;
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        if (f.type != void) s = @max(s, sizeOf(f.type));
+    }
+    return s;
+}
+
+/// Byte offset of a union payload: past the discriminant, padded to the
+/// payload alignment.
+fn unionPayloadOffset(comptime T: type) usize {
+    const disc = @sizeOf(DiscInt(@typeInfo(T).@"union".fields.len));
+    return alignTo(disc, unionPayloadAlign(T));
+}
+
+/// The Zig type for a WIT `result<T, E>`: a tagged union the marshaller
+/// lowers/lifts as a 2-case variant. Pass `void` for an absent (`_`) arm.
+///
+/// Naming the type through this memoized constructor — rather than spelling an
+/// inline `union(enum) { … }` at each binding site — keeps it identical across
+/// modules, so a generated export shell and the user `impl` it calls agree on
+/// the type (two textually-identical inline unions are distinct nominal types).
+pub fn Result(comptime T: type, comptime E: type) type {
+    return union(enum) { ok: T, err: E };
+}
+
 // ── Layout ──────────────────────────────────────────────────────────
 
 /// Canonical alignment of `T`, in bytes.
@@ -76,6 +119,7 @@ pub fn alignOf(comptime T: type) usize {
             inline for (s.fields) |f| a = @max(a, alignOf(f.type));
             break :blk a;
         },
+        .@"union" => |u| @max(@as(usize, @sizeOf(DiscInt(u.fields.len))), unionPayloadAlign(T)),
         else => unsupported(T),
     };
 }
@@ -99,6 +143,7 @@ pub fn sizeOf(comptime T: type) usize {
             }
             break :blk alignTo(off, alignOf(T));
         },
+        .@"union" => alignTo(unionPayloadOffset(T) + unionPayloadSize(T), alignOf(T)),
         else => unsupported(T),
     };
 }
@@ -150,6 +195,18 @@ pub fn lower(comptime T: type, value: T, base: [*]u8, ra: Realloc) void {
         .@"struct" => |s| inline for (s.fields, 0..) |f, i| {
             lower(f.type, @field(value, f.name), base + fieldOffset(T, i), ra);
         },
+        .@"union" => |u| {
+            const Tag = u.tag_type.?;
+            const tag = std.meta.activeTag(value);
+            store(DiscInt(u.fields.len), base, @intCast(@intFromEnum(tag)));
+            inline for (u.fields) |f| {
+                if (comptime f.type != void) {
+                    if (tag == @field(Tag, f.name)) {
+                        lower(f.type, @field(value, f.name), base + unionPayloadOffset(T), ra);
+                    }
+                }
+            }
+        },
         else => unsupported(T),
     }
 }
@@ -195,6 +252,19 @@ pub fn lift(comptime T: type, base: [*]const u8) T {
                 @field(result, f.name) = lift(f.type, base + fieldOffset(T, i));
             }
             break :blk result;
+        },
+        .@"union" => |u| blk: {
+            const Tag = u.tag_type.?;
+            const disc = load(DiscInt(u.fields.len), base);
+            inline for (u.fields) |f| {
+                if (disc == @intFromEnum(@field(Tag, f.name))) {
+                    break :blk if (f.type == void)
+                        @unionInit(T, f.name, {})
+                    else
+                        @unionInit(T, f.name, lift(f.type, base + unionPayloadOffset(T)));
+                }
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -254,6 +324,15 @@ pub fn flatCount(comptime T: type) usize {
             inline for (s.fields) |f| c += flatCount(f.type);
             break :blk c;
         },
+        .@"union" => |u| blk: {
+            // discriminant + the widest case's flattened payload (the canonical
+            // ABI joins case payloads element-wise; the count is the max).
+            var m: usize = 0;
+            inline for (u.fields) |f| {
+                if (f.type != void) m = @max(m, flatCount(f.type));
+            }
+            break :blk 1 + m;
+        },
         else => unsupported(T),
     };
 }
@@ -265,6 +344,7 @@ fn CoreScalar(comptime T: type) type {
         .int => |i| if (i.bits <= 32) i32 else i64,
         .float => |f| if (f.bits == 32) f32 else f64,
         .@"struct" => |s| CoreScalar(s.fields[0].type), // single-field record
+        .@"union" => i32, // 1-slot union = bare discriminant (all-void cases)
         else => unsupported(T),
     };
 }
@@ -301,6 +381,7 @@ fn toCore(comptime T: type, value: T) CoreScalar(T) {
             @intCast(value),
         .float => value,
         .@"struct" => |s| toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        .@"union" => @intCast(@intFromEnum(std.meta.activeTag(value))),
         else => unsupported(T),
     };
 }
@@ -320,6 +401,13 @@ fn fromCore(comptime T: type, core: CoreScalar(T)) T {
             var r: T = undefined;
             @field(r, s.fields[0].name) = fromCore(s.fields[0].type, core);
             break :blk r;
+        },
+        .@"union" => |u| blk: {
+            const Tag = u.tag_type.?;
+            inline for (u.fields) |f| {
+                if (core == @intFromEnum(@field(Tag, f.name))) break :blk @unionInit(T, f.name, {});
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -388,6 +476,21 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
                 @field(v, f.name) = flatLift(f.type, slots, start + comptime flatFieldOffset(T, i));
             }
             break :blk v;
+        },
+        .@"union" => |u| blk: {
+            // discriminant at `start`; the active case's payload occupies the
+            // joined slots beginning at `start + 1` (matching-width cases only).
+            const Tag = u.tag_type.?;
+            const disc = slots[start];
+            inline for (u.fields) |f| {
+                if (disc == @intFromEnum(@field(Tag, f.name))) {
+                    break :blk if (f.type == void)
+                        @unionInit(T, f.name, {})
+                    else
+                        @unionInit(T, f.name, flatLift(f.type, slots, start + 1));
+                }
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -534,4 +637,98 @@ test "liftParams places string/option/scalar at the right slots" {
     try testing.expectEqual(@as(usize, 0), got.name.len);
     try testing.expect(got.tag == null);
     try testing.expectEqual(@as(u32, 5), got.age);
+}
+
+// ── Variant / result (tagged union) ─────────────────────────────────
+
+const ResU32Str = union(enum) { ok: u32, err: []const u8 }; // result<u32, string>
+const Shape = union(enum) { circle: u32, square: Toy, point }; // 3-case variant
+const Outcome = union(enum) { pass, fail }; // result<_, _> — all-void → flat
+
+test "union: flatten counts and result classification" {
+    try testing.expectEqual(@as(usize, 3), flatCount(ResU32Str)); // disc + (ptr, len)
+    try testing.expectEqual(@as(usize, 1), flatCount(Outcome)); // disc only
+    try testing.expectEqual(@as(usize, 5), flatCount(Shape)); // disc + max(1, Toy=4, 0)
+    try testing.expect(resultIsFlat(Outcome));
+    try testing.expect(!resultIsFlat(ResU32Str));
+    try testing.expectEqual(i32, CoreReturn(Outcome)); // bare discriminant
+    try testing.expectEqual(i32, CoreReturn(ResU32Str)); // pointer to spilled result
+}
+
+test "union: flat all-void result encode/decode round-trip" {
+    // Flat results don't touch memory, so this runs on any host.
+    try testing.expect(std.meta.activeTag(liftResultFlat(Outcome, returnResult(Outcome, .pass, &testAlloc))) == .pass);
+    try testing.expect(std.meta.activeTag(liftResultFlat(Outcome, returnResult(Outcome, .fail, &testAlloc))) == .fail);
+}
+
+test "union: memory lower/lift round-trip result<u32, string>" {
+    test_top = 0;
+    var buf: [sizeOf(ResU32Str)]u8 align(8) = undefined;
+    lower(ResU32Str, .{ .ok = 7 }, &buf, &testAlloc);
+    switch (lift(ResU32Str, &buf)) {
+        .ok => |v| try testing.expectEqual(@as(u32, 7), v),
+        .err => return error.TestUnexpectedResult,
+    }
+    lower(ResU32Str, .{ .err = "nope" }, &buf, &testAlloc);
+    switch (lift(ResU32Str, &buf)) {
+        .err => |e| try testing.expectEqualStrings("nope", e),
+        .ok => return error.TestUnexpectedResult,
+    }
+}
+
+test "union: memory round-trip 3-case variant (record + no-payload cases)" {
+    test_top = 0;
+    var buf: [sizeOf(Shape)]u8 align(8) = undefined;
+    lower(Shape, .{ .square = .{ .id = 1, .pet_id = 2, .name = "yo" } }, &buf, &testAlloc);
+    switch (lift(Shape, &buf)) {
+        .square => |t| {
+            try testing.expectEqual(@as(u32, 1), t.id);
+            try testing.expectEqual(@as(u32, 2), t.pet_id);
+            try testing.expectEqualStrings("yo", t.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    lower(Shape, .{ .circle = 9 }, &buf, &testAlloc);
+    switch (lift(Shape, &buf)) {
+        .circle => |r| try testing.expectEqual(@as(u32, 9), r),
+        else => return error.TestUnexpectedResult,
+    }
+    lower(Shape, .point, &buf, &testAlloc);
+    try testing.expect(std.meta.activeTag(lift(Shape, &buf)) == .point);
+}
+
+test "union: flatLift reconstructs a variant param" {
+    const R = union(enum) { ok: u32, err: u32 }; // result<u32, u32>
+    const a = liftParams(R, .{ @as(i32, 1), @as(i32, @bitCast(@as(u32, 99))) });
+    try testing.expect(std.meta.activeTag(a) == .err);
+    try testing.expectEqual(@as(u32, 99), a.err);
+    const b = liftParams(R, .{ @as(i32, 0), @as(i32, @bitCast(@as(u32, 7))) });
+    try testing.expect(std.meta.activeTag(b) == .ok);
+    try testing.expectEqual(@as(u32, 7), b.ok);
+}
+
+test "union canonical wasm32 layout" {
+    if (@sizeOf(usize) != 4) return error.SkipZigTest;
+    // result<u32, string>: u8 disc padded to 4, payload max(4, 8)=8 → size 12.
+    try testing.expectEqual(@as(usize, 4), alignOf(ResU32Str));
+    try testing.expectEqual(@as(usize, 12), sizeOf(ResU32Str));
+    try testing.expectEqual(@as(usize, 4), unionPayloadOffset(ResU32Str));
+    // all-void 2-case variant: the bare discriminant byte.
+    try testing.expectEqual(@as(usize, 1), alignOf(Outcome));
+    try testing.expectEqual(@as(usize, 1), sizeOf(Outcome));
+}
+
+test "Result constructor is memoized and round-trips" {
+    // Same args → identical type (so generated shells and user impls agree).
+    try testing.expect(Result(u32, []const u8) == Result(u32, []const u8));
+    const R = Result(u32, []const u8);
+    test_top = 0;
+    var buf: [sizeOf(R)]u8 align(8) = undefined;
+    lower(R, .{ .ok = 5 }, &buf, &testAlloc);
+    switch (lift(R, &buf)) {
+        .ok => |v| try testing.expectEqual(@as(u32, 5), v),
+        .err => return error.TestUnexpectedResult,
+    }
+    // result<_, _> flattens to a flat discriminant.
+    try testing.expect(resultIsFlat(Result(void, void)));
 }
