@@ -19,7 +19,7 @@ pub fn build(b: *std.Build) void {
     // Import wrappers for the frontend (store-consumer world) and export shells
     // for the backend (store-provider world); both delegate marshalling to `canon`.
     const store_imports = bindgen(b, wabt_bin, "store-consumer", "store_impl", "store_imports.zig");
-    const store_exports = bindgen(b, wabt_bin, "store-provider", "store_impl", "store_exports.zig");
+    const store_exports = bindgen(b, wabt_bin, "store-provider", "root", "store_exports.zig");
 
     // ── Frontend: wasi:http handler importing example:petstore/store ──
     const fe_base = wasip3.resolveWasmImports(b, dep, &.{ "wasi_http", "canon" });
@@ -40,14 +40,15 @@ pub fn build(b: *std.Build) void {
     const frontend = componentNew(b, wabt_bin, fe_core, "svc", "http.wasm");
 
     // ── Backend: example:petstore/store provider ──────────────────────
-    // Generated export shells (`store_bindings`) call the in-memory store
-    // (`store_impl`); the two reference each other (types ↔ logic).
+    // `src/store_impl.zig` (the in-memory store) is the root; the generated
+    // export shells (`store_bindings`) reach it via `@import("root")` as their
+    // `Impl`, and use it for the `Pet`/`Toy` types. `-rdynamic` exports the
+    // shells, so no separate root or export list is needed.
     const be_core = wasip3.zigBuildWasm(b, .{
-        .source = b.path("src/store_backend_root.zig"),
+        .source = b.path("src/store_impl.zig"),
         .output = "store.core.wasm",
         .imports = &.{
-            .{ .name = "store_bindings", .path = store_exports, .deps = &.{ "store_impl", "canon", "abi" }, .root_dep = true },
-            .{ .name = "store_impl", .path = b.path("src/store_impl.zig"), .deps = &.{"store_bindings"}, .root_dep = false },
+            .{ .name = "store_bindings", .path = store_exports, .deps = &.{ "canon", "abi" }, .root_dep = true },
             .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
             .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
         },
