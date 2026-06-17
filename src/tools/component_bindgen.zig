@@ -242,10 +242,21 @@ const Gen = struct {
                 for (cases) |c| self.print("    {s},\n", .{try snake(self.ar, c)});
                 self.raw("};\n\n");
             },
+            .variant => |cases| {
+                self.print("pub const {s} = union(enum) {{\n", .{try pascal(self.ar, td.name)});
+                for (cases) |c| {
+                    if (c.type) |t| {
+                        self.print("    {s}: {s},\n", .{ try snake(self.ar, c.name), try self.zigType(t) });
+                    } else {
+                        self.print("    {s},\n", .{try snake(self.ar, c.name)});
+                    }
+                }
+                self.raw("};\n\n");
+            },
             .alias => |t| {
                 self.print("pub const {s} = {s};\n\n", .{ try pascal(self.ar, td.name), try self.zigType(t) });
             },
-            else => return error.UnsupportedWitType, // variant/flags/resource: v2
+            else => return error.UnsupportedWitType, // flags/resource: later phase
         }
     }
 
@@ -296,6 +307,14 @@ const Gen = struct {
                         var c: usize = 0;
                         for (fields) |f| c += try self.flatCount(f.type);
                         break :r c;
+                    },
+                    .variant => |cases| v: {
+                        // discriminant + the widest case payload (`null` = 0).
+                        var m: usize = 0;
+                        for (cases) |c| if (c.type) |t| {
+                            m = @max(m, try self.flatCount(t));
+                        };
+                        break :v 1 + m;
                     },
                     .@"enum" => 1,
                     .alias => |t| try self.flatCount(t),
@@ -552,10 +571,22 @@ const Gen = struct {
     }
 
     fn coreOfResult(self: *Gen, ty: ast.Type) GenError!Core {
-        // A flat (single-core) `result<_, _>` flattens to its bare i32
-        // discriminant; aggregate results take the indirect (memory) path.
-        if (ty == .result) return .i32;
-        return self.coreOf(ty);
+        // `ty` is a result already known to flatten to a single core slot.
+        // Aggregates carrying a discriminant (result / all-void variant / enum)
+        // flatten to its i32; a single-field record flattens to that field.
+        return switch (ty) {
+            .result => .i32,
+            .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
+                .@"enum", .variant => .i32,
+                .record => |fields| if (fields.len == 1)
+                    try self.coreOfResult(fields[0].type)
+                else
+                    error.UnsupportedWitType,
+                .alias => |t| try self.coreOfResult(t),
+                else => error.UnsupportedWitType,
+            },
+            else => self.coreOf(ty),
+        };
     }
 };
 
@@ -783,6 +814,74 @@ test "generate: identifier hygiene (param named `a`, single-word import name)" {
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:e/edge\" fn @\"ack\"() i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"ack\"()") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn ack()") != null);
+    }
+}
+
+test "generate: variant typedef + returns (payload-bearing + all-void)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // variant value { num(u32), text(string), nothing }  — payload-bearing.
+    // variant flag2 { on, off }                          — all-void (flat).
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const value_cases = [_]ast.Case{
+        .{ .name = "num", .type = u32_ty },
+        .{ .name = "text", .type = str_ty },
+        .{ .name = "nothing", .type = null },
+    };
+    const flag_cases = [_]ast.Case{
+        .{ .name = "on", .type = null },
+        .{ .name = "off", .type = null },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "value", .kind = .{ .variant = &value_cases } } },
+        .{ .type = .{ .name = "flag2", .kind = .{ .variant = &flag_cases } } },
+        .{ .func = .{ .name = "pick", .func = .{ .params = &.{}, .result = ast.Type{ .name = "value" } } } },
+        .{ .func = .{ .name = "state", .func = .{ .params = &.{}, .result = ast.Type{ .name = "flag2" } } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "v" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = exp_world },
+            .{ .world = imp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        // The named variant becomes a Zig `union(enum)` (void arm for `nothing`).
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Value = union(enum) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    num: u32,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    text: []const u8,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    nothing,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Flag2 = union(enum) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#pick\"() canon.CoreReturn(Value)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(Value, Impl.pick(), &abi.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#state\"() canon.CoreReturn(Flag2)") != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(imp_world, "guest");
+        const out = g.out.items;
+        // payload-bearing variant → indirect (retptr + lift).
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:v/api\" fn @\"pick\"(retptr: i32) void;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(Value, abi.retArea());") != null);
+        // all-void variant → flat i32 discriminant.
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:v/api\" fn @\"state\"() i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(Flag2, imp.@\"state\"());") != null);
     }
 }
 
