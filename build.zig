@@ -66,6 +66,12 @@ pub fn build(b: *std.Build) void {
     const install = b.addInstallFileWithDir(component, .prefix, "petstore.wasm");
     b.getInstallStep().dependOn(&install.step);
 
+    // `zig build bindgen` — write the generated store bindings to
+    // zig-out/generated/ so they can be inspected.
+    const gen_step = b.step("bindgen", "Write the generated store bindings to zig-out/generated/");
+    gen_step.dependOn(&b.addInstallFileWithDir(store_imports, .prefix, "generated/store_imports.zig").step);
+    gen_step.dependOn(&b.addInstallFileWithDir(store_exports, .prefix, "generated/store_exports.zig").step);
+
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     const serve = b.addSystemCommand(&.{
         wasmtime_bin,                          "serve",

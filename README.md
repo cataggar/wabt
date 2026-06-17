@@ -90,6 +90,7 @@ git clone --branch example/http --single-branch https://github.com/cataggar/wabt
 cd petstore
 zig build                 # builds both components + composes -> zig-out/petstore.wasm
 zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
+zig build bindgen         # write the generated store bindings to zig-out/generated/
 ```
 
 In another terminal:
