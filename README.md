@@ -46,8 +46,9 @@ the plain Zig `Pet` / `Toy` types — no hand-written `extern struct` layouts an
 no hand-coded flat-vs-indirect result handling.
 
 - **Backend** (`src/store_backend.zig`) owns the static pets/toys store; each
-  export declares its core return type as `canon.CoreReturn(R)` and encodes the
-  result with `canon.returnResult` — `canon` picks flat (a scalar, e.g.
+  export decodes its params with `canon.liftParams`, declares its core return
+  type as `canon.CoreReturn(R)`, and encodes the result with
+  `canon.returnResult` — `canon` picks flat (a scalar, e.g.
   `pet-count`/`delete-pet`) vs. indirect (a pointer to the `option<record>` it
   lowers into a static return area) from `R` at comptime.
 - **Frontend** (`src/store_client.zig`) calls the imports and decodes results

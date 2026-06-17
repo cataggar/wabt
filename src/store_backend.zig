@@ -132,11 +132,6 @@ fn toyView(t: *const StoredToy) Toy {
     return .{ .id = @intCast(t.id), .pet_id = @intCast(t.pet_id), .name = t.name() };
 }
 
-fn slice(ptr: i32, len: i32) []const u8 {
-    const p: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ptr)));
-    return p[0..@intCast(len)];
-}
-
 // ── Exports: example:petstore/store ─────────────────────────────────
 //
 // Record-returning exports `abi.resetScratch()` first so the strings `canon`
@@ -181,9 +176,12 @@ export fn @"example:petstore/store#create-pet"(
 ) canon.CoreReturn(?Pet) {
     abi.resetScratch();
     ensureSeeded();
-    const name = slice(name_ptr, name_len);
-    const tag: ?[]const u8 = if (tag_disc == 1) slice(tag_ptr, tag_len) else null;
-    if (addPet(name, tag, age)) |p| return canon.returnResult(?Pet, petView(p), &abi.alloc);
+    const a = canon.liftParams(struct {
+        name: []const u8,
+        tag: ?[]const u8,
+        age: u32,
+    }, .{ name_ptr, name_len, tag_disc, tag_ptr, tag_len, age });
+    if (addPet(a.name, a.tag, @bitCast(a.age))) |p| return canon.returnResult(?Pet, petView(p), &abi.alloc);
     return canon.returnResult(?Pet, null, &abi.alloc);
 }
 
