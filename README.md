@@ -40,15 +40,19 @@ on lives on the orphan branch `wasip3` of the same repository.
 `store-provider` (the backend) `export`s it.
 
 Both sides marshal records/options/strings across the boundary with the
-**comptime canonical-ABI marshaller** `wasip3`'s `canon` module — `canon.lower`
-/ `canon.lift` derive the canonical memory layout from the plain Zig `Pet` /
-`Toy` types, so there are no hand-written `extern struct` layouts.
+**comptime canonical-ABI marshaller** in `wasip3`'s `canon` module: `canon`
+derives the canonical memory layout *and* the core function result shape from
+the plain Zig `Pet` / `Toy` types — no hand-written `extern struct` layouts and
+no hand-coded flat-vs-indirect result handling.
 
 - **Backend** (`src/store_backend.zig`) owns the static pets/toys store; each
-  `store` export lowers its `option<record>` result into a `canon.RetArea(T)`
-  and returns its address.
-- **Frontend** (`src/store_client.zig`) calls the imports and `canon.lift`s the
-  returned records into typed Zig structs; `src/main.zig` builds `PetJson` /
+  export declares its core return type as `canon.CoreReturn(R)` and encodes the
+  result with `canon.returnResult` — `canon` picks flat (a scalar, e.g.
+  `pet-count`/`delete-pet`) vs. indirect (a pointer to the `option<record>` it
+  lowers into a static return area) from `R` at comptime.
+- **Frontend** (`src/store_client.zig`) calls the imports and decodes results
+  with `canon` (`liftResultFlat` for scalars, `lift` for the spilled records);
+  `src/main.zig` builds `PetJson` /
   `ToyJson` from them and serializes with `std.json` (`emit_null_optional_fields
   = false`, so an absent `tag` is omitted).
 

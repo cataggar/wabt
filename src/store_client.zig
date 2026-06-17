@@ -45,7 +45,7 @@ extern "example:petstore/store" fn @"toy-count"(pet_id: i32) i32;
 extern "example:petstore/store" fn @"toy-at"(pet_id: i32, index: i32, retptr: i32) void;
 
 pub fn petCount() u32 {
-    return @bitCast(@"pet-count"());
+    return canon.liftResultFlat(u32, @"pet-count"());
 }
 
 pub fn petAt(index: u32) ?Pet {
@@ -75,11 +75,11 @@ pub fn createPet(name: []const u8, tag: ?[]const u8, age: u32) ?Pet {
 }
 
 pub fn deletePet(id: u32) bool {
-    return @"delete-pet"(@bitCast(id)) != 0;
+    return canon.liftResultFlat(bool, @"delete-pet"(@bitCast(id)));
 }
 
 pub fn toyCount(pet_id: u32) u32 {
-    return @bitCast(@"toy-count"(@bitCast(pet_id)));
+    return canon.liftResultFlat(u32, @"toy-count"(@bitCast(pet_id)));
 }
 
 pub fn toyAt(pet_id: u32, index: u32) ?Toy {

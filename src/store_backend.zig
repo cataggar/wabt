@@ -116,9 +116,10 @@ fn ensureSeeded() void {
 
 // ── Canonical-ABI result encoding ───────────────────────────────────
 //
-// `option<pet>` / `option<toy>` results spill to memory. `canon` derives the
-// canonical layout from these plain Zig types and lowers a value into a static
-// `RetArea`, returning its address (the indirect result pointer).
+// Each export declares its core return type as `canon.CoreReturn(R)` and
+// encodes the result with `canon.returnResult` — `canon` decides flat (a
+// scalar) vs. indirect (a pointer to the `option<record>` it lowers into a
+// static return area) from `R` at comptime.
 
 const Pet = struct { id: u32, name: []const u8, tag: ?[]const u8, age: u32 };
 const Toy = struct { id: u32, pet_id: u32, name: []const u8 };
@@ -131,14 +132,6 @@ fn toyView(t: *const StoredToy) Toy {
     return .{ .id = @intCast(t.id), .pet_id = @intCast(t.pet_id), .name = t.name() };
 }
 
-fn putPet(value: ?Pet) i32 {
-    return canon.RetArea(?Pet).put(value, &abi.alloc);
-}
-
-fn putToy(value: ?Toy) i32 {
-    return canon.RetArea(?Toy).put(value, &abi.alloc);
-}
-
 fn slice(ptr: i32, len: i32) []const u8 {
     const p: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ptr)));
     return p[0..@intCast(len)];
@@ -149,33 +142,33 @@ fn slice(ptr: i32, len: i32) []const u8 {
 // Record-returning exports `abi.resetScratch()` first so the strings `canon`
 // lowers for the result don't accumulate across calls.
 
-export fn @"example:petstore/store#pet-count"() i32 {
+export fn @"example:petstore/store#pet-count"() canon.CoreReturn(u32) {
     ensureSeeded();
     var n: u32 = 0;
     for (&pets) |*p| {
         if (p.used) n += 1;
     }
-    return @bitCast(n);
+    return canon.returnResult(u32, n, &abi.alloc);
 }
 
-export fn @"example:petstore/store#pet-at"(index: i32) i32 {
+export fn @"example:petstore/store#pet-at"(index: i32) canon.CoreReturn(?Pet) {
     abi.resetScratch();
     ensureSeeded();
     const idx: u32 = @bitCast(index);
     var n: u32 = 0;
     for (&pets) |*p| {
         if (!p.used) continue;
-        if (n == idx) return putPet(petView(p));
+        if (n == idx) return canon.returnResult(?Pet, petView(p), &abi.alloc);
         n += 1;
     }
-    return putPet(null);
+    return canon.returnResult(?Pet, null, &abi.alloc);
 }
 
-export fn @"example:petstore/store#get-pet"(id: i32) i32 {
+export fn @"example:petstore/store#get-pet"(id: i32) canon.CoreReturn(?Pet) {
     abi.resetScratch();
     ensureSeeded();
-    if (findPet(id)) |p| return putPet(petView(p));
-    return putPet(null);
+    if (findPet(id)) |p| return canon.returnResult(?Pet, petView(p), &abi.alloc);
+    return canon.returnResult(?Pet, null, &abi.alloc);
 }
 
 export fn @"example:petstore/store#create-pet"(
@@ -185,42 +178,42 @@ export fn @"example:petstore/store#create-pet"(
     tag_ptr: i32,
     tag_len: i32,
     age: i32,
-) i32 {
+) canon.CoreReturn(?Pet) {
     abi.resetScratch();
     ensureSeeded();
     const name = slice(name_ptr, name_len);
     const tag: ?[]const u8 = if (tag_disc == 1) slice(tag_ptr, tag_len) else null;
-    if (addPet(name, tag, age)) |p| return putPet(petView(p));
-    return putPet(null);
+    if (addPet(name, tag, age)) |p| return canon.returnResult(?Pet, petView(p), &abi.alloc);
+    return canon.returnResult(?Pet, null, &abi.alloc);
 }
 
-export fn @"example:petstore/store#delete-pet"(id: i32) i32 {
+export fn @"example:petstore/store#delete-pet"(id: i32) canon.CoreReturn(bool) {
     ensureSeeded();
-    if (findPet(id)) |p| {
+    const existed = if (findPet(id)) |p| blk: {
         p.used = false;
-        return 1;
-    }
-    return 0;
+        break :blk true;
+    } else false;
+    return canon.returnResult(bool, existed, &abi.alloc);
 }
 
-export fn @"example:petstore/store#toy-count"(pet_id: i32) i32 {
+export fn @"example:petstore/store#toy-count"(pet_id: i32) canon.CoreReturn(u32) {
     ensureSeeded();
     var n: u32 = 0;
     for (&toys) |*t| {
         if (t.used and t.pet_id == pet_id) n += 1;
     }
-    return @bitCast(n);
+    return canon.returnResult(u32, n, &abi.alloc);
 }
 
-export fn @"example:petstore/store#toy-at"(pet_id: i32, index: i32) i32 {
+export fn @"example:petstore/store#toy-at"(pet_id: i32, index: i32) canon.CoreReturn(?Toy) {
     abi.resetScratch();
     ensureSeeded();
     const idx: u32 = @bitCast(index);
     var n: u32 = 0;
     for (&toys) |*t| {
         if (!t.used or t.pet_id != pet_id) continue;
-        if (n == idx) return putToy(toyView(t));
+        if (n == idx) return canon.returnResult(?Toy, toyView(t), &abi.alloc);
         n += 1;
     }
-    return putToy(null);
+    return canon.returnResult(?Toy, null, &abi.alloc);
 }
