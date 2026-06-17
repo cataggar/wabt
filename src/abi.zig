@@ -78,6 +78,13 @@ pub fn resetScratch() void {
     arena_top = 0;
 }
 
+/// Allocate `size` bytes aligned to `alignment` from the scratch arena — the
+/// `canon.Realloc` used to place `string` / `list` storage during lowering.
+/// Grows the same bump arena as `cabi_realloc`; reclaimed by `resetScratch`.
+pub fn alloc(size: usize, alignment: usize) [*]u8 {
+    return @ptrFromInt(cabi_realloc(0, 0, alignment, size));
+}
+
 // ── Ret-area for spilled results ───────────────────────────────────
 //
 // Every imported function whose flat result exceeds one core value
@@ -99,6 +106,11 @@ pub inline fn retPtr() i32 {
 /// `i32` result slots back after a call.
 pub inline fn retWords() [*]u32 {
     return @ptrCast(@alignCast(&ret_area));
+}
+
+/// The ret-area as a byte pointer, for `canon.lift` of a spilled result.
+pub inline fn retArea() [*]const u8 {
+    return @ptrCast(&ret_area);
 }
 
 /// Decode the ret-area as `result<own<handle>, _>` → the handle on the

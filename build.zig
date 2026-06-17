@@ -21,9 +21,15 @@ pub fn build(b: *std.Build) void {
     wasi_http.addImport("abi", abi);
     wasi_http.addImport("cm_async", cm_async);
 
+    // Comptime canonical-ABI value marshaller (records / strings / options /
+    // lists → linear memory). Depends only on `std`; a guest passes it the
+    // `abi.alloc` realloc.
+    const canon = b.addModule("canon", .{ .root_source_file = b.path("src/canon.zig") });
+
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
     wasip3.addImport("abi", abi);
+    wasip3.addImport("canon", canon);
     wasip3.addImport("cm_async", cm_async);
     wasip3.addImport("wasi_cli", wasi_cli);
     wasip3.addImport("wasi_http", wasi_http);
@@ -41,8 +47,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_abi_tests = b.addRunArtifact(abi_tests);
+
+    // Native unit tests for the comptime canonical-ABI marshaller (`canon.zig`):
+    // layout + lower/lift round-trips (host-import-free).
+    const canon_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/canon.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    const run_canon_tests = b.addRunArtifact(canon_tests);
+
     const test_step = b.step("test", "Run native unit tests");
     test_step.dependOn(&run_abi_tests.step);
+    test_step.dependOn(&run_canon_tests.step);
 }
 
 // ?? Build helpers (ported from cataggar/wamr) ??????????????????????
@@ -79,6 +97,7 @@ pub const ModuleSpec = struct {
 
 pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
+    .{ .name = "canon" },
     .{ .name = "cm_async", .deps = &.{"abi"} },
     .{ .name = "wasi_cli", .deps = &.{"cm_async"} },
     .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
