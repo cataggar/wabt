@@ -34,7 +34,6 @@ pub fn build(b: *std.Build) void {
 
     const fe_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
-        .exports = &.{"wasi:http/handler@0.3.0#handle"},
         .output = "http.core.wasm",
         .imports = fe_imports,
     });
@@ -45,15 +44,6 @@ pub fn build(b: *std.Build) void {
     // (`store_impl`); the two reference each other (types ↔ logic).
     const be_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/store_backend_root.zig"),
-        .exports = &.{
-            "example:petstore/store#pet-count",
-            "example:petstore/store#pet-at",
-            "example:petstore/store#get-pet",
-            "example:petstore/store#create-pet",
-            "example:petstore/store#delete-pet",
-            "example:petstore/store#toy-count",
-            "example:petstore/store#toy-at",
-        },
         .output = "store.core.wasm",
         .imports = &.{
             .{ .name = "store_bindings", .path = store_exports, .deps = &.{ "store_impl", "canon", "abi" }, .root_dep = true },
