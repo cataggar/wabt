@@ -4,8 +4,8 @@ const wasip3 = @import("wasip3");
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
 
-    const store_consumer = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer", .impl = "memory_store" });
-    const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider", .impl = "root" });
+    const store_consumer = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer" });
+    const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider" });
 
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
