@@ -49,7 +49,7 @@ logic, or lower/lift code on either side.
 - **Backend** — `build.zig` runs `bindgen` on `store-provider` to generate the
   `export fn` shells (params lifted with `canon.liftParams`, return type
   `canon.CoreReturn(R)`, result encoded with `canon.returnResult`). The shells
-  call **`src/store_impl.zig`** — the in-memory pets/toys store, pure business
+  call **`src/memory_store.zig`** — the in-memory pets/toys store, pure business
   logic returning the generated `Pet` / `Toy` types.
 - **Frontend** — `bindgen` on `store-consumer` generates the `store.*` import
   wrappers (results decoded with `canon.liftResultFlat` / `canon.lift`).

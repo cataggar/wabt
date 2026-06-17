@@ -8,12 +8,12 @@
 //! declare. The `comptime` reference below force-links the generated shells
 //! (and `cabi_realloc`) into the component — there is no other root file.
 
-const b = @import("store");
-const Pet = b.Pet;
-const Toy = b.Toy;
+const store = @import("store");
+const Pet = store.Pet;
+const Toy = store.Toy;
 
 comptime {
-    _ = b; // force-export the generated shells + cabi_realloc (-rdynamic)
+    _ = store; // force-export the generated shells + cabi_realloc (-rdynamic)
 }
 
 // ── In-memory store ─────────────────────────────────────────────────

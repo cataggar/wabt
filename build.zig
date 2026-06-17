@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
     // ── Generate the store bindings from WIT via `wabt component bindgen` ──
     // Import wrappers for the frontend (store-consumer world) and export shells
     // for the backend (store-provider world); both delegate marshalling to `canon`.
-    const store_imports = bindgen(b, wabt_bin, "store-consumer", "store_impl", "store_imports.zig");
+    const store_imports = bindgen(b, wabt_bin, "store-consumer", "memory_store", "store_imports.zig");
     const store_exports = bindgen(b, wabt_bin, "store-provider", "root", "store_exports.zig");
 
     // ── Frontend: wasi:http handler importing example:petstore/store ──
@@ -40,12 +40,12 @@ pub fn build(b: *std.Build) void {
     const frontend = componentNew(b, wabt_bin, fe_core, "svc", "http.wasm");
 
     // ── Backend: example:petstore/store provider ──────────────────────
-    // `src/store_impl.zig` (the in-memory store) is the root; the generated
+    // `src/memory_store.zig` (the in-memory store) is the root; the generated
     // export shells (`store`) reach it via `@import("root")` as their
     // `Impl`, and use it for the `Pet`/`Toy` types. `-rdynamic` exports the
     // shells, so no separate root or export list is needed.
     const be_core = wasip3.zigBuildWasm(b, .{
-        .source = b.path("src/store_impl.zig"),
+        .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = &.{
             .{ .name = "store", .path = store_exports, .deps = &.{ "canon", "abi" }, .root_dep = true },
