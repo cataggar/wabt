@@ -155,10 +155,11 @@ pub fn resolveWasmImports(
 
 pub const ZigBuildWasm = struct {
     source: std.Build.LazyPath,
-    /// Names passed via `--export=<name>`. The universal `cabi_realloc`
-    /// export is added automatically (see `cabi_realloc`), so list only
-    /// the component-specific exports here.
-    exports: []const []const u8,
+    /// Additional names force-exported via `--export=<name>`. Usually empty:
+    /// the build passes `-rdynamic`, so every `export fn` (the guest's
+    /// interface exports + `cabi_realloc`) is exported automatically and the
+    /// export names live solely in the (generated) Zig source.
+    exports: []const []const u8 = &.{},
     /// Output basename for the emitted core wasm.
     output: []const u8,
     /// Extra modules importable from the root via `@import("<name>")`.
@@ -185,6 +186,11 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
         "-target",       opts.target_triple,
         "-O",            "ReleaseSmall",
         "-fno-entry",
+        // Export every `export fn` (interface exports + `cabi_realloc`) without
+        // having to enumerate their canonical names; they're declared in the
+        // (often generated) guest source. `--export=<name>` below still works
+        // for forcing extra symbols.
+        "-rdynamic",
     });
     if (opts.no_llvm) cmd.addArg("-fno-llvm");
     if (opts.no_lld) cmd.addArg("-fno-lld");
