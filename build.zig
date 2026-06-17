@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
         .imports = wasip3.guestImports(b, dep, &.{"wasi_http"}, &.{
-            .{ .name = "store_consumer", .bindings = store_consumer },
+            .{ .bindings = store_consumer },
         }),
     });
     const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = wasip3.guestImports(b, dep, &.{}, &.{
-            .{ .name = "store_provider", .bindings = store_provider },
+            .{ .bindings = store_provider },
         }),
     });
     const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "store-provider" });
