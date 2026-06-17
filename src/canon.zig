@@ -344,6 +344,60 @@ pub fn liftResultFlat(comptime T: type, core: CoreScalar(T)) T {
     return fromCore(T, core);
 }
 
+// ── Parameter lifting (flat slots → values) ─────────────────────────
+//
+// Params are passed as a flat tuple of core slots (a `string` as two slots, an
+// `option<string>` as three, a scalar as one). `liftParams` reconstructs the
+// high-level `Params` struct from those slots — the inverse of the canonical
+// ABI's parameter flattening — so an export decodes its params with one call
+// instead of hand-slicing pointers.
+
+fn coreSlotTo(comptime T: type, slot: anytype) T {
+    return switch (@typeInfo(T)) {
+        .bool => slot != 0,
+        .@"enum" => @enumFromInt(slot),
+        .int => if (@bitSizeOf(T) == @bitSizeOf(@TypeOf(slot))) @bitCast(slot) else @intCast(slot),
+        .float => slot,
+        else => unsupported(T),
+    };
+}
+
+fn flatFieldOffset(comptime T: type, comptime idx: usize) usize {
+    const fields = @typeInfo(T).@"struct".fields;
+    var off: usize = 0;
+    inline for (fields, 0..) |f, i| {
+        if (i == idx) return off;
+        off += flatCount(f.type);
+    }
+    return off;
+}
+
+fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
+    return switch (@typeInfo(T)) {
+        .bool, .int, .float, .@"enum" => coreSlotTo(T, slots[start]),
+        .pointer => |p| blk: { // string/list = (ptr, len)
+            const len: usize = @intCast(slots[start + 1]);
+            if (len == 0) break :blk &.{};
+            const items: [*]const p.child = @ptrFromInt(@as(usize, @intCast(slots[start])));
+            break :blk items[0..len];
+        },
+        .optional => |o| if (slots[start] == 0) null else flatLift(o.child, slots, start + 1),
+        .@"struct" => |s| blk: {
+            var v: T = undefined;
+            inline for (s.fields, 0..) |f, i| {
+                @field(v, f.name) = flatLift(f.type, slots, start + comptime flatFieldOffset(T, i));
+            }
+            break :blk v;
+        },
+        else => unsupported(T),
+    };
+}
+
+/// Lift a function's flattened core parameters — a tuple of `i32`/`i64`/`f32`/
+/// `f64` slots — into the high-level `Params` struct.
+pub fn liftParams(comptime Params: type, slots: anytype) Params {
+    return flatLift(Params, slots, 0);
+}
 
 // ── Tests (native; layout + lower/lift + result round-trips) ────────
 
@@ -458,4 +512,26 @@ test "flat result encode/decode round-trip" {
     try testing.expectEqual(false, liftResultFlat(bool, returnResult(bool, false, &testAlloc)));
     const big: u64 = 0x1_0000_0000;
     try testing.expectEqual(big, liftResultFlat(u64, returnResult(u64, big, &testAlloc)));
+}
+
+test "liftParams decodes flat scalar params" {
+    const P = struct { a: u32, b: bool, c: u32 };
+    const got = liftParams(P, .{ @as(i32, @bitCast(@as(u32, 7))), @as(i32, 1), @as(i32, @bitCast(@as(u32, 99))) });
+    try testing.expectEqual(@as(u32, 7), got.a);
+    try testing.expectEqual(true, got.b);
+    try testing.expectEqual(@as(u32, 99), got.c);
+}
+
+test "liftParams places string/option/scalar at the right slots" {
+    // name=(ptr,len) slots 0..1, tag=(disc,ptr,len) slots 2..4, age slot 5.
+    // Pointers aren't dereferenced here, so empty (ptr=0,len=0) is safe.
+    const P = struct { name: []const u8, tag: ?[]const u8, age: u32 };
+    const got = liftParams(P, .{
+        @as(i32, 0),                       @as(i32, 0), // name ptr,len
+        @as(i32, 0),  @as(i32, 0),         @as(i32, 0), // tag none
+        @as(i32, @bitCast(@as(u32, 5))), // age
+    });
+    try testing.expectEqual(@as(usize, 0), got.name.len);
+    try testing.expect(got.tag == null);
+    try testing.expectEqual(@as(u32, 5), got.age);
 }
