@@ -233,7 +233,119 @@ pub fn RetArea(comptime T: type) type {
     };
 }
 
-// ── Tests (native; layout + lower/lift round-trips) ─────────────────
+// ── Result flattening (flat vs. indirect) ───────────────────────────
+//
+// A function result flattens to a sequence of core values; the canonical ABI
+// returns it directly when that sequence is a single core value, otherwise
+// through a pointer to memory (`MAX_FLAT_RESULTS = 1`). These helpers compute
+// that decision — and the flat core type — from `T` at comptime, so an export
+// declares its core return type as `CoreReturn(T)` and encodes the value with
+// `returnResult`, with no hand-coded flat/indirect distinction.
+
+/// Number of core values `T` flattens to.
+pub fn flatCount(comptime T: type) usize {
+    return switch (@typeInfo(T)) {
+        .void => 0,
+        .bool, .int, .float, .@"enum" => 1,
+        .pointer => 2, // (ptr, len)
+        .optional => |o| 1 + flatCount(o.child), // discriminant + payload
+        .@"struct" => |s| blk: {
+            var c: usize = 0;
+            inline for (s.fields) |f| c += flatCount(f.type);
+            break :blk c;
+        },
+        else => unsupported(T),
+    };
+}
+
+/// The single core type a 1-slot `T` flattens to (`i32` / `i64` / `f32` / `f64`).
+fn CoreScalar(comptime T: type) type {
+    return switch (@typeInfo(T)) {
+        .bool, .@"enum" => i32,
+        .int => |i| if (i.bits <= 32) i32 else i64,
+        .float => |f| if (f.bits == 32) f32 else f64,
+        .@"struct" => |s| CoreScalar(s.fields[0].type), // single-field record
+        else => unsupported(T),
+    };
+}
+
+/// The core return type of a function returning `T`: `void` (empty), the flat
+/// scalar (1 core value), or `i32` (a pointer to the spilled result).
+pub fn CoreReturn(comptime T: type) type {
+    const fc = flatCount(T);
+    return if (fc == 0) void else if (fc == 1) CoreScalar(T) else i32;
+}
+
+const ResultClass = enum { empty, flat, indirect };
+
+fn resultClass(comptime T: type) ResultClass {
+    const fc = flatCount(T);
+    return if (fc == 0) .empty else if (fc == 1) .flat else .indirect;
+}
+
+/// True when `T`'s result is returned flat (≤ 1 core value) rather than via a
+/// memory pointer. Lets a caller pick the matching import shape.
+pub fn resultIsFlat(comptime T: type) bool {
+    return flatCount(T) <= 1;
+}
+
+fn toCore(comptime T: type, value: T) CoreScalar(T) {
+    return switch (@typeInfo(T)) {
+        .bool => @intFromBool(value),
+        .@"enum" => @intCast(@intFromEnum(value)),
+        .int => |i| if (CoreScalar(T) == i64)
+            @bitCast(value)
+        else if (i.bits == 32)
+            @bitCast(value)
+        else
+            @intCast(value),
+        .float => value,
+        .@"struct" => |s| toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        else => unsupported(T),
+    };
+}
+
+fn fromCore(comptime T: type, core: CoreScalar(T)) T {
+    return switch (@typeInfo(T)) {
+        .bool => core != 0,
+        .@"enum" => @enumFromInt(core),
+        .int => |i| if (CoreScalar(T) == i64)
+            @bitCast(core)
+        else if (i.bits == 32)
+            @bitCast(core)
+        else
+            @intCast(core),
+        .float => core,
+        .@"struct" => |s| blk: {
+            var r: T = undefined;
+            @field(r, s.fields[0].name) = fromCore(s.fields[0].type, core);
+            break :blk r;
+        },
+        else => unsupported(T),
+    };
+}
+
+/// Encode a function result of type `T` as its core return value: the flat
+/// scalar, or (for a spilled result) the pointer to the lowered value. `ra`
+/// supplies `string`/`list` storage and is unused for flat results.
+pub fn returnResult(comptime T: type, value: T, ra: Realloc) CoreReturn(T) {
+    // comptime switch so only the matching arm is analyzed — `toCore`'s
+    // `CoreScalar(T)` is undefined for indirect (multi-slot) types.
+    return switch (comptime resultClass(T)) {
+        .empty => {},
+        .flat => toCore(T, value),
+        .indirect => RetArea(T).put(value, ra),
+    };
+}
+
+/// Decode a flat (≤ 1 core value) function result back into `T`. Spilled
+/// results are read from memory with `lift` instead.
+pub fn liftResultFlat(comptime T: type, core: CoreScalar(T)) T {
+    return fromCore(T, core);
+}
+
+
+// ── Tests (native; layout + lower/lift + result round-trips) ────────
 
 const testing = std.testing;
 
@@ -325,4 +437,25 @@ test "round-trip: toy and scalars" {
     try testing.expectEqual(@as(u32, 100), t.id);
     try testing.expectEqual(@as(u32, 1), t.pet_id);
     try testing.expectEqualStrings("Yarn Ball", t.name);
+}
+
+test "result flattening decision and core types" {
+    try testing.expect(resultIsFlat(u32));
+    try testing.expect(resultIsFlat(bool));
+    try testing.expect(!resultIsFlat([]const u8)); // (ptr, len) = 2 slots
+    try testing.expect(!resultIsFlat(?Pet));
+    try testing.expectEqual(i32, CoreReturn(u32));
+    try testing.expectEqual(i32, CoreReturn(?Pet)); // pointer to spilled result
+    try testing.expectEqual(i64, CoreReturn(u64));
+    try testing.expectEqual(@as(usize, 1), flatCount(bool));
+    try testing.expectEqual(@as(usize, 3), flatCount(?[]const u8)); // disc + (ptr, len)
+}
+
+test "flat result encode/decode round-trip" {
+    // Flat results don't touch memory, so this runs on any host.
+    try testing.expectEqual(@as(u32, 42), liftResultFlat(u32, returnResult(u32, 42, &testAlloc)));
+    try testing.expectEqual(true, liftResultFlat(bool, returnResult(bool, true, &testAlloc)));
+    try testing.expectEqual(false, liftResultFlat(bool, returnResult(bool, false, &testAlloc)));
+    const big: u64 = 0x1_0000_0000;
+    try testing.expectEqual(big, liftResultFlat(u64, returnResult(u64, big, &testAlloc)));
 }
