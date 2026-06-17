@@ -430,9 +430,20 @@ pub const WabtComponentBindgen = struct {
     impl: []const u8 = "root",
     /// WIT package directory to read (`--wit`). Defaults to `wit/`.
     wit_dir: ?std.Build.LazyPath = null,
-    /// Output basename for the generated `.zig` source.
-    output: []const u8,
+    /// Output basename for the generated `.zig` source. Defaults to the world
+    /// name in snake_case + `.zig` (e.g. `store-consumer` → `store_consumer.zig`).
+    output: ?[]const u8 = null,
 };
+
+/// The world name as a snake_case `.zig` basename (kebab `-` → `_`), e.g.
+/// `store-consumer` → `store_consumer.zig`.
+fn worldBasename(b: *std.Build, world: []const u8) []const u8 {
+    const buf = b.allocator.dupe(u8, world) catch @panic("OOM");
+    for (buf) |*c| {
+        if (c.* == '-') c.* = '_';
+    }
+    return b.fmt("{s}.zig", .{buf});
+}
 
 /// `wabt component bindgen --wit <dir> --world <world> --impl <impl> -o <out>`:
 /// generate the canonical-ABI guest bindings (typed import wrappers and/or
@@ -442,7 +453,7 @@ pub fn wabtComponentBindgen(b: *std.Build, opts: WabtComponentBindgen) std.Build
     addWitArg(b, cmd, opts.wit_dir orelse b.path("wit"));
     cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl, "-o" });
     cmd.setName(b.fmt("wabt component bindgen {s}", .{opts.world}));
-    return cmd.addOutputFileArg(opts.output);
+    return cmd.addOutputFileArg(opts.output orelse worldBasename(b, opts.world));
 }
 
 pub const WabtComponentCompose = struct {
