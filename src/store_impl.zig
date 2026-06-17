@@ -1,6 +1,6 @@
 //! In-memory petstore implementation — the backend component's root module.
 //!
-//! `wabt component bindgen` generates `store_bindings` — the canonical-ABI
+//! `wabt component bindgen` generates the `store` bindings — the canonical-ABI
 //! export shells for `example:petstore/store`. Those shells lift the params,
 //! call the functions below (`Impl`, reached via `@import("root")`), and encode
 //! the results, all via `canon`. The business logic here is pure: an in-memory
@@ -8,7 +8,7 @@
 //! declare. The `comptime` reference below force-links the generated shells
 //! (and `cabi_realloc`) into the component — there is no other root file.
 
-const b = @import("store_bindings");
+const b = @import("store");
 const Pet = b.Pet;
 const Toy = b.Toy;
 

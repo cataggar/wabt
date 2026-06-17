@@ -41,14 +41,14 @@ pub fn build(b: *std.Build) void {
 
     // ── Backend: example:petstore/store provider ──────────────────────
     // `src/store_impl.zig` (the in-memory store) is the root; the generated
-    // export shells (`store_bindings`) reach it via `@import("root")` as their
+    // export shells (`store`) reach it via `@import("root")` as their
     // `Impl`, and use it for the `Pet`/`Toy` types. `-rdynamic` exports the
     // shells, so no separate root or export list is needed.
     const be_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/store_impl.zig"),
         .output = "store.core.wasm",
         .imports = &.{
-            .{ .name = "store_bindings", .path = store_exports, .deps = &.{ "canon", "abi" }, .root_dep = true },
+            .{ .name = "store", .path = store_exports, .deps = &.{ "canon", "abi" }, .root_dep = true },
             .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
             .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
         },
