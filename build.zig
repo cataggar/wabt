@@ -31,4 +31,7 @@ pub fn build(b: *std.Build) void {
         .output = "petstore.wasm",
     });
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(component, .prefix, "petstore.wasm").step);
+
+    // `zig build serve [-- --addr 127.0.0.1:8080]`
+    _ = wasip3.wasmtimeServe(b, .{ .wasm = component, .description = "Serve the composed petstore component with wasmtime (P3)" });
 }
