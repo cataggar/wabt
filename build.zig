@@ -15,15 +15,15 @@ pub fn build(b: *std.Build) void {
     // Generate the store bindings from WIT: import wrappers for the web side
     // (store-consumer world) and `export fn` shells for the store side
     // (store-provider world). Both delegate all marshalling to `canon`.
-    const store_imports = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer", .impl = "memory_store", .output = "store_imports.zig" });
-    const store_exports = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider", .impl = "root", .output = "store_exports.zig" });
+    const store_consumer = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer", .impl = "memory_store", .output = "store_consumer.zig" });
+    const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider", .impl = "root", .output = "store_provider.zig" });
 
     // ── Web frontend: wasi:http handler importing example:petstore/store ──
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
         .imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_http", "canon" }, &.{
-            .{ .name = "store_consumer", .path = store_imports, .deps = &.{ "abi", "canon" } },
+            .{ .name = "store_consumer", .path = store_consumer, .deps = &.{ "abi", "canon" } },
         }),
     });
     const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = &.{
-            .{ .name = "store_provider", .path = store_exports, .deps = &.{ "canon", "abi" } },
+            .{ .name = "store_provider", .path = store_provider, .deps = &.{ "canon", "abi" } },
             .{ .name = "canon", .path = dep.path("src/canon.zig"), .root_dep = false },
             .{ .name = "abi", .path = dep.path("src/abi.zig"), .root_dep = false },
         },
@@ -55,8 +55,8 @@ pub fn build(b: *std.Build) void {
     // `zig build bindgen` — write the generated store bindings to
     // zig-out/generated/ so they can be inspected.
     const gen_step = b.step("bindgen", "Write the generated store bindings to zig-out/generated/");
-    gen_step.dependOn(&b.addInstallFileWithDir(store_imports, .prefix, "generated/store_imports.zig").step);
-    gen_step.dependOn(&b.addInstallFileWithDir(store_exports, .prefix, "generated/store_exports.zig").step);
+    gen_step.dependOn(&b.addInstallFileWithDir(store_consumer, .prefix, "generated/store_consumer.zig").step);
+    gen_step.dependOn(&b.addInstallFileWithDir(store_provider, .prefix, "generated/store_provider.zig").step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     _ = wasip3.wasmtimeServe(b, .{ .wasm = component, .description = "Serve the composed petstore component with wasmtime (P3)" });
@@ -72,7 +72,7 @@ pub fn build(b: *std.Build) void {
     // wired into `install`.
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
 
-    const store_consumer_mod = b.createModule(.{ .root_source_file = store_imports });
+    const store_consumer_mod = b.createModule(.{ .root_source_file = store_consumer });
     store_consumer_mod.addImport("abi", dep.module("abi"));
     store_consumer_mod.addImport("canon", dep.module("canon"));
     const web_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = wasm_target });
@@ -82,7 +82,7 @@ pub fn build(b: *std.Build) void {
     web_check.entry = .disabled;
     web_check.rdynamic = true;
 
-    const store_provider_mod = b.createModule(.{ .root_source_file = store_exports });
+    const store_provider_mod = b.createModule(.{ .root_source_file = store_provider });
     store_provider_mod.addImport("canon", dep.module("canon"));
     store_provider_mod.addImport("abi", dep.module("abi"));
     const store_mod = b.createModule(.{ .root_source_file = b.path("src/memory_store.zig"), .target = wasm_target });
