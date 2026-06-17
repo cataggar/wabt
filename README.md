@@ -36,15 +36,18 @@ on lives on the orphan branch `wasip3` of the same repository.
 
 `interface store` is a typed data-access API: `pet` / `toy` **records**, with
 `option<record>` results and `count` + indexed `*-at` accessors (instead of
-`list<record>`) so the canonical-ABI marshalling stays hand-writable on both
-sides. Two worlds use it: `svc` (the frontend) `import`s `store`; `store-provider`
-(the backend) `export`s it.
+`list<record>`). Two worlds use it: `svc` (the frontend) `import`s `store`;
+`store-provider` (the backend) `export`s it.
 
-- **Backend** (`src/store_backend.zig`) owns the static pets/toys store and lifts
-  each `store` export by hand: record strings point straight at the persistent
-  store buffers (the host lifts them synchronously), and `option<record>` results
-  are returned through a canonically-laid-out return area.
-- **Frontend** (`src/store_client.zig`) lowers the imported calls and lifts the
+Both sides marshal records/options/strings across the boundary with the
+**comptime canonical-ABI marshaller** `wasip3`'s `canon` module — `canon.lower`
+/ `canon.lift` derive the canonical memory layout from the plain Zig `Pet` /
+`Toy` types, so there are no hand-written `extern struct` layouts.
+
+- **Backend** (`src/store_backend.zig`) owns the static pets/toys store; each
+  `store` export lowers its `option<record>` result into a `canon.RetArea(T)`
+  and returns its address.
+- **Frontend** (`src/store_client.zig`) calls the imports and `canon.lift`s the
   returned records into typed Zig structs; `src/main.zig` builds `PetJson` /
   `ToyJson` from them and serializes with `std.json` (`emit_null_optional_fields
   = false`, so an absent `tag` is omitted).

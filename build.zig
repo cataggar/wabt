@@ -16,13 +16,13 @@ pub fn build(b: *std.Build) void {
     const wasmtime_bin = b.graph.environ_map.get("WASMTIME") orelse "wasmtime";
 
     // ── Frontend: wasi:http handler importing example:petstore/store ──
-    const fe_base = wasip3.resolveWasmImports(b, dep, &.{"wasi_http"});
+    const fe_base = wasip3.resolveWasmImports(b, dep, &.{ "wasi_http", "canon" });
     const fe_imports = b.allocator.alloc(wasip3.ZigWasmImport, fe_base.len + 1) catch @panic("OOM");
     @memcpy(fe_imports[0..fe_base.len], fe_base);
     fe_imports[fe_base.len] = .{
         .name = "store",
         .path = b.path("src/store_client.zig"),
-        .deps = &.{"abi"},
+        .deps = &.{ "abi", "canon" },
         .root_dep = true,
     };
 
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
             "example:petstore/store#toy-at",
         },
         .output = "store.core.wasm",
-        .imports = wasip3.resolveWasmImports(b, dep, &.{"abi"}),
+        .imports = wasip3.resolveWasmImports(b, dep, &.{ "abi", "canon" }),
     });
     const backend = componentNew(b, wabt_bin, be_core, "store-provider", "store.wasm");
 

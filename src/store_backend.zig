@@ -3,25 +3,27 @@
 //! examples) and answers the data-access calls the HTTP frontend imports.
 //! `wabt component compose` links this provider into the frontend.
 //!
-//! ## Canonical ABI (export / "lift" side)
+//! ## Canonical ABI (export side)
 //!
-//! Each export receives its params already flattened to core `i32`s (strings
-//! as `(ptr, len)`, `option<string>` as `(disc, ptr, len)`). A result wider
-//! than one core value (`option<pet>` / `option<toy>`) is returned through a
-//! pointer: the function writes the record in canonical memory layout into a
-//! static return area and returns its address. Record strings point straight
-//! at the persistent store buffers — the host lifts them synchronously before
-//! any later mutation, so no per-call copy is needed.
+//! Params arrive already flattened to core `i32`s (strings as `(ptr, len)`,
+//! `option<string>` as `(disc, ptr, len)`). A result wider than one core value
+//! (`option<pet>` / `option<toy>`) spills to memory: the comptime `canon`
+//! marshaller computes the canonical layout from the plain Zig `Pet` / `Toy`
+//! types — no hand-written `extern struct`s — and `canon.RetArea(T)` lowers the
+//! value into a static area and returns its address. Result strings are copied
+//! into the `abi` scratch arena (reset per call), which the host lifts
+//! synchronously before the next call.
 //!
 //! The store is static global state mutated by synchronous, await-free calls;
 //! the host serializes these imports, so a single static return area is safe.
 
 const std = @import("std");
 const abi = @import("abi");
+const canon = @import("canon");
 
-// `cabi_realloc` (exported by `abi`) is how the host lowers our string
-// params into this component's memory. Keep the module alive so the export
-// is linked even though we never call it directly.
+// `cabi_realloc` (exported by `abi`) is how the host lowers our string params
+// into this component's memory, and how `canon` lowers result strings. Keep the
+// module alive so the export is linked.
 comptime {
     _ = abi;
 }
@@ -37,6 +39,13 @@ const StoredPet = struct {
     has_tag: bool = false,
     tag_buf: [64]u8 = undefined,
     tag_len: u8 = 0,
+
+    fn name(self: *const StoredPet) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
+    fn tag(self: *const StoredPet) ?[]const u8 {
+        return if (self.has_tag) self.tag_buf[0..self.tag_len] else null;
+    }
 };
 
 const StoredToy = struct {
@@ -45,6 +54,10 @@ const StoredToy = struct {
     pet_id: i32 = 0,
     name_buf: [64]u8 = undefined,
     name_len: u8 = 0,
+
+    fn name(self: *const StoredToy) []const u8 {
+        return self.name_buf[0..self.name_len];
+    }
 };
 
 var pets = [_]StoredPet{.{}} ** 128;
@@ -103,80 +116,27 @@ fn ensureSeeded() void {
 
 // ── Canonical-ABI result encoding ───────────────────────────────────
 //
-// A result wider than one core value (`option<pet>` / `option<toy>`) is
-// returned through a pointer. `OptionRet(T)` is the reusable mechanism: a
-// static `extern struct { disc: u8, value: T }` reproduces the `option<T>`
-// layout (a 1-byte discriminant, then the payload at `align(T)`), and
-// `some`/`none` fill it and return its address. `T` is the canonical record
-// layout — written out explicitly below, since that is the per-field
-// marshalling this example exists to show.
+// `option<pet>` / `option<toy>` results spill to memory. `canon` derives the
+// canonical layout from these plain Zig types and lowers a value into a static
+// `RetArea`, returning its address (the indirect result pointer).
 
-fn OptionRet(comptime T: type) type {
-    return struct {
-        var area: extern struct { disc: u8, value: T } = undefined;
+const Pet = struct { id: u32, name: []const u8, tag: ?[]const u8, age: u32 };
+const Toy = struct { id: u32, pet_id: u32, name: []const u8 };
 
-        fn some(value: T) i32 {
-            area = .{ .disc = 1, .value = value };
-            return @intCast(@intFromPtr(&area));
-        }
-        fn none() i32 {
-            area.disc = 0;
-            return @intCast(@intFromPtr(&area));
-        }
-    };
+fn petView(p: *const StoredPet) Pet {
+    return .{ .id = @intCast(p.id), .name = p.name(), .tag = p.tag(), .age = @intCast(p.age) };
 }
 
-const PetRec = extern struct {
-    id: u32,
-    name_ptr: u32,
-    name_len: u32,
-    tag_disc: u8, // option<string> discriminant
-    tag_ptr: u32,
-    tag_len: u32,
-    age: u32,
-};
-
-const ToyRec = extern struct {
-    id: u32,
-    pet_id: u32,
-    name_ptr: u32,
-    name_len: u32,
-};
-
-const PetOption = OptionRet(PetRec);
-const ToyOption = OptionRet(ToyRec);
-
-fn ptrTo(p: *const anyopaque) u32 {
-    return @intCast(@intFromPtr(p));
+fn toyView(t: *const StoredToy) Toy {
+    return .{ .id = @intCast(t.id), .pet_id = @intCast(t.pet_id), .name = t.name() };
 }
 
-fn writePet(p: *const StoredPet) i32 {
-    return PetOption.some(.{
-        .id = @intCast(p.id),
-        .name_ptr = ptrTo(&p.name_buf),
-        .name_len = p.name_len,
-        .tag_disc = if (p.has_tag) 1 else 0,
-        .tag_ptr = if (p.has_tag) ptrTo(&p.tag_buf) else 0,
-        .tag_len = if (p.has_tag) p.tag_len else 0,
-        .age = @intCast(p.age),
-    });
+fn putPet(value: ?Pet) i32 {
+    return canon.RetArea(?Pet).put(value, &abi.alloc);
 }
 
-fn writeNoPet() i32 {
-    return PetOption.none();
-}
-
-fn writeToy(t: *const StoredToy) i32 {
-    return ToyOption.some(.{
-        .id = @intCast(t.id),
-        .pet_id = @intCast(t.pet_id),
-        .name_ptr = ptrTo(&t.name_buf),
-        .name_len = t.name_len,
-    });
-}
-
-fn writeNoToy() i32 {
-    return ToyOption.none();
+fn putToy(value: ?Toy) i32 {
+    return canon.RetArea(?Toy).put(value, &abi.alloc);
 }
 
 fn slice(ptr: i32, len: i32) []const u8 {
@@ -185,6 +145,9 @@ fn slice(ptr: i32, len: i32) []const u8 {
 }
 
 // ── Exports: example:petstore/store ─────────────────────────────────
+//
+// Record-returning exports `abi.resetScratch()` first so the strings `canon`
+// lowers for the result don't accumulate across calls.
 
 export fn @"example:petstore/store#pet-count"() i32 {
     ensureSeeded();
@@ -196,21 +159,23 @@ export fn @"example:petstore/store#pet-count"() i32 {
 }
 
 export fn @"example:petstore/store#pet-at"(index: i32) i32 {
+    abi.resetScratch();
     ensureSeeded();
     const idx: u32 = @bitCast(index);
     var n: u32 = 0;
     for (&pets) |*p| {
         if (!p.used) continue;
-        if (n == idx) return writePet(p);
+        if (n == idx) return putPet(petView(p));
         n += 1;
     }
-    return writeNoPet();
+    return putPet(null);
 }
 
 export fn @"example:petstore/store#get-pet"(id: i32) i32 {
+    abi.resetScratch();
     ensureSeeded();
-    if (findPet(id)) |p| return writePet(p);
-    return writeNoPet();
+    if (findPet(id)) |p| return putPet(petView(p));
+    return putPet(null);
 }
 
 export fn @"example:petstore/store#create-pet"(
@@ -221,11 +186,12 @@ export fn @"example:petstore/store#create-pet"(
     tag_len: i32,
     age: i32,
 ) i32 {
+    abi.resetScratch();
     ensureSeeded();
     const name = slice(name_ptr, name_len);
     const tag: ?[]const u8 = if (tag_disc == 1) slice(tag_ptr, tag_len) else null;
-    if (addPet(name, tag, age)) |p| return writePet(p);
-    return writeNoPet();
+    if (addPet(name, tag, age)) |p| return putPet(petView(p));
+    return putPet(null);
 }
 
 export fn @"example:petstore/store#delete-pet"(id: i32) i32 {
@@ -247,13 +213,14 @@ export fn @"example:petstore/store#toy-count"(pet_id: i32) i32 {
 }
 
 export fn @"example:petstore/store#toy-at"(pet_id: i32, index: i32) i32 {
+    abi.resetScratch();
     ensureSeeded();
     const idx: u32 = @bitCast(index);
     var n: u32 = 0;
     for (&toys) |*t| {
         if (!t.used or t.pet_id != pet_id) continue;
-        if (n == idx) return writeToy(t);
+        if (n == idx) return putToy(toyView(t));
         n += 1;
     }
-    return writeNoToy();
+    return putToy(null);
 }
