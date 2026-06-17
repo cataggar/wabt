@@ -69,6 +69,18 @@ pub fn build(b: *std.Build) void {
 // and reuse them. Path fields are `LazyPath` so a dependent points at the
 // vendored sources via `dep.path("src/...")`.
 
+/// The `wabt` CLI binary: `$WABT` if set (point it at a P3-capable build),
+/// else `wabt` from `PATH`.
+pub fn wabtBin(b: *std.Build) []const u8 {
+    return b.graph.environ_map.get("WABT") orelse "wabt";
+}
+
+/// The `wasmtime` CLI binary: `$WASMTIME` if set (point it at wasmtime >= 46),
+/// else `wasmtime` from `PATH`.
+pub fn wasmtimeBin(b: *std.Build) []const u8 {
+    return b.graph.environ_map.get("WASMTIME") orelse "wasmtime";
+}
+
 pub const ZigWasmImport = struct {
     /// Import name, e.g. `wasi_cli` for `@import("wasi_cli")`.
     name: []const u8,
@@ -151,6 +163,25 @@ pub fn resolveWasmImports(
         }) catch @panic("OOM");
     }
     return out.toOwnedSlice(b.allocator) catch @panic("OOM");
+}
+
+/// Like `resolveWasmImports`, but also appends caller-provided generated
+/// imports (e.g. `wabtComponentBindgen` output) after the resolved wasip3
+/// closure — so a guest that imports a generated WIT binding alongside the
+/// `wasi_*` helpers can describe its whole import set in one call instead of
+/// hand-splicing arrays.
+pub fn resolveWasmImportsWith(
+    b: *std.Build,
+    dep: *std.Build.Dependency,
+    roots: []const []const u8,
+    extra: []const ZigWasmImport,
+) []const ZigWasmImport {
+    const base = resolveWasmImports(b, dep, roots);
+    if (extra.len == 0) return base;
+    const out = b.allocator.alloc(ZigWasmImport, base.len + extra.len) catch @panic("OOM");
+    @memcpy(out[0..base.len], base);
+    @memcpy(out[base.len..], extra);
+    return out;
 }
 
 pub const ZigBuildWasm = struct {
@@ -245,7 +276,7 @@ pub const WabtComponentNew = struct {
 /// The bundled WASI WIT + wasi-preview1 adapter are auto-attached, so no
 /// on-disk `wit/deps/` copy is needed.
 pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPath {
-    const cmd = b.addSystemCommand(&.{ "wabt", "component", "new" });
+    const cmd = b.addSystemCommand(&.{ wabtBin(b), "component", "new" });
     if (opts.world) |world| {
         cmd.addArg("--world");
         cmd.addArg(world);
@@ -255,6 +286,54 @@ pub fn wabtComponentNew(b: *std.Build, opts: WabtComponentNew) std.Build.LazyPat
     cmd.addFileArg(opts.wasm_core);
     cmd.addArg("-o");
     return cmd.addOutputFileArg(opts.output orelse componentBasename(b, lazyBasename(opts.wasm_core)));
+}
+
+pub const WabtComponentBindgen = struct {
+    /// World to generate guest bindings for (`--world`).
+    world: []const u8,
+    /// Module the generated export shells delegate to as their `Impl`
+    /// (`--impl`); `"root"` makes them call `@import("root")`. Ignored for an
+    /// import-only world (no export shells are emitted).
+    impl: []const u8 = "root",
+    /// WIT package directory to read (`--wit`). Defaults to `wit/`.
+    wit_dir: ?std.Build.LazyPath = null,
+    /// Output basename for the generated `.zig` source.
+    output: []const u8,
+};
+
+/// `wabt component bindgen --wit <dir> --world <world> --impl <impl> -o <out>`:
+/// generate the canonical-ABI guest bindings (typed import wrappers and/or
+/// `export fn` shells) for a world as a Zig source `LazyPath`.
+pub fn wabtComponentBindgen(b: *std.Build, opts: WabtComponentBindgen) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{ wabtBin(b), "component", "bindgen", "--wit" });
+    cmd.addDirectoryArg(opts.wit_dir orelse b.path("wit"));
+    cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl, "-o" });
+    cmd.setName(b.fmt("wabt component bindgen {s}", .{opts.world}));
+    return cmd.addOutputFileArg(opts.output);
+}
+
+pub const WabtComponentCompose = struct {
+    /// The consumer/"main" component whose imports get satisfied.
+    consumer: std.Build.LazyPath,
+    /// Provider components (`-d`) that satisfy the consumer's imports.
+    dependencies: []const std.Build.LazyPath,
+    /// Output basename for the composed component.
+    output: []const u8,
+};
+
+/// `wabt component compose -d <dep>... -o <out> <consumer>`: link a consumer
+/// component against one or more provider components into a single composed
+/// component `LazyPath`.
+pub fn wabtComponentCompose(b: *std.Build, opts: WabtComponentCompose) std.Build.LazyPath {
+    const cmd = b.addSystemCommand(&.{ wabtBin(b), "component", "compose" });
+    for (opts.dependencies) |d| {
+        cmd.addArg("-d");
+        cmd.addFileArg(d);
+    }
+    cmd.addArg("-o");
+    const out = cmd.addOutputFileArg(opts.output);
+    cmd.addFileArg(opts.consumer);
+    return out;
 }
 
 pub const WabtModuleValidate = struct {
@@ -299,7 +378,7 @@ pub const WasmtimeRun = struct {
 /// Create a named step that runs the component with `wasmtime run`.
 /// Returns the step so callers can wire further dependencies if needed.
 pub fn wasmtimeRun(b: *std.Build, opts: WasmtimeRun) *std.Build.Step {
-    const cmd = b.addSystemCommand(&.{ "wasmtime", "run" });
+    const cmd = b.addSystemCommand(&.{ wasmtimeBin(b), "run" });
     for (opts.wasi) |feature| {
         cmd.addArg("-S");
         cmd.addArg(feature);
@@ -307,6 +386,46 @@ pub fn wasmtimeRun(b: *std.Build, opts: WasmtimeRun) *std.Build.Step {
     cmd.addFileArg(opts.wasm);
     for (opts.args) |arg| cmd.addArg(arg);
     if (b.args) |forwarded| cmd.addArgs(forwarded);
+
+    const step = b.step(opts.step_name, opts.description);
+    step.dependOn(&cmd.step);
+    return step;
+}
+
+pub const WasmtimeServe = struct {
+    /// Component to serve.
+    wasm: std.Build.LazyPath,
+    /// Named step to create (e.g. `zig build serve`).
+    step_name: []const u8 = "serve",
+    /// Step description shown in `zig build --help`.
+    description: []const u8 = "Serve the component with wasmtime",
+    /// `-W <feature>` Wasm / component-model features. Defaults to the full
+    /// WASI 0.3 (P3) async feature set wasmtime needs for a wasip3 component.
+    wasm_features: []const []const u8 = &.{
+        "component-model-async",
+        "component-model-async-stackful",
+        "component-model-more-async-builtins",
+        "component-model-error-context",
+    },
+    /// `-S <feature>` WASI features. Defaults to `p3,cli`.
+    wasi: []const []const u8 = &.{"p3,cli"},
+};
+
+/// Create a named step that serves the component with `wasmtime serve`.
+/// Args from `zig build <step> -- ...` (e.g. `--addr 127.0.0.1:8080`) are
+/// forwarded to wasmtime after the component path. Returns the step.
+pub fn wasmtimeServe(b: *std.Build, opts: WasmtimeServe) *std.Build.Step {
+    const cmd = b.addSystemCommand(&.{ wasmtimeBin(b), "serve" });
+    for (opts.wasm_features) |f| {
+        cmd.addArg("-W");
+        cmd.addArg(f);
+    }
+    for (opts.wasi) |f| {
+        cmd.addArg("-S");
+        cmd.addArg(f);
+    }
+    cmd.addFileArg(opts.wasm);
+    if (b.args) |extra| cmd.addArgs(extra);
 
     const step = b.step(opts.step_name, opts.description);
     step.dependOn(&cmd.step);

@@ -1,6 +1,6 @@
 .{
     .name = .wasip3,
-    .version = "0.2.6",
+    .version = "0.2.7",
     .fingerprint = 0xadd4251ada326c2a,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
