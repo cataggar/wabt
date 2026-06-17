@@ -91,7 +91,19 @@ cd petstore
 zig build                 # builds both components + composes -> zig-out/petstore.wasm
 zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
 zig build bindgen         # write the generated store bindings to zig-out/generated/
+zig build check           # analyze the guest modules (used by ZLS); no install
 ```
+
+### Editor / ZLS
+
+The guests are compiled by shelling out to `zig build-exe` (`wasip3.zigBuildWasm`),
+which the language server can't introspect, so `@import("wasi_http")` and the
+generated `store_consumer` / `store_provider` bindings would otherwise be
+unresolved. `build.zig` exposes a `check` step that declares the same module
+graph with `addExecutable` / `addImport`, and `.vscode/settings.json` points
+ZLS's build-on-save at it (`zig.zls.buildOnSaveStep = "check"`), so imports
+resolve and diagnostics surface in the editor. `wabt` must be on `PATH` (ZLS
+runs the build to materialize the generated bindings).
 
 In another terminal:
 

@@ -1,0 +1,9 @@
+{
+  // ZLS resolves @import(...) from the build graph's modules. The real guests
+  // are compiled by shelling out to `zig build-exe` (wasip3.zigBuildWasm),
+  // which ZLS can't introspect, so build.zig also exposes a `check` step with
+  // equivalent addExecutable/addImport modules. Point build-on-save at it so
+  // imports resolve and diagnostics surface without producing artifacts.
+  "zig.zls.enableBuildOnSave": true,
+  "zig.zls.buildOnSaveStep": "check"
+}
