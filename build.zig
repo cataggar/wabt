@@ -233,6 +233,14 @@ pub const ZigBuildWasm = struct {
     /// `__stack_pointer` (cataggar/wamr#843).
     no_llvm: bool = false,
     no_lld: bool = false,
+    /// Also register a parallel, real `addExecutable` mirroring this guest's
+    /// module graph onto a shared `check` step (created on demand). The actual
+    /// build shells out to `zig build-exe`, which ZLS can't introspect; the
+    /// `check` exe gives the language server the same `@import` graph so
+    /// editor completion / go-to-def / diagnostics work, transparently — a
+    /// consumer just points ZLS's build-on-save at the `check` step. Nothing
+    /// here is wired into `install`. Set false to opt out.
+    zls_check: bool = true,
 };
 
 /// Invoke `zig build-exe -target wasm32-freestanding -O ReleaseSmall
@@ -282,7 +290,50 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
     }
     const out = cmd.addPrefixedOutputFileArg("-femit-bin=", opts.output);
     cmd.setName(b.fmt("zig build-exe {s}", .{opts.output}));
+    if (opts.zls_check) registerZlsCheck(b, opts);
     return out;
+}
+
+/// The shared `check` step, created on first use. ZLS introspects all module
+/// graphs in the build regardless of which step they hang off, so any
+/// `zigBuildWasm` guest's `check` exe makes that guest's imports resolvable;
+/// pointing ZLS's build-on-save at `check` also surfaces diagnostics.
+fn checkStep(b: *std.Build) *std.Build.Step {
+    if (b.top_level_steps.get("check")) |tls| return &tls.step;
+    return b.step("check", "Analyze guest modules for ZLS (no install)");
+}
+
+/// Mirror a `zigBuildWasm` guest's module graph (`opts.source` + `opts.imports`)
+/// as a real `addExecutable` + `createModule` / `addImport` so ZLS can resolve
+/// the guest's `@import`s. The `zig build-exe` invocation the real build uses is
+/// opaque to ZLS; this rebuilds the same graph from the same data. `@import
+/// ("root")` (e.g. an export shell reaching its impl) resolves to the exe's root
+/// module automatically. Attached only to the `check` step — never to install.
+fn registerZlsCheck(b: *std.Build, opts: ZigBuildWasm) void {
+    const query = std.Target.Query.parse(.{ .arch_os_abi = opts.target_triple }) catch return;
+    const target = b.resolveTargetQuery(query);
+
+    const root = b.createModule(.{ .root_source_file = opts.source, .target = target });
+
+    var mods: std.StringArrayHashMapUnmanaged(*std.Build.Module) = .empty;
+    for (opts.imports) |imp| {
+        mods.put(b.allocator, imp.name, b.createModule(.{ .root_source_file = imp.path })) catch @panic("OOM");
+    }
+    // Wire each import's declared deps (other imports referenced by name).
+    for (opts.imports) |imp| {
+        const m = mods.get(imp.name).?;
+        for (imp.deps) |d| if (mods.get(d)) |dm| m.addImport(d, dm);
+    }
+    // Wire the root's direct imports.
+    for (opts.imports) |imp| {
+        if (imp.root_dep) root.addImport(imp.name, mods.get(imp.name).?);
+    }
+
+    const stem = opts.output[0 .. std.mem.indexOfScalar(u8, opts.output, '.') orelse opts.output.len];
+    const exe = b.addExecutable(.{ .name = b.fmt("{s}-check", .{stem}), .root_module = root });
+    exe.entry = .disabled;
+    exe.rdynamic = true;
+    checkStep(b).dependOn(&exe.step);
 }
 
 pub const WabtComponentNew = struct {
