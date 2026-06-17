@@ -61,37 +61,7 @@ pub fn build(b: *std.Build) void {
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     _ = wasip3.wasmtimeServe(b, .{ .wasm = component, .description = "Serve the composed petstore component with wasmtime (P3)" });
 
-    // `zig build check` — a no-install analysis target so ZLS can resolve the
-    // guests' imports. The real build compiles each guest by shelling out to
-    // `zig build-exe` (via `wasip3.zigBuildWasm`), which ZLS cannot introspect;
-    // these `addExecutable` + `addImport` modules mirror the same graph
-    // (`main.zig` → wasi_http + the generated `store_consumer`; `memory_store.zig`
-    // → the generated `store_provider`, whose shells reach the store via
-    // `@import("root")`) so the language server sees the modules. `entry =
-    // .disabled` + `rdynamic` match the freestanding guest link; nothing here is
-    // wired into `install`.
-    const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
-
-    const store_consumer_mod = b.createModule(.{ .root_source_file = store_consumer });
-    store_consumer_mod.addImport("abi", dep.module("abi"));
-    store_consumer_mod.addImport("canon", dep.module("canon"));
-    const web_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = wasm_target });
-    web_mod.addImport("wasi_http", dep.module("wasi_http"));
-    web_mod.addImport("store_consumer", store_consumer_mod);
-    const web_check = b.addExecutable(.{ .name = "web-check", .root_module = web_mod });
-    web_check.entry = .disabled;
-    web_check.rdynamic = true;
-
-    const store_provider_mod = b.createModule(.{ .root_source_file = store_provider });
-    store_provider_mod.addImport("canon", dep.module("canon"));
-    store_provider_mod.addImport("abi", dep.module("abi"));
-    const store_mod = b.createModule(.{ .root_source_file = b.path("src/memory_store.zig"), .target = wasm_target });
-    store_mod.addImport("store_provider", store_provider_mod);
-    const store_check = b.addExecutable(.{ .name = "store-check", .root_module = store_mod });
-    store_check.entry = .disabled;
-    store_check.rdynamic = true;
-
-    const check = b.step("check", "Analyze the guest modules for ZLS (no install)");
-    check.dependOn(&web_check.step);
-    check.dependOn(&store_check.step);
+    // `zig build check` is registered automatically by `wasip3.zigBuildWasm`
+    // for each guest above (it mirrors the guest's module graph as a real
+    // `addExecutable` so ZLS can resolve `@import`s). No wiring needed here.
 }
