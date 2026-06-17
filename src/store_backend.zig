@@ -103,12 +103,30 @@ fn ensureSeeded() void {
 
 // ── Canonical-ABI result encoding ───────────────────────────────────
 //
-// Memory layout of `option<pet>` / `option<toy>` (all fields 4-byte
-// aligned); `extern struct` reproduces it exactly so we can return a
-// pointer to it as the function's indirect result.
+// A result wider than one core value (`option<pet>` / `option<toy>`) is
+// returned through a pointer. `OptionRet(T)` is the reusable mechanism: a
+// static `extern struct { disc: u8, value: T }` reproduces the `option<T>`
+// layout (a 1-byte discriminant, then the payload at `align(T)`), and
+// `some`/`none` fill it and return its address. `T` is the canonical record
+// layout — written out explicitly below, since that is the per-field
+// marshalling this example exists to show.
 
-const RetPet = extern struct {
-    disc: u8, // option discriminant: 0 = none, 1 = some
+fn OptionRet(comptime T: type) type {
+    return struct {
+        var area: extern struct { disc: u8, value: T } = undefined;
+
+        fn some(value: T) i32 {
+            area = .{ .disc = 1, .value = value };
+            return @intCast(@intFromPtr(&area));
+        }
+        fn none() i32 {
+            area.disc = 0;
+            return @intCast(@intFromPtr(&area));
+        }
+    };
+}
+
+const PetRec = extern struct {
     id: u32,
     name_ptr: u32,
     name_len: u32,
@@ -118,24 +136,22 @@ const RetPet = extern struct {
     age: u32,
 };
 
-const RetToy = extern struct {
-    disc: u8,
+const ToyRec = extern struct {
     id: u32,
     pet_id: u32,
     name_ptr: u32,
     name_len: u32,
 };
 
-var ret_pet: RetPet = undefined;
-var ret_toy: RetToy = undefined;
+const PetOption = OptionRet(PetRec);
+const ToyOption = OptionRet(ToyRec);
 
 fn ptrTo(p: *const anyopaque) u32 {
     return @intCast(@intFromPtr(p));
 }
 
 fn writePet(p: *const StoredPet) i32 {
-    ret_pet = .{
-        .disc = 1,
+    return PetOption.some(.{
         .id = @intCast(p.id),
         .name_ptr = ptrTo(&p.name_buf),
         .name_len = p.name_len,
@@ -143,29 +159,24 @@ fn writePet(p: *const StoredPet) i32 {
         .tag_ptr = if (p.has_tag) ptrTo(&p.tag_buf) else 0,
         .tag_len = if (p.has_tag) p.tag_len else 0,
         .age = @intCast(p.age),
-    };
-    return @intCast(@intFromPtr(&ret_pet));
+    });
 }
 
 fn writeNoPet() i32 {
-    ret_pet.disc = 0;
-    return @intCast(@intFromPtr(&ret_pet));
+    return PetOption.none();
 }
 
 fn writeToy(t: *const StoredToy) i32 {
-    ret_toy = .{
-        .disc = 1,
+    return ToyOption.some(.{
         .id = @intCast(t.id),
         .pet_id = @intCast(t.pet_id),
         .name_ptr = ptrTo(&t.name_buf),
         .name_len = t.name_len,
-    };
-    return @intCast(@intFromPtr(&ret_toy));
+    });
 }
 
 fn writeNoToy() i32 {
-    ret_toy.disc = 0;
-    return @intCast(@intFromPtr(&ret_toy));
+    return ToyOption.none();
 }
 
 fn slice(ptr: i32, len: i32) []const u8 {
