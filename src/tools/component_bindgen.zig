@@ -442,19 +442,25 @@ const Gen = struct {
     /// Emit an async-lifted export: a core `export fn … () void` that lifts its
     /// params, calls the user impl, and delivers the result through the
     /// `[task-return]<iface>#<fn>` intrinsic (the canonical async-lift shape
-    /// `component new` wires for an `async func`). Results that flatten to more
-    /// than one core slot (the direct multi-slot task.return form) are a later
-    /// phase, as is calling *imported* async functions.
+    /// `component new` wires for an `async func`). The result is delivered as its
+    /// flattened core slots; results wider than 16 slots (the spilled,
+    /// memory-pointer task.return form) and calling *imported* async functions
+    /// are later phases.
     fn emitAsyncExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
-        if (rcount > 1) return error.UnsupportedWitType; // async aggregate result: later phase
+        if (rcount > 16) return error.UnsupportedWitType; // spilled task.return (memory): later
 
         // Per-export `[task-return]` helper (extern decls must be container-scope).
         const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
         self.task_counter += 1;
         self.print("const {s} = struct {{\n", .{tname});
         self.print("    extern \"[task-return]{s}#{s}\" fn @\"task-return\"(", .{ iface_id, name });
-        if (rcount == 1) self.print("d0: {s}", .{@tagName(try self.coreOfResult(func.result.?))});
+        if (func.result) |t| {
+            for ((try self.flatCores(t)), 0..) |c, i| {
+                if (i != 0) self.raw(", ");
+                self.print("d{d}: {s}", .{ i, @tagName(c) });
+            }
+        }
         self.raw(") void;\n};\n\n");
 
         self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
@@ -465,14 +471,27 @@ const Gen = struct {
         try self.emitLiftParams(func.params);
 
         const args = try self.implArgList(func.params);
+        const camel_name = try camel(self.ar, name);
         if (func.result == null) {
-            self.print("    Impl.{s}({s});\n", .{ try camel(self.ar, name), args });
+            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
             self.print("    {s}.@\"task-return\"();\n", .{tname});
-        } else {
+        } else if (rcount == 1) {
             self.print(
                 "    {s}.@\"task-return\"(canon.returnResult({s}, Impl.{s}({s}), &abi.alloc));\n",
-                .{ tname, try self.resultZig(func), try camel(self.ar, name), args },
+                .{ tname, try self.resultZig(func), camel_name, args },
             );
+        } else {
+            // multi-slot: flatten the result to its core slots and pass them.
+            self.print(
+                "    const __r = canon.lowerFlat({s}, Impl.{s}({s}), &abi.alloc);\n",
+                .{ try self.resultZig(func), camel_name, args },
+            );
+            self.print("    {s}.@\"task-return\"(", .{tname});
+            for (0..rcount) |i| {
+                if (i != 0) self.raw(", ");
+                self.print("__r[{d}]", .{i});
+            }
+            self.raw(");\n");
         }
         self.raw("}\n\n");
     }
@@ -1398,13 +1417,12 @@ test "generate: async export lift (task.return)" {
     try testing.expect(std.mem.indexOf(u8, out, "__task_1.@\"task-return\"(canon.returnResult(u32, Impl.double(__params.x), &abi.alloc));") != null);
 }
 
-test "generate: async aggregate result and async import are rejected (later phases)" {
+test "generate: async multi-slot result lifts via lowerFlat; async import rejected" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
 
-    // `async func() -> string` flattens to 2 slots (the direct multi-slot
-    // task.return form), which is a later phase.
+    // `async func() -> string` flattens to 2 slots → direct multi-slot task.return.
     const agg_items = [_]ast.InterfaceItem{
         .{ .func = .{ .name = "greet", .func = .{ .params = &.{}, .result = .string, .is_async = true } } },
     };
@@ -1423,7 +1441,13 @@ test "generate: async aggregate result and async import are rejected (later phas
 
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
-        try testing.expectError(error.UnsupportedWitType, g.generate(agg_exp, "host"));
+        try g.generate(agg_exp, "host");
+        const out = g.out.items;
+        // task.return carries the 2 flattened result slots; the result is lowered
+        // with canon.lowerFlat and passed positionally.
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"[task-return]test:a/api#greet\" fn @\"task-return\"(d0: i32, d1: i32) void;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const __r = canon.lowerFlat([]const u8, Impl.greet(), &abi.alloc);") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(__r[0], __r[1]);") != null);
     }
     {
         // Calling an imported async function (async lower) is a later phase.
