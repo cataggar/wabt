@@ -14,9 +14,12 @@
 //! user-supplied implementation imported via `--impl`), and encode the result
 //! (`canon.returnResult`).
 //!
-//! v1 supports primitives, `string`, `option<T>`, `list<T>`, and named
-//! `record`/`enum` types. `variant`/`flags`/`result`, resources, and async
-//! (`future`/`stream`) are rejected with a clear error for now.
+//! Supports primitives, `string`, `option<T>`, `list<T>`, named
+//! `record`/`enum`/`variant`/`flags`/`result`/`tuple` types, imported
+//! resources, async exports (`task.return`), and `future<T>`/`stream<T>` —
+//! primitive elements via `canon.Future`/`Stream`, complex (aggregate /
+//! resource-bearing) elements via `canon.FutureOf`/`StreamOf` bound to a
+//! function-reference intrinsic `[future]<iface>#<fn>#<idx>`.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -137,6 +140,10 @@ fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
 
 const Core = enum { i32, i64, f32, f64 };
 
+/// A generated nominal type for a complex (non-primitive-element) future/stream
+/// channel: its Zig name and the `canon.FutureOf(…)` / `canon.StreamOf(…)` RHS.
+const ChanDecl = struct { name: []const u8, rhs: []const u8 };
+
 const GenError = error{ OutOfMemory, UnsupportedWitType, UnknownInterface, UnknownType };
 
 const Gen = struct {
@@ -148,6 +155,12 @@ const Gen = struct {
     types: std.StringHashMapUnmanaged(ast.TypeDefKind) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
+    // Distinct complex (non-primitive-element) future/stream channels → the
+    // generated nominal type name. Key: "F:"/"S:" ++ element zig type.
+    chan_map: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // The nominal channel type decls to emit (name + RHS), in discovery order.
+    chan_decls: std.ArrayListUnmanaged(ChanDecl) = .empty,
+    chan_counter: usize = 0,
 
     fn raw(self: *Gen, s: []const u8) void {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
@@ -221,6 +234,11 @@ const Gen = struct {
             \\
         , .{world_name});
 
+        // Register complex (non-primitive-element) future/stream channels so
+        // their nominal types are shared across import wrappers and the user
+        // impl. Must run after `self.types` is fully indexed.
+        try self.registerChannels(uses.items);
+
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
             try self.emitTypeDef(ut.iface_id, .{ .name = ut.name, .kind = ut.kind });
@@ -236,6 +254,12 @@ const Gen = struct {
                 else => {},
             };
         }
+
+        // ── complex future/stream channel types (after their element types) ──
+        for (self.chan_decls.items) |d| {
+            self.print("const {s} = {s};\n", .{ d.name, d.rhs });
+        }
+        if (self.chan_decls.items.len != 0) self.raw("\n");
 
         var have_exports = false;
         for (uses.items) |u| {
@@ -334,8 +358,14 @@ const Gen = struct {
                 try b.appendSlice(self.ar, " })");
                 break :blk b.items;
             },
-            .future => |e| try std.fmt.allocPrint(self.ar, "canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
-            .stream => |e| try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .future => |e| if (try self.chanName(true, if (e) |p| p.* else null)) |nm|
+                nm
+            else
+                try std.fmt.allocPrint(self.ar, "canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .stream => |e| if (try self.chanName(false, if (e) |p| p.* else null)) |nm|
+                nm
+            else
+                try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
             .error_context => "canon.ErrorContextHandle",
             .own, .borrow => |r| try pascal(self.ar, r), // resource handle wrapper
             .name => |n| try pascal(self.ar, n),
@@ -716,6 +746,120 @@ const Gen = struct {
             }
         }
         return t;
+    }
+
+    // ── complex future/stream channels (function-reference intrinsics) ───
+    //
+    // A non-primitive future/stream element can't be named with the
+    // `[future]future<T>` / `[stream]stream<T>` intrinsic module (that spelling
+    // only covers primitive `T`). `component new` instead resolves the
+    // function-reference form `[future]<iface>#<fn>#<idx>` (and `[stream]…`),
+    // where `<idx>` is the 0-based position of the future/stream in `<fn>`'s
+    // signature, walked params-then-result, depth-first pre-order (mirroring
+    // `collectAsyncInSig` / `collectAsyncInValType` in component_new.zig). We
+    // pre-walk every imported function, bind each distinct structural channel to
+    // one such site, and emit a shared `canon.FutureOf` / `canon.StreamOf` type.
+
+    const AsyncOcc = struct { is_future: bool, element: ?ast.Type };
+
+    /// Append every stream/future reachable from a function signature (params
+    /// then result), depth-first in appearance order. An occurrence's position
+    /// in `out` is its async-idx.
+    fn collectAsyncSig(self: *Gen, func: ast.Func, out: *std.ArrayListUnmanaged(AsyncOcc)) GenError!void {
+        for (func.params) |p| try self.collectAsyncTy(p.type, out);
+        if (func.result) |r| try self.collectAsyncTy(r, out);
+    }
+
+    fn collectAsyncTy(self: *Gen, raw_ty: ast.Type, out: *std.ArrayListUnmanaged(AsyncOcc)) GenError!void {
+        switch (self.resolveAlias(raw_ty)) {
+            .future => |e| {
+                try out.append(self.ar, .{ .is_future = true, .element = if (e) |p| p.* else null });
+                if (e) |p| try self.collectAsyncTy(p.*, out);
+            },
+            .stream => |e| {
+                try out.append(self.ar, .{ .is_future = false, .element = if (e) |p| p.* else null });
+                if (e) |p| try self.collectAsyncTy(p.*, out);
+            },
+            .option => |e| try self.collectAsyncTy(e.*, out),
+            .list => |e| try self.collectAsyncTy(e.*, out),
+            .result => |r| {
+                if (r.ok) |t| try self.collectAsyncTy(t.*, out);
+                if (r.err) |t| try self.collectAsyncTy(t.*, out);
+            },
+            .tuple => |elems| for (elems) |e| try self.collectAsyncTy(e, out),
+            .name => |n| switch (self.types.get(n) orelse return) {
+                .record => |fields| for (fields) |f| try self.collectAsyncTy(f.type, out),
+                .variant => |cases| for (cases) |c| if (c.type) |t| try self.collectAsyncTy(t, out),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    /// True if a future/stream element is a primitive the `canon.Future` /
+    /// `canon.Stream` `[future]future<T>` spelling supports; a complex element
+    /// instead needs the function-reference intrinsic (`canon.FutureOf` /
+    /// `canon.StreamOf`).
+    fn isPrimitiveElement(self: *Gen, e: ?ast.Type) bool {
+        return switch (self.resolveAlias(e orelse return false)) {
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64 => true,
+            else => false,
+        };
+    }
+
+    /// Dedup key for a complex channel: family tag + element zig type.
+    fn chanKey(self: *Gen, is_future: bool, elem: ast.Type) GenError![]const u8 {
+        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ if (is_future) "F:" else "S:", try self.zigType(elem) });
+    }
+
+    /// The generated nominal type name for a complex channel, or null for a
+    /// primitive-element channel (which uses `canon.Future` / `canon.Stream`).
+    fn chanName(self: *Gen, is_future: bool, e: ?ast.Type) GenError!?[]const u8 {
+        const elem = e orelse return null;
+        if (self.isPrimitiveElement(e)) return null;
+        return self.chan_map.get(try self.chanKey(is_future, elem));
+    }
+
+    /// Pre-pass: register every distinct complex future/stream channel reachable
+    /// from the world's imported functions, binding each to a function-reference
+    /// intrinsic module. Each distinct structural channel is bound to one
+    /// canonical site (any valid site resolves to the same structure).
+    fn registerChannels(self: *Gen, uses: []const Use) GenError!void {
+        for (uses) |u| {
+            // Imports only for now: complex channels in the worlds we target are
+            // import-side; the export-side intrinsic form is a later refinement.
+            if (u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| try self.registerFuncChannels(u.id, fd.name, fd.func),
+                .type => |td| switch (td.kind) {
+                    .resource => |methods| for (methods) |m| {
+                        try self.registerFuncChannels(u.id, try self.resourceExternName(td.name, m), m.func);
+                    },
+                    else => {},
+                },
+                else => {},
+            };
+        }
+    }
+
+    fn registerFuncChannels(self: *Gen, iface_id: []const u8, fn_name: []const u8, func: ast.Func) GenError!void {
+        var occ = std.ArrayListUnmanaged(AsyncOcc).empty;
+        try self.collectAsyncSig(func, &occ);
+        for (occ.items, 0..) |o, idx| {
+            const elem = o.element orelse continue;
+            if (self.isPrimitiveElement(o.element)) continue;
+            const key = try self.chanKey(o.is_future, elem);
+            if (self.chan_map.contains(key)) continue;
+            const name = try std.fmt.allocPrint(self.ar, "__chan{d}", .{self.chan_counter});
+            self.chan_counter += 1;
+            const ctor: []const u8 = if (o.is_future) "FutureOf" else "StreamOf";
+            const family: []const u8 = if (o.is_future) "future" else "stream";
+            const rhs = try std.fmt.allocPrint(self.ar, "canon.{s}({s}, \"[{s}]{s}#{s}#{d}\")", .{
+                ctor, try self.zigType(elem), family, iface_id, fn_name, idx,
+            });
+            try self.chan_map.put(self.ar, key, name);
+            try self.chan_decls.append(self.ar, .{ .name = name, .rhs = rhs });
+        }
     }
 
     /// Lower each high-level param into the flat call arguments, emitting temp
@@ -1511,6 +1655,62 @@ test "generate: future / stream / tuple in signatures" {
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
     // free function returning tuple<u32, string>.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() canon.Tuple(.{ u32, []const u8 }) {") != null);
+}
+
+test "generate: complex future/stream channels (function-reference intrinsics)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface api {
+    //   resource conn {
+    //     open: static func(seed: future<u32>) -> future<result<u32, string>>;
+    //   }
+    //   sink: func(s: stream<list<u8>>) -> bool;
+    // }
+    // A primitive `future<u32>` param (async-idx 0) precedes the complex
+    // `future<result<u32, string>>` result (async-idx 1): the complex channel
+    // must bind to `#1`, exercising the appearance-order index walk. The
+    // primitive channel stays `canon.Future(u32)`.
+    const u8_ty: ast.Type = .u8;
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const future_u32 = ast.Type{ .future = &u32_ty };
+    const res_u32_str = ast.Type{ .result = .{ .ok = &u32_ty, .err = &str_ty } };
+    const cfut = ast.Type{ .future = &res_u32_str };
+    const list_u8 = ast.Type{ .list = &u8_ty };
+    const cstream = ast.Type{ .stream = &list_u8 };
+    const conn_methods = [_]ast.ResourceMethod{
+        .{ .kind = .static, .name = "open", .func = .{ .params = &.{.{ .name = "seed", .type = future_u32 }}, .result = cfut } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "conn", .kind = .{ .resource = &conn_methods } } },
+        .{ .func = .{ .name = "sink", .func = .{ .params = &.{.{ .name = "s", .type = cstream }}, .result = .bool } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "x", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // Complex channels are shared nominal types bound to a function-reference
+    // intrinsic `[future]<iface>#<fn>#<idx>` (`<fn>` is the canonical extern
+    // name: a static method is `[static]conn.open`). The complex future is
+    // async-idx 1 (the primitive `future<u32>` param took idx 0).
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = canon.FutureOf(canon.Result(u32, []const u8), \"[future]demo:x/api@0.1.0#[static]conn.open#1\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = canon.StreamOf([]const u8, \"[stream]demo:x/api@0.1.0#sink#0\");") != null);
+    // The static wrapper: primitive param stays `canon.Future(u32)`; the complex
+    // result is the shared nominal `__chan0`.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: canon.Future(u32)) __chan0 {") != null);
+    // The complex stream is a param typed as the shared nominal `__chan1`.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn sink(s: __chan1) bool {") != null);
 }
 
 test "generate: option<handle> / option<scalar> params" {
