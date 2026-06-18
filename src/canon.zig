@@ -60,6 +60,188 @@ fn DiscInt(comptime n: usize) type {
     return if (n <= 0x100) u8 else if (n <= 0x10000) u16 else u32;
 }
 
+// ── Variant / result (Zig `union(enum)`) helpers ────────────────────
+//
+// A WIT `variant` / `result<T, E>` lowers to a tagged union: a discriminant
+// (the case index) followed by the active case's payload. A Zig `union(enum)`
+// with `void` payloads for no-data cases models it exactly. The payload sits at
+// the discriminant's end, padded to the widest case alignment.
+
+/// Max canonical alignment among a union's case payloads (1 if all `void`).
+fn unionPayloadAlign(comptime T: type) usize {
+    var a: usize = 1;
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        if (f.type != void) a = @max(a, alignOf(f.type));
+    }
+    return a;
+}
+
+/// Max canonical size among a union's case payloads (0 if all `void`).
+fn unionPayloadSize(comptime T: type) usize {
+    var s: usize = 0;
+    inline for (@typeInfo(T).@"union".fields) |f| {
+        if (f.type != void) s = @max(s, sizeOf(f.type));
+    }
+    return s;
+}
+
+/// Byte offset of a union payload: past the discriminant, padded to the
+/// payload alignment.
+fn unionPayloadOffset(comptime T: type) usize {
+    const disc = @sizeOf(DiscInt(@typeInfo(T).@"union".fields.len));
+    return alignTo(disc, unionPayloadAlign(T));
+}
+
+/// The Zig type for a WIT `result<T, E>`: a tagged union the marshaller
+/// lowers/lifts as a 2-case variant. Pass `void` for an absent (`_`) arm.
+///
+/// Naming the type through this memoized constructor — rather than spelling an
+/// inline `union(enum) { … }` at each binding site — keeps it identical across
+/// modules, so a generated export shell and the user `impl` it calls agree on
+/// the type (two textually-identical inline unions are distinct nominal types).
+pub fn Result(comptime T: type, comptime E: type) type {
+    return union(enum) { ok: T, err: E };
+}
+
+/// The Zig type for a WIT `tuple<…>`: a tuple struct the marshaller lowers/lifts
+/// as a record (fields concatenated at their canonical alignment). Memoized so
+/// it is identical across modules. `Ts` is a tuple of element types, e.g.
+/// `canon.Tuple(.{ u32, []const u8 })`.
+pub fn Tuple(comptime Ts: anytype) type {
+    return std.meta.Tuple(&Ts);
+}
+
+/// The WIT spelling of a primitive type, for the `[stream]stream<…>` /
+/// `[future]future<…>` async-intrinsic module names. Non-primitive elements
+/// (resources, results, …) need the function-reference intrinsic form instead.
+fn witSpell(comptime T: type) []const u8 {
+    return switch (T) {
+        bool => "bool",
+        u8 => "u8",
+        u16 => "u16",
+        u32 => "u32",
+        u64 => "u64",
+        i8 => "s8",
+        i16 => "s16",
+        i32 => "s32",
+        i64 => "s64",
+        f32 => "f32",
+        f64 => "f64",
+        else => @compileError("canon: stream/future read/write needs a primitive element; got " ++ @typeName(T)),
+    };
+}
+
+/// The two ends of a freshly created `future`/`stream` of element `T`.
+fn EndsOf(comptime Chan: type) type {
+    return struct { readable: Chan, writable: Chan };
+}
+
+fn unpackChanEnds(comptime Chan: type, packed_ends: i64) EndsOf(Chan) {
+    const u: u64 = @bitCast(packed_ends);
+    return .{
+        .readable = .{ .handle = @bitCast(@as(u32, @truncate(u))) },
+        .writable = .{ .handle = @bitCast(@as(u32, @truncate(u >> 32))) },
+    };
+}
+
+/// The Zig type for a WIT `future<T>`: an async single-value channel. At the
+/// canonical ABI it is a single `i32` handle (the readable or writable end).
+/// For a primitive `T` the read/write/drop intrinsics are available; the
+/// element type is carried for those helpers.
+pub fn Future(comptime T: type) type {
+    return struct {
+        handle: i32,
+        pub const Element = T;
+        const Self = @This();
+        const mod = "[future]future<" ++ witSpell(T) ++ ">";
+
+        /// Create a new `future<T>`, returning both ends.
+        pub fn new() EndsOf(Self) {
+            const f = @extern(*const fn () callconv(.c) i64, .{ .name = "new", .library_name = mod });
+            return unpackChanEnds(Self, f());
+        }
+        /// Read the value into `out`; returns the raw canonical status.
+        pub fn read(self: Self, out: *T) i32 {
+            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(out)));
+        }
+        /// Write `value` (kept alive by the caller until the op completes).
+        pub fn write(self: Self, value: *const T) i32 {
+            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(value)));
+        }
+        pub fn dropReadable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
+            f(self.handle);
+        }
+        pub fn dropWritable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-writable", .library_name = mod });
+            f(self.handle);
+        }
+    };
+}
+
+/// The Zig type for a WIT `stream<T>`: an async multi-value channel. Like
+/// `Future`, a single `i32` handle at the canonical ABI; read/write/drop
+/// intrinsics are available for a primitive `T`.
+pub fn Stream(comptime T: type) type {
+    return struct {
+        handle: i32,
+        pub const Element = T;
+        const Self = @This();
+        const mod = "[stream]stream<" ++ witSpell(T) ++ ">";
+
+        /// Create a new `stream<T>`, returning both ends.
+        pub fn new() EndsOf(Self) {
+            const f = @extern(*const fn () callconv(.c) i64, .{ .name = "new", .library_name = mod });
+            return unpackChanEnds(Self, f());
+        }
+        /// Read up to `buf.len` elements; returns the raw canonical status.
+        pub fn read(self: Self, buf: []T) i32 {
+            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len));
+        }
+        /// Write `items`; returns the raw canonical status.
+        pub fn write(self: Self, items: []const T) i32 {
+            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(items.ptr)), @intCast(items.len));
+        }
+        pub fn dropReadable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
+            f(self.handle);
+        }
+        pub fn dropWritable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-writable", .library_name = mod });
+            f(self.handle);
+        }
+    };
+}
+
+/// The Zig type for a WIT `error-context`: an opaque async error value, a single
+/// `i32` handle at the canonical ABI.
+pub const ErrorContextHandle = struct { handle: i32 };
+
+// ── Flags (Zig `packed struct`) ─────────────────────────────────────
+//
+// A WIT `flags` lowers to a bitset: one bit per label, packed LSB-first into an
+// integer of 1/2/4 bytes (≤8/≤16/≤32 labels). A Zig `packed struct(uN)` of
+// `bool` fields (in label order) has exactly that representation, so the
+// marshaller treats any packed struct as its backing integer.
+
+fn PackedInt(comptime T: type) type {
+    return @typeInfo(T).@"struct".backing_integer.?;
+}
+
+/// Widen a flags value to its flat i32 core slot.
+fn packedToCore(comptime T: type, value: T) i32 {
+    return @bitCast(@as(u32, @as(PackedInt(T), @bitCast(value))));
+}
+
+/// Rebuild a flags value from its flat i32 core slot.
+fn packedFromCore(comptime T: type, core: anytype) T {
+    return @bitCast(@as(PackedInt(T), @truncate(@as(u32, @bitCast(@as(i32, core))))));
+}
+
 // ── Layout ──────────────────────────────────────────────────────────
 
 /// Canonical alignment of `T`, in bytes.
@@ -71,11 +253,12 @@ pub fn alignOf(comptime T: type) usize {
         .@"enum" => |e| @sizeOf(DiscInt(e.fields.len)),
         .optional => |o| @max(@as(usize, 1), alignOf(o.child)),
         .pointer => |p| if (p.size == .slice) @alignOf(usize) else unsupported(T),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") @alignOf(T) else blk: {
             var a: usize = 1;
             inline for (s.fields) |f| a = @max(a, alignOf(f.type));
             break :blk a;
         },
+        .@"union" => |u| @max(@as(usize, @sizeOf(DiscInt(u.fields.len))), unionPayloadAlign(T)),
         else => unsupported(T),
     };
 }
@@ -92,13 +275,14 @@ pub fn sizeOf(comptime T: type) usize {
             break :blk alignTo(alignTo(1, pa) + sizeOf(o.child), @max(@as(usize, 1), pa));
         },
         .pointer => |p| if (p.size == .slice) 2 * @sizeOf(usize) else unsupported(T),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") @sizeOf(T) else blk: {
             var off: usize = 0;
             inline for (s.fields) |f| {
                 off = alignTo(off, alignOf(f.type)) + sizeOf(f.type);
             }
             break :blk alignTo(off, alignOf(T));
         },
+        .@"union" => alignTo(unionPayloadOffset(T) + unionPayloadSize(T), alignOf(T)),
         else => unsupported(T),
     };
 }
@@ -147,8 +331,22 @@ pub fn lower(comptime T: type, value: T, base: [*]u8, ra: Realloc) void {
             base[0] = 0;
         },
         .pointer => |p| lowerSlice(p.child, value, base, ra),
-        .@"struct" => |s| inline for (s.fields, 0..) |f, i| {
+        .@"struct" => |s| if (s.layout == .@"packed") {
+            store(PackedInt(T), base, @bitCast(value));
+        } else inline for (s.fields, 0..) |f, i| {
             lower(f.type, @field(value, f.name), base + fieldOffset(T, i), ra);
+        },
+        .@"union" => |u| {
+            const Tag = u.tag_type.?;
+            const tag = std.meta.activeTag(value);
+            store(DiscInt(u.fields.len), base, @intCast(@intFromEnum(tag)));
+            inline for (u.fields) |f| {
+                if (comptime f.type != void) {
+                    if (tag == @field(Tag, f.name)) {
+                        lower(f.type, @field(value, f.name), base + unionPayloadOffset(T), ra);
+                    }
+                }
+            }
         },
         else => unsupported(T),
     }
@@ -189,12 +387,27 @@ pub fn lift(comptime T: type, base: [*]const u8) T {
         .@"enum" => |e| @enumFromInt(load(DiscInt(e.fields.len), base)),
         .optional => |o| if (base[0] == 0) null else lift(o.child, base + payloadOffset(T)),
         .pointer => |p| liftSlice(p.child, base),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed")
+            @as(T, @bitCast(load(PackedInt(T), base)))
+        else blk: {
             var result: T = undefined;
             inline for (s.fields, 0..) |f, i| {
                 @field(result, f.name) = lift(f.type, base + fieldOffset(T, i));
             }
             break :blk result;
+        },
+        .@"union" => |u| blk: {
+            const Tag = u.tag_type.?;
+            const disc = load(DiscInt(u.fields.len), base);
+            inline for (u.fields) |f| {
+                if (disc == @intFromEnum(@field(Tag, f.name))) {
+                    break :blk if (f.type == void)
+                        @unionInit(T, f.name, {})
+                    else
+                        @unionInit(T, f.name, lift(f.type, base + unionPayloadOffset(T)));
+                }
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -249,10 +462,21 @@ pub fn flatCount(comptime T: type) usize {
         .bool, .int, .float, .@"enum" => 1,
         .pointer => 2, // (ptr, len)
         .optional => |o| 1 + flatCount(o.child), // discriminant + payload
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed")
+            (@bitSizeOf(PackedInt(T)) + 31) / 32
+        else blk: {
             var c: usize = 0;
             inline for (s.fields) |f| c += flatCount(f.type);
             break :blk c;
+        },
+        .@"union" => |u| blk: {
+            // discriminant + the widest case's flattened payload (the canonical
+            // ABI joins case payloads element-wise; the count is the max).
+            var m: usize = 0;
+            inline for (u.fields) |f| {
+                if (f.type != void) m = @max(m, flatCount(f.type));
+            }
+            break :blk 1 + m;
         },
         else => unsupported(T),
     };
@@ -264,7 +488,8 @@ fn CoreScalar(comptime T: type) type {
         .bool, .@"enum" => i32,
         .int => |i| if (i.bits <= 32) i32 else i64,
         .float => |f| if (f.bits == 32) f32 else f64,
-        .@"struct" => |s| CoreScalar(s.fields[0].type), // single-field record
+        .@"struct" => |s| if (s.layout == .@"packed") i32 else CoreScalar(s.fields[0].type), // packed=flags(i32), single-field record
+        .@"union" => i32, // 1-slot union = bare discriminant (all-void cases)
         else => unsupported(T),
     };
 }
@@ -300,7 +525,8 @@ fn toCore(comptime T: type, value: T) CoreScalar(T) {
         else
             @intCast(value),
         .float => value,
-        .@"struct" => |s| toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        .@"struct" => |s| if (s.layout == .@"packed") packedToCore(T, value) else toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        .@"union" => @intCast(@intFromEnum(std.meta.activeTag(value))),
         else => unsupported(T),
     };
 }
@@ -316,10 +542,17 @@ fn fromCore(comptime T: type, core: CoreScalar(T)) T {
         else
             @intCast(core),
         .float => core,
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, core) else blk: {
             var r: T = undefined;
             @field(r, s.fields[0].name) = fromCore(s.fields[0].type, core);
             break :blk r;
+        },
+        .@"union" => |u| blk: {
+            const Tag = u.tag_type.?;
+            inline for (u.fields) |f| {
+                if (core == @intFromEnum(@field(Tag, f.name))) break :blk @unionInit(T, f.name, {});
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -382,12 +615,27 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
             break :blk items[0..len];
         },
         .optional => |o| if (slots[start] == 0) null else flatLift(o.child, slots, start + 1),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, slots[start]) else blk: {
             var v: T = undefined;
             inline for (s.fields, 0..) |f, i| {
                 @field(v, f.name) = flatLift(f.type, slots, start + comptime flatFieldOffset(T, i));
             }
             break :blk v;
+        },
+        .@"union" => |u| blk: {
+            // discriminant at `start`; the active case's payload occupies the
+            // joined slots beginning at `start + 1` (matching-width cases only).
+            const Tag = u.tag_type.?;
+            const disc = slots[start];
+            inline for (u.fields) |f| {
+                if (disc == @intFromEnum(@field(Tag, f.name))) {
+                    break :blk if (f.type == void)
+                        @unionInit(T, f.name, {})
+                    else
+                        @unionInit(T, f.name, flatLift(f.type, slots, start + 1));
+                }
+            }
+            unreachable;
         },
         else => unsupported(T),
     };
@@ -397,6 +645,155 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
 /// `f64` slots — into the high-level `Params` struct.
 pub fn liftParams(comptime Params: type, slots: anytype) Params {
     return flatLift(Params, slots, 0);
+}
+
+// ── Lower to flat core slots (value → params/task.return slots) ──────
+//
+// The inverse of `liftParams`: flatten a value to the tuple of core slots a
+// call (or `task.return`) passes directly. `variant`/`result` join their case
+// payloads element-wise (a `void` case contributes nothing; unused slots are
+// zeroed), so this is the lowering half of aggregate params.
+
+fn joinCore(comptime a: type, comptime b: type) type {
+    if (a == b) return a;
+    if ((a == i32 and b == f32) or (a == f32 and b == i32)) return i32;
+    return i64;
+}
+
+/// The list of core slot types `T` flattens to (with the variant join).
+fn flatTypeList(comptime T: type) []const type {
+    return switch (@typeInfo(T)) {
+        .void => &[_]type{},
+        .bool, .@"enum" => &[_]type{i32},
+        .int => |i| &[_]type{if (i.bits <= 32) i32 else i64},
+        .float => |f| &[_]type{if (f.bits == 32) f32 else f64},
+        .pointer => &[_]type{ i32, i32 }, // (ptr, len)
+        .optional => |o| concatTypes(&[_]type{i32}, flatTypeList(o.child)),
+        .@"struct" => |s| if (s.layout == .@"packed")
+            &([_]type{i32} ** ((@bitSizeOf(PackedInt(T)) + 31) / 32))
+        else blk: {
+            comptime var list: []const type = &[_]type{};
+            inline for (s.fields) |f| list = concatTypes(list, flatTypeList(f.type));
+            break :blk list;
+        },
+        .@"union" => |u| blk: {
+            comptime var list: []const type = &[_]type{i32}; // discriminant
+            inline for (u.fields) |f| {
+                if (f.type != void) {
+                    const cl = flatTypeList(f.type);
+                    inline for (cl, 0..) |ct, i| {
+                        const idx = 1 + i;
+                        if (idx < list.len) {
+                            list = concatTypes(concatTypes(list[0..idx], &[_]type{joinCore(list[idx], ct)}), list[idx + 1 ..]);
+                        } else {
+                            list = concatTypes(list, &[_]type{ct});
+                        }
+                    }
+                }
+            }
+            break :blk list;
+        },
+        else => unsupported(T),
+    };
+}
+
+fn concatTypes(comptime a: []const type, comptime b: []const type) []const type {
+    return a ++ b;
+}
+
+/// The tuple type of `T`'s flattened core slots.
+pub fn FlatParams(comptime T: type) type {
+    return std.meta.Tuple(flatTypeList(T));
+}
+
+fn zeroOf(comptime S: type) S {
+    return 0;
+}
+
+/// Store `val` into slot `i`, coercing to the slot's (possibly wider) core type.
+fn setSlot(out: anytype, comptime i: usize, val: anytype) void {
+    const S = @TypeOf(out.*[i]);
+    const V = @TypeOf(val);
+    out.*[i] = if (S == V)
+        val
+    else switch (@typeInfo(S)) {
+        .int => switch (@typeInfo(V)) {
+            .int => @intCast(val),
+            else => @compileError("canon: cannot widen " ++ @typeName(V) ++ " into " ++ @typeName(S)),
+        },
+        .float => @floatCast(val),
+        else => @compileError("canon: bad slot type " ++ @typeName(S)),
+    };
+}
+
+fn zeroSlots(out: anytype, comptime start: usize, comptime n: usize) void {
+    comptime var i = start;
+    inline while (i < start + n) : (i += 1) out.*[i] = zeroOf(@TypeOf(out.*[i]));
+}
+
+fn fillFlat(comptime T: type, value: T, out: anytype, comptime start: usize, ra: Realloc) void {
+    switch (@typeInfo(T)) {
+        .void => {},
+        .bool => setSlot(out, start, @as(i32, @intFromBool(value))),
+        .@"enum" => setSlot(out, start, @as(i32, @intCast(@intFromEnum(value)))),
+        .int => setSlot(out, start, toCore(T, value)),
+        .float => setSlot(out, start, value),
+        .pointer => |p| {
+            const r = lowerSliceFlat(p.child, value, ra);
+            setSlot(out, start, r.ptr);
+            setSlot(out, start + 1, r.len);
+        },
+        .optional => |o| if (value) |v| {
+            setSlot(out, start, @as(i32, 1));
+            fillFlat(o.child, v, out, start + 1, ra);
+        } else {
+            setSlot(out, start, @as(i32, 0));
+            zeroSlots(out, start + 1, flatCount(o.child));
+        },
+        .@"struct" => |s| if (s.layout == .@"packed")
+            setSlot(out, start, packedToCore(T, value))
+        else {
+            comptime var idx = start;
+            inline for (s.fields) |f| {
+                fillFlat(f.type, @field(value, f.name), out, idx, ra);
+                idx += comptime flatCount(f.type);
+            }
+        },
+        .@"union" => |u| {
+            const Tag = u.tag_type.?;
+            setSlot(out, start, @as(i32, @intCast(@intFromEnum(std.meta.activeTag(value)))));
+            zeroSlots(out, start + 1, flatCount(T) - 1);
+            inline for (u.fields) |f| {
+                if (comptime f.type != void) {
+                    if (std.meta.activeTag(value) == @field(Tag, f.name)) {
+                        fillFlat(f.type, @field(value, f.name), out, start + 1, ra);
+                    }
+                }
+            }
+        },
+        else => unsupported(T),
+    }
+}
+
+fn lowerSliceFlat(comptime E: type, value: []const E, ra: Realloc) struct { ptr: i32, len: i32 } {
+    const n = value.len;
+    if (n == 0) return .{ .ptr = 0, .len = 0 };
+    const esize = sizeOf(E);
+    const buf = ra(n * esize, alignOf(E));
+    if (E == u8) {
+        @memcpy(buf[0..n], value);
+    } else {
+        for (value, 0..) |elem, i| lower(E, elem, buf + i * esize, ra);
+    }
+    return .{ .ptr = @intCast(@intFromPtr(buf)), .len = @intCast(n) };
+}
+
+/// Flatten `value` to the tuple of core slots a call passes directly. `ra`
+/// supplies `string`/`list` element storage.
+pub fn lowerFlat(comptime T: type, value: T, ra: Realloc) FlatParams(T) {
+    var out: FlatParams(T) = undefined;
+    fillFlat(T, value, &out, 0, ra);
+    return out;
 }
 
 // ── Tests (native; layout + lower/lift + result round-trips) ────────
@@ -493,6 +890,38 @@ test "round-trip: toy and scalars" {
     try testing.expectEqualStrings("Yarn Ball", t.name);
 }
 
+test "lowerFlat round-trips through liftParams" {
+    test_top = 0;
+    // record { a: u32, c: bool, d: u64 } — no pointer (host-safe; strings are
+    // validated end-to-end on wasm32 where pointers fit an i32 slot).
+    const R = struct { a: u32, c: bool, d: u64 };
+    const rg = liftParams(R, lowerFlat(R, .{ .a = 5, .c = true, .d = 0x1_0000_0000 }, &testAlloc));
+    try testing.expectEqual(@as(u32, 5), rg.a);
+    try testing.expectEqual(true, rg.c);
+    try testing.expectEqual(@as(u64, 0x1_0000_0000), rg.d);
+
+    // option<u32>
+    try testing.expectEqual(@as(?u32, 9), liftParams(?u32, lowerFlat(?u32, @as(?u32, 9), &testAlloc)));
+    try testing.expect(liftParams(?u32, lowerFlat(?u32, @as(?u32, null), &testAlloc)) == null);
+
+    // variant: void cases + a payload case (the discriminant + joined-payload form)
+    const M = union(enum) { get, post, val: u32 };
+    const mg = liftParams(M, lowerFlat(M, .{ .val = 42 }, &testAlloc));
+    try testing.expect(std.meta.activeTag(mg) == .val);
+    try testing.expectEqual(@as(u32, 42), mg.val);
+    try testing.expect(std.meta.activeTag(liftParams(M, lowerFlat(M, .post, &testAlloc))) == .post);
+
+    // tuple<u32, bool>
+    const Tup = Tuple(.{ u32, bool });
+    const tg = liftParams(Tup, lowerFlat(Tup, .{ 7, false }, &testAlloc));
+    try testing.expectEqual(@as(u32, 7), tg[0]);
+    try testing.expectEqual(false, tg[1]);
+
+    // FlatParams of a `method`/`other(string)` shape = disc + (ptr, len) = 3 slots.
+    const Method = union(enum) { get, other: []const u8 };
+    try testing.expectEqual(@as(usize, 3), @typeInfo(FlatParams(Method)).@"struct".fields.len);
+}
+
 test "result flattening decision and core types" {
     try testing.expect(resultIsFlat(u32));
     try testing.expect(resultIsFlat(bool));
@@ -534,4 +963,172 @@ test "liftParams places string/option/scalar at the right slots" {
     try testing.expectEqual(@as(usize, 0), got.name.len);
     try testing.expect(got.tag == null);
     try testing.expectEqual(@as(u32, 5), got.age);
+}
+
+// ── Variant / result (tagged union) ─────────────────────────────────
+
+const ResU32Str = union(enum) { ok: u32, err: []const u8 }; // result<u32, string>
+const Shape = union(enum) { circle: u32, square: Toy, point }; // 3-case variant
+const Outcome = union(enum) { pass, fail }; // result<_, _> — all-void → flat
+
+test "union: flatten counts and result classification" {
+    try testing.expectEqual(@as(usize, 3), flatCount(ResU32Str)); // disc + (ptr, len)
+    try testing.expectEqual(@as(usize, 1), flatCount(Outcome)); // disc only
+    try testing.expectEqual(@as(usize, 5), flatCount(Shape)); // disc + max(1, Toy=4, 0)
+    try testing.expect(resultIsFlat(Outcome));
+    try testing.expect(!resultIsFlat(ResU32Str));
+    try testing.expectEqual(i32, CoreReturn(Outcome)); // bare discriminant
+    try testing.expectEqual(i32, CoreReturn(ResU32Str)); // pointer to spilled result
+}
+
+test "union: flat all-void result encode/decode round-trip" {
+    // Flat results don't touch memory, so this runs on any host.
+    try testing.expect(std.meta.activeTag(liftResultFlat(Outcome, returnResult(Outcome, .pass, &testAlloc))) == .pass);
+    try testing.expect(std.meta.activeTag(liftResultFlat(Outcome, returnResult(Outcome, .fail, &testAlloc))) == .fail);
+}
+
+test "union: memory lower/lift round-trip result<u32, string>" {
+    test_top = 0;
+    var buf: [sizeOf(ResU32Str)]u8 align(8) = undefined;
+    lower(ResU32Str, .{ .ok = 7 }, &buf, &testAlloc);
+    switch (lift(ResU32Str, &buf)) {
+        .ok => |v| try testing.expectEqual(@as(u32, 7), v),
+        .err => return error.TestUnexpectedResult,
+    }
+    lower(ResU32Str, .{ .err = "nope" }, &buf, &testAlloc);
+    switch (lift(ResU32Str, &buf)) {
+        .err => |e| try testing.expectEqualStrings("nope", e),
+        .ok => return error.TestUnexpectedResult,
+    }
+}
+
+test "union: memory round-trip 3-case variant (record + no-payload cases)" {
+    test_top = 0;
+    var buf: [sizeOf(Shape)]u8 align(8) = undefined;
+    lower(Shape, .{ .square = .{ .id = 1, .pet_id = 2, .name = "yo" } }, &buf, &testAlloc);
+    switch (lift(Shape, &buf)) {
+        .square => |t| {
+            try testing.expectEqual(@as(u32, 1), t.id);
+            try testing.expectEqual(@as(u32, 2), t.pet_id);
+            try testing.expectEqualStrings("yo", t.name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    lower(Shape, .{ .circle = 9 }, &buf, &testAlloc);
+    switch (lift(Shape, &buf)) {
+        .circle => |r| try testing.expectEqual(@as(u32, 9), r),
+        else => return error.TestUnexpectedResult,
+    }
+    lower(Shape, .point, &buf, &testAlloc);
+    try testing.expect(std.meta.activeTag(lift(Shape, &buf)) == .point);
+}
+
+test "union: flatLift reconstructs a variant param" {
+    const R = union(enum) { ok: u32, err: u32 }; // result<u32, u32>
+    const a = liftParams(R, .{ @as(i32, 1), @as(i32, @bitCast(@as(u32, 99))) });
+    try testing.expect(std.meta.activeTag(a) == .err);
+    try testing.expectEqual(@as(u32, 99), a.err);
+    const b = liftParams(R, .{ @as(i32, 0), @as(i32, @bitCast(@as(u32, 7))) });
+    try testing.expect(std.meta.activeTag(b) == .ok);
+    try testing.expectEqual(@as(u32, 7), b.ok);
+}
+
+test "union canonical wasm32 layout" {
+    if (@sizeOf(usize) != 4) return error.SkipZigTest;
+    // result<u32, string>: u8 disc padded to 4, payload max(4, 8)=8 → size 12.
+    try testing.expectEqual(@as(usize, 4), alignOf(ResU32Str));
+    try testing.expectEqual(@as(usize, 12), sizeOf(ResU32Str));
+    try testing.expectEqual(@as(usize, 4), unionPayloadOffset(ResU32Str));
+    // all-void 2-case variant: the bare discriminant byte.
+    try testing.expectEqual(@as(usize, 1), alignOf(Outcome));
+    try testing.expectEqual(@as(usize, 1), sizeOf(Outcome));
+}
+
+test "Result constructor is memoized and round-trips" {
+    // Same args → identical type (so generated shells and user impls agree).
+    try testing.expect(Result(u32, []const u8) == Result(u32, []const u8));
+    const R = Result(u32, []const u8);
+    test_top = 0;
+    var buf: [sizeOf(R)]u8 align(8) = undefined;
+    lower(R, .{ .ok = 5 }, &buf, &testAlloc);
+    switch (lift(R, &buf)) {
+        .ok => |v| try testing.expectEqual(@as(u32, 5), v),
+        .err => return error.TestUnexpectedResult,
+    }
+    // result<_, _> flattens to a flat discriminant.
+    try testing.expect(resultIsFlat(Result(void, void)));
+}
+
+test "Tuple / Future / Stream constructors marshal correctly" {
+    // Future/Stream are i32 handles (single-field records).
+    try testing.expectEqual(@as(usize, 1), flatCount(Future(u32)));
+    try testing.expectEqual(@as(usize, 1), flatCount(Stream(u8)));
+    try testing.expectEqual(i32, CoreReturn(Future(u32)));
+    try testing.expect(Future(u32) == Future(u32)); // memoized
+    const f = liftResultFlat(Future(u32), returnResult(Future(u32), .{ .handle = 7 }, &testAlloc));
+    try testing.expectEqual(@as(i32, 7), f.handle);
+
+    // tuple<u32, string> = 1 + (ptr,len) = 3 flat slots; round-trips via memory.
+    const T = Tuple(.{ u32, []const u8 });
+    try testing.expectEqual(@as(usize, 3), flatCount(T));
+    test_top = 0;
+    var buf: [sizeOf(T)]u8 align(8) = undefined;
+    lower(T, .{ 9, "hi" }, &buf, &testAlloc);
+    const got = lift(T, &buf);
+    try testing.expectEqual(@as(u32, 9), got[0]);
+    try testing.expectEqualStrings("hi", got[1]);
+}
+
+test "Stream/Future intrinsic wrappers type-check for primitive elements" {
+    // The read/write/drop/new methods declare `@extern` intrinsics whose module
+    // is `[stream]stream<u8>` / `[future]future<u32>`; they can't be called
+    // natively, but must type-check (analyzing them evaluates the module name).
+    const S = Stream(u8);
+    _ = @TypeOf(S.new);
+    _ = @TypeOf(S.read);
+    _ = @TypeOf(S.write);
+    _ = @TypeOf(S.dropReadable);
+    const F = Future(u32);
+    _ = @TypeOf(F.new);
+    _ = @TypeOf(F.read);
+    _ = @TypeOf(F.write);
+    // Adding methods doesn't change the handle marshalling.
+    try testing.expectEqual(@as(usize, 1), flatCount(S));
+    try testing.expectEqual(@as(usize, 1), flatCount(F));
+}
+
+// ── Flags (packed struct) ───────────────────────────────────────────
+
+const Perms = packed struct(u8) { read: bool = false, write: bool = false, exec: bool = false, _pad: u5 = 0 };
+const Big = packed struct(u32) { f0: bool = false, rest: u31 = 0 };
+
+test "flags: packed-struct layout, flat counts, round-trips" {
+    try testing.expectEqual(@as(usize, 1), sizeOf(Perms));
+    try testing.expectEqual(@as(usize, 1), alignOf(Perms));
+    try testing.expectEqual(@as(usize, 1), flatCount(Perms)); // ≤32 labels → 1 i32
+    try testing.expectEqual(i32, CoreReturn(Perms));
+
+    // Flat result encode/decode (no memory).
+    const v = Perms{ .read = true, .exec = true };
+    const got = liftResultFlat(Perms, returnResult(Perms, v, &testAlloc));
+    try testing.expect(got.read and got.exec and !got.write);
+
+    // flatLift (param): read=bit0, exec=bit2 → 0b101 = 5.
+    const p = liftParams(struct { f: Perms }, .{@as(i32, 5)});
+    try testing.expect(p.f.read and p.f.exec and !p.f.write);
+}
+
+test "flags: memory lower/lift round-trip (LSB-first)" {
+    test_top = 0;
+    var buf: [sizeOf(Perms)]u8 align(8) = undefined;
+    lower(Perms, .{ .write = true }, &buf, &testAlloc);
+    try testing.expectEqual(@as(u8, 0b010), buf[0]); // write = bit 1
+    const got = lift(Perms, &buf);
+    try testing.expect(got.write and !got.read and !got.exec);
+}
+
+test "flags: u32 backing flattens through i32 without overflow" {
+    const v: Big = @bitCast(@as(u32, 0x8000_0001)); // bit 31 + bit 0
+    const got = liftResultFlat(Big, returnResult(Big, v, &testAlloc));
+    try testing.expectEqual(@as(u32, 0x8000_0001), @as(u32, @bitCast(got)));
 }
