@@ -561,6 +561,155 @@ pub fn liftParams(comptime Params: type, slots: anytype) Params {
     return flatLift(Params, slots, 0);
 }
 
+// ── Lower to flat core slots (value → params/task.return slots) ──────
+//
+// The inverse of `liftParams`: flatten a value to the tuple of core slots a
+// call (or `task.return`) passes directly. `variant`/`result` join their case
+// payloads element-wise (a `void` case contributes nothing; unused slots are
+// zeroed), so this is the lowering half of aggregate params.
+
+fn joinCore(comptime a: type, comptime b: type) type {
+    if (a == b) return a;
+    if ((a == i32 and b == f32) or (a == f32 and b == i32)) return i32;
+    return i64;
+}
+
+/// The list of core slot types `T` flattens to (with the variant join).
+fn flatTypeList(comptime T: type) []const type {
+    return switch (@typeInfo(T)) {
+        .void => &[_]type{},
+        .bool, .@"enum" => &[_]type{i32},
+        .int => |i| &[_]type{if (i.bits <= 32) i32 else i64},
+        .float => |f| &[_]type{if (f.bits == 32) f32 else f64},
+        .pointer => &[_]type{ i32, i32 }, // (ptr, len)
+        .optional => |o| concatTypes(&[_]type{i32}, flatTypeList(o.child)),
+        .@"struct" => |s| if (s.layout == .@"packed")
+            &([_]type{i32} ** ((@bitSizeOf(PackedInt(T)) + 31) / 32))
+        else blk: {
+            comptime var list: []const type = &[_]type{};
+            inline for (s.fields) |f| list = concatTypes(list, flatTypeList(f.type));
+            break :blk list;
+        },
+        .@"union" => |u| blk: {
+            comptime var list: []const type = &[_]type{i32}; // discriminant
+            inline for (u.fields) |f| {
+                if (f.type != void) {
+                    const cl = flatTypeList(f.type);
+                    inline for (cl, 0..) |ct, i| {
+                        const idx = 1 + i;
+                        if (idx < list.len) {
+                            list = concatTypes(concatTypes(list[0..idx], &[_]type{joinCore(list[idx], ct)}), list[idx + 1 ..]);
+                        } else {
+                            list = concatTypes(list, &[_]type{ct});
+                        }
+                    }
+                }
+            }
+            break :blk list;
+        },
+        else => unsupported(T),
+    };
+}
+
+fn concatTypes(comptime a: []const type, comptime b: []const type) []const type {
+    return a ++ b;
+}
+
+/// The tuple type of `T`'s flattened core slots.
+pub fn FlatParams(comptime T: type) type {
+    return std.meta.Tuple(flatTypeList(T));
+}
+
+fn zeroOf(comptime S: type) S {
+    return 0;
+}
+
+/// Store `val` into slot `i`, coercing to the slot's (possibly wider) core type.
+fn setSlot(out: anytype, comptime i: usize, val: anytype) void {
+    const S = @TypeOf(out.*[i]);
+    const V = @TypeOf(val);
+    out.*[i] = if (S == V)
+        val
+    else switch (@typeInfo(S)) {
+        .int => switch (@typeInfo(V)) {
+            .int => @intCast(val),
+            else => @compileError("canon: cannot widen " ++ @typeName(V) ++ " into " ++ @typeName(S)),
+        },
+        .float => @floatCast(val),
+        else => @compileError("canon: bad slot type " ++ @typeName(S)),
+    };
+}
+
+fn zeroSlots(out: anytype, comptime start: usize, comptime n: usize) void {
+    comptime var i = start;
+    inline while (i < start + n) : (i += 1) out.*[i] = zeroOf(@TypeOf(out.*[i]));
+}
+
+fn fillFlat(comptime T: type, value: T, out: anytype, comptime start: usize, ra: Realloc) void {
+    switch (@typeInfo(T)) {
+        .void => {},
+        .bool => setSlot(out, start, @as(i32, @intFromBool(value))),
+        .@"enum" => setSlot(out, start, @as(i32, @intCast(@intFromEnum(value)))),
+        .int => setSlot(out, start, toCore(T, value)),
+        .float => setSlot(out, start, value),
+        .pointer => |p| {
+            const r = lowerSliceFlat(p.child, value, ra);
+            setSlot(out, start, r.ptr);
+            setSlot(out, start + 1, r.len);
+        },
+        .optional => |o| if (value) |v| {
+            setSlot(out, start, @as(i32, 1));
+            fillFlat(o.child, v, out, start + 1, ra);
+        } else {
+            setSlot(out, start, @as(i32, 0));
+            zeroSlots(out, start + 1, flatCount(o.child));
+        },
+        .@"struct" => |s| if (s.layout == .@"packed")
+            setSlot(out, start, packedToCore(T, value))
+        else {
+            comptime var idx = start;
+            inline for (s.fields) |f| {
+                fillFlat(f.type, @field(value, f.name), out, idx, ra);
+                idx += comptime flatCount(f.type);
+            }
+        },
+        .@"union" => |u| {
+            const Tag = u.tag_type.?;
+            setSlot(out, start, @as(i32, @intCast(@intFromEnum(std.meta.activeTag(value)))));
+            zeroSlots(out, start + 1, flatCount(T) - 1);
+            inline for (u.fields) |f| {
+                if (comptime f.type != void) {
+                    if (std.meta.activeTag(value) == @field(Tag, f.name)) {
+                        fillFlat(f.type, @field(value, f.name), out, start + 1, ra);
+                    }
+                }
+            }
+        },
+        else => unsupported(T),
+    }
+}
+
+fn lowerSliceFlat(comptime E: type, value: []const E, ra: Realloc) struct { ptr: i32, len: i32 } {
+    const n = value.len;
+    if (n == 0) return .{ .ptr = 0, .len = 0 };
+    const esize = sizeOf(E);
+    const buf = ra(n * esize, alignOf(E));
+    if (E == u8) {
+        @memcpy(buf[0..n], value);
+    } else {
+        for (value, 0..) |elem, i| lower(E, elem, buf + i * esize, ra);
+    }
+    return .{ .ptr = @intCast(@intFromPtr(buf)), .len = @intCast(n) };
+}
+
+/// Flatten `value` to the tuple of core slots a call passes directly. `ra`
+/// supplies `string`/`list` element storage.
+pub fn lowerFlat(comptime T: type, value: T, ra: Realloc) FlatParams(T) {
+    var out: FlatParams(T) = undefined;
+    fillFlat(T, value, &out, 0, ra);
+    return out;
+}
+
 // ── Tests (native; layout + lower/lift + result round-trips) ────────
 
 const testing = std.testing;
@@ -653,6 +802,38 @@ test "round-trip: toy and scalars" {
     try testing.expectEqual(@as(u32, 100), t.id);
     try testing.expectEqual(@as(u32, 1), t.pet_id);
     try testing.expectEqualStrings("Yarn Ball", t.name);
+}
+
+test "lowerFlat round-trips through liftParams" {
+    test_top = 0;
+    // record { a: u32, c: bool, d: u64 } — no pointer (host-safe; strings are
+    // validated end-to-end on wasm32 where pointers fit an i32 slot).
+    const R = struct { a: u32, c: bool, d: u64 };
+    const rg = liftParams(R, lowerFlat(R, .{ .a = 5, .c = true, .d = 0x1_0000_0000 }, &testAlloc));
+    try testing.expectEqual(@as(u32, 5), rg.a);
+    try testing.expectEqual(true, rg.c);
+    try testing.expectEqual(@as(u64, 0x1_0000_0000), rg.d);
+
+    // option<u32>
+    try testing.expectEqual(@as(?u32, 9), liftParams(?u32, lowerFlat(?u32, @as(?u32, 9), &testAlloc)));
+    try testing.expect(liftParams(?u32, lowerFlat(?u32, @as(?u32, null), &testAlloc)) == null);
+
+    // variant: void cases + a payload case (the discriminant + joined-payload form)
+    const M = union(enum) { get, post, val: u32 };
+    const mg = liftParams(M, lowerFlat(M, .{ .val = 42 }, &testAlloc));
+    try testing.expect(std.meta.activeTag(mg) == .val);
+    try testing.expectEqual(@as(u32, 42), mg.val);
+    try testing.expect(std.meta.activeTag(liftParams(M, lowerFlat(M, .post, &testAlloc))) == .post);
+
+    // tuple<u32, bool>
+    const Tup = Tuple(.{ u32, bool });
+    const tg = liftParams(Tup, lowerFlat(Tup, .{ 7, false }, &testAlloc));
+    try testing.expectEqual(@as(u32, 7), tg[0]);
+    try testing.expectEqual(false, tg[1]);
+
+    // FlatParams of a `method`/`other(string)` shape = disc + (ptr, len) = 3 slots.
+    const Method = union(enum) { get, other: []const u8 };
+    try testing.expectEqual(@as(usize, 3), @typeInfo(FlatParams(Method)).@"struct".fields.len);
 }
 
 test "result flattening decision and core types" {
