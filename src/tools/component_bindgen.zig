@@ -489,20 +489,22 @@ const Gen = struct {
     /// Emit an async-lifted export: a core `export fn … () void` that lifts its
     /// params, calls the user impl, and delivers the result through the
     /// `[task-return]<iface>#<fn>` intrinsic (the canonical async-lift shape
-    /// `component new` wires for an `async func`). The result is delivered as its
-    /// flattened core slots; results wider than 16 slots (the spilled,
-    /// memory-pointer task.return form) and calling *imported* async functions
-    /// are later phases.
+    /// `component new` wires for an `async func`). A result of ≤16 flat slots is
+    /// delivered as those slots; a wider one spills to a single memory pointer
+    /// (`task.return` lifts with `MAX_FLAT_PARAMS` = 16). Calling *imported*
+    /// async functions is handled on the import side.
     fn emitAsyncExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
-        if (rcount > 16) return error.UnsupportedWitType; // spilled task.return (memory): later
+        const spilled = rcount > 16; // result wider than 16 flat slots → memory pointer
 
         // Per-export `[task-return]` helper (extern decls must be container-scope).
         const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
         self.task_counter += 1;
         self.print("const {s} = struct {{\n", .{tname});
         self.print("    extern \"[task-return]{s}#{s}\" fn @\"task-return\"(", .{ iface_id, name });
-        if (func.result) |t| {
+        if (spilled) {
+            self.raw("d0: i32"); // pointer to the lowered result in memory
+        } else if (func.result) |t| {
             for ((try self.flatCores(t)), 0..) |c, i| {
                 if (i != 0) self.raw(", ");
                 self.print("d{d}: {s}", .{ i, @tagName(c) });
@@ -522,6 +524,13 @@ const Gen = struct {
         if (func.result == null) {
             self.print("    Impl.{s}({s});\n", .{ camel_name, args });
             self.print("    {s}.@\"task-return\"();\n", .{tname});
+        } else if (spilled) {
+            // Lower the result into a fresh scratch buffer (canonical layout) and
+            // hand task.return the pointer.
+            const rz = try self.resultZig(func);
+            self.print("    const __ret = abi.alloc(canon.sizeOf({s}), canon.alignOf({s}));\n", .{ rz, rz });
+            self.print("    canon.lower({s}, Impl.{s}({s}), __ret, &abi.alloc);\n", .{ rz, camel_name, args });
+            self.print("    {s}.@\"task-return\"(@intCast(@intFromPtr(__ret)));\n", .{tname});
         } else if (rcount == 1) {
             self.print(
                 "    {s}.@\"task-return\"(canon.returnResult({s}, Impl.{s}({s}), &abi.alloc));\n",
@@ -1712,6 +1721,42 @@ test "generate: async import with param + result (async-lower extern)" {
     try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"double\"(@bitCast(x), abi.retPtr());") != null);
     try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(u32, abi.retArea());") != null);
+}
+
+test "generate: async export with >16-slot result spills task.return to a pointer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // wide: async func() -> tuple<u32 x17>;  17 flat slots > MAX_FLAT_PARAMS (16),
+    // so task.return takes a single memory pointer to the lowered result.
+    const u32_ty: ast.Type = .u32;
+    const wide_result = ast.Type{ .tuple = &.{
+        u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty,
+        u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty,
+    } };
+    const items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "wide", .func = .{ .params = &.{}, .result = wide_result, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "w" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(exp_world, "host");
+    const out = g.out.items;
+    // The task.return intrinsic takes one i32 pointer (not 17 flat slots).
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"[task-return]test:w/api#wide\" fn @\"task-return\"(d0: i32) void;") != null);
+    // The result is lowered into a fresh scratch buffer and the pointer handed over.
+    try testing.expect(std.mem.indexOf(u8, out, "const __ret = abi.alloc(canon.sizeOf(") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "), __ret, &abi.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(@intCast(@intFromPtr(__ret)));") != null);
 }
 
 test "generate: future / stream / tuple in signatures" {
