@@ -253,10 +253,21 @@ const Gen = struct {
                 }
                 self.raw("};\n\n");
             },
+            .flags => |labels| {
+                // A bitset: one bool bit per label (LSB-first) in a backing
+                // integer sized to the canonical ABI (1/2/4 bytes for ≤8/≤16/≤32
+                // labels). >32 labels (multi-i32) is a later phase.
+                if (labels.len > 32) return error.UnsupportedWitType;
+                const bits: usize = if (labels.len <= 8) 8 else if (labels.len <= 16) 16 else 32;
+                self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try pascal(self.ar, td.name), bits });
+                for (labels) |l| self.print("    {s}: bool = false,\n", .{try snake(self.ar, l)});
+                if (bits > labels.len) self.print("    _padding: u{d} = 0,\n", .{bits - labels.len});
+                self.raw("};\n\n");
+            },
             .alias => |t| {
                 self.print("pub const {s} = {s};\n\n", .{ try pascal(self.ar, td.name), try self.zigType(t) });
             },
-            else => return error.UnsupportedWitType, // flags/resource: later phase
+            else => return error.UnsupportedWitType, // resource: later phase
         }
     }
 
@@ -316,6 +327,7 @@ const Gen = struct {
                         };
                         break :v 1 + m;
                     },
+                    .flags => |labels| (labels.len + 31) / 32, // i32 slots
                     .@"enum" => 1,
                     .alias => |t| try self.flatCount(t),
                     else => error.UnsupportedWitType,
@@ -578,6 +590,7 @@ const Gen = struct {
             .result => .i32,
             .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
                 .@"enum", .variant => .i32,
+                .flags => .i32, // ≤32 labels → a single i32 slot
                 .record => |fields| if (fields.len == 1)
                     try self.coreOfResult(fields[0].type)
                 else
@@ -882,6 +895,57 @@ test "generate: variant typedef + returns (payload-bearing + all-void)" {
         // all-void variant → flat i32 discriminant.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:v/api\" fn @\"state\"() i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(Flag2, imp.@\"state\"());") != null);
+    }
+}
+
+test "generate: flags typedef + flat return" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // flags perms { read, write, exec } ; get-perms: func() -> perms
+    const labels = [_][]const u8{ "read", "write", "exec" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "perms", .kind = .{ .flags = &labels } } },
+        .{ .func = .{ .name = "get-perms", .func = .{ .params = &.{}, .result = ast.Type{ .name = "perms" } } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "f" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = exp_world },
+            .{ .world = imp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        // 3 labels (≤8) → a u8-backed packed struct with padding to fill it.
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Perms = packed struct(u8) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    read: bool = false,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    exec: bool = false,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    _padding: u5 = 0,") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:f/api#get-perms\"() canon.CoreReturn(Perms)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(Perms, Impl.getPerms(), &abi.alloc)") != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(imp_world, "guest");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Perms = packed struct(u8) {") != null);
+        // ≤32 labels → flat i32.
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:f/api\" fn @\"get-perms\"() i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(Perms, imp.@\"get-perms\"());") != null);
     }
 }
 
