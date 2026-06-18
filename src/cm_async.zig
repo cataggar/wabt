@@ -180,3 +180,52 @@ pub const WaitableSet = struct {
         waitset.drop(self.handle);
     }
 };
+
+// ── subtask intrinsics (await an async-lowered import call) ─────────
+
+const subtask = struct {
+    /// `subtask.drop` — release a resolved subtask handle.
+    extern "[subtask]" fn drop(self: i32) void;
+};
+
+/// Canonical async `CallState` — the low 4 bits of an async-lowered call's
+/// packed status word, and the payload of a `[subtask]` waitable event.
+/// Mirrors the Component Model `CallState` enum.
+pub const CallState = enum(u32) {
+    starting = 0,
+    started = 1,
+    returned = 2,
+    start_cancelled = 3,
+    return_cancelled = 4,
+};
+
+/// `waitable-set.wait` event code for a subtask state change.
+const EVENT_SUBTASK: u32 = 1;
+
+/// Drive a just-issued async-lowered import call to completion.
+///
+/// `status` is the packed `i32` the async-lowered import returned:
+/// `state | (subtask << 4)` (see `CallState`). When the callee returned
+/// synchronously (`state == returned`) this is a no-op. Otherwise it registers
+/// the returned subtask with a fresh `waitable-set`, blocks until the subtask
+/// reaches `returned`, then drops it. On return the callee has written its
+/// results to the result pointer the caller passed to the async-lowered import,
+/// ready to `canon.lift`.
+pub fn awaitCall(status: i32) void {
+    const s: u32 = @bitCast(status);
+    if (s & 0xf == @intFromEnum(CallState.returned)) return;
+    const sub: i32 = @bitCast(s >> 4);
+
+    const set = WaitableSet.create();
+    set.add(sub);
+    while (true) {
+        const event = set.waitOne();
+        const w = abi.retWords();
+        // `waitable-set.wait` writes [waitable, payload]; the payload of a
+        // subtask event is its new CallState. Only this subtask is joined.
+        if (event == EVENT_SUBTASK and w[0] == s >> 4 and
+            w[1] == @intFromEnum(CallState.returned)) break;
+    }
+    set.drop();
+    subtask.drop(sub);
+}

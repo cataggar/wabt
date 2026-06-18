@@ -144,31 +144,53 @@ fn unpackChanEnds(comptime Chan: type, packed_ends: i64) EndsOf(Chan) {
     };
 }
 
-/// The Zig type for a WIT `future<T>`: an async single-value channel. At the
-/// canonical ABI it is a single `i32` handle (the readable or writable end).
-/// For a primitive `T` the read/write/drop intrinsics are available; the
-/// element type is carried for those helpers.
-pub fn Future(comptime T: type) type {
+/// A WIT `future<T>` whose async read/write/drop intrinsics resolve through the
+/// supplied module `mod` (the `@extern` `library_name`). `Future(T)` derives
+/// `mod` from `T`'s primitive WIT spelling; a complex (aggregate /
+/// resource-bearing) element can't be spelled that way, so the bindings
+/// generator supplies the function-reference form
+/// `[future]<iface>#<fn>#<idx>` here instead. At the canonical ABI the channel
+/// is a single `i32` handle (the readable or writable end).
+///
+/// `read`/`write` take a pointer to a value already in *canonical* memory
+/// layout. For a primitive `T` the Zig layout matches, so `&value` works; a
+/// complex element (e.g. `Result(…)`, a Zig `union(enum)` whose in-memory
+/// layout differs from the canonical ABI) must be staged via `lower`/`lift`
+/// into a `sizeOf(T)`-byte, `alignOf(T)`-aligned buffer that stays live until
+/// the op completes — use `readInto`/`writeFrom` (see `wasi_http.zig` for the
+/// blocked-status + wait pattern).
+pub fn FutureOf(comptime T: type, comptime mod: []const u8) type {
     return struct {
         handle: i32,
         pub const Element = T;
         const Self = @This();
-        const mod = "[future]future<" ++ witSpell(T) ++ ">";
 
         /// Create a new `future<T>`, returning both ends.
         pub fn new() EndsOf(Self) {
             const f = @extern(*const fn () callconv(.c) i64, .{ .name = "new", .library_name = mod });
             return unpackChanEnds(Self, f());
         }
-        /// Read the value into `out`; returns the raw canonical status.
+        /// Read the value into `out` (which must be in canonical layout and stay
+        /// live until the op completes); returns the raw canonical status.
         pub fn read(self: Self, out: *T) i32 {
-            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
-            return f(self.handle, @intCast(@intFromPtr(out)));
+            return self.readInto(@ptrCast(out));
         }
-        /// Write `value` (kept alive by the caller until the op completes).
+        /// Write `*value` (canonical layout, kept live by the caller until the
+        /// op completes); returns the raw canonical status.
         pub fn write(self: Self, value: *const T) i32 {
+            return self.writeFrom(@ptrCast(value));
+        }
+        /// Read into a raw canonical-layout buffer (for complex elements staged
+        /// via `lift`).
+        pub fn readInto(self: Self, base: [*]u8) i32 {
+            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(base)));
+        }
+        /// Write from a raw canonical-layout buffer (for complex elements staged
+        /// via `lower`).
+        pub fn writeFrom(self: Self, base: [*]const u8) i32 {
             const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
-            return f(self.handle, @intCast(@intFromPtr(value)));
+            return f(self.handle, @intCast(@intFromPtr(base)));
         }
         pub fn dropReadable(self: Self) void {
             const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
@@ -181,15 +203,23 @@ pub fn Future(comptime T: type) type {
     };
 }
 
-/// The Zig type for a WIT `stream<T>`: an async multi-value channel. Like
-/// `Future`, a single `i32` handle at the canonical ABI; read/write/drop
-/// intrinsics are available for a primitive `T`.
-pub fn Stream(comptime T: type) type {
+/// The Zig type for a WIT `future<T>` with a primitive element `T`. For a
+/// complex element the bindings generator uses `FutureOf` with the
+/// function-reference intrinsic module instead.
+pub fn Future(comptime T: type) type {
+    return FutureOf(T, "[future]future<" ++ witSpell(T) ++ ">");
+}
+
+/// A WIT `stream<T>` whose async intrinsics resolve through `mod` — the stream
+/// analogue of `FutureOf` (see it for the primitive-vs-complex element
+/// contract). `read`/`write` take a typed slice (correct for a primitive `T`);
+/// `readInto`/`writeFrom` take a raw canonical-layout buffer plus element
+/// `count` for complex elements.
+pub fn StreamOf(comptime T: type, comptime mod: []const u8) type {
     return struct {
         handle: i32,
         pub const Element = T;
         const Self = @This();
-        const mod = "[stream]stream<" ++ witSpell(T) ++ ">";
 
         /// Create a new `stream<T>`, returning both ends.
         pub fn new() EndsOf(Self) {
@@ -198,13 +228,21 @@ pub fn Stream(comptime T: type) type {
         }
         /// Read up to `buf.len` elements; returns the raw canonical status.
         pub fn read(self: Self, buf: []T) i32 {
-            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
-            return f(self.handle, @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len));
+            return self.readInto(@ptrCast(buf.ptr), buf.len);
         }
         /// Write `items`; returns the raw canonical status.
         pub fn write(self: Self, items: []const T) i32 {
+            return self.writeFrom(@ptrCast(items.ptr), items.len);
+        }
+        /// Read up to `count` elements into a raw canonical-layout buffer.
+        pub fn readInto(self: Self, base: [*]u8, count: usize) i32 {
+            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(base)), @intCast(count));
+        }
+        /// Write `count` elements from a raw canonical-layout buffer.
+        pub fn writeFrom(self: Self, base: [*]const u8, count: usize) i32 {
             const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
-            return f(self.handle, @intCast(@intFromPtr(items.ptr)), @intCast(items.len));
+            return f(self.handle, @intCast(@intFromPtr(base)), @intCast(count));
         }
         pub fn dropReadable(self: Self) void {
             const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
@@ -215,6 +253,13 @@ pub fn Stream(comptime T: type) type {
             f(self.handle);
         }
     };
+}
+
+/// The Zig type for a WIT `stream<T>` with a primitive element `T`. For a
+/// complex element the bindings generator uses `StreamOf` with the
+/// function-reference intrinsic module instead.
+pub fn Stream(comptime T: type) type {
+    return StreamOf(T, "[stream]stream<" ++ witSpell(T) ++ ">");
 }
 
 /// The Zig type for a WIT `error-context`: an opaque async error value, a single
@@ -1095,6 +1140,37 @@ test "Stream/Future intrinsic wrappers type-check for primitive elements" {
     // Adding methods doesn't change the handle marshalling.
     try testing.expectEqual(@as(usize, 1), flatCount(S));
     try testing.expectEqual(@as(usize, 1), flatCount(F));
+}
+
+test "FutureOf / StreamOf: parameterized module name, complex elements" {
+    // `Future(T)` / `Stream(T)` are the primitive-spelling specializations of
+    // `FutureOf` / `StreamOf`; they must be the *same* memoized nominal type
+    // (so generated shells and the user impl agree on the type).
+    try testing.expect(Future(u32) == FutureOf(u32, "[future]future<u32>"));
+    try testing.expect(Stream(u8) == StreamOf(u8, "[stream]stream<u8>"));
+
+    // A complex element (a `union(enum)` whose Zig layout != canonical ABI
+    // layout) is valid for `FutureOf` — its module is a function-reference, and
+    // marshalling is still a single i32 handle. `witSpell` is never reached.
+    const TrailersFut = FutureOf(Result(u32, void), "[future]wasi:http/types@0.3.0#[static]request.new#1");
+    try testing.expectEqual(@as(usize, 1), flatCount(TrailersFut));
+    try testing.expectEqual(i32, CoreReturn(TrailersFut));
+    // The raw `readInto`/`writeFrom` wrappers type-check for the complex element
+    // (the primitive-layout `read`/`write` would be wrong to *call* here, but a
+    // caller stages the element through `lower`/`lift` into a canonical buffer).
+    _ = @TypeOf(TrailersFut.new);
+    _ = @TypeOf(TrailersFut.readInto);
+    _ = @TypeOf(TrailersFut.writeFrom);
+    _ = @TypeOf(TrailersFut.dropReadable);
+    _ = @TypeOf(TrailersFut.dropWritable);
+    // The handle still lifts/lowers as a bare i32 across a Result/Tuple.
+    const f = liftResultFlat(TrailersFut, returnResult(TrailersFut, .{ .handle = 5 }, &testAlloc));
+    try testing.expectEqual(@as(i32, 5), f.handle);
+
+    const BodyStream = StreamOf(Result(u8, void), "[stream]wasi:http/types@0.3.0#[static]request.new#0");
+    try testing.expectEqual(@as(usize, 1), flatCount(BodyStream));
+    _ = @TypeOf(BodyStream.readInto);
+    _ = @TypeOf(BodyStream.writeFrom);
 }
 
 // ── Flags (packed struct) ───────────────────────────────────────────

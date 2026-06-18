@@ -441,6 +441,11 @@ pub const WabtComponentBindgen = struct {
     /// Output basename for the generated `.zig` source. Defaults to the world
     /// name in snake_case + `.zig` (e.g. `store-consumer` → `store_consumer.zig`).
     output: ?[]const u8 = null,
+    /// Async export func names to generate in manual-return form
+    /// (`--manual-return`): the export shell only dispatches to the impl, which
+    /// calls a generated `<fn>Return(result)` when ready and may keep running
+    /// afterward (e.g. to stream a `wasi:http` response body).
+    manual_returns: []const []const u8 = &.{},
 };
 
 /// The world name as a snake_case `.zig` basename (kebab `-` → `_`), e.g.
@@ -459,7 +464,9 @@ fn worldBasename(b: *std.Build, world: []const u8) []const u8 {
 pub fn wabtComponentBindgen(b: *std.Build, opts: WabtComponentBindgen) std.Build.LazyPath {
     const cmd = b.addSystemCommand(&.{ wabtBin(b), "component", "bindgen", "--wit" });
     addWitArg(b, cmd, opts.wit_dir orelse b.path("wit"));
-    cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl, "-o" });
+    cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl });
+    for (opts.manual_returns) |fn_name| cmd.addArgs(&.{ "--manual-return", fn_name });
+    cmd.addArg("-o");
     cmd.setName(b.fmt("wabt component bindgen {s}", .{opts.world}));
     return cmd.addOutputFileArg(opts.output orelse worldBasename(b, opts.world));
 }
