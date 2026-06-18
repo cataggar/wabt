@@ -161,6 +161,8 @@ const Gen = struct {
     // The nominal channel type decls to emit (name + RHS), in discovery order.
     chan_decls: std.ArrayListUnmanaged(ChanDecl) = .empty,
     chan_counter: usize = 0,
+    // True when the world imports an async func (the wrappers need `cm_async`).
+    needs_cm_async: bool = false,
 
     fn raw(self: *Gen, s: []const u8) void {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
@@ -231,8 +233,20 @@ const Gen = struct {
             \\const canon = @import("canon");
             \\const abi = @import("abi");
             \\
-            \\
         , .{world_name});
+        // A world that imports an async func drives the async-lowered call
+        // through `cm_async.awaitCall`.
+        for (uses.items) |u| {
+            if (u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| if (fd.func.is_async) {
+                    self.needs_cm_async = true;
+                },
+                else => {},
+            };
+        }
+        if (self.needs_cm_async) self.raw("const cm_async = @import(\"cm_async\");\n");
+        self.raw("\n");
 
         // Register complex (non-primitive-element) future/stream channels so
         // their nominal types are shared across import wrappers and the user
@@ -565,7 +579,7 @@ const Gen = struct {
     /// Emit the flattened `extern` import declaration (inside the `imp`
     /// namespace) for one imported function.
     fn emitImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
-        if (func.is_async) return error.UnsupportedWitType;
+        if (func.is_async) return self.emitAsyncImportExtern(iface_id, name, func);
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
         const indirect = rcount > 1;
 
@@ -582,10 +596,33 @@ const Gen = struct {
         }
     }
 
+    /// Sum of the flattened core slots of a func's params.
+    fn paramFlatCount(self: *Gen, params: []const ast.Param) GenError!usize {
+        var c: usize = 0;
+        for (params) |p| c += try self.flatCount(p.type);
+        return c;
+    }
+
+    /// Emit the `extern` decl for an imported **async** func. The canonical
+    /// async lowering produces `(flat params, result_ptr if any) -> i32 status`
+    /// (the packed callstatus); results are written to `result_ptr`. Params that
+    /// exceed `MAX_FLAT_ASYNC_PARAMS` (4) spill to a single pointer — a later
+    /// refinement, rejected for now.
+    fn emitAsyncImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
+        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, name });
+        try self.emitFlatParamDecls(func.params);
+        if (func.result != null) {
+            if (func.params.len > 0) self.raw(", ");
+            self.raw("result_ptr: i32");
+        }
+        self.raw(") i32;\n"); // packed callstatus
+    }
+
     /// Emit the typed wrapper that lowers params, calls the `imp.@"…"` extern,
     /// and lifts the result.
     fn emitImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
-        if (func.is_async) return error.UnsupportedWitType;
+        if (func.is_async) return self.emitAsyncImportWrapper(name, func);
         const result_zig = try self.resultZig(func);
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
         const indirect = rcount > 1;
@@ -611,6 +648,35 @@ const Gen = struct {
                 "        return canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n",
                 .{ result_zig, name, call_args },
             );
+        }
+        self.raw("    }\n");
+    }
+
+    /// Emit the typed wrapper for an imported **async** func: lower params, call
+    /// the async-lowered extern (returns the packed callstatus), drive it to
+    /// completion via `cm_async.awaitCall`, then lift the result the host wrote
+    /// to the result pointer. Always lifts from memory (async lowering writes
+    /// results indirectly, even for a single-slot result).
+    fn emitAsyncImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
+        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        const result_zig = try self.resultZig(func);
+
+        self.print("    pub fn {s}(", .{try camel(self.ar, name)});
+        try self.emitTypedParamDecls(func.params);
+        self.print(") {s} {{\n", .{result_zig});
+
+        const call_args = try self.lowerParams(func.params);
+        if (func.result != null) {
+            if (call_args.len > 0) {
+                self.print("        const __status = imp.@\"{s}\"({s}, abi.retPtr());\n", .{ name, call_args });
+            } else {
+                self.print("        const __status = imp.@\"{s}\"(abi.retPtr());\n", .{name});
+            }
+            self.raw("        cm_async.awaitCall(__status);\n");
+            self.print("        return canon.lift({s}, abi.retArea());\n", .{result_zig});
+        } else {
+            self.print("        const __status = imp.@\"{s}\"({s});\n", .{ name, call_args });
+            self.raw("        cm_async.awaitCall(__status);\n");
         }
         self.raw("    }\n");
     }
@@ -1570,7 +1636,7 @@ test "generate: async export lift (task.return)" {
     try testing.expect(std.mem.indexOf(u8, out, "__task_1.@\"task-return\"(canon.returnResult(u32, Impl.double(__params.x), &abi.alloc));") != null);
 }
 
-test "generate: async multi-slot result lifts via lowerFlat; async import rejected" {
+test "generate: async multi-slot result lifts via lowerFlat; async import via awaitCall" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -1603,10 +1669,49 @@ test "generate: async multi-slot result lifts via lowerFlat; async import reject
         try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(__r[0], __r[1]);") != null);
     }
     {
-        // Calling an imported async function (async lower) is a later phase.
+        // Importing an async func: the extern is async-lowered (params +
+        // result_ptr -> i32 status); the wrapper drives the subtask to
+        // completion via cm_async.awaitCall, then lifts the result from memory.
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
-        try testing.expectError(error.UnsupportedWitType, g.generate(agg_imp, "guest"));
+        try g.generate(agg_imp, "guest");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "const cm_async = @import(\"cm_async\");") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:a/api\" fn @\"greet\"(result_ptr: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"greet\"(abi.retPtr());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.lift([]const u8, abi.retArea());") != null);
     }
+}
+
+test "generate: async import with param + result (async-lower extern)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // double: async func(x: u32) -> u32;  imported.
+    const items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "double", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "math", .items = &items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "math" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "m" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // async-lower extern: the flat param `x` precedes the result pointer; the
+    // core result is the packed callstatus (i32), not the lifted u32.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:m/math\" fn @\"double\"(x: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn double(x: u32) u32 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"double\"(@bitCast(x), abi.retPtr());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(u32, abi.retArea());") != null);
 }
 
 test "generate: future / stream / tuple in signatures" {
