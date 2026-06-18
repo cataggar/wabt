@@ -146,6 +146,8 @@ const Gen = struct {
     out: std.ArrayListUnmanaged(u8) = .empty,
     // WIT type name → its kind, across all interfaces in the world.
     types: std.StringHashMapUnmanaged(ast.TypeDefKind) = .empty,
+    // Monotonic counter for naming per-export `[task-return]` helper structs.
+    task_counter: usize = 0,
 
     fn raw(self: *Gen, s: []const u8) void {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
@@ -360,7 +362,7 @@ const Gen = struct {
     }
 
     fn emitExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
-        if (func.is_async) return error.UnsupportedWitType;
+        if (func.is_async) return self.emitAsyncExportFunc(iface_id, name, func);
         const result_zig = try self.resultZig(func);
 
         self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
@@ -368,18 +370,7 @@ const Gen = struct {
         self.print(") canon.CoreReturn({s}) {{\n", .{result_zig});
         self.raw("    abi.resetScratch();\n");
 
-        // Lift params into a typed struct via canon. The local is named
-        // `__params` (not a WIT-spellable identifier) so it can't shadow a
-        // function parameter that happens to be named `a`/`p`/etc.
-        if (func.params.len > 0) {
-            self.raw("    const __params = canon.liftParams(struct {\n");
-            for (func.params) |p| {
-                self.print("        {s}: {s},\n", .{ try snake(self.ar, p.name), try self.zigType(p.type) });
-            }
-            self.raw("    }, .{ ");
-            try self.emitFlatSlotNames(func.params);
-            self.raw(" });\n");
-        }
+        try self.emitLiftParams(func.params);
 
         // Call the user impl + encode the result.
         const args = try self.implArgList(func.params);
@@ -390,6 +381,58 @@ const Gen = struct {
             self.print(
                 "    return canon.returnResult({s}, Impl.{s}({s}), &abi.alloc);\n",
                 .{ result_zig, try camel(self.ar, name), args },
+            );
+        }
+        self.raw("}\n\n");
+    }
+
+    /// Emit the `const __params = canon.liftParams(struct { … }, .{ … });` block
+    /// that decodes an export's flattened core params (named `__params` so it
+    /// can't shadow a parameter named `a`/`p`/etc.). No-op when there are none.
+    fn emitLiftParams(self: *Gen, params: []const ast.Param) GenError!void {
+        if (params.len == 0) return;
+        self.raw("    const __params = canon.liftParams(struct {\n");
+        for (params) |p| {
+            self.print("        {s}: {s},\n", .{ try snake(self.ar, p.name), try self.zigType(p.type) });
+        }
+        self.raw("    }, .{ ");
+        try self.emitFlatSlotNames(params);
+        self.raw(" });\n");
+    }
+
+    /// Emit an async-lifted export: a core `export fn … () void` that lifts its
+    /// params, calls the user impl, and delivers the result through the
+    /// `[task-return]<iface>#<fn>` intrinsic (the canonical async-lift shape
+    /// `component new` wires for an `async func`). Results that flatten to more
+    /// than one core slot (the direct multi-slot task.return form) are a later
+    /// phase, as is calling *imported* async functions.
+    fn emitAsyncExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
+        const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
+        if (rcount > 1) return error.UnsupportedWitType; // async aggregate result: later phase
+
+        // Per-export `[task-return]` helper (extern decls must be container-scope).
+        const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
+        self.task_counter += 1;
+        self.print("const {s} = struct {{\n", .{tname});
+        self.print("    extern \"[task-return]{s}#{s}\" fn @\"task-return\"(", .{ iface_id, name });
+        if (rcount == 1) self.print("d0: {s}", .{@tagName(try self.coreOfResult(func.result.?))});
+        self.raw(") void;\n};\n\n");
+
+        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+        try self.emitFlatParamDecls(func.params);
+        self.raw(") void {\n");
+        self.raw("    abi.resetScratch();\n");
+
+        try self.emitLiftParams(func.params);
+
+        const args = try self.implArgList(func.params);
+        if (func.result == null) {
+            self.print("    Impl.{s}({s});\n", .{ try camel(self.ar, name), args });
+            self.print("    {s}.@\"task-return\"();\n", .{tname});
+        } else {
+            self.print(
+                "    {s}.@\"task-return\"(canon.returnResult({s}, Impl.{s}({s}), &abi.alloc));\n",
+                .{ tname, try self.resultZig(func), try camel(self.ar, name), args },
             );
         }
         self.raw("}\n\n");
@@ -1154,6 +1197,73 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         // Exported (guest-implemented) resources are not supported yet.
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
+    }
+}
+
+test "generate: async export lift (task.return)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // run:    async func() -> result        (flat result → task-return(i32))
+    // double: async func(x: u32) -> u32      (param lift + flat result)
+    const res_void = ast.Type{ .result = .{ .ok = null, .err = null } };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "run", .func = .{ .params = &.{}, .result = res_void, .is_async = true } } },
+        .{ .func = .{ .name = "double", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "run", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "run" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "p", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(exp_world, "host");
+    const out = g.out.items;
+    // async export = core `() void` + a `[task-return]` intrinsic delivering the result.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"[task-return]local:p/run@0.1.0#run\" fn @\"task-return\"(d0: i32) void;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"local:p/run@0.1.0#run\"() void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(canon.returnResult(canon.Result(void, void), Impl.run(), &abi.alloc));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"local:p/run@0.1.0#double\"(x: i32) void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_1.@\"task-return\"(canon.returnResult(u32, Impl.double(__params.x), &abi.alloc));") != null);
+}
+
+test "generate: async aggregate result and async import are rejected (later phases)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // `async func() -> string` flattens to 2 slots (the direct multi-slot
+    // task.return form), which is a later phase.
+    const agg_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "greet", .func = .{ .params = &.{}, .result = .string, .is_async = true } } },
+    };
+    const agg_iface = ast.Interface{ .name = "api", .items = &agg_items };
+    const agg_exp = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const agg_imp = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "a" },
+        .items = &.{ .{ .interface = agg_iface }, .{ .world = agg_exp }, .{ .world = agg_imp } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try testing.expectError(error.UnsupportedWitType, g.generate(agg_exp, "host"));
+    }
+    {
+        // Calling an imported async function (async lower) is a later phase.
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try testing.expectError(error.UnsupportedWitType, g.generate(agg_imp, "guest"));
     }
 }
 
