@@ -39,6 +39,13 @@ pub const usage =
     \\                      defines more than one world)
     \\  --impl <module>     Import name for the user implementation of exported
     \\                      interfaces (default: "impl")
+    \\  --manual-return <fn>
+    \\                      Generate an async export `<fn>` in manual-return form:
+    \\                      the shell calls `Impl.<fn>(params)` (returning void)
+    \\                      and the bindings expose a `pub fn <fn>Return(result)`
+    \\                      the impl calls when ready. Lets the handler keep
+    \\                      running after `task.return` (e.g. to write a
+    \\                      `wasi:http` response body stream). Repeatable.
     \\  -o, --output <file> Output .zig file (default: stdout)
     \\
 ;
@@ -54,6 +61,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var world_arg: ?[]const u8 = null;
     var impl_arg: []const u8 = "impl";
     var output_file: ?[]const u8 = null;
+    var manual_returns = std.ArrayListUnmanaged([]const u8).empty;
+    defer manual_returns.deinit(alloc);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -67,6 +76,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--impl")) {
             i += 1;
             impl_arg = nextArg(sub_args, i, arg);
+        } else if (std.mem.eql(u8, arg, "--manual-return")) {
+            i += 1;
+            manual_returns.append(alloc, nextArg(sub_args, i, arg)) catch @panic("OOM");
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             output_file = nextArg(sub_args, i, arg);
@@ -100,7 +112,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg };
+    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg, .manual_returns = manual_returns.items };
     g.generate(world, world_name) catch |err| {
         std.debug.print("error: generating bindings for world '{s}': {s}\n", .{ world_name, @errorName(err) });
         std.process.exit(1);
@@ -150,6 +162,8 @@ const Gen = struct {
     ar: Allocator,
     resolver: wit.resolver.Resolver,
     impl: []const u8,
+    /// Async export func names to generate in manual-return form (`--manual-return`).
+    manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
     // WIT type name → its kind, across all interfaces in the world.
     types: std.StringHashMapUnmanaged(ast.TypeDefKind) = .empty,
@@ -500,6 +514,60 @@ const Gen = struct {
         // Per-export `[task-return]` helper (extern decls must be container-scope).
         const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
         self.task_counter += 1;
+        try self.emitTaskReturnExternDecl(tname, iface_id, name, func, spilled);
+
+        const camel_name = try camel(self.ar, name);
+        const args = try self.implArgList(func.params);
+
+        if (self.isManualReturn(name)) {
+            // Manual-return form: expose a `pub fn <fn>Return(result)` the impl
+            // calls when ready, and a shell that just dispatches to the impl
+            // (which keeps running after task.return — e.g. to write a response
+            // body stream).
+            if (func.result) |t| {
+                self.print("pub fn {s}Return(__result: {s}) void {{\n", .{ camel_name, try self.zigType(t) });
+            } else {
+                self.print("pub fn {s}Return() void {{\n", .{camel_name});
+            }
+            try self.emitTaskReturnDeliver(tname, func, spilled, "__result");
+            self.raw("}\n\n");
+
+            self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+            try self.emitFlatParamDecls(func.params);
+            self.raw(") void {\n");
+            self.raw("    abi.resetScratch();\n");
+            try self.emitLiftParams(func.params);
+            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+            self.raw("}\n\n");
+            return;
+        }
+
+        // Auto form: the shell calls the impl and delivers the result.
+        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+        try self.emitFlatParamDecls(func.params);
+        self.raw(") void {\n");
+        self.raw("    abi.resetScratch();\n");
+        try self.emitLiftParams(func.params);
+
+        if (func.result == null) {
+            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+            self.print("    {s}.@\"task-return\"();\n", .{tname});
+        } else {
+            const rexpr = try std.fmt.allocPrint(self.ar, "Impl.{s}({s})", .{ camel_name, args });
+            try self.emitTaskReturnDeliver(tname, func, spilled, rexpr);
+        }
+        self.raw("}\n\n");
+    }
+
+    fn isManualReturn(self: *Gen, name: []const u8) bool {
+        for (self.manual_returns) |m| if (std.mem.eql(u8, m, name)) return true;
+        return false;
+    }
+
+    /// Emit the container-scope `const <tname> = struct { extern "[task-return]…" … };`
+    /// helper. The intrinsic takes the result's flat slots, or one i32 pointer
+    /// when the result spills past 16 slots.
+    fn emitTaskReturnExternDecl(self: *Gen, tname: []const u8, iface_id: []const u8, name: []const u8, func: ast.Func, spilled: bool) GenError!void {
         self.print("const {s} = struct {{\n", .{tname});
         self.print("    extern \"[task-return]{s}#{s}\" fn @\"task-return\"(", .{ iface_id, name });
         if (spilled) {
@@ -511,37 +579,27 @@ const Gen = struct {
             }
         }
         self.raw(") void;\n};\n\n");
+    }
 
-        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
-        try self.emitFlatParamDecls(func.params);
-        self.raw(") void {\n");
-        self.raw("    abi.resetScratch();\n");
-
-        try self.emitLiftParams(func.params);
-
-        const args = try self.implArgList(func.params);
-        const camel_name = try camel(self.ar, name);
-        if (func.result == null) {
-            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+    /// Emit the `task.return` delivery (4-space indented) for the result value
+    /// expression `rexpr` (ignored when the func has no result).
+    fn emitTaskReturnDeliver(self: *Gen, tname: []const u8, func: ast.Func, spilled: bool, rexpr: []const u8) GenError!void {
+        const t = func.result orelse {
             self.print("    {s}.@\"task-return\"();\n", .{tname});
-        } else if (spilled) {
+            return;
+        };
+        const rz = try self.zigType(t);
+        const rcount = try self.flatCount(t);
+        if (spilled) {
             // Lower the result into a fresh scratch buffer (canonical layout) and
             // hand task.return the pointer.
-            const rz = try self.resultZig(func);
             self.print("    const __ret = abi.alloc(canon.sizeOf({s}), canon.alignOf({s}));\n", .{ rz, rz });
-            self.print("    canon.lower({s}, Impl.{s}({s}), __ret, &abi.alloc);\n", .{ rz, camel_name, args });
+            self.print("    canon.lower({s}, {s}, __ret, &abi.alloc);\n", .{ rz, rexpr });
             self.print("    {s}.@\"task-return\"(@intCast(@intFromPtr(__ret)));\n", .{tname});
         } else if (rcount == 1) {
-            self.print(
-                "    {s}.@\"task-return\"(canon.returnResult({s}, Impl.{s}({s}), &abi.alloc));\n",
-                .{ tname, try self.resultZig(func), camel_name, args },
-            );
+            self.print("    {s}.@\"task-return\"(canon.returnResult({s}, {s}, &abi.alloc));\n", .{ tname, rz, rexpr });
         } else {
-            // multi-slot: flatten the result to its core slots and pass them.
-            self.print(
-                "    const __r = canon.lowerFlat({s}, Impl.{s}({s}), &abi.alloc);\n",
-                .{ try self.resultZig(func), camel_name, args },
-            );
+            self.print("    const __r = canon.lowerFlat({s}, {s}, &abi.alloc);\n", .{ rz, rexpr });
             self.print("    {s}.@\"task-return\"(", .{tname});
             for (0..rcount) |i| {
                 if (i != 0) self.raw(", ");
@@ -549,7 +607,6 @@ const Gen = struct {
             }
             self.raw(");\n");
         }
-        self.raw("}\n\n");
     }
 
     fn implArgList(self: *Gen, params: []const ast.Param) GenError![]const u8 {
@@ -1643,6 +1700,39 @@ test "generate: async export lift (task.return)" {
     try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(canon.returnResult(canon.Result(void, void), Impl.run(), &abi.alloc));") != null);
     try testing.expect(std.mem.indexOf(u8, out, "export fn @\"local:p/run@0.1.0#double\"(x: i32) void {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "__task_1.@\"task-return\"(canon.returnResult(u32, Impl.double(__params.x), &abi.alloc));") != null);
+}
+
+test "generate: manual-return async export (--manual-return)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // handle: async func(x: u32) -> u32, requested in manual-return form. The
+    // shell only dispatches to the impl (which calls handleReturn when ready and
+    // may keep running afterward); the result is delivered by a pub return fn.
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "handle", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "h", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "h" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "p", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .manual_returns = &.{"handle"} };
+    try g.generate(exp_world, "host");
+    const out = g.out.items;
+    // A pub return fn delivers the result; the shell only calls the impl.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn handleReturn(__result: u32) void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(canon.returnResult(u32, __result, &abi.alloc));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"local:p/h@0.1.0#handle\"(x: i32) void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    Impl.handle(__params.x);\n") != null);
+    // No auto task.return embedding the impl call.
+    try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(u32, Impl.handle(") == null);
 }
 
 test "generate: async multi-slot result lifts via lowerFlat; async import via awaitCall" {
