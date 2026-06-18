@@ -103,6 +103,38 @@ pub fn Result(comptime T: type, comptime E: type) type {
     return union(enum) { ok: T, err: E };
 }
 
+/// The Zig type for a WIT `tuple<…>`: a tuple struct the marshaller lowers/lifts
+/// as a record (fields concatenated at their canonical alignment). Memoized so
+/// it is identical across modules. `Ts` is a tuple of element types, e.g.
+/// `canon.Tuple(.{ u32, []const u8 })`.
+pub fn Tuple(comptime Ts: anytype) type {
+    return std.meta.Tuple(&Ts);
+}
+
+/// The Zig type for a WIT `future<T>`: an async single-value channel. At the
+/// canonical ABI it is a single `i32` handle (the readable or writable end);
+/// the element type `T` is carried for read/write helpers. Lowers/lifts as a
+/// single-field record (the handle).
+pub fn Future(comptime T: type) type {
+    return struct {
+        handle: i32,
+        pub const Element = T;
+    };
+}
+
+/// The Zig type for a WIT `stream<T>`: an async multi-value channel. Like
+/// `Future`, a single `i32` handle at the canonical ABI.
+pub fn Stream(comptime T: type) type {
+    return struct {
+        handle: i32,
+        pub const Element = T;
+    };
+}
+
+/// The Zig type for a WIT `error-context`: an opaque async error value, a single
+/// `i32` handle at the canonical ABI.
+pub const ErrorContextHandle = struct { handle: i32 };
+
 // ── Flags (Zig `packed struct`) ─────────────────────────────────────
 //
 // A WIT `flags` lowers to a bitset: one bit per label, packed LSB-first into an
@@ -758,6 +790,26 @@ test "Result constructor is memoized and round-trips" {
     }
     // result<_, _> flattens to a flat discriminant.
     try testing.expect(resultIsFlat(Result(void, void)));
+}
+
+test "Tuple / Future / Stream constructors marshal correctly" {
+    // Future/Stream are i32 handles (single-field records).
+    try testing.expectEqual(@as(usize, 1), flatCount(Future(u32)));
+    try testing.expectEqual(@as(usize, 1), flatCount(Stream(u8)));
+    try testing.expectEqual(i32, CoreReturn(Future(u32)));
+    try testing.expect(Future(u32) == Future(u32)); // memoized
+    const f = liftResultFlat(Future(u32), returnResult(Future(u32), .{ .handle = 7 }, &testAlloc));
+    try testing.expectEqual(@as(i32, 7), f.handle);
+
+    // tuple<u32, string> = 1 + (ptr,len) = 3 flat slots; round-trips via memory.
+    const T = Tuple(.{ u32, []const u8 });
+    try testing.expectEqual(@as(usize, 3), flatCount(T));
+    test_top = 0;
+    var buf: [sizeOf(T)]u8 align(8) = undefined;
+    lower(T, .{ 9, "hi" }, &buf, &testAlloc);
+    const got = lift(T, &buf);
+    try testing.expectEqual(@as(u32, 9), got[0]);
+    try testing.expectEqualStrings("hi", got[1]);
 }
 
 // ── Flags (packed struct) ───────────────────────────────────────────
