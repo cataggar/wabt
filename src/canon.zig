@@ -103,6 +103,27 @@ pub fn Result(comptime T: type, comptime E: type) type {
     return union(enum) { ok: T, err: E };
 }
 
+// ── Flags (Zig `packed struct`) ─────────────────────────────────────
+//
+// A WIT `flags` lowers to a bitset: one bit per label, packed LSB-first into an
+// integer of 1/2/4 bytes (≤8/≤16/≤32 labels). A Zig `packed struct(uN)` of
+// `bool` fields (in label order) has exactly that representation, so the
+// marshaller treats any packed struct as its backing integer.
+
+fn PackedInt(comptime T: type) type {
+    return @typeInfo(T).@"struct".backing_integer.?;
+}
+
+/// Widen a flags value to its flat i32 core slot.
+fn packedToCore(comptime T: type, value: T) i32 {
+    return @bitCast(@as(u32, @as(PackedInt(T), @bitCast(value))));
+}
+
+/// Rebuild a flags value from its flat i32 core slot.
+fn packedFromCore(comptime T: type, core: anytype) T {
+    return @bitCast(@as(PackedInt(T), @truncate(@as(u32, @bitCast(@as(i32, core))))));
+}
+
 // ── Layout ──────────────────────────────────────────────────────────
 
 /// Canonical alignment of `T`, in bytes.
@@ -114,7 +135,7 @@ pub fn alignOf(comptime T: type) usize {
         .@"enum" => |e| @sizeOf(DiscInt(e.fields.len)),
         .optional => |o| @max(@as(usize, 1), alignOf(o.child)),
         .pointer => |p| if (p.size == .slice) @alignOf(usize) else unsupported(T),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") @alignOf(T) else blk: {
             var a: usize = 1;
             inline for (s.fields) |f| a = @max(a, alignOf(f.type));
             break :blk a;
@@ -136,7 +157,7 @@ pub fn sizeOf(comptime T: type) usize {
             break :blk alignTo(alignTo(1, pa) + sizeOf(o.child), @max(@as(usize, 1), pa));
         },
         .pointer => |p| if (p.size == .slice) 2 * @sizeOf(usize) else unsupported(T),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") @sizeOf(T) else blk: {
             var off: usize = 0;
             inline for (s.fields) |f| {
                 off = alignTo(off, alignOf(f.type)) + sizeOf(f.type);
@@ -192,7 +213,9 @@ pub fn lower(comptime T: type, value: T, base: [*]u8, ra: Realloc) void {
             base[0] = 0;
         },
         .pointer => |p| lowerSlice(p.child, value, base, ra),
-        .@"struct" => |s| inline for (s.fields, 0..) |f, i| {
+        .@"struct" => |s| if (s.layout == .@"packed") {
+            store(PackedInt(T), base, @bitCast(value));
+        } else inline for (s.fields, 0..) |f, i| {
             lower(f.type, @field(value, f.name), base + fieldOffset(T, i), ra);
         },
         .@"union" => |u| {
@@ -246,7 +269,9 @@ pub fn lift(comptime T: type, base: [*]const u8) T {
         .@"enum" => |e| @enumFromInt(load(DiscInt(e.fields.len), base)),
         .optional => |o| if (base[0] == 0) null else lift(o.child, base + payloadOffset(T)),
         .pointer => |p| liftSlice(p.child, base),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed")
+            @as(T, @bitCast(load(PackedInt(T), base)))
+        else blk: {
             var result: T = undefined;
             inline for (s.fields, 0..) |f, i| {
                 @field(result, f.name) = lift(f.type, base + fieldOffset(T, i));
@@ -319,7 +344,9 @@ pub fn flatCount(comptime T: type) usize {
         .bool, .int, .float, .@"enum" => 1,
         .pointer => 2, // (ptr, len)
         .optional => |o| 1 + flatCount(o.child), // discriminant + payload
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed")
+            (@bitSizeOf(PackedInt(T)) + 31) / 32
+        else blk: {
             var c: usize = 0;
             inline for (s.fields) |f| c += flatCount(f.type);
             break :blk c;
@@ -343,7 +370,7 @@ fn CoreScalar(comptime T: type) type {
         .bool, .@"enum" => i32,
         .int => |i| if (i.bits <= 32) i32 else i64,
         .float => |f| if (f.bits == 32) f32 else f64,
-        .@"struct" => |s| CoreScalar(s.fields[0].type), // single-field record
+        .@"struct" => |s| if (s.layout == .@"packed") i32 else CoreScalar(s.fields[0].type), // packed=flags(i32), single-field record
         .@"union" => i32, // 1-slot union = bare discriminant (all-void cases)
         else => unsupported(T),
     };
@@ -380,7 +407,7 @@ fn toCore(comptime T: type, value: T) CoreScalar(T) {
         else
             @intCast(value),
         .float => value,
-        .@"struct" => |s| toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        .@"struct" => |s| if (s.layout == .@"packed") packedToCore(T, value) else toCore(s.fields[0].type, @field(value, s.fields[0].name)),
         .@"union" => @intCast(@intFromEnum(std.meta.activeTag(value))),
         else => unsupported(T),
     };
@@ -397,7 +424,7 @@ fn fromCore(comptime T: type, core: CoreScalar(T)) T {
         else
             @intCast(core),
         .float => core,
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, core) else blk: {
             var r: T = undefined;
             @field(r, s.fields[0].name) = fromCore(s.fields[0].type, core);
             break :blk r;
@@ -470,7 +497,7 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
             break :blk items[0..len];
         },
         .optional => |o| if (slots[start] == 0) null else flatLift(o.child, slots, start + 1),
-        .@"struct" => |s| blk: {
+        .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, slots[start]) else blk: {
             var v: T = undefined;
             inline for (s.fields, 0..) |f, i| {
                 @field(v, f.name) = flatLift(f.type, slots, start + comptime flatFieldOffset(T, i));
@@ -731,4 +758,40 @@ test "Result constructor is memoized and round-trips" {
     }
     // result<_, _> flattens to a flat discriminant.
     try testing.expect(resultIsFlat(Result(void, void)));
+}
+
+// ── Flags (packed struct) ───────────────────────────────────────────
+
+const Perms = packed struct(u8) { read: bool = false, write: bool = false, exec: bool = false, _pad: u5 = 0 };
+const Big = packed struct(u32) { f0: bool = false, rest: u31 = 0 };
+
+test "flags: packed-struct layout, flat counts, round-trips" {
+    try testing.expectEqual(@as(usize, 1), sizeOf(Perms));
+    try testing.expectEqual(@as(usize, 1), alignOf(Perms));
+    try testing.expectEqual(@as(usize, 1), flatCount(Perms)); // ≤32 labels → 1 i32
+    try testing.expectEqual(i32, CoreReturn(Perms));
+
+    // Flat result encode/decode (no memory).
+    const v = Perms{ .read = true, .exec = true };
+    const got = liftResultFlat(Perms, returnResult(Perms, v, &testAlloc));
+    try testing.expect(got.read and got.exec and !got.write);
+
+    // flatLift (param): read=bit0, exec=bit2 → 0b101 = 5.
+    const p = liftParams(struct { f: Perms }, .{@as(i32, 5)});
+    try testing.expect(p.f.read and p.f.exec and !p.f.write);
+}
+
+test "flags: memory lower/lift round-trip (LSB-first)" {
+    test_top = 0;
+    var buf: [sizeOf(Perms)]u8 align(8) = undefined;
+    lower(Perms, .{ .write = true }, &buf, &testAlloc);
+    try testing.expectEqual(@as(u8, 0b010), buf[0]); // write = bit 1
+    const got = lift(Perms, &buf);
+    try testing.expect(got.write and !got.read and !got.exec);
+}
+
+test "flags: u32 backing flattens through i32 without overflow" {
+    const v: Big = @bitCast(@as(u32, 0x8000_0001)); // bit 31 + bit 0
+    const got = liftResultFlat(Big, returnResult(Big, v, &testAlloc));
+    try testing.expectEqual(@as(u32, 0x8000_0001), @as(u32, @bitCast(got)));
 }
