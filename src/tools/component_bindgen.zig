@@ -182,10 +182,28 @@ const Gen = struct {
             });
         }
 
-        // Index every named type so `.name` refs resolve.
+        // Index every named type so `.name` refs resolve, plus any types pulled
+        // in from another interface via `use pkg:iface.{ … }`.
+        const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, iface_id: []const u8 };
+        var used_types = std.ArrayListUnmanaged(UsedType).empty;
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
                 .type => |td| try self.types.put(self.ar, td.name, td.kind),
+                .use => |use_item| {
+                    const src = self.resolver.findInterface(use_item.from) orelse continue;
+                    const src_id = try ifaceId(self.ar, use_item.from, doc_pkg);
+                    for (use_item.names) |un| {
+                        const local = un.rename orelse un.name;
+                        if (self.types.contains(local)) continue;
+                        for (src.items) |sit| switch (sit) {
+                            .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
+                                try self.types.put(self.ar, local, td.kind);
+                                try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
+                            },
+                            else => {},
+                        };
+                    }
+                },
                 else => {},
             };
         }
@@ -200,7 +218,10 @@ const Gen = struct {
             \\
         , .{world_name});
 
-        // ── named types ──
+        // ── named types (use-imported first, then locally-defined) ──
+        for (used_types.items) |ut| {
+            try self.emitTypeDef(ut.iface_id, .{ .name = ut.name, .kind = ut.kind });
+        }
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
                 .type => |td| {
@@ -1541,5 +1562,42 @@ test "generate: aggregate params (variant / record) lower via canon.lowerFlat" {
     try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"move-to\"(p_0: i32, p_1: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const p_s = canon.lowerFlat(Point, p, &abi.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"move-to\"(p_s[0], p_s[1])") != null);
+}
+
+test "generate: use-imported types are indexed and emitted" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface base { type duration = u64; }
+    // interface api  { use base.{duration}; tick: func(d: duration) -> u64; }
+    const dur_ty: ast.Type = .u64;
+    const base_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "duration", .kind = .{ .alias = dur_ty } } },
+    };
+    const base_iface = ast.Interface{ .name = "base", .items = &base_items };
+    const dur_ref = ast.Type{ .name = "duration" };
+    const api_items = [_]ast.InterfaceItem{
+        .{ .use = .{ .from = .{ .name = "base" }, .names = &.{.{ .name = "duration" }} } },
+        .{ .func = .{ .name = "tick", .func = .{ .params = &.{.{ .name = "d", .type = dur_ref }}, .result = .u64 } } },
+    };
+    const api_iface = ast.Interface{ .name = "api", .items = &api_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "u" },
+        .items = &.{ .{ .interface = base_iface }, .{ .interface = api_iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // the `use`d alias is emitted as a top-level typedef …
+    try testing.expect(std.mem.indexOf(u8, out, "pub const Duration = u64;") != null);
+    // … and resolves through to its underlying core type when used as a param.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn tick(d: Duration) u64 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:u/api\" fn @\"tick\"(d: i64) i64;") != null);
 }
 
