@@ -39,6 +39,10 @@ interface store {
 
 // A `wasi:http/service`-shaped world that also imports the `store`
 // data-access interface; exports the async `handler` the host calls.
+// `wabt component bindgen` generates the full client surface — the
+// `wasi:http/types` wrappers, the `store` client, and the async `handle`
+// export — so the frontend drives the generated bindings directly (no
+// hand-written `wasi_http`).
 world svc {
     import wasi:http/types@0.3.0;
     import store;
@@ -48,11 +52,4 @@ world svc {
 // The storage component: exports the `store` interface.
 world store-provider {
     export store;
-}
-
-// Import-only world used by `wabt component bindgen` to generate the
-// frontend's `store` client wrappers (the `svc` world also imports
-// wasi:http, which bindgen v1 does not handle).
-world store-consumer {
-    import store;
 }
