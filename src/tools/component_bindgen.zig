@@ -300,9 +300,21 @@ const Gen = struct {
                 const err = if (r.err) |t| try self.zigType(t.*) else "void";
                 break :blk try std.fmt.allocPrint(self.ar, "canon.Result({s}, {s})", .{ ok, err });
             },
+            .tuple => |elems| blk: {
+                var b = std.ArrayListUnmanaged(u8).empty;
+                try b.appendSlice(self.ar, "canon.Tuple(.{ ");
+                for (elems, 0..) |e, i| {
+                    if (i != 0) try b.appendSlice(self.ar, ", ");
+                    try b.appendSlice(self.ar, try self.zigType(e));
+                }
+                try b.appendSlice(self.ar, " })");
+                break :blk b.items;
+            },
+            .future => |e| try std.fmt.allocPrint(self.ar, "canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .stream => |e| try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .error_context => "canon.ErrorContextHandle",
             .own, .borrow => |r| try pascal(self.ar, r), // resource handle wrapper
             .name => |n| try pascal(self.ar, n),
-            else => error.UnsupportedWitType,
         };
     }
 
@@ -319,6 +331,12 @@ const Gen = struct {
                 const err = if (r.err) |t| try self.flatCount(t.*) else 0;
                 break :blk 1 + @max(ok, err);
             },
+            .tuple => |elems| blk: {
+                var c: usize = 0;
+                for (elems) |e| c += try self.flatCount(e);
+                break :blk c;
+            },
+            .future, .stream, .error_context => 1, // an i32 handle
             .name => |n| blk: {
                 const kind = self.types.get(n) orelse return error.UnknownType;
                 break :blk switch (kind) {
@@ -651,7 +669,7 @@ const Gen = struct {
         for (params) |p| {
             const pn = try snake(self.ar, p.name);
             if (args.items.len != 0) try args.appendSlice(self.ar, ", ");
-            if (self.handleResource(p.type) != null) {
+            if (self.isHandleLike(p.type)) {
                 try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}.handle", .{pn}));
                 continue;
             }
@@ -732,7 +750,7 @@ const Gen = struct {
     }
 
     fn flattenSlots(self: *Gen, out: *std.ArrayListUnmanaged(Slot), base: []const u8, ty: ast.Type) GenError!void {
-        if (self.handleResource(ty) != null) {
+        if (self.isHandleLike(ty)) {
             try out.append(self.ar, .{ .name = base, .core = .i32 });
             return;
         }
@@ -745,6 +763,9 @@ const Gen = struct {
                 try out.append(self.ar, .{ .name = try std.fmt.allocPrint(self.ar, "{s}_disc", .{base}), .core = .i32 });
                 try self.flattenSlots(out, base, e.*);
             },
+            .tuple => |elems| for (elems, 0..) |e, i| {
+                try self.flattenSlots(out, try std.fmt.allocPrint(self.ar, "{s}_{d}", .{ base, i }), e);
+            },
             else => try out.append(self.ar, .{ .name = base, .core = self.coreOf(ty) catch return error.UnsupportedWitType }),
         }
     }
@@ -756,18 +777,19 @@ const Gen = struct {
             .u64, .s64 => .i64,
             .f32 => .f32,
             .f64 => .f64,
-            .own, .borrow => .i32, // resource handle
+            .own, .borrow, .future, .stream, .error_context => .i32, // handles
             else => error.UnsupportedWitType,
         };
     }
 
-    /// If `ty` is a resource handle — `own<R>`, `borrow<R>`, or a bare reference
-    /// to a resource type — return the resource's WIT name; otherwise null.
-    fn handleResource(self: *Gen, ty: ast.Type) ?[]const u8 {
+    /// True when `ty` lowers to a single `i32` handle accessed via a `.handle`
+    /// field: `own<R>` / `borrow<R>` / a bare resource reference, or a
+    /// `future<T>` / `stream<T>` / `error-context`.
+    fn isHandleLike(self: *Gen, ty: ast.Type) bool {
         return switch (ty) {
-            .own, .borrow => |r| r,
-            .name => |n| if (self.types.get(n)) |k| (if (k == .resource) n else null) else null,
-            else => null,
+            .own, .borrow, .future, .stream, .error_context => true,
+            .name => |n| if (self.types.get(n)) |k| k == .resource else false,
+            else => false,
         };
     }
 
@@ -777,7 +799,8 @@ const Gen = struct {
         // flatten to its i32; a single-field record flattens to that field.
         return switch (ty) {
             .result => .i32,
-            .own, .borrow => .i32, // resource handle
+            .own, .borrow, .future, .stream, .error_context => .i32, // handles
+            .tuple => |elems| if (elems.len == 1) try self.coreOfResult(elems[0]) else error.UnsupportedWitType,
             .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
                 .@"enum", .variant => .i32,
                 .flags => .i32, // ≤32 labels → a single i32 slot
@@ -1265,5 +1288,53 @@ test "generate: async aggregate result and async import are rejected (later phas
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(agg_imp, "guest"));
     }
+}
+
+test "generate: future / stream / tuple in signatures" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // resource pipe {
+    //   body: func() -> tuple<stream<u8>, future<u32>>;
+    //   signal: func(f: future<u32>) -> bool;
+    // }
+    // make-pair: func() -> tuple<u32, string>;
+    const u8_ty: ast.Type = .u8;
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const stream_u8 = ast.Type{ .stream = &u8_ty };
+    const future_u32 = ast.Type{ .future = &u32_ty };
+    const body_result = ast.Type{ .tuple = &.{ stream_u8, future_u32 } };
+    const pair_result = ast.Type{ .tuple = &.{ u32_ty, str_ty } };
+    const pipe_methods = [_]ast.ResourceMethod{
+        .{ .kind = .method, .name = "body", .func = .{ .params = &.{}, .result = body_result } },
+        .{ .kind = .method, .name = "signal", .func = .{ .params = &.{.{ .name = "f", .type = future_u32 }}, .result = .bool } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "pipe", .kind = .{ .resource = &pipe_methods } } },
+        .{ .func = .{ .name = "make-pair", .func = .{ .params = &.{}, .result = pair_result } } },
+    };
+    const iface = ast.Interface{ .name = "chan", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "chan" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "fs" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // tuple<stream<u8>, future<u32>> result (indirect, lifted from memory).
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn body(self: Pipe) canon.Tuple(.{ canon.Stream(u8), canon.Future(u32) }) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(canon.Tuple(.{ canon.Stream(u8), canon.Future(u32) }), abi.retArea());") != null);
+    // future<u32> param lowers to its i32 handle.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn signal(self: Pipe, f: canon.Future(u32)) bool {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
+    // free function returning tuple<u32, string>.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() canon.Tuple(.{ u32, []const u8 }) {") != null);
 }
 
