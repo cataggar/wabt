@@ -157,7 +157,7 @@ const Gen = struct {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
     }
 
-    const Use = struct { id: []const u8, iface: ast.Interface, is_export: bool };
+    const Use = struct { id: []const u8, iface: ast.Interface, is_export: bool, pkg: ?ast.PackageId };
 
     fn generate(self: *Gen, world: ast.World, world_name: []const u8) GenError!void {
         const doc_pkg = self.resolver.main.package;
@@ -174,28 +174,31 @@ const Gen = struct {
                 .interface_ref => |ir| ir.ref,
                 else => return error.UnsupportedWitType, // named_func/named_interface: v2
             };
-            const iface = self.resolver.findInterface(ref) orelse return error.UnknownInterface;
+            const hit = self.resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
             try uses.append(self.ar, .{
                 .id = try ifaceId(self.ar, ref, doc_pkg),
-                .iface = iface,
+                .iface = hit.iface,
                 .is_export = ei.is_export,
+                .pkg = hit.pkg,
             });
         }
 
         // Index every named type so `.name` refs resolve, plus any types pulled
-        // in from another interface via `use pkg:iface.{ … }`.
+        // in from another interface via `use pkg:iface.{ … }` (resolved in the
+        // package context of the interface that contains the `use`).
         const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, iface_id: []const u8 };
         var used_types = std.ArrayListUnmanaged(UsedType).empty;
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
                 .type => |td| try self.types.put(self.ar, td.name, td.kind),
                 .use => |use_item| {
-                    const src = self.resolver.findInterface(use_item.from) orelse continue;
-                    const src_id = try ifaceId(self.ar, use_item.from, doc_pkg);
+                    const hit = self.resolver.findInterfaceWithPkgCtx(use_item.from, u.pkg) orelse continue;
+                    const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
+                    const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                     for (use_item.names) |un| {
                         const local = un.rename orelse un.name;
                         if (self.types.contains(local)) continue;
-                        for (src.items) |sit| switch (sit) {
+                        for (hit.iface.items) |sit| switch (sit) {
                             .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
                                 try self.types.put(self.ar, local, td.kind);
                                 try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
@@ -918,7 +921,13 @@ const Gen = struct {
                 },
                 .alias => unreachable, // resolved above
             },
-            else => &[_]Core{try self.coreOf(ty)}, // scalar
+            else => blk: {
+                // scalar: a single core slot. Allocate in the arena (a
+                // `&[_]Core{runtime}` literal would dangle after return).
+                var l = std.ArrayListUnmanaged(Core).empty;
+                try l.append(self.ar, try self.coreOf(ty));
+                break :blk l.items;
+            },
         };
     }
 
