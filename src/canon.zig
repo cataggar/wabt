@@ -458,14 +458,37 @@ pub fn lift(comptime T: type, base: [*]const u8) T {
     };
 }
 
+/// True when `E`'s native Zig layout equals its canonical-ABI layout, so a
+/// canonical array of `E` can be borrowed in place as a `[]const E` with no
+/// copy. Holds for primitives, `string`/`list` (slices), and `record`/`tuple`
+/// of such on little-endian wasm32. A tagged `variant`/`result` (a Zig `union`,
+/// whose in-memory layout differs from the canonical discriminant+payload) does
+/// not match.
+fn layoutMatches(comptime E: type) bool {
+    return switch (@typeInfo(E)) {
+        .bool, .int, .float, .@"enum" => sizeOf(E) == @sizeOf(E),
+        .pointer => |p| p.size == .slice and sizeOf(E) == @sizeOf(E) and alignOf(E) == @alignOf(E),
+        .@"struct" => |s| blk: {
+            if (s.layout == .@"packed") break :blk sizeOf(E) == @sizeOf(E);
+            if (sizeOf(E) != @sizeOf(E) or alignOf(E) != @alignOf(E)) break :blk false;
+            inline for (s.fields, 0..) |f, i| {
+                if (@offsetOf(E, f.name) != fieldOffset(E, i)) break :blk false;
+                if (!layoutMatches(f.type)) break :blk false;
+            }
+            break :blk true;
+        },
+        else => false,
+    };
+}
+
 fn liftSlice(comptime E: type, base: [*]const u8) []const E {
-    // Borrow in place: valid only when the canonical element layout equals
-    // the native one (primitives on little-endian wasm). Aggregate elements
-    // would need element-wise copies into a fresh allocation.
-    switch (@typeInfo(E)) {
-        .int, .float, .bool => {},
-        else => @compileError("canon: lifting list<" ++ @typeName(E) ++ "> (aggregate element) is unsupported"),
-    }
+    // Borrow in place when `E`'s canonical layout equals its native one — the
+    // canonical element array is then already a valid `[]const E` (primitives,
+    // plus `string` / `list` / `record` / `tuple` of such on little-endian
+    // wasm32). An element whose layouts differ (e.g. a tagged `variant` /
+    // `result`) would need element-wise copies into a fresh allocation.
+    if (!comptime layoutMatches(E))
+        @compileError("canon: lifting list<" ++ @typeName(E) ++ "> (layout mismatch) is unsupported");
     const len = load(usize, base + @sizeOf(usize));
     if (len == 0) return &.{};
     const items: [*]const E = @ptrFromInt(load(usize, base));
@@ -1122,6 +1145,39 @@ test "Tuple / Future / Stream constructors marshal correctly" {
     const got = lift(T, &buf);
     try testing.expectEqual(@as(u32, 9), got[0]);
     try testing.expectEqualStrings("hi", got[1]);
+}
+
+test "list of aggregate elements: lower/lift round-trip (string / tuple<string,string>)" {
+    // `list<string>` (wasi:cli get-arguments) and `list<tuple<string,string>>`
+    // (get-environment) borrow the canonical element array in place — valid
+    // because their canonical layout equals the native one.
+    try testing.expect(layoutMatches([]const u8));
+    try testing.expect(layoutMatches(Tuple(.{ []const u8, []const u8 })));
+    try testing.expect(!layoutMatches(Result(u32, u8))); // a union: layout differs
+
+    test_top = 0;
+    {
+        const L = []const []const u8;
+        var buf: [sizeOf(L)]u8 align(8) = undefined;
+        lower(L, &.{ "alpha", "beta", "gamma" }, &buf, &testAlloc);
+        const got = lift(L, &buf);
+        try testing.expectEqual(@as(usize, 3), got.len);
+        try testing.expectEqualStrings("alpha", got[0]);
+        try testing.expectEqualStrings("beta", got[1]);
+        try testing.expectEqualStrings("gamma", got[2]);
+    }
+    {
+        const Pair = Tuple(.{ []const u8, []const u8 });
+        const L = []const Pair;
+        var buf: [sizeOf(L)]u8 align(8) = undefined;
+        lower(L, &.{ .{ "PATH", "/usr/bin" }, .{ "HOME", "/root" } }, &buf, &testAlloc);
+        const got = lift(L, &buf);
+        try testing.expectEqual(@as(usize, 2), got.len);
+        try testing.expectEqualStrings("PATH", got[0][0]);
+        try testing.expectEqualStrings("/usr/bin", got[0][1]);
+        try testing.expectEqualStrings("HOME", got[1][0]);
+        try testing.expectEqualStrings("/root", got[1][1]);
+    }
 }
 
 test "Stream/Future intrinsic wrappers type-check for primitive elements" {

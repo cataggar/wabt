@@ -44,24 +44,33 @@ with `wit-bindgen`'s convention for cross-toolchain interop.
 
 ```
 src/
-  abi.zig        shared canonical-ABI core (cabi_realloc, ret-area) — unchanged from 0.2
-  cm_async.zig   WASI 0.3 async primitives contract (future/stream/error-context/waitable-set)
-  wasi_cli.zig   wasi:cli@0.3.0 (async run + stdout via write-via-stream(stream<u8>))
-  root.zig       `wasip3` re-export index
+  abi.zig              shared canonical-ABI core (cabi_realloc, ret-area)
+  canon.zig            comptime canonical-ABI value marshaller (records/strings/options/lists/variants/futures/streams)
+  cm_async.zig         WASI 0.3 async primitives (future/stream/error-context/waitable-set/subtask)
+  wasi_cli_bindings.zig  `wabt component bindgen`-generated wasi:cli@0.3.0 import client wrappers
+  wasi_cli.zig         ergonomic wasi:cli@0.3.0 layer (run export, stdout/stderr/stdin, args/env, exit, terminal)
+  wasi_http.zig        wasi:http@0.3.0 service handler helper
+  root.zig             `wasip3` re-export index
 ```
 
-The other 0.2 modules (`wasi_clocks`/`random`/`filesystem`/`sockets`/`http` and
-the proposals) were removed; they will be re-added as 0.3 bindings as the
-generation work lands.
+The remaining 0.2 interfaces (`clocks`/`random`/`filesystem`/`sockets`) are being
+re-added as 0.3 bindings by **generating** them with `wabt component bindgen`
+(see [cataggar/wabt#280](https://github.com/cataggar/wabt/issues/280)) + thin
+ergonomic wrappers, the pattern `wasi_cli` now uses.
 
 ## Status
 
-**Design-stage.** The bindings **type-check** and compile to a
-`wasm32-freestanding` core module exporting `wasi:cli/run@0.3.0#run` with the
-intrinsic imports above — i.e. the contract is concrete. They do **not** yet
-wrap into a runnable component: that needs wabt's P3 generation to emit the
-matching `canon` glue. The validation target is the local **wasmtime 46** build
-(`-S p3 -W component-model-async -W component-model-error-context`).
+**Runnable.** P3 canonical-ABI generation in `wabt component new` landed
+([#263](https://github.com/cataggar/wabt/issues/263)), and `component bindgen`
+now generates the full client surface — including non-primitive `future`/`stream`
+elements, async imports, and streaming exports
+([#284](https://github.com/cataggar/wabt/issues/284) /
+[#289](https://github.com/cataggar/wabt/issues/289)). The `wasi:cli@0.3.0`
+bindings here are **generated + wrapped**, build to a `wasm32-freestanding`
+command, wrap via `wabt component new`, and **run on wasmtime 46** end to end
+(`run` + stdout/stderr + `get-arguments`). Validate with
+`-S p3 -W component-model-async -W component-model-async-stackful
+-W component-model-more-async-builtins -W component-model-error-context`.
 
 ## Prerequisites
 

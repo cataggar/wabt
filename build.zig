@@ -14,17 +14,26 @@ pub fn build(b: *std.Build) void {
     const cm_async = b.addModule("cm_async", .{ .root_source_file = b.path("src/cm_async.zig") });
     cm_async.addImport("abi", abi);
 
-    const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
-    wasi_cli.addImport("cm_async", cm_async);
-
-    const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
-    wasi_http.addImport("abi", abi);
-    wasi_http.addImport("cm_async", cm_async);
-
     // Comptime canonical-ABI value marshaller (records / strings / options /
     // lists → linear memory). Depends only on `std`; a guest passes it the
     // `abi.alloc` realloc.
     const canon = b.addModule("canon", .{ .root_source_file = b.path("src/canon.zig") });
+
+    // `wabt component bindgen`-generated `wasi:cli@0.3.0` import client wrappers;
+    // `wasi_cli` is the ergonomic layer over them.
+    const wasi_cli_bindings = b.addModule("wasi_cli_bindings", .{ .root_source_file = b.path("src/wasi_cli_bindings.zig") });
+    wasi_cli_bindings.addImport("canon", canon);
+    wasi_cli_bindings.addImport("abi", abi);
+
+    const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
+    wasi_cli.addImport("cm_async", cm_async);
+    wasi_cli.addImport("canon", canon);
+    wasi_cli.addImport("abi", abi);
+    wasi_cli.addImport("wasi_cli_bindings", wasi_cli_bindings);
+
+    const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
+    wasi_http.addImport("abi", abi);
+    wasi_http.addImport("cm_async", cm_async);
 
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
@@ -139,7 +148,8 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
     .{ .name = "canon" },
     .{ .name = "cm_async", .deps = &.{"abi"} },
-    .{ .name = "wasi_cli", .deps = &.{"cm_async"} },
+    .{ .name = "wasi_cli_bindings", .deps = &.{ "canon", "abi" } },
+    .{ .name = "wasi_cli", .deps = &.{ "cm_async", "canon", "abi", "wasi_cli_bindings" } },
     .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
 };
 
