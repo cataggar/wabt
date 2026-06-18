@@ -36,39 +36,51 @@ on lives on the orphan branch `wasip3` of the same repository.
 
 `interface store` is a typed data-access API: `pet` / `toy` **records**, with
 `option<record>` results and `count` + indexed `*-at` accessors (instead of
-`list<record>`). Worlds: `svc` (the frontend) `import`s `store` and wasi:http;
-`store-provider` (the backend) `export`s `store`; `store-consumer` is an
-import-only world used by bindgen.
+`list<record>`). Worlds: `svc` (the frontend) `import`s `store` **and**
+`wasi:http/types` and `export`s the async `wasi:http/handler`; `store-provider`
+(the backend) `export`s `store`.
 
 Both sides' canonical-ABI glue is **generated at build time** by
 `wabt component bindgen`, which emits the flattened `extern`/`export` shells and
 the `Pet` / `Toy` Zig types and delegates all marshalling to `wasip3`'s comptime
 `canon` library. There is no hand-written `extern struct`, flat-vs-indirect
-logic, or lower/lift code on either side.
+logic, or lower/lift code on either side — and no hand-written `wasi_http`: the
+frontend drives the **generated** `wasi:http` bindings directly.
 
 - **Backend** — `build.zig` runs `bindgen` on `store-provider` to generate the
   `export fn` shells (params lifted with `canon.liftParams`, return type
   `canon.CoreReturn(R)`, result encoded with `canon.returnResult`). The shells
   call **`src/memory_store.zig`** — the in-memory pets/toys store, pure business
   logic returning the generated `Pet` / `Toy` types.
-- **Frontend** — `bindgen` on `store-consumer` generates the `store.*` import
-  wrappers (results decoded with `canon.liftResultFlat` / `canon.lift`).
-  `src/main.zig` calls them and builds `PetJson` / `ToyJson`, serializing with
-  `std.json` (`emit_null_optional_fields = false`, so an absent `tag` is
-  omitted).
+- **Frontend** — `bindgen` on the single `svc` world generates everything
+  `src/main.zig` needs: the `store.*` import wrappers (results decoded with
+  `canon.liftResultFlat` / `canon.lift`), the `wasi:http/types` resource wrappers
+  (`Request` / `Response` / `Fields` and the body `stream<u8>` / trailers
+  `future` channels), and the async `wasi:http/handler@0.3.0#handle` export — in
+  `--manual-return` form, so the handler can `task.return` the response and then
+  keep streaming its body. `src/main.zig` calls them and builds `PetJson` /
+  `ToyJson`, serializing with `std.json` (`emit_null_optional_fields = false`, so
+  an absent `tag` is omitted).
 
 ### The HTTP request (WASI 0.3 has no `wasi:io`)
 
-Per request the frontend handler:
+Per request the frontend handler (`src/main.zig`, driving the generated `svc`
+bindings):
 
-1. Reads the request **method** and **path-with-query** (`request.get-method`,
-   `request.get-path-with-query`), then the request **body** by `consume-body` +
-   a cooperative `stream.read` loop.
+1. Reads the request **method** and **path-with-query** (`Request.getMethod`,
+   `Request.getPathWithQuery`), then the request **body** by `Request.consumeBody`
+   + a cooperative `stream.read` loop on the returned body `stream<u8>`.
 2. Routes to the imported `store` calls and serializes JSON into a per-task
    buffer.
-3. Builds a `response` (status + `content-type` header + body `stream<u8>`),
-   reports it with `task.return`, then streams the body and resolves the
-   trailers — cooperatively waiting on a `waitable-set` whenever a write blocks.
+3. Builds a `Response` (status + `content-type` header + body `stream<u8>` +
+   trailers `future`), reports it with the generated `handleReturn` (`task.return`),
+   then streams the body and resolves the trailers — cooperatively waiting on a
+   `cm_async.WaitableSet` whenever a write blocks.
+
+The body `stream<u8>` and the `future<result<…>>` trailers/transmission channels
+are the **non-primitive async element** bindings (`canon.Stream` / `canon.FutureOf`
+bound to function-reference intrinsics) the generator emits for the `wasi:http`
+signatures.
 
 **Concurrency.** Hosts may invoke `handle` concurrently (interleaved at `await`
 points on one thread). The store is static global state (in the backend
@@ -79,9 +91,10 @@ corrupt each other.
 ## Prerequisites
 
 - `zig` 0.16, a **P3-capable `wabt`** (with non-primitive stream/future element
-  support, value-typed export interfaces, and the `component bindgen` subcommand
-  — see cataggar/wabt #281/#282/#283), and **`wasmtime` >= 46** on `PATH` — or
-  pointed to via the `WABT` and `WASMTIME` environment variables.
+  support, async imports/exports, spilled `task.return`, and `component bindgen`
+  with `--manual-return` — see cataggar/wabt #281–#284 and #289), and
+  **`wasmtime` >= 46** on `PATH` — or pointed to via the `WABT` and `WASMTIME`
+  environment variables.
 
 ## Build and serve
 
@@ -97,14 +110,14 @@ zig build check           # analyze the guest modules (used by ZLS); no install
 ### Editor / ZLS
 
 The guests are compiled by shelling out to `zig build-exe` (`wasip3.zigBuildWasm`),
-which the language server can't introspect, so `@import("wasi_http")` and the
-generated `store_consumer` / `store_provider` bindings would otherwise be
-unresolved. `wasip3.zigBuildWasm` therefore auto-registers a `check` step that
-mirrors each guest's module graph as a real `addExecutable` / `addImport` — no
-build.zig wiring needed here. `.vscode/settings.json` points ZLS's build-on-save
-at it (`zig.zls.buildOnSaveStep = "check"`), so imports resolve and diagnostics
-surface in the editor. `wabt` must be on `PATH` (ZLS runs the build to
-materialize the generated bindings).
+which the language server can't introspect, so the generated `svc` /
+`store_provider` bindings would otherwise be unresolved. `wasip3.zigBuildWasm`
+therefore auto-registers a `check` step that mirrors each guest's module graph as
+a real `addExecutable` / `addImport` — no build.zig wiring needed here.
+`.vscode/settings.json` points ZLS's build-on-save at it
+(`zig.zls.buildOnSaveStep = "check"`), so imports resolve and diagnostics surface
+in the editor. `wabt` must be on `PATH` (ZLS runs the build to materialize the
+generated bindings).
 
 In another terminal:
 

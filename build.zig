@@ -4,14 +4,19 @@ const wasip3 = @import("wasip3");
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
 
-    const store_consumer = wasip3.wabtComponentBindgen(b, .{ .world = "store-consumer" });
+    // The `svc` world generates the whole guest surface the frontend needs:
+    // the `wasi:http/types` client wrappers, the `store` client, and the async
+    // `wasi:http/handler` export. `handle` is generated in manual-return form so
+    // the handler can `task.return` the response and then keep streaming its
+    // body.
+    const svc = wasip3.wabtComponentBindgen(b, .{ .world = "svc", .manual_returns = &.{"handle"} });
     const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider" });
 
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
-        .imports = wasip3.guestImports(b, dep, &.{"wasi_http"}, &.{
-            .{ .bindings = store_consumer },
+        .imports = wasip3.guestImports(b, dep, &.{ "cm_async", "canon", "abi" }, &.{
+            .{ .bindings = svc },
         }),
     });
     const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "svc" });
