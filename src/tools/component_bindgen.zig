@@ -14,9 +14,12 @@
 //! user-supplied implementation imported via `--impl`), and encode the result
 //! (`canon.returnResult`).
 //!
-//! v1 supports primitives, `string`, `option<T>`, `list<T>`, and named
-//! `record`/`enum` types. `variant`/`flags`/`result`, resources, and async
-//! (`future`/`stream`) are rejected with a clear error for now.
+//! Supports primitives, `string`, `option<T>`, `list<T>`, named
+//! `record`/`enum`/`variant`/`flags`/`result`/`tuple` types, imported
+//! resources, async exports (`task.return`), and `future<T>`/`stream<T>` —
+//! primitive elements via `canon.Future`/`Stream`, complex (aggregate /
+//! resource-bearing) elements via `canon.FutureOf`/`StreamOf` bound to a
+//! function-reference intrinsic `[future]<iface>#<fn>#<idx>`.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -36,6 +39,13 @@ pub const usage =
     \\                      defines more than one world)
     \\  --impl <module>     Import name for the user implementation of exported
     \\                      interfaces (default: "impl")
+    \\  --manual-return <fn>
+    \\                      Generate an async export `<fn>` in manual-return form:
+    \\                      the shell calls `Impl.<fn>(params)` (returning void)
+    \\                      and the bindings expose a `pub fn <fn>Return(result)`
+    \\                      the impl calls when ready. Lets the handler keep
+    \\                      running after `task.return` (e.g. to write a
+    \\                      `wasi:http` response body stream). Repeatable.
     \\  -o, --output <file> Output .zig file (default: stdout)
     \\
 ;
@@ -51,6 +61,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var world_arg: ?[]const u8 = null;
     var impl_arg: []const u8 = "impl";
     var output_file: ?[]const u8 = null;
+    var manual_returns = std.ArrayListUnmanaged([]const u8).empty;
+    defer manual_returns.deinit(alloc);
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -64,6 +76,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--impl")) {
             i += 1;
             impl_arg = nextArg(sub_args, i, arg);
+        } else if (std.mem.eql(u8, arg, "--manual-return")) {
+            i += 1;
+            manual_returns.append(alloc, nextArg(sub_args, i, arg)) catch @panic("OOM");
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             output_file = nextArg(sub_args, i, arg);
@@ -97,7 +112,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg };
+    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg, .manual_returns = manual_returns.items };
     g.generate(world, world_name) catch |err| {
         std.debug.print("error: generating bindings for world '{s}': {s}\n", .{ world_name, @errorName(err) });
         std.process.exit(1);
@@ -137,17 +152,31 @@ fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
 
 const Core = enum { i32, i64, f32, f64 };
 
+/// A generated nominal type for a complex (non-primitive-element) future/stream
+/// channel: its Zig name and the `canon.FutureOf(…)` / `canon.StreamOf(…)` RHS.
+const ChanDecl = struct { name: []const u8, rhs: []const u8 };
+
 const GenError = error{ OutOfMemory, UnsupportedWitType, UnknownInterface, UnknownType };
 
 const Gen = struct {
     ar: Allocator,
     resolver: wit.resolver.Resolver,
     impl: []const u8,
+    /// Async export func names to generate in manual-return form (`--manual-return`).
+    manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
     // WIT type name → its kind, across all interfaces in the world.
     types: std.StringHashMapUnmanaged(ast.TypeDefKind) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
+    // Distinct complex (non-primitive-element) future/stream channels → the
+    // generated nominal type name. Key: "F:"/"S:" ++ element zig type.
+    chan_map: std.StringHashMapUnmanaged([]const u8) = .empty,
+    // The nominal channel type decls to emit (name + RHS), in discovery order.
+    chan_decls: std.ArrayListUnmanaged(ChanDecl) = .empty,
+    chan_counter: usize = 0,
+    // True when the world imports an async func (the wrappers need `cm_async`).
+    needs_cm_async: bool = false,
 
     fn raw(self: *Gen, s: []const u8) void {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
@@ -218,8 +247,25 @@ const Gen = struct {
             \\const canon = @import("canon");
             \\const abi = @import("abi");
             \\
-            \\
         , .{world_name});
+        // A world that imports an async func drives the async-lowered call
+        // through `cm_async.awaitCall`.
+        for (uses.items) |u| {
+            if (u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| if (fd.func.is_async) {
+                    self.needs_cm_async = true;
+                },
+                else => {},
+            };
+        }
+        if (self.needs_cm_async) self.raw("const cm_async = @import(\"cm_async\");\n");
+        self.raw("\n");
+
+        // Register complex (non-primitive-element) future/stream channels so
+        // their nominal types are shared across import wrappers and the user
+        // impl. Must run after `self.types` is fully indexed.
+        try self.registerChannels(uses.items);
 
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
@@ -236,6 +282,12 @@ const Gen = struct {
                 else => {},
             };
         }
+
+        // ── complex future/stream channel types (after their element types) ──
+        for (self.chan_decls.items) |d| {
+            self.print("const {s} = {s};\n", .{ d.name, d.rhs });
+        }
+        if (self.chan_decls.items.len != 0) self.raw("\n");
 
         var have_exports = false;
         for (uses.items) |u| {
@@ -334,8 +386,14 @@ const Gen = struct {
                 try b.appendSlice(self.ar, " })");
                 break :blk b.items;
             },
-            .future => |e| try std.fmt.allocPrint(self.ar, "canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
-            .stream => |e| try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .future => |e| if (try self.chanName(true, if (e) |p| p.* else null)) |nm|
+                nm
+            else
+                try std.fmt.allocPrint(self.ar, "canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .stream => |e| if (try self.chanName(false, if (e) |p| p.* else null)) |nm|
+                nm
+            else
+                try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
             .error_context => "canon.ErrorContextHandle",
             .own, .borrow => |r| try pascal(self.ar, r), // resource handle wrapper
             .name => |n| try pascal(self.ar, n),
@@ -445,50 +503,103 @@ const Gen = struct {
     /// Emit an async-lifted export: a core `export fn … () void` that lifts its
     /// params, calls the user impl, and delivers the result through the
     /// `[task-return]<iface>#<fn>` intrinsic (the canonical async-lift shape
-    /// `component new` wires for an `async func`). The result is delivered as its
-    /// flattened core slots; results wider than 16 slots (the spilled,
-    /// memory-pointer task.return form) and calling *imported* async functions
-    /// are later phases.
+    /// `component new` wires for an `async func`). A result of ≤16 flat slots is
+    /// delivered as those slots; a wider one spills to a single memory pointer
+    /// (`task.return` lifts with `MAX_FLAT_PARAMS` = 16). Calling *imported*
+    /// async functions is handled on the import side.
     fn emitAsyncExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
-        if (rcount > 16) return error.UnsupportedWitType; // spilled task.return (memory): later
+        const spilled = rcount > 16; // result wider than 16 flat slots → memory pointer
 
         // Per-export `[task-return]` helper (extern decls must be container-scope).
         const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
         self.task_counter += 1;
+        try self.emitTaskReturnExternDecl(tname, iface_id, name, func, spilled);
+
+        const camel_name = try camel(self.ar, name);
+        const args = try self.implArgList(func.params);
+
+        if (self.isManualReturn(name)) {
+            // Manual-return form: expose a `pub fn <fn>Return(result)` the impl
+            // calls when ready, and a shell that just dispatches to the impl
+            // (which keeps running after task.return — e.g. to write a response
+            // body stream).
+            if (func.result) |t| {
+                self.print("pub fn {s}Return(__result: {s}) void {{\n", .{ camel_name, try self.zigType(t) });
+            } else {
+                self.print("pub fn {s}Return() void {{\n", .{camel_name});
+            }
+            try self.emitTaskReturnDeliver(tname, func, spilled, "__result");
+            self.raw("}\n\n");
+
+            self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+            try self.emitFlatParamDecls(func.params);
+            self.raw(") void {\n");
+            self.raw("    abi.resetScratch();\n");
+            try self.emitLiftParams(func.params);
+            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+            self.raw("}\n\n");
+            return;
+        }
+
+        // Auto form: the shell calls the impl and delivers the result.
+        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+        try self.emitFlatParamDecls(func.params);
+        self.raw(") void {\n");
+        self.raw("    abi.resetScratch();\n");
+        try self.emitLiftParams(func.params);
+
+        if (func.result == null) {
+            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+            self.print("    {s}.@\"task-return\"();\n", .{tname});
+        } else {
+            const rexpr = try std.fmt.allocPrint(self.ar, "Impl.{s}({s})", .{ camel_name, args });
+            try self.emitTaskReturnDeliver(tname, func, spilled, rexpr);
+        }
+        self.raw("}\n\n");
+    }
+
+    fn isManualReturn(self: *Gen, name: []const u8) bool {
+        for (self.manual_returns) |m| if (std.mem.eql(u8, m, name)) return true;
+        return false;
+    }
+
+    /// Emit the container-scope `const <tname> = struct { extern "[task-return]…" … };`
+    /// helper. The intrinsic takes the result's flat slots, or one i32 pointer
+    /// when the result spills past 16 slots.
+    fn emitTaskReturnExternDecl(self: *Gen, tname: []const u8, iface_id: []const u8, name: []const u8, func: ast.Func, spilled: bool) GenError!void {
         self.print("const {s} = struct {{\n", .{tname});
         self.print("    extern \"[task-return]{s}#{s}\" fn @\"task-return\"(", .{ iface_id, name });
-        if (func.result) |t| {
+        if (spilled) {
+            self.raw("d0: i32"); // pointer to the lowered result in memory
+        } else if (func.result) |t| {
             for ((try self.flatCores(t)), 0..) |c, i| {
                 if (i != 0) self.raw(", ");
                 self.print("d{d}: {s}", .{ i, @tagName(c) });
             }
         }
         self.raw(") void;\n};\n\n");
+    }
 
-        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
-        try self.emitFlatParamDecls(func.params);
-        self.raw(") void {\n");
-        self.raw("    abi.resetScratch();\n");
-
-        try self.emitLiftParams(func.params);
-
-        const args = try self.implArgList(func.params);
-        const camel_name = try camel(self.ar, name);
-        if (func.result == null) {
-            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
+    /// Emit the `task.return` delivery (4-space indented) for the result value
+    /// expression `rexpr` (ignored when the func has no result).
+    fn emitTaskReturnDeliver(self: *Gen, tname: []const u8, func: ast.Func, spilled: bool, rexpr: []const u8) GenError!void {
+        const t = func.result orelse {
             self.print("    {s}.@\"task-return\"();\n", .{tname});
+            return;
+        };
+        const rz = try self.zigType(t);
+        const rcount = try self.flatCount(t);
+        if (spilled) {
+            // Lower the result into a fresh scratch buffer (canonical layout) and
+            // hand task.return the pointer.
+            self.print("    const __ret = abi.alloc(canon.sizeOf({s}), canon.alignOf({s}));\n", .{ rz, rz });
+            self.print("    canon.lower({s}, {s}, __ret, &abi.alloc);\n", .{ rz, rexpr });
+            self.print("    {s}.@\"task-return\"(@intCast(@intFromPtr(__ret)));\n", .{tname});
         } else if (rcount == 1) {
-            self.print(
-                "    {s}.@\"task-return\"(canon.returnResult({s}, Impl.{s}({s}), &abi.alloc));\n",
-                .{ tname, try self.resultZig(func), camel_name, args },
-            );
+            self.print("    {s}.@\"task-return\"(canon.returnResult({s}, {s}, &abi.alloc));\n", .{ tname, rz, rexpr });
         } else {
-            // multi-slot: flatten the result to its core slots and pass them.
-            self.print(
-                "    const __r = canon.lowerFlat({s}, Impl.{s}({s}), &abi.alloc);\n",
-                .{ try self.resultZig(func), camel_name, args },
-            );
+            self.print("    const __r = canon.lowerFlat({s}, {s}, &abi.alloc);\n", .{ rz, rexpr });
             self.print("    {s}.@\"task-return\"(", .{tname});
             for (0..rcount) |i| {
                 if (i != 0) self.raw(", ");
@@ -496,7 +607,6 @@ const Gen = struct {
             }
             self.raw(");\n");
         }
-        self.raw("}\n\n");
     }
 
     fn implArgList(self: *Gen, params: []const ast.Param) GenError![]const u8 {
@@ -535,7 +645,7 @@ const Gen = struct {
     /// Emit the flattened `extern` import declaration (inside the `imp`
     /// namespace) for one imported function.
     fn emitImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
-        if (func.is_async) return error.UnsupportedWitType;
+        if (func.is_async) return self.emitAsyncImportExtern(iface_id, name, func);
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
         const indirect = rcount > 1;
 
@@ -552,10 +662,33 @@ const Gen = struct {
         }
     }
 
+    /// Sum of the flattened core slots of a func's params.
+    fn paramFlatCount(self: *Gen, params: []const ast.Param) GenError!usize {
+        var c: usize = 0;
+        for (params) |p| c += try self.flatCount(p.type);
+        return c;
+    }
+
+    /// Emit the `extern` decl for an imported **async** func. The canonical
+    /// async lowering produces `(flat params, result_ptr if any) -> i32 status`
+    /// (the packed callstatus); results are written to `result_ptr`. Params that
+    /// exceed `MAX_FLAT_ASYNC_PARAMS` (4) spill to a single pointer — a later
+    /// refinement, rejected for now.
+    fn emitAsyncImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
+        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, name });
+        try self.emitFlatParamDecls(func.params);
+        if (func.result != null) {
+            if (func.params.len > 0) self.raw(", ");
+            self.raw("result_ptr: i32");
+        }
+        self.raw(") i32;\n"); // packed callstatus
+    }
+
     /// Emit the typed wrapper that lowers params, calls the `imp.@"…"` extern,
     /// and lifts the result.
     fn emitImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
-        if (func.is_async) return error.UnsupportedWitType;
+        if (func.is_async) return self.emitAsyncImportWrapper(name, func);
         const result_zig = try self.resultZig(func);
         const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
         const indirect = rcount > 1;
@@ -581,6 +714,35 @@ const Gen = struct {
                 "        return canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n",
                 .{ result_zig, name, call_args },
             );
+        }
+        self.raw("    }\n");
+    }
+
+    /// Emit the typed wrapper for an imported **async** func: lower params, call
+    /// the async-lowered extern (returns the packed callstatus), drive it to
+    /// completion via `cm_async.awaitCall`, then lift the result the host wrote
+    /// to the result pointer. Always lifts from memory (async lowering writes
+    /// results indirectly, even for a single-slot result).
+    fn emitAsyncImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
+        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        const result_zig = try self.resultZig(func);
+
+        self.print("    pub fn {s}(", .{try camel(self.ar, name)});
+        try self.emitTypedParamDecls(func.params);
+        self.print(") {s} {{\n", .{result_zig});
+
+        const call_args = try self.lowerParams(func.params);
+        if (func.result != null) {
+            if (call_args.len > 0) {
+                self.print("        const __status = imp.@\"{s}\"({s}, abi.retPtr());\n", .{ name, call_args });
+            } else {
+                self.print("        const __status = imp.@\"{s}\"(abi.retPtr());\n", .{name});
+            }
+            self.raw("        cm_async.awaitCall(__status);\n");
+            self.print("        return canon.lift({s}, abi.retArea());\n", .{result_zig});
+        } else {
+            self.print("        const __status = imp.@\"{s}\"({s});\n", .{ name, call_args });
+            self.raw("        cm_async.awaitCall(__status);\n");
         }
         self.raw("    }\n");
     }
@@ -716,6 +878,120 @@ const Gen = struct {
             }
         }
         return t;
+    }
+
+    // ── complex future/stream channels (function-reference intrinsics) ───
+    //
+    // A non-primitive future/stream element can't be named with the
+    // `[future]future<T>` / `[stream]stream<T>` intrinsic module (that spelling
+    // only covers primitive `T`). `component new` instead resolves the
+    // function-reference form `[future]<iface>#<fn>#<idx>` (and `[stream]…`),
+    // where `<idx>` is the 0-based position of the future/stream in `<fn>`'s
+    // signature, walked params-then-result, depth-first pre-order (mirroring
+    // `collectAsyncInSig` / `collectAsyncInValType` in component_new.zig). We
+    // pre-walk every imported function, bind each distinct structural channel to
+    // one such site, and emit a shared `canon.FutureOf` / `canon.StreamOf` type.
+
+    const AsyncOcc = struct { is_future: bool, element: ?ast.Type };
+
+    /// Append every stream/future reachable from a function signature (params
+    /// then result), depth-first in appearance order. An occurrence's position
+    /// in `out` is its async-idx.
+    fn collectAsyncSig(self: *Gen, func: ast.Func, out: *std.ArrayListUnmanaged(AsyncOcc)) GenError!void {
+        for (func.params) |p| try self.collectAsyncTy(p.type, out);
+        if (func.result) |r| try self.collectAsyncTy(r, out);
+    }
+
+    fn collectAsyncTy(self: *Gen, raw_ty: ast.Type, out: *std.ArrayListUnmanaged(AsyncOcc)) GenError!void {
+        switch (self.resolveAlias(raw_ty)) {
+            .future => |e| {
+                try out.append(self.ar, .{ .is_future = true, .element = if (e) |p| p.* else null });
+                if (e) |p| try self.collectAsyncTy(p.*, out);
+            },
+            .stream => |e| {
+                try out.append(self.ar, .{ .is_future = false, .element = if (e) |p| p.* else null });
+                if (e) |p| try self.collectAsyncTy(p.*, out);
+            },
+            .option => |e| try self.collectAsyncTy(e.*, out),
+            .list => |e| try self.collectAsyncTy(e.*, out),
+            .result => |r| {
+                if (r.ok) |t| try self.collectAsyncTy(t.*, out);
+                if (r.err) |t| try self.collectAsyncTy(t.*, out);
+            },
+            .tuple => |elems| for (elems) |e| try self.collectAsyncTy(e, out),
+            .name => |n| switch (self.types.get(n) orelse return) {
+                .record => |fields| for (fields) |f| try self.collectAsyncTy(f.type, out),
+                .variant => |cases| for (cases) |c| if (c.type) |t| try self.collectAsyncTy(t, out),
+                else => {},
+            },
+            else => {},
+        }
+    }
+
+    /// True if a future/stream element is a primitive the `canon.Future` /
+    /// `canon.Stream` `[future]future<T>` spelling supports; a complex element
+    /// instead needs the function-reference intrinsic (`canon.FutureOf` /
+    /// `canon.StreamOf`).
+    fn isPrimitiveElement(self: *Gen, e: ?ast.Type) bool {
+        return switch (self.resolveAlias(e orelse return false)) {
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64 => true,
+            else => false,
+        };
+    }
+
+    /// Dedup key for a complex channel: family tag + element zig type.
+    fn chanKey(self: *Gen, is_future: bool, elem: ast.Type) GenError![]const u8 {
+        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ if (is_future) "F:" else "S:", try self.zigType(elem) });
+    }
+
+    /// The generated nominal type name for a complex channel, or null for a
+    /// primitive-element channel (which uses `canon.Future` / `canon.Stream`).
+    fn chanName(self: *Gen, is_future: bool, e: ?ast.Type) GenError!?[]const u8 {
+        const elem = e orelse return null;
+        if (self.isPrimitiveElement(e)) return null;
+        return self.chan_map.get(try self.chanKey(is_future, elem));
+    }
+
+    /// Pre-pass: register every distinct complex future/stream channel reachable
+    /// from the world's imported functions, binding each to a function-reference
+    /// intrinsic module. Each distinct structural channel is bound to one
+    /// canonical site (any valid site resolves to the same structure).
+    fn registerChannels(self: *Gen, uses: []const Use) GenError!void {
+        for (uses) |u| {
+            // Imports only for now: complex channels in the worlds we target are
+            // import-side; the export-side intrinsic form is a later refinement.
+            if (u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| try self.registerFuncChannels(u.id, fd.name, fd.func),
+                .type => |td| switch (td.kind) {
+                    .resource => |methods| for (methods) |m| {
+                        try self.registerFuncChannels(u.id, try self.resourceExternName(td.name, m), m.func);
+                    },
+                    else => {},
+                },
+                else => {},
+            };
+        }
+    }
+
+    fn registerFuncChannels(self: *Gen, iface_id: []const u8, fn_name: []const u8, func: ast.Func) GenError!void {
+        var occ = std.ArrayListUnmanaged(AsyncOcc).empty;
+        try self.collectAsyncSig(func, &occ);
+        for (occ.items, 0..) |o, idx| {
+            const elem = o.element orelse continue;
+            if (self.isPrimitiveElement(o.element)) continue;
+            const key = try self.chanKey(o.is_future, elem);
+            if (self.chan_map.contains(key)) continue;
+            const name = try std.fmt.allocPrint(self.ar, "__chan{d}", .{self.chan_counter});
+            self.chan_counter += 1;
+            const ctor: []const u8 = if (o.is_future) "FutureOf" else "StreamOf";
+            const family: []const u8 = if (o.is_future) "future" else "stream";
+            const rhs = try std.fmt.allocPrint(self.ar, "canon.{s}({s}, \"[{s}]{s}#{s}#{d}\")", .{
+                ctor, try self.zigType(elem), family, iface_id, fn_name, idx,
+            });
+            try self.chan_map.put(self.ar, key, name);
+            try self.chan_decls.append(self.ar, .{ .name = name, .rhs = rhs });
+        }
     }
 
     /// Lower each high-level param into the flat call arguments, emitting temp
@@ -1426,7 +1702,40 @@ test "generate: async export lift (task.return)" {
     try testing.expect(std.mem.indexOf(u8, out, "__task_1.@\"task-return\"(canon.returnResult(u32, Impl.double(__params.x), &abi.alloc));") != null);
 }
 
-test "generate: async multi-slot result lifts via lowerFlat; async import rejected" {
+test "generate: manual-return async export (--manual-return)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // handle: async func(x: u32) -> u32, requested in manual-return form. The
+    // shell only dispatches to the impl (which calls handleReturn when ready and
+    // may keep running afterward); the result is delivered by a pub return fn.
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "handle", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "h", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "h" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "p", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .manual_returns = &.{"handle"} };
+    try g.generate(exp_world, "host");
+    const out = g.out.items;
+    // A pub return fn delivers the result; the shell only calls the impl.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn handleReturn(__result: u32) void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(canon.returnResult(u32, __result, &abi.alloc));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"local:p/h@0.1.0#handle\"(x: i32) void {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "    Impl.handle(__params.x);\n") != null);
+    // No auto task.return embedding the impl call.
+    try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(u32, Impl.handle(") == null);
+}
+
+test "generate: async multi-slot result lifts via lowerFlat; async import via awaitCall" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -1459,10 +1768,85 @@ test "generate: async multi-slot result lifts via lowerFlat; async import reject
         try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(__r[0], __r[1]);") != null);
     }
     {
-        // Calling an imported async function (async lower) is a later phase.
+        // Importing an async func: the extern is async-lowered (params +
+        // result_ptr -> i32 status); the wrapper drives the subtask to
+        // completion via cm_async.awaitCall, then lifts the result from memory.
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
-        try testing.expectError(error.UnsupportedWitType, g.generate(agg_imp, "guest"));
+        try g.generate(agg_imp, "guest");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "const cm_async = @import(\"cm_async\");") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:a/api\" fn @\"greet\"(result_ptr: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"greet\"(abi.retPtr());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.lift([]const u8, abi.retArea());") != null);
     }
+}
+
+test "generate: async import with param + result (async-lower extern)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // double: async func(x: u32) -> u32;  imported.
+    const items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "double", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "math", .items = &items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "math" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "m" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // async-lower extern: the flat param `x` precedes the result pointer; the
+    // core result is the packed callstatus (i32), not the lifted u32.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:m/math\" fn @\"double\"(x: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn double(x: u32) u32 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"double\"(@bitCast(x), abi.retPtr());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(u32, abi.retArea());") != null);
+}
+
+test "generate: async export with >16-slot result spills task.return to a pointer" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // wide: async func() -> tuple<u32 x17>;  17 flat slots > MAX_FLAT_PARAMS (16),
+    // so task.return takes a single memory pointer to the lowered result.
+    const u32_ty: ast.Type = .u32;
+    const wide_result = ast.Type{ .tuple = &.{
+        u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty,
+        u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty, u32_ty,
+    } };
+    const items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "wide", .func = .{ .params = &.{}, .result = wide_result, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "w" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(exp_world, "host");
+    const out = g.out.items;
+    // The task.return intrinsic takes one i32 pointer (not 17 flat slots).
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"[task-return]test:w/api#wide\" fn @\"task-return\"(d0: i32) void;") != null);
+    // The result is lowered into a fresh scratch buffer and the pointer handed over.
+    try testing.expect(std.mem.indexOf(u8, out, "const __ret = abi.alloc(canon.sizeOf(") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "), __ret, &abi.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "__task_0.@\"task-return\"(@intCast(@intFromPtr(__ret)));") != null);
 }
 
 test "generate: future / stream / tuple in signatures" {
@@ -1511,6 +1895,62 @@ test "generate: future / stream / tuple in signatures" {
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
     // free function returning tuple<u32, string>.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() canon.Tuple(.{ u32, []const u8 }) {") != null);
+}
+
+test "generate: complex future/stream channels (function-reference intrinsics)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface api {
+    //   resource conn {
+    //     open: static func(seed: future<u32>) -> future<result<u32, string>>;
+    //   }
+    //   sink: func(s: stream<list<u8>>) -> bool;
+    // }
+    // A primitive `future<u32>` param (async-idx 0) precedes the complex
+    // `future<result<u32, string>>` result (async-idx 1): the complex channel
+    // must bind to `#1`, exercising the appearance-order index walk. The
+    // primitive channel stays `canon.Future(u32)`.
+    const u8_ty: ast.Type = .u8;
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const future_u32 = ast.Type{ .future = &u32_ty };
+    const res_u32_str = ast.Type{ .result = .{ .ok = &u32_ty, .err = &str_ty } };
+    const cfut = ast.Type{ .future = &res_u32_str };
+    const list_u8 = ast.Type{ .list = &u8_ty };
+    const cstream = ast.Type{ .stream = &list_u8 };
+    const conn_methods = [_]ast.ResourceMethod{
+        .{ .kind = .static, .name = "open", .func = .{ .params = &.{.{ .name = "seed", .type = future_u32 }}, .result = cfut } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "conn", .kind = .{ .resource = &conn_methods } } },
+        .{ .func = .{ .name = "sink", .func = .{ .params = &.{.{ .name = "s", .type = cstream }}, .result = .bool } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "x", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // Complex channels are shared nominal types bound to a function-reference
+    // intrinsic `[future]<iface>#<fn>#<idx>` (`<fn>` is the canonical extern
+    // name: a static method is `[static]conn.open`). The complex future is
+    // async-idx 1 (the primitive `future<u32>` param took idx 0).
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = canon.FutureOf(canon.Result(u32, []const u8), \"[future]demo:x/api@0.1.0#[static]conn.open#1\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = canon.StreamOf([]const u8, \"[stream]demo:x/api@0.1.0#sink#0\");") != null);
+    // The static wrapper: primitive param stays `canon.Future(u32)`; the complex
+    // result is the shared nominal `__chan0`.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: canon.Future(u32)) __chan0 {") != null);
+    // The complex stream is a param typed as the shared nominal `__chan1`.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn sink(s: __chan1) bool {") != null);
 }
 
 test "generate: option<handle> / option<scalar> params" {

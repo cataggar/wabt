@@ -3955,6 +3955,7 @@ fn buildComponentShimFixup(
                     w.opts,
                     memory_core_idx,
                     realloc_core_idx,
+                    w.fn_ref.sig.is_async,
                 );
                 try canons.append(ar, .{ .lower = .{
                     .func_idx = func_alias_by_shape[si][fi].comp_func_idx,

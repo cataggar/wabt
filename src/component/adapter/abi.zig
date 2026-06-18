@@ -536,6 +536,9 @@ fn saturatingAdd(a: u32, b: u32) u32 {
 /// these, the canon ABI passes through memory pointers.
 pub const MAX_FLAT_PARAMS: u32 = 16;
 pub const MAX_FLAT_RESULTS: u32 = 1;
+/// Async-lowered calls spill their params to a single pointer at a lower
+/// threshold than sync calls (Component Model `MAX_FLAT_ASYNC_PARAMS`).
+pub const MAX_FLAT_ASYNC_PARAMS: u32 = 4;
 
 pub const Classification = struct {
     class: Class,
@@ -590,7 +593,10 @@ pub fn classifyFunc(ftr: FuncTypeRef) Classification {
     const need_memory =
         params_have_string_or_list_via_memory or
         results_flat > MAX_FLAT_RESULTS or
-        results_have_string_or_list;
+        results_have_string_or_list or
+        // An async-lowered call writes its result through a caller-supplied
+        // pointer, so it always needs the `(memory)` opt when it has a result.
+        (ft.is_async and has_result);
 
     const need_realloc = results_have_string_or_list;
 
@@ -725,6 +731,24 @@ pub fn lowerCoreSig(
         .unnamed => |vt| try flattenSlots(arena, vt, resolver, 0, &results),
         .named => |list| for (list) |nv|
             try flattenSlots(arena, nv.type, resolver, 0, &results),
+    }
+
+    if (ft.is_async) {
+        // Async lower: params spill to one pointer past MAX_FLAT_ASYNC_PARAMS;
+        // results are always returned indirectly through a caller-supplied
+        // pointer (appended after the params when the func has a result); the
+        // core result is the packed callstatus (i32). (CanonicalABI.md
+        // `flatten_functype`, async `lower`.)
+        if (params.items.len > MAX_FLAT_ASYNC_PARAMS) {
+            params.clearRetainingCapacity();
+            try params.append(arena, .i32);
+        }
+        const has_result = results.items.len > 0;
+        if (has_result) try params.append(arena, .i32); // result pointer
+        return .{
+            .params = try params.toOwnedSlice(arena),
+            .results = try arena.dupe(wtypes.ValType, &.{.i32}),
+        };
     }
 
     if (results.items.len > MAX_FLAT_RESULTS) {
@@ -1190,8 +1214,34 @@ test "lowerCoreSig: option<u32> result becomes ret-ptr (i32) -> ()" {
     try testing.expectEqual(@as(usize, 0), sig.results.len);
 }
 
-test "lowerCoreSig: 1-flat result keeps 1 result, no extra param" {
+test "lowerCoreSig: async func -> (params, result_ptr) -> i32 status" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // double: async func(x: u32) -> u32.  Async lower: the flat param `x`
+    // precedes the result pointer; the core result is the packed callstatus.
+    var inst_decls = try a.alloc(ctypes.Decl, 2);
+    inst_decls[0] = .{ .type = .{ .func = .{
+        .params = &.{.{ .name = "x", .type = .u32 }},
+        .results = .{ .unnamed = .u32 },
+        .is_async = true,
+    } } };
+    inst_decls[1] = .{ .@"export" = .{ .name = "f", .desc = .{ .func = 0 } } };
+
+    const world = try buildSyntheticWorld(a, inst_decls, 0);
+    const ftr = try findFuncImport(world, 0, "f");
+    const sig = try lowerCoreSig(a, ftr);
+    try testing.expectEqual(@as(usize, 2), sig.params.len);
+    try testing.expectEqual(wtypes.ValType.i32, sig.params[0]); // x
+    try testing.expectEqual(wtypes.ValType.i32, sig.params[1]); // result pointer
+    try testing.expectEqual(@as(usize, 1), sig.results.len);
+    try testing.expectEqual(wtypes.ValType.i32, sig.results[0]); // packed callstatus
+    // An async func always needs the (memory) opt for its indirect result.
+    try testing.expect(classifyFunc(ftr).opts.memory);
+}
+
+test "lowerCoreSig: 1-flat result keeps 1 result, no extra param" {    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 

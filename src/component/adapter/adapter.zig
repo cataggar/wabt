@@ -1633,7 +1633,7 @@ fn assemble(in: Inputs) ![]u8 {
                     .instance_idx = bk.instance_idx,
                     .name = idf.name,
                 } });
-                const opts = try buildCanonLowerOpts(a, idf.cls.opts, memory_idx, realloc_idx);
+                const opts = try buildCanonLowerOpts(a, idf.cls.opts, memory_idx, realloc_idx, false);
                 const cf_idx = try b.addCanon(.{ .lower = .{
                     .func_idx = f_idx,
                     .opts = opts,
@@ -1665,7 +1665,7 @@ fn assemble(in: Inputs) ![]u8 {
             .instance_idx = iface_inst_idx,
             .name = info.fn_name,
         } });
-        const opts = try buildCanonLowerOpts(a, info.opts, memory_idx, main_realloc_idx);
+        const opts = try buildCanonLowerOpts(a, info.opts, memory_idx, main_realloc_idx, false);
         const cf_idx = try b.addCanon(.{ .lower = .{
             .func_idx = f_idx,
             .opts = opts,
@@ -1832,11 +1832,13 @@ pub fn buildCanonLowerOpts(
     o: abi.FuncOpts,
     memory_core_idx: u32,
     realloc_core_idx: u32,
+    is_async: bool,
 ) error{OutOfMemory}![]const ctypes.CanonOpt {
     var n: usize = 0;
     if (o.memory) n += 1;
     if (o.realloc) n += 1;
     if (o.string_encoding) n += 1;
+    if (is_async) n += 1;
 
     const opts = try arena.alloc(ctypes.CanonOpt, n);
     var i: usize = 0;
@@ -1850,6 +1852,10 @@ pub fn buildCanonLowerOpts(
     }
     if (o.string_encoding) {
         opts[i] = .{ .string_encoding = .utf8 };
+        i += 1;
+    }
+    if (is_async) {
+        opts[i] = .async_;
         i += 1;
     }
     return opts;
