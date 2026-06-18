@@ -682,21 +682,44 @@ const Gen = struct {
         for (params) |p| {
             const pn = try snake(self.ar, p.name);
             if (args.items.len != 0) try args.appendSlice(self.ar, ", ");
-            if (self.isHandleLike(p.type)) {
+            const rty = self.resolveAlias(p.type);
+            if (self.isHandleLike(rty)) {
                 try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}.handle", .{pn}));
                 continue;
             }
-            switch (p.type) {
-                .string => {
+            switch (rty) {
+                .string, .list => {
+                    // `string` / `list<T>`: pass the guest slice's (ptr, len).
                     try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "@intCast(@intFromPtr({s}.ptr)), @intCast({s}.len)", .{ pn, pn }));
                 },
-                .option => |e| try self.lowerOptionParam(&args, pn, e.*),
-                else => {
-                    try args.appendSlice(self.ar, try self.scalarLowerExpr(pn, p.type));
+                .option => |e| {
+                    const inner = self.resolveAlias(e.*);
+                    if (inner == .string or (try self.flatCount(inner)) == 1) {
+                        try self.lowerOptionParam(&args, pn, inner);
+                    } else {
+                        try self.lowerAggregateParam(&args, pn, p.type);
+                    }
                 },
+                .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .char => {
+                    try args.appendSlice(self.ar, try self.scalarLowerExpr(pn, rty));
+                },
+                // record / variant / result / tuple / enum / flags: flatten the
+                // whole value to its core slots via canon and pass them positionally.
+                else => try self.lowerAggregateParam(&args, pn, p.type),
             }
         }
         return args.items;
+    }
+
+    /// Lower an aggregate param: `const <pn>_s = canon.lowerFlat(<T>, <pn>,
+    /// &abi.alloc);` then pass `<pn>_s[0], …, <pn>_s[K-1]` positionally.
+    fn lowerAggregateParam(self: *Gen, args: *std.ArrayListUnmanaged(u8), pn: []const u8, ty: ast.Type) GenError!void {
+        const k = (try self.flatCores(ty)).len;
+        self.print("        const {s}_s = canon.lowerFlat({s}, {s}, &abi.alloc);\n", .{ pn, try self.zigType(ty), pn });
+        for (0..k) |i| {
+            if (i != 0) try args.appendSlice(self.ar, ", ");
+            try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}_s[{d}]", .{ pn, i }));
+        }
     }
 
     /// Lower an `option<inner>` param: a discriminant plus the (null-zeroed)
@@ -772,7 +795,8 @@ const Gen = struct {
         return out.items;
     }
 
-    fn flattenSlots(self: *Gen, out: *std.ArrayListUnmanaged(Slot), base: []const u8, ty: ast.Type) GenError!void {
+    fn flattenSlots(self: *Gen, out: *std.ArrayListUnmanaged(Slot), base: []const u8, raw_ty: ast.Type) GenError!void {
+        const ty = self.resolveAlias(raw_ty);
         if (self.isHandleLike(ty)) {
             try out.append(self.ar, .{ .name = base, .core = .i32 });
             return;
@@ -789,7 +813,81 @@ const Gen = struct {
             .tuple => |elems| for (elems, 0..) |e, i| {
                 try self.flattenSlots(out, try std.fmt.allocPrint(self.ar, "{s}_{d}", .{ base, i }), e);
             },
-            else => try out.append(self.ar, .{ .name = base, .core = self.coreOf(ty) catch return error.UnsupportedWitType }),
+            else => {
+                // scalar (1 slot) or aggregate (record/variant/result/enum/flags):
+                // use the canonical flat core types (with the variant join).
+                const cores = try self.flatCores(ty);
+                if (cores.len == 1) {
+                    try out.append(self.ar, .{ .name = base, .core = cores[0] });
+                } else for (cores, 0..) |c, i| {
+                    try out.append(self.ar, .{ .name = try std.fmt.allocPrint(self.ar, "{s}_{d}", .{ base, i }), .core = c });
+                }
+            },
+        }
+    }
+
+    fn joinCoreG(a: Core, b: Core) Core {
+        if (a == b) return a;
+        if ((a == .i32 and b == .f32) or (a == .f32 and b == .i32)) return .i32;
+        return .i64;
+    }
+
+    /// The canonical flat core types `ty` lowers to (mirrors `canon.flatTypeList`,
+    /// including the `variant`/`result` join). Used for both the flattened extern
+    /// signatures and the export param decls.
+    fn flatCores(self: *Gen, raw_ty: ast.Type) GenError![]const Core {
+        const ty = self.resolveAlias(raw_ty);
+        if (self.isHandleLike(ty)) return &[_]Core{.i32};
+        return switch (ty) {
+            .string, .list => &[_]Core{ .i32, .i32 },
+            .option => |e| blk: {
+                var l = std.ArrayListUnmanaged(Core).empty;
+                try l.append(self.ar, .i32);
+                try l.appendSlice(self.ar, try self.flatCores(e.*));
+                break :blk l.items;
+            },
+            .tuple => |elems| blk: {
+                var l = std.ArrayListUnmanaged(Core).empty;
+                for (elems) |e| try l.appendSlice(self.ar, try self.flatCores(e));
+                break :blk l.items;
+            },
+            .result => |r| blk: {
+                var l = std.ArrayListUnmanaged(Core).empty;
+                try l.append(self.ar, .i32); // discriminant
+                if (r.ok) |t| try self.joinInto(&l, t.*);
+                if (r.err) |t| try self.joinInto(&l, t.*);
+                break :blk l.items;
+            },
+            .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
+                .record => |fields| blk: {
+                    var l = std.ArrayListUnmanaged(Core).empty;
+                    for (fields) |f| try l.appendSlice(self.ar, try self.flatCores(f.type));
+                    break :blk l.items;
+                },
+                .variant => |cases| blk: {
+                    var l = std.ArrayListUnmanaged(Core).empty;
+                    try l.append(self.ar, .i32); // discriminant
+                    for (cases) |c| if (c.type) |t| try self.joinInto(&l, t);
+                    break :blk l.items;
+                },
+                .@"enum", .resource => &[_]Core{.i32},
+                .flags => |labels| blk: {
+                    var l = std.ArrayListUnmanaged(Core).empty;
+                    for (0..(labels.len + 31) / 32) |_| try l.append(self.ar, .i32);
+                    break :blk l.items;
+                },
+                .alias => unreachable, // resolved above
+            },
+            else => &[_]Core{try self.coreOf(ty)}, // scalar
+        };
+    }
+
+    /// Join `ty`'s flat cores element-wise into `l[1..]` (extending as needed).
+    fn joinInto(self: *Gen, l: *std.ArrayListUnmanaged(Core), ty: ast.Type) GenError!void {
+        const cores = try self.flatCores(ty);
+        for (cores, 0..) |c, i| {
+            const idx = 1 + i;
+            if (idx < l.items.len) l.items[idx] = joinCoreG(l.items[idx], c) else try l.append(self.ar, c);
         }
     }
 
@@ -1395,5 +1493,53 @@ test "generate: option<handle> / option<scalar> params" {
     try testing.expect(std.mem.indexOf(u8, out, "const t_0: i32 = if (t) |v| v.handle else 0;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const n_0: i32 = if (n) |v| @bitCast(v) else 0;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"set-a\"(t_disc, t_0, n_disc, n_0)") != null);
+}
+
+test "generate: aggregate params (variant / record) lower via canon.lowerFlat" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // variant method { get, post, other(string) }   → disc + (ptr, len) = 3 slots
+    // record point { x: u32, y: u32 }                 → 2 slots
+    const str_ty: ast.Type = .string;
+    const method_cases = [_]ast.Case{
+        .{ .name = "get", .type = null },
+        .{ .name = "post", .type = null },
+        .{ .name = "other", .type = str_ty },
+    };
+    const point_fields = [_]ast.Field{
+        .{ .name = "x", .type = .u32 },
+        .{ .name = "y", .type = .u32 },
+    };
+    const method_ref = ast.Type{ .name = "method" };
+    const point_ref = ast.Type{ .name = "point" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "method", .kind = .{ .variant = &method_cases } } },
+        .{ .type = .{ .name = "point", .kind = .{ .record = &point_fields } } },
+        .{ .func = .{ .name = "set-method", .func = .{ .params = &.{.{ .name = "m", .type = method_ref }}, .result = .bool } } },
+        .{ .func = .{ .name = "move-to", .func = .{ .params = &.{.{ .name = "p", .type = point_ref }}, .result = .u32 } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "m" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // variant flattens to disc + joined payload (here (ptr, len)) = 3 i32 slots.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"set-method\"(m_0: i32, m_1: i32, m_2: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const m_s = canon.lowerFlat(Method, m, &abi.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"set-method\"(m_s[0], m_s[1], m_s[2])") != null);
+    // record flattens to its concatenated fields = 2 i32 slots.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"move-to\"(p_0: i32, p_1: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = canon.lowerFlat(Point, p, &abi.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"move-to\"(p_s[0], p_s[1])") != null);
 }
 
