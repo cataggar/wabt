@@ -111,23 +111,109 @@ pub fn Tuple(comptime Ts: anytype) type {
     return std.meta.Tuple(&Ts);
 }
 
+/// The WIT spelling of a primitive type, for the `[stream]stream<…>` /
+/// `[future]future<…>` async-intrinsic module names. Non-primitive elements
+/// (resources, results, …) need the function-reference intrinsic form instead.
+fn witSpell(comptime T: type) []const u8 {
+    return switch (T) {
+        bool => "bool",
+        u8 => "u8",
+        u16 => "u16",
+        u32 => "u32",
+        u64 => "u64",
+        i8 => "s8",
+        i16 => "s16",
+        i32 => "s32",
+        i64 => "s64",
+        f32 => "f32",
+        f64 => "f64",
+        else => @compileError("canon: stream/future read/write needs a primitive element; got " ++ @typeName(T)),
+    };
+}
+
+/// The two ends of a freshly created `future`/`stream` of element `T`.
+fn EndsOf(comptime Chan: type) type {
+    return struct { readable: Chan, writable: Chan };
+}
+
+fn unpackChanEnds(comptime Chan: type, packed_ends: i64) EndsOf(Chan) {
+    const u: u64 = @bitCast(packed_ends);
+    return .{
+        .readable = .{ .handle = @bitCast(@as(u32, @truncate(u))) },
+        .writable = .{ .handle = @bitCast(@as(u32, @truncate(u >> 32))) },
+    };
+}
+
 /// The Zig type for a WIT `future<T>`: an async single-value channel. At the
-/// canonical ABI it is a single `i32` handle (the readable or writable end);
-/// the element type `T` is carried for read/write helpers. Lowers/lifts as a
-/// single-field record (the handle).
+/// canonical ABI it is a single `i32` handle (the readable or writable end).
+/// For a primitive `T` the read/write/drop intrinsics are available; the
+/// element type is carried for those helpers.
 pub fn Future(comptime T: type) type {
     return struct {
         handle: i32,
         pub const Element = T;
+        const Self = @This();
+        const mod = "[future]future<" ++ witSpell(T) ++ ">";
+
+        /// Create a new `future<T>`, returning both ends.
+        pub fn new() EndsOf(Self) {
+            const f = @extern(*const fn () callconv(.c) i64, .{ .name = "new", .library_name = mod });
+            return unpackChanEnds(Self, f());
+        }
+        /// Read the value into `out`; returns the raw canonical status.
+        pub fn read(self: Self, out: *T) i32 {
+            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(out)));
+        }
+        /// Write `value` (kept alive by the caller until the op completes).
+        pub fn write(self: Self, value: *const T) i32 {
+            const f = @extern(*const fn (i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(value)));
+        }
+        pub fn dropReadable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
+            f(self.handle);
+        }
+        pub fn dropWritable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-writable", .library_name = mod });
+            f(self.handle);
+        }
     };
 }
 
 /// The Zig type for a WIT `stream<T>`: an async multi-value channel. Like
-/// `Future`, a single `i32` handle at the canonical ABI.
+/// `Future`, a single `i32` handle at the canonical ABI; read/write/drop
+/// intrinsics are available for a primitive `T`.
 pub fn Stream(comptime T: type) type {
     return struct {
         handle: i32,
         pub const Element = T;
+        const Self = @This();
+        const mod = "[stream]stream<" ++ witSpell(T) ++ ">";
+
+        /// Create a new `stream<T>`, returning both ends.
+        pub fn new() EndsOf(Self) {
+            const f = @extern(*const fn () callconv(.c) i64, .{ .name = "new", .library_name = mod });
+            return unpackChanEnds(Self, f());
+        }
+        /// Read up to `buf.len` elements; returns the raw canonical status.
+        pub fn read(self: Self, buf: []T) i32 {
+            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "read", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(buf.ptr)), @intCast(buf.len));
+        }
+        /// Write `items`; returns the raw canonical status.
+        pub fn write(self: Self, items: []const T) i32 {
+            const f = @extern(*const fn (i32, i32, i32) callconv(.c) i32, .{ .name = "write", .library_name = mod });
+            return f(self.handle, @intCast(@intFromPtr(items.ptr)), @intCast(items.len));
+        }
+        pub fn dropReadable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-readable", .library_name = mod });
+            f(self.handle);
+        }
+        pub fn dropWritable(self: Self) void {
+            const f = @extern(*const fn (i32) callconv(.c) void, .{ .name = "drop-writable", .library_name = mod });
+            f(self.handle);
+        }
     };
 }
 
@@ -991,6 +1077,24 @@ test "Tuple / Future / Stream constructors marshal correctly" {
     const got = lift(T, &buf);
     try testing.expectEqual(@as(u32, 9), got[0]);
     try testing.expectEqualStrings("hi", got[1]);
+}
+
+test "Stream/Future intrinsic wrappers type-check for primitive elements" {
+    // The read/write/drop/new methods declare `@extern` intrinsics whose module
+    // is `[stream]stream<u8>` / `[future]future<u32>`; they can't be called
+    // natively, but must type-check (analyzing them evaluates the module name).
+    const S = Stream(u8);
+    _ = @TypeOf(S.new);
+    _ = @TypeOf(S.read);
+    _ = @TypeOf(S.write);
+    _ = @TypeOf(S.dropReadable);
+    const F = Future(u32);
+    _ = @TypeOf(F.new);
+    _ = @TypeOf(F.read);
+    _ = @TypeOf(F.write);
+    // Adding methods doesn't change the handle marshalling.
+    try testing.expectEqual(@as(usize, 1), flatCount(S));
+    try testing.expectEqual(@as(usize, 1), flatCount(F));
 }
 
 // ── Flags (packed struct) ───────────────────────────────────────────
