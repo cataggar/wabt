@@ -201,7 +201,12 @@ const Gen = struct {
         // ── named types ──
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
-                .type => |td| try self.emitTypeDef(td),
+                .type => |td| {
+                    // Exported resources (guest-implemented, resource-new/rep) are
+                    // a later phase; imported resources are handled below.
+                    if (td.kind == .resource and u.is_export) return error.UnsupportedWitType;
+                    try self.emitTypeDef(u.id, td);
+                },
                 else => {},
             };
         }
@@ -228,7 +233,7 @@ const Gen = struct {
 
     // ── type emission ────────────────────────────────────────────────
 
-    fn emitTypeDef(self: *Gen, td: ast.TypeDef) GenError!void {
+    fn emitTypeDef(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
         switch (td.kind) {
             .record => |fields| {
                 self.print("pub const {s} = struct {{\n", .{try pascal(self.ar, td.name)});
@@ -267,7 +272,7 @@ const Gen = struct {
             .alias => |t| {
                 self.print("pub const {s} = {s};\n\n", .{ try pascal(self.ar, td.name), try self.zigType(t) });
             },
-            else => return error.UnsupportedWitType, // resource: later phase
+            .resource => try self.emitResource(iface_id, td),
         }
     }
 
@@ -293,6 +298,7 @@ const Gen = struct {
                 const err = if (r.err) |t| try self.zigType(t.*) else "void";
                 break :blk try std.fmt.allocPrint(self.ar, "canon.Result({s}, {s})", .{ ok, err });
             },
+            .own, .borrow => |r| try pascal(self.ar, r), // resource handle wrapper
             .name => |n| try pascal(self.ar, n),
             else => error.UnsupportedWitType,
         };
@@ -329,10 +335,11 @@ const Gen = struct {
                     },
                     .flags => |labels| (labels.len + 31) / 32, // i32 slots
                     .@"enum" => 1,
+                    .resource => 1, // an i32 handle
                     .alias => |t| try self.flatCount(t),
-                    else => error.UnsupportedWitType,
                 };
             },
+            .own, .borrow => 1, // resource handle (i32)
             else => 1, // scalars (bool/int/float/char/enum)
         };
     }
@@ -474,6 +481,126 @@ const Gen = struct {
         self.raw("    }\n");
     }
 
+    // ── resources (imported) ─────────────────────────────────────────
+
+    /// The canonical extern name for a resource method/static/constructor.
+    fn resourceExternName(self: *Gen, rname: []const u8, m: ast.ResourceMethod) GenError![]const u8 {
+        return switch (m.kind) {
+            .constructor => try std.fmt.allocPrint(self.ar, "[constructor]{s}", .{rname}),
+            .method => try std.fmt.allocPrint(self.ar, "[method]{s}.{s}", .{ rname, m.name }),
+            .static => try std.fmt.allocPrint(self.ar, "[static]{s}.{s}", .{ rname, m.name }),
+        };
+    }
+
+    /// Emit an imported resource as a handle-wrapper struct: an `i32` handle, a
+    /// private `imp` namespace of the canonical resource externs, typed
+    /// method/static/constructor wrappers, and a `deinit` that drops the handle.
+    fn emitResource(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
+        const methods = td.kind.resource;
+        const R = try pascal(self.ar, td.name);
+
+        self.print("pub const {s} = struct {{\n", .{R});
+        self.raw("    handle: i32,\n\n");
+
+        self.raw("    const imp = struct {\n");
+        for (methods) |m| try self.emitResourceExtern(iface_id, td.name, m);
+        self.print("        extern \"{s}\" fn @\"[resource-drop]{s}\"(self: i32) void;\n", .{ iface_id, td.name });
+        self.raw("    };\n\n");
+
+        for (methods) |m| try self.emitResourceWrapper(R, td.name, m);
+
+        self.print("    pub fn deinit(self: {s}) void {{\n", .{R});
+        self.print("        imp.@\"[resource-drop]{s}\"(self.handle);\n", .{td.name});
+        self.raw("    }\n");
+        self.raw("};\n\n");
+    }
+
+    fn emitResourceExtern(self: *Gen, iface_id: []const u8, rname: []const u8, m: ast.ResourceMethod) GenError!void {
+        const func = m.func;
+        if (func.is_async) return error.UnsupportedWitType;
+        const ext = try self.resourceExternName(rname, m);
+
+        self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, ext });
+        var first = true;
+        if (m.kind == .method) {
+            self.raw("self: i32");
+            first = false;
+        }
+        for (func.params) |p| {
+            const slots = try self.paramSlots(p);
+            for (slots) |s| {
+                if (!first) self.raw(", ");
+                first = false;
+                self.print("{s}: {s}", .{ s.name, @tagName(s.core) });
+            }
+        }
+        if (m.kind == .constructor) {
+            self.raw(") i32;\n"); // -> own<R> handle
+            return;
+        }
+        const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
+        if (rcount > 1) {
+            if (!first) self.raw(", ");
+            self.raw("retptr: i32) void;\n");
+        } else if (rcount == 1) {
+            self.print(") {s};\n", .{@tagName(try self.coreOfResult(func.result.?))});
+        } else {
+            self.raw(") void;\n");
+        }
+    }
+
+    fn emitResourceWrapper(self: *Gen, R: []const u8, rname: []const u8, m: ast.ResourceMethod) GenError!void {
+        const func = m.func;
+        if (func.is_async) return error.UnsupportedWitType;
+        const ext = try self.resourceExternName(rname, m);
+        const is_method = m.kind == .method;
+
+        if (m.kind == .constructor) {
+            self.raw("    pub fn init(");
+        } else {
+            self.print("    pub fn {s}(", .{try camel(self.ar, m.name)});
+        }
+        if (is_method) {
+            self.print("self: {s}", .{R});
+            if (func.params.len > 0) self.raw(", ");
+        }
+        try self.emitTypedParamDecls(func.params);
+        if (m.kind == .constructor) {
+            self.print(") {s} {{\n", .{R});
+        } else {
+            self.print(") {s} {{\n", .{try self.resultZig(func)});
+        }
+
+        // lower params → arg expressions (emitting temps as needed)
+        const call_args = try self.lowerParams(func.params);
+        const args = if (is_method) blk: {
+            if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
+            break :blk "self.handle";
+        } else call_args;
+
+        if (m.kind == .constructor) {
+            self.print("        return .{{ .handle = imp.@\"{s}\"({s}) }};\n", .{ ext, args });
+            self.raw("    }\n");
+            return;
+        }
+
+        const result_zig = try self.resultZig(func);
+        const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
+        if (rcount > 1) {
+            if (args.len > 0) {
+                self.print("        imp.@\"{s}\"({s}, abi.retPtr());\n", .{ ext, args });
+            } else {
+                self.print("        imp.@\"{s}\"(abi.retPtr());\n", .{ext});
+            }
+            self.print("        return canon.lift({s}, abi.retArea());\n", .{result_zig});
+        } else if (func.result == null) {
+            self.print("        imp.@\"{s}\"({s});\n", .{ ext, args });
+        } else {
+            self.print("        return canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n", .{ result_zig, ext, args });
+        }
+        self.raw("    }\n");
+    }
+
     /// Lower each high-level param into the flat call arguments, emitting temp
     /// statements for `option<…>`. Returns the comma-joined argument list.
     fn lowerParams(self: *Gen, params: []const ast.Param) GenError![]const u8 {
@@ -481,6 +608,10 @@ const Gen = struct {
         for (params) |p| {
             const pn = try snake(self.ar, p.name);
             if (args.items.len != 0) try args.appendSlice(self.ar, ", ");
+            if (self.handleResource(p.type) != null) {
+                try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}.handle", .{pn}));
+                continue;
+            }
             switch (p.type) {
                 .string => {
                     try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "@intCast(@intFromPtr({s}.ptr)), @intCast({s}.len)", .{ pn, pn }));
@@ -558,6 +689,10 @@ const Gen = struct {
     }
 
     fn flattenSlots(self: *Gen, out: *std.ArrayListUnmanaged(Slot), base: []const u8, ty: ast.Type) GenError!void {
+        if (self.handleResource(ty) != null) {
+            try out.append(self.ar, .{ .name = base, .core = .i32 });
+            return;
+        }
         switch (ty) {
             .string, .list => {
                 try out.append(self.ar, .{ .name = try std.fmt.allocPrint(self.ar, "{s}_ptr", .{base}), .core = .i32 });
@@ -578,7 +713,18 @@ const Gen = struct {
             .u64, .s64 => .i64,
             .f32 => .f32,
             .f64 => .f64,
+            .own, .borrow => .i32, // resource handle
             else => error.UnsupportedWitType,
+        };
+    }
+
+    /// If `ty` is a resource handle — `own<R>`, `borrow<R>`, or a bare reference
+    /// to a resource type — return the resource's WIT name; otherwise null.
+    fn handleResource(self: *Gen, ty: ast.Type) ?[]const u8 {
+        return switch (ty) {
+            .own, .borrow => |r| r,
+            .name => |n| if (self.types.get(n)) |k| (if (k == .resource) n else null) else null,
+            else => null,
         };
     }
 
@@ -588,15 +734,16 @@ const Gen = struct {
         // flatten to its i32; a single-field record flattens to that field.
         return switch (ty) {
             .result => .i32,
+            .own, .borrow => .i32, // resource handle
             .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
                 .@"enum", .variant => .i32,
                 .flags => .i32, // ≤32 labels → a single i32 slot
+                .resource => .i32, // a handle
                 .record => |fields| if (fields.len == 1)
                     try self.coreOfResult(fields[0].type)
                 else
                     error.UnsupportedWitType,
                 .alias => |t| try self.coreOfResult(t),
-                else => error.UnsupportedWitType,
             },
             else => self.coreOf(ty),
         };
@@ -946,6 +1093,67 @@ test "generate: flags typedef + flat return" {
         // ≤32 labels → flat i32.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:f/api\" fn @\"get-perms\"() i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(Perms, imp.@\"get-perms\"());") != null);
+    }
+}
+
+test "generate: imported resource handle struct + methods/static/ctor/drop" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // resource counter { constructor(start: u32); increment: func(by: u32) -> u32;
+    //   make-zero: static func() -> counter; }
+    const counter_methods = [_]ast.ResourceMethod{
+        .{ .kind = .constructor, .name = "", .func = .{ .params = &.{.{ .name = "start", .type = .u32 }}, .result = null } },
+        .{ .kind = .method, .name = "increment", .func = .{ .params = &.{.{ .name = "by", .type = .u32 }}, .result = .u32 } },
+        .{ .kind = .static, .name = "make-zero", .func = .{ .params = &.{}, .result = ast.Type{ .name = "counter" } } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "counter", .kind = .{ .resource = &counter_methods } } },
+    };
+    const iface = ast.Interface{ .name = "counters", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "counters" } } } },
+    } };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "counters" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "res" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = imp_world },
+            .{ .world = exp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(imp_world, "guest");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Counter = struct {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "    handle: i32,") != null);
+        // canonical resource externs (module = iface id).
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[constructor]counter\"(start: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[method]counter.increment\"(self: i32, by: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[static]counter.make-zero\"() i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[resource-drop]counter\"(self: i32) void;") != null);
+        // typed wrappers.
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn init(start: u32) Counter {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return .{ .handle = imp.@\"[constructor]counter\"(@bitCast(start)) };") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn increment(self: Counter, by: u32) u32 {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]counter.increment\"(self.handle, @bitCast(by))") != null);
+        // a static returning own<counter> lifts the handle into the wrapper struct.
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn makeZero() Counter {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(Counter, imp.@\"[static]counter.make-zero\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn deinit(self: Counter) void {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[resource-drop]counter\"(self.handle);") != null);
+    }
+    {
+        // Exported (guest-implemented) resources are not supported yet.
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
     }
 }
 
