@@ -662,6 +662,19 @@ const Gen = struct {
         self.raw("    }\n");
     }
 
+    /// Follow `type x = y` aliases to the underlying WIT type.
+    fn resolveAlias(self: *Gen, ty: ast.Type) ast.Type {
+        var t = ty;
+        while (t == .name) {
+            const k = self.types.get(t.name) orelse return t;
+            switch (k) {
+                .alias => |a| t = a,
+                else => return t,
+            }
+        }
+        return t;
+    }
+
     /// Lower each high-level param into the flat call arguments, emitting temp
     /// statements for `option<…>`. Returns the comma-joined argument list.
     fn lowerParams(self: *Gen, params: []const ast.Param) GenError![]const u8 {
@@ -677,24 +690,34 @@ const Gen = struct {
                 .string => {
                     try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "@intCast(@intFromPtr({s}.ptr)), @intCast({s}.len)", .{ pn, pn }));
                 },
-                .option => |e| {
-                    // emit disc/payload temps
-                    self.print("        const {s}_disc: i32 = if ({s} != null) 1 else 0;\n", .{ pn, pn });
-                    switch (e.*) {
-                        .string => {
-                            self.print("        const {s}_ptr: i32 = if ({s}) |v| @intCast(@intFromPtr(v.ptr)) else 0;\n", .{ pn, pn });
-                            self.print("        const {s}_len: i32 = if ({s}) |v| @intCast(v.len) else 0;\n", .{ pn, pn });
-                            try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}_disc, {s}_ptr, {s}_len", .{ pn, pn, pn }));
-                        },
-                        else => return error.UnsupportedWitType,
-                    }
-                },
+                .option => |e| try self.lowerOptionParam(&args, pn, e.*),
                 else => {
                     try args.appendSlice(self.ar, try self.scalarLowerExpr(pn, p.type));
                 },
             }
         }
         return args.items;
+    }
+
+    /// Lower an `option<inner>` param: a discriminant plus the (null-zeroed)
+    /// payload slots. `string` is the (ptr, len) special case; otherwise the
+    /// payload must flatten to a single core slot (a scalar or a handle).
+    fn lowerOptionParam(self: *Gen, args: *std.ArrayListUnmanaged(u8), pn: []const u8, inner: ast.Type) GenError!void {
+        self.print("        const {s}_disc: i32 = if ({s} != null) 1 else 0;\n", .{ pn, pn });
+        if (inner == .string) {
+            self.print("        const {s}_ptr: i32 = if ({s}) |v| @intCast(@intFromPtr(v.ptr)) else 0;\n", .{ pn, pn });
+            self.print("        const {s}_len: i32 = if ({s}) |v| @intCast(v.len) else 0;\n", .{ pn, pn });
+            try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}_disc, {s}_ptr, {s}_len", .{ pn, pn, pn }));
+            return;
+        }
+        if (try self.flatCount(inner) != 1) return error.UnsupportedWitType;
+        const core = @tagName(try self.coreOfResult(inner));
+        const some: []const u8 = if (self.isHandleLike(inner))
+            "v.handle"
+        else
+            try self.scalarLowerExpr("v", self.resolveAlias(inner));
+        self.print("        const {s}_0: {s} = if ({s}) |v| {s} else 0;\n", .{ pn, core, pn, some });
+        try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}_disc, {s}_0", .{ pn, pn }));
     }
 
     fn scalarLowerExpr(self: *Gen, name: []const u8, ty: ast.Type) GenError![]const u8 {
@@ -1336,5 +1359,41 @@ test "generate: future / stream / tuple in signatures" {
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
     // free function returning tuple<u32, string>.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() canon.Tuple(.{ u32, []const u8 }) {") != null);
+}
+
+test "generate: option<handle> / option<scalar> params" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // resource thing { }
+    // set-a: func(t: option<thing>, n: option<u32>) -> bool;
+    const thing_methods = [_]ast.ResourceMethod{};
+    const thing_ref = ast.Type{ .name = "thing" };
+    const opt_thing = ast.Type{ .option = &thing_ref };
+    const u32_ty: ast.Type = .u32;
+    const opt_u32 = ast.Type{ .option = &u32_ty };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &thing_methods } } },
+        .{ .func = .{ .name = "set-a", .func = .{ .params = &.{ .{ .name = "t", .type = opt_thing }, .{ .name = "n", .type = opt_u32 } }, .result = .bool } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "o" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // each option lowers to a discriminant + a single (null-zeroed) payload slot.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:o/api\" fn @\"set-a\"(t_disc: i32, t: i32, n_disc: i32, n: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const t_0: i32 = if (t) |v| v.handle else 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const n_0: i32 = if (n) |v| @bitCast(v) else 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"set-a\"(t_disc, t_0, n_disc, n_0)") != null);
 }
 
