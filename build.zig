@@ -15,9 +15,11 @@ pub fn build(b: *std.Build) void {
     cm_async.addImport("abi", abi);
 
     // Comptime canonical-ABI value marshaller (records / strings / options /
-    // lists → linear memory). Depends only on `std`; a guest passes it the
-    // `abi.alloc` realloc.
+    // lists → linear memory). Lowers via a caller-supplied realloc; for `lift`
+    // of a `list<E>` whose element can't be borrowed in place (e.g. a tagged
+    // `variant`) it copies elements via `abi`'s scratch arena.
     const canon = b.addModule("canon", .{ .root_source_file = b.path("src/canon.zig") });
+    canon.addImport("abi", abi);
 
     // `wabt component bindgen`-generated `wasi:cli@0.3.0` import client wrappers;
     // `wasi_cli` is the ergonomic layer over them.
@@ -88,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
         }),
     });
+    canon_tests.root_module.addImport("abi", abi);
     const run_canon_tests = b.addRunArtifact(canon_tests);
 
     const test_step = b.step("test", "Run native unit tests");
@@ -169,7 +172,7 @@ pub const ModuleSpec = struct {
 
 pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
-    .{ .name = "canon" },
+    .{ .name = "canon", .deps = &.{"abi"} },
     .{ .name = "cm_async", .deps = &.{"abi"} },
     .{ .name = "wasi_cli_bindings", .deps = &.{ "canon", "abi" } },
     .{ .name = "wasi_cli", .deps = &.{ "cm_async", "canon", "abi", "wasi_cli_bindings" } },
