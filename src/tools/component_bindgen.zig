@@ -156,6 +156,11 @@ const Core = enum { i32, i64, f32, f64 };
 /// channel: its Zig name and the `canon.FutureOf(…)` / `canon.StreamOf(…)` RHS.
 const ChanDecl = struct { name: []const u8, rhs: []const u8 };
 
+/// Per-interface view of a named type: its kind and the interface whose name
+/// drives the emitted Zig identifier (the definer — itself for a local type, or
+/// the source for a `use`d type).
+const ScopedType = struct { kind: ast.TypeDefKind, def_iface: []const u8 };
+
 const GenError = error{ OutOfMemory, UnsupportedWitType, UnknownInterface, UnknownType };
 
 const Gen = struct {
@@ -165,8 +170,18 @@ const Gen = struct {
     /// Async export func names to generate in manual-return form (`--manual-return`).
     manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
-    // WIT type name → its kind, across all interfaces in the world.
+    // WIT type name → its kind, across all interfaces in the world. Global
+    // fallback; per-interface resolution goes through `scoped` first so
+    // same-named types in different interfaces (e.g. two `error-code`s) keep
+    // their own structure + Zig name (#303).
     types: std.StringHashMapUnmanaged(ast.TypeDefKind) = .empty,
+    // (iface_id \x00 name) → { kind, def_iface } for every named type each
+    // interface can reference (its locals + `use`d types). `def_iface` is the
+    // interface whose name drives the emitted Zig identifier.
+    scoped: std.StringHashMapUnmanaged(ScopedType) = .empty,
+    // Names defined *locally* by ≥2 interfaces — their Zig identifier is
+    // disambiguated by the defining interface.
+    colliding: std.StringHashMapUnmanaged(void) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
     // Distinct complex (non-primitive-element) future/stream channels → the
@@ -222,18 +237,33 @@ const Gen = struct {
         // package context of the interface that contains the `use`).
         const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, iface_id: []const u8 };
         var used_types = std.ArrayListUnmanaged(UsedType).empty;
+        // #303: detect names defined *locally* by more than one interface so we
+        // can disambiguate their Zig identifiers. Keyed by name → first
+        // defining interface; a second distinct definer marks a collision.
+        var local_def_iface = std.StringHashMapUnmanaged([]const u8).empty;
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
-                .type => |td| try self.types.put(self.ar, td.name, td.kind),
+                .type => |td| {
+                    try self.types.put(self.ar, td.name, td.kind);
+                    try self.scoped.put(self.ar, self.scopeKey(u.id, td.name), .{ .kind = td.kind, .def_iface = u.id });
+                    const gop = try local_def_iface.getOrPut(self.ar, td.name);
+                    if (gop.found_existing) {
+                        if (!std.mem.eql(u8, gop.value_ptr.*, u.id))
+                            try self.colliding.put(self.ar, td.name, {});
+                    } else gop.value_ptr.* = u.id;
+                },
                 .use => |use_item| {
                     const hit = self.resolver.findInterfaceWithPkgCtx(use_item.from, u.pkg) orelse continue;
                     const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
                     const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                     for (use_item.names) |un| {
                         const local = un.rename orelse un.name;
-                        if (self.types.contains(local)) continue;
                         for (hit.iface.items) |sit| switch (sit) {
                             .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
+                                // The consuming interface can reference `local`,
+                                // bound to the source's structure + name.
+                                try self.scoped.put(self.ar, self.scopeKey(u.id, local), .{ .kind = td.kind, .def_iface = src_id });
+                                if (self.types.contains(local)) continue;
                                 try self.types.put(self.ar, local, td.kind);
                                 try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
                             },
@@ -330,19 +360,19 @@ const Gen = struct {
     fn emitTypeDef(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
         switch (td.kind) {
             .record => |fields| {
-                self.print("pub const {s} = struct {{\n", .{try pascal(self.ar, td.name)});
+                self.print("pub const {s} = struct {{\n", .{try self.typeName(td.name)});
                 for (fields) |f| {
                     self.print("    {s}: {s},\n", .{ try snake(self.ar, f.name), try self.zigType(f.type) });
                 }
                 self.raw("};\n\n");
             },
             .@"enum" => |cases| {
-                self.print("pub const {s} = enum {{\n", .{try pascal(self.ar, td.name)});
+                self.print("pub const {s} = enum {{\n", .{try self.typeName(td.name)});
                 for (cases) |c| self.print("    {s},\n", .{try snake(self.ar, c)});
                 self.raw("};\n\n");
             },
             .variant => |cases| {
-                self.print("pub const {s} = union(enum) {{\n", .{try pascal(self.ar, td.name)});
+                self.print("pub const {s} = union(enum) {{\n", .{try self.typeName(td.name)});
                 for (cases) |c| {
                     if (c.type) |t| {
                         self.print("    {s}: {s},\n", .{ try snake(self.ar, c.name), try self.zigType(t) });
@@ -358,13 +388,13 @@ const Gen = struct {
                 // labels). >32 labels (multi-i32) is a later phase.
                 if (labels.len > 32) return error.UnsupportedWitType;
                 const bits: usize = if (labels.len <= 8) 8 else if (labels.len <= 16) 16 else 32;
-                self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try pascal(self.ar, td.name), bits });
+                self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try self.typeName(td.name), bits });
                 for (labels) |l| self.print("    {s}: bool = false,\n", .{try snake(self.ar, l)});
                 if (bits > labels.len) self.print("    _padding: u{d} = 0,\n", .{bits - labels.len});
                 self.raw("};\n\n");
             },
             .alias => |t| {
-                self.print("pub const {s} = {s};\n\n", .{ try pascal(self.ar, td.name), try self.zigType(t) });
+                self.print("pub const {s} = {s};\n\n", .{ try self.typeName(td.name), try self.zigType(t) });
             },
             .resource => try self.emitResource(iface_id, td),
         }
@@ -411,8 +441,8 @@ const Gen = struct {
             else
                 try std.fmt.allocPrint(self.ar, "canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
             .error_context => "canon.ErrorContextHandle",
-            .own, .borrow => |r| try pascal(self.ar, r), // resource handle wrapper
-            .name => |n| try pascal(self.ar, n),
+            .own, .borrow => |r| try self.typeName(r), // resource handle wrapper
+            .name => |n| try self.typeName(n),
         };
     }
 
@@ -436,7 +466,7 @@ const Gen = struct {
             },
             .future, .stream, .error_context => 1, // an i32 handle
             .name => |n| blk: {
-                const kind = self.types.get(n) orelse return error.UnknownType;
+                const kind = self.typeKind(n) orelse return error.UnknownType;
                 break :blk switch (kind) {
                     .record => |fields| r: {
                         var c: usize = 0;
@@ -812,7 +842,7 @@ const Gen = struct {
     /// method/static/constructor wrappers, and a `deinit` that drops the handle.
     fn emitResource(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
         const methods = td.kind.resource;
-        const R = try pascal(self.ar, td.name);
+        const R = try self.typeName(td.name);
 
         self.print("pub const {s} = struct {{\n", .{R});
         self.raw("    handle: i32,\n\n");
@@ -1005,10 +1035,48 @@ const Gen = struct {
     }
 
 
+    /// `iface_id \x00 name` — the `scoped` map key.
+    fn scopeKey(self: *Gen, iface: []const u8, name: []const u8) []const u8 {
+        return std.fmt.allocPrint(self.ar, "{s}\x00{s}", .{ iface, name }) catch @panic("OOM");
+    }
+
+    /// The kind of a named type, resolved in the current interface's scope (so a
+    /// `use`d or same-named type binds to the right structure), falling back to
+    /// the global registry when no interface context is set.
+    fn typeKind(self: *Gen, name: []const u8) ?ast.TypeDefKind {
+        if (self.current_iface.len != 0) {
+            if (self.scoped.get(self.scopeKey(self.current_iface, name))) |info| return info.kind;
+        }
+        return self.types.get(name);
+    }
+
+    /// The interface name (`<iface>`) portion of a qualified id
+    /// (`<ns>:<pkg>/<iface>[@<ver>]`).
+    fn ifaceBaseName(iface_id: []const u8) []const u8 {
+        var s = iface_id;
+        if (std.mem.lastIndexOfScalar(u8, s, '/')) |i| s = s[i + 1 ..];
+        if (std.mem.indexOfScalar(u8, s, '@')) |i| s = s[0..i];
+        return s;
+    }
+
+    /// The Zig identifier for a named type. Unique names keep their plain
+    /// PascalCase; a name defined by several interfaces is prefixed with its
+    /// defining interface (e.g. `IpNameLookupErrorCode`) so the bindings compile
+    /// (#303).
+    fn typeName(self: *Gen, name: []const u8) GenError![]const u8 {
+        if (!self.colliding.contains(name)) return pascal(self.ar, name);
+        const def_iface = if (self.current_iface.len != 0)
+            (if (self.scoped.get(self.scopeKey(self.current_iface, name))) |info| info.def_iface else self.current_iface)
+        else
+            self.current_iface;
+        if (def_iface.len == 0) return pascal(self.ar, name);
+        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ try pascal(self.ar, ifaceBaseName(def_iface)), try pascal(self.ar, name) });
+    }
+
     fn resolveAlias(self: *Gen, ty: ast.Type) ast.Type {
         var t = ty;
         while (t == .name) {
-            const k = self.types.get(t.name) orelse return t;
+            const k = self.typeKind(t.name) orelse return t;
             switch (k) {
                 .alias => |a| t = a,
                 else => return t,
@@ -1056,7 +1124,7 @@ const Gen = struct {
                 if (r.err) |t| try self.collectAsyncTy(t.*, out);
             },
             .tuple => |elems| for (elems) |e| try self.collectAsyncTy(e, out),
-            .name => |n| switch (self.types.get(n) orelse return) {
+            .name => |n| switch (self.typeKind(n) orelse return) {
                 .record => |fields| for (fields) |f| try self.collectAsyncTy(f.type, out),
                 .variant => |cases| for (cases) |c| if (c.type) |t| try self.collectAsyncTy(t, out),
                 else => {},
@@ -1319,7 +1387,7 @@ const Gen = struct {
                 if (r.err) |t| try self.joinInto(&l, t.*);
                 break :blk l.items;
             },
-            .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
+            .name => |n| switch (self.typeKind(n) orelse return error.UnknownType) {
                 .record => |fields| blk: {
                     var l = std.ArrayListUnmanaged(Core).empty;
                     for (fields) |f| try l.appendSlice(self.ar, try self.flatCores(f.type));
@@ -1376,7 +1444,7 @@ const Gen = struct {
     fn isHandleLike(self: *Gen, ty: ast.Type) bool {
         return switch (ty) {
             .own, .borrow, .future, .stream, .error_context => true,
-            .name => |n| if (self.types.get(n)) |k| k == .resource else false,
+            .name => |n| if (self.typeKind(n)) |k| k == .resource else false,
             else => false,
         };
     }
@@ -1389,7 +1457,7 @@ const Gen = struct {
             .result => .i32,
             .own, .borrow, .future, .stream, .error_context => .i32, // handles
             .tuple => |elems| if (elems.len == 1) try self.coreOfResult(elems[0]) else error.UnsupportedWitType,
-            .name => |n| switch (self.types.get(n) orelse return error.UnknownType) {
+            .name => |n| switch (self.typeKind(n) orelse return error.UnknownType) {
                 .@"enum", .variant => .i32,
                 .flags => .i32, // ≤32 labels → a single i32 slot
                 .resource => .i32, // a handle
@@ -2240,6 +2308,52 @@ test "generate: same complex channel in two interfaces binds per-interface (#295
     try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = canon.FutureOf(canon.Result(u32, []const u8), \"[future]demo:two/b@0.1.0#g#0\");") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn f() __chan0 {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn g() __chan1 {") != null);
+}
+
+test "generate: same-named types in two interfaces get per-interface names (#303)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface a { variant error-code { x };       f: func() -> result<u32, error-code>; }
+    // interface b { variant error-code { y, z };    g: func() -> result<u32, error-code>; }
+    // Both define `error-code` locally → their Zig identifiers must differ.
+    const u32_ty: ast.Type = .u32;
+    const a_cases = [_]ast.Case{.{ .name = "x", .type = null }};
+    const b_cases = [_]ast.Case{ .{ .name = "y", .type = null }, .{ .name = "z", .type = null } };
+    const ec_ref = ast.Type{ .name = "error-code" };
+    const a_res = ast.Type{ .result = .{ .ok = &u32_ty, .err = &ec_ref } };
+    const a_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "error-code", .kind = .{ .variant = &a_cases } } },
+        .{ .func = .{ .name = "f", .func = .{ .params = &.{}, .result = a_res } } },
+    };
+    const b_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "error-code", .kind = .{ .variant = &b_cases } } },
+        .{ .func = .{ .name = "g", .func = .{ .params = &.{}, .result = a_res } } },
+    };
+    const iface_a = ast.Interface{ .name = "a", .items = &a_items };
+    const iface_b = ast.Interface{ .name = "b", .items = &b_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "a" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "b" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "two", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface_a }, .{ .interface = iface_b }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // Two distinct type decls, prefixed by their defining interface.
+    try testing.expect(std.mem.indexOf(u8, out, "pub const AErrorCode = union(enum) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const BErrorCode = union(enum) {") != null);
+    // No bare `ErrorCode` (the collision is fully disambiguated).
+    try testing.expect(std.mem.indexOf(u8, out, "pub const ErrorCode = ") == null);
+    // Each func's result binds to its own interface's error-code.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn f() canon.Result(u32, AErrorCode) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn g() canon.Result(u32, BErrorCode) {") != null);
 }
 
 test "generate: option<handle> / option<scalar> params" {
