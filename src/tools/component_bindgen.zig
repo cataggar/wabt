@@ -687,18 +687,46 @@ const Gen = struct {
         return c;
     }
 
+    /// Emit the spilled-params lowering for an async call whose flattened params
+    /// (including `self` for a method) exceed `MAX_FLAT_ASYNC_PARAMS` (4). The
+    /// whole param tuple is lowered into a fresh scratch buffer in canonical
+    /// layout and the call takes a single pointer to it. `self_field` is the
+    /// `self` expression to prepend for a method (null for a free func/static).
+    /// Returns the pointer argument expression for the call.
+    fn emitAsyncSpill(self: *Gen, params: []const ast.Param, self_field: ?[]const u8) GenError![]const u8 {
+        self.raw("        const __pargs = .{ ");
+        var first = true;
+        if (self_field) |sf| {
+            self.raw(sf);
+            first = false;
+        }
+        for (params) |p| {
+            if (!first) self.raw(", ");
+            first = false;
+            self.raw(try snake(self.ar, p.name));
+        }
+        self.raw(" };\n");
+        self.raw("        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));\n");
+        self.raw("        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);\n");
+        return "@intCast(@intFromPtr(__pp))";
+    }
+
     /// Emit the `extern` decl for an imported **async** func. The canonical
     /// async lowering produces `(flat params, result_ptr if any) -> i32 status`
     /// (the packed callstatus); results are written to `result_ptr`. Params that
-    /// exceed `MAX_FLAT_ASYNC_PARAMS` (4) spill to a single pointer — a later
-    /// refinement, rejected for now.
+    /// exceed `MAX_FLAT_ASYNC_PARAMS` (4) spill to a single pointer.
     fn emitAsyncImportExtern(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
-        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        const spill = try self.paramFlatCount(func.params) > 4;
         self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, name });
-        try self.emitFlatParamDecls(func.params);
-        if (func.result != null) {
-            if (func.params.len > 0) self.raw(", ");
-            self.raw("result_ptr: i32");
+        if (spill) {
+            self.raw("args_ptr: i32");
+            if (func.result != null) self.raw(", result_ptr: i32");
+        } else {
+            try self.emitFlatParamDecls(func.params);
+            if (func.result != null) {
+                if (func.params.len > 0) self.raw(", ");
+                self.raw("result_ptr: i32");
+            }
         }
         self.raw(") i32;\n"); // packed callstatus
     }
@@ -742,14 +770,17 @@ const Gen = struct {
     /// to the result pointer. Always lifts from memory (async lowering writes
     /// results indirectly, even for a single-slot result).
     fn emitAsyncImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
-        if (try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        const spill = try self.paramFlatCount(func.params) > 4;
         const result_zig = try self.resultZig(func);
 
         self.print("    pub fn {s}(", .{try camel(self.ar, name)});
         try self.emitTypedParamDecls(func.params);
         self.print(") {s} {{\n", .{result_zig});
 
-        const call_args = try self.lowerParams(func.params);
+        const call_args = if (spill)
+            try self.emitAsyncSpill(func.params, null)
+        else
+            try self.lowerParams(func.params);
         if (func.result != null) {
             if (call_args.len > 0) {
                 self.print("        const __status = imp.@\"{s}\"({s}, abi.retPtr());\n", .{ name, call_args });
@@ -837,15 +868,22 @@ const Gen = struct {
     /// async lowering yields `(self?, flat params, result_ptr if any) -> i32`
     /// (the packed callstatus); the result is written to `result_ptr`. `self`
     /// (for a method) counts toward the `MAX_FLAT_ASYNC_PARAMS` (4) budget;
-    /// spilling the params to one pointer is a later refinement (rejected here),
-    /// as is an async constructor (not used by WASI 0.3).
+    /// beyond it the params (including `self`) spill to a single pointer. An
+    /// async constructor (not used by WASI 0.3) is rejected.
     fn emitAsyncResourceExtern(self: *Gen, iface_id: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
         const func = m.func;
         if (m.kind == .constructor) return error.UnsupportedWitType;
         const self_slot: usize = if (m.kind == .method) 1 else 0;
-        if (self_slot + try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+        const spill = self_slot + try self.paramFlatCount(func.params) > 4;
 
         self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, ext });
+        if (spill) {
+            // `self` (for a method) lowers into the spilled param block.
+            self.raw("args_ptr: i32");
+            if (func.result != null) self.raw(", result_ptr: i32");
+            self.raw(") i32;\n");
+            return;
+        }
         var first = true;
         if (m.kind == .method) {
             self.raw("self: i32");
@@ -928,6 +966,8 @@ const Gen = struct {
     fn emitAsyncResourceWrapper(self: *Gen, R: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
         const func = m.func;
         const is_method = m.kind == .method;
+        const self_slot: usize = if (is_method) 1 else 0;
+        const spill = self_slot + try self.paramFlatCount(func.params) > 4;
 
         self.print("    pub fn {s}(", .{try camel(self.ar, m.name)});
         if (is_method) {
@@ -937,12 +977,17 @@ const Gen = struct {
         try self.emitTypedParamDecls(func.params);
         self.print(") {s} {{\n", .{try self.resultZig(func)});
 
-        // lower params → arg expressions (emitting temps as needed)
-        const call_args = try self.lowerParams(func.params);
-        const args = if (is_method) blk: {
-            if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
-            break :blk "self.handle";
-        } else call_args;
+        // lower params → arg expressions (emitting temps / a spilled block).
+        const args = if (spill)
+            try self.emitAsyncSpill(func.params, if (is_method) "self" else null)
+        else blk: {
+            const call_args = try self.lowerParams(func.params);
+            if (is_method) {
+                if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
+                break :blk "self.handle";
+            }
+            break :blk call_args;
+        };
 
         if (func.result != null) {
             if (args.len > 0) {
@@ -1816,6 +1861,58 @@ test "generate: imported resource with async methods (#300)" {
 
     // The sync method is unchanged (single-slot flat return).
     try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(u32, imp.@\"[method]thing.get-id\"(self.handle));") != null);
+}
+
+test "generate: async param spill past MAX_FLAT_ASYNC_PARAMS (#300)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // resource thing { openish: async func(a, name, b, c) -> u32; }   self+1+2+1+1 = 6 > 4
+    // combine: async func(a, b, name, c) -> string;                   1+1+2+1   = 5 > 4
+    const thing_methods = [_]ast.ResourceMethod{
+        .{ .kind = .method, .name = "openish", .func = .{ .params = &.{
+            .{ .name = "a", .type = .u32 },
+            .{ .name = "name", .type = .string },
+            .{ .name = "b", .type = .u32 },
+            .{ .name = "c", .type = .u32 },
+        }, .result = .u32, .is_async = true } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &thing_methods } } },
+        .{ .func = .{ .name = "combine", .func = .{ .params = &.{
+            .{ .name = "a", .type = .u32 },
+            .{ .name = "b", .type = .u32 },
+            .{ .name = "name", .type = .string },
+            .{ .name = "c", .type = .u32 },
+        }, .result = .string, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "things", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "things" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "res" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+
+    // Spilled method: the extern takes one args pointer (self lowers into the
+    // block) + a result pointer; the wrapper lowers the whole param tuple
+    // (self first) to a scratch buffer and passes the pointer.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.openish\"(args_ptr: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __pargs = .{ self, a, name, b, c };") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]thing.openish\"(@intCast(@intFromPtr(__pp)), abi.retPtr());") != null);
+
+    // Spilled free func: no self in the tuple.
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"combine\"(args_ptr: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __pargs = .{ a, b, name, c };") != null);
 }
 
 test "generate: async export lift (task.return)" {
