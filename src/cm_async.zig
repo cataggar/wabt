@@ -226,6 +226,10 @@ pub fn awaitCall(status: i32) void {
         if (event == EVENT_SUBTASK and w[0] == s >> 4 and
             w[1] == @intFromEnum(CallState.returned)) break;
     }
-    set.drop();
+    // Drop the subtask first: `subtask.drop` unjoins it from the set
+    // (`waitable.join(_, none)` → `remove_child`), so the set is childless
+    // before we drop it. Dropping the set first would trap with "resource has
+    // children" because the joined subtask is still the set's child.
     subtask.drop(sub);
+    set.drop();
 }
