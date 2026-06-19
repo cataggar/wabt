@@ -261,6 +261,14 @@ const Gen = struct {
                 .func => |fd| if (fd.func.is_async) {
                     self.needs_cm_async = true;
                 },
+                // An imported resource with an async method also drives the call
+                // through `cm_async.awaitCall`.
+                .type => |td| switch (td.kind) {
+                    .resource => |methods| for (methods) |m| {
+                        if (m.func.is_async) self.needs_cm_async = true;
+                    },
+                    else => {},
+                },
                 else => {},
             };
         }
@@ -793,8 +801,8 @@ const Gen = struct {
 
     fn emitResourceExtern(self: *Gen, iface_id: []const u8, rname: []const u8, m: ast.ResourceMethod) GenError!void {
         const func = m.func;
-        if (func.is_async) return error.UnsupportedWitType;
         const ext = try self.resourceExternName(rname, m);
+        if (func.is_async) return self.emitAsyncResourceExtern(iface_id, ext, m);
 
         self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, ext });
         var first = true;
@@ -825,10 +833,44 @@ const Gen = struct {
         }
     }
 
+    /// Emit the `extern` for an **async** resource method/static: the canonical
+    /// async lowering yields `(self?, flat params, result_ptr if any) -> i32`
+    /// (the packed callstatus); the result is written to `result_ptr`. `self`
+    /// (for a method) counts toward the `MAX_FLAT_ASYNC_PARAMS` (4) budget;
+    /// spilling the params to one pointer is a later refinement (rejected here),
+    /// as is an async constructor (not used by WASI 0.3).
+    fn emitAsyncResourceExtern(self: *Gen, iface_id: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
+        const func = m.func;
+        if (m.kind == .constructor) return error.UnsupportedWitType;
+        const self_slot: usize = if (m.kind == .method) 1 else 0;
+        if (self_slot + try self.paramFlatCount(func.params) > 4) return error.UnsupportedWitType;
+
+        self.print("        extern \"{s}\" fn @\"{s}\"(", .{ iface_id, ext });
+        var first = true;
+        if (m.kind == .method) {
+            self.raw("self: i32");
+            first = false;
+        }
+        for (func.params) |p| {
+            const slots = try self.paramSlots(p);
+            for (slots) |s| {
+                if (!first) self.raw(", ");
+                first = false;
+                self.print("{s}: {s}", .{ s.name, @tagName(s.core) });
+            }
+        }
+        if (func.result != null) {
+            if (!first) self.raw(", ");
+            self.raw("result_ptr: i32");
+        }
+        self.raw(") i32;\n"); // packed callstatus
+    }
+
+
     fn emitResourceWrapper(self: *Gen, R: []const u8, rname: []const u8, m: ast.ResourceMethod) GenError!void {
         const func = m.func;
-        if (func.is_async) return error.UnsupportedWitType;
         const ext = try self.resourceExternName(rname, m);
+        if (func.is_async) return self.emitAsyncResourceWrapper(R, ext, m);
         const is_method = m.kind == .method;
 
         if (m.kind == .constructor) {
@@ -877,7 +919,47 @@ const Gen = struct {
         self.raw("    }\n");
     }
 
-    /// Follow `type x = y` aliases to the underlying WIT type.
+    /// Emit the typed wrapper for an **async** resource method/static: lower the
+    /// params (prefixed by `self.handle` for a method), call the async-lowered
+    /// extern (returns the packed callstatus), drive it to completion via
+    /// `cm_async.awaitCall`, then lift the result the host wrote to the result
+    /// pointer. Always lifts from memory (async lowering writes results
+    /// indirectly, even for a single-slot result).
+    fn emitAsyncResourceWrapper(self: *Gen, R: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
+        const func = m.func;
+        const is_method = m.kind == .method;
+
+        self.print("    pub fn {s}(", .{try camel(self.ar, m.name)});
+        if (is_method) {
+            self.print("self: {s}", .{R});
+            if (func.params.len > 0) self.raw(", ");
+        }
+        try self.emitTypedParamDecls(func.params);
+        self.print(") {s} {{\n", .{try self.resultZig(func)});
+
+        // lower params → arg expressions (emitting temps as needed)
+        const call_args = try self.lowerParams(func.params);
+        const args = if (is_method) blk: {
+            if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
+            break :blk "self.handle";
+        } else call_args;
+
+        if (func.result != null) {
+            if (args.len > 0) {
+                self.print("        const __status = imp.@\"{s}\"({s}, abi.retPtr());\n", .{ ext, args });
+            } else {
+                self.print("        const __status = imp.@\"{s}\"(abi.retPtr());\n", .{ext});
+            }
+            self.raw("        cm_async.awaitCall(__status);\n");
+            self.print("        return canon.lift({s}, abi.retArea());\n", .{try self.resultZig(func)});
+        } else {
+            self.print("        const __status = imp.@\"{s}\"({s});\n", .{ ext, args });
+            self.raw("        cm_async.awaitCall(__status);\n");
+        }
+        self.raw("    }\n");
+    }
+
+
     fn resolveAlias(self: *Gen, ty: ast.Type) ast.Type {
         var t = ty;
         while (t == .name) {
@@ -1682,6 +1764,58 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
     }
+}
+
+test "generate: imported resource with async methods (#300)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // resource thing { constructor(id: u32); get-id: func() -> u32;
+    //   bump: async func(by: u32) -> u32; label: async func() -> string;
+    //   reset: async func(); }
+    const thing_methods = [_]ast.ResourceMethod{
+        .{ .kind = .constructor, .name = "", .func = .{ .params = &.{.{ .name = "id", .type = .u32 }}, .result = null } },
+        .{ .kind = .method, .name = "get-id", .func = .{ .params = &.{}, .result = .u32 } },
+        .{ .kind = .method, .name = "bump", .func = .{ .params = &.{.{ .name = "by", .type = .u32 }}, .result = .u32, .is_async = true } },
+        .{ .kind = .method, .name = "label", .func = .{ .params = &.{}, .result = .string, .is_async = true } },
+        .{ .kind = .method, .name = "reset", .func = .{ .params = &.{}, .result = null, .is_async = true } },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &thing_methods } } },
+    };
+    const iface = ast.Interface{ .name = "things", .items = &iface_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "things" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "res" },
+        .items = &.{ .{ .interface = iface }, .{ .world = imp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+
+    // An async method needs the cm_async driver.
+    try testing.expect(std.mem.indexOf(u8, out, "const cm_async = @import(\"cm_async\");") != null);
+
+    // Async externs: `(self?, flat params, result_ptr?) -> i32` (packed callstatus).
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.bump\"(self: i32, by: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.label\"(self: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.reset\"(self: i32) i32;") != null);
+
+    // Async wrappers drive the subtask via awaitCall then lift from memory.
+    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.bump\"(self.handle, @bitCast(by), abi.retPtr());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.lift(u32, abi.retArea());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.lift([]const u8, abi.retArea());") != null);
+    // No-result async method: awaitCall, no lift.
+    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.reset\"(self.handle);") != null);
+
+    // The sync method is unchanged (single-slot flat return).
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(u32, imp.@\"[method]thing.get-id\"(self.handle));") != null);
 }
 
 test "generate: async export lift (task.return)" {
