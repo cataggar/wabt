@@ -12,4 +12,8 @@ pub const canon = @import("canon");
 /// waitable-set) — the WASI 0.3 replacement for `wasi:io`.
 pub const cm_async = @import("cm_async");
 pub const wasi_cli = @import("wasi_cli");
+/// `wasi:clocks@0.3.0` — monotonic + system clocks (async waits).
+pub const wasi_clocks = @import("wasi_clocks");
+/// `wasi:random@0.3.0` — secure + insecure random, insecure-seed.
+pub const wasi_random = @import("wasi_random");
 pub const wasi_http = @import("wasi_http");

@@ -31,6 +31,27 @@ pub fn build(b: *std.Build) void {
     wasi_cli.addImport("abi", abi);
     wasi_cli.addImport("wasi_cli_bindings", wasi_cli_bindings);
 
+    // `wabt component bindgen`-generated `wasi:clocks@0.3.0` import wrappers
+    // (`monotonic-clock` waits are async → `cm_async`); `wasi_clocks` is the
+    // ergonomic layer over them.
+    const wasi_clocks_bindings = b.addModule("wasi_clocks_bindings", .{ .root_source_file = b.path("src/wasi_clocks_bindings.zig") });
+    wasi_clocks_bindings.addImport("canon", canon);
+    wasi_clocks_bindings.addImport("abi", abi);
+    wasi_clocks_bindings.addImport("cm_async", cm_async);
+
+    const wasi_clocks = b.addModule("wasi_clocks", .{ .root_source_file = b.path("src/wasi_clocks.zig") });
+    wasi_clocks.addImport("wasi_clocks_bindings", wasi_clocks_bindings);
+
+    // `wabt component bindgen`-generated `wasi:random@0.3.0` import wrappers
+    // (all synchronous); `wasi_random` is the ergonomic layer over them.
+    const wasi_random_bindings = b.addModule("wasi_random_bindings", .{ .root_source_file = b.path("src/wasi_random_bindings.zig") });
+    wasi_random_bindings.addImport("canon", canon);
+    wasi_random_bindings.addImport("abi", abi);
+
+    const wasi_random = b.addModule("wasi_random", .{ .root_source_file = b.path("src/wasi_random.zig") });
+    wasi_random.addImport("wasi_random_bindings", wasi_random_bindings);
+    wasi_random.addImport("canon", canon);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("abi", abi);
     wasi_http.addImport("cm_async", cm_async);
@@ -41,6 +62,8 @@ pub fn build(b: *std.Build) void {
     wasip3.addImport("canon", canon);
     wasip3.addImport("cm_async", cm_async);
     wasip3.addImport("wasi_cli", wasi_cli);
+    wasip3.addImport("wasi_clocks", wasi_clocks);
+    wasip3.addImport("wasi_random", wasi_random);
     wasip3.addImport("wasi_http", wasi_http);
 
 
@@ -150,6 +173,10 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "cm_async", .deps = &.{"abi"} },
     .{ .name = "wasi_cli_bindings", .deps = &.{ "canon", "abi" } },
     .{ .name = "wasi_cli", .deps = &.{ "cm_async", "canon", "abi", "wasi_cli_bindings" } },
+    .{ .name = "wasi_clocks_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
+    .{ .name = "wasi_clocks", .deps = &.{"wasi_clocks_bindings"} },
+    .{ .name = "wasi_random_bindings", .deps = &.{ "canon", "abi" } },
+    .{ .name = "wasi_random", .deps = &.{ "wasi_random_bindings", "canon" } },
     .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
 };
 
