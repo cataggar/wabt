@@ -16,4 +16,8 @@ pub const wasi_cli = @import("wasi_cli");
 pub const wasi_clocks = @import("wasi_clocks");
 /// `wasi:random@0.3.0` — secure + insecure random, insecure-seed.
 pub const wasi_random = @import("wasi_random");
+/// `wasi:filesystem@0.3.0` — preopens + descriptors (async stat/open, `stream<u8>` I/O).
+pub const wasi_filesystem = @import("wasi_filesystem");
+/// `wasi:sockets@0.3.0` — tcp/udp socket resources + ip-name-lookup.
+pub const wasi_sockets = @import("wasi_sockets");
 pub const wasi_http = @import("wasi_http");

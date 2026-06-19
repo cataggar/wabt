@@ -53,14 +53,18 @@ src/
   wasi_clocks.zig      ergonomic wasi:clocks@0.3.0 layer (monotonic now/resolution/sleep, system now/resolution)
   wasi_random_bindings.zig  `wabt component bindgen`-generated wasi:random@0.3.0 import client wrappers
   wasi_random.zig      ergonomic wasi:random@0.3.0 layer (secure/insecure bytes + u64, insecure-seed)
+  wasi_filesystem_bindings.zig  `wabt component bindgen`-generated wasi:filesystem@0.3.0 import client wrappers
+  wasi_filesystem.zig  ergonomic wasi:filesystem@0.3.0 layer (preopens, open, read/writeAll via stream<u8>, stat/get-type)
+  wasi_sockets_bindings.zig  `wabt component bindgen`-generated wasi:sockets@0.3.0 import client wrappers
+  wasi_sockets.zig     ergonomic wasi:sockets@0.3.0 layer (tcp/udp socket resources + ip-name-lookup resolveAddresses)
   wasi_http.zig        wasi:http@0.3.0 service handler helper
   root.zig             `wasip3` re-export index
 ```
 
-The remaining 0.2 interfaces (`filesystem`/`sockets`) are being re-added as 0.3
-bindings by **generating** them with `wabt component bindgen`
+All of `wasi:cli` / `wasi:clocks` / `wasi:random` / `wasi:filesystem` / `wasi:sockets`
+are now **generated** with `wabt component bindgen`
 (see [cataggar/wabt#280](https://github.com/cataggar/wabt/issues/280)) + thin
-ergonomic wrappers, the pattern `wasi_cli` / `wasi_clocks` / `wasi_random` use.
+ergonomic wrappers, the pattern `wasi_cli` established.
 
 ## Status
 
@@ -70,13 +74,16 @@ now generates the full client surface — including non-primitive `future`/`stre
 elements, async imports, and streaming exports
 ([#284](https://github.com/cataggar/wabt/issues/284) /
 [#289](https://github.com/cataggar/wabt/issues/289)). The `wasi:cli@0.3.0`,
-`wasi:clocks@0.3.0`, and `wasi:random@0.3.0` bindings here are
-**generated + wrapped**, build to a `wasm32-freestanding` command, wrap via
-`wabt component new`, and **run on wasmtime 46** end to end (`run` +
-stdout/stderr + `get-arguments`, monotonic/system clocks incl. the async
-`wait-for`/`wait-until`, secure/insecure random + insecure-seed). Validate with
+`wasi:clocks@0.3.0`, `wasi:random@0.3.0`, `wasi:filesystem@0.3.0`, and
+`wasi:sockets@0.3.0` bindings here are **generated + wrapped**, build to a
+`wasm32-freestanding` command, wrap via `wabt component new`, and **run on
+wasmtime 46** end to end: `run` + stdout/stderr + `get-arguments`; monotonic/system
+clocks incl. the async `wait-for`/`wait-until`; secure/insecure random +
+insecure-seed; filesystem preopens + async `descriptor.stat`/`get-type` + `stream<u8>`
+file read/write; `sockets` `ip-name-lookup.resolve-addresses`. Validate with
 `-S p3 -W component-model-async -W component-model-async-stackful
--W component-model-more-async-builtins -W component-model-error-context`.
+-W component-model-more-async-builtins -W component-model-error-context` (filesystem
+adds `--dir`, sockets adds `-S allow-ip-name-lookup`).
 
 ## Prerequisites
 
