@@ -34,6 +34,8 @@ pub const TerminalOutput = struct {
 };
 
 const __chan0 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stdin@0.3.0#read-via-stream#1");
+const __chan1 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stdout@0.3.0#write-via-stream#1");
+const __chan2 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stderr@0.3.0#write-via-stream#1");
 
 pub const environment = struct {
     const imp = struct {
@@ -87,8 +89,8 @@ pub const stdout = struct {
         extern "wasi:cli/stdout@0.3.0" fn @"write-via-stream"(data: i32) i32;
     };
 
-    pub fn writeViaStream(data: canon.Stream(u8)) __chan0 {
-        return canon.liftResultFlat(__chan0, imp.@"write-via-stream"(data.handle));
+    pub fn writeViaStream(data: canon.Stream(u8)) __chan1 {
+        return canon.liftResultFlat(__chan1, imp.@"write-via-stream"(data.handle));
     }
 };
 
@@ -97,8 +99,8 @@ pub const stderr = struct {
         extern "wasi:cli/stderr@0.3.0" fn @"write-via-stream"(data: i32) i32;
     };
 
-    pub fn writeViaStream(data: canon.Stream(u8)) __chan0 {
-        return canon.liftResultFlat(__chan0, imp.@"write-via-stream"(data.handle));
+    pub fn writeViaStream(data: canon.Stream(u8)) __chan2 {
+        return canon.liftResultFlat(__chan2, imp.@"write-via-stream"(data.handle));
     }
 };
 
