@@ -4040,19 +4040,26 @@ fn buildComponentShimFixup(
     {
         const memop_start: u32 = @intCast(canons.items.len);
         const mem_realloc = [_]ctypes.CanonOpt{ .{ .memory = memory_core_idx }, .{ .realloc = realloc_core_idx } };
+        const mem_only = [_]ctypes.CanonOpt{.{ .memory = memory_core_idx }};
         for (async_groups) |grp| {
+            // A complex (non-primitive) element may reach a `string`/`list` whose
+            // lift needs `cabi_realloc` (e.g. `future<result<_, error-code>>`
+            // where `error-code` has an `other(option<string>)` case); a
+            // primitive element (`stream<u8>`) never does, so it stays
+            // memory-only to keep the simple cases bit-identical.
+            const elem_opts: []const ctypes.CanonOpt = if (grp.elem_raw != null) &mem_realloc else &mem_only;
             for (grp.fields) |field| {
                 if (!field.is_mem_op) continue;
                 const canon: ctypes.Canon = switch (grp.family) {
                     .stream => blk: {
-                        const opts = try ar.dupe(ctypes.CanonOpt, &.{.{ .memory = memory_core_idx }});
+                        const opts = try ar.dupe(ctypes.CanonOpt, elem_opts);
                         break :blk if (std.mem.eql(u8, field.name, "write"))
                             .{ .stream_write = .{ .type_idx = grp.stream_type_idx, .opts = opts } }
                         else
                             .{ .stream_read = .{ .type_idx = grp.stream_type_idx, .opts = opts } };
                     },
                     .future => blk: {
-                        const opts = try ar.dupe(ctypes.CanonOpt, &.{.{ .memory = memory_core_idx }});
+                        const opts = try ar.dupe(ctypes.CanonOpt, elem_opts);
                         break :blk if (std.mem.eql(u8, field.name, "write"))
                             .{ .future_write = .{ .type_idx = grp.stream_type_idx, .opts = opts } }
                         else
