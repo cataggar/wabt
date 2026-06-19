@@ -170,11 +170,16 @@ const Gen = struct {
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
     // Distinct complex (non-primitive-element) future/stream channels → the
-    // generated nominal type name. Key: "F:"/"S:" ++ element zig type.
+    // generated nominal type name. Key: "<iface>|" + "F:"/"S:" + element zig
+    // type — per-interface, so a channel binds to a function-reference site in
+    // the interface where it appears (subset-world composition; #295).
     chan_map: std.StringHashMapUnmanaged([]const u8) = .empty,
     // The nominal channel type decls to emit (name + RHS), in discovery order.
     chan_decls: std.ArrayListUnmanaged(ChanDecl) = .empty,
     chan_counter: usize = 0,
+    // The interface whose funcs/types are currently being walked or emitted;
+    // disambiguates complex channels by their declaring interface.
+    current_iface: []const u8 = "",
     // True when the world imports an async func (the wrappers need `cm_async`).
     needs_cm_async: bool = false,
 
@@ -269,9 +274,11 @@ const Gen = struct {
 
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
+            self.current_iface = ut.iface_id;
             try self.emitTypeDef(ut.iface_id, .{ .name = ut.name, .kind = ut.kind });
         }
         for (uses.items) |u| {
+            self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
                 .type => |td| {
                     // Exported resources (guest-implemented, resource-new/rep) are
@@ -282,6 +289,7 @@ const Gen = struct {
                 else => {},
             };
         }
+        self.current_iface = "";
 
         // ── complex future/stream channel types (after their element types) ──
         for (self.chan_decls.items) |d| {
@@ -453,6 +461,7 @@ const Gen = struct {
     // ── exports ──────────────────────────────────────────────────────
 
     fn emitExportIface(self: *Gen, u: Use) GenError!void {
+        self.current_iface = u.id;
         self.print("// exports: {s}\n", .{u.id});
         for (u.iface.items) |it| switch (it) {
             .func => |fd| try self.emitExportFunc(u.id, fd.name, fd.func),
@@ -622,6 +631,7 @@ const Gen = struct {
     // ── imports ──────────────────────────────────────────────────────
 
     fn emitImportIface(self: *Gen, u: Use) GenError!void {
+        self.current_iface = u.id;
         const mod = try snake(self.ar, lastSegment(u.id));
         self.print("pub const {s} = struct {{\n", .{mod});
         // The flattened `extern` import decls live in a private `imp`
@@ -939,9 +949,12 @@ const Gen = struct {
         };
     }
 
-    /// Dedup key for a complex channel: family tag + element zig type.
+    /// Dedup key for a complex channel: declaring interface + family + element
+    /// zig type. Per-interface so a channel binds to a site in its own
+    /// interface (a subset-importing consumer then always imports the named
+    /// interface — #295).
     fn chanKey(self: *Gen, is_future: bool, elem: ast.Type) GenError![]const u8 {
-        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ if (is_future) "F:" else "S:", try self.zigType(elem) });
+        return std.fmt.allocPrint(self.ar, "{s}|{s}{s}", .{ self.current_iface, if (is_future) "F:" else "S:", try self.zigType(elem) });
     }
 
     /// The generated nominal type name for a complex channel, or null for a
@@ -961,6 +974,7 @@ const Gen = struct {
             // Imports only for now: complex channels in the worlds we target are
             // import-side; the export-side intrinsic form is a later refinement.
             if (u.is_export) continue;
+            self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
                 .func => |fd| try self.registerFuncChannels(u.id, fd.name, fd.func),
                 .type => |td| switch (td.kind) {
@@ -972,6 +986,7 @@ const Gen = struct {
                 else => {},
             };
         }
+        self.current_iface = "";
     }
 
     fn registerFuncChannels(self: *Gen, iface_id: []const u8, fn_name: []const u8, func: ast.Func) GenError!void {
@@ -1951,6 +1966,49 @@ test "generate: complex future/stream channels (function-reference intrinsics)" 
     try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: canon.Future(u32)) __chan0 {") != null);
     // The complex stream is a param typed as the shared nominal `__chan1`.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn sink(s: __chan1) bool {") != null);
+}
+
+test "generate: same complex channel in two interfaces binds per-interface (#295)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface a { f: func() -> future<result<u32, string>>; }
+    // interface b { g: func() -> future<result<u32, string>>; }
+    // A subset consumer importing only `a` must NOT pull in `b`'s intrinsic, so
+    // the structurally identical channel binds to its own interface, not one
+    // shared site.
+    const u32_ty: ast.Type = .u32;
+    const str_ty: ast.Type = .string;
+    const res = ast.Type{ .result = .{ .ok = &u32_ty, .err = &str_ty } };
+    const cfut = ast.Type{ .future = &res };
+    const a_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "f", .func = .{ .params = &.{}, .result = cfut } } },
+    };
+    const b_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "g", .func = .{ .params = &.{}, .result = cfut } } },
+    };
+    const iface_a = ast.Interface{ .name = "a", .items = &a_items };
+    const iface_b = ast.Interface{ .name = "b", .items = &b_items };
+    const imp_world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "a" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "b" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "two", .version = "0.1.0" },
+        .items = &.{ .{ .interface = iface_a }, .{ .interface = iface_b }, .{ .world = imp_world } },
+    };
+    const res2 = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res2, .impl = "impl" };
+    try g.generate(imp_world, "guest");
+    const out = g.out.items;
+    // Two distinct channel types, each bound to a site in ITS OWN interface —
+    // not one shared type bound only to `a`.
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = canon.FutureOf(canon.Result(u32, []const u8), \"[future]demo:two/a@0.1.0#f#0\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = canon.FutureOf(canon.Result(u32, []const u8), \"[future]demo:two/b@0.1.0#g#0\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn f() __chan0 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn g() __chan1 {") != null);
 }
 
 test "generate: option<handle> / option<scalar> params" {
