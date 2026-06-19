@@ -36,6 +36,12 @@
 
 const std = @import("std");
 
+/// The guest's `cabi_realloc` scratch arena — `lift` allocates from it when a
+/// `list<E>` element can't be borrowed in place (its native Zig layout differs
+/// from the canonical one, e.g. a tagged `variant`), copying each element into a
+/// fresh native array with the same lifetime as the host-allocated list.
+const abi = @import("abi");
+
 /// A bump allocator the canonical ABI calls to place `string` / `list` element
 /// storage during `lower` (the guest's `cabi_realloc` arena). `lift` borrows
 /// memory and needs none.
@@ -485,14 +491,21 @@ fn liftSlice(comptime E: type, base: [*]const u8) []const E {
     // Borrow in place when `E`'s canonical layout equals its native one — the
     // canonical element array is then already a valid `[]const E` (primitives,
     // plus `string` / `list` / `record` / `tuple` of such on little-endian
-    // wasm32). An element whose layouts differ (e.g. a tagged `variant` /
-    // `result`) would need element-wise copies into a fresh allocation.
-    if (!comptime layoutMatches(E))
-        @compileError("canon: lifting list<" ++ @typeName(E) ++ "> (layout mismatch) is unsupported");
+    // wasm32). Otherwise (a tagged `variant` / `result`, or an aggregate
+    // reaching one) lift element-by-element into a fresh native array allocated
+    // from the same scratch arena the host placed the canonical list in.
+    const ptr = load(usize, base);
     const len = load(usize, base + @sizeOf(usize));
     if (len == 0) return &.{};
-    const items: [*]const E = @ptrFromInt(load(usize, base));
-    return items[0..len];
+    if (comptime layoutMatches(E)) {
+        const items: [*]const E = @ptrFromInt(ptr);
+        return items[0..len];
+    }
+    const esize = comptime sizeOf(E); // canonical element stride (matches `lowerSlice`)
+    const src: [*]const u8 = @ptrFromInt(ptr);
+    const out: [*]E = @ptrCast(@alignCast(abi.alloc(len * @sizeOf(E), @alignOf(E))));
+    for (0..len) |i| out[i] = lift(E, src + i * esize);
+    return out[0..len];
 }
 
 // ── Return area for indirect (memory) results ───────────────────────
@@ -956,6 +969,31 @@ test "round-trip: toy and scalars" {
     try testing.expectEqual(@as(u32, 100), t.id);
     try testing.expectEqual(@as(u32, 1), t.pet_id);
     try testing.expectEqualStrings("Yarn Ball", t.name);
+}
+
+test "lift list<variant>: element-wise copy of a non-layout-matching element (#306)" {
+    test_top = 0;
+    abi.resetScratch();
+    // variant V { num(u32), nothing, text(string) } — a tagged union whose Zig
+    // layout differs from the canonical discriminant+payload, so the list can't
+    // be borrowed in place.
+    const V = union(enum) { num: u32, nothing: void, text: []const u8 };
+    const items = [_]V{ .{ .num = 42 }, .{ .nothing = {} }, .{ .text = "hi" } };
+    const list: []const V = &items;
+    var buf: [sizeOf([]const V)]u8 align(8) = undefined;
+    lower([]const V, list, &buf, &testAlloc);
+    const got = lift([]const V, &buf);
+    try testing.expectEqual(@as(usize, 3), got.len);
+    try testing.expect(got[0] == .num);
+    try testing.expectEqual(@as(u32, 42), got[0].num);
+    try testing.expect(got[1] == .nothing);
+    try testing.expect(got[2] == .text);
+    try testing.expectEqualStrings("hi", got[2].text);
+
+    // An empty list lifts to an empty slice (no allocation).
+    var ebuf: [sizeOf([]const V)]u8 align(8) = undefined;
+    lower([]const V, &.{}, &ebuf, &testAlloc);
+    try testing.expectEqual(@as(usize, 0), lift([]const V, &ebuf).len);
 }
 
 test "lowerFlat round-trips through liftParams" {
