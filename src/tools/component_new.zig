@@ -1382,11 +1382,20 @@ fn collectAsyncInSig(
 
 /// A resolved complex async element: its element value type still references
 /// `slots`, so a caller transcribes it (resource-aware) with that slot space.
+/// `owner` is the qualified name of the interface the element belongs to, used
+/// to scope same-named type resolution to the right package (#302).
 const AsyncElemRef = struct {
     is_future: bool,
     element: ?ctypes.ValType,
     slots: []const metadata_decode.TypeSlot,
+    owner: []const u8,
 };
+
+/// The package portion (`<ns>:<pkg>`) of a qualified interface name
+/// (`<ns>:<pkg>/<iface>[@<ver>]`), or the whole string if it has no `/`.
+fn packageOf(qualified: []const u8) []const u8 {
+    return if (std.mem.indexOfScalar(u8, qualified, '/')) |i| qualified[0..i] else qualified;
+}
 
 /// Resolve a function-reference async spec `<iface>#<fn>#<idx>` (the part of a
 /// `[future]`/`[stream]` module after the family prefix) against the decoded
@@ -1409,7 +1418,7 @@ fn resolveAsyncRef(
             if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
             const list = try collectAsyncInSig(ar, ext.type_slots, fn_ref.sig);
             if (idx >= list.len) return null;
-            return .{ .is_future = list[idx].is_future, .element = list[idx].element, .slots = ext.type_slots };
+            return .{ .is_future = list[idx].is_future, .element = list[idx].element, .slots = ext.type_slots, .owner = ext.qualified_name };
         }
     }
     return null;
@@ -1422,6 +1431,8 @@ const ResolvedElem = struct {
     elem: ctypes.ValType = .u8,
     elem_raw: ?ctypes.ValType = null,
     elem_slots: ?[]const metadata_decode.TypeSlot = null,
+    /// Owning interface qualified name (for package-scoped type resolution, #302).
+    elem_owner: ?[]const u8 = null,
 };
 
 /// Resolve a `[stream]`/`[future]` element spec (the part after the family
@@ -1435,7 +1446,7 @@ fn resolveElemSpec(
 ) error{OutOfMemory}!?ResolvedElem {
     if (std.mem.indexOfScalar(u8, spec, '#') != null) {
         const r = (try resolveAsyncRef(ar, externs, spec)) orelse return null;
-        return .{ .elem_raw = r.element, .elem_slots = r.slots };
+        return .{ .elem_raw = r.element, .elem_slots = r.slots, .elem_owner = r.owner };
     }
     const e = parseAsyncElement(spec) orelse return null;
     return .{ .elem = e };
@@ -2632,6 +2643,11 @@ fn buildComponentShimFixup(
     // its providing import instance when a transcribed top-level type
     // references it. First-writer wins on a name collision across imports.
     var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    // #302: all interfaces that export a given named type, so the resolver can
+    // pick the package-matching one when a name (e.g. `error-code`) collides
+    // across interfaces. `type_owner` keeps the first owner for the unscoped
+    // fallback path.
+    var type_owners_all = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
     const ImportShape = struct {
         qualified_name: []const u8,
         resources: []const []const u8,
@@ -2668,6 +2684,14 @@ fn buildComponentShimFixup(
             .export_eq => |e| {
                 const gop = try type_owner.getOrPut(ar, e.name);
                 if (!gop.found_existing) gop.value_ptr.* = ext.qualified_name;
+                const agop = try type_owners_all.getOrPut(ar, e.name);
+                if (!agop.found_existing) agop.value_ptr.* = .empty;
+                // Dedup: an interface can list the same name once.
+                var seen = false;
+                for (agop.value_ptr.items) |o| {
+                    if (std.mem.eql(u8, o, ext.qualified_name)) seen = true;
+                }
+                if (!seen) try agop.value_ptr.append(ar, ext.qualified_name);
             },
             else => {},
         };
@@ -2769,6 +2793,9 @@ fn buildComponentShimFixup(
         /// resource-aware at the canon site. Null `elem_slots` ⇒ use `elem`.
         elem_raw: ?ctypes.ValType = null,
         elem_slots: ?[]const metadata_decode.TypeSlot = null,
+        /// #302: owning interface qualified name — scopes same-named type
+        /// resolution of the element to the right package.
+        elem_owner: ?[]const u8 = null,
     };
     const stream_rw_params = [_]wtypes.ValType{ .i32, .i32, .i32 };
     const i32x2_params = [_]wtypes.ValType{ .i32, .i32 };
@@ -2852,6 +2879,7 @@ fn buildComponentShimFixup(
                     .elem = re.elem,
                     .elem_raw = re.elem_raw,
                     .elem_slots = re.elem_slots,
+                    .elem_owner = re.elem_owner,
                     .export_ref = "",
                     .fields = fields,
                 });
@@ -2878,6 +2906,7 @@ fn buildComponentShimFixup(
                     .elem = re.elem,
                     .elem_raw = re.elem_raw,
                     .elem_slots = re.elem_slots,
+                    .elem_owner = re.elem_owner,
                     .export_ref = "",
                     .fields = fields,
                 });
@@ -3289,6 +3318,12 @@ fn buildComponentShimFixup(
         hoist_idxs: *std.ArrayListUnmanaged(u32),
         comp_type_idx: *u32,
         order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
+        /// #302: when transcribing a future/stream element, the element's owning
+        /// interface (qualified name); lets `typeAlias` resolve a same-named type
+        /// to the package-matching owner. Null elsewhere → first-owner fallback.
+        elem_owner: ?[]const u8 = null,
+        /// #302: name → all owners, for the package-scoped pick above.
+        type_owners_all: ?*std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = null,
 
         fn resourceAlias(self: @This(), name: []const u8) !u32 {
             // #250: guest-defined (exported) resource → its declared
@@ -3310,12 +3345,17 @@ fn buildComponentShimFixup(
         }
 
         /// #280: alias a named (non-resource) type (e.g. `error-code`) out of
-        /// its providing import instance to a top-level type index, deduped by
-        /// name. Returns null when `name` isn't an import-provided named type,
-        /// so the caller leaves the leaf reference unchanged.
+        /// its providing import instance to a top-level type index. #302: when
+        /// the same name is exported by several interfaces, prefer the owner in
+        /// the same package as the element being transcribed (`elem_owner`), so
+        /// e.g. a `wasi:cli` future's `error-code` binds to `wasi:cli`'s, not a
+        /// co-imported `wasi:filesystem`'s. Dedup is keyed by the chosen owner so
+        /// distinct same-named types get distinct aliases. Returns null when
+        /// `name` isn't an import-provided named type.
         fn typeAlias(self: @This(), name: []const u8) error{OutOfMemory}!?u32 {
-            if (self.type_alias_idx.get(name)) |idx| return idx;
-            const owner = self.type_owner.get(name) orelse return null;
+            const owner = self.pickOwner(name) orelse return null;
+            const key = try std.fmt.allocPrint(self.ar, "{s}|{s}", .{ owner, name });
+            if (self.type_alias_idx.get(key)) |idx| return idx;
             const inst_idx = self.import_inst_idx_for.get(owner) orelse return null;
             try self.aliases.append(self.ar, .{ .instance_export = .{
                 .sort = .type,
@@ -3325,8 +3365,27 @@ fn buildComponentShimFixup(
             try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
             const slot = self.comp_type_idx.*;
             self.comp_type_idx.* += 1;
-            try self.type_alias_idx.put(self.ar, name, slot);
+            try self.type_alias_idx.put(self.ar, key, slot);
             return slot;
+        }
+
+        /// Pick the providing interface for `name`: the package-matching owner
+        /// when `elem_owner` is set and the name collides across interfaces,
+        /// else the first/only owner.
+        fn pickOwner(self: @This(), name: []const u8) ?[]const u8 {
+            if (self.elem_owner) |eo| {
+                if (self.type_owners_all) |all| {
+                    if (all.get(name)) |owners| {
+                        if (owners.items.len > 1) {
+                            const pkg = packageOf(eo);
+                            for (owners.items) |o| {
+                                if (std.mem.eql(u8, packageOf(o), pkg)) return o;
+                            }
+                        }
+                    }
+                }
+            }
+            return self.type_owner.get(name);
         }
 
         /// Hoist a locally-defined named value type — e.g. a `record`
@@ -3598,6 +3657,7 @@ fn buildComponentShimFixup(
                             .exported_resource_type_idx = &exported_resource_type_idx,
                             .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
                             .comp_type_idx = &comp_type_idx,   .order = &order,
+                            .elem_owner = grp.elem_owner,      .type_owners_all = &type_owners_all,
                         };
                         break :blk try er.rewriteValType(raw);
                     } else break :blk null;
@@ -3643,6 +3703,7 @@ fn buildComponentShimFixup(
                             .exported_resource_type_idx = &exported_resource_type_idx,
                             .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
                             .comp_type_idx = &comp_type_idx,   .order = &order,
+                            .elem_owner = grp.elem_owner,      .type_owners_all = &type_owners_all,
                         };
                         break :blk try er.rewriteValType(raw);
                     } else break :blk null;
@@ -4484,6 +4545,14 @@ fn writeU32Leb(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), v: u3
 const testing = std.testing;
 const metadata_encode = wabt.component.wit.metadata_encode;
 const loader = wabt.component.loader;
+
+test "packageOf: splits the package from a qualified interface name (#302)" {
+    try testing.expectEqualStrings("wasi:cli", packageOf("wasi:cli/stdout@0.3.0"));
+    try testing.expectEqualStrings("wasi:filesystem", packageOf("wasi:filesystem/types@0.3.0"));
+    try testing.expectEqualStrings("wasi:cli", packageOf("wasi:cli/types@0.3.0"));
+    // No `/` → whole string (defensive).
+    try testing.expectEqualStrings("bare", packageOf("bare"));
+}
 
 test "buildComponent: builds a wrapping component for the adder fixture" {
     // Synthesize an embedded core wasm by hand: minimal core module
