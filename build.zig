@@ -58,6 +58,32 @@ pub fn build(b: *std.Build) void {
     wasi_http.addImport("abi", abi);
     wasi_http.addImport("cm_async", cm_async);
 
+    // `wabt component bindgen`-generated `wasi:filesystem@0.3.0` import wrappers
+    // (async descriptor methods + `stream<u8>` file I/O); `wasi_filesystem` is
+    // the ergonomic layer over them.
+    const wasi_filesystem_bindings = b.addModule("wasi_filesystem_bindings", .{ .root_source_file = b.path("src/wasi_filesystem_bindings.zig") });
+    wasi_filesystem_bindings.addImport("canon", canon);
+    wasi_filesystem_bindings.addImport("abi", abi);
+    wasi_filesystem_bindings.addImport("cm_async", cm_async);
+
+    const wasi_filesystem = b.addModule("wasi_filesystem", .{ .root_source_file = b.path("src/wasi_filesystem.zig") });
+    wasi_filesystem.addImport("wasi_filesystem_bindings", wasi_filesystem_bindings);
+    wasi_filesystem.addImport("canon", canon);
+    wasi_filesystem.addImport("cm_async", cm_async);
+    wasi_filesystem.addImport("abi", abi);
+
+    // `wabt component bindgen`-generated `wasi:sockets@0.3.0` import wrappers
+    // (tcp/udp socket resources + ip-name-lookup); `wasi_sockets` is the
+    // ergonomic layer over them.
+    const wasi_sockets_bindings = b.addModule("wasi_sockets_bindings", .{ .root_source_file = b.path("src/wasi_sockets_bindings.zig") });
+    wasi_sockets_bindings.addImport("canon", canon);
+    wasi_sockets_bindings.addImport("abi", abi);
+    wasi_sockets_bindings.addImport("cm_async", cm_async);
+
+    const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
+    wasi_sockets.addImport("wasi_sockets_bindings", wasi_sockets_bindings);
+    wasi_sockets.addImport("canon", canon);
+
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
     wasip3.addImport("abi", abi);
@@ -66,6 +92,8 @@ pub fn build(b: *std.Build) void {
     wasip3.addImport("wasi_cli", wasi_cli);
     wasip3.addImport("wasi_clocks", wasi_clocks);
     wasip3.addImport("wasi_random", wasi_random);
+    wasip3.addImport("wasi_filesystem", wasi_filesystem);
+    wasip3.addImport("wasi_sockets", wasi_sockets);
     wasip3.addImport("wasi_http", wasi_http);
 
 
@@ -180,6 +208,10 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "wasi_clocks", .deps = &.{"wasi_clocks_bindings"} },
     .{ .name = "wasi_random_bindings", .deps = &.{ "canon", "abi" } },
     .{ .name = "wasi_random", .deps = &.{ "wasi_random_bindings", "canon" } },
+    .{ .name = "wasi_filesystem_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
+    .{ .name = "wasi_filesystem", .deps = &.{ "wasi_filesystem_bindings", "canon", "cm_async", "abi" } },
+    .{ .name = "wasi_sockets_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
+    .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "canon" } },
     .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
 };
 
