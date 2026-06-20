@@ -216,15 +216,21 @@ pub fn awaitCall(status: i32) void {
     if (s & 0xf == @intFromEnum(CallState.returned)) return;
     const sub: i32 = @bitCast(s >> 4);
 
+    // The callee writes its result to the caller's result pointer — typically
+    // the shared ret-area — when the subtask completes. So the wait event must
+    // land in a *local* buffer (not `WaitableSet.waitOne`, which targets the
+    // ret-area) or it would clobber that result before `canon.lift` reads it.
+    // (A synchronously-returning call hits the early `return` above and never
+    // waits; only a genuinely-blocking call with a result is affected.)
+    var ev: [4]u32 align(8) = undefined;
     const set = WaitableSet.create();
     set.add(sub);
     while (true) {
-        const event = set.waitOne();
-        const w = abi.retWords();
+        const event = waitset.wait(set.handle, @intCast(@intFromPtr(&ev)));
         // `waitable-set.wait` writes [waitable, payload]; the payload of a
         // subtask event is its new CallState. Only this subtask is joined.
-        if (event == EVENT_SUBTASK and w[0] == s >> 4 and
-            w[1] == @intFromEnum(CallState.returned)) break;
+        if (event == EVENT_SUBTASK and ev[0] == s >> 4 and
+            ev[1] == @intFromEnum(CallState.returned)) break;
     }
     // Drop the subtask first: `subtask.drop` unjoins it from the set
     // (`waitable.join(_, none)` → `remove_child`), so the set is childless
