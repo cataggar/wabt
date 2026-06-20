@@ -93,6 +93,8 @@ pub fn build(b: *std.Build) void {
     const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
     wasi_sockets.addImport("wasi_sockets_bindings", wasi_sockets_bindings);
     wasi_sockets.addImport("canon", canon);
+    wasi_sockets.addImport("cm_async", cm_async);
+    wasi_sockets.addImport("abi", abi);
 
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
@@ -221,7 +223,7 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "wasi_filesystem_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
     .{ .name = "wasi_filesystem", .deps = &.{ "wasi_filesystem_bindings", "canon", "cm_async", "abi" } },
     .{ .name = "wasi_sockets_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
-    .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "canon" } },
+    .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "canon", "cm_async", "abi" } },
     .{ .name = "wasi_http_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
     .{ .name = "wasi_http", .deps = &.{ "wasi_http_bindings", "canon", "abi", "cm_async" } },
 };
