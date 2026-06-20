@@ -1,23 +1,27 @@
-//! `wasi_http` — guest-side helper for a `wasi:http/service@0.3.0` component
-//! in pure Zig (WASI 0.3 / Component-Model async).
+//! `wasi_http` — guest-side helper for a `wasi:http/handler@0.3.0` service
+//! component in pure Zig (WASI 0.3 / Component-Model async).
 //!
-//! A service exports `wasi:http/handler@0.3.0#handle`, an **async**
-//! `func(request) -> result<response, error-code>`. This module reads the
-//! request (method, path-with-query, and the request body), invokes a user
-//! `handler` that fills a `Responder` (status, content-type, body), then
-//! builds the `response` and streams it back.
+//! The `wasi:http/types` client surface (the `request` / `response` / `fields`
+//! resources and the body `stream<u8>` + trailers `future` channels) is
+//! **generated** by `wabt component bindgen` (see `wasi_http_bindings.zig`);
+//! this module is the thin ergonomic layer over it. A service exports
+//! `wasi:http/handler@0.3.0#handle`, an **async**
+//! `func(request) -> result<response, error-code>`: this module reads the
+//! request (method, path-with-query, body), invokes a user `handler` that fills
+//! a `Responder` (status, content-type, body), then builds the `response` and
+//! streams it back — `task.return`-ing the response (which carries the body
+//! stream's readable end) *before* writing the writable end, as the protocol
+//! requires.
 //!
 //! ## Concurrency
 //!
 //! Hosts (e.g. `wasmtime serve`) may invoke `handle` concurrently: multiple
-//! request tasks can be in flight, interleaved at `await` points on one thread.
-//! To stay correct, **all per-request data lives in per-task stack buffers**
-//! (the request path/body and the response body), never in the shared
-//! `cabi_realloc` arena. The arena is reset at the top of each `handle` and
-//! only used transiently for canonical-ABI string lifts, which are copied to
-//! stack storage before the task ever yields — so a sibling task's reset can
-//! never clobber live data. Application state (e.g. an in-memory store) must
-//! likewise be in static globals mutated with synchronous, await-free ops.
+//! request tasks can interleave at `await` points on one thread. To stay
+//! correct, **all per-request data lives in per-task stack buffers** (request
+//! path/body, response body), never in the shared `cabi_realloc` arena; the
+//! arena is reset at the top of each `handle` and only used transiently for
+//! canonical-ABI lifts copied to stack storage before any `await`. Application
+//! state must be in static globals mutated with synchronous, await-free ops.
 //!
 //! ## Usage
 //!
@@ -31,35 +35,65 @@
 //! ```
 
 const std = @import("std");
-const abi = @import("abi");
+const b = @import("wasi_http_bindings");
+const canon = @import("canon");
 const cm = @import("cm_async");
+const abi = @import("abi");
+
+// The private body/trailers future channel types, recovered by reflection on
+// the generated client signatures (the same trick the petstore example uses):
+// `consume-body`'s `res` param and `response.new`'s `trailers` param.
+const TxnFut = @typeInfo(@TypeOf(b.Request.consumeBody)).@"fn".params[1].type.?;
+const TrailersFut = @typeInfo(@TypeOf(b.Response.new)).@"fn".params[2].type.?;
+const ByteStream = canon.Stream(u8);
+
+/// Canonical `stream`/`future` status: blocked (operation pending).
+const BLOCKED: i32 = @bitCast(@as(u32, 0xffff_ffff));
+
+// `ok(())` / `ok(none)` of the transmission / trailers futures are all-zero.
+var ok_zero: [64]u8 align(8) = [_]u8{0} ** 64;
 
 /// HTTP method (the standard cases of `wasi:http`'s `method` variant; `other`
 /// covers any extension method).
 pub const Method = enum(u8) {
-    get = 0,
-    head = 1,
-    post = 2,
-    put = 3,
-    delete = 4,
-    connect = 5,
-    options = 6,
-    trace = 7,
-    patch = 8,
-    other = 9,
+    get,
+    head,
+    post,
+    put,
+    delete,
+    connect,
+    options,
+    trace,
+    patch,
+    other,
 };
 
+fn mapMethod(m: b.Method) Method {
+    return switch (m) {
+        .get => .get,
+        .head => .head,
+        .post => .post,
+        .put => .put,
+        .delete => .delete,
+        .connect => .connect,
+        .options => .options,
+        .trace => .trace,
+        .patch => .patch,
+        .other => .other,
+    };
+}
+
 /// A decoded incoming request. `path` is the full path-with-query
-/// (e.g. `/pets/3?x=1`); `body` is the request body (empty unless read).
-/// Both borrow per-task stack buffers valid for the `handler` call.
+/// (e.g. `/pets/3?x=1`); `body` is the request body (empty unless read). Both
+/// borrow per-task stack buffers valid for the `handler` call.
 pub const Request = struct {
     method: Method,
     path: []const u8,
     body: []const u8,
 };
 
-/// What the handler fills in: a status, a content-type, and a body written
-/// into a caller-provided per-task buffer.
+/// What the handler fills: a status, a content-type, and a body written into a
+/// caller-provided per-task buffer.
 pub const Responder = struct {
     status: u16 = 200,
     content_type: []const u8 = "application/json",
@@ -87,47 +121,65 @@ pub const Responder = struct {
     }
 };
 
-// ── Host imports: wasi:http/types@0.3.0 resource canons ─────────────
+// ── async helpers (drive the generated stream/future channels) ──────
 
-extern "wasi:http/types@0.3.0" fn @"[constructor]fields"() i32;
-extern "wasi:http/types@0.3.0" fn @"[method]fields.append"(self: i32, name_ptr: i32, name_len: i32, val_ptr: i32, val_len: i32, retptr: i32) void;
+/// Block on `waitable` until it makes progress; returns the event payload
+/// (`waitable-set.wait` writes `[waitable, payload]` to the ret-area).
+fn waitCode(waitable: i32) u32 {
+    const set = cm.WaitableSet.create();
+    set.add(waitable);
+    _ = set.waitOne();
+    const code: u32 = abi.retWords()[1];
+    set.drop();
+    return code;
+}
 
-extern "wasi:http/types@0.3.0" fn @"[method]request.get-method"(self: i32, retptr: i32) void;
-extern "wasi:http/types@0.3.0" fn @"[method]request.get-path-with-query"(self: i32, retptr: i32) void;
-extern "wasi:http/types@0.3.0" fn @"[resource-drop]request"(req: i32) void;
-/// `consume-body(this: request, res: future<result<_, error-code>>)
-///   -> tuple<stream<u8>, future<result<option<trailers>, error-code>>>`.
-/// Moves the request; returns the body stream + the request's trailers future.
-extern "wasi:http/types@0.3.0" fn @"[static]request.consume-body"(this: i32, res: i32, retptr: i32) void;
+/// Consume the request and read its body into `buf`, cooperatively waiting on
+/// blocked reads. Drops the trailers future and signals `ok(())` on the
+/// error-signal future (we never report a request-handling error).
+fn readBody(request: b.Request, buf: []u8) []const u8 {
+    const res = TxnFut.new();
+    const tup = b.Request.consumeBody(request, res.readable);
+    const stream: ByteStream = tup[0];
+    const trailers: TrailersFut = tup[1];
 
-extern "wasi:http/types@0.3.0" fn @"[static]response.new"(
-    headers: i32,
-    contents_disc: i32,
-    contents_stream: i32,
-    trailers: i32,
-    retptr: i32,
-) void;
-extern "wasi:http/types@0.3.0" fn @"[method]response.set-status-code"(self: i32, status: i32) i32;
+    var len: usize = 0;
+    while (len < buf.len) {
+        const status = stream.read(buf[len..]);
+        const code: u32 = if (status == BLOCKED) waitCode(stream.handle) else @bitCast(status);
+        len += @as(usize, code >> 4);
+        if (code & 0xf != 0) break; // dropped (EOF) / cancelled
+        if (code >> 4 == 0) break; // no progress
+    }
+    stream.dropReadable();
+    trailers.dropReadable();
+    _ = res.writable.writeFrom(&ok_zero);
+    res.writable.dropWritable();
+    return buf[0..len];
+}
 
-// The trailers `future<result<option<trailers>, error-code>>` — named after
-// `request.new`'s async type #1 (response.new / consume-body reuse this type).
-const trailers_future = struct {
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#1" fn new() i64;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#1" fn write(f: i32, ptr: i32) i32;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#1" fn @"drop-writable"(f: i32) void;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#1" fn @"drop-readable"(f: i32) void;
-};
+fn writeBody(writable: ByteStream, bytes: []const u8) void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const status = writable.write(bytes[off..]);
+        const code: u32 = if (status == BLOCKED) waitCode(writable.handle) else @bitCast(status);
+        const n: usize = code >> 4;
+        if (n == 0) break;
+        off += n;
+    }
+    writable.dropWritable();
+}
 
-// The `future<result<_, error-code>>` (request.new async type #2): the result
-// transmission future from `response.new`, and the `res` error-signal future
-// passed to `consume-body`.
-const txn_future = struct {
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#2" fn new() i64;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#2" fn write(f: i32, ptr: i32) i32;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#2" fn @"drop-writable"(f: i32) void;
-    extern "[future]wasi:http/types@0.3.0#[static]request.new#2" fn @"drop-readable"(f: i32) void;
-};
+fn writeTrailers(writable: TrailersFut) void {
+    const status = writable.writeFrom(&ok_zero);
+    if (status == BLOCKED) _ = waitCode(writable.handle);
+    writable.dropWritable();
+}
 
+// `[task-return]wasi:http/handler@0.3.0#handle` — the async lift's return path
+// for `result<response, error-code>`. The result flattens to a discriminant + a
+// response handle joined against the (wider) `error-code` payload (8 slots); an
+// `ok(response)` is `(0, response, 0, 0, 0, 0, 0, 0)`.
 const handle_task = struct {
     extern "[task-return]wasi:http/handler@0.3.0#handle" fn @"task-return"(
         d0: i32,
@@ -141,145 +193,37 @@ const handle_task = struct {
     ) void;
 };
 
-// `ok(none)` of `result<option<trailers>, error-code>` is all-zero bytes.
-var trailers_ok_none: [64]u8 align(8) = [_]u8{0} ** 64;
-
-/// Canonical `stream.write` status: blocked (operation pending).
-const STREAM_BLOCKED: i32 = @bitCast(@as(u32, 0xffff_ffff));
-
-// ── Request decoding ────────────────────────────────────────────────
-
-fn readMethod(request: i32) Method {
-    @"[method]request.get-method"(request, abi.retPtr());
-    const disc = abi.retWords()[0];
-    return if (disc <= @intFromEnum(Method.patch))
-        @enumFromInt(@as(u8, @intCast(disc)))
-    else
-        .other;
-}
-
-fn readPathWithQuery(request: i32, buf: []u8) []const u8 {
-    @"[method]request.get-path-with-query"(request, abi.retPtr());
-    const w = abi.retWords();
-    if (w[0] != 1) return buf[0..0]; // none
-    const src: [*]const u8 = @ptrFromInt(w[1]);
-    const n = @min(@as(usize, w[2]), buf.len);
-    @memcpy(buf[0..n], src[0..n]);
-    return buf[0..n];
-}
-
-/// Consume the request and read its body into `buf`, cooperatively waiting on
-/// blocked reads. Also drops the request's trailers future and the `res`
-/// error-signal future (we never signal a request-handling error).
-fn readBody(request: i32, buf: []u8) []const u8 {
-    const res = cm.unpack(txn_future.new());
-    @"[static]request.consume-body"(request, res.readable, abi.retPtr());
-    const rw = abi.retWords();
-    const body_stream: i32 = @bitCast(rw[0]);
-    const req_trailers: i32 = @bitCast(rw[1]);
-
-    const stream = cm.ByteStream{ .handle = body_stream };
-    var len: usize = 0;
-    while (len < buf.len) {
-        const status = stream.read(buf[len..]);
-        const code: u32 = if (status == STREAM_BLOCKED) blk: {
-            const set = cm.WaitableSet.create();
-            set.add(body_stream);
-            _ = set.waitOne();
-            const c: u32 = abi.retWords()[2];
-            set.drop();
-            break :blk c;
-        } else @bitCast(status);
-        len += @as(usize, code >> 4);
-        if (code & 0xf != 0) break; // dropped (EOF) / cancelled
-        if (code >> 4 == 0) break; // no progress
-    }
-    stream.dropReadable();
-    trailers_future.@"drop-readable"(req_trailers);
-    // The `res` error-signal future must carry a value before its writable end
-    // is dropped: write ok(()) (no request-handling error), then drop.
-    _ = txn_future.write(res.writable, @intCast(@intFromPtr(&trailers_ok_none)));
-    txn_future.@"drop-writable"(res.writable);
-    return buf[0..len];
-}
-
-// ── Response building ───────────────────────────────────────────────
-
-fn writeBody(writable: i32, bytes: []const u8) void {
-    const stream = cm.ByteStream{ .handle = writable };
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const status = stream.write(bytes[off..]);
-        if (status == STREAM_BLOCKED) {
-            const set = cm.WaitableSet.create();
-            set.add(writable);
-            _ = set.waitOne();
-            const code: u32 = abi.retWords()[2];
-            set.drop();
-            const n: usize = @intCast(code >> 4);
-            if (n == 0 and (code & 0xf) != 0) break;
-            off += n;
-        } else {
-            const n: usize = @intCast(@as(u32, @bitCast(status)) >> 4);
-            if (n == 0) break;
-            off += n;
-        }
-    }
-    stream.dropWritable();
-}
-
-fn writeTrailers(writable: i32) void {
-    const status = trailers_future.write(writable, @intCast(@intFromPtr(&trailers_ok_none)));
-    if (status == STREAM_BLOCKED) {
-        const set = cm.WaitableSet.create();
-        set.add(writable);
-        _ = set.waitOne();
-        set.drop();
-    }
-    trailers_future.@"drop-writable"(writable);
-}
-
 fn sendResponse(res: *const Responder) void {
-    const headers = @"[constructor]fields"();
-    const ct = "content-type";
-    _ = @"[method]fields.append"(
-        headers,
-        @intCast(@intFromPtr(ct.ptr)),
-        @intCast(ct.len),
-        @intCast(@intFromPtr(res.content_type.ptr)),
-        @intCast(res.content_type.len),
-        abi.retPtr(),
-    );
+    const headers = b.Fields.init();
+    _ = headers.append("content-type", res.content_type);
 
     const payload = res.body();
-    var contents_disc: i32 = 0;
-    var contents_stream: i32 = 0;
-    var body_writable: i32 = 0;
     const has_body = payload.len != 0;
+    var body_writable: ByteStream = undefined;
+    var contents: ?ByteStream = null;
     if (has_body) {
-        const stream = cm.ByteStream.new();
-        contents_disc = 1;
-        contents_stream = stream.readable;
-        body_writable = stream.writable;
+        const bs = ByteStream.new();
+        contents = bs.readable;
+        body_writable = bs.writable;
     }
 
-    const tf = cm.unpack(trailers_future.new());
+    const tf = TrailersFut.new();
+    const tup = b.Response.new(headers, contents, tf.readable);
+    const response: b.Response = tup[0];
+    const transmission: TxnFut = tup[1];
+    transmission.dropReadable();
 
-    @"[static]response.new"(headers, contents_disc, contents_stream, tf.readable, abi.retPtr());
-    const w = abi.retWords();
-    const response: i32 = @bitCast(w[0]);
-    const transmission: i32 = @bitCast(w[1]);
-    txn_future.@"drop-readable"(transmission);
+    if (res.status != 200) _ = response.setStatusCode(res.status);
 
-    if (res.status != 200) _ = @"[method]response.set-status-code"(response, @intCast(res.status));
-
-    handle_task.@"task-return"(0, response, 0, 0, 0, 0, 0, 0);
+    // task.return the response (carrying the body stream's readable end) BEFORE
+    // writing the writable end — otherwise the write blocks with no reader.
+    handle_task.@"task-return"(0, response.handle, 0, 0, 0, 0, 0, 0);
 
     if (has_body) writeBody(body_writable, payload);
     writeTrailers(tf.writable);
 }
 
-// ── Export wiring ───────────────────────────────────────────────────
+// ── export wiring ───────────────────────────────────────────────────
 
 /// Per-task stack buffer sizes (request path, request body, response body).
 pub const path_capacity = 1024;
@@ -296,10 +240,16 @@ pub fn exportHandler(comptime handler: fn (req: *const Request, res: *Responder)
             var body_buf: [request_body_capacity]u8 = undefined;
             var resp_buf: [body_capacity]u8 = undefined;
 
-            const method = readMethod(request);
-            const path = readPathWithQuery(request, &path_buf);
+            const req_handle = b.Request{ .handle = request };
+            const method = mapMethod(req_handle.getMethod());
+            const path = blk: {
+                const p = req_handle.getPathWithQuery() orelse break :blk path_buf[0..0];
+                const n = @min(p.len, path_buf.len);
+                @memcpy(path_buf[0..n], p[0..n]);
+                break :blk path_buf[0..n];
+            };
             // consume-body moves the request, so read method + path first.
-            const reqbody = readBody(request, &body_buf);
+            const reqbody = readBody(req_handle, &body_buf);
 
             const req = Request{ .method = method, .path = path, .body = reqbody };
             var res = Responder{ .buf = &resp_buf };

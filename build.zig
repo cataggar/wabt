@@ -54,7 +54,17 @@ pub fn build(b: *std.Build) void {
     wasi_random.addImport("wasi_random_bindings", wasi_random_bindings);
     wasi_random.addImport("canon", canon);
 
+    // `wabt component bindgen`-generated `wasi:http/types@0.3.0` import wrappers
+    // (request/response/fields resources + body stream + trailers future);
+    // `wasi_http` is the ergonomic service-handler layer over them.
+    const wasi_http_bindings = b.addModule("wasi_http_bindings", .{ .root_source_file = b.path("src/wasi_http_bindings.zig") });
+    wasi_http_bindings.addImport("canon", canon);
+    wasi_http_bindings.addImport("abi", abi);
+    wasi_http_bindings.addImport("cm_async", cm_async);
+
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
+    wasi_http.addImport("wasi_http_bindings", wasi_http_bindings);
+    wasi_http.addImport("canon", canon);
     wasi_http.addImport("abi", abi);
     wasi_http.addImport("cm_async", cm_async);
 
@@ -212,7 +222,8 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "wasi_filesystem", .deps = &.{ "wasi_filesystem_bindings", "canon", "cm_async", "abi" } },
     .{ .name = "wasi_sockets_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
     .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "canon" } },
-    .{ .name = "wasi_http", .deps = &.{ "abi", "cm_async" } },
+    .{ .name = "wasi_http_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
+    .{ .name = "wasi_http", .deps = &.{ "wasi_http_bindings", "canon", "abi", "cm_async" } },
 };
 
 fn findSpec(name: []const u8) ModuleSpec {
