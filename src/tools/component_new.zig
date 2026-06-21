@@ -475,6 +475,35 @@ fn valTypesEql(a: []const wabt.types.ValType, b: []const wabt.types.ValType) boo
     return true;
 }
 
+/// A component `ValType` that is a no-memory inline scalar primitive —
+/// one flat core slot, no hoisted typedef, no `(memory)`/`(realloc)`
+/// lift opts. Excludes `string` / `error_context` (need memory or are
+/// P3 async), every compound (`list`/`tuple`/`record`/… or a hoisted
+/// `type_idx`), and resource handles (`own`/`borrow`).
+fn isInlineScalarValType(vt: ctypes.ValType) bool {
+    return switch (vt) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char => true,
+        else => false,
+    };
+}
+
+/// Whether a top-level world func (`named_func`) signature is liftable
+/// by `buildComponent`'s fast path: every param and result is an inline
+/// scalar primitive and the param count stays within the canonical flat
+/// limit (so nothing spills to memory). Non-simple sigs are rejected
+/// (rather than emitted verbatim, which would dangle a `type_idx` into
+/// the wrong type space — an invalid component).
+fn topLevelFuncSigIsSimple(sig: ctypes.FuncType) bool {
+    if (sig.params.len > wabt.component.adapter.abi.MAX_FLAT_PARAMS) return false;
+    for (sig.params) |p| if (!isInlineScalarValType(p.type)) return false;
+    switch (sig.results) {
+        .none => {},
+        .unnamed => |vt| if (!isInlineScalarValType(vt)) return false,
+        .named => return false, // multi/named results: needs memory, out of scope
+    }
+    return true;
+}
+
 fn debugPrintCoreSig(params: []const wabt.types.ValType, results: []const wabt.types.ValType) void {
     std.debug.print("(func", .{});
     for (params) |p| std.debug.print(" (param {s})", .{@tagName(p)});
@@ -2484,16 +2513,18 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     var captured_top_funcs = std.ArrayListUnmanaged(CapturedTopFunc).empty;
     for (decoded.func_externs) |fext| {
         if (!fext.is_export) continue; // imports rejected before path selection
-        // A top-level func whose lift needs `(memory)` / `(realloc)` /
-        // string-encoding can't ride the fast path (the shim/fixup path
-        // doesn't handle top-level funcs yet) — reject cleanly.
-        const lift_resolver = wabt.component.adapter.abi.TypeResolver{
-            .inst_decls = &.{},
-            .world_decls = decoded.world_decls,
-        };
-        if (wabt.component.adapter.abi.liftNeedsOpts(
-            wabt.component.adapter.abi.classifyFuncLift(.{ .func = fext.sig, .resolver = lift_resolver }),
-        )) return error.UnsupportedShape;
+        // Only top-level funcs whose signature is composed entirely of
+        // no-memory inline scalar primitives (and stays within the
+        // canonical flat-param/result limits) ride the fast path. Any
+        // `string` / compound (`list`/`tuple`/…) / handle / async value
+        // type would need its type hoisted+rebased into the wrapping
+        // component's type space and/or `(memory)`/`(realloc)` lift opts
+        // — neither of which this path emits for top-level funcs. The
+        // signature is appended verbatim below, so emitting a non-simple
+        // sig would dangle a `type_idx` into the wrong type space (an
+        // invalid component). Reject cleanly instead (a later phase may
+        // transcribe these). Func *imports* were already rejected.
+        if (!topLevelFuncSigIsSimple(fext.sig)) return error.UnsupportedShape;
 
         try types.append(ar, .{ .func = fext.sig });
         try Section.appendType(&order, ar, types.items.len);
@@ -6411,6 +6442,28 @@ test "buildComponent #285: top-level func import is rejected (not yet supported)
         \\(module
         \\  (import "compute" "" (func (result i32)))
         \\  (func (export "run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
+    defer testing.allocator.free(core);
+    try testing.expectError(error.UnsupportedShape, buildComponent(testing.allocator, core));
+}
+
+test "buildComponent #285: named_func export with a compound (non-simple) sig is rejected" {
+    // A top-level func whose result is a compound type (`tuple<u32, u32>`)
+    // can't ride the fast path: its sig carries a `type_idx` into the
+    // embed's world-body type space, which would dangle if emitted
+    // verbatim. The fast path rejects it cleanly rather than producing an
+    // invalid component.
+    const wit =
+        \\package local:nfc@0.1.0;
+        \\world cmd {
+        \\    export f: func() -> tuple<u32, u32>;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "f") (param i32))
         \\)
     ;
     const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
