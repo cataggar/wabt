@@ -212,6 +212,10 @@ const Gen = struct {
         const doc_pkg = self.resolver.main.package;
 
         var uses = std.ArrayListUnmanaged(Use).empty;
+        // Top-level world funcs (`named_func`): emitted at module scope
+        // (no enclosing interface struct), separate from `uses`.
+        const TopFunc = struct { name: []const u8, func: ast.Func, is_export: bool };
+        var top_funcs = std.ArrayListUnmanaged(TopFunc).empty;
         for (world.items) |item| {
             const extern_item: ?struct { ext: ast.WorldExtern, is_export: bool } = switch (item) {
                 .import => |e| .{ .ext = e, .is_export = false },
@@ -219,17 +223,33 @@ const Gen = struct {
                 else => null,
             };
             const ei = extern_item orelse continue;
-            const ref = switch (ei.ext) {
-                .interface_ref => |ir| ir.ref,
-                else => return error.UnsupportedWitType, // named_func/named_interface: v2
-            };
-            const hit = self.resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
-            try uses.append(self.ar, .{
-                .id = try ifaceId(self.ar, ref, doc_pkg),
-                .iface = hit.iface,
-                .is_export = ei.is_export,
-                .pkg = hit.pkg,
-            });
+            switch (ei.ext) {
+                .interface_ref => |ir| {
+                    const ref = ir.ref;
+                    const hit = self.resolver.findInterfaceWithPkg(ref) orelse return error.UnknownInterface;
+                    try uses.append(self.ar, .{
+                        .id = try ifaceId(self.ar, ref, doc_pkg),
+                        .iface = hit.iface,
+                        .is_export = ei.is_export,
+                        .pkg = hit.pkg,
+                    });
+                },
+                .named_interface => |ni| {
+                    // Inline interface: advertised under the world-local plain
+                    // name (matching metadata_encode / component new), so the
+                    // extern module string is `ni.name`. Reuse the interface
+                    // machinery by synthesizing a `Use` over its inline items.
+                    try uses.append(self.ar, .{
+                        .id = ni.name,
+                        .iface = .{ .name = ni.name, .items = ni.items },
+                        .is_export = ei.is_export,
+                        .pkg = doc_pkg,
+                    });
+                },
+                .named_func => |nf| {
+                    try top_funcs.append(self.ar, .{ .name = nf.name, .func = nf.func, .is_export = ei.is_export });
+                },
+            }
         }
 
         // Index every named type so `.name` refs resolve, plus any types pulled
@@ -339,6 +359,9 @@ const Gen = struct {
         for (uses.items) |u| {
             if (u.is_export) have_exports = true;
         }
+        for (top_funcs.items) |tf| {
+            if (tf.is_export) have_exports = true;
+        }
         if (have_exports) {
             self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
         }
@@ -352,6 +375,16 @@ const Gen = struct {
         for (uses.items) |u| {
             if (!u.is_export) continue;
             try self.emitExportIface(u);
+        }
+        // ── top-level world funcs (`named_func`) ──
+        for (top_funcs.items) |tf| {
+            if (tf.is_export) {
+                try self.emitTopLevelExportFunc(tf.name, tf.func);
+            } else {
+                // Top-level func *imports* are not yet wired by
+                // `component new` (they'd dangle); a later phase.
+                return error.UnsupportedWitType;
+            }
         }
     }
 
@@ -510,9 +543,28 @@ const Gen = struct {
 
     fn emitExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
         if (func.is_async) return self.emitAsyncExportFunc(iface_id, name, func);
+        const export_sym = try std.fmt.allocPrint(self.ar, "{s}#{s}", .{ iface_id, name });
+        try self.emitSyncExportFuncSym(export_sym, name, func);
+    }
+
+    /// Emit a module-scope export shell for a top-level world func
+    /// (`named_func`). The core export name is the plain func name (no
+    /// `<iface>#` prefix), matching what `component new` lifts.
+    fn emitTopLevelExportFunc(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
+        // Async top-level func exports need a top-level `[task-return]`
+        // intrinsic name; deferred to a later phase.
+        if (func.is_async) return error.UnsupportedWitType;
+        try self.emitSyncExportFuncSym(name, name, func);
+    }
+
+    /// Shared body for a synchronous export shell. `export_sym` is the
+    /// exact wasm core export name (`<iface>#<func>` for an interface
+    /// func, or the plain func name for a top-level world func); `name`
+    /// drives the `Impl.<fn>` call.
+    fn emitSyncExportFuncSym(self: *Gen, export_sym: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const result_zig = try self.resultZig(func);
 
-        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
+        self.print("export fn @\"{s}\"(", .{export_sym});
         try self.emitFlatParamDecls(func.params);
         self.print(") canon.CoreReturn({s}) {{\n", .{result_zig});
         self.raw("    abi.resetScratch();\n");
@@ -1877,6 +1929,107 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
     }
+}
+
+test "generate #286: named_interface import emits a plain-named import struct" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // world guest { import foo: interface { bar: func() -> u32; }; }
+    const foo_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "bar", .func = .{ .params = &.{}, .result = .u32 } } },
+    };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .named_interface = .{ .name = "foo", .items = &foo_items } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "ni" },
+        .items = &.{.{ .world = world }},
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Import struct named after the plain local name; the extern's wasm
+    // module is the plain name `foo`, field `bar` — matching the pipeline.
+    try testing.expect(std.mem.indexOf(u8, out, "pub const foo = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"foo\" fn @\"bar\"() i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn bar() u32 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return canon.liftResultFlat(u32, imp.@\"bar\"());") != null);
+}
+
+test "generate #286: named_func export emits a module-scope export shell" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // world cmd { export run: func(); }
+    const world = ast.World{ .name = "cmd", .items = &.{
+        .{ .@"export" = .{ .named_func = .{ .name = "run", .func = .{ .params = &.{}, .result = null } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "nf" },
+        .items = &.{.{ .world = world }},
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(world, "cmd");
+    const out = g.out.items;
+
+    // An export pulls in the user impl.
+    try testing.expect(std.mem.indexOf(u8, out, "const Impl = @import(\"impl\");") != null);
+    // Module-scope export under the plain func name (no `<iface>#` prefix).
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"run\"() canon.CoreReturn(void) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Impl.run();") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "#run") == null);
+}
+
+test "generate #286: named_func export with a primitive result" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // world cmd { export compute: func(x: u32) -> u32; }
+    const world = ast.World{ .name = "cmd", .items = &.{
+        .{ .@"export" = .{ .named_func = .{
+            .name = "compute",
+            .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32 },
+        } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "nf" },
+        .items = &.{.{ .world = world }},
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(world, "cmd");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"compute\"(") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "canon.returnResult(u32, Impl.compute(") != null);
+}
+
+test "generate #286: top-level func import is rejected (later phase)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const world = ast.World{ .name = "cmd", .items = &.{
+        .{ .import = .{ .named_func = .{ .name = "compute", .func = .{ .params = &.{}, .result = .u32 } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "nfi" },
+        .items = &.{.{ .world = world }},
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "cmd"));
 }
 
 test "generate: imported resource with async methods (#300)" {
