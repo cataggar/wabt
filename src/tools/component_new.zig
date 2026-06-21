@@ -475,6 +475,35 @@ fn valTypesEql(a: []const wabt.types.ValType, b: []const wabt.types.ValType) boo
     return true;
 }
 
+/// A component `ValType` that is a no-memory inline scalar primitive —
+/// one flat core slot, no hoisted typedef, no `(memory)`/`(realloc)`
+/// lift opts. Excludes `string` / `error_context` (need memory or are
+/// P3 async), every compound (`list`/`tuple`/`record`/… or a hoisted
+/// `type_idx`), and resource handles (`own`/`borrow`).
+fn isInlineScalarValType(vt: ctypes.ValType) bool {
+    return switch (vt) {
+        .bool, .s8, .u8, .s16, .u16, .s32, .u32, .s64, .u64, .f32, .f64, .char => true,
+        else => false,
+    };
+}
+
+/// Whether a top-level world func (`named_func`) signature is liftable
+/// by `buildComponent`'s fast path: every param and result is an inline
+/// scalar primitive and the param count stays within the canonical flat
+/// limit (so nothing spills to memory). Non-simple sigs are rejected
+/// (rather than emitted verbatim, which would dangle a `type_idx` into
+/// the wrong type space — an invalid component).
+fn topLevelFuncSigIsSimple(sig: ctypes.FuncType) bool {
+    if (sig.params.len > wabt.component.adapter.abi.MAX_FLAT_PARAMS) return false;
+    for (sig.params) |p| if (!isInlineScalarValType(p.type)) return false;
+    switch (sig.results) {
+        .none => {},
+        .unnamed => |vt| if (!isInlineScalarValType(vt)) return false,
+        .named => return false, // multi/named results: needs memory, out of scope
+    }
+    return true;
+}
+
 fn debugPrintCoreSig(params: []const wabt.types.ValType, results: []const wabt.types.ValType) void {
     std.debug.print("(func", .{});
     for (params) |p| std.debug.print(" (param {s})", .{@tagName(p)});
@@ -1516,6 +1545,14 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
 
     const decoded = try metadata_decode.decode(ar, found.payload);
 
+    // Top-level world func *imports* (`import name: func(...);`) are not
+    // yet wired by `component new` — rejecting here (before path
+    // selection) avoids silently dropping the guest's matching core
+    // import. Func *exports* are handled on the fast path below.
+    for (decoded.func_externs) |fext| {
+        if (!fext.is_export) return error.UnsupportedShape;
+    }
+
     // Strip the `component-type:*` custom sections from the core
     // module — they're metadata for `component new`, not part of the
     // module that goes inside the wrapping component.
@@ -2462,6 +2499,55 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         try ext_export_start.append(ar, .{ .ext = ext, .start = start });
     }
 
+    // ── Top-level world func exports (`named_func`). Capture each like
+    //    an interface export func — append its component func type and
+    //    alias the guest's core export — but emit a top-level func
+    //    export (not an instance) further below. The core export name
+    //    convention is the plain func name (documented in the README).
+    const CapturedTopFunc = struct {
+        name: []const u8,
+        func_type_idx: u32,
+        core_func_alias_idx: u32,
+        is_async: bool,
+    };
+    var captured_top_funcs = std.ArrayListUnmanaged(CapturedTopFunc).empty;
+    for (decoded.func_externs) |fext| {
+        if (!fext.is_export) continue; // imports rejected before path selection
+        // Only top-level funcs whose signature is composed entirely of
+        // no-memory inline scalar primitives (and stays within the
+        // canonical flat-param/result limits) ride the fast path. Any
+        // `string` / compound (`list`/`tuple`/…) / handle / async value
+        // type would need its type hoisted+rebased into the wrapping
+        // component's type space and/or `(memory)`/`(realloc)` lift opts
+        // — neither of which this path emits for top-level funcs. The
+        // signature is appended verbatim below, so emitting a non-simple
+        // sig would dangle a `type_idx` into the wrong type space (an
+        // invalid component). Reject cleanly instead (a later phase may
+        // transcribe these). Func *imports* were already rejected.
+        if (!topLevelFuncSigIsSimple(fext.sig)) return error.UnsupportedShape;
+
+        try types.append(ar, .{ .func = fext.sig });
+        try Section.appendType(&order, ar, types.items.len);
+        const func_type_idx = comp_type_idx;
+        comp_type_idx += 1;
+
+        try aliases.append(ar, .{ .instance_export = .{
+            .sort = .{ .core = .func },
+            .instance_idx = main_core_inst_idx,
+            .name = fext.name,
+        } });
+        try Section.appendAlias(&order, ar, aliases.items.len);
+        const cf_idx = core_func_idx;
+        core_func_idx += 1;
+
+        try captured_top_funcs.append(ar, .{
+            .name = fext.name,
+            .func_type_idx = func_type_idx,
+            .core_func_alias_idx = cf_idx,
+            .is_async = fext.sig.is_async,
+        });
+    }
+
     // ── Canon lifts and instance exprs: appended to flat lists,
     //    section_order entries appended after.
     const lifts_start: u32 = @intCast(canons.items.len);
@@ -2469,6 +2555,20 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         // An `async func` export lifts with the `async` canon option;
         // its async-ness reached us via the `[async]` declarator name
         // (see metadata_decode), surfaced as `fn_ref.sig.is_async`.
+        const opts: []const ctypes.CanonOpt = if (cf.is_async)
+            try ar.dupe(ctypes.CanonOpt, &.{.async_})
+        else
+            &.{};
+        try canons.append(ar, .{ .lift = .{
+            .core_func_idx = cf.core_func_alias_idx,
+            .type_idx = cf.func_type_idx,
+            .opts = opts,
+        } });
+    }
+    // Lift the captured top-level func exports into the same canon
+    // batch (after the interface export lifts, so their component func
+    // indices follow contiguously — see the export emit loop below).
+    for (captured_top_funcs.items) |cf| {
         const opts: []const ctypes.CanonOpt = if (cf.is_async)
             try ar.dupe(ctypes.CanonOpt, &.{.async_})
         else
@@ -2544,6 +2644,24 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .name = es.ext.qualified_name,
             .desc = .{ .instance = 0 },
             .sort_idx = .{ .sort = .instance, .idx = inst_idx },
+        });
+    }
+
+    // ── Top-level func exports: one component-level `export "<name>"
+    //    (func …)` per captured top-level func. Their lifted component
+    //    func indices follow the interface export funcs contiguously
+    //    (`comp_func_idx` was left at the first free slot by the loop
+    //    above, and the top-level lifts were appended to the canon
+    //    batch after the interface lifts).
+    for (captured_top_funcs.items) |cf| {
+        const cfi = comp_func_idx;
+        comp_func_idx += 1;
+        try exports.append(ar, .{
+            .name = cf.name,
+            // `idx = 0` placeholder → the writer emits the un-ascribed
+            // export form, deriving the func type from `sort_idx`.
+            .desc = .{ .func = 0 },
+            .sort_idx = .{ .sort = .func, .idx = cfi },
         });
     }
 
@@ -2635,6 +2753,13 @@ fn buildComponentShimFixup(
     const core_exports = try probeCoreExports(stripped_core);
     const memory_export_name = core_exports.memory_name orelse return error.MissingCoreExportMemory;
     const realloc_export_name = core_exports.realloc_name orelse return error.MissingCabiRealloc;
+
+    // The shim/fixup path does not yet emit top-level world func
+    // externs (`named_func`). Func imports are already rejected before
+    // path selection; any func extern reaching here is an export this
+    // path can't lift — reject cleanly rather than silently drop it.
+    // (Top-level func exports with only simple sigs take the fast path.)
+    if (decoded.func_externs.len > 0) return error.UnsupportedShape;
 
     // ── Phase 1: re-collect import shapes (same as the fast path).
     var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
@@ -6207,6 +6332,143 @@ test "buildComponent #263: async run export wires task.return + async lift" {
     try testing.expect(anyAsyncLift(loaded));
     try testing.expect(mainWithArgFor(loaded, "[task-return]local:p/run@0.1.0#run"));
     try testing.expect(bundleExportsFunc(loaded, "task-return"));
+}
+
+test "buildComponent #285: named_func export becomes a top-level component func export" {
+    // A world exporting a bare `run: func();` produces a component with
+    // a top-level func export named `run` (NOT wrapped in an instance).
+    // The guest core module exports the func under its plain name.
+    const wit =
+        \\package local:nf@0.1.0;
+        \\world cmd {
+        \\    export run: func();
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Exactly one top-level export: `run`, a func (no instance).
+    var saw_run_func = false;
+    for (loaded.exports) |e| {
+        if (std.mem.eql(u8, e.name, "run")) {
+            try testing.expect(e.sort_idx != null);
+            try testing.expectEqual(ctypes.Sort.func, e.sort_idx.?.sort);
+            saw_run_func = true;
+        }
+        // No instance export should be emitted for this world.
+        if (e.sort_idx) |si| try testing.expect(si.sort != .instance);
+    }
+    try testing.expect(saw_run_func);
+    // The func was lifted from the guest's `run` core export.
+    var saw_lift = false;
+    for (loaded.canons) |c| switch (c) {
+        .lift => saw_lift = true,
+        else => {},
+    };
+    try testing.expect(saw_lift);
+}
+
+test "buildComponent #285: named_interface import becomes a plain-named instance import" {
+    // A world importing an inline interface `host: interface { add: ... }`
+    // produces a component with an instance import named `host`; the
+    // guest's `(import "host" "add" …)` core import is wired to it.
+    const wit =
+        \\package local:ni@0.1.0;
+        \\world cmd {
+        \\    import host: interface { add: func(x: u32, y: u32) -> u32; };
+        \\    export run: func();
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "host" "add" (func (param i32 i32) (result i32)))
+        \\  (func (export "run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
+    defer testing.allocator.free(core);
+
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    // Instance import named `host`.
+    var saw_host_import = false;
+    for (loaded.imports) |im| {
+        if (std.mem.eql(u8, im.name, "host")) {
+            try testing.expect(im.desc == .instance);
+            saw_host_import = true;
+        }
+    }
+    try testing.expect(saw_host_import);
+
+    // The imported `add` func is lowered, and the guest is fed a
+    // `(with "host" …)` bundle exporting `add`.
+    try testing.expect(bundleExportsFunc(loaded, "add"));
+    try testing.expect(mainWithArgFor(loaded, "host"));
+
+    // And `run` is still exported as a top-level func.
+    var saw_run = false;
+    for (loaded.exports) |e| {
+        if (std.mem.eql(u8, e.name, "run") and e.sort_idx != null and e.sort_idx.?.sort == .func) saw_run = true;
+    }
+    try testing.expect(saw_run);
+}
+
+test "buildComponent #285: top-level func import is rejected (not yet supported)" {
+    const wit =
+        \\package local:nfi@0.1.0;
+        \\world cmd {
+        \\    import compute: func() -> u32;
+        \\    export run: func();
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "compute" "" (func (result i32)))
+        \\  (func (export "run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
+    defer testing.allocator.free(core);
+    try testing.expectError(error.UnsupportedShape, buildComponent(testing.allocator, core));
+}
+
+test "buildComponent #285: named_func export with a compound (non-simple) sig is rejected" {
+    // A top-level func whose result is a compound type (`tuple<u32, u32>`)
+    // can't ride the fast path: its sig carries a `type_idx` into the
+    // embed's world-body type space, which would dangle if emitted
+    // verbatim. The fast path rejects it cleanly rather than producing an
+    // invalid component.
+    const wit =
+        \\package local:nfc@0.1.0;
+        \\world cmd {
+        \\    export f: func() -> tuple<u32, u32>;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "f") (param i32))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "cmd");
+    defer testing.allocator.free(core);
+    try testing.expectError(error.UnsupportedShape, buildComponent(testing.allocator, core));
 }
 
 fn countStreamCanons(loaded: anytype) usize {

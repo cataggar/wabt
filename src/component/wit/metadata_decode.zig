@@ -48,6 +48,20 @@ pub const FuncRef = struct {
     sig: ctypes.FuncType,
 };
 
+/// A top-level world func extern (`import|export name: func(...);`).
+/// Unlike `WorldExtern`, it is not backed by an instance body — it is a
+/// component-level func import/export advertised under its plain name.
+pub const FuncExtern = struct {
+    is_export: bool,
+    /// Plain extern name on the wire, e.g. `run`.
+    name: []const u8,
+    /// Component-level func signature. For the shapes supported today
+    /// (primitive / simple value types) the sig is self-contained; a
+    /// `ValType.type_idx` payload would reference the world body's type
+    /// space (`DecodedWorld.world_decls`).
+    sig: ctypes.FuncType,
+};
+
 /// Per-slot view of an interface body's type-index space.
 ///
 /// `decodeInterfaceBody` walks the body in declaration order and
@@ -119,6 +133,13 @@ pub const DecodedWorld = struct {
     qualified_name: []const u8,
     /// All world externs (imports and exports), in declaration order.
     externs: []const WorldExtern,
+    /// Top-level world func externs (`import|export name: func(...);`,
+    /// the `named_func` WIT shape). These are component-level func
+    /// imports/exports (`ExternDesc.func`), not instances, so they are
+    /// kept separate from `externs` (which models instance-typed
+    /// imports/exports). Empty for worlds that use only interface /
+    /// inline-interface externs.
+    func_externs: []const FuncExtern,
     /// Raw on-wire world body decls. The outer scope that
     /// `WorldExtern.inst_decls`'s `alias outer (type 1 K)` references
     /// resolve against. Lets consumers transplanting an interface
@@ -188,6 +209,7 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
     // to this decoder — they bump the on-wire type-index but don't
     // introduce a new world extern.
     var externs = std.ArrayListUnmanaged(WorldExtern).empty;
+    var func_externs = std.ArrayListUnmanaged(FuncExtern).empty;
     var i: usize = 0;
     while (i < world_body.decls.len) {
         const decl = world_body.decls[i];
@@ -195,35 +217,65 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
             i += 1;
             continue;
         }
-        if (decl != .type or decl.type != .instance) return error.UnsupportedShape;
-        const inst_type = decl.type.instance;
-        // Find the matching import|export decl, skipping any alias
-        // decls the encoder may have spliced in between.
+        // Every extern is preceded by one or more `.type` decls (the
+        // instance type for an interface extern, or the hoisted
+        // compound + func type decls for a top-level func extern).
+        if (decl != .type) return error.UnsupportedShape;
+        // Find the matching import|export decl, skipping any alias or
+        // intervening type decls (a top-level func extern may emit
+        // compound type decls before its func-type decl).
         var j: usize = i + 1;
-        while (j < world_body.decls.len and world_body.decls[j] == .alias) : (j += 1) {}
+        while (j < world_body.decls.len and
+            world_body.decls[j] != .@"export" and
+            world_body.decls[j] != .import) : (j += 1)
+        {}
         if (j >= world_body.decls.len) return error.UnsupportedShape;
         const next = world_body.decls[j];
         var is_export: bool = undefined;
-        var qualified_name: []const u8 = undefined;
+        var extern_name: []const u8 = undefined;
+        var desc: ctypes.ExternDesc = undefined;
         switch (next) {
             .@"export" => |e| {
                 is_export = true;
-                qualified_name = e.name;
+                extern_name = e.name;
+                desc = e.desc;
             },
             .import => |im| {
                 is_export = false;
-                qualified_name = im.name;
+                extern_name = im.name;
+                desc = im.desc;
             },
             else => return error.UnsupportedShape,
         }
-        const body = try decodeInterfaceBody(arena, inst_type);
-        try externs.append(arena, .{
-            .is_export = is_export,
-            .qualified_name = qualified_name,
-            .type_slots = body.type_slots,
-            .funcs = body.funcs,
-            .inst_decls = inst_type.decls,
-        });
+        switch (desc) {
+            // Interface / inline-interface extern: an instance type.
+            .instance => {
+                if (decl.type != .instance) return error.UnsupportedShape;
+                const inst_type = decl.type.instance;
+                const body = try decodeInterfaceBody(arena, inst_type);
+                try externs.append(arena, .{
+                    .is_export = is_export,
+                    .qualified_name = extern_name,
+                    .type_slots = body.type_slots,
+                    .funcs = body.funcs,
+                    .inst_decls = inst_type.decls,
+                });
+            },
+            // Top-level world func extern (`named_func`). The func-type
+            // decl is the type decl immediately preceding the extern
+            // decl (the encoder appends the func type last among the
+            // func's hoisted type decls).
+            .func => {
+                const ftype_decl = world_body.decls[j - 1];
+                if (ftype_decl != .type or ftype_decl.type != .func) return error.UnsupportedShape;
+                try func_externs.append(arena, .{
+                    .is_export = is_export,
+                    .name = extern_name,
+                    .sig = ftype_decl.type.func,
+                });
+            },
+            else => return error.UnsupportedShape,
+        }
         i = j + 1;
     }
 
@@ -236,6 +288,7 @@ pub fn decode(arena: Allocator, ct_payload: []const u8) DecodeError!DecodedWorld
         .name = bare,
         .qualified_name = world_qualified,
         .externs = try externs.toOwnedSlice(arena),
+        .func_externs = try func_externs.toOwnedSlice(arena),
         .world_decls = world_body.decls,
     };
 }
@@ -540,6 +593,75 @@ test "decode: round-trip adder world" {
     try testing.expect(w.externs[0].funcs[0].sig.params[0].type == .u32);
     try testing.expect(w.externs[0].funcs[0].sig.results == .unnamed);
     try testing.expect(w.externs[0].funcs[0].sig.results.unnamed == .u32);
+}
+
+test "decode #285: top-level named_func export surfaces in func_externs" {
+    const wit_source =
+        \\package docs:nf@0.1.0;
+        \\world w {
+        \\    export run: func();
+        \\}
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "w");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const w = try decode(arena.allocator(), ct);
+
+    // No instance externs; one top-level func export named `run`.
+    try testing.expectEqual(@as(usize, 0), w.externs.len);
+    try testing.expectEqual(@as(usize, 1), w.func_externs.len);
+    try testing.expect(w.func_externs[0].is_export);
+    try testing.expectEqualStrings("run", w.func_externs[0].name);
+    try testing.expectEqual(@as(usize, 0), w.func_externs[0].sig.params.len);
+    try testing.expect(w.func_externs[0].sig.results == .none);
+}
+
+test "decode #285: top-level named_func import surfaces in func_externs" {
+    const wit_source =
+        \\package docs:nfi@0.1.0;
+        \\world w {
+        \\    import compute: func(x: u32) -> u32;
+        \\}
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "w");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const w = try decode(arena.allocator(), ct);
+
+    try testing.expectEqual(@as(usize, 0), w.externs.len);
+    try testing.expectEqual(@as(usize, 1), w.func_externs.len);
+    try testing.expect(!w.func_externs[0].is_export);
+    try testing.expectEqualStrings("compute", w.func_externs[0].name);
+    try testing.expectEqual(@as(usize, 1), w.func_externs[0].sig.params.len);
+    try testing.expect(w.func_externs[0].sig.params[0].type == .u32);
+    try testing.expect(w.func_externs[0].sig.results == .unnamed);
+    try testing.expect(w.func_externs[0].sig.results.unnamed == .u32);
+}
+
+test "decode #285: named_interface import surfaces as a plain-named instance extern" {
+    const wit_source =
+        \\package docs:ni@0.1.0;
+        \\world w {
+        \\    import foo: interface { bar: func() -> u32; };
+        \\}
+    ;
+    const ct = try metadata_encode.encodeWorldFromSource(testing.allocator, wit_source, "w");
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const w = try decode(arena.allocator(), ct);
+
+    try testing.expectEqual(@as(usize, 0), w.func_externs.len);
+    try testing.expectEqual(@as(usize, 1), w.externs.len);
+    try testing.expect(!w.externs[0].is_export);
+    try testing.expectEqualStrings("foo", w.externs[0].qualified_name);
+    try testing.expectEqual(@as(usize, 1), w.externs[0].funcs.len);
+    try testing.expectEqualStrings("bar", w.externs[0].funcs[0].name);
 }
 
 test "decode #191: world with cross-interface `use` and resources" {

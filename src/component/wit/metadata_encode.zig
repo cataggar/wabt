@@ -40,6 +40,26 @@
 //!     them; the func params/results then carry `ValType.type_idx`
 //!     references to those slots.
 //!
+//! World-extern naming convention (#285). Besides qualified
+//! `interface_ref` externs, two world-local `WorldExtern` shapes are
+//! supported; both `wabt component bindgen` and `component new` agree
+//! on these names (the contract is purely the advertised wire name and
+//! the guest core import/export module/field strings):
+//!
+//!   * `named_interface` — `import|export name: interface { … };`. An
+//!     inline interface advertised under its **plain local name**
+//!     (e.g. `foo`), NOT a `ns:pkg/iface@ver` qualifier. Encoded as an
+//!     instance import/export exactly like an `interface_ref`, so its
+//!     funcs' guest core import module is the plain name `foo` and the
+//!     field is the func name. Inline `use` clauses are out of scope.
+//!   * `named_func` — `import|export name: func(...) -> ...;`. A
+//!     **top-level component func** extern (`ExternDesc.func`), not an
+//!     instance: `lowerWorldFunc` hoists its type into the world body
+//!     and the main loop emits a `func` import/export decl under the
+//!     plain name. The guest core **export** name is the plain func
+//!     name (no `<iface>#` prefix). Top-level func *imports* are not
+//!     yet wired by `component new`.
+//!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
 //!   * `use` clauses (cross-interface type imports).
@@ -236,6 +256,31 @@ pub fn encodeWorldFromResolverWithDiag(
             .@"export", .import => |we| {
                 const is_export = item == .@"export";
                 const ext = we;
+
+                // World-level function externs
+                // (`import|export name: func(...) -> ...;`) are
+                // **top-level component funcs**, not instances: lower
+                // the func type into the world body and emit a `func`
+                // extern decl advertised under the plain local name.
+                // They advance only the type index space
+                // (`world_type_idx`), never the instance index space.
+                if (ext == .named_func) {
+                    const nf = ext.named_func;
+                    const func_type_idx = try lowerWorldFunc(ar, &world_decls, &world_type_idx, nf.func);
+                    if (is_export) {
+                        try world_decls.append(ar, .{ .@"export" = .{
+                            .name = nf.name,
+                            .desc = .{ .func = func_type_idx },
+                        } });
+                    } else {
+                        try world_decls.append(ar, .{ .import = .{
+                            .name = nf.name,
+                            .desc = .{ .func = func_type_idx },
+                        } });
+                    }
+                    continue;
+                }
+
                 const iface_name = qualifiedName(ar, ext, pkg_id) catch return error.InvalidWit;
                 // Type aliases this interface defines that another
                 // interface pulls in via `use <this>.{T};` must be
@@ -869,7 +914,12 @@ fn qualifiedName(
             }
             break :blk try formatQualifiedName(ar, pkg.namespace, pkg.name, ref.name, pkg.version);
         },
-        .named_func, .named_interface => return error.UnsupportedWitFeature,
+        // Inline interfaces and world-level funcs are advertised on the
+        // wire under their world-local plain name (no `ns:pkg/iface@ver`
+        // qualifier). See the module doc comment + README for the
+        // named_interface / named_func naming convention.
+        .named_interface => |ni| try ar.dupe(u8, ni.name),
+        .named_func => |nf| try ar.dupe(u8, nf.name),
     };
 }
 
@@ -884,6 +934,55 @@ fn formatQualifiedName(
         return try std.fmt.allocPrint(ar, "{s}:{s}/{s}@{s}", .{ ns, pkg, item, v });
     }
     return try std.fmt.allocPrint(ar, "{s}:{s}/{s}", .{ ns, pkg, item });
+}
+
+/// Lower a world-level `func` (`named_func`) into the world body's type
+/// index space and return the type index of the appended func-type
+/// decl. Any compound param/result types are hoisted into preceding
+/// `.type` decls (mirroring `BodyBuilder.emitFuncExport`), all spliced
+/// into `world_decls`; only the type index space (`world_type_idx`)
+/// advances — a top-level func extern does not occupy an instance slot.
+///
+/// Named-type params/results are out of scope for world-level funcs:
+/// there is no enclosing interface body to bind `type` aliases, so a
+/// `.name` ref bottoms out in an empty `name_map` as
+/// `error.InvalidWit`. Primitive / `list` / `option` / `result` /
+/// `tuple` / async value types are supported.
+fn lowerWorldFunc(
+    ar: Allocator,
+    world_decls: *std.ArrayListUnmanaged(ctypes.Decl),
+    world_type_idx: *u32,
+    func: ast.Func,
+) EncodeError!u32 {
+    var builder: BodyBuilder = .{
+        .ar = ar,
+        .decls = .empty,
+        .type_idx = world_type_idx.*,
+        .name_map = .empty,
+    };
+    const params = try ar.alloc(ctypes.NamedValType, func.params.len);
+    for (func.params, 0..) |p, i| {
+        params[i] = .{ .name = p.name, .type = try builder.lowerType(p.type) };
+    }
+    const results: ctypes.FuncType.ResultList = if (func.result) |t|
+        .{ .unnamed = try builder.lowerType(t) }
+    else
+        .none;
+
+    const func_type_idx = builder.type_idx;
+    try builder.decls.append(ar, .{ .type = .{ .func = .{
+        .params = params,
+        .results = results,
+        .is_async = func.is_async,
+    } } });
+    builder.type_idx += 1;
+
+    // Splice the hoisted compound type decls + the func type decl into
+    // the world body in order (the builder started counting at
+    // `world_type_idx`, so the slots line up).
+    for (builder.decls.items) |d| try world_decls.append(ar, d);
+    world_type_idx.* = builder.type_idx;
+    return func_type_idx;
 }
 
 /// Lower an interface's WIT items to instance-type decls.
@@ -902,24 +1001,81 @@ fn buildInterfaceBody(
     diag: ?*EncodeDiagnostic,
     world_name: []const u8,
 ) EncodeError![]const ctypes.Decl {
-    const ref = switch (ext) {
-        .interface_ref => |ir| ir.ref,
-        else => return error.UnsupportedWitFeature,
-    };
+    switch (ext) {
+        .interface_ref => |ir| {
+            const ref = ir.ref;
+            // Resolve the interface body across packages: same-package
+            // refs (no `pkg/` qualifier) hit the main doc;
+            // `<ns>:<pkg>/<iface>[@<ver>]` refs traverse the deps
+            // (populated by `parseLayout` walking `<root>/deps/<pkg>/`).
+            // The resolver returns the same shape either way. The
+            // returned `pkg` is the consuming interface's own package —
+            // used below as fallback context when resolving short
+            // `use src.{T};` refs against the dep's sibling files.
+            const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse {
+                const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
+                return failUnknownInterface(gpa, diag, ref, ctx);
+            };
+            return buildInterfaceBodyFromItems(
+                ar,
+                resolver,
+                iface_lookup.iface.items,
+                iface_lookup.pkg,
+                ref.name,
+                world_alias_map,
+                requested_exports,
+                gpa,
+                diag,
+            );
+        },
+        .named_interface => |ni| {
+            // Inline interface: its `items` live directly in the world
+            // body. Resolve named-type / `use` context against the
+            // enclosing document package (the world's own package), and
+            // advertise the extern under the plain local name `ni.name`.
+            for (ni.items) |it| {
+                // Cross-interface `use` from an inline interface is out
+                // of scope (#285 R2): the world-body alias prepass
+                // (`collectUseRequests`) only surfaces source types for
+                // `interface_ref` externs, so an inline `use` would
+                // dangle. Reject cleanly rather than emit a bad section.
+                if (it == .use) return error.UnsupportedWitFeature;
+            }
+            const pkg_ctx = resolver.main.package orelse return error.InvalidWit;
+            return buildInterfaceBodyFromItems(
+                ar,
+                resolver,
+                ni.items,
+                pkg_ctx,
+                ni.name,
+                world_alias_map,
+                requested_exports,
+                gpa,
+                diag,
+            );
+        },
+        // `named_func` is a top-level world func, not an interface body;
+        // it is emitted directly by the main loop, never via this path.
+        .named_func => return error.UnsupportedWitFeature,
+    }
+}
 
-    // Resolve the interface body across packages: same-package refs
-    // (no `pkg/` qualifier) hit the main doc; `<ns>:<pkg>/<iface>[@<ver>]`
-    // refs traverse the deps (populated by `parseLayout` walking
-    // `<root>/deps/<pkg>/`). The resolver returns the same shape
-    // either way. The returned `pkg` is the consuming interface's
-    // own package — used below as fallback context when resolving
-    // short `use src.{T};` refs against the dep's sibling files.
-    const iface_lookup = resolver.findInterfaceWithPkg(ref) orelse {
-        const ctx = std.fmt.allocPrint(ar, "world '{s}'", .{world_name}) catch world_name;
-        return failUnknownInterface(gpa, diag, ref, ctx);
-    };
-    const iface_body = iface_lookup.iface;
-
+/// Lower an explicit interface `items` list (sourced either from an
+/// `interface_ref` lookup or an inline `named_interface`) to
+/// instance-type decls. `pkg_ctx` is the package used to resolve short
+/// `use src.{T};` refs; `iface_name` is the consuming interface's local
+/// name (for diagnostics).
+fn buildInterfaceBodyFromItems(
+    ar: Allocator,
+    resolver: wit_resolver.Resolver,
+    items: []const ast.InterfaceItem,
+    pkg_ctx: ast.PackageId,
+    iface_name: []const u8,
+    world_alias_map: std.StringHashMapUnmanaged(u32),
+    requested_exports: ?[]const []const u8,
+    gpa: Allocator,
+    diag: ?*EncodeDiagnostic,
+) EncodeError![]const ctypes.Decl {
     // `BodyBuilder` tracks the type-index space inside this
     // instance-type body. Every appended `.type` decl bumps
     // `type_idx`; compound valtypes lower to a fresh `.type` decl
@@ -941,7 +1097,7 @@ fn buildInterfaceBody(
     // are then emitted in topological order (each type's name-deps
     // are emitted before it); funcs come last (they may reference
     // any name).
-    const sorted_items = try sortIfaceItemsForEncoding(ar, iface_body.items);
+    const sorted_items = try sortIfaceItemsForEncoding(ar, items);
 
     for (sorted_items) |it| {
         switch (it) {
@@ -1063,8 +1219,8 @@ fn buildInterfaceBody(
                 // canonical wit-component output: consumers of this
                 // iface can pull the type via the export chain
                 // without re-traversing the alias path).
-                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, iface_lookup.pkg) orelse {
-                    const consumer = formatQualifiedName(ar, iface_lookup.pkg.namespace, iface_lookup.pkg.name, ref.name, iface_lookup.pkg.version) catch ref.name;
+                const src_lookup = resolver.findInterfaceWithPkgCtx(u.from, pkg_ctx) orelse {
+                    const consumer = formatQualifiedName(ar, pkg_ctx.namespace, pkg_ctx.name, iface_name, pkg_ctx.version) catch iface_name;
                     return failUnknownInterface(gpa, diag, u.from, consumer);
                 };
                 const src_qname = try formatQualifiedName(
@@ -1590,6 +1746,122 @@ test "metadata_encode: bare `result` return is hoisted into a TypeDef + idx ref"
     try testing.expectEqualStrings("run", iface.decls[2].@"export".name);
     try testing.expect(iface.decls[2].@"export".desc == .func);
     try testing.expectEqual(@as(u32, 1), iface.decls[2].@"export".desc.func);
+}
+
+test "metadata_encode #285: named_interface inline import round-trips as a plain-named instance" {
+    // `import foo: interface { bar: func() -> u32; }` — an inline
+    // interface advertised under the world-local plain name `foo`
+    // (no `ns:pkg/iface@ver` qualifier), with `bar` as an instance
+    // export. Mirrors the `interface_ref` import path but sources its
+    // items inline.
+    const source =
+        \\package docs:ni@0.1.0;
+        \\world w {
+        \\    import foo: interface { bar: func() -> u32; };
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    // One instance type + one import decl named `foo` (plain, unqualified).
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .instance);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("foo", world.decls[1].import.name);
+    try testing.expect(world.decls[1].import.desc == .instance);
+
+    // The inline interface body has one func + one export `bar`.
+    const iface = world.decls[0].type.instance;
+    try testing.expectEqual(@as(usize, 2), iface.decls.len);
+    try testing.expect(iface.decls[0] == .type);
+    try testing.expect(iface.decls[0].type == .func);
+    try testing.expect(iface.decls[1] == .@"export");
+    try testing.expectEqualStrings("bar", iface.decls[1].@"export".name);
+}
+
+test "metadata_encode #285: named_func export round-trips as a top-level func export" {
+    // `export run: func();` — a world-level function, advertised as a
+    // top-level component func export named `run` (NOT wrapped in an
+    // instance). The world body holds a `func` type decl + a `func`
+    // extern export decl.
+    const source =
+        \\package docs:nf@0.1.0;
+        \\world w {
+        \\    export run: func();
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    // [func type decl, func export decl].
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .func);
+    try testing.expectEqual(@as(usize, 0), world.decls[0].type.func.params.len);
+    try testing.expect(world.decls[0].type.func.results == .none);
+    try testing.expect(world.decls[1] == .@"export");
+    try testing.expectEqualStrings("run", world.decls[1].@"export".name);
+    try testing.expect(world.decls[1].@"export".desc == .func);
+    try testing.expectEqual(@as(u32, 0), world.decls[1].@"export".desc.func);
+}
+
+test "metadata_encode #285: named_func import with a primitive result round-trips" {
+    // `import compute: func(x: u32) -> u32;` — a world-level function
+    // import, advertised as a top-level component func import.
+    const source =
+        \\package docs:nfi@0.1.0;
+        \\world w {
+        \\    import compute: func(x: u32) -> u32;
+        \\}
+    ;
+    const bytes = try encodeWorldFromSource(testing.allocator, source, "w");
+    defer testing.allocator.free(bytes);
+
+    const loader = @import("../loader.zig");
+    var arena_loaded = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_loaded.deinit();
+    const comp = try loader.load(bytes, arena_loaded.allocator());
+
+    const outer = comp.types[0].component;
+    const world = outer.decls[0].type.component;
+    try testing.expectEqual(@as(usize, 2), world.decls.len);
+    try testing.expect(world.decls[0] == .type);
+    try testing.expect(world.decls[0].type == .func);
+    const f = world.decls[0].type.func;
+    try testing.expectEqual(@as(usize, 1), f.params.len);
+    try testing.expect(f.params[0].type == .u32);
+    try testing.expect(f.results == .unnamed);
+    try testing.expect(f.results.unnamed == .u32);
+    try testing.expect(world.decls[1] == .import);
+    try testing.expectEqualStrings("compute", world.decls[1].import.name);
+    try testing.expect(world.decls[1].import.desc == .func);
+}
+
+test "metadata_encode #285: inline interface with a `use` clause is rejected (R2 scope guard)" {
+    const source =
+        \\package docs:niu@0.1.0;
+        \\interface types { type t = u32; }
+        \\world w {
+        \\    import foo: interface { use types.{t}; bar: func() -> t; };
+        \\}
+    ;
+    const r = encodeWorldFromSource(testing.allocator, source, "w");
+    try testing.expectError(error.UnsupportedWitFeature, r);
 }
 
 test "metadata_encode #263: lower P3 stream/future/error-context/async func" {
