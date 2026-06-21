@@ -30,6 +30,10 @@ const ByteStream = canon.Stream(u8);
 // The send/receive completion `future<result<_, error-code>>`, recovered by
 // reflection on the generated `tcp-socket.send` signature (its return type).
 const SendFut = @typeInfo(@TypeOf(b.TcpSocket.send)).@"fn".return_type.?;
+// The accept stream `stream<tcp-socket>` returned by `tcp-socket.listen`,
+// recovered from the `.ok` arm of its `canon.Result(stream, error-code)` return.
+const ListenRet = @typeInfo(@TypeOf(b.TcpSocket.listen)).@"fn".return_type.?;
+const AcceptStream = @typeInfo(ListenRet).@"union".fields[0].type;
 
 /// Canonical `stream`/`future` status: blocked (operation pending).
 const BLOCKED: i32 = @bitCast(@as(u32, 0xffff_ffff));
@@ -163,6 +167,56 @@ pub fn connect(remote: IpSocketAddress) canon.Result(TcpStream, ErrorCode) {
         },
     }
     return .{ .ok = .{ .socket = sock } };
+}
+
+// ── TCP server ──────────────────────────────────────────────────────
+
+/// A listening TCP socket whose `accept` yields inbound connections by reading
+/// the `stream<tcp-socket>` the host produces — each element is an accepted
+/// `tcp-socket` resource handle.
+pub const TcpListener = struct {
+    socket: TcpSocket,
+    accepts: AcceptStream,
+
+    /// Accept the next inbound connection, blocking until one arrives. Returns
+    /// null when the accept stream closes.
+    pub fn accept(self: TcpListener) ?TcpStream {
+        var one: [1]TcpSocket = undefined;
+        const status = self.accepts.read(&one);
+        const code: u32 = if (status == BLOCKED) waitCode(self.accepts.handle) else @bitCast(status);
+        if (code >> 4 == 0) return null; // closed / no socket delivered
+        return .{ .socket = one[0] };
+    }
+
+    /// Stop listening: drop the accept stream and the listener socket.
+    pub fn close(self: TcpListener) void {
+        self.accepts.dropReadable();
+        self.socket.deinit();
+    }
+};
+
+/// Bind + listen on `local`; the returned listener's `accept` yields inbound
+/// `TcpStream`s.
+pub fn listen(local: IpSocketAddress) canon.Result(TcpListener, ErrorCode) {
+    const sock = switch (TcpSocket.create(familyOf(local))) {
+        .ok => |s| s,
+        .err => |e| return .{ .err = e },
+    };
+    switch (sock.bind(local)) {
+        .ok => {},
+        .err => |e| {
+            sock.deinit();
+            return .{ .err = e };
+        },
+    }
+    const accepts = switch (sock.listen()) {
+        .ok => |s| s,
+        .err => |e| {
+            sock.deinit();
+            return .{ .err = e };
+        },
+    };
+    return .{ .ok = .{ .socket = sock, .accepts = accepts } };
 }
 
 // ── UDP ─────────────────────────────────────────────────────────────

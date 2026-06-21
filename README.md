@@ -56,7 +56,7 @@ src/
   wasi_filesystem_bindings.zig  `wabt component bindgen`-generated wasi:filesystem@0.3.0 import client wrappers
   wasi_filesystem.zig  ergonomic wasi:filesystem@0.3.0 layer (preopens, open, read/writeAll via stream<u8>, stat/get-type)
   wasi_sockets_bindings.zig  `wabt component bindgen`-generated wasi:sockets@0.3.0 import client wrappers
-  wasi_sockets.zig     ergonomic wasi:sockets@0.3.0 layer (TCP connect/send/recv, UDP connect/send/recv, ip-name-lookup resolveAddresses, address builders)
+  wasi_sockets.zig     ergonomic wasi:sockets@0.3.0 layer (TCP connect/send/recv + listen/accept, UDP connect/send/recv, ip-name-lookup resolveAddresses, address builders)
   wasi_http_bindings.zig  `wabt component bindgen`-generated wasi:http/types@0.3.0 import client wrappers
   wasi_http.zig        ergonomic wasi:http@0.3.0 service handler layer (exportHandler + Request/Responder, over the generated body stream/trailers future)
   root.zig             `wasip3` re-export index
