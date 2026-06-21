@@ -40,6 +40,26 @@
 //!     them; the func params/results then carry `ValType.type_idx`
 //!     references to those slots.
 //!
+//! World-extern naming convention (#285). Besides qualified
+//! `interface_ref` externs, two world-local `WorldExtern` shapes are
+//! supported; both `wabt component bindgen` and `component new` agree
+//! on these names (the contract is purely the advertised wire name and
+//! the guest core import/export module/field strings):
+//!
+//!   * `named_interface` — `import|export name: interface { … };`. An
+//!     inline interface advertised under its **plain local name**
+//!     (e.g. `foo`), NOT a `ns:pkg/iface@ver` qualifier. Encoded as an
+//!     instance import/export exactly like an `interface_ref`, so its
+//!     funcs' guest core import module is the plain name `foo` and the
+//!     field is the func name. Inline `use` clauses are out of scope.
+//!   * `named_func` — `import|export name: func(...) -> ...;`. A
+//!     **top-level component func** extern (`ExternDesc.func`), not an
+//!     instance: `lowerWorldFunc` hoists its type into the world body
+//!     and the main loop emits a `func` import/export decl under the
+//!     plain name. The guest core **export** name is the plain func
+//!     name (no `<iface>#` prefix). Top-level func *imports* are not
+//!     yet wired by `component new`.
+//!
 //! Deferred (rejected with `error.UnsupportedWitFeature`):
 //!
 //!   * `use` clauses (cross-interface type imports).
