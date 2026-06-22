@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
             .{ .bindings = web_bindings },
         }),
     });
-    const web_component = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "web" });
+    const web = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "web" });
 
     const store_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/memory_store.zig"),
@@ -24,13 +24,13 @@ pub fn build(b: *std.Build) void {
     });
     const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "storage" });
 
-    const component = wasip3.wabtComponentCompose(b, .{
-        .consumer = web_component,
+    const petstore = wasip3.wabtComponentCompose(b, .{
+        .consumer = web,
         .dependencies = &.{store},
         .output = "petstore.wasm",
     });
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(component, .prefix, "petstore.wasm").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(petstore, .prefix, "petstore.wasm").step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
-    _ = wasip3.wasmtimeServe(b, .{ .wasm = component, .description = "Serve the composed petstore component with wasmtime (P3)" });
+    _ = wasip3.wasmtimeServe(b, .{ .wasm = petstore, .description = "Serve petstore with wasmtime" });
 }
