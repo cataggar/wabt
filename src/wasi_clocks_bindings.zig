@@ -3,7 +3,7 @@
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types.canon;
+const canon = wit_types;
 const abi = wit_types.abi;
 const cm_async = wit_async;
 

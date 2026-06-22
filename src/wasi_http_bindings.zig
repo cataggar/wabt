@@ -2,7 +2,7 @@
 
 const wit_types = @import("wit_types");
 
-const canon = wit_types.canon;
+const canon = wit_types;
 const abi = wit_types.abi;
 
 pub const Duration = u64;

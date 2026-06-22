@@ -32,7 +32,8 @@
 //! (`design/mvp/CanonicalABI.md`) and were cross-checked against the
 //! wasmtime `component-model/async` test fixtures.
 
-const abi = @import("abi");
+const wit_types = @import("wit_types");
+const abi = wit_types.abi;
 
 // Keep `abi` alive so its `cabi_realloc` export survives even when a guest
 // only touches the `stream<u8>` path (e.g. a pure-output `wasi:cli` command

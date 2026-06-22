@@ -27,11 +27,11 @@ const b = @import("wasi_filesystem_bindings");
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types.canon;
+const canon = wit_types;
 const abi = wit_types.abi;
 const cm = wit_async;
 
-const ByteStream = wit_types.canon.Stream(u8);
+const ByteStream = wit_types.Stream(u8);
 
 /// Canonical `stream`/`future` status: blocked (operation pending).
 const BLOCKED: i32 = @bitCast(@as(u32, 0xffff_ffff));
