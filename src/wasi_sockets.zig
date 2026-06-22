@@ -22,11 +22,14 @@
 //! ```
 
 const b = @import("wasi_sockets_bindings");
-const canon = @import("canon");
-const cm = @import("cm_async");
-const abi = @import("abi");
+const wit_types = @import("wit_types");
+const wit_async = @import("wit_async");
 
-const ByteStream = canon.Stream(u8);
+const canon = wit_types;
+const abi = wit_types.abi;
+const cm = wit_async;
+
+const ByteStream = wit_types.Stream(u8);
 // The send/receive completion `future<result<_, error-code>>`, recovered by
 // reflection on the generated `tcp-socket.send` signature (its return type).
 const SendFut = @typeInfo(@TypeOf(b.TcpSocket.send)).@"fn".return_type.?;

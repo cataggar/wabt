@@ -1,47 +1,241 @@
-//! `canon` — a comptime Component-Model **canonical ABI** value marshaller.
-//!
-//! Given an ordinary Zig type, this module computes the canonical memory
-//! layout (`alignOf` / `sizeOf`) and lowers/lifts values to/from linear memory
-//! exactly as the Component Model canonical ABI specifies — so a guest never
-//! hand-writes `extern struct` layouts or pointer arithmetic for records,
-//! options, strings, or lists. It is the in-memory half of the ABI (the part
-//! used for aggregate params/results that spill to memory); flat scalar slots
-//! that a core function passes directly are handled by the caller.
-//!
-//! ## Zig → WIT type mapping
-//!
-//!   | Zig                         | WIT            |
-//!   | --------------------------- | -------------- |
-//!   | `bool`                      | `bool`         |
-//!   | `u8/u16/u32/u64`            | `u8/u16/u32/u64` |
-//!   | `i8/i16/i32/i64`            | `s8/s16/s32/s64` |
-//!   | `f32` / `f64`               | `f32` / `f64`  |
-//!   | `[]const u8`                | `string`       |
-//!   | `[]const T` (T ≠ u8)        | `list<T>`      |
-//!   | `?T`                        | `option<T>`    |
-//!   | `enum`                      | `enum`         |
-//!   | `struct { … }`              | `record`       |
-//!   | tuple `struct { T, U }`     | `tuple<T, U>`  |
-//!
-//! ## Layout rules (canonical ABI)
-//!
-//!   * `align(T)` / `size(T)` follow the spec: records concatenate fields at
-//!     their alignment; `option<T>` is a 2-case variant — a 1-byte
-//!     discriminant, the payload at `align(T)`, padded to `align(T)`;
-//!     `string`/`list` are a `(ptr: u32, len: u32)` pair (size 8, align 4 on
-//!     wasm32).
-//!   * A value wider than one core slot is returned/received through a pointer
-//!     to such a layout; `RetArea(T)` provides the static return area an export
-//!     returns by address.
+// wit_types - shared canonical-ABI helpers for WASI 0.3 guests.
+//
+// This module now owns both:
+// - abi: scratch arena and ret-area primitives
+// - canon: canonical ABI marshalling and typed future/stream wrappers
 
 const std = @import("std");
+pub const abi: type = @This();
+// `abi` — shared guest-side Component Model canonical-ABI primitives.
+//
+// The `wasi_*` helper modules in this directory (`wasi_http`,
+// `wasi_keyvalue`, …) are thin typed wrappers over
+// `extern` declarations of host imports. Everything those wrappers
+// share — the `cabi_realloc` scratch arena and the "ret-area" used to
+// receive results wider than one core value — lives here, exactly once,
+// so a guest can pull in several `wasi_*` modules without duplicate
+// `cabi_realloc` exports or competing scratch state.
+//
+// ## Canonical ABI, briefly
+//
+// A component guest speaks the **canonical ABI**: host functions are
+// imported with lowered core-wasm signatures (every WIT type flattened
+// to `i32` / `i64` slots). The flattening rules used throughout the
+// `wasi_*` wrappers:
+//
+//   * `MAX_FLAT_PARAMS = 16`, `MAX_FLAT_RESULTS = 1`.
+//   * A result whose flattened representation exceeds one core value is
+//     returned through a guest-allocated "ret-area" pointer passed as
+//     the trailing parameter; the callee writes the flattened words
+//     there and the caller reads them back. `retPtr` / `retWords`
+//     below provide that area.
+//   * `string` and `list<T>` lower to `(ptr, len)` pairs.
+//   * `option<T>` lowers to `(discriminant, …flatten(T))`.
+//   * `result<T, E>` lowers to `(discriminant, …join(flatten(T), flatten(E)))`.
+//
+// There is no Zig `wit-bindgen` backend that emits these bindings, so
+// they are written by hand in the wrappers; this module factors out the
+// parts that are identical across every interface.
+
+// ── cabi_realloc scratch arena ─────────────────────────────────────
+//
+// Canonical-ABI lifts of host-side `string` / `list` values into guest
+// memory call `cabi_realloc`. A bump arena suits the canonical ABI's
+// "grow-only, no free, lifetime = one host→guest call" shape: the host
+// never frees, and `resetScratch` reclaims everything at once at the top
+// of each request. `cabi_realloc` is `export`ed (a linker root), so it
+// appears in the final component even though it lives in this dependency
+// module rather than the guest's root source file.
+
+var arena_buf: [65536]u8 align(16) = undefined;
+var arena_top: usize = 0;
+
+inline fn alignUp(x: usize, a: usize) usize {
+    return (x + a - 1) & ~(a - 1);
+}
+
+export fn cabi_realloc(
+    _: usize, // old_ptr — we never free
+    _: usize, // old_size
+    alignment: usize,
+    new_size: usize,
+) usize {
+    if (new_size == 0) return 0;
+    const a = if (alignment == 0) 1 else alignment;
+    const start = alignUp(arena_top, a);
+    if (start + new_size > arena_buf.len) return 0;
+    arena_top = start + new_size;
+    return @intFromPtr(&arena_buf[start]);
+}
+
+/// Reset the scratch arena. A handler entry point (e.g. `wasi_http`'s
+/// `exportIncomingHandler` wrapper) calls this once at the top of each
+/// request so every invocation gets a fresh 64 KiB scratch surface.
+///
+/// Not thread-safe, and intentionally so: the module-level `arena_buf`,
+/// `arena_top`, and `ret_area` globals assume **one invocation at a
+/// time**. That holds for wamr's serial accept loop and for a
+/// single-threaded freestanding guest (no wasi-threads / shared memory),
+/// and for runtimes that instantiate a fresh component per request
+/// (e.g. `wasmtime serve`, where each request has its own linear
+/// memory). A model that invoked one instance's export concurrently on
+/// multiple threads would need per-thread scratch (wasm thread-locals).
+pub fn resetScratch() void {
+    arena_top = 0;
+}
+
+/// Allocate `size` bytes aligned to `alignment` from the scratch arena — the
+/// `canon.Realloc` used to place `string` / `list` storage during lowering.
+/// Grows the same bump arena as `cabi_realloc`; reclaimed by `resetScratch`.
+pub fn alloc(size: usize, alignment: usize) [*]u8 {
+    return @ptrFromInt(cabi_realloc(0, 0, alignment, size));
+}
+
+// ── Ret-area for spilled results ───────────────────────────────────
+//
+// Every imported function whose flat result exceeds one core value
+// writes its result words here; the decoders below read them back. 64
+// bytes (16 words) covers the widest result the wrappers decode —
+// canonical `wasi:http` `outgoing-body.finish` → `result<_, error-code>`
+// where the full `error-code` variant flattens to ~7 words (so the
+// result is ~8), plus headroom.
+
+var ret_area: [64]u8 align(8) = undefined;
+
+/// Pointer to the ret-area as an `i32`, for passing as the trailing
+/// `retptr` parameter of a spilled-result import.
+pub inline fn retPtr() i32 {
+    return @intCast(@intFromPtr(&ret_area));
+}
+
+/// The ret-area reinterpreted as a word array, for reading flattened
+/// `i32` result slots back after a call.
+pub inline fn retWords() [*]u32 {
+    return @ptrCast(@alignCast(&ret_area));
+}
+
+/// The ret-area as a byte pointer, for `canon.lift` of a spilled result.
+pub inline fn retArea() [*]const u8 {
+    return @ptrCast(&ret_area);
+}
+
+/// Decode the ret-area as `result<own<handle>, _>` → the handle on the
+/// ok arm (word layout `[disc, handle]`), or null on the err arm.
+pub inline fn readResultHandle() ?i32 {
+    const w = retWords();
+    return if (w[0] == 0) @bitCast(w[1]) else null;
+}
+
+/// Decode the ret-area as `option<string>` / `option<list<u8>>`
+/// (`[disc, ptr, len]`) into a slice borrowing from the scratch arena,
+/// or null for `none`.
+pub inline fn readOptionBytes() ?[]const u8 {
+    const w = retWords();
+    if (w[0] != 1) return null;
+    const p: [*]const u8 = @ptrFromInt(w[1]);
+    return p[0..w[2]];
+}
+
+// ── Tests ──────────────────────────────────────────────────────────
+//
+// These exercise the pure, host-import-free core: the alignment helper,
+// the `cabi_realloc` bump arena, and the ret-area decoders. They link
+// and run natively (`zig build test`); the `wasi_*` wrappers can't be
+// tested this way because every public function calls an `extern` host
+// import that only resolves under `wasm32-freestanding`.
+
+const abi_testing = std.testing;
+
+test alignUp {
+    try abi_testing.expectEqual(@as(usize, 0), alignUp(0, 8));
+    try abi_testing.expectEqual(@as(usize, 8), alignUp(1, 8));
+    try abi_testing.expectEqual(@as(usize, 8), alignUp(8, 8));
+    try abi_testing.expectEqual(@as(usize, 16), alignUp(9, 8));
+    try abi_testing.expectEqual(@as(usize, 16), alignUp(16, 16));
+    try abi_testing.expectEqual(@as(usize, 5), alignUp(5, 1));
+}
+
+test "cabi_realloc bumps, aligns, and grows monotonically" {
+    resetScratch();
+
+    const a = cabi_realloc(0, 0, 16, 32);
+    try abi_testing.expect(a != 0);
+    try abi_testing.expectEqual(@as(usize, 0), a % 16);
+
+    // Next allocation is past the first and respects its alignment.
+    const b = cabi_realloc(0, 0, 8, 8);
+    try abi_testing.expect(b >= a + 32);
+    try abi_testing.expectEqual(@as(usize, 0), b % 8);
+}
+
+test "cabi_realloc: zero size returns 0, oversize fails, reset reclaims" {
+    resetScratch();
+
+    try abi_testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, 0));
+
+    // A request larger than the whole arena cannot be satisfied.
+    try abi_testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, arena_buf.len + 1));
+
+    // Fill the arena, then confirm reset makes room again.
+    const full = cabi_realloc(0, 0, 1, arena_buf.len);
+    try abi_testing.expect(full != 0);
+    try abi_testing.expectEqual(@as(usize, 0), cabi_realloc(0, 0, 1, 1));
+    resetScratch();
+    try abi_testing.expect(cabi_realloc(0, 0, 1, 1) != 0);
+}
+
+test "readResultHandle decodes the ok and err arms" {
+    const w = retWords();
+
+    w[0] = 0; // ok
+    w[1] = @bitCast(@as(i32, 42));
+    try abi_testing.expectEqual(@as(?i32, 42), readResultHandle());
+
+    w[0] = 1; // err
+    try abi_testing.expectEqual(@as(?i32, null), readResultHandle());
+}
+
+// `canon` — a comptime Component-Model **canonical ABI** value marshaller.
+//
+// Given an ordinary Zig type, this module computes the canonical memory
+// layout (`alignOf` / `sizeOf`) and lowers/lifts values to/from linear memory
+// exactly as the Component Model canonical ABI specifies — so a guest never
+// hand-writes `extern struct` layouts or pointer arithmetic for records,
+// options, strings, or lists. It is the in-memory half of the ABI (the part
+// used for aggregate params/results that spill to memory); flat scalar slots
+// that a core function passes directly are handled by the caller.
+//
+// ## Zig → WIT type mapping
+//
+//   | Zig                         | WIT            |
+//   | --------------------------- | -------------- |
+//   | `bool`                      | `bool`         |
+//   | `u8/u16/u32/u64`            | `u8/u16/u32/u64` |
+//   | `i8/i16/i32/i64`            | `s8/s16/s32/s64` |
+//   | `f32` / `f64`               | `f32` / `f64`  |
+//   | `[]const u8`                | `string`       |
+//   | `[]const T` (T ≠ u8)        | `list<T>`      |
+//   | `?T`                        | `option<T>`    |
+//   | `enum`                      | `enum`         |
+//   | `struct { … }`              | `record`       |
+//   | tuple `struct { T, U }`     | `tuple<T, U>`  |
+//
+// ## Layout rules (canonical ABI)
+//
+//   * `align(T)` / `size(T)` follow the spec: records concatenate fields at
+//     their alignment; `option<T>` is a 2-case variant — a 1-byte
+//     discriminant, the payload at `align(T)`, padded to `align(T)`;
+//     `string`/`list` are a `(ptr: u32, len: u32)` pair (size 8, align 4 on
+//     wasm32).
+//   * A value wider than one core slot is returned/received through a pointer
+//     to such a layout; `RetArea(T)` provides the static return area an export
+//     returns by address.
 
 /// The guest's `cabi_realloc` scratch arena — `lift` allocates from it when a
 /// `list<E>` element can't be borrowed in place (its native Zig layout differs
 /// from the canonical one, e.g. a tagged `variant`), copying each element into a
 /// fresh native array with the same lifetime as the host-allocated list.
-const abi = @import("abi");
-
+const abi_core = abi;
 /// A bump allocator the canonical ABI calls to place `string` / `list` element
 /// storage during `lower` (the guest's `cabi_realloc` arena). `lift` borrows
 /// memory and needs none.
@@ -503,7 +697,7 @@ fn liftSlice(comptime E: type, base: [*]const u8) []const E {
     }
     const esize = comptime sizeOf(E); // canonical element stride (matches `lowerSlice`)
     const src: [*]const u8 = @ptrFromInt(ptr);
-    const out: [*]E = @ptrCast(@alignCast(abi.alloc(len * @sizeOf(E), @alignOf(E))));
+    const out: [*]E = @ptrCast(@alignCast(abi_core.alloc(len * @sizeOf(E), @alignOf(E))));
     for (0..len) |i| out[i] = lift(E, src + i * esize);
     return out[0..len];
 }
@@ -973,7 +1167,7 @@ test "round-trip: toy and scalars" {
 
 test "lift list<variant>: element-wise copy of a non-layout-matching element (#306)" {
     test_top = 0;
-    abi.resetScratch();
+    abi_core.resetScratch();
     // variant V { num(u32), nothing, text(string) } — a tagged union whose Zig
     // layout differs from the canonical discriminant+payload, so the list can't
     // be borrowed in place.
@@ -1062,8 +1256,8 @@ test "liftParams places string/option/scalar at the right slots" {
     // Pointers aren't dereferenced here, so empty (ptr=0,len=0) is safe.
     const P = struct { name: []const u8, tag: ?[]const u8, age: u32 };
     const got = liftParams(P, .{
-        @as(i32, 0),                       @as(i32, 0), // name ptr,len
-        @as(i32, 0),  @as(i32, 0),         @as(i32, 0), // tag none
+        @as(i32, 0), @as(i32, 0), // name ptr,len
+        @as(i32, 0), @as(i32, 0), @as(i32, 0), // tag none
         @as(i32, @bitCast(@as(u32, 5))), // age
     });
     try testing.expectEqual(@as(usize, 0), got.name.len);

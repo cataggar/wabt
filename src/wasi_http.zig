@@ -36,16 +36,19 @@
 
 const std = @import("std");
 const b = @import("wasi_http_bindings");
-const canon = @import("canon");
-const cm = @import("cm_async");
-const abi = @import("abi");
+const wit_types = @import("wit_types");
+const wit_async = @import("wit_async");
+
+const canon = wit_types;
+const abi = wit_types.abi;
+const cm = wit_async;
 
 // The private body/trailers future channel types, recovered by reflection on
 // the generated client signatures (the same trick the petstore example uses):
 // `consume-body`'s `res` param and `response.new`'s `trailers` param.
 const TxnFut = @typeInfo(@TypeOf(b.Request.consumeBody)).@"fn".params[1].type.?;
 const TrailersFut = @typeInfo(@TypeOf(b.Response.new)).@"fn".params[2].type.?;
-const ByteStream = canon.Stream(u8);
+const ByteStream = wit_types.Stream(u8);
 
 /// Canonical `stream`/`future` status: blocked (operation pending).
 const BLOCKED: i32 = @bitCast(@as(u32, 0xffff_ffff));
@@ -120,6 +123,14 @@ pub const Responder = struct {
         return self.buf[0..self.len];
     }
 };
+
+/// Default JSON stringification options (omit null optional fields).
+pub const json_opts = std.json.Stringify.Options{ .emit_null_optional_fields = false };
+
+/// Stringify a value as JSON and append to the response buffer.
+pub fn writeJson(res: *Responder, value: anytype) void {
+    res.print("{f}", .{std.json.fmt(value, json_opts)});
+}
 
 // ── async helpers (drive the generated stream/future channels) ──────
 

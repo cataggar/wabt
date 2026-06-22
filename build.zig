@@ -6,40 +6,30 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     // ?? Library modules (guest bindings) ???????????????????????????
     // Public modules so dependents can `@import` them when compiling a
-    // `wasm32-freestanding` guest. `abi` owns the sole `cabi_realloc`
-    // export + ret-area; `cm_async` declares the canonical-ABI async
-    // intrinsics (the WASI 0.3 replacement for `wasi:io`).
-    const abi = b.addModule("abi", .{ .root_source_file = b.path("src/abi.zig") });
+    // `wasm32-freestanding` guest. `wit_types` owns the canonical ABI core
+    // (scratch arena + ret-area + marshaller), while `wit_async` declares the
+    // canonical-ABI async intrinsics (the WASI 0.3 replacement for `wasi:io`).
+    const wit_types = b.addModule("wit_types", .{ .root_source_file = b.path("src/wit_types.zig") });
 
-    const cm_async = b.addModule("cm_async", .{ .root_source_file = b.path("src/cm_async.zig") });
-    cm_async.addImport("abi", abi);
-
-    // Comptime canonical-ABI value marshaller (records / strings / options /
-    // lists → linear memory). Lowers via a caller-supplied realloc; for `lift`
-    // of a `list<E>` whose element can't be borrowed in place (e.g. a tagged
-    // `variant`) it copies elements via `abi`'s scratch arena.
-    const canon = b.addModule("canon", .{ .root_source_file = b.path("src/canon.zig") });
-    canon.addImport("abi", abi);
+    const wit_async = b.addModule("wit_async", .{ .root_source_file = b.path("src/wit_async.zig") });
+    wit_async.addImport("wit_types", wit_types);
 
     // `wabt component bindgen`-generated `wasi:cli@0.3.0` import client wrappers;
     // `wasi_cli` is the ergonomic layer over them.
     const wasi_cli_bindings = b.addModule("wasi_cli_bindings", .{ .root_source_file = b.path("src/wasi_cli_bindings.zig") });
-    wasi_cli_bindings.addImport("canon", canon);
-    wasi_cli_bindings.addImport("abi", abi);
+    wasi_cli_bindings.addImport("wit_types", wit_types);
 
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
-    wasi_cli.addImport("cm_async", cm_async);
-    wasi_cli.addImport("canon", canon);
-    wasi_cli.addImport("abi", abi);
+    wasi_cli.addImport("wit_types", wit_types);
+    wasi_cli.addImport("wit_async", wit_async);
     wasi_cli.addImport("wasi_cli_bindings", wasi_cli_bindings);
 
     // `wabt component bindgen`-generated `wasi:clocks@0.3.0` import wrappers
-    // (`monotonic-clock` waits are async → `cm_async`); `wasi_clocks` is the
+    // (`monotonic-clock` waits are async → `wit_async`); `wasi_clocks` is the
     // ergonomic layer over them.
     const wasi_clocks_bindings = b.addModule("wasi_clocks_bindings", .{ .root_source_file = b.path("src/wasi_clocks_bindings.zig") });
-    wasi_clocks_bindings.addImport("canon", canon);
-    wasi_clocks_bindings.addImport("abi", abi);
-    wasi_clocks_bindings.addImport("cm_async", cm_async);
+    wasi_clocks_bindings.addImport("wit_types", wit_types);
+    wasi_clocks_bindings.addImport("wit_async", wit_async);
 
     const wasi_clocks = b.addModule("wasi_clocks", .{ .root_source_file = b.path("src/wasi_clocks.zig") });
     wasi_clocks.addImport("wasi_clocks_bindings", wasi_clocks_bindings);
@@ -47,60 +37,51 @@ pub fn build(b: *std.Build) void {
     // `wabt component bindgen`-generated `wasi:random@0.3.0` import wrappers
     // (all synchronous); `wasi_random` is the ergonomic layer over them.
     const wasi_random_bindings = b.addModule("wasi_random_bindings", .{ .root_source_file = b.path("src/wasi_random_bindings.zig") });
-    wasi_random_bindings.addImport("canon", canon);
-    wasi_random_bindings.addImport("abi", abi);
+    wasi_random_bindings.addImport("wit_types", wit_types);
 
     const wasi_random = b.addModule("wasi_random", .{ .root_source_file = b.path("src/wasi_random.zig") });
     wasi_random.addImport("wasi_random_bindings", wasi_random_bindings);
-    wasi_random.addImport("canon", canon);
+    wasi_random.addImport("wit_types", wit_types);
 
     // `wabt component bindgen`-generated `wasi:http/types@0.3.0` import wrappers
     // (request/response/fields resources + body stream + trailers future);
     // `wasi_http` is the ergonomic service-handler layer over them.
     const wasi_http_bindings = b.addModule("wasi_http_bindings", .{ .root_source_file = b.path("src/wasi_http_bindings.zig") });
-    wasi_http_bindings.addImport("canon", canon);
-    wasi_http_bindings.addImport("abi", abi);
-    wasi_http_bindings.addImport("cm_async", cm_async);
+    wasi_http_bindings.addImport("wit_types", wit_types);
 
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("wasi_http_bindings", wasi_http_bindings);
-    wasi_http.addImport("canon", canon);
-    wasi_http.addImport("abi", abi);
-    wasi_http.addImport("cm_async", cm_async);
+    wasi_http.addImport("wit_types", wit_types);
+    wasi_http.addImport("wit_async", wit_async);
 
     // `wabt component bindgen`-generated `wasi:filesystem@0.3.0` import wrappers
     // (async descriptor methods + `stream<u8>` file I/O); `wasi_filesystem` is
     // the ergonomic layer over them.
     const wasi_filesystem_bindings = b.addModule("wasi_filesystem_bindings", .{ .root_source_file = b.path("src/wasi_filesystem_bindings.zig") });
-    wasi_filesystem_bindings.addImport("canon", canon);
-    wasi_filesystem_bindings.addImport("abi", abi);
-    wasi_filesystem_bindings.addImport("cm_async", cm_async);
+    wasi_filesystem_bindings.addImport("wit_types", wit_types);
+    wasi_filesystem_bindings.addImport("wit_async", wit_async);
 
     const wasi_filesystem = b.addModule("wasi_filesystem", .{ .root_source_file = b.path("src/wasi_filesystem.zig") });
     wasi_filesystem.addImport("wasi_filesystem_bindings", wasi_filesystem_bindings);
-    wasi_filesystem.addImport("canon", canon);
-    wasi_filesystem.addImport("cm_async", cm_async);
-    wasi_filesystem.addImport("abi", abi);
+    wasi_filesystem.addImport("wit_types", wit_types);
+    wasi_filesystem.addImport("wit_async", wit_async);
 
     // `wabt component bindgen`-generated `wasi:sockets@0.3.0` import wrappers
     // (tcp/udp socket resources + ip-name-lookup); `wasi_sockets` is the
     // ergonomic layer over them.
     const wasi_sockets_bindings = b.addModule("wasi_sockets_bindings", .{ .root_source_file = b.path("src/wasi_sockets_bindings.zig") });
-    wasi_sockets_bindings.addImport("canon", canon);
-    wasi_sockets_bindings.addImport("abi", abi);
-    wasi_sockets_bindings.addImport("cm_async", cm_async);
+    wasi_sockets_bindings.addImport("wit_types", wit_types);
+    wasi_sockets_bindings.addImport("wit_async", wit_async);
 
     const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
     wasi_sockets.addImport("wasi_sockets_bindings", wasi_sockets_bindings);
-    wasi_sockets.addImport("canon", canon);
-    wasi_sockets.addImport("cm_async", cm_async);
-    wasi_sockets.addImport("abi", abi);
+    wasi_sockets.addImport("wit_types", wit_types);
+    wasi_sockets.addImport("wit_async", wit_async);
 
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
-    wasip3.addImport("abi", abi);
-    wasip3.addImport("canon", canon);
-    wasip3.addImport("cm_async", cm_async);
+    wasip3.addImport("wit_types", wit_types);
+    wasip3.addImport("wit_async", wit_async);
     wasip3.addImport("wasi_cli", wasi_cli);
     wasip3.addImport("wasi_clocks", wasi_clocks);
     wasip3.addImport("wasi_random", wasi_random);
@@ -108,34 +89,21 @@ pub fn build(b: *std.Build) void {
     wasip3.addImport("wasi_sockets", wasi_sockets);
     wasip3.addImport("wasi_http", wasi_http);
 
-
     // ?? Tests ??????????????????????????????????????????????????????
     // Native unit tests for the host-import-free canonical-ABI core in
-    // `abi.zig` (bump arena + ret-area decoders). The `wasi_*` wrappers
+    // `wit_types.zig` (abi + canon internals). The `wasi_*` wrappers
     // can't be tested natively ? their public functions call `extern`
     // host imports that only link for `wasm32-freestanding`.
-    const abi_tests = b.addTest(.{
+    const wit_types_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/abi.zig"),
+            .root_source_file = b.path("src/wit_types.zig"),
             .target = b.graph.host,
         }),
     });
-    const run_abi_tests = b.addRunArtifact(abi_tests);
-
-    // Native unit tests for the comptime canonical-ABI marshaller (`canon.zig`):
-    // layout + lower/lift round-trips (host-import-free).
-    const canon_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/canon.zig"),
-            .target = b.graph.host,
-        }),
-    });
-    canon_tests.root_module.addImport("abi", abi);
-    const run_canon_tests = b.addRunArtifact(canon_tests);
+    const run_wit_types_tests = b.addRunArtifact(wit_types_tests);
 
     const test_step = b.step("test", "Run native unit tests");
-    test_step.dependOn(&run_abi_tests.step);
-    test_step.dependOn(&run_canon_tests.step);
+    test_step.dependOn(&run_wit_types_tests.step);
 }
 
 // ?? Build helpers (ported from cataggar/wamr) ??????????????????????
@@ -211,21 +179,20 @@ pub const ModuleSpec = struct {
 };
 
 pub const modules = [_]ModuleSpec{
-    .{ .name = "abi" },
-    .{ .name = "canon", .deps = &.{"abi"} },
-    .{ .name = "cm_async", .deps = &.{"abi"} },
-    .{ .name = "wasi_cli_bindings", .deps = &.{ "canon", "abi" } },
-    .{ .name = "wasi_cli", .deps = &.{ "cm_async", "canon", "abi", "wasi_cli_bindings" } },
-    .{ .name = "wasi_clocks_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
+    .{ .name = "wit_types" },
+    .{ .name = "wit_async", .deps = &.{"wit_types"} },
+    .{ .name = "wasi_cli_bindings", .deps = &.{"wit_types"} },
+    .{ .name = "wasi_cli", .deps = &.{ "wit_async", "wit_types", "wasi_cli_bindings" } },
+    .{ .name = "wasi_clocks_bindings", .deps = &.{ "wit_types", "wit_async" } },
     .{ .name = "wasi_clocks", .deps = &.{"wasi_clocks_bindings"} },
-    .{ .name = "wasi_random_bindings", .deps = &.{ "canon", "abi" } },
-    .{ .name = "wasi_random", .deps = &.{ "wasi_random_bindings", "canon" } },
-    .{ .name = "wasi_filesystem_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
-    .{ .name = "wasi_filesystem", .deps = &.{ "wasi_filesystem_bindings", "canon", "cm_async", "abi" } },
-    .{ .name = "wasi_sockets_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
-    .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "canon", "cm_async", "abi" } },
-    .{ .name = "wasi_http_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
-    .{ .name = "wasi_http", .deps = &.{ "wasi_http_bindings", "canon", "abi", "cm_async" } },
+    .{ .name = "wasi_random_bindings", .deps = &.{"wit_types"} },
+    .{ .name = "wasi_random", .deps = &.{ "wasi_random_bindings", "wit_types" } },
+    .{ .name = "wasi_filesystem_bindings", .deps = &.{ "wit_types", "wit_async" } },
+    .{ .name = "wasi_filesystem", .deps = &.{ "wasi_filesystem_bindings", "wit_types", "wit_async" } },
+    .{ .name = "wasi_sockets_bindings", .deps = &.{ "wit_types", "wit_async" } },
+    .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "wit_types", "wit_async" } },
+    .{ .name = "wasi_http_bindings", .deps = &.{"wit_types"} },
+    .{ .name = "wasi_http", .deps = &.{ "wasi_http_bindings", "wit_types", "wit_async" } },
 };
 
 fn findSpec(name: []const u8) ModuleSpec {
@@ -404,7 +371,7 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
         // having to enumerate their canonical names; they're declared in the
         // (often generated) guest source. `--export=<name>` below still works
         // for forcing extra symbols.
-        "-rdynamic",
+           "-rdynamic",
     });
     if (opts.no_llvm) cmd.addArg("-fno-llvm");
     if (opts.no_lld) cmd.addArg("-fno-lld");
