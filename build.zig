@@ -298,6 +298,7 @@ pub fn guestImports(
 
     // Generated bindings still import `canon` and `abi`; provide those legacy
     // module names as thin compatibility shims.
+    const runtime_names = [_][]const u8{ "canon", "abi" };
     const runtime = [_]ZigWasmImport{
         .{ .name = "canon", .path = dep.path("src/canon.zig"), .deps = &.{"wit_types"}, .root_dep = false },
         .{ .name = "abi", .path = dep.path("src/abi.zig"), .deps = &.{"wit_types"}, .root_dep = false },
@@ -316,7 +317,7 @@ pub fn guestImports(
         list.append(b.allocator, .{
             .name = name,
             .path = g.bindings,
-            .deps = &runtime,
+            .deps = &runtime_names,
             .root_dep = true,
         }) catch @panic("OOM");
     }
