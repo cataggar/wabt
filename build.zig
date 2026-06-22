@@ -7,15 +7,12 @@ pub fn build(b: *std.Build) void {
     // ?? Library modules (guest bindings) ???????????????????????????
     // Public modules so dependents can `@import` them when compiling a
     // `wasm32-freestanding` guest. `wit_types` owns the canonical ABI core
-    // (scratch arena + ret-area + marshaller), while `cm_async` declares the
+    // (scratch arena + ret-area + marshaller), while `wit_async` declares the
     // canonical-ABI async intrinsics (the WASI 0.3 replacement for `wasi:io`).
     const wit_types = b.addModule("wit_types", .{ .root_source_file = b.path("src/wit_types.zig") });
 
-    const cm_async = b.addModule("cm_async", .{ .root_source_file = b.path("src/cm_async.zig") });
-    cm_async.addImport("wit_types", wit_types);
-
     const wit_async = b.addModule("wit_async", .{ .root_source_file = b.path("src/wit_async.zig") });
-    wit_async.addImport("cm_async", cm_async);
+    wit_async.addImport("wit_types", wit_types);
 
     // `wabt component bindgen`-generated `wasi:cli@0.3.0` import client wrappers;
     // `wasi_cli` is the ergonomic layer over them.
@@ -28,7 +25,7 @@ pub fn build(b: *std.Build) void {
     wasi_cli.addImport("wasi_cli_bindings", wasi_cli_bindings);
 
     // `wabt component bindgen`-generated `wasi:clocks@0.3.0` import wrappers
-    // (`monotonic-clock` waits are async → `cm_async`); `wasi_clocks` is the
+    // (`monotonic-clock` waits are async → `wit_async`); `wasi_clocks` is the
     // ergonomic layer over them.
     const wasi_clocks_bindings = b.addModule("wasi_clocks_bindings", .{ .root_source_file = b.path("src/wasi_clocks_bindings.zig") });
     wasi_clocks_bindings.addImport("wit_types", wit_types);
@@ -83,7 +80,6 @@ pub fn build(b: *std.Build) void {
 
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
-    wasip3.addImport("cm_async", cm_async);
     wasip3.addImport("wit_types", wit_types);
     wasip3.addImport("wit_async", wit_async);
     wasip3.addImport("wasi_cli", wasi_cli);
@@ -184,8 +180,7 @@ pub const ModuleSpec = struct {
 
 pub const modules = [_]ModuleSpec{
     .{ .name = "wit_types" },
-    .{ .name = "cm_async", .deps = &.{"wit_types"} },
-    .{ .name = "wit_async", .deps = &.{"cm_async"} },
+    .{ .name = "wit_async", .deps = &.{"wit_types"} },
     .{ .name = "wasi_cli_bindings", .deps = &.{"wit_types"} },
     .{ .name = "wasi_cli", .deps = &.{ "wit_async", "wit_types", "wasi_cli_bindings" } },
     .{ .name = "wasi_clocks_bindings", .deps = &.{ "wit_types", "wit_async" } },
