@@ -296,17 +296,16 @@ pub fn guestImports(
         list.append(b.allocator, imp) catch @panic("OOM");
     }
 
-    // The generated bindings always need the canonical-ABI runtime. Ensure
-    // `canon` + `abi` are present as (transitive-only) modules so the bindings
-    // can dep on them.
+    // Generated bindings still import `canon` and `abi`. Provide those names
+    // as transitive aliases that both resolve to `wit_types`.
     const runtime = [_][]const u8{ "canon", "abi" };
     for (runtime) |name| {
         for (list.items) |imp| {
             if (std.mem.eql(u8, imp.name, name)) break;
         } else list.append(b.allocator, .{
             .name = name,
-            .path = dep.path(b.fmt("src/{s}.zig", .{name})),
-            .deps = findSpec(name).deps,
+            .path = dep.path("src/wit_types.zig"),
+            .deps = &.{},
             .root_dep = false,
         }) catch @panic("OOM");
     }
