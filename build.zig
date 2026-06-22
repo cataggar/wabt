@@ -8,6 +8,10 @@ pub fn build(b: *std.Build) void {
     const stack_protector = b.option(bool, "stack-protector", "Enable stack protector (requires libc linkage)") orelse false;
     const link_libc = b.option(bool, "link-libc", "Link against libc") orelse stack_protector;
     const version = b.option([]const u8, "version", "Version string") orelse "dev";
+    // When set, `zig build p3-conformance` fails (instead of skipping) if no
+    // usable Wasmtime is found — set by the CI p3-conformance job, which
+    // installs a pinned Wasmtime that supports the P3 canon built-ins.
+    const p3_require_wasmtime = b.option(bool, "p3-require-wasmtime", "Fail (not skip) p3-conformance when no Wasmtime is found (CI)") orelse false;
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
@@ -389,6 +393,9 @@ pub fn build(b: *std.Build) void {
         "--wabt",
     });
     p3_runner.addArtifactArg(wabt_exe);
+    // CI installs a pinned Wasmtime and sets this so a missing/broken
+    // Wasmtime is a hard failure rather than a silent skip.
+    if (p3_require_wasmtime) p3_runner.addArg("--require-wasmtime");
     const p3_step = b.step(
         "p3-conformance",
         "Validate wabt-produced P3 components against Wasmtime (set WASMTIME)",
