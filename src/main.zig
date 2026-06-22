@@ -1,7 +1,3 @@
-//! PetStore — a `wasi:http@0.3.0` service (TypeSpec petstore sample).
-//! Uses the `wasi_http` module from wasip3 for all HTTP protocol handling
-//! and the `web` bindings for the store data-access interface.
-
 const wit_types = @import("wit_types");
 const std = @import("std");
 const http = @import("wasi_http");
@@ -13,8 +9,6 @@ const Pet = web.Pet;
 comptime {
     _ = wit_types.cabi_realloc;
 }
-
-// ── PetStore routes (TypeSpec petstore sample) ──────────────────────
 
 const PetJson = struct {
     id: i32,
@@ -144,10 +138,10 @@ fn route(method: http.Method, full_path: []const u8, body: []const u8, res: *htt
     writeError(res, 404, 404, "not found");
 }
 
-fn handleHttp(req: *const http.Request, res: *http.Responder) void {
+fn handler(req: *const http.Request, res: *http.Responder) void {
     route(req.method, req.path, req.body, res);
 }
 
 comptime {
-    http.handler(handleHttp);
+    http.handler(handler);
 }
