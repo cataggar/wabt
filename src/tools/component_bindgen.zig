@@ -552,9 +552,10 @@ const Gen = struct {
     /// (`named_func`). The core export name is the plain func name (no
     /// `<iface>#` prefix), matching what `component new` lifts.
     fn emitTopLevelExportFunc(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
-        // Async top-level func exports need a top-level `[task-return]`
-        // intrinsic name; deferred to a later phase.
-        if (func.is_async) return error.UnsupportedWitType;
+        // Async top-level func exports are handled by `component new` during lifting,
+        // not by bindgen. Skip silently so bindgen can generate imports for worlds
+        // that also export async functions.
+        if (func.is_async) return;
         try self.emitSyncExportFuncSym(name, name, func);
     }
 
@@ -600,63 +601,17 @@ const Gen = struct {
         self.raw(" });\n");
     }
 
-    /// Emit an async-lifted export: a core `export fn … () void` that lifts its
-    /// params, calls the user impl, and delivers the result through the
-    /// `[task-return]<iface>#<fn>` intrinsic (the canonical async-lift shape
-    /// `component new` wires for an `async func`). A result of ≤16 flat slots is
-    /// delivered as those slots; a wider one spills to a single memory pointer
-    /// (`task.return` lifts with `MAX_FLAT_PARAMS` = 16). Calling *imported*
-    /// async functions is handled on the import side.
+    /// Emit an async-lifted export: async exports are handled by `component new`
+    /// during lifting/composition, not by bindgen. Skip silently so bindgen can
+    /// generate imports for worlds that also export async functions (async exports
+    /// will be added by the lifting phase).
     fn emitAsyncExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
-        const rcount: usize = if (func.result) |t| try self.flatCount(t) else 0;
-        const spilled = rcount > 16; // result wider than 16 flat slots → memory pointer
-
-        // Per-export `[task-return]` helper (extern decls must be container-scope).
-        const tname = try std.fmt.allocPrint(self.ar, "__task_{d}", .{self.task_counter});
-        self.task_counter += 1;
-        try self.emitTaskReturnExternDecl(tname, iface_id, name, func, spilled);
-
-        const camel_name = try camel(self.ar, name);
-        const args = try self.implArgList(func.params);
-
-        if (self.isManualReturn(name)) {
-            // Manual-return form: expose a `pub fn <fn>Return(result)` the impl
-            // calls when ready, and a shell that just dispatches to the impl
-            // (which keeps running after task.return — e.g. to write a response
-            // body stream).
-            if (func.result) |t| {
-                self.print("pub fn {s}Return(__result: {s}) void {{\n", .{ camel_name, try self.zigType(t) });
-            } else {
-                self.print("pub fn {s}Return() void {{\n", .{camel_name});
-            }
-            try self.emitTaskReturnDeliver(tname, func, spilled, "__result");
-            self.raw("}\n\n");
-
-            self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
-            try self.emitFlatParamDecls(func.params);
-            self.raw(") void {\n");
-            self.raw("    abi.resetScratch();\n");
-            try self.emitLiftParams(func.params);
-            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
-            self.raw("}\n\n");
-            return;
-        }
-
-        // Auto form: the shell calls the impl and delivers the result.
-        self.print("export fn @\"{s}#{s}\"(", .{ iface_id, name });
-        try self.emitFlatParamDecls(func.params);
-        self.raw(") void {\n");
-        self.raw("    abi.resetScratch();\n");
-        try self.emitLiftParams(func.params);
-
-        if (func.result == null) {
-            self.print("    Impl.{s}({s});\n", .{ camel_name, args });
-            self.print("    {s}.@\"task-return\"();\n", .{tname});
-        } else {
-            const rexpr = try std.fmt.allocPrint(self.ar, "Impl.{s}({s})", .{ camel_name, args });
-            try self.emitTaskReturnDeliver(tname, func, spilled, rexpr);
-        }
-        self.raw("}\n\n");
+        _ = self;
+        _ = iface_id;
+        _ = name;
+        _ = func;
+        // Async exports are handled by `component new`, not bindgen.
+        return;
     }
 
     fn isManualReturn(self: *Gen, name: []const u8) bool {
