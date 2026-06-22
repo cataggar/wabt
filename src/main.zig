@@ -2,12 +2,17 @@
 //! Uses the `wasi_http` module from wasip3 for all HTTP protocol handling
 //! and the `svc` bindings for the store data-access interface.
 
+const wit_types = @import("wit_types");
 const std = @import("std");
 const http = @import("wasi_http");
 const svc = @import("svc");
 
 const store = svc.store;
 const Pet = svc.Pet;
+
+comptime {
+    _ = wit_types.cabi_realloc;
+}
 
 // ── PetStore routes (TypeSpec petstore sample) ──────────────────────
 
@@ -139,10 +144,10 @@ fn route(method: http.Method, full_path: []const u8, body: []const u8, res: *htt
     writeError(res, 404, 404, "not found");
 }
 
-fn handle(req: *const http.Request, res: *http.Responder) void {
+fn handleHttp(req: *const http.Request, res: *http.Responder) void {
     route(req.method, req.path, req.body, res);
 }
 
-comptime {
-    http.exportHandler(handle);
+pub fn handle(request: svc.Request) void {
+    http.serve(svc, request, handleHttp);
 }
