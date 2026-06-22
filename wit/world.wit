@@ -37,19 +37,14 @@ interface store {
     toy-at: func(pet-id: u32, index: u32) -> option<toy>;
 }
 
-// A `wasi:http/service`-shaped world that also imports the `store`
-// data-access interface; exports the async `handler` the host calls.
+// Bindings for imports only (used by the HTTP handler).
+// No handler export — the handler is registered via `http.handler()` comptime.
 world frontend {
     import wasi:http/types@0.3.0;
     import store;
 }
 
-// A `wasi:http/service`-shaped world that also imports the `store`
-// data-access interface; exports the async `handler` the host calls.
-// `wabt component bindgen` generates the full client surface — the
-// `wasi:http/types` wrappers, the `store` client, and the async `handle`
-// export — so the frontend drives the generated bindings directly (no
-// hand-written `wasi_http`).
+// The web service — imports plus the HTTP handler export.
 world svc {
     import wasi:http/types@0.3.0;
     import store;

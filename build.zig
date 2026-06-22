@@ -3,9 +3,6 @@ const wasip3 = @import("wasip3");
 
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
-
-    // The `frontend` world generates the guest-side client surface the
-    // frontend needs: the `wasi:http/types` wrappers and the `store` client.
     const svc = wasip3.wabtComponentBindgen(b, .{ .world = "frontend" });
     const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider" });
 
