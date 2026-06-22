@@ -3,8 +3,8 @@ const wasip3 = @import("wasip3");
 
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
-    const web_bindings = wasip3.wabtComponentBindgen(b, .{ .world = "web" });
-    const storage_bindings = wasip3.wabtComponentBindgen(b, .{ .world = "storage" });
+    const web_bindings = wasip3.bindgen(b, dep, .{ .world = "web" });
+    const storage_bindings = wasip3.bindgen(b, dep, .{ .world = "storage" });
 
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),

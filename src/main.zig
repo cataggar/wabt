@@ -1,14 +1,9 @@
-const wit_types = @import("wit_types");
 const std = @import("std");
 const http = @import("wasi_http");
 const web = @import("web");
 
 const store = web.store;
 const Pet = web.Pet;
-
-comptime {
-    _ = wit_types.cabi_realloc;
-}
 
 const PetJson = struct {
     id: i32,
@@ -143,5 +138,5 @@ fn handler(req: *const http.Request, res: *http.Responder) void {
 }
 
 comptime {
-    http.handler(handler);
+    http.exportHandler(handler);
 }

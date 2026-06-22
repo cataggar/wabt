@@ -1,12 +1,10 @@
 //! In-memory petstore implementation — the backend component's root module.
 
-const wit_types = @import("wit_types");
 const storage = @import("storage");
 const Pet = storage.Pet;
 const Toy = storage.Toy;
 
 comptime {
-    _ = wit_types.cabi_realloc;
     _ = storage;
 }
 
