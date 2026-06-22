@@ -39,6 +39,13 @@ interface store {
 
 // A `wasi:http/service`-shaped world that also imports the `store`
 // data-access interface; exports the async `handler` the host calls.
+world frontend {
+    import wasi:http/types@0.3.0;
+    import store;
+}
+
+// A `wasi:http/service`-shaped world that also imports the `store`
+// data-access interface; exports the async `handler` the host calls.
 // `wabt component bindgen` generates the full client surface — the
 // `wasi:http/types` wrappers, the `store` client, and the async `handle`
 // export — so the frontend drives the generated bindings directly (no

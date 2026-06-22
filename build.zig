@@ -4,12 +4,9 @@ const wasip3 = @import("wasip3");
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
 
-    // The `svc` world generates the whole guest surface the frontend needs:
-    // the `wasi:http/types` client wrappers, the `store` client, and the async
-    // `wasi:http/handler` export. `handle` is generated in manual-return form so
-    // the handler can `task.return` the response and then keep streaming its
-    // body.
-    const svc = wasip3.wabtComponentBindgen(b, .{ .world = "svc", .manual_returns = &.{"handle"} });
+    // The `frontend` world generates the guest-side client surface the
+    // frontend needs: the `wasi:http/types` wrappers and the `store` client.
+    const svc = wasip3.wabtComponentBindgen(b, .{ .world = "frontend" });
     const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider" });
 
     const web_core = wasip3.zigBuildWasm(b, .{

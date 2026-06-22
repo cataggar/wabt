@@ -5,7 +5,7 @@
 const wit_types = @import("wit_types");
 const std = @import("std");
 const http = @import("wasi_http");
-const svc = @import("svc");
+const svc = @import("frontend");
 
 const store = svc.store;
 const Pet = svc.Pet;
@@ -148,6 +148,6 @@ fn handleHttp(req: *const http.Request, res: *http.Responder) void {
     route(req.method, req.path, req.body, res);
 }
 
-pub fn handle(request: svc.Request) void {
-    http.serve(svc, request, handleHttp);
+comptime {
+    http.exportHandler(handleHttp);
 }
