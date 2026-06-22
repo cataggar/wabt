@@ -16,8 +16,9 @@
 //! ```
 
 const b = @import("wasi_random_bindings");
+const wit_types = @import("wit_types");
 
-const canon = @import("canon");
+const canon = wit_types.canon;
 
 /// A 128-bit seed value as `{ a, b }`.
 pub const Seed = canon.Tuple(.{ u64, u64 });

@@ -21,16 +21,21 @@ pub fn build(b: *std.Build) void {
     const canon = b.addModule("canon", .{ .root_source_file = b.path("src/canon.zig") });
     canon.addImport("abi", abi);
 
+    const wit_types = b.addModule("wit_types", .{ .root_source_file = b.path("src/wit_types.zig") });
+    wit_types.addImport("abi", abi);
+    wit_types.addImport("canon", canon);
+
+    const wit_async = b.addModule("wit_async", .{ .root_source_file = b.path("src/wit_async.zig") });
+    wit_async.addImport("cm_async", cm_async);
+
     // `wabt component bindgen`-generated `wasi:cli@0.3.0` import client wrappers;
     // `wasi_cli` is the ergonomic layer over them.
     const wasi_cli_bindings = b.addModule("wasi_cli_bindings", .{ .root_source_file = b.path("src/wasi_cli_bindings.zig") });
-    wasi_cli_bindings.addImport("canon", canon);
-    wasi_cli_bindings.addImport("abi", abi);
+    wasi_cli_bindings.addImport("wit_types", wit_types);
 
     const wasi_cli = b.addModule("wasi_cli", .{ .root_source_file = b.path("src/wasi_cli.zig") });
-    wasi_cli.addImport("cm_async", cm_async);
-    wasi_cli.addImport("canon", canon);
-    wasi_cli.addImport("abi", abi);
+    wasi_cli.addImport("wit_types", wit_types);
+    wasi_cli.addImport("wit_async", wit_async);
     wasi_cli.addImport("wasi_cli_bindings", wasi_cli_bindings);
 
     // `wabt component bindgen`-generated `wasi:clocks@0.3.0` import wrappers
@@ -58,56 +63,50 @@ pub fn build(b: *std.Build) void {
     // (request/response/fields resources + body stream + trailers future);
     // `wasi_http` is the ergonomic service-handler layer over them.
     const wasi_http_bindings = b.addModule("wasi_http_bindings", .{ .root_source_file = b.path("src/wasi_http_bindings.zig") });
-    wasi_http_bindings.addImport("canon", canon);
-    wasi_http_bindings.addImport("abi", abi);
-    wasi_http_bindings.addImport("cm_async", cm_async);
+    wasi_http_bindings.addImport("wit_types", wit_types);
 
     const wasi_http = b.addModule("wasi_http", .{ .root_source_file = b.path("src/wasi_http.zig") });
     wasi_http.addImport("wasi_http_bindings", wasi_http_bindings);
-    wasi_http.addImport("canon", canon);
-    wasi_http.addImport("abi", abi);
-    wasi_http.addImport("cm_async", cm_async);
+    wasi_http.addImport("wit_types", wit_types);
+    wasi_http.addImport("wit_async", wit_async);
 
     // `wabt component bindgen`-generated `wasi:filesystem@0.3.0` import wrappers
     // (async descriptor methods + `stream<u8>` file I/O); `wasi_filesystem` is
     // the ergonomic layer over them.
     const wasi_filesystem_bindings = b.addModule("wasi_filesystem_bindings", .{ .root_source_file = b.path("src/wasi_filesystem_bindings.zig") });
-    wasi_filesystem_bindings.addImport("canon", canon);
-    wasi_filesystem_bindings.addImport("abi", abi);
-    wasi_filesystem_bindings.addImport("cm_async", cm_async);
+    wasi_filesystem_bindings.addImport("wit_types", wit_types);
+    wasi_filesystem_bindings.addImport("wit_async", wit_async);
 
     const wasi_filesystem = b.addModule("wasi_filesystem", .{ .root_source_file = b.path("src/wasi_filesystem.zig") });
     wasi_filesystem.addImport("wasi_filesystem_bindings", wasi_filesystem_bindings);
-    wasi_filesystem.addImport("canon", canon);
-    wasi_filesystem.addImport("cm_async", cm_async);
-    wasi_filesystem.addImport("abi", abi);
+    wasi_filesystem.addImport("wit_types", wit_types);
+    wasi_filesystem.addImport("wit_async", wit_async);
 
     // `wabt component bindgen`-generated `wasi:sockets@0.3.0` import wrappers
     // (tcp/udp socket resources + ip-name-lookup); `wasi_sockets` is the
     // ergonomic layer over them.
     const wasi_sockets_bindings = b.addModule("wasi_sockets_bindings", .{ .root_source_file = b.path("src/wasi_sockets_bindings.zig") });
-    wasi_sockets_bindings.addImport("canon", canon);
-    wasi_sockets_bindings.addImport("abi", abi);
-    wasi_sockets_bindings.addImport("cm_async", cm_async);
+    wasi_sockets_bindings.addImport("wit_types", wit_types);
+    wasi_sockets_bindings.addImport("wit_async", wit_async);
 
     const wasi_sockets = b.addModule("wasi_sockets", .{ .root_source_file = b.path("src/wasi_sockets.zig") });
     wasi_sockets.addImport("wasi_sockets_bindings", wasi_sockets_bindings);
-    wasi_sockets.addImport("canon", canon);
-    wasi_sockets.addImport("cm_async", cm_async);
-    wasi_sockets.addImport("abi", abi);
+    wasi_sockets.addImport("wit_types", wit_types);
+    wasi_sockets.addImport("wit_async", wit_async);
 
     // Single-import library surface re-exporting every module.
     const wasip3 = b.addModule("wasip3", .{ .root_source_file = b.path("src/root.zig") });
     wasip3.addImport("abi", abi);
     wasip3.addImport("canon", canon);
     wasip3.addImport("cm_async", cm_async);
+    wasip3.addImport("wit_types", wit_types);
+    wasip3.addImport("wit_async", wit_async);
     wasip3.addImport("wasi_cli", wasi_cli);
     wasip3.addImport("wasi_clocks", wasi_clocks);
     wasip3.addImport("wasi_random", wasi_random);
     wasip3.addImport("wasi_filesystem", wasi_filesystem);
     wasip3.addImport("wasi_sockets", wasi_sockets);
     wasip3.addImport("wasi_http", wasi_http);
-
 
     // ?? Tests ??????????????????????????????????????????????????????
     // Native unit tests for the host-import-free canonical-ABI core in
@@ -214,6 +213,8 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "abi" },
     .{ .name = "canon", .deps = &.{"abi"} },
     .{ .name = "cm_async", .deps = &.{"abi"} },
+    .{ .name = "wit_types", .deps = &.{ "abi", "canon" } },
+    .{ .name = "wit_async", .deps = &.{"cm_async"} },
     .{ .name = "wasi_cli_bindings", .deps = &.{ "canon", "abi" } },
     .{ .name = "wasi_cli", .deps = &.{ "cm_async", "canon", "abi", "wasi_cli_bindings" } },
     .{ .name = "wasi_clocks_bindings", .deps = &.{ "canon", "abi", "cm_async" } },
@@ -404,7 +405,7 @@ pub fn zigBuildWasm(b: *std.Build, opts: ZigBuildWasm) std.Build.LazyPath {
         // having to enumerate their canonical names; they're declared in the
         // (often generated) guest source. `--export=<name>` below still works
         // for forcing extra symbols.
-        "-rdynamic",
+           "-rdynamic",
     });
     if (opts.no_llvm) cmd.addArg("-fno-llvm");
     if (opts.no_lld) cmd.addArg("-fno-lld");
