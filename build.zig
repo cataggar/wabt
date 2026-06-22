@@ -89,6 +89,20 @@ pub fn build(b: *std.Build) void {
     wasip3.addImport("wasi_sockets", wasi_sockets);
     wasip3.addImport("wasi_http", wasi_http);
 
+    // ── Bindgen generator (host build tool) ────────────────────────
+    // The WIT→Zig guest-binding generator, vendored under `build/bindgen/`.
+    // Built for the host and exposed as an installable artifact so dependents
+    // can run it through the `bindgen` helper below — the in-package
+    // replacement for the external `wabt component bindgen` subcommand.
+    const bindgen_exe = b.addExecutable(.{
+        .name = "wasip3-bindgen",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/bindgen/main.zig"),
+            .target = b.graph.host,
+        }),
+    });
+    b.installArtifact(bindgen_exe);
+
     // ?? Tests ??????????????????????????????????????????????????????
     // Native unit tests for the host-import-free canonical-ABI core in
     // `wit_types.zig` (abi + canon internals). The `wasi_*` wrappers
@@ -527,6 +541,43 @@ pub fn wabtComponentBindgen(b: *std.Build, opts: WabtComponentBindgen) std.Build
     for (opts.manual_returns) |fn_name| cmd.addArgs(&.{ "--manual-return", fn_name });
     cmd.addArg("-o");
     cmd.setName(b.fmt("wabt component bindgen {s}", .{opts.world}));
+    return cmd.addOutputFileArg(opts.output orelse worldBasename(b, opts.world));
+}
+
+pub const Bindgen = struct {
+    /// World to generate guest bindings for.
+    world: []const u8,
+    /// Module the generated export shells delegate to as their `Impl`;
+    /// `"root"` makes them call `@import("root")`. Ignored for an import-only
+    /// world (no export shells are emitted).
+    impl: []const u8 = "root",
+    /// WIT package directory to read. Defaults to `wit/`.
+    wit_dir: ?std.Build.LazyPath = null,
+    /// Output basename for the generated `.zig` source. Defaults to the world
+    /// name in snake_case + `.zig` (e.g. `store-consumer` → `store_consumer.zig`).
+    output: ?[]const u8 = null,
+    /// Async export func names to generate in manual-return form: the export
+    /// shell only dispatches to the impl, which calls a generated
+    /// `<fn>Return(result)` when ready and may keep running afterward.
+    manual_returns: []const []const u8 = &.{},
+};
+
+/// Generate the canonical-ABI guest bindings (typed import wrappers and/or
+/// `export fn` shells) for a world as a Zig source `LazyPath`, by running the
+/// vendored `wasip3-bindgen` host tool from the `wasip3` dependency.
+///
+/// The in-package replacement for `wabtComponentBindgen`: the WIT→Zig
+/// generator ships in this package (under `build/bindgen/`), so no external
+/// `wabt` binary is required. `dep` is the resolved `wasip3` dependency
+/// (`b.dependency("wasip3", .{})`), used to locate the generator artifact.
+pub fn bindgen(b: *std.Build, dep: *std.Build.Dependency, opts: Bindgen) std.Build.LazyPath {
+    const cmd = b.addRunArtifact(dep.artifact("wasip3-bindgen"));
+    cmd.addArg("--wit");
+    addWitArg(b, cmd, opts.wit_dir orelse b.path("wit"));
+    cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl });
+    for (opts.manual_returns) |fn_name| cmd.addArgs(&.{ "--manual-return", fn_name });
+    cmd.addArg("-o");
+    cmd.setName(b.fmt("wasip3 bindgen {s}", .{opts.world}));
     return cmd.addOutputFileArg(opts.output orelse worldBasename(b, opts.world));
 }
 
