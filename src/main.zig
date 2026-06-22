@@ -1,14 +1,14 @@
 //! PetStore — a `wasi:http@0.3.0` service (TypeSpec petstore sample).
 //! Uses the `wasi_http` module from wasip3 for all HTTP protocol handling
-//! and the `frontend` bindings for the store data-access interface.
+//! and the `web` bindings for the store data-access interface.
 
 const wit_types = @import("wit_types");
 const std = @import("std");
 const http = @import("wasi_http");
-const frontend = @import("frontend");
+const web = @import("web");
 
-const store = frontend.store;
-const Pet = frontend.Pet;
+const store = web.store;
+const Pet = web.Pet;
 
 comptime {
     _ = wit_types.cabi_realloc;
