@@ -544,7 +544,6 @@ const Gen = struct {
         if (func.is_async) return self.emitAsyncExportFunc(iface_id, name, func);
         const export_sym = try std.fmt.allocPrint(self.ar, "{s}#{s}", .{ iface_id, name });
         try self.emitSyncExportFuncSym(export_sym, name, func);
-        self.raw("    wit_types.resetScratch();\n");
     }
 
     /// Emit a module-scope export shell for a top-level world func
@@ -1587,6 +1586,9 @@ test "generate: export shells + import wrappers" {
         try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#ping\"(x: i32) wit_types.canon.CoreReturn(u32)") != null);
         try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(u32, Impl.ping(__params.x), &wit_types.alloc)") != null);
         try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#get\"(id: i32) wit_types.canon.CoreReturn(?Pet)") != null);
+        // No stray module-scope statement after an export shell's closing brace
+        // (regression: a duplicate resetScratch was emitted at container scope).
+        try testing.expect(std.mem.indexOf(u8, out, "}\n\n    wit_types.resetScratch();") == null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
