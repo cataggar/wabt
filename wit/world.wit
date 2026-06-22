@@ -1,6 +1,18 @@
 package example:petstore;
 
-/// A data storage service.
+// A web component.
+world web {
+    import wasi:http/types@0.3.0;
+    import store;
+    export wasi:http/handler@0.3.0;
+}
+
+// A storage component.
+world storage {
+    export store;
+}
+
+/// A data storage interface.
 interface store {
     record pet {
         id: u32,
@@ -29,16 +41,4 @@ interface store {
     toy-count: func(pet-id: u32) -> u32;
     /// The `index`-th toy of a pet, or none.
     toy-at: func(pet-id: u32, index: u32) -> option<toy>;
-}
-
-// The web service.
-world web {
-    import wasi:http/types@0.3.0;
-    import store;
-    export wasi:http/handler@0.3.0;
-}
-
-// The storage component: exports the `store` interface.
-world store-provider {
-    export store;
 }

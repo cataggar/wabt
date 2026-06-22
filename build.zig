@@ -3,14 +3,14 @@ const wasip3 = @import("wasip3");
 
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("wasip3", .{});
-    const web = wasip3.wabtComponentBindgen(b, .{ .world = "web" });
-    const store_provider = wasip3.wabtComponentBindgen(b, .{ .world = "store-provider" });
+    const web_bindings = wasip3.wabtComponentBindgen(b, .{ .world = "web" });
+    const storage_bindings = wasip3.wabtComponentBindgen(b, .{ .world = "storage" });
 
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
         .imports = wasip3.guestImports(b, dep, &.{ "wit_types", "wit_async", "wasi_http" }, &.{
-            .{ .bindings = web },
+            .{ .bindings = web_bindings },
         }),
     });
     const web_component = wasip3.wabtComponentNew(b, .{ .wasm_core = web_core, .world = "web" });
@@ -19,10 +19,10 @@ pub fn build(b: *std.Build) void {
         .source = b.path("src/memory_store.zig"),
         .output = "store.core.wasm",
         .imports = wasip3.guestImports(b, dep, &.{"wit_types"}, &.{
-            .{ .bindings = store_provider },
+            .{ .bindings = storage_bindings },
         }),
     });
-    const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "store-provider" });
+    const store = wasip3.wabtComponentNew(b, .{ .wasm_core = store_core, .world = "storage" });
 
     const component = wasip3.wabtComponentCompose(b, .{
         .consumer = web_component,

@@ -37,7 +37,7 @@ on lives on the orphan branch `wasip3` of the same repository.
 `interface store` is a typed data-access API: `pet` / `toy` **records**, with
 `option<record>` results and `count` + indexed `*-at` accessors (instead of
 `list<record>`). Worlds: `svc` (the frontend) `import`s `store` **and**
-`wasi:http/types` and `export`s the async `wasi:http/handler`; `store-provider`
+`wasi:http/types` and `export`s the async `wasi:http/handler`; `storage`
 (the backend) `export`s `store`.
 
 Both sides' canonical-ABI glue is **generated at build time** by
@@ -47,7 +47,7 @@ the `Pet` / `Toy` Zig types and delegates all marshalling to `wasip3`'s comptime
 logic, or lower/lift code on either side — and no hand-written `wasi_http`: the
 frontend drives the **generated** `wasi:http` bindings directly.
 
-- **Backend** — `build.zig` runs `bindgen` on `store-provider` to generate the
+- **Backend** — `build.zig` runs `bindgen` on `storage` to generate the
   `export fn` shells (params lifted with `canon.liftParams`, return type
   `canon.CoreReturn(R)`, result encoded with `canon.returnResult`). The shells
   call **`src/memory_store.zig`** — the in-memory pets/toys store, pure business
