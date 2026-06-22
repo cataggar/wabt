@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const web_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/main.zig"),
         .output = "http.core.wasm",
-        .imports = wasip3.guestImports(b, dep, &.{ "cm_async", "canon", "abi" }, &.{
+        .imports = wasip3.guestImports(b, dep, &.{ "wit_types", "wit_async" }, &.{
             .{ .bindings = svc },
         }),
     });
