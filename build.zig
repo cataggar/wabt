@@ -428,7 +428,7 @@ pub fn build(b: *std.Build) void {
     if (wasip3_require_suite) wasip3_runner.addArg("--require-suite");
     const wasip3_step = b.step(
         "wasi-p3-testsuite",
-        "Decode upstream wasm32-wasip3 components with wabt's component loader",
+        "Decode + byte-identical round-trip upstream wasm32-wasip3 components with wabt",
     );
     wasip3_step.dependOn(&wasip3_runner.step);
 }

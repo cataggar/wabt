@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
-"""WASI Preview 3 (wasm32-wasip3) component decode gate for wabt.
+"""WASI Preview 3 (wasm32-wasip3) component decode + round-trip gate for wabt.
 
 This is the #267 Phase 4 gate. Where ``scripts/p3_conformance.py`` checks that
 the components wabt *produces* from hand-authored single-built-in fixtures are
 accepted by Wasmtime (``wasmtime compile``), this gate runs in the other
 direction: it feeds wabt the **real-world** ``wasm32-wasip3`` components from
-the upstream WASI testsuite and requires wabt's component loader to decode
-every one of them.
+the upstream WASI testsuite and exercises wabt's component loader + writer on
+each one.
 
 The upstream testsuite ships *already-componentized* ``wasm32-wasip3`` binaries
 (component-model layer-1 modules, magic ``\\0asm\\x0d\\x00\\x01\\x00``), so the
 core->component path (``wabt component new``) does not apply. wabt is a toolkit,
 not a runtime, so the meaningful analog of the wamr project's wasip3 runtime
-gate is *decode/loader parity*: for each fixture run
+gate is *decode/loader parity*. For each fixture this gate runs:
 
-    wabt component objdump <fixture>.wasm
+  1. ``wabt component objdump <fixture>.wasm``        (decode: loader parses it)
+  2. ``wabt component objdump <fixture>.wasm -o tmp`` (round-trip: load->encode)
+     and requires ``tmp`` to be **byte-identical** to the input.
 
-and require exit 0 -- i.e. wabt's ``src/component/loader.zig`` fully parses every
-real P3 component (nested components, async canon built-ins, stream/future,
-error-context, ...) that upstream produces.
+i.e. wabt's ``src/component/loader.zig`` fully parses *and* its
+``src/component/writer.zig`` faithfully re-emits every real P3 component
+(nested components, async canon built-ins, stream/future, error-context, ...)
+that upstream produces. The round-trip check needs no Wasmtime.
 
 Per-fixture skips live in ``tests/wasi-p3-testsuite-skip.json`` (each entry a
 rationale ending in a tracking issue), keyed by the suite ``name`` from the
@@ -37,6 +40,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -102,9 +106,29 @@ def main() -> int:
             skipped.append(fname)
             print(f"  SKIP {fname:28s} - {skip[fname]}")
             continue
+        # 1. Decode: wabt's component loader must parse the component.
         code, out = run([args.wabt, "component", "objdump", str(wasm)])
         if code != 0:
             failed.append((fname, f"`wabt component objdump` exited {code}\n{out.strip()}"))
+            print(f"  FAIL {fname}")
+            continue
+        # 2. Round-trip: re-emit via `objdump -o` (loader -> writer) and
+        #    require the output to be byte-identical to the input, locking
+        #    in faithful decode+encode of every real-world P3 component.
+        err = None
+        with tempfile.TemporaryDirectory(prefix=f"wasip3-rt-{fname}-") as td:
+            out_path = Path(td) / "reemit.wasm"
+            code, rt_out = run([args.wabt, "component", "objdump", str(wasm), "-o", str(out_path)])
+            if code != 0:
+                err = f"`wabt component objdump -o` exited {code}\n{rt_out.strip()}"
+            else:
+                original = wasm.read_bytes()
+                reemit = out_path.read_bytes()
+                if reemit != original:
+                    err = (f"round-trip not byte-identical "
+                           f"(input {len(original)} bytes, re-emit {len(reemit)} bytes)")
+        if err:
+            failed.append((fname, err))
             print(f"  FAIL {fname}")
         else:
             passed.append(fname)
