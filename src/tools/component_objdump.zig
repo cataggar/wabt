@@ -20,11 +20,11 @@ pub const usage =
     \\  -o, --output <file>   Re-emit the decoded component to <file> (a
     \\                        load -> encode round-trip through wabt's
     \\                        component loader + writer), to unblock
-    \\                        round-trip testing. NOTE: re-emission is
-    \\                        currently lossy for some real-world inputs
-    \\                        (custom sections are dropped; section order
-    \\                        may change), so the output is not guaranteed
-    \\                        byte-identical or even re-validatable yet.
+    \\                        round-trip testing. The verbatim loader
+    \\                        preserves the physical section order and
+    \\                        custom sections, so the output is structurally
+    \\                        equivalent to the input (re-validatable),
+    \\                        though not guaranteed byte-identical.
     \\
 ;
 
@@ -236,7 +236,7 @@ pub const ReemitError = DumpError || error{ValueTooLarge};
 pub fn reemit(allocator: std.mem.Allocator, bytes: []const u8) ReemitError![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const comp = try wabt.component.loader.load(bytes, arena.allocator());
+    const comp = try wabt.component.loader.loadVerbatim(bytes, arena.allocator());
     return wabt.component.writer.encode(allocator, &comp);
 }
 
@@ -342,20 +342,25 @@ test "dump rejects core wasm preamble" {
 }
 
 test "reemit round-trips a component through the loader + writer" {
-    // Bare component preamble (no sections): the simplest input the
-    // writer fully round-trips. Re-emission of richer real-world
-    // components is currently lossy — the loader drops custom sections
-    // (loader.zig) and the writer's section ordering does not yet
-    // preserve every external interleaving — so this test asserts only
-    // the guarantees that hold today: the output is a valid component
-    // binary that decodes again. See #267 for faithful round-trip work.
-    const bytes = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 };
+    // Component preamble + one custom section named "wit-component".
+    // The verbatim loader (used by reemit) now preserves custom sections
+    // and the physical section order, so the re-emitted bytes decode to
+    // an identical summary — including the custom section that the plain
+    // loader would drop.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
+        0x00, 0x0e,
+        0x0d, 'w', 'i', 't', '-', 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't',
+    };
     const out = try reemit(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(out);
 
     try std.testing.expect(looksLikeComponent(out));
-    // Re-decoding the emitted bytes must succeed (no loader error).
-    const summary = try dump(std.testing.allocator, out);
-    defer std.testing.allocator.free(summary);
-    try std.testing.expect(std.mem.indexOf(u8, summary, "wabt component objdump:") != null);
+    const a = try dump(std.testing.allocator, &bytes);
+    defer std.testing.allocator.free(a);
+    const b = try dump(std.testing.allocator, out);
+    defer std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+    // The custom section survived the round-trip.
+    try std.testing.expect(std.mem.indexOf(u8, b, "Custom sections:      1 (wit-component)") != null);
 }

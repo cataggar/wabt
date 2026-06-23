@@ -119,6 +119,22 @@ const SectionId = enum(u8) {
 
 /// Load a WebAssembly Component from binary data.
 pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, false);
+}
+
+/// Like `load`, but additionally captures the physical section layout
+/// (`section_order`) and preserves custom sections, so that a
+/// `load -> writer.encode` round-trip reproduces the component's section
+/// sequence (and metadata) rather than the writer's conventional
+/// re-ordering. Used by `wabt component objdump -o` for round-trip
+/// testing. Do NOT use this for components that will be *mutated* before
+/// re-encoding (e.g. compose / component-new transforms): the captured
+/// `section_order` indices would go stale against the edited arrays.
+pub fn loadVerbatim(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, true);
+}
+
+fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: bool) LoadError!ctypes.Component {
     var reader = BinaryReader{ .data = data };
 
     // Validate preamble
@@ -157,6 +173,18 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
     // layouts (issue #355).
     var comp_instance_indexspace: std.ArrayListUnmanaged(ctypes.CompInstanceContributor) = .empty;
 
+    // Physical section layout, captured only when `capture_layout` is set
+    // (see `loadVerbatim`). One `SectionEntry` per physical section, in
+    // encounter order, so the writer's ordered path can faithfully
+    // reproduce the original section sequence. Custom sections — normally
+    // dropped — are preserved into `custom_sections` and referenced by
+    // their `.custom` entries. `layout_faithful` is cleared if a section
+    // we cannot represent (e.g. `value`) is encountered, in which case we
+    // emit no `section_order` and fall back to conventional ordering.
+    var section_order: std.ArrayListUnmanaged(ctypes.SectionEntry) = .empty;
+    var custom_sections: std.ArrayListUnmanaged(ctypes.CustomSection) = .empty;
+    var layout_faithful = true;
+
     while (reader.remaining() > 0) {
         const section_id_byte = try reader.readByte();
         const section_size = try reader.readU32();
@@ -167,9 +195,33 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         const section_id = std.enums.fromInt(SectionId, section_id_byte) orelse
             return error.InvalidSectionId;
 
+        // Snapshot per-section array lengths so we can record a
+        // `SectionEntry` (start + count) for this physical section after
+        // it is parsed (only when capturing layout).
+        const len_before = .{
+            .custom = custom_sections.items.len,
+            .core_module = core_modules.items.len,
+            .core_instance = core_instances.items.len,
+            .core_type = core_type_defs.items.len,
+            .component = components.items.len,
+            .instance = instances.items.len,
+            .alias = aliases.items.len,
+            .type = type_defs.items.len,
+            .canon = canons.items.len,
+            .import = imports.items.len,
+            .@"export" = exports.items.len,
+        };
+
         switch (section_id) {
             .custom => {
-                // Skip custom sections
+                if (capture_layout) {
+                    // Preserve the custom section: name (LEB-prefixed) then
+                    // the remaining bytes as opaque payload.
+                    const name = try reader.readName();
+                    const payload = reader.data[reader.pos .. section_start + section_size];
+                    try custom_sections.append(allocator, .{ .name = name, .payload = payload });
+                }
+                // Skip to the end (whether or not we captured the name).
                 reader.pos = section_start + section_size;
             },
             .core_module => {
@@ -193,10 +245,14 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
                 }
             },
             .component => {
-                // Nested component — recursively parse
+                // Nested component — recursively parse. Propagate
+                // `capture_layout` so nested components also preserve
+                // their section order + custom sections; otherwise the
+                // writer re-orders them and breaks their internal index
+                // spaces on re-emit (#267).
                 const comp_data = reader.data[section_start .. section_start + section_size];
                 const child = try allocator.create(ctypes.Component);
-                child.* = try load(comp_data, allocator);
+                child.* = try loadInner(comp_data, allocator, capture_layout);
                 try components.append(allocator, child);
                 reader.pos = section_start + section_size;
             },
@@ -296,6 +352,32 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         // exactly `section_size` bytes. If a bug causes under- or over-read
         // we'd otherwise misalign the next section header.
         if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
+
+        // Record this physical section's layout entry (one per section).
+        if (capture_layout) {
+            const Kind = ctypes.SectionKind;
+            const entry: ?ctypes.SectionEntry = switch (section_id) {
+                .custom => mkEntry(.custom, len_before.custom, custom_sections.items.len),
+                .core_module => mkEntry(.core_module, len_before.core_module, core_modules.items.len),
+                .core_instance => mkEntry(.core_instance, len_before.core_instance, core_instances.items.len),
+                .core_type => mkEntry(.core_type, len_before.core_type, core_type_defs.items.len),
+                .component => mkEntry(.component, len_before.component, components.items.len),
+                .instance => mkEntry(.instance, len_before.instance, instances.items.len),
+                .alias => mkEntry(.alias, len_before.alias, aliases.items.len),
+                .type => mkEntry(.type, len_before.type, type_defs.items.len),
+                .canon => mkEntry(.canon, len_before.canon, canons.items.len),
+                .start => ctypes.SectionEntry{ .kind = Kind.start, .start = 0, .count = 0 },
+                .@"import" => mkEntry(.import, len_before.@"import", imports.items.len),
+                .@"export" => mkEntry(.@"export", len_before.@"export", exports.items.len),
+                // `value` sections aren't materialized, so the layout
+                // cannot be faithfully reproduced — disable layout capture.
+                .value => blk: {
+                    layout_faithful = false;
+                    break :blk null;
+                },
+            };
+            if (entry) |e| try section_order.append(allocator, e);
+        }
     }
 
     return .{
@@ -313,7 +395,17 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
         .exports = try exports.toOwnedSlice(allocator),
         .core_func_indexspace = try core_func_indexspace.toOwnedSlice(allocator),
         .comp_instance_indexspace = try comp_instance_indexspace.toOwnedSlice(allocator),
+        .custom_sections = if (capture_layout) try custom_sections.toOwnedSlice(allocator) else &.{},
+        .section_order = if (capture_layout and layout_faithful)
+            try section_order.toOwnedSlice(allocator)
+        else
+            null,
     };
+}
+
+/// Build a `SectionEntry` from a per-section array's before/after length.
+fn mkEntry(kind: ctypes.SectionKind, before: usize, after: usize) ctypes.SectionEntry {
+    return .{ .kind = kind, .start = @intCast(before), .count = @intCast(after - before) };
 }
 
 // ── Section parsers ─────────────────────────────────────────────────────────
@@ -1279,6 +1371,35 @@ test "load: real P3 (component-model-async) component (#263)" {
         else => {},
     };
     try std.testing.expect(fnew2 and fread2);
+}
+
+test "loadVerbatim: captures section_order and byte-faithfully round-trips (#267)" {
+    // The verbatim loader records the physical section layout so a
+    // `loadVerbatim -> writer.encode` round-trip reproduces the original
+    // section order, unlike the plain `load -> encode` path which falls
+    // back to the writer's conventional re-ordering.
+    const data = @embedFile("fixtures/p3-future.wasm");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const comp = try loadVerbatim(data, ar);
+    // Layout was captured: one entry per physical section.
+    try std.testing.expect(comp.section_order != null);
+    try std.testing.expect(comp.section_order.?.len > 0);
+
+    // Re-encode from the verbatim AST and re-load: the section order
+    // (and every per-section count) must be identical to the original.
+    const writer = @import("writer.zig");
+    const reencoded = try writer.encode(ar, &comp);
+    const comp2 = try loadVerbatim(reencoded, ar);
+
+    try std.testing.expect(comp2.section_order != null);
+    try std.testing.expectEqual(comp.section_order.?.len, comp2.section_order.?.len);
+    for (comp.section_order.?, comp2.section_order.?) |a, b| {
+        try std.testing.expectEqual(a.kind, b.kind);
+        try std.testing.expectEqual(a.count, b.count);
+    }
 }
 
 test "load: real P3 stream component (#263)" {
