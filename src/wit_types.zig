@@ -6,6 +6,9 @@
 
 const std = @import("std");
 pub const abi: type = @This();
+/// `canon` alias: this module also exposes the canonical-ABI marshaller
+/// surface, so generated bindings reach it as `wit_types.canon.*`.
+pub const canon: type = @This();
 // `abi` — shared guest-side Component Model canonical-ABI primitives.
 //
 // The `wasi_*` helper modules in this directory (`wasi_http`,
