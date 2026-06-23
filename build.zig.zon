@@ -3,7 +3,15 @@
     .version = "0.3.0",
     .fingerprint = 0xadd4251ada326c2a,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        // The WIT front-end (parser/resolver/AST) used by the bindgen host
+        // tool. The bindgen generator under `build/bindgen/` imports
+        // `wabt.component.wit` instead of vendoring it. Pinned to wabt `main`.
+        .wabt = .{
+            .url = "https://github.com/cataggar/wabt/archive/69b9dc948062047dc3222cd8d3b54e61270c41bd.tar.gz",
+            .hash = "wabt-0.1.0-eK3F5t5cNABZMX25DAZOH3cBRTURgFAwz2vXS7lK3G3g",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -22,19 +22,13 @@
 //! function-reference intrinsic `[future]<iface>#<fn>#<idx>`.
 
 const std = @import("std");
-// The WIT front-end (parser/resolver/AST) is vendored alongside this generator
-// under `wit/` so the bindgen tool builds standalone from the wasip3 package's
-// `build/` folder — no dependency on the full `wabt` module.
-const wit = struct {
-    pub const ast = @import("wit/ast.zig");
-    pub const resolver = @import("wit/resolver.zig");
-    pub const embed = @import("wit/embed.zig");
-};
+const wabt = @import("wabt");
+const wit = wabt.component.wit;
 const ast = wit.ast;
 const Allocator = std.mem.Allocator;
 
 pub const usage =
-    \\Usage: wabt component bindgen [options]
+    \\Usage: wasip3-bindgen [options]
     \\
     \\Generate Zig guest bindings (canonical-ABI shells targeting the `canon`
     \\library) from a WIT world.

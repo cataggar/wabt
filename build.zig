@@ -93,12 +93,24 @@ pub fn build(b: *std.Build) void {
     // The WIT→Zig guest-binding generator, vendored under `build/bindgen/`.
     // Built for the host and exposed as an installable artifact so dependents
     // can run it through the `bindgen` helper below — the in-package
-    // replacement for the external `wabt component bindgen` subcommand.
+    // replacement for the external `wabt component bindgen` subcommand. Its
+    // WIT front-end (parser/resolver/AST) comes from the `wabt` package (a
+    // local `../wabt` reference) rather than a vendored copy.
+    const wabt_dep = b.dependency("wabt", .{});
+    const wabt_options = b.addOptions();
+    wabt_options.addOption([]const u8, "version", "dev");
+    const wabt_mod = b.createModule(.{
+        .root_source_file = wabt_dep.path("src/root.zig"),
+        .target = b.graph.host,
+    });
+    wabt_mod.addOptions("build_options", wabt_options);
+
     const bindgen_exe = b.addExecutable(.{
         .name = "wasip3-bindgen",
         .root_module = b.createModule(.{
             .root_source_file = b.path("build/bindgen/main.zig"),
             .target = b.graph.host,
+            .imports = &.{.{ .name = "wabt", .module = wabt_mod }},
         }),
     });
     b.installArtifact(bindgen_exe);
