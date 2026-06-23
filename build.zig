@@ -406,17 +406,17 @@ pub fn build(b: *std.Build) void {
     );
     p3_step.dependOn(&p3_runner.step);
 
-    // ── WASI Preview 3 behavioral testsuite parity gate (#267 Phase 4) ──
-    // Where `p3-conformance` only validates that wabt's hand-authored
-    // single-built-in fixtures *encode* acceptably (`wasmtime compile`), this
-    // gate lifts **real** `wasm32-wasip3` guest programs with `wabt component
-    // new` and *runs* them on upstream Wasmtime, checking each against the
-    // testsuite's expected exit code / stdout. Like `p3-conformance` it is not
-    // in the default `test` aggregate (needs Python 3 + an external Wasmtime),
-    // and skips cleanly when no Wasmtime — or no vendored suite — is found.
-    // The upstream `wasm32-wasip3` fixtures are not vendored yet, so this is
-    // the harness; it self-skips until they land. Run locally with
-    // `zig build wasi-p3-testsuite` (optionally `WASMTIME=/path/to/wasmtime`).
+    // ── WASI Preview 3 component decode gate (#267 Phase 4) ────────────
+    // Where `p3-conformance` validates that the components wabt *produces*
+    // from hand-authored single-built-in fixtures are accepted by Wasmtime
+    // (`wasmtime compile`), this gate runs the other direction: it feeds
+    // wabt the **real-world** `wasm32-wasip3` components from the upstream
+    // WASI testsuite (vendored at `tests/wasi-testsuite`) and requires wabt's
+    // component loader to decode every one (`wabt component objdump`). wabt is
+    // a toolkit, not a runtime, so this is the loader-parity analog of the
+    // wamr project's wasip3 runtime gate. Not in the default `test` aggregate
+    // (needs Python 3 + the testsuite submodule); skips cleanly when the suite
+    // isn't checked out. Run locally with `zig build wasi-p3-testsuite`.
     const wasip3_runner = b.addSystemCommand(&.{
         "python3",
         "scripts/wasi_p3_testsuite.py",
@@ -425,11 +425,10 @@ pub fn build(b: *std.Build) void {
         "--wabt",
     });
     wasip3_runner.addArtifactArg(wabt_exe);
-    if (p3_require_wasmtime) wasip3_runner.addArg("--require-wasmtime");
     if (wasip3_require_suite) wasip3_runner.addArg("--require-suite");
     const wasip3_step = b.step(
         "wasi-p3-testsuite",
-        "Run wabt-produced wasm32-wasip3 components against Wasmtime (set WASMTIME)",
+        "Decode upstream wasm32-wasip3 components with wabt's component loader",
     );
     wasip3_step.dependOn(&wasip3_runner.step);
 }
