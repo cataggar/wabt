@@ -362,8 +362,8 @@ pub const ZigBuildWasm = struct {
     imports: []const ZigWasmImport = &.{},
     target_triple: []const u8 = "wasm32-freestanding",
     /// Auto-add `--export=cabi_realloc`, the canonical-ABI allocator every
-    /// wasip3 component needs (exported by `abi.zig`). Set false for a core
-    /// module that doesn't link `abi`.
+    /// wasip3 component needs (exported by `wit_types.zig`). Set false for a
+    /// core module that doesn't link the canonical-ABI core.
     cabi_realloc: bool = true,
     /// `-fno-llvm` (self-hosted wasm codegen). Off: LLVM/LLD is required
     /// because Zig 0.16's self-hosted wasm linker mis-sets

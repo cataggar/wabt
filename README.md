@@ -44,8 +44,6 @@ with `wit-bindgen`'s convention for cross-toolchain interop.
 
 ```
 src/
-  abi.zig              shared canonical-ABI core (cabi_realloc, ret-area)
-  canon.zig            comptime canonical-ABI value marshaller (records/strings/options/lists/variants/futures/streams)
   cm_async.zig         WASI 0.3 async primitives (future/stream/error-context/waitable-set/subtask)
   wasi_cli_bindings.zig  `wabt component bindgen`-generated wasi:cli@0.3.0 import client wrappers
   wasi_cli.zig         ergonomic wasi:cli@0.3.0 layer (run export, stdout/stderr/stdin, args/env, exit, terminal)
@@ -94,7 +92,7 @@ adds `--dir`, sockets adds `-S allow-ip-name-lookup`).
 ## Build
 
 ```sh
-zig build test     # native unit tests for abi.zig (cabi_realloc + ret-area)
+zig build test     # native unit tests for wit_types.zig (cabi_realloc + ret-area)
 ```
 
 The `wasi_*` / `cm_async` wrappers are wasm-only (their `extern` host imports
