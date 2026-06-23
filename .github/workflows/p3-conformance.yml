@@ -1,0 +1,42 @@
+name: WASI P3 conformance
+
+# Phase 3b of cataggar/wabt#267: validate wabt-produced WASI Preview 3
+# components against a pinned upstream Wasmtime. Runs on push-to-main and
+# nightly (plus manual dispatch) — intentionally NOT on `pull_request`, so it
+# never gates PRs. Zig and Wasmtime are installed from GitHub releases via the
+# `ghr` install action.
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 6 * * *' # nightly ~06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Tool versions installed from GitHub releases via `ghr`. The P3 canon
+  # built-ins (`backpressure.*`, `context.*`, `subtask.cancel`) require Wasmtime
+  # >= 46 (wasmparser 0.251). Bump these single lines to move the pins.
+  WASMTIME_VERSION: v46.0.0
+  ZIG_VERSION: v0.16.0
+
+jobs:
+  p3-conformance:
+    name: WASI P3 conformance (Wasmtime ${{ env.WASMTIME_VERSION }})
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          submodules: true
+
+      - name: Install Zig and Wasmtime via ghr
+        uses: cataggar/ghr/actions/install@v0.5.2
+        with:
+          tools: |
+            cataggar/zig@${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            bytecodealliance/wasmtime@${{ env.WASMTIME_VERSION }}
+
+      - name: Run P3 conformance gate
+        run: zig build p3-conformance -Dp3-require-wasmtime
