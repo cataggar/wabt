@@ -1,3 +1,7 @@
 [submodule "third_party/testsuite"]
 path = third_party/testsuite
 url = https://github.com/WebAssembly/testsuite
+[submodule "tests/wasi-testsuite"]
+	path = tests/wasi-testsuite
+	url = https://github.com/WebAssembly/wasi-testsuite.git
+	branch = prod/testsuite-base

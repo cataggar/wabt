@@ -12,6 +12,10 @@ pub fn build(b: *std.Build) void {
     // usable Wasmtime is found — set by the CI p3-conformance job, which
     // installs a pinned Wasmtime that supports the P3 canon built-ins.
     const p3_require_wasmtime = b.option(bool, "p3-require-wasmtime", "Fail (not skip) p3-conformance when no Wasmtime is found (CI)") orelse false;
+    // When set, `zig build wasi-p3-testsuite` fails (instead of skipping) if the
+    // vendored wasm32-wasip3 testsuite is missing — set by CI once the suite is
+    // vendored, so a dropped checkout is a hard failure rather than a silent skip.
+    const wasip3_require_suite = b.option(bool, "wasip3-require-suite", "Fail (not skip) wasi-p3-testsuite when the testsuite is not vendored (CI)") orelse false;
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
@@ -401,6 +405,32 @@ pub fn build(b: *std.Build) void {
         "Validate wabt-produced P3 components against Wasmtime (set WASMTIME)",
     );
     p3_step.dependOn(&p3_runner.step);
+
+    // ── WASI Preview 3 component decode gate (#267 Phase 4) ────────────
+    // Where `p3-conformance` validates that the components wabt *produces*
+    // from hand-authored single-built-in fixtures are accepted by Wasmtime
+    // (`wasmtime compile`), this gate runs the other direction: it feeds
+    // wabt the **real-world** `wasm32-wasip3` components from the upstream
+    // WASI testsuite (vendored at `tests/wasi-testsuite`) and requires wabt's
+    // component loader to decode every one (`wabt component objdump`). wabt is
+    // a toolkit, not a runtime, so this is the loader-parity analog of the
+    // wamr project's wasip3 runtime gate. Not in the default `test` aggregate
+    // (needs Python 3 + the testsuite submodule); skips cleanly when the suite
+    // isn't checked out. Run locally with `zig build wasi-p3-testsuite`.
+    const wasip3_runner = b.addSystemCommand(&.{
+        "python3",
+        "scripts/wasi_p3_testsuite.py",
+        "--skip",
+        "tests/wasi-p3-testsuite-skip.json",
+        "--wabt",
+    });
+    wasip3_runner.addArtifactArg(wabt_exe);
+    if (wasip3_require_suite) wasip3_runner.addArg("--require-suite");
+    const wasip3_step = b.step(
+        "wasi-p3-testsuite",
+        "Decode upstream wasm32-wasip3 components with wabt's component loader",
+    );
+    wasip3_step.dependOn(&wasip3_runner.step);
 }
 
 /// Adapter shape selector used by `buildAdapterArtifact` to pick

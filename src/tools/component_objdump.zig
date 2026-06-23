@@ -14,9 +14,17 @@ pub const usage =
     \\Usage: wabt component objdump [options] <file.wasm>
     \\
     \\Dump a structural summary of a WebAssembly Component Model binary.
+    \\The summary is always written to stdout.
     \\
     \\Options:
-    \\  -o, --output <file>   Output file (default: stdout)
+    \\  -o, --output <file>   Re-emit the decoded component to <file> (a
+    \\                        load -> encode round-trip through wabt's
+    \\                        component loader + writer), to unblock
+    \\                        round-trip testing. NOTE: re-emission is
+    \\                        currently lossy for some real-world inputs
+    \\                        (custom sections are dropped; section order
+    \\                        may change), so the output is not guaranteed
+    \\                        byte-identical or even re-validatable yet.
     \\
 ;
 
@@ -218,6 +226,20 @@ pub fn dump(allocator: std.mem.Allocator, bytes: []const u8) DumpError![]u8 {
     });
 }
 
+pub const ReemitError = DumpError || error{ValueTooLarge};
+
+/// Decode `bytes` with the component loader and re-serialize via the
+/// component writer — a structural round-trip. The returned slice
+/// (a component binary) is owned by `allocator`. Re-emission is
+/// structurally equivalent to the input but may differ byte-for-byte
+/// (e.g. section interleaving), per `writer.zig`'s contract.
+pub fn reemit(allocator: std.mem.Allocator, bytes: []const u8) ReemitError![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const comp = try wabt.component.loader.load(bytes, arena.allocator());
+    return wabt.component.writer.encode(allocator, &comp);
+}
+
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     if (sub_args.len > 0 and std.mem.eql(u8, sub_args[0], "help")) {
         writeStdout(init.io, usage);
@@ -260,13 +282,21 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     };
     defer alloc.free(output);
 
+    // The structural summary always goes to stdout.
+    std.Io.File.stdout().writeStreamingAll(init.io, output) catch {};
+
+    // `-o` re-emits the decoded component as a binary (load -> encode
+    // round-trip), e.g. for round-trip / writer-parity testing.
     if (output_file) |out_path| {
-        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = output }) catch |err| {
+        const binary = reemit(alloc, source) catch |err| {
+            std.debug.print("error: cannot re-emit component: {any}\n", .{err});
+            std.process.exit(1);
+        };
+        defer alloc.free(binary);
+        std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = binary }) catch |err| {
             std.debug.print("error: cannot write '{s}': {any}\n", .{ out_path, err });
             std.process.exit(1);
         };
-    } else {
-        std.Io.File.stdout().writeStreamingAll(init.io, output) catch {};
     }
 }
 
@@ -309,4 +339,23 @@ test "dump renders summary block for minimal component with one custom section" 
 test "dump rejects core wasm preamble" {
     const core = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
     try std.testing.expectError(error.InvalidVersion, dump(std.testing.allocator, &core));
+}
+
+test "reemit round-trips a component through the loader + writer" {
+    // Bare component preamble (no sections): the simplest input the
+    // writer fully round-trips. Re-emission of richer real-world
+    // components is currently lossy — the loader drops custom sections
+    // (loader.zig) and the writer's section ordering does not yet
+    // preserve every external interleaving — so this test asserts only
+    // the guarantees that hold today: the output is a valid component
+    // binary that decodes again. See #267 for faithful round-trip work.
+    const bytes = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00 };
+    const out = try reemit(std.testing.allocator, &bytes);
+    defer std.testing.allocator.free(out);
+
+    try std.testing.expect(looksLikeComponent(out));
+    // Re-decoding the emitted bytes must succeed (no loader error).
+    const summary = try dump(std.testing.allocator, out);
+    defer std.testing.allocator.free(summary);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "wabt component objdump:") != null);
 }
