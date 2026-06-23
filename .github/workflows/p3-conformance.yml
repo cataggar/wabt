@@ -3,8 +3,8 @@ name: WASI P3 conformance
 # Phase 3b of cataggar/wabt#267: validate wabt-produced WASI Preview 3
 # components against a pinned upstream Wasmtime. Runs on push-to-main and
 # nightly (plus manual dispatch) — intentionally NOT on `pull_request`, so it
-# never gates PRs. Until the pinned Wasmtime release is tagged, the job
-# downloads nothing and the conformance step is skipped, so the job stays green.
+# never gates PRs. Zig and Wasmtime are installed from GitHub releases via the
+# `ghr` install action.
 on:
   push:
     branches: [main]
@@ -16,12 +16,11 @@ permissions:
   contents: read
 
 env:
-  # Wasmtime release to validate P3 components against. The P3 canon built-ins
-  # (`backpressure.*`, `context.*`, `subtask.cancel`) require Wasmtime >= 46
-  # (wasmparser 0.251). Bump this single line once a newer P3-capable release
-  # ships. v46.0.0 is not yet tagged as of this PR; until it is, the job skips
-  # the conformance run cleanly (see the install step).
+  # Tool versions installed from GitHub releases via `ghr`. The P3 canon
+  # built-ins (`backpressure.*`, `context.*`, `subtask.cancel`) require Wasmtime
+  # >= 46 (wasmparser 0.251). Bump these single lines to move the pins.
   WASMTIME_VERSION: v46.0.0
+  ZIG_VERSION: v0.16.0
 
 jobs:
   p3-conformance:
@@ -32,41 +31,16 @@ jobs:
         with:
           submodules: true
 
-      - name: Install Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      - name: Install Zig and Wasmtime via ghr
+        uses: cataggar/ghr/actions/install@v0.5.2
         with:
-          version: 0.16.0
+          tools: |
+            cataggar/zig@${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            bytecodealliance/wasmtime@${{ env.WASMTIME_VERSION }}
 
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.x'
 
-      - name: Install Wasmtime ${{ env.WASMTIME_VERSION }}
-        id: wasmtime
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          ver="${WASMTIME_VERSION}"
-          api="https://api.github.com/repos/bytecodealliance/wasmtime/releases/tags/${ver}"
-          code=$(curl -sL -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" "${api}" || echo 000)
-          if [ "${code}" != "200" ]; then
-            echo "::notice::Wasmtime ${ver} is not released yet (releases API returned ${code}); skipping P3 conformance until it ships."
-            echo "available=false" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          asset="wasmtime-${ver}-x86_64-linux.tar.xz"
-          url="https://github.com/bytecodealliance/wasmtime/releases/download/${ver}/${asset}"
-          curl -fsSL "${url}" -o "${RUNNER_TEMP}/wasmtime.tar.xz"
-          mkdir -p "${RUNNER_TEMP}/wasmtime"
-          tar -xf "${RUNNER_TEMP}/wasmtime.tar.xz" -C "${RUNNER_TEMP}/wasmtime" --strip-components=1
-          chmod +x "${RUNNER_TEMP}/wasmtime/wasmtime"
-          echo "WASMTIME=${RUNNER_TEMP}/wasmtime/wasmtime" >> "${GITHUB_ENV}"
-          echo "available=true" >> "${GITHUB_OUTPUT}"
-          "${RUNNER_TEMP}/wasmtime/wasmtime" --version
-
       - name: Run P3 conformance gate
-        if: steps.wasmtime.outputs.available == 'true'
         run: zig build p3-conformance -Dp3-require-wasmtime
