@@ -1,11 +1,11 @@
 //! In-memory petstore implementation — the backend component's root module.
 
-const store = @import("store_provider");
-const Pet = store.Pet;
-const Toy = store.Toy;
+const storage = @import("storage");
+const Pet = storage.Pet;
+const Toy = storage.Toy;
 
 comptime {
-    _ = store;
+    _ = storage;
 }
 
 const StoredPet = struct {

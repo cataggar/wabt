@@ -1,12 +1,18 @@
 package example:petstore;
 
-/// A typed data-access boundary for the petstore. The HTTP frontend
-/// (`svc`) imports it; a separate storage component (`store-provider`)
-/// exports it. `wabt component compose` links the two into one component.
-///
-/// Lists are exposed as `count` + indexed `*-at` accessors (rather than
-/// `list<record>`) so the canonical-ABI marshalling stays hand-writable on
-/// both sides; failures collapse to `option`/`bool` for the same reason.
+// A web component.
+world web {
+    import wasi:http/types@0.3.0;
+    import store;
+    export wasi:http/handler@0.3.0;
+}
+
+// A storage component.
+world storage {
+    export store;
+}
+
+/// A data storage interface.
 interface store {
     record pet {
         id: u32,
@@ -35,21 +41,4 @@ interface store {
     toy-count: func(pet-id: u32) -> u32;
     /// The `index`-th toy of a pet, or none.
     toy-at: func(pet-id: u32, index: u32) -> option<toy>;
-}
-
-// A `wasi:http/service`-shaped world that also imports the `store`
-// data-access interface; exports the async `handler` the host calls.
-// `wabt component bindgen` generates the full client surface — the
-// `wasi:http/types` wrappers, the `store` client, and the async `handle`
-// export — so the frontend drives the generated bindings directly (no
-// hand-written `wasi_http`).
-world svc {
-    import wasi:http/types@0.3.0;
-    import store;
-    export wasi:http/handler@0.3.0;
-}
-
-// The storage component: exports the `store` interface.
-world store-provider {
-    export store;
 }
