@@ -58,7 +58,7 @@ src/
   wasi_sockets_bindings.zig  `wabt component bindgen`-generated wasi:sockets@0.3.0 import client wrappers
   wasi_sockets.zig     ergonomic wasi:sockets@0.3.0 layer (TCP connect/send/recv + listen/accept, UDP connect/send/recv, ip-name-lookup resolveAddresses, address builders)
   wasi_http_bindings.zig  `wabt component bindgen`-generated wasi:http/types@0.3.0 import client wrappers
-  wasi_http.zig        ergonomic wasi:http@0.3.0 service handler layer (exportHandler + Request/Responder, over the generated body stream/trailers future)
+  wasi_http.zig        ergonomic wasi:http@0.3.0 service handler layer (handler + Request/Responder, over the generated body stream/trailers future)
   root.zig             `wasip3` re-export index
 ```
 

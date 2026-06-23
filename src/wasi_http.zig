@@ -31,7 +31,7 @@
 //!     res.setStatus(200);
 //!     res.writeAll("hello");
 //! }
-//! comptime { http.exportHandler(handle); }
+//! comptime { http.handler(handle); }
 //! ```
 
 const std = @import("std");
@@ -234,16 +234,16 @@ fn sendResponse(res: *const Responder) void {
     writeTrailers(tf.writable);
 }
 
-// ── export wiring ───────────────────────────────────────────────────
-
-/// Per-task stack buffer sizes (request path, request body, response body).
-pub const path_capacity = 1024;
-pub const request_body_capacity = 8192;
-pub const body_capacity = 8192;
+/// Per-task stack buffer sizes (request path, request body, response body),
+/// sized to align with wasmtime/hyper defaults: an 8 KiB request line/URI and
+/// 64 KiB body chunks (the wasi-http stream transfer size).
+pub const path_capacity = 8 * 1024;
+pub const request_body_capacity = 64 * 1024;
+pub const body_capacity = 64 * 1024;
 
 /// Emit the async `wasi:http/handler@0.3.0#handle` export, dispatching each
-/// request to `handler`.
-pub fn exportHandler(comptime handler: fn (req: *const Request, res: *Responder) void) void {
+/// request to `impl`.
+pub fn handler(comptime impl: fn (req: *const Request, res: *Responder) void) void {
     const Wrapper = struct {
         fn handle(request: i32) callconv(.c) void {
             abi.resetScratch();
@@ -264,7 +264,7 @@ pub fn exportHandler(comptime handler: fn (req: *const Request, res: *Responder)
 
             const req = Request{ .method = method, .path = path, .body = reqbody };
             var res = Responder{ .buf = &resp_buf };
-            handler(&req, &res);
+            impl(&req, &res);
             sendResponse(&res);
         }
     };
