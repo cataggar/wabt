@@ -138,5 +138,5 @@ fn handler(req: *const http.Request, res: *http.Responder) void {
 }
 
 comptime {
-    http.exportHandler(handler);
+    http.handler(handler);
 }
