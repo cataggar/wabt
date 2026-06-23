@@ -245,10 +245,14 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 }
             },
             .component => {
-                // Nested component — recursively parse
+                // Nested component — recursively parse. Propagate
+                // `capture_layout` so nested components also preserve
+                // their section order + custom sections; otherwise the
+                // writer re-orders them and breaks their internal index
+                // spaces on re-emit (#267).
                 const comp_data = reader.data[section_start .. section_start + section_size];
                 const child = try allocator.create(ctypes.Component);
-                child.* = try load(comp_data, allocator);
+                child.* = try loadInner(comp_data, allocator, capture_layout);
                 try components.append(allocator, child);
                 reader.pos = section_start + section_size;
             },
