@@ -42,9 +42,9 @@
 //!
 //! World-extern naming convention (#285). Besides qualified
 //! `interface_ref` externs, two world-local `WorldExtern` shapes are
-//! supported; both `wabt component bindgen` and `component new` agree
-//! on these names (the contract is purely the advertised wire name and
-//! the guest core import/export module/field strings):
+//! supported; `component new` lifts these names (the contract is purely
+//! the advertised wire name and the guest core import/export
+//! module/field strings):
 //!
 //!   * `named_interface` — `import|export name: interface { … };`. An
 //!     inline interface advertised under its **plain local name**

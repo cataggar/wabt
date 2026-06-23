@@ -10,7 +10,6 @@ const embed_cmd = @import("component_embed.zig");
 const new_cmd = @import("component_new.zig");
 const compose_cmd = @import("component_compose.zig");
 const objdump_cmd = @import("component_objdump.zig");
-const bindgen_cmd = @import("component_bindgen.zig");
 
 pub const usage =
     \\Usage: wabt component <verb> [args...]
@@ -20,7 +19,6 @@ pub const usage =
     \\  new            Wrap a core wasm + embedded metadata into a component
     \\  compose        Link a consumer component's imports to provider exports
     \\  objdump        Dump a structural summary of a Component Model binary
-    \\  bindgen        Generate Zig guest bindings (canonical-ABI shells) from WIT
     \\
     \\Run `wabt help component <verb>` for verb-specific help.
     \\
@@ -31,7 +29,6 @@ pub const Verb = enum {
     new,
     compose,
     objdump,
-    bindgen,
     help,
 };
 
@@ -40,7 +37,6 @@ pub fn parseVerb(s: []const u8) ?Verb {
     if (std.mem.eql(u8, s, "new")) return .new;
     if (std.mem.eql(u8, s, "compose")) return .compose;
     if (std.mem.eql(u8, s, "objdump")) return .objdump;
-    if (std.mem.eql(u8, s, "bindgen")) return .bindgen;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
 }
@@ -60,7 +56,6 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         .new => try new_cmd.run(init, verb_args),
         .compose => try compose_cmd.run(init, verb_args),
         .objdump => try objdump_cmd.run(init, verb_args),
-        .bindgen => try bindgen_cmd.run(init, verb_args),
         .help => {
             if (verb_args.len == 0) {
                 writeStdout(init.io, usage);
@@ -75,7 +70,6 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 .new => new_cmd.usage,
                 .compose => compose_cmd.usage,
                 .objdump => objdump_cmd.usage,
-                .bindgen => bindgen_cmd.usage,
                 .help => usage,
             });
         },
