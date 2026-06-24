@@ -1,12 +1,12 @@
 package example:hello;
 
 world hello {
-    // output-stream + blocking-write-and-flush: the actual stdout write.
-    import wasi:io/streams@0.2.6;
-    // get-stdout: yields the output-stream the greeting is written to.
-    import wasi:cli/stdout@0.2.6;
+    // get-arguments: the program arguments inspected by the guest.
+    import wasi:cli/environment@0.3.0;
+    // get-stdout: yields the stream<u8> the greeting is written to (WASI 0.3 async).
+    import wasi:cli/stdout@0.3.0;
     // exit-with-code: reports the u8 process exit code to the host.
-    import wasi:cli/exit@0.2.6;
-    // run: the command entry point (prints, then exits).
-    export wasi:cli/run@0.2.6;
+    import wasi:cli/exit@0.3.0;
+    // run: the async command entry point (prints, then exits).
+    export wasi:cli/run@0.3.0;
 }
