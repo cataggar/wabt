@@ -606,6 +606,14 @@ pub const WasmtimeRun = struct {
     step_name: []const u8 = "run",
     /// Step description shown in `zig build --help`.
     description: []const u8 = "Run the component with wasmtime",
+    /// `-W <feature>` Wasm / component-model features. Defaults to the full
+    /// WASI 0.3 (P3) async feature set wasmtime needs for a wasip3 component.
+    wasm_features: []const []const u8 = &.{
+        "component-model-async",
+        "component-model-async-stackful",
+        "component-model-more-async-builtins",
+        "component-model-error-context",
+    },
     /// `-S <feature>` flags enabling WASI features on `wasmtime run`.
     /// Defaults to `cli-exit-with-code` so the guest's exit code propagates.
     wasi: []const []const u8 = &.{"cli-exit-with-code"},
@@ -618,6 +626,10 @@ pub const WasmtimeRun = struct {
 /// Returns the step so callers can wire further dependencies if needed.
 pub fn wasmtimeRun(b: *std.Build, opts: WasmtimeRun) *std.Build.Step {
     const cmd = b.addSystemCommand(&.{ wasmtimeBin(b), "run" });
+    for (opts.wasm_features) |f| {
+        cmd.addArg("-W");
+        cmd.addArg(f);
+    }
     for (opts.wasi) |feature| {
         cmd.addArg("-S");
         cmd.addArg(feature);
