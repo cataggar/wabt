@@ -13,11 +13,11 @@
 //!
 //! ```zig
 //! const cli = @import("wasi_cli");
-//! comptime { cli.exportRun(run); }
+//! comptime { cli.run(run); }
 //! fn run() u8 {
 //!     cli.println("hello from a wasi 0.3 zig component");
 //!     for (cli.arguments()) |a| cli.println(a);
-//!     return 0; // 0 -> result::ok, nonzero -> result::err
+//!     return 0; // 0 -> result::ok, nonzero -> exit code via exit-with-code
 //! }
 //! ```
 
@@ -186,15 +186,20 @@ const run_task = struct {
     extern "[task-return]wasi:cli/run@0.3.0#run" fn @"task-return"(result_disc: i32) void;
 };
 
-/// Emit the async `wasi:cli/run@0.3.0#run` export that dispatches to `entry`.
-/// `entry` returns a `u8` (0 → `result::ok`, nonzero → `result::err`); the
-/// wrapper reports it via `task.return`.
-pub fn exportRun(comptime entry: fn () u8) void {
+/// Emit the async `wasi:cli/run@0.3.0#run` export that dispatches to `impl`.
+/// `impl` returns a `u8` that is treated as the process exit code: `0` reports
+/// `result::ok` via `task.return`, while any nonzero value is propagated
+/// exactly through `exit-with-code` (which terminates and does not return).
+pub fn run(comptime impl: fn () u8) void {
     const Wrapper = struct {
         fn run() callconv(.c) void {
             abi.resetScratch();
-            const code = entry();
-            run_task.@"task-return"(if (code == 0) 0 else 1);
+            const code = impl();
+            if (code == 0) {
+                run_task.@"task-return"(0);
+            } else {
+                b.exit.exitWithCode(code); // conveys the exact code; terminates
+            }
         }
     };
     @export(&Wrapper.run, .{ .name = "wasi:cli/run@0.3.0#run" });
