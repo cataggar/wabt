@@ -3,27 +3,28 @@
 # from the MINISIGN_PASSWORD environment variable instead of /dev/tty
 # (which is how upstream minisign always prompts for it).
 #
-# Usage: expect scripts/sign-asset.exp <asset> <trusted-comment>
+# Usage: expect scripts/sign-asset.exp <minisign-bin> <asset> <trusted-comment>
 #
 # Requires:
-#   * `minisign` and `expect` on PATH
+#   * `expect` on PATH
 #   * `minisign.key` in the current working directory
 #   * MINISIGN_PASSWORD env var set to the secret-key passphrase
 
-if {$argc != 2} {
-    puts stderr "usage: sign-asset.exp <asset> <trusted-comment>"
+if {$argc != 3} {
+    puts stderr "usage: sign-asset.exp <minisign-bin> <asset> <trusted-comment>"
     exit 64
 }
 
-set asset   [lindex $argv 0]
-set comment [lindex $argv 1]
+set bin     [lindex $argv 0]
+set asset   [lindex $argv 1]
+set comment [lindex $argv 2]
 set timeout 30
 
 # Don't echo minisign's output (which would include the prompt) onto the
 # job log. The trusted comment is logged separately by the caller.
 log_user 0
 
-spawn minisign -S -s minisign.key -m $asset -t $comment
+spawn $bin -S -s minisign.key -m $asset -t $comment
 
 expect {
     "Password:" {

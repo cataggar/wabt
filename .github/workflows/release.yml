@@ -78,6 +78,15 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -qq -y expect
+          # minisign's release tarball bundles both x86_64 and aarch64
+          # binaries under the same name, so ghr can symlink the wrong arch
+          # onto PATH. Prefer the host-arch binary from ghr's tool dir, then
+          # fall back to whatever `minisign` resolves to.
+          minisign_bin="$(command -v minisign)"
+          host_minisign="$(find "${GHR_TOOL_DIR}" -type f -path "*$(uname -m)/minisign" 2>/dev/null | head -n1)"
+          if [ -n "$host_minisign" ]; then minisign_bin="$host_minisign"; fi
+          chmod +x "$minisign_bin"
+          "$minisign_bin" -v || true
           # Write the secret key to a 0600 file; the runner workspace is
           # ephemeral and the trap removes it before the step exits.
           umask 077
@@ -87,7 +96,7 @@ jobs:
           # verification, so encode self-identifying metadata in it.
           comment="timestamp:$(date +%s) file:hello.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
           echo "signing hello.wasm (trusted comment: ${comment})"
-          expect scripts/sign-asset.exp hello.wasm "$comment"
+          expect scripts/sign-asset.exp "$minisign_bin" hello.wasm "$comment"
           ls -la hello.wasm.minisig
 
       - name: Create release
