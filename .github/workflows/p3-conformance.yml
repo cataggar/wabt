@@ -32,7 +32,7 @@ jobs:
           submodules: true
 
       - name: Install Zig and Wasmtime via ghr
-        uses: cataggar/ghr/actions/install@v0.6.0
+        uses: cataggar/ghr/actions/install@v0.6.1
         with:
           tools: |
             cataggar/zig@${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
@@ -54,7 +54,7 @@ jobs:
           submodules: true
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.0
+        uses: cataggar/ghr/actions/install@v0.6.1
         with:
           tools: |
             cataggar/zig@${{ env.ZIG_VERSION }} RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
