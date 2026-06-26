@@ -71,19 +71,7 @@ jobs:
             A `wasi:cli` command example, installable with [ghr](https://github.com/cataggar/ghr):
 
             ```
-            ghr install cataggar/wabt@${{ steps.meta.outputs.tag }}
-            ```
-
-            ## Verify
-
-            `hello.wasm` is signed with [minisign](https://jedisct1.github.io/minisign/). Verify it with the public key:
-
-            ```
-            RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
-            ```
-
-            ```
-            minisign -V -P RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0 -m hello.wasm
+            ghr install cataggar/wabt@${{ steps.meta.outputs.tag }} RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
             ```
           files: |
             hello.wasm
