@@ -38,13 +38,12 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#hello-}" >> "$GITHUB_OUTPUT"
 
-      - name: Install zig, wabt, and minisign
-        uses: cataggar/ghr/actions/install@v0.5.2
+      - name: Install zig and wabt
+        uses: cataggar/ghr/actions/install@v0.6.0
         with:
           tools: |
             cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
             cataggar/wabt@v3.0.0-dev.19 RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
-            jedisct1/minisign@0.12 RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3
 
       - name: Build release component
         run: zig build
@@ -76,27 +75,12 @@ jobs:
           MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -qq -y expect
-          # minisign's release tarball bundles both x86_64 and aarch64
-          # binaries under the same name, so ghr can symlink the wrong arch
-          # onto PATH. Prefer the host-arch binary from ghr's tool dir, then
-          # fall back to whatever `minisign` resolves to.
-          minisign_bin="$(command -v minisign)"
-          host_minisign="$(find "${GHR_TOOL_DIR}" -type f -path "*$(uname -m)/minisign" 2>/dev/null | head -n1)"
-          if [ -n "$host_minisign" ]; then minisign_bin="$host_minisign"; fi
-          chmod +x "$minisign_bin"
-          "$minisign_bin" -v || true
-          # Write the secret key to a 0600 file; the runner workspace is
-          # ephemeral and the trap removes it before the step exits.
-          umask 077
-          printf '%s\n' "$MINISIGN_SECRET_KEY" > minisign.key
-          trap 'rm -f minisign.key' EXIT
-          # The trusted comment is printed by `ghr install` on successful
-          # verification, so encode self-identifying metadata in it.
+          # `ghr minisign sign` signs without an external minisign binary,
+          # key file, or expect script: the key/password come from the env.
+          # Encode self-identifying metadata in the signed trusted comment.
           comment="timestamp:$(date +%s) file:hello.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
           echo "signing hello.wasm (trusted comment: ${comment})"
-          expect scripts/sign-asset.exp "$minisign_bin" hello.wasm "$comment"
+          ghr minisign sign hello.wasm -t "$comment"
           ls -la hello.wasm.minisig
 
       - name: Create release
