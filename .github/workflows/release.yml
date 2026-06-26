@@ -52,36 +52,15 @@ jobs:
         run: |
           set -euo pipefail
           cp zig-out/hello.wasm hello.wasm
-          # Launcher manifest consumed by `ghr`: how to run hello.wasm.
-          cat > hello.wasm.ghr <<'EOF'
-          .{
-              .version = 1,
-              .runtime = "wasmtime",
-              .runtimeArgs = .{
-                  "run",
-                  "-W", "component-model-async",
-                  "-W", "component-model-async-stackful",
-                  "-W", "component-model-more-async-builtins",
-                  "-W", "component-model-error-context",
-                  "-S", "cli-exit-with-code",
-              },
-          }
-          EOF
-          cat hello.wasm.ghr
 
-      - name: Sign hello.wasm with minisign (.minisig sidecar)
+      - name: Sign with minisign
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD:   ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          # `ghr minisign sign` signs without an external minisign binary,
-          # key file, or expect script: the key/password come from the env.
-          # Encode self-identifying metadata in the signed trusted comment.
-          comment="timestamp:$(date +%s) file:hello.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
-          echo "signing hello.wasm (trusted comment: ${comment})"
-          ghr minisign sign hello.wasm -t "$comment"
-          ls -la hello.wasm.minisig
+          ghr minisign sign hello.wasm -t "timestamp:$(date +%s) file:hello.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
+          test -f hello.wasm.minisig
 
       - name: Create release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
