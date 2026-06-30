@@ -27,9 +27,9 @@ pub fn build(b: *std.Build) void {
     const petstore = wasip3.wabtComponentCompose(b, .{
         .consumer = web,
         .dependencies = &.{store},
-        .output = "petstore-serve.wasm",
+        .output = "petstore.wasm",
     });
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(petstore, .prefix, "petstore-serve.wasm").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(petstore, .prefix, "petstore.wasm").step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     _ = wasip3.wasmtimeServe(b, .{ .wasm = petstore, .description = "Serve with wasmtime" });
@@ -45,7 +45,7 @@ pub fn build(b: *std.Build) void {
         .imports = client_imports,
     });
     const client = wasip3.wabtComponentNew(b, .{ .wasm_core = client_core, .world = "client" });
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(client, .prefix, "petstore-client.wasm").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(client, .prefix, "petstore-test.wasm").step);
 
     // `zig build client [-- 127.0.0.1:8080]` — needs the P3 async features
     // plus the outgoing `wasi:http` and `wasi:cli` host support.

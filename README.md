@@ -1,7 +1,7 @@
-# example/http — PetStore (composed)
+# example/http — PetStore
 
-A `wasi:http@0.3.0` **service** written in Zig and is based on the
-[petstore TypeSpec](https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp).
+A `wasi:http` service loosely based on this
+[TypeSpec](https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp).
 
 split into **two components linked with `wabt component compose`**:
 
@@ -11,7 +11,7 @@ split into **two components linked with `wabt component compose`**:
   examples) and exports a typed `example:petstore/store` data-access interface.
 
 The frontend `import`s `store`; compose binds that import to the storage
-provider's export, yielding one servable component (`zig-out/petstore-serve.wasm`).
+provider's export, yielding one servable component (`zig-out/petstore.wasm`).
 Each half is built `wasm32-freestanding`, wrapped with `wabt component new`, then
 linked with `wabt component compose`.
 
@@ -102,7 +102,7 @@ corrupt each other.
 ```sh
 git clone --branch example/http --single-branch https://github.com/cataggar/wabt.git example-http
 cd example-http
-zig build                 # builds both components + composes -> zig-out/petstore-serve.wasm
+zig build                 # builds both components + composes -> zig-out/petstore.wasm
 zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
 ```
 
@@ -112,5 +112,5 @@ zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
 ```sh
 wasmtime serve -W component-model-async -W component-model-async-stackful \
   -W component-model-more-async-builtins -W component-model-error-context \
-  -S p3,cli zig-out/petstore-serve.wasm
+  -S p3,cli zig-out/petstore.wasm
 ```
