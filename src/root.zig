@@ -18,3 +18,5 @@ pub const wasi_filesystem = @import("wasi_filesystem");
 /// `wasi:sockets@0.3.0` — tcp/udp socket resources + ip-name-lookup.
 pub const wasi_sockets = @import("wasi_sockets");
 pub const wasi_http = @import("wasi_http");
+/// `wasi:http/client@0.3.0` — outgoing-request driver (async `send`).
+pub const wasi_http_client = @import("wasi_http_client");

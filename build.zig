@@ -54,6 +54,13 @@ pub fn build(b: *std.Build) void {
     wasi_http.addImport("wit_types", wit_types);
     wasi_http.addImport("wit_async", wit_async);
 
+    // Outgoing-HTTP driver over the same generated `wasi:http/types` bindings,
+    // issuing requests through the imported `wasi:http/client@0.3.0#send`.
+    const wasi_http_client = b.addModule("wasi_http_client", .{ .root_source_file = b.path("src/wasi_http_client.zig") });
+    wasi_http_client.addImport("wasi_http_bindings", wasi_http_bindings);
+    wasi_http_client.addImport("wit_types", wit_types);
+    wasi_http_client.addImport("wit_async", wit_async);
+
     // `wabt component bindgen`-generated `wasi:filesystem@0.3.0` import wrappers
     // (async descriptor methods + `stream<u8>` file I/O); `wasi_filesystem` is
     // the ergonomic layer over them.
@@ -88,6 +95,7 @@ pub fn build(b: *std.Build) void {
     wasip3.addImport("wasi_filesystem", wasi_filesystem);
     wasip3.addImport("wasi_sockets", wasi_sockets);
     wasip3.addImport("wasi_http", wasi_http);
+    wasip3.addImport("wasi_http_client", wasi_http_client);
 
     // ── Bindgen generator (host build tool) ────────────────────────
     // The WIT→Zig guest-binding generator, vendored under `build/bindgen/`.
@@ -219,6 +227,7 @@ pub const modules = [_]ModuleSpec{
     .{ .name = "wasi_sockets", .deps = &.{ "wasi_sockets_bindings", "wit_types", "wit_async" } },
     .{ .name = "wasi_http_bindings", .deps = &.{"wit_types"} },
     .{ .name = "wasi_http", .deps = &.{ "wasi_http_bindings", "wit_types", "wit_async" } },
+    .{ .name = "wasi_http_client", .deps = &.{ "wasi_http_bindings", "wit_types", "wit_async" } },
 };
 
 fn findSpec(name: []const u8) ModuleSpec {
