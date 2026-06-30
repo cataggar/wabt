@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArg(f);
     }
     run_cmd.addArg("-S");
-    run_cmd.addArg("p3,http,cli");
+    run_cmd.addArg("p3,http,cli,cli-exit-with-code");
     run_cmd.addFileArg(client);
     if (b.args) |forwarded| run_cmd.addArgs(forwarded);
     const run_test = b.step("test", "Run the petstore integration test");

@@ -7,6 +7,6 @@
         "-W", "component-model-async-stackful",
         "-W", "component-model-more-async-builtins",
         "-W", "component-model-error-context",
-        "-S", "cli-exit-with-code",
+        "-S", "p3,http,cli,cli-exit-with-code",
     },
 }
