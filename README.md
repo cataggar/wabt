@@ -11,7 +11,7 @@ split into **two components linked with `wabt component compose`**:
   examples) and exports a typed `example:petstore/store` data-access interface.
 
 The frontend `import`s `store`; compose binds that import to the storage
-provider's export, yielding one servable component (`zig-out/petstore.wasm`).
+provider's export, yielding one servable component (`zig-out/petstore-serve.wasm`).
 Each half is built `wasm32-freestanding`, wrapped with `wabt component new`, then
 linked with `wabt component compose`.
 
@@ -102,46 +102,15 @@ corrupt each other.
 ```sh
 git clone --branch example/http --single-branch https://github.com/cataggar/wabt.git example-http
 cd example-http
-zig build                 # builds both components + composes -> zig-out/petstore.wasm
+zig build                 # builds both components + composes -> zig-out/petstore-serve.wasm
 zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
 ```
 
-### Editor / ZLS
-
-The guests are compiled by shelling out to `zig build-exe` (`wasip3.zigBuildWasm`),
-which the language server can't introspect, so the generated `svc` /
-`store_provider` bindings would otherwise be unresolved. `wasip3.zigBuildWasm`
-therefore auto-registers a `check` step that mirrors each guest's module graph as
-a real `addExecutable` / `addImport` — no build.zig wiring needed here.
-`.vscode/settings.json` points ZLS's build-on-save at it
-(`zig.zls.buildOnSaveStep = "check"`), so imports resolve and diagnostics surface
-in the editor. `wabt` must be on `PATH` (ZLS runs the build to materialize the
-generated bindings).
-
-In another terminal:
-
-```sh
-curl http://127.0.0.1:8080/pets
-# {"items":[{"id":1,"name":"Fluffy","tag":"cat","age":3}, ...]}
-
-curl -X POST http://127.0.0.1:8080/pets -H 'content-type: application/json' \
-  -d '{"name":"Whiskers","tag":"cat","age":2}'
-# {"id":4,"name":"Whiskers","tag":"cat","age":2}
-
-curl http://127.0.0.1:8080/pets/1/toys
-# {"items":[{"id":100,"petId":1,"name":"Yarn Ball"}, ...]}
-```
-
-To point at specific tool builds:
-
-```sh
-WABT=/path/to/wabt WASMTIME=/path/to/wasmtime zig build serve -- --addr 127.0.0.1:8080
-```
 
 ## Serve directly
 
 ```sh
 wasmtime serve -W component-model-async -W component-model-async-stackful \
   -W component-model-more-async-builtins -W component-model-error-context \
-  -S p3,cli zig-out/petstore.wasm
+  -S p3,cli zig-out/petstore-serve.wasm
 ```

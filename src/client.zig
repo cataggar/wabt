@@ -6,7 +6,7 @@
 //! (`host:port`) is taken from the first non-`.wasm` program argument, then the
 //! `BASE_URL` environment variable, then defaults to `localhost:8080` — so a
 //! `zig build serve` in another terminal can be driven with
-//! `zig build run-client` (optionally `-- 127.0.0.1:8080`).
+//! `zig build client` (optionally `-- 127.0.0.1:8080`).
 
 const std = @import("std");
 const cli = @import("wasi_cli");
