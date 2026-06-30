@@ -1,0 +1,100 @@
+name: Publish Release
+
+on:
+  push:
+    tags:
+      - 'petstore-*'
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0
+
+      - name: Build WASM components
+        run: |
+          zig build
+          mkdir -p dist
+          cp zig-out/petstore.wasm dist/
+          cp zig-out/petstore-test.wasm dist/
+
+      - name: Install minisig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y minisign
+
+      - name: Create minisig signatures
+        env:
+          MINISIG_SK: ${{ secrets.MINISIG_SECRET_KEY }}
+          MINISIG_PASSWORD: ${{ secrets.MINISIG_PASSWORD }}
+        run: |
+          # Create a temporary file for the secret key
+          echo "$MINISIG_SK" > /tmp/minisig.key
+          
+          # Sign each WASM file
+          cd dist
+          for wasm in *.wasm; do
+            minisign -Sm "$wasm" -s /tmp/minisig.key -t "PetStore release" -x "${wasm}.minisig"
+          done
+          
+          # Clean up
+          rm /tmp/minisig.key
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.wasm > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install ghr
+        run: |
+          go install github.com/tcnksm/ghr@latest
+
+      - name: Create Release Notes
+        run: |
+          cat > /tmp/release-notes.txt <<'EOF'
+          ## PetStore WASM Release
+          
+          Release artifacts:
+          - `petstore.wasm` - Main service component
+          - `petstore-test.wasm` - Test/client component
+          
+          ### Verification
+          
+          To verify the signatures, first import the public key (if not already done):
+          ```bash
+          minisign -P -p pubkey.pub
+          ```
+          
+          Then verify each file:
+          ```bash
+          minisign -Vm petstore.wasm -p pubkey.pub
+          minisign -Vm petstore-test.wasm -p pubkey.pub
+          ```
+          
+          Or verify checksums:
+          ```bash
+          sha256sum -c SHA256SUMS
+          ```
+          EOF
+
+      - name: Publish Release with ghr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          ghr -t "$GITHUB_TOKEN" \
+            -u "${{ github.repository_owner }}" \
+            -r "${{ github.event.repository.name }}" \
+            -b "$(cat /tmp/release-notes.txt)" \
+            -c "${{ github.sha }}" \
+            -delete \
+            "$TAG_NAME" \
+            dist/
