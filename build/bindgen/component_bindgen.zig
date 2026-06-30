@@ -303,7 +303,7 @@ const Gen = struct {
             \\
         , .{world_name});
         // A world that imports an async func drives the async-lowered call
-        // through `cm_async.awaitCall`.
+        // through `wit_async.awaitCall`.
         for (uses.items) |u| {
             if (u.is_export) continue;
             for (u.iface.items) |it| switch (it) {
@@ -311,7 +311,7 @@ const Gen = struct {
                     self.needs_cm_async = true;
                 },
                 // An imported resource with an async method also drives the call
-                // through `cm_async.awaitCall`.
+                // through `wit_async.awaitCall`.
                 .type => |td| switch (td.kind) {
                     .resource => |methods| for (methods) |m| {
                         if (m.func.is_async) self.needs_cm_async = true;
@@ -321,7 +321,7 @@ const Gen = struct {
                 else => {},
             };
         }
-        if (self.needs_cm_async) self.raw("const cm_async = @import(\"cm_async\");\n");
+        if (self.needs_cm_async) self.raw("const wit_async = @import(\"wit_async\");\n");
         self.raw("\n");
 
         // Register complex (non-primitive-element) future/stream channels so
@@ -452,11 +452,11 @@ const Gen = struct {
             .result => |r| blk: {
                 const ok = if (r.ok) |t| try self.zigType(t.*) else "void";
                 const err = if (r.err) |t| try self.zigType(t.*) else "void";
-                break :blk try std.fmt.allocPrint(self.ar, "wit_types.canon.Result({s}, {s})", .{ ok, err });
+                break :blk try std.fmt.allocPrint(self.ar, "wit_types.Result({s}, {s})", .{ ok, err });
             },
             .tuple => |elems| blk: {
                 var b = std.ArrayListUnmanaged(u8).empty;
-                try b.appendSlice(self.ar, "wit_types.canon.Tuple(.{ ");
+                try b.appendSlice(self.ar, "wit_types.Tuple(.{ ");
                 for (elems, 0..) |e, i| {
                     if (i != 0) try b.appendSlice(self.ar, ", ");
                     try b.appendSlice(self.ar, try self.zigType(e));
@@ -467,12 +467,12 @@ const Gen = struct {
             .future => |e| if (try self.chanName(true, if (e) |p| p.* else null)) |nm|
                 nm
             else
-                try std.fmt.allocPrint(self.ar, "wit_types.canon.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+                try std.fmt.allocPrint(self.ar, "wit_types.Future({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
             .stream => |e| if (try self.chanName(false, if (e) |p| p.* else null)) |nm|
                 nm
             else
-                try std.fmt.allocPrint(self.ar, "wit_types.canon.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
-            .error_context => "wit_types.canon.ErrorContextHandle",
+                try std.fmt.allocPrint(self.ar, "wit_types.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
+            .error_context => "wit_types.ErrorContextHandle",
             .own, .borrow => |r| try self.typeName(r), // resource handle wrapper
             .name => |n| try self.typeName(n),
         };
@@ -566,7 +566,7 @@ const Gen = struct {
 
         self.print("export fn @\"{s}\"(", .{export_sym});
         try self.emitFlatParamDecls(func.params);
-        self.print(") wit_types.canon.CoreReturn({s}) {{\n", .{result_zig});
+        self.print(") wit_types.CoreReturn({s}) {{\n", .{result_zig});
         self.raw("    wit_types.resetScratch();\n");
 
         try self.emitLiftParams(func.params);
@@ -578,7 +578,7 @@ const Gen = struct {
             self.raw("    return;\n");
         } else {
             self.print(
-                "    return wit_types.canon.returnResult({s}, Impl.{s}({s}), &wit_types.alloc);\n",
+                "    return wit_types.returnResult({s}, Impl.{s}({s}), &wit_types.alloc);\n",
                 .{ result_zig, try camel(self.ar, name), args },
             );
         }
@@ -590,7 +590,7 @@ const Gen = struct {
     /// can't shadow a parameter named `a`/`p`/etc.). No-op when there are none.
     fn emitLiftParams(self: *Gen, params: []const ast.Param) GenError!void {
         if (params.len == 0) return;
-        self.raw("    const __params = wit_types.canon.liftParams(struct {\n");
+        self.raw("    const __params = wit_types.liftParams(struct {\n");
         for (params) |p| {
             self.print("        {s}: {s},\n", .{ try snake(self.ar, p.name), try self.zigType(p.type) });
         }
@@ -646,13 +646,13 @@ const Gen = struct {
         if (spilled) {
             // Lower the result into a fresh scratch buffer (canonical layout) and
             // hand task.return the pointer.
-            self.print("    const __ret = wit_types.alloc(wit_types.canon.sizeOf({s}), wit_types.canon.alignOf({s}));\n", .{ rz, rz });
-            self.print("    wit_types.canon.lower({s}, {s}, __ret, &wit_types.alloc);\n", .{ rz, rexpr });
+            self.print("    const __ret = wit_types.alloc(wit_types.sizeOf({s}), wit_types.alignOf({s}));\n", .{ rz, rz });
+            self.print("    wit_types.lower({s}, {s}, __ret, &wit_types.alloc);\n", .{ rz, rexpr });
             self.print("    {s}.@\"task-return\"(@intCast(@intFromPtr(__ret)));\n", .{tname});
         } else if (rcount == 1) {
-            self.print("    {s}.@\"task-return\"(wit_types.canon.returnResult({s}, {s}, &wit_types.alloc));\n", .{ tname, rz, rexpr });
+            self.print("    {s}.@\"task-return\"(wit_types.returnResult({s}, {s}, &wit_types.alloc));\n", .{ tname, rz, rexpr });
         } else {
-            self.print("    const __r = wit_types.canon.lowerFlat({s}, {s}, &wit_types.alloc);\n", .{ rz, rexpr });
+            self.print("    const __r = wit_types.lowerFlat({s}, {s}, &wit_types.alloc);\n", .{ rz, rexpr });
             self.print("    {s}.@\"task-return\"(", .{tname});
             for (0..rcount) |i| {
                 if (i != 0) self.raw(", ");
@@ -742,8 +742,8 @@ const Gen = struct {
             self.raw(try snake(self.ar, p.name));
         }
         self.raw(" };\n");
-        self.raw("        const __pp = wit_types.alloc(wit_types.canon.sizeOf(@TypeOf(__pargs)), wit_types.canon.alignOf(@TypeOf(__pargs)));\n");
-        self.raw("        wit_types.canon.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);\n");
+        self.raw("        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));\n");
+        self.raw("        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);\n");
         return "@intCast(@intFromPtr(__pp))";
     }
 
@@ -788,12 +788,12 @@ const Gen = struct {
             } else {
                 self.print("        imp.@\"{s}\"(wit_types.retPtr());\n", .{name});
             }
-            self.print("        return wit_types.canon.lift({s}, wit_types.retArea());\n", .{result_zig});
+            self.print("        return wit_types.lift({s}, wit_types.retArea());\n", .{result_zig});
         } else if (func.result == null) {
             self.print("        imp.@\"{s}\"({s});\n", .{ name, call_args });
         } else {
             self.print(
-                "        return wit_types.canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n",
+                "        return wit_types.liftResultFlat({s}, imp.@\"{s}\"({s}));\n",
                 .{ result_zig, name, call_args },
             );
         }
@@ -802,7 +802,7 @@ const Gen = struct {
 
     /// Emit the typed wrapper for an imported **async** func: lower params, call
     /// the async-lowered extern (returns the packed callstatus), drive it to
-    /// completion via `cm_async.awaitCall`, then lift the result the host wrote
+    /// completion via `wit_async.awaitCall`, then lift the result the host wrote
     /// to the result pointer. Always lifts from memory (async lowering writes
     /// results indirectly, even for a single-slot result).
     fn emitAsyncImportWrapper(self: *Gen, name: []const u8, func: ast.Func) GenError!void {
@@ -823,11 +823,11 @@ const Gen = struct {
             } else {
                 self.print("        const __status = imp.@\"{s}\"(wit_types.retPtr());\n", .{name});
             }
-            self.raw("        cm_async.awaitCall(__status);\n");
-            self.print("        return wit_types.canon.lift({s}, wit_types.retArea());\n", .{result_zig});
+            self.raw("        wit_async.awaitCall(__status);\n");
+            self.print("        return wit_types.lift({s}, wit_types.retArea());\n", .{result_zig});
         } else {
             self.print("        const __status = imp.@\"{s}\"({s});\n", .{ name, call_args });
-            self.raw("        cm_async.awaitCall(__status);\n");
+            self.raw("        wit_async.awaitCall(__status);\n");
         }
         self.raw("    }\n");
     }
@@ -983,11 +983,11 @@ const Gen = struct {
             } else {
                 self.print("        imp.@\"{s}\"(wit_types.retPtr());\n", .{ext});
             }
-            self.print("        return wit_types.canon.lift({s}, wit_types.retArea());\n", .{result_zig});
+            self.print("        return wit_types.lift({s}, wit_types.retArea());\n", .{result_zig});
         } else if (func.result == null) {
             self.print("        imp.@\"{s}\"({s});\n", .{ ext, args });
         } else {
-            self.print("        return wit_types.canon.liftResultFlat({s}, imp.@\"{s}\"({s}));\n", .{ result_zig, ext, args });
+            self.print("        return wit_types.liftResultFlat({s}, imp.@\"{s}\"({s}));\n", .{ result_zig, ext, args });
         }
         self.raw("    }\n");
     }
@@ -995,7 +995,7 @@ const Gen = struct {
     /// Emit the typed wrapper for an **async** resource method/static: lower the
     /// params (prefixed by `self.handle` for a method), call the async-lowered
     /// extern (returns the packed callstatus), drive it to completion via
-    /// `cm_async.awaitCall`, then lift the result the host wrote to the result
+    /// `wit_async.awaitCall`, then lift the result the host wrote to the result
     /// pointer. Always lifts from memory (async lowering writes results
     /// indirectly, even for a single-slot result).
     fn emitAsyncResourceWrapper(self: *Gen, R: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
@@ -1030,11 +1030,11 @@ const Gen = struct {
             } else {
                 self.print("        const __status = imp.@\"{s}\"(wit_types.retPtr());\n", .{ext});
             }
-            self.raw("        cm_async.awaitCall(__status);\n");
-            self.print("        return wit_types.canon.lift({s}, wit_types.retArea());\n", .{try self.resultZig(func)});
+            self.raw("        wit_async.awaitCall(__status);\n");
+            self.print("        return wit_types.lift({s}, wit_types.retArea());\n", .{try self.resultZig(func)});
         } else {
             self.print("        const __status = imp.@\"{s}\"({s});\n", .{ ext, args });
-            self.raw("        cm_async.awaitCall(__status);\n");
+            self.raw("        wit_async.awaitCall(__status);\n");
         }
         self.raw("    }\n");
     }
@@ -1200,7 +1200,7 @@ const Gen = struct {
             self.chan_counter += 1;
             const ctor: []const u8 = if (o.is_future) "FutureOf" else "StreamOf";
             const family: []const u8 = if (o.is_future) "future" else "stream";
-            const rhs = try std.fmt.allocPrint(self.ar, "wit_types.canon.{s}({s}, \"[{s}]{s}#{s}#{d}\")", .{
+            const rhs = try std.fmt.allocPrint(self.ar, "wit_types.{s}({s}, \"[{s}]{s}#{s}#{d}\")", .{
                 ctor, try self.zigType(elem), family, iface_id, fn_name, idx,
             });
             try self.chan_map.put(self.ar, key, name);
@@ -1244,11 +1244,11 @@ const Gen = struct {
         return args.items;
     }
 
-    /// Lower an aggregate param: `const <pn>_s = wit_types.canon.lowerFlat(<T>, <pn>,
+    /// Lower an aggregate param: `const <pn>_s = wit_types.lowerFlat(<T>, <pn>,
     /// &wit_types.alloc);` then pass `<pn>_s[0], …, <pn>_s[K-1]` positionally.
     fn lowerAggregateParam(self: *Gen, args: *std.ArrayListUnmanaged(u8), pn: []const u8, ty: ast.Type) GenError!void {
         const k = (try self.flatCores(ty)).len;
-        self.print("        const {s}_s = wit_types.canon.lowerFlat({s}, {s}, &wit_types.alloc);\n", .{ pn, try self.zigType(ty), pn });
+        self.print("        const {s}_s = wit_types.lowerFlat({s}, {s}, &wit_types.alloc);\n", .{ pn, try self.zigType(ty), pn });
         for (0..k) |i| {
             if (i != 0) try args.appendSlice(self.ar, ", ");
             try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}_s[{d}]", .{ pn, i }));
@@ -1583,9 +1583,9 @@ test "generate: export shells + import wrappers" {
         try g.generate(exp_world, "host");
         const out = g.out.items;
         try testing.expect(std.mem.indexOf(u8, out, "pub const Pet = struct {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#ping\"(x: i32) wit_types.canon.CoreReturn(u32)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(u32, Impl.ping(__params.x), &wit_types.alloc)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#get\"(id: i32) wit_types.canon.CoreReturn(?Pet)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#ping\"(x: i32) wit_types.CoreReturn(u32)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.returnResult(u32, Impl.ping(__params.x), &wit_types.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:t/store#get\"(id: i32) wit_types.CoreReturn(?Pet)") != null);
         // No stray module-scope statement after an export shell's closing brace
         // (regression: a duplicate resetScratch was emitted at container scope).
         try testing.expect(std.mem.indexOf(u8, out, "}\n\n    wit_types.resetScratch();") == null);
@@ -1596,9 +1596,9 @@ test "generate: export shells + import wrappers" {
         const out = g.out.items;
         try testing.expect(std.mem.indexOf(u8, out, "pub const store = struct {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:t/store\" fn @\"ping\"(x: i32) i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(u32, imp.@\"ping\"(@bitCast(x)));") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(u32, imp.@\"ping\"(@bitCast(x)));") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:t/store\" fn @\"get\"(id: i32, retptr: i32) void;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(?Pet, wit_types.retArea());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(?Pet, wit_types.retArea());") != null);
     }
 }
 
@@ -1638,9 +1638,9 @@ test "generate: result<T,E> returns (indirect + flat all-void)" {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try g.generate(exp_world, "host");
         const out = g.out.items;
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#make\"() wit_types.canon.CoreReturn(wit_types.canon.Result(u32, []const u8))") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(wit_types.canon.Result(u32, []const u8), Impl.make(), &wit_types.alloc)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#flag\"() wit_types.canon.CoreReturn(wit_types.canon.Result(void, void))") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#make\"() wit_types.CoreReturn(wit_types.Result(u32, []const u8))") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.returnResult(wit_types.Result(u32, []const u8), Impl.make(), &wit_types.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:r/api#flag\"() wit_types.CoreReturn(wit_types.Result(void, void))") != null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
@@ -1648,10 +1648,10 @@ test "generate: result<T,E> returns (indirect + flat all-void)" {
         const out = g.out.items;
         // indirect result: extern takes a retptr, wrapper lifts from the ret area.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:r/api\" fn @\"make\"(retptr: i32) void;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(wit_types.canon.Result(u32, []const u8), wit_types.retArea());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(wit_types.Result(u32, []const u8), wit_types.retArea());") != null);
         // flat all-void result: extern returns the i32 discriminant directly.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:r/api\" fn @\"flag\"() i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(wit_types.canon.Result(void, void), imp.@\"flag\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@\"flag\"());") != null);
     }
 }
 
@@ -1691,7 +1691,7 @@ test "generate: identifier hygiene (param named `a`, single-word import name)" {
         const out = g.out.items;
         // The export param is still `a`; the lifted-params local is `__params`.
         try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:e/edge#pick\"(a: i32)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "const __params = wit_types.canon.liftParams(struct {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const __params = wit_types.liftParams(struct {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "Impl.pick(__params.a)") != null);
     }
     {
@@ -1757,9 +1757,9 @@ test "generate: variant typedef + returns (payload-bearing + all-void)" {
         try testing.expect(std.mem.indexOf(u8, out, "    text: []const u8,") != null);
         try testing.expect(std.mem.indexOf(u8, out, "    nothing,") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub const Flag2 = union(enum) {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#pick\"() wit_types.canon.CoreReturn(Value)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(Value, Impl.pick(), &wit_types.alloc)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#state\"() wit_types.canon.CoreReturn(Flag2)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#pick\"() wit_types.CoreReturn(Value)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.returnResult(Value, Impl.pick(), &wit_types.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:v/api#state\"() wit_types.CoreReturn(Flag2)") != null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
@@ -1767,10 +1767,10 @@ test "generate: variant typedef + returns (payload-bearing + all-void)" {
         const out = g.out.items;
         // payload-bearing variant → indirect (retptr + lift).
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:v/api\" fn @\"pick\"(retptr: i32) void;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(Value, wit_types.retArea());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(Value, wit_types.retArea());") != null);
         // all-void variant → flat i32 discriminant.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:v/api\" fn @\"state\"() i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(Flag2, imp.@\"state\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(Flag2, imp.@\"state\"());") != null);
     }
 }
 
@@ -1811,8 +1811,8 @@ test "generate: flags typedef + flat return" {
         try testing.expect(std.mem.indexOf(u8, out, "    read: bool = false,") != null);
         try testing.expect(std.mem.indexOf(u8, out, "    exec: bool = false,") != null);
         try testing.expect(std.mem.indexOf(u8, out, "    _padding: u5 = 0,") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:f/api#get-perms\"() wit_types.canon.CoreReturn(Perms)") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(Perms, Impl.getPerms(), &wit_types.alloc)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "export fn @\"test:f/api#get-perms\"() wit_types.CoreReturn(Perms)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.returnResult(Perms, Impl.getPerms(), &wit_types.alloc)") != null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
@@ -1821,7 +1821,7 @@ test "generate: flags typedef + flat return" {
         try testing.expect(std.mem.indexOf(u8, out, "pub const Perms = packed struct(u8) {") != null);
         // ≤32 labels → flat i32.
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:f/api\" fn @\"get-perms\"() i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(Perms, imp.@\"get-perms\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(Perms, imp.@\"get-perms\"());") != null);
     }
 }
 
@@ -1875,7 +1875,7 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]counter.increment\"(self.handle, @bitCast(by))") != null);
         // a static returning own<counter> lifts the handle into the wrapper struct.
         try testing.expect(std.mem.indexOf(u8, out, "pub fn makeZero() Counter {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(Counter, imp.@\"[static]counter.make-zero\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(Counter, imp.@\"[static]counter.make-zero\"());") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn deinit(self: Counter) void {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[resource-drop]counter\"(self.handle);") != null);
     }
@@ -1913,7 +1913,7 @@ test "generate #286: named_interface import emits a plain-named import struct" {
     try testing.expect(std.mem.indexOf(u8, out, "pub const foo = struct {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "extern \"foo\" fn @\"bar\"() i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn bar() u32 {") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(u32, imp.@\"bar\"());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(u32, imp.@\"bar\"());") != null);
 }
 
 test "generate #286: named_func export emits a module-scope export shell" {
@@ -1938,7 +1938,7 @@ test "generate #286: named_func export emits a module-scope export shell" {
     // An export pulls in the user impl.
     try testing.expect(std.mem.indexOf(u8, out, "const Impl = @import(\"impl\");") != null);
     // Module-scope export under the plain func name (no `<iface>#` prefix).
-    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"run\"() wit_types.canon.CoreReturn(void) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "export fn @\"run\"() wit_types.CoreReturn(void) {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Impl.run();") != null);
     try testing.expect(std.mem.indexOf(u8, out, "#run") == null);
 }
@@ -1966,7 +1966,7 @@ test "generate #286: named_func export with a primitive result" {
     const out = g.out.items;
 
     try testing.expect(std.mem.indexOf(u8, out, "export fn @\"compute\"(") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.returnResult(u32, Impl.compute(") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wit_types.returnResult(u32, Impl.compute(") != null);
 }
 
 test "generate #286: top-level func import is rejected (later phase)" {
@@ -2019,8 +2019,8 @@ test "generate: imported resource with async methods (#300)" {
     try g.generate(imp_world, "guest");
     const out = g.out.items;
 
-    // An async method needs the cm_async driver.
-    try testing.expect(std.mem.indexOf(u8, out, "const cm_async = @import(\"cm_async\");") != null);
+    // An async method needs the wit_async driver.
+    try testing.expect(std.mem.indexOf(u8, out, "const wit_async = @import(\"wit_async\");") != null);
 
     // Async externs: `(self?, flat params, result_ptr?) -> i32` (packed callstatus).
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.bump\"(self: i32, by: i32, result_ptr: i32) i32;") != null);
@@ -2029,14 +2029,14 @@ test "generate: imported resource with async methods (#300)" {
 
     // Async wrappers drive the subtask via awaitCall then lift from memory.
     try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.bump\"(self.handle, @bitCast(by), wit_types.retPtr());") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(u32, wit_types.retArea());") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift([]const u8, wit_types.retArea());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wit_async.awaitCall(__status);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(u32, wit_types.retArea());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift([]const u8, wit_types.retArea());") != null);
     // No-result async method: awaitCall, no lift.
     try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.reset\"(self.handle);") != null);
 
     // The sync method is unchanged (single-slot flat return).
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.liftResultFlat(u32, imp.@\"[method]thing.get-id\"(self.handle));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(u32, imp.@\"[method]thing.get-id\"(self.handle));") != null);
 }
 
 test "generate: async param spill past MAX_FLAT_ASYNC_PARAMS (#300)" {
@@ -2082,8 +2082,8 @@ test "generate: async param spill past MAX_FLAT_ASYNC_PARAMS (#300)" {
     // (self first) to a scratch buffer and passes the pointer.
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.openish\"(args_ptr: i32, result_ptr: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const __pargs = .{ self, a, name, b, c };") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const __pp = wit_types.alloc(wit_types.canon.sizeOf(@TypeOf(__pargs)), wit_types.canon.alignOf(@TypeOf(__pargs)));") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "wit_types.canon.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]thing.openish\"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());") != null);
 
     // Spilled free func: no self in the tuple.
@@ -2189,15 +2189,15 @@ test "generate: async multi-slot result lifts via lowerFlat; async import via aw
     {
         // Importing an async func: the extern is async-lowered (params +
         // result_ptr -> i32 status); the wrapper drives the subtask to
-        // completion via cm_async.awaitCall, then lifts the result from memory.
+        // completion via wit_async.awaitCall, then lifts the result from memory.
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try g.generate(agg_imp, "guest");
         const out = g.out.items;
-        try testing.expect(std.mem.indexOf(u8, out, "const cm_async = @import(\"cm_async\");") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "const wit_async = @import(\"wit_async\");") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:a/api\" fn @\"greet\"(result_ptr: i32) i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"greet\"(wit_types.retPtr());") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift([]const u8, wit_types.retArea());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_async.awaitCall(__status);") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift([]const u8, wit_types.retArea());") != null);
     }
 }
 
@@ -2228,8 +2228,8 @@ test "generate: async import with param + result (async-lower extern)" {
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:m/math\" fn @\"double\"(x: i32, result_ptr: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn double(x: u32) u32 {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"double\"(@bitCast(x), wit_types.retPtr());") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "cm_async.awaitCall(__status);") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(u32, wit_types.retArea());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wit_async.awaitCall(__status);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(u32, wit_types.retArea());") != null);
 }
 
 test "generate: async export with >16-slot result spills task.return to a pointer" {
@@ -2305,13 +2305,13 @@ test "generate: future / stream / tuple in signatures" {
     try g.generate(imp_world, "guest");
     const out = g.out.items;
     // tuple<stream<u8>, future<u32>> result (indirect, lifted from memory).
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn body(self: Pipe) wit_types.canon.Tuple(.{ wit_types.canon.Stream(u8), wit_types.canon.Future(u32) }) {") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.canon.lift(wit_types.canon.Tuple(.{ wit_types.canon.Stream(u8), wit_types.canon.Future(u32) }), wit_types.retArea());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn body(self: Pipe) wit_types.Tuple(.{ wit_types.Stream(u8), wit_types.Future(u32) }) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), wit_types.Future(u32) }), wit_types.retArea());") != null);
     // future<u32> param lowers to its i32 handle.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn signal(self: Pipe, f: wit_types.canon.Future(u32)) bool {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn signal(self: Pipe, f: wit_types.Future(u32)) bool {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
     // free function returning tuple<u32, string>.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() wit_types.canon.Tuple(.{ u32, []const u8 }) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() wit_types.Tuple(.{ u32, []const u8 }) {") != null);
 }
 
 test "generate: complex future/stream channels (function-reference intrinsics)" {
@@ -2361,11 +2361,11 @@ test "generate: complex future/stream channels (function-reference intrinsics)" 
     // intrinsic `[future]<iface>#<fn>#<idx>` (`<fn>` is the canonical extern
     // name: a static method is `[static]conn.open`). The complex future is
     // async-idx 1 (the primitive `future<u32>` param took idx 0).
-    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = wit_types.canon.FutureOf(wit_types.canon.Result(u32, []const u8), \"[future]demo:x/api@0.1.0#[static]conn.open#1\");") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = wit_types.canon.StreamOf([]const u8, \"[stream]demo:x/api@0.1.0#sink#0\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = wit_types.FutureOf(wit_types.Result(u32, []const u8), \"[future]demo:x/api@0.1.0#[static]conn.open#1\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = wit_types.StreamOf([]const u8, \"[stream]demo:x/api@0.1.0#sink#0\");") != null);
     // The static wrapper: primitive param stays `canon.Future(u32)`; the complex
     // result is the shared nominal `__chan0`.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: wit_types.canon.Future(u32)) __chan0 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: wit_types.Future(u32)) __chan0 {") != null);
     // The complex stream is a param typed as the shared nominal `__chan1`.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn sink(s: __chan1) bool {") != null);
 }
@@ -2407,8 +2407,8 @@ test "generate: same complex channel in two interfaces binds per-interface (#295
     const out = g.out.items;
     // Two distinct channel types, each bound to a site in ITS OWN interface —
     // not one shared type bound only to `a`.
-    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = wit_types.canon.FutureOf(wit_types.canon.Result(u32, []const u8), \"[future]demo:two/a@0.1.0#f#0\");") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = wit_types.canon.FutureOf(wit_types.canon.Result(u32, []const u8), \"[future]demo:two/b@0.1.0#g#0\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan0 = wit_types.FutureOf(wit_types.Result(u32, []const u8), \"[future]demo:two/a@0.1.0#f#0\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = wit_types.FutureOf(wit_types.Result(u32, []const u8), \"[future]demo:two/b@0.1.0#g#0\");") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn f() __chan0 {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub fn g() __chan1 {") != null);
 }
@@ -2455,8 +2455,8 @@ test "generate: same-named types in two interfaces get per-interface names (#303
     // No bare `ErrorCode` (the collision is fully disambiguated).
     try testing.expect(std.mem.indexOf(u8, out, "pub const ErrorCode = ") == null);
     // Each func's result binds to its own interface's error-code.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn f() wit_types.canon.Result(u32, AErrorCode) {") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn g() wit_types.canon.Result(u32, BErrorCode) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn f() wit_types.Result(u32, AErrorCode) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn g() wit_types.Result(u32, BErrorCode) {") != null);
 }
 
 test "generate: option<handle> / option<scalar> params" {
@@ -2535,11 +2535,11 @@ test "generate: aggregate params (variant / record) lower via canon.lowerFlat" {
     const out = g.out.items;
     // variant flattens to disc + joined payload (here (ptr, len)) = 3 i32 slots.
     try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"set-method\"(m_0: i32, m_1: i32, m_2: i32) i32;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const m_s = wit_types.canon.lowerFlat(Method, m, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const m_s = wit_types.lowerFlat(Method, m, &wit_types.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"set-method\"(m_s[0], m_s[1], m_s[2])") != null);
     // record flattens to its concatenated fields = 2 i32 slots.
     try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"move-to\"(p_0: i32, p_1: i32) i32;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.canon.lowerFlat(Point, p, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(Point, p, &wit_types.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"move-to\"(p_s[0], p_s[1])") != null);
 }
 

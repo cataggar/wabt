@@ -2,9 +2,6 @@
 
 const wit_types = @import("wit_types");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-
 pub const ErrorCode = enum {
     io,
     illegal_byte_sequence,
@@ -35,9 +32,9 @@ pub const TerminalOutput = struct {
     }
 };
 
-const __chan0 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stdin@0.3.0#read-via-stream#1");
-const __chan1 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stdout@0.3.0#write-via-stream#1");
-const __chan2 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:cli/stderr@0.3.0#write-via-stream#1");
+const __chan0 = wit_types.FutureOf(wit_types.Result(void, ErrorCode), "[future]wasi:cli/stdin@0.3.0#read-via-stream#1");
+const __chan1 = wit_types.FutureOf(wit_types.Result(void, ErrorCode), "[future]wasi:cli/stdout@0.3.0#write-via-stream#1");
+const __chan2 = wit_types.FutureOf(wit_types.Result(void, ErrorCode), "[future]wasi:cli/stderr@0.3.0#write-via-stream#1");
 
 pub const environment = struct {
     const imp = struct {
@@ -46,29 +43,29 @@ pub const environment = struct {
         extern "wasi:cli/environment@0.3.0" fn @"get-initial-cwd"(retptr: i32) void;
     };
 
-    pub fn getEnvironment() []const canon.Tuple(.{ []const u8, []const u8 }) {
-        imp.@"get-environment"(abi.retPtr());
-        return canon.lift([]const canon.Tuple(.{ []const u8, []const u8 }), abi.retArea());
+    pub fn getEnvironment() []const wit_types.Tuple(.{ []const u8, []const u8 }) {
+        imp.@"get-environment"(wit_types.retPtr());
+        return wit_types.lift([]const wit_types.Tuple(.{ []const u8, []const u8 }), wit_types.retArea());
     }
     pub fn getArguments() []const []const u8 {
-        imp.@"get-arguments"(abi.retPtr());
-        return canon.lift([]const []const u8, abi.retArea());
+        imp.@"get-arguments"(wit_types.retPtr());
+        return wit_types.lift([]const []const u8, wit_types.retArea());
     }
     pub fn getInitialCwd() ?[]const u8 {
-        imp.@"get-initial-cwd"(abi.retPtr());
-        return canon.lift(?[]const u8, abi.retArea());
+        imp.@"get-initial-cwd"(wit_types.retPtr());
+        return wit_types.lift(?[]const u8, wit_types.retArea());
     }
 };
 
 pub const exit = struct {
     const imp = struct {
-        extern "wasi:cli/exit@0.3.0" fn exit(status: i32) void;
+        extern "wasi:cli/exit@0.3.0" fn @"exit"(status: i32) void;
         extern "wasi:cli/exit@0.3.0" fn @"exit-with-code"(status_code: i32) void;
     };
 
-    pub fn exit(status: canon.Result(void, void)) void {
-        const status_s = canon.lowerFlat(canon.Result(void, void), status, &abi.alloc);
-        imp.exit(status_s[0]);
+    pub fn exit(status: wit_types.Result(void, void)) void {
+        const status_s = wit_types.lowerFlat(wit_types.Result(void, void), status, &wit_types.alloc);
+        imp.@"exit"(status_s[0]);
     }
     pub fn exitWithCode(status_code: u8) void {
         imp.@"exit-with-code"(@intCast(status_code));
@@ -80,9 +77,9 @@ pub const stdin = struct {
         extern "wasi:cli/stdin@0.3.0" fn @"read-via-stream"(retptr: i32) void;
     };
 
-    pub fn readViaStream() canon.Tuple(.{ canon.Stream(u8), __chan0 }) {
-        imp.@"read-via-stream"(abi.retPtr());
-        return canon.lift(canon.Tuple(.{ canon.Stream(u8), __chan0 }), abi.retArea());
+    pub fn readViaStream() wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }) {
+        imp.@"read-via-stream"(wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }), wit_types.retArea());
     }
 };
 
@@ -91,8 +88,8 @@ pub const stdout = struct {
         extern "wasi:cli/stdout@0.3.0" fn @"write-via-stream"(data: i32) i32;
     };
 
-    pub fn writeViaStream(data: canon.Stream(u8)) __chan1 {
-        return canon.liftResultFlat(__chan1, imp.@"write-via-stream"(data.handle));
+    pub fn writeViaStream(data: wit_types.Stream(u8)) __chan1 {
+        return wit_types.liftResultFlat(__chan1, imp.@"write-via-stream"(data.handle));
     }
 };
 
@@ -101,17 +98,21 @@ pub const stderr = struct {
         extern "wasi:cli/stderr@0.3.0" fn @"write-via-stream"(data: i32) i32;
     };
 
-    pub fn writeViaStream(data: canon.Stream(u8)) __chan2 {
-        return canon.liftResultFlat(__chan2, imp.@"write-via-stream"(data.handle));
+    pub fn writeViaStream(data: wit_types.Stream(u8)) __chan2 {
+        return wit_types.liftResultFlat(__chan2, imp.@"write-via-stream"(data.handle));
     }
 };
 
 pub const terminal_input = struct {
-    const imp = struct {};
+    const imp = struct {
+    };
+
 };
 
 pub const terminal_output = struct {
-    const imp = struct {};
+    const imp = struct {
+    };
+
 };
 
 pub const terminal_stdin = struct {
@@ -120,8 +121,8 @@ pub const terminal_stdin = struct {
     };
 
     pub fn getTerminalStdin() ?TerminalInput {
-        imp.@"get-terminal-stdin"(abi.retPtr());
-        return canon.lift(?TerminalInput, abi.retArea());
+        imp.@"get-terminal-stdin"(wit_types.retPtr());
+        return wit_types.lift(?TerminalInput, wit_types.retArea());
     }
 };
 
@@ -131,8 +132,8 @@ pub const terminal_stdout = struct {
     };
 
     pub fn getTerminalStdout() ?TerminalOutput {
-        imp.@"get-terminal-stdout"(abi.retPtr());
-        return canon.lift(?TerminalOutput, abi.retArea());
+        imp.@"get-terminal-stdout"(wit_types.retPtr());
+        return wit_types.lift(?TerminalOutput, wit_types.retArea());
     }
 };
 
@@ -142,7 +143,8 @@ pub const terminal_stderr = struct {
     };
 
     pub fn getTerminalStderr() ?TerminalOutput {
-        imp.@"get-terminal-stderr"(abi.retPtr());
-        return canon.lift(?TerminalOutput, abi.retArea());
+        imp.@"get-terminal-stderr"(wit_types.retPtr());
+        return wit_types.lift(?TerminalOutput, wit_types.retArea());
     }
 };
+

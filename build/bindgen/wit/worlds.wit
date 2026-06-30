@@ -1,0 +1,43 @@
+// Custom per-package import worlds used to regenerate the `wasi_*_bindings.zig`
+// guest bindings via `wasip3-bindgen`. The `wasi:*@0.3.0` interfaces resolve
+// from the canonical WASI packages embedded in the wabt WIT resolver, so only
+// these thin world wrappers are needed on disk.
+package wasip3:bindings@0.3.0;
+
+world cli-imports {
+  import wasi:cli/environment@0.3.0;
+  import wasi:cli/exit@0.3.0;
+  import wasi:cli/stdin@0.3.0;
+  import wasi:cli/stdout@0.3.0;
+  import wasi:cli/stderr@0.3.0;
+  import wasi:cli/terminal-input@0.3.0;
+  import wasi:cli/terminal-output@0.3.0;
+  import wasi:cli/terminal-stdin@0.3.0;
+  import wasi:cli/terminal-stdout@0.3.0;
+  import wasi:cli/terminal-stderr@0.3.0;
+}
+
+world clocks-imports {
+  import wasi:clocks/monotonic-clock@0.3.0;
+  import wasi:clocks/system-clock@0.3.0;
+}
+
+world random-imports {
+  import wasi:random/random@0.3.0;
+  import wasi:random/insecure@0.3.0;
+  import wasi:random/insecure-seed@0.3.0;
+}
+
+world fs-imports {
+  import wasi:filesystem/types@0.3.0;
+  import wasi:filesystem/preopens@0.3.0;
+}
+
+world sk-imports {
+  import wasi:sockets/types@0.3.0;
+  import wasi:sockets/ip-name-lookup@0.3.0;
+}
+
+world http-imports {
+  import wasi:http/types@0.3.0;
+}

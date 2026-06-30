@@ -3,10 +3,6 @@
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm_async = wit_async;
-
 pub const Instant = struct {
     seconds: i64,
     nanoseconds: u32,
@@ -156,156 +152,158 @@ pub const Descriptor = struct {
         extern "wasi:filesystem/types@0.3.0" fn @"[resource-drop]descriptor"(self: i32) void;
     };
 
-    pub fn readViaStream(self: Descriptor, offset: Filesize) canon.Tuple(.{ canon.Stream(u8), __chan0 }) {
-        imp.@"[method]descriptor.read-via-stream"(self.handle, @bitCast(offset), abi.retPtr());
-        return canon.lift(canon.Tuple(.{ canon.Stream(u8), __chan0 }), abi.retArea());
+    pub fn readViaStream(self: Descriptor, offset: Filesize) wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }) {
+        imp.@"[method]descriptor.read-via-stream"(self.handle, @bitCast(offset), wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }), wit_types.retArea());
     }
-    pub fn writeViaStream(self: Descriptor, data: canon.Stream(u8), offset: Filesize) __chan0 {
-        return canon.liftResultFlat(__chan0, imp.@"[method]descriptor.write-via-stream"(self.handle, data.handle, @bitCast(offset)));
+    pub fn writeViaStream(self: Descriptor, data: wit_types.Stream(u8), offset: Filesize) __chan0 {
+        return wit_types.liftResultFlat(__chan0, imp.@"[method]descriptor.write-via-stream"(self.handle, data.handle, @bitCast(offset)));
     }
-    pub fn appendViaStream(self: Descriptor, data: canon.Stream(u8)) __chan0 {
-        return canon.liftResultFlat(__chan0, imp.@"[method]descriptor.append-via-stream"(self.handle, data.handle));
+    pub fn appendViaStream(self: Descriptor, data: wit_types.Stream(u8)) __chan0 {
+        return wit_types.liftResultFlat(__chan0, imp.@"[method]descriptor.append-via-stream"(self.handle, data.handle));
     }
-    pub fn advise(self: Descriptor, offset: Filesize, length: Filesize, advice: Advice) canon.Result(void, ErrorCode) {
-        const advice_s = canon.lowerFlat(Advice, advice, &abi.alloc);
-        const __status = imp.@"[method]descriptor.advise"(self.handle, @bitCast(offset), @bitCast(length), advice_s[0], abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn advise(self: Descriptor, offset: Filesize, length: Filesize, advice: Advice) wit_types.Result(void, ErrorCode) {
+        const advice_s = wit_types.lowerFlat(Advice, advice, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.advise"(self.handle, @bitCast(offset), @bitCast(length), advice_s[0], wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn syncData(self: Descriptor) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.sync-data"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn syncData(self: Descriptor) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.sync-data"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn getFlags(self: Descriptor) canon.Result(DescriptorFlags, ErrorCode) {
-        const __status = imp.@"[method]descriptor.get-flags"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(DescriptorFlags, ErrorCode), abi.retArea());
+    pub fn getFlags(self: Descriptor) wit_types.Result(DescriptorFlags, ErrorCode) {
+        const __status = imp.@"[method]descriptor.get-flags"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(DescriptorFlags, ErrorCode), wit_types.retArea());
     }
-    pub fn getType(self: Descriptor) canon.Result(DescriptorType, ErrorCode) {
-        const __status = imp.@"[method]descriptor.get-type"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(DescriptorType, ErrorCode), abi.retArea());
+    pub fn getType(self: Descriptor) wit_types.Result(DescriptorType, ErrorCode) {
+        const __status = imp.@"[method]descriptor.get-type"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(DescriptorType, ErrorCode), wit_types.retArea());
     }
-    pub fn setSize(self: Descriptor, size: Filesize) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.set-size"(self.handle, @bitCast(size), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn setSize(self: Descriptor, size: Filesize) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.set-size"(self.handle, @bitCast(size), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn setTimes(self: Descriptor, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) canon.Result(void, ErrorCode) {
+    pub fn setTimes(self: Descriptor, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) wit_types.Result(void, ErrorCode) {
         const __pargs = .{ self, data_access_timestamp, data_modification_timestamp };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.set-times"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.set-times"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn readDirectory(self: Descriptor) canon.Tuple(.{ __chan1, __chan0 }) {
-        imp.@"[method]descriptor.read-directory"(self.handle, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ __chan1, __chan0 }), abi.retArea());
+    pub fn readDirectory(self: Descriptor) wit_types.Tuple(.{ __chan1, __chan0 }) {
+        imp.@"[method]descriptor.read-directory"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ __chan1, __chan0 }), wit_types.retArea());
     }
-    pub fn sync(self: Descriptor) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.sync"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn sync(self: Descriptor) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.sync"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn createDirectoryAt(self: Descriptor, path: []const u8) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.create-directory-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn createDirectoryAt(self: Descriptor, path: []const u8) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.create-directory-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn stat(self: Descriptor) canon.Result(DescriptorStat, ErrorCode) {
-        const __status = imp.@"[method]descriptor.stat"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(DescriptorStat, ErrorCode), abi.retArea());
+    pub fn stat(self: Descriptor) wit_types.Result(DescriptorStat, ErrorCode) {
+        const __status = imp.@"[method]descriptor.stat"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(DescriptorStat, ErrorCode), wit_types.retArea());
     }
-    pub fn statAt(self: Descriptor, path_flags: PathFlags, path: []const u8) canon.Result(DescriptorStat, ErrorCode) {
-        const path_flags_s = canon.lowerFlat(PathFlags, path_flags, &abi.alloc);
-        const __status = imp.@"[method]descriptor.stat-at"(self.handle, path_flags_s[0], @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(DescriptorStat, ErrorCode), abi.retArea());
+    pub fn statAt(self: Descriptor, path_flags: PathFlags, path: []const u8) wit_types.Result(DescriptorStat, ErrorCode) {
+        const path_flags_s = wit_types.lowerFlat(PathFlags, path_flags, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.stat-at"(self.handle, path_flags_s[0], @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(DescriptorStat, ErrorCode), wit_types.retArea());
     }
-    pub fn setTimesAt(self: Descriptor, path_flags: PathFlags, path: []const u8, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) canon.Result(void, ErrorCode) {
+    pub fn setTimesAt(self: Descriptor, path_flags: PathFlags, path: []const u8, data_access_timestamp: NewTimestamp, data_modification_timestamp: NewTimestamp) wit_types.Result(void, ErrorCode) {
         const __pargs = .{ self, path_flags, path, data_access_timestamp, data_modification_timestamp };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.set-times-at"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.set-times-at"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn linkAt(self: Descriptor, old_path_flags: PathFlags, old_path: []const u8, new_descriptor: Descriptor, new_path: []const u8) canon.Result(void, ErrorCode) {
+    pub fn linkAt(self: Descriptor, old_path_flags: PathFlags, old_path: []const u8, new_descriptor: Descriptor, new_path: []const u8) wit_types.Result(void, ErrorCode) {
         const __pargs = .{ self, old_path_flags, old_path, new_descriptor, new_path };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.link-at"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.link-at"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn openAt(self: Descriptor, path_flags: PathFlags, path: []const u8, open_flags: OpenFlags, flags: DescriptorFlags) canon.Result(Descriptor, ErrorCode) {
+    pub fn openAt(self: Descriptor, path_flags: PathFlags, path: []const u8, open_flags: OpenFlags, flags: DescriptorFlags) wit_types.Result(Descriptor, ErrorCode) {
         const __pargs = .{ self, path_flags, path, open_flags, flags };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.open-at"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(Descriptor, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.open-at"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(Descriptor, ErrorCode), wit_types.retArea());
     }
-    pub fn readlinkAt(self: Descriptor, path: []const u8) canon.Result([]const u8, ErrorCode) {
-        const __status = imp.@"[method]descriptor.readlink-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result([]const u8, ErrorCode), abi.retArea());
+    pub fn readlinkAt(self: Descriptor, path: []const u8) wit_types.Result([]const u8, ErrorCode) {
+        const __status = imp.@"[method]descriptor.readlink-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result([]const u8, ErrorCode), wit_types.retArea());
     }
-    pub fn removeDirectoryAt(self: Descriptor, path: []const u8) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.remove-directory-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn removeDirectoryAt(self: Descriptor, path: []const u8) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.remove-directory-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn renameAt(self: Descriptor, old_path: []const u8, new_descriptor: Descriptor, new_path: []const u8) canon.Result(void, ErrorCode) {
+    pub fn renameAt(self: Descriptor, old_path: []const u8, new_descriptor: Descriptor, new_path: []const u8) wit_types.Result(void, ErrorCode) {
         const __pargs = .{ self, old_path, new_descriptor, new_path };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.rename-at"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.rename-at"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn symlinkAt(self: Descriptor, old_path: []const u8, new_path: []const u8) canon.Result(void, ErrorCode) {
+    pub fn symlinkAt(self: Descriptor, old_path: []const u8, new_path: []const u8) wit_types.Result(void, ErrorCode) {
         const __pargs = .{ self, old_path, new_path };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]descriptor.symlink-at"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.symlink-at"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
-    pub fn unlinkFileAt(self: Descriptor, path: []const u8) canon.Result(void, ErrorCode) {
-        const __status = imp.@"[method]descriptor.unlink-file-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, ErrorCode), abi.retArea());
+    pub fn unlinkFileAt(self: Descriptor, path: []const u8) wit_types.Result(void, ErrorCode) {
+        const __status = imp.@"[method]descriptor.unlink-file-at"(self.handle, @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, ErrorCode), wit_types.retArea());
     }
     pub fn isSameObject(self: Descriptor, other: Descriptor) bool {
-        const __status = imp.@"[method]descriptor.is-same-object"(self.handle, other.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(bool, abi.retArea());
+        const __status = imp.@"[method]descriptor.is-same-object"(self.handle, other.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(bool, wit_types.retArea());
     }
-    pub fn metadataHash(self: Descriptor) canon.Result(MetadataHashValue, ErrorCode) {
-        const __status = imp.@"[method]descriptor.metadata-hash"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(MetadataHashValue, ErrorCode), abi.retArea());
+    pub fn metadataHash(self: Descriptor) wit_types.Result(MetadataHashValue, ErrorCode) {
+        const __status = imp.@"[method]descriptor.metadata-hash"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(MetadataHashValue, ErrorCode), wit_types.retArea());
     }
-    pub fn metadataHashAt(self: Descriptor, path_flags: PathFlags, path: []const u8) canon.Result(MetadataHashValue, ErrorCode) {
-        const path_flags_s = canon.lowerFlat(PathFlags, path_flags, &abi.alloc);
-        const __status = imp.@"[method]descriptor.metadata-hash-at"(self.handle, path_flags_s[0], @intCast(@intFromPtr(path.ptr)), @intCast(path.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(MetadataHashValue, ErrorCode), abi.retArea());
+    pub fn metadataHashAt(self: Descriptor, path_flags: PathFlags, path: []const u8) wit_types.Result(MetadataHashValue, ErrorCode) {
+        const path_flags_s = wit_types.lowerFlat(PathFlags, path_flags, &wit_types.alloc);
+        const __status = imp.@"[method]descriptor.metadata-hash-at"(self.handle, path_flags_s[0], @intCast(@intFromPtr(path.ptr)), @intCast(path.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(MetadataHashValue, ErrorCode), wit_types.retArea());
     }
     pub fn deinit(self: Descriptor) void {
         imp.@"[resource-drop]descriptor"(self.handle);
     }
 };
 
-const __chan0 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:filesystem/types@0.3.0#[method]descriptor.read-via-stream#1");
-const __chan1 = canon.StreamOf(DirectoryEntry, "[stream]wasi:filesystem/types@0.3.0#[method]descriptor.read-directory#0");
+const __chan0 = wit_types.FutureOf(wit_types.Result(void, ErrorCode), "[future]wasi:filesystem/types@0.3.0#[method]descriptor.read-via-stream#1");
+const __chan1 = wit_types.StreamOf(DirectoryEntry, "[stream]wasi:filesystem/types@0.3.0#[method]descriptor.read-directory#0");
 
 pub const types = struct {
-    const imp = struct {};
+    const imp = struct {
+    };
+
 };
 
 pub const preopens = struct {
@@ -313,8 +311,9 @@ pub const preopens = struct {
         extern "wasi:filesystem/preopens@0.3.0" fn @"get-directories"(retptr: i32) void;
     };
 
-    pub fn getDirectories() []const canon.Tuple(.{ Descriptor, []const u8 }) {
-        imp.@"get-directories"(abi.retPtr());
-        return canon.lift([]const canon.Tuple(.{ Descriptor, []const u8 }), abi.retArea());
+    pub fn getDirectories() []const wit_types.Tuple(.{ Descriptor, []const u8 }) {
+        imp.@"get-directories"(wit_types.retPtr());
+        return wit_types.lift([]const wit_types.Tuple(.{ Descriptor, []const u8 }), wit_types.retArea());
     }
 };
+

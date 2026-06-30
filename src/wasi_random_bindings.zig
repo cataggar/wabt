@@ -2,9 +2,6 @@
 
 const wit_types = @import("wit_types");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-
 pub const random = struct {
     const imp = struct {
         extern "wasi:random/random@0.3.0" fn @"get-random-bytes"(max_len: i64, retptr: i32) void;
@@ -12,11 +9,11 @@ pub const random = struct {
     };
 
     pub fn getRandomBytes(max_len: u64) []const u8 {
-        imp.@"get-random-bytes"(@bitCast(max_len), abi.retPtr());
-        return canon.lift([]const u8, abi.retArea());
+        imp.@"get-random-bytes"(@bitCast(max_len), wit_types.retPtr());
+        return wit_types.lift([]const u8, wit_types.retArea());
     }
     pub fn getRandomU64() u64 {
-        return canon.liftResultFlat(u64, imp.@"get-random-u64"());
+        return wit_types.liftResultFlat(u64, imp.@"get-random-u64"());
     }
 };
 
@@ -27,11 +24,11 @@ pub const insecure = struct {
     };
 
     pub fn getInsecureRandomBytes(max_len: u64) []const u8 {
-        imp.@"get-insecure-random-bytes"(@bitCast(max_len), abi.retPtr());
-        return canon.lift([]const u8, abi.retArea());
+        imp.@"get-insecure-random-bytes"(@bitCast(max_len), wit_types.retPtr());
+        return wit_types.lift([]const u8, wit_types.retArea());
     }
     pub fn getInsecureRandomU64() u64 {
-        return canon.liftResultFlat(u64, imp.@"get-insecure-random-u64"());
+        return wit_types.liftResultFlat(u64, imp.@"get-insecure-random-u64"());
     }
 };
 
@@ -40,8 +37,9 @@ pub const insecure_seed = struct {
         extern "wasi:random/insecure-seed@0.3.0" fn @"get-insecure-seed"(retptr: i32) void;
     };
 
-    pub fn getInsecureSeed() canon.Tuple(.{ u64, u64 }) {
-        imp.@"get-insecure-seed"(abi.retPtr());
-        return canon.lift(canon.Tuple(.{ u64, u64 }), abi.retArea());
+    pub fn getInsecureSeed() wit_types.Tuple(.{ u64, u64 }) {
+        imp.@"get-insecure-seed"(wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ u64, u64 }), wit_types.retArea());
     }
 };
+

@@ -2,9 +2,6 @@
 
 const wit_types = @import("wit_types");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-
 pub const Duration = u64;
 
 pub const Method = union(enum) {
@@ -121,39 +118,39 @@ pub const Fields = struct {
     pub fn init() Fields {
         return .{ .handle = imp.@"[constructor]fields"() };
     }
-    pub fn fromList(entries: []const canon.Tuple(.{ FieldName, FieldValue })) canon.Result(Fields, HeaderError) {
-        imp.@"[static]fields.from-list"(@intCast(@intFromPtr(entries.ptr)), @intCast(entries.len), abi.retPtr());
-        return canon.lift(canon.Result(Fields, HeaderError), abi.retArea());
+    pub fn fromList(entries: []const wit_types.Tuple(.{ FieldName, FieldValue })) wit_types.Result(Fields, HeaderError) {
+        imp.@"[static]fields.from-list"(@intCast(@intFromPtr(entries.ptr)), @intCast(entries.len), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(Fields, HeaderError), wit_types.retArea());
     }
     pub fn get(self: Fields, name: FieldName) []const FieldValue {
-        imp.@"[method]fields.get"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), abi.retPtr());
-        return canon.lift([]const FieldValue, abi.retArea());
+        imp.@"[method]fields.get"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), wit_types.retPtr());
+        return wit_types.lift([]const FieldValue, wit_types.retArea());
     }
     pub fn has(self: Fields, name: FieldName) bool {
-        return canon.liftResultFlat(bool, imp.@"[method]fields.has"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len)));
+        return wit_types.liftResultFlat(bool, imp.@"[method]fields.has"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len)));
     }
-    pub fn set(self: Fields, name: FieldName, value: []const FieldValue) canon.Result(void, HeaderError) {
-        imp.@"[method]fields.set"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), @intCast(@intFromPtr(value.ptr)), @intCast(value.len), abi.retPtr());
-        return canon.lift(canon.Result(void, HeaderError), abi.retArea());
+    pub fn set(self: Fields, name: FieldName, value: []const FieldValue) wit_types.Result(void, HeaderError) {
+        imp.@"[method]fields.set"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), @intCast(@intFromPtr(value.ptr)), @intCast(value.len), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, HeaderError), wit_types.retArea());
     }
-    pub fn delete(self: Fields, name: FieldName) canon.Result(void, HeaderError) {
-        imp.@"[method]fields.delete"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), abi.retPtr());
-        return canon.lift(canon.Result(void, HeaderError), abi.retArea());
+    pub fn delete(self: Fields, name: FieldName) wit_types.Result(void, HeaderError) {
+        imp.@"[method]fields.delete"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, HeaderError), wit_types.retArea());
     }
-    pub fn getAndDelete(self: Fields, name: FieldName) canon.Result([]const FieldValue, HeaderError) {
-        imp.@"[method]fields.get-and-delete"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), abi.retPtr());
-        return canon.lift(canon.Result([]const FieldValue, HeaderError), abi.retArea());
+    pub fn getAndDelete(self: Fields, name: FieldName) wit_types.Result([]const FieldValue, HeaderError) {
+        imp.@"[method]fields.get-and-delete"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result([]const FieldValue, HeaderError), wit_types.retArea());
     }
-    pub fn append(self: Fields, name: FieldName, value: FieldValue) canon.Result(void, HeaderError) {
-        imp.@"[method]fields.append"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), @intCast(@intFromPtr(value.ptr)), @intCast(value.len), abi.retPtr());
-        return canon.lift(canon.Result(void, HeaderError), abi.retArea());
+    pub fn append(self: Fields, name: FieldName, value: FieldValue) wit_types.Result(void, HeaderError) {
+        imp.@"[method]fields.append"(self.handle, @intCast(@intFromPtr(name.ptr)), @intCast(name.len), @intCast(@intFromPtr(value.ptr)), @intCast(value.len), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, HeaderError), wit_types.retArea());
     }
-    pub fn copyAll(self: Fields) []const canon.Tuple(.{ FieldName, FieldValue }) {
-        imp.@"[method]fields.copy-all"(self.handle, abi.retPtr());
-        return canon.lift([]const canon.Tuple(.{ FieldName, FieldValue }), abi.retArea());
+    pub fn copyAll(self: Fields) []const wit_types.Tuple(.{ FieldName, FieldValue }) {
+        imp.@"[method]fields.copy-all"(self.handle, wit_types.retPtr());
+        return wit_types.lift([]const wit_types.Tuple(.{ FieldName, FieldValue }), wit_types.retArea());
     }
     pub fn clone(self: Fields) Fields {
-        return canon.liftResultFlat(Fields, imp.@"[method]fields.clone"(self.handle));
+        return wit_types.liftResultFlat(Fields, imp.@"[method]fields.clone"(self.handle));
     }
     pub fn deinit(self: Fields) void {
         imp.@"[resource-drop]fields"(self.handle);
@@ -183,60 +180,60 @@ pub const Request = struct {
         extern "wasi:http/types@0.3.0" fn @"[resource-drop]request"(self: i32) void;
     };
 
-    pub fn new(headers: Headers, contents: ?canon.Stream(u8), trailers: __chan0, options: ?RequestOptions) canon.Tuple(.{ Request, __chan1 }) {
+    pub fn new(headers: Headers, contents: ?wit_types.Stream(u8), trailers: __chan0, options: ?RequestOptions) wit_types.Tuple(.{ Request, __chan1 }) {
         const contents_disc: i32 = if (contents != null) 1 else 0;
         const contents_0: i32 = if (contents) |v| v.handle else 0;
         const options_disc: i32 = if (options != null) 1 else 0;
         const options_0: i32 = if (options) |v| v.handle else 0;
-        imp.@"[static]request.new"(headers.handle, contents_disc, contents_0, trailers.handle, options_disc, options_0, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ Request, __chan1 }), abi.retArea());
+        imp.@"[static]request.new"(headers.handle, contents_disc, contents_0, trailers.handle, options_disc, options_0, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ Request, __chan1 }), wit_types.retArea());
     }
     pub fn getMethod(self: Request) Method {
-        imp.@"[method]request.get-method"(self.handle, abi.retPtr());
-        return canon.lift(Method, abi.retArea());
+        imp.@"[method]request.get-method"(self.handle, wit_types.retPtr());
+        return wit_types.lift(Method, wit_types.retArea());
     }
-    pub fn setMethod(self: Request, method: Method) canon.Result(void, void) {
-        const method_s = canon.lowerFlat(Method, method, &abi.alloc);
-        return canon.liftResultFlat(canon.Result(void, void), imp.@"[method]request.set-method"(self.handle, method_s[0], method_s[1], method_s[2]));
+    pub fn setMethod(self: Request, method: Method) wit_types.Result(void, void) {
+        const method_s = wit_types.lowerFlat(Method, method, &wit_types.alloc);
+        return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@"[method]request.set-method"(self.handle, method_s[0], method_s[1], method_s[2]));
     }
     pub fn getPathWithQuery(self: Request) ?[]const u8 {
-        imp.@"[method]request.get-path-with-query"(self.handle, abi.retPtr());
-        return canon.lift(?[]const u8, abi.retArea());
+        imp.@"[method]request.get-path-with-query"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?[]const u8, wit_types.retArea());
     }
-    pub fn setPathWithQuery(self: Request, path_with_query: ?[]const u8) canon.Result(void, void) {
+    pub fn setPathWithQuery(self: Request, path_with_query: ?[]const u8) wit_types.Result(void, void) {
         const path_with_query_disc: i32 = if (path_with_query != null) 1 else 0;
         const path_with_query_ptr: i32 = if (path_with_query) |v| @intCast(@intFromPtr(v.ptr)) else 0;
         const path_with_query_len: i32 = if (path_with_query) |v| @intCast(v.len) else 0;
-        return canon.liftResultFlat(canon.Result(void, void), imp.@"[method]request.set-path-with-query"(self.handle, path_with_query_disc, path_with_query_ptr, path_with_query_len));
+        return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@"[method]request.set-path-with-query"(self.handle, path_with_query_disc, path_with_query_ptr, path_with_query_len));
     }
     pub fn getScheme(self: Request) ?Scheme {
-        imp.@"[method]request.get-scheme"(self.handle, abi.retPtr());
-        return canon.lift(?Scheme, abi.retArea());
+        imp.@"[method]request.get-scheme"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?Scheme, wit_types.retArea());
     }
-    pub fn setScheme(self: Request, scheme: ?Scheme) canon.Result(void, void) {
-        const scheme_s = canon.lowerFlat(?Scheme, scheme, &abi.alloc);
-        return canon.liftResultFlat(canon.Result(void, void), imp.@"[method]request.set-scheme"(self.handle, scheme_s[0], scheme_s[1], scheme_s[2], scheme_s[3]));
+    pub fn setScheme(self: Request, scheme: ?Scheme) wit_types.Result(void, void) {
+        const scheme_s = wit_types.lowerFlat(?Scheme, scheme, &wit_types.alloc);
+        return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@"[method]request.set-scheme"(self.handle, scheme_s[0], scheme_s[1], scheme_s[2], scheme_s[3]));
     }
     pub fn getAuthority(self: Request) ?[]const u8 {
-        imp.@"[method]request.get-authority"(self.handle, abi.retPtr());
-        return canon.lift(?[]const u8, abi.retArea());
+        imp.@"[method]request.get-authority"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?[]const u8, wit_types.retArea());
     }
-    pub fn setAuthority(self: Request, authority: ?[]const u8) canon.Result(void, void) {
+    pub fn setAuthority(self: Request, authority: ?[]const u8) wit_types.Result(void, void) {
         const authority_disc: i32 = if (authority != null) 1 else 0;
         const authority_ptr: i32 = if (authority) |v| @intCast(@intFromPtr(v.ptr)) else 0;
         const authority_len: i32 = if (authority) |v| @intCast(v.len) else 0;
-        return canon.liftResultFlat(canon.Result(void, void), imp.@"[method]request.set-authority"(self.handle, authority_disc, authority_ptr, authority_len));
+        return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@"[method]request.set-authority"(self.handle, authority_disc, authority_ptr, authority_len));
     }
     pub fn getOptions(self: Request) ?RequestOptions {
-        imp.@"[method]request.get-options"(self.handle, abi.retPtr());
-        return canon.lift(?RequestOptions, abi.retArea());
+        imp.@"[method]request.get-options"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?RequestOptions, wit_types.retArea());
     }
     pub fn getHeaders(self: Request) Headers {
-        return canon.liftResultFlat(Headers, imp.@"[method]request.get-headers"(self.handle));
+        return wit_types.liftResultFlat(Headers, imp.@"[method]request.get-headers"(self.handle));
     }
-    pub fn consumeBody(this: Request, res: __chan1) canon.Tuple(.{ canon.Stream(u8), __chan0 }) {
-        imp.@"[static]request.consume-body"(this.handle, res.handle, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ canon.Stream(u8), __chan0 }), abi.retArea());
+    pub fn consumeBody(this: Request, res: __chan1) wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }) {
+        imp.@"[static]request.consume-body"(this.handle, res.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }), wit_types.retArea());
     }
     pub fn deinit(self: Request) void {
         imp.@"[resource-drop]request"(self.handle);
@@ -262,37 +259,37 @@ pub const RequestOptions = struct {
         return .{ .handle = imp.@"[constructor]request-options"() };
     }
     pub fn getConnectTimeout(self: RequestOptions) ?Duration {
-        imp.@"[method]request-options.get-connect-timeout"(self.handle, abi.retPtr());
-        return canon.lift(?Duration, abi.retArea());
+        imp.@"[method]request-options.get-connect-timeout"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?Duration, wit_types.retArea());
     }
-    pub fn setConnectTimeout(self: RequestOptions, duration: ?Duration) canon.Result(void, RequestOptionsError) {
+    pub fn setConnectTimeout(self: RequestOptions, duration: ?Duration) wit_types.Result(void, RequestOptionsError) {
         const duration_disc: i32 = if (duration != null) 1 else 0;
         const duration_0: i64 = if (duration) |v| @bitCast(v) else 0;
-        imp.@"[method]request-options.set-connect-timeout"(self.handle, duration_disc, duration_0, abi.retPtr());
-        return canon.lift(canon.Result(void, RequestOptionsError), abi.retArea());
+        imp.@"[method]request-options.set-connect-timeout"(self.handle, duration_disc, duration_0, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, RequestOptionsError), wit_types.retArea());
     }
     pub fn getFirstByteTimeout(self: RequestOptions) ?Duration {
-        imp.@"[method]request-options.get-first-byte-timeout"(self.handle, abi.retPtr());
-        return canon.lift(?Duration, abi.retArea());
+        imp.@"[method]request-options.get-first-byte-timeout"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?Duration, wit_types.retArea());
     }
-    pub fn setFirstByteTimeout(self: RequestOptions, duration: ?Duration) canon.Result(void, RequestOptionsError) {
+    pub fn setFirstByteTimeout(self: RequestOptions, duration: ?Duration) wit_types.Result(void, RequestOptionsError) {
         const duration_disc: i32 = if (duration != null) 1 else 0;
         const duration_0: i64 = if (duration) |v| @bitCast(v) else 0;
-        imp.@"[method]request-options.set-first-byte-timeout"(self.handle, duration_disc, duration_0, abi.retPtr());
-        return canon.lift(canon.Result(void, RequestOptionsError), abi.retArea());
+        imp.@"[method]request-options.set-first-byte-timeout"(self.handle, duration_disc, duration_0, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, RequestOptionsError), wit_types.retArea());
     }
     pub fn getBetweenBytesTimeout(self: RequestOptions) ?Duration {
-        imp.@"[method]request-options.get-between-bytes-timeout"(self.handle, abi.retPtr());
-        return canon.lift(?Duration, abi.retArea());
+        imp.@"[method]request-options.get-between-bytes-timeout"(self.handle, wit_types.retPtr());
+        return wit_types.lift(?Duration, wit_types.retArea());
     }
-    pub fn setBetweenBytesTimeout(self: RequestOptions, duration: ?Duration) canon.Result(void, RequestOptionsError) {
+    pub fn setBetweenBytesTimeout(self: RequestOptions, duration: ?Duration) wit_types.Result(void, RequestOptionsError) {
         const duration_disc: i32 = if (duration != null) 1 else 0;
         const duration_0: i64 = if (duration) |v| @bitCast(v) else 0;
-        imp.@"[method]request-options.set-between-bytes-timeout"(self.handle, duration_disc, duration_0, abi.retPtr());
-        return canon.lift(canon.Result(void, RequestOptionsError), abi.retArea());
+        imp.@"[method]request-options.set-between-bytes-timeout"(self.handle, duration_disc, duration_0, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, RequestOptionsError), wit_types.retArea());
     }
     pub fn clone(self: RequestOptions) RequestOptions {
-        return canon.liftResultFlat(RequestOptions, imp.@"[method]request-options.clone"(self.handle));
+        return wit_types.liftResultFlat(RequestOptions, imp.@"[method]request-options.clone"(self.handle));
     }
     pub fn deinit(self: RequestOptions) void {
         imp.@"[resource-drop]request-options"(self.handle);
@@ -313,33 +310,36 @@ pub const Response = struct {
         extern "wasi:http/types@0.3.0" fn @"[resource-drop]response"(self: i32) void;
     };
 
-    pub fn new(headers: Headers, contents: ?canon.Stream(u8), trailers: __chan0) canon.Tuple(.{ Response, __chan1 }) {
+    pub fn new(headers: Headers, contents: ?wit_types.Stream(u8), trailers: __chan0) wit_types.Tuple(.{ Response, __chan1 }) {
         const contents_disc: i32 = if (contents != null) 1 else 0;
         const contents_0: i32 = if (contents) |v| v.handle else 0;
-        imp.@"[static]response.new"(headers.handle, contents_disc, contents_0, trailers.handle, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ Response, __chan1 }), abi.retArea());
+        imp.@"[static]response.new"(headers.handle, contents_disc, contents_0, trailers.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ Response, __chan1 }), wit_types.retArea());
     }
     pub fn getStatusCode(self: Response) StatusCode {
-        return canon.liftResultFlat(StatusCode, imp.@"[method]response.get-status-code"(self.handle));
+        return wit_types.liftResultFlat(StatusCode, imp.@"[method]response.get-status-code"(self.handle));
     }
-    pub fn setStatusCode(self: Response, status_code: StatusCode) canon.Result(void, void) {
-        return canon.liftResultFlat(canon.Result(void, void), imp.@"[method]response.set-status-code"(self.handle, @intCast(status_code)));
+    pub fn setStatusCode(self: Response, status_code: StatusCode) wit_types.Result(void, void) {
+        return wit_types.liftResultFlat(wit_types.Result(void, void), imp.@"[method]response.set-status-code"(self.handle, @intCast(status_code)));
     }
     pub fn getHeaders(self: Response) Headers {
-        return canon.liftResultFlat(Headers, imp.@"[method]response.get-headers"(self.handle));
+        return wit_types.liftResultFlat(Headers, imp.@"[method]response.get-headers"(self.handle));
     }
-    pub fn consumeBody(this: Response, res: __chan1) canon.Tuple(.{ canon.Stream(u8), __chan0 }) {
-        imp.@"[static]response.consume-body"(this.handle, res.handle, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ canon.Stream(u8), __chan0 }), abi.retArea());
+    pub fn consumeBody(this: Response, res: __chan1) wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }) {
+        imp.@"[static]response.consume-body"(this.handle, res.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), __chan0 }), wit_types.retArea());
     }
     pub fn deinit(self: Response) void {
         imp.@"[resource-drop]response"(self.handle);
     }
 };
 
-const __chan0 = canon.FutureOf(canon.Result(?Trailers, ErrorCode), "[future]wasi:http/types@0.3.0#[static]request.new#1");
-const __chan1 = canon.FutureOf(canon.Result(void, ErrorCode), "[future]wasi:http/types@0.3.0#[static]request.new#2");
+const __chan0 = wit_types.FutureOf(wit_types.Result(?Trailers, ErrorCode), "[future]wasi:http/types@0.3.0#[static]request.new#1");
+const __chan1 = wit_types.FutureOf(wit_types.Result(void, ErrorCode), "[future]wasi:http/types@0.3.0#[static]request.new#2");
 
 pub const types = struct {
-    const imp = struct {};
+    const imp = struct {
+    };
+
 };
+

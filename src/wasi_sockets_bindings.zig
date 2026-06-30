@@ -3,10 +3,6 @@
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm_async = wit_async;
-
 pub const Duration = u64;
 
 pub const TypesErrorCode = union(enum) {
@@ -32,9 +28,9 @@ pub const IpAddressFamily = enum {
     ipv6,
 };
 
-pub const Ipv4Address = canon.Tuple(.{ u8, u8, u8, u8 });
+pub const Ipv4Address = wit_types.Tuple(.{ u8, u8, u8, u8 });
 
-pub const Ipv6Address = canon.Tuple(.{ u16, u16, u16, u16, u16, u16, u16, u16 });
+pub const Ipv6Address = wit_types.Tuple(.{ u16, u16, u16, u16, u16, u16, u16, u16 });
 
 pub const IpAddress = union(enum) {
     ipv4: Ipv4Address,
@@ -90,108 +86,108 @@ pub const TcpSocket = struct {
         extern "wasi:sockets/types@0.3.0" fn @"[resource-drop]tcp-socket"(self: i32) void;
     };
 
-    pub fn create(address_family: IpAddressFamily) canon.Result(TcpSocket, TypesErrorCode) {
-        const address_family_s = canon.lowerFlat(IpAddressFamily, address_family, &abi.alloc);
-        imp.@"[static]tcp-socket.create"(address_family_s[0], abi.retPtr());
-        return canon.lift(canon.Result(TcpSocket, TypesErrorCode), abi.retArea());
+    pub fn create(address_family: IpAddressFamily) wit_types.Result(TcpSocket, TypesErrorCode) {
+        const address_family_s = wit_types.lowerFlat(IpAddressFamily, address_family, &wit_types.alloc);
+        imp.@"[static]tcp-socket.create"(address_family_s[0], wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(TcpSocket, TypesErrorCode), wit_types.retArea());
     }
-    pub fn bind(self: TcpSocket, local_address: IpSocketAddress) canon.Result(void, TypesErrorCode) {
-        const local_address_s = canon.lowerFlat(IpSocketAddress, local_address, &abi.alloc);
-        imp.@"[method]tcp-socket.bind"(self.handle, local_address_s[0], local_address_s[1], local_address_s[2], local_address_s[3], local_address_s[4], local_address_s[5], local_address_s[6], local_address_s[7], local_address_s[8], local_address_s[9], local_address_s[10], local_address_s[11], abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn bind(self: TcpSocket, local_address: IpSocketAddress) wit_types.Result(void, TypesErrorCode) {
+        const local_address_s = wit_types.lowerFlat(IpSocketAddress, local_address, &wit_types.alloc);
+        imp.@"[method]tcp-socket.bind"(self.handle, local_address_s[0], local_address_s[1], local_address_s[2], local_address_s[3], local_address_s[4], local_address_s[5], local_address_s[6], local_address_s[7], local_address_s[8], local_address_s[9], local_address_s[10], local_address_s[11], wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn connect(self: TcpSocket, remote_address: IpSocketAddress) canon.Result(void, TypesErrorCode) {
+    pub fn connect(self: TcpSocket, remote_address: IpSocketAddress) wit_types.Result(void, TypesErrorCode) {
         const __pargs = .{ self, remote_address };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]tcp-socket.connect"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]tcp-socket.connect"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn listen(self: TcpSocket) canon.Result(__chan0, TypesErrorCode) {
-        imp.@"[method]tcp-socket.listen"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(__chan0, TypesErrorCode), abi.retArea());
+    pub fn listen(self: TcpSocket) wit_types.Result(__chan0, TypesErrorCode) {
+        imp.@"[method]tcp-socket.listen"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(__chan0, TypesErrorCode), wit_types.retArea());
     }
-    pub fn send(self: TcpSocket, data: canon.Stream(u8)) __chan1 {
-        return canon.liftResultFlat(__chan1, imp.@"[method]tcp-socket.send"(self.handle, data.handle));
+    pub fn send(self: TcpSocket, data: wit_types.Stream(u8)) __chan1 {
+        return wit_types.liftResultFlat(__chan1, imp.@"[method]tcp-socket.send"(self.handle, data.handle));
     }
-    pub fn receive(self: TcpSocket) canon.Tuple(.{ canon.Stream(u8), __chan1 }) {
-        imp.@"[method]tcp-socket.receive"(self.handle, abi.retPtr());
-        return canon.lift(canon.Tuple(.{ canon.Stream(u8), __chan1 }), abi.retArea());
+    pub fn receive(self: TcpSocket) wit_types.Tuple(.{ wit_types.Stream(u8), __chan1 }) {
+        imp.@"[method]tcp-socket.receive"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), __chan1 }), wit_types.retArea());
     }
-    pub fn getLocalAddress(self: TcpSocket) canon.Result(IpSocketAddress, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-local-address"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(IpSocketAddress, TypesErrorCode), abi.retArea());
+    pub fn getLocalAddress(self: TcpSocket) wit_types.Result(IpSocketAddress, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-local-address"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(IpSocketAddress, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getRemoteAddress(self: TcpSocket) canon.Result(IpSocketAddress, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-remote-address"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(IpSocketAddress, TypesErrorCode), abi.retArea());
+    pub fn getRemoteAddress(self: TcpSocket) wit_types.Result(IpSocketAddress, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-remote-address"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(IpSocketAddress, TypesErrorCode), wit_types.retArea());
     }
     pub fn getIsListening(self: TcpSocket) bool {
-        return canon.liftResultFlat(bool, imp.@"[method]tcp-socket.get-is-listening"(self.handle));
+        return wit_types.liftResultFlat(bool, imp.@"[method]tcp-socket.get-is-listening"(self.handle));
     }
     pub fn getAddressFamily(self: TcpSocket) IpAddressFamily {
-        return canon.liftResultFlat(IpAddressFamily, imp.@"[method]tcp-socket.get-address-family"(self.handle));
+        return wit_types.liftResultFlat(IpAddressFamily, imp.@"[method]tcp-socket.get-address-family"(self.handle));
     }
-    pub fn setListenBacklogSize(self: TcpSocket, value: u64) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-listen-backlog-size"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setListenBacklogSize(self: TcpSocket, value: u64) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-listen-backlog-size"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getKeepAliveEnabled(self: TcpSocket) canon.Result(bool, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-keep-alive-enabled"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(bool, TypesErrorCode), abi.retArea());
+    pub fn getKeepAliveEnabled(self: TcpSocket) wit_types.Result(bool, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-keep-alive-enabled"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(bool, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setKeepAliveEnabled(self: TcpSocket, value: bool) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-keep-alive-enabled"(self.handle, @as(i32, @intFromBool(value)), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setKeepAliveEnabled(self: TcpSocket, value: bool) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-keep-alive-enabled"(self.handle, @as(i32, @intFromBool(value)), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getKeepAliveIdleTime(self: TcpSocket) canon.Result(Duration, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-keep-alive-idle-time"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(Duration, TypesErrorCode), abi.retArea());
+    pub fn getKeepAliveIdleTime(self: TcpSocket) wit_types.Result(Duration, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-keep-alive-idle-time"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(Duration, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setKeepAliveIdleTime(self: TcpSocket, value: Duration) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-keep-alive-idle-time"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setKeepAliveIdleTime(self: TcpSocket, value: Duration) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-keep-alive-idle-time"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getKeepAliveInterval(self: TcpSocket) canon.Result(Duration, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-keep-alive-interval"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(Duration, TypesErrorCode), abi.retArea());
+    pub fn getKeepAliveInterval(self: TcpSocket) wit_types.Result(Duration, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-keep-alive-interval"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(Duration, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setKeepAliveInterval(self: TcpSocket, value: Duration) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-keep-alive-interval"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setKeepAliveInterval(self: TcpSocket, value: Duration) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-keep-alive-interval"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getKeepAliveCount(self: TcpSocket) canon.Result(u32, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-keep-alive-count"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u32, TypesErrorCode), abi.retArea());
+    pub fn getKeepAliveCount(self: TcpSocket) wit_types.Result(u32, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-keep-alive-count"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u32, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setKeepAliveCount(self: TcpSocket, value: u32) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-keep-alive-count"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setKeepAliveCount(self: TcpSocket, value: u32) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-keep-alive-count"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getHopLimit(self: TcpSocket) canon.Result(u8, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-hop-limit"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u8, TypesErrorCode), abi.retArea());
+    pub fn getHopLimit(self: TcpSocket) wit_types.Result(u8, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-hop-limit"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u8, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setHopLimit(self: TcpSocket, value: u8) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-hop-limit"(self.handle, @intCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setHopLimit(self: TcpSocket, value: u8) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-hop-limit"(self.handle, @intCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getReceiveBufferSize(self: TcpSocket) canon.Result(u64, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-receive-buffer-size"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u64, TypesErrorCode), abi.retArea());
+    pub fn getReceiveBufferSize(self: TcpSocket) wit_types.Result(u64, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-receive-buffer-size"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u64, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setReceiveBufferSize(self: TcpSocket, value: u64) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-receive-buffer-size"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setReceiveBufferSize(self: TcpSocket, value: u64) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-receive-buffer-size"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getSendBufferSize(self: TcpSocket) canon.Result(u64, TypesErrorCode) {
-        imp.@"[method]tcp-socket.get-send-buffer-size"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u64, TypesErrorCode), abi.retArea());
+    pub fn getSendBufferSize(self: TcpSocket) wit_types.Result(u64, TypesErrorCode) {
+        imp.@"[method]tcp-socket.get-send-buffer-size"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u64, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setSendBufferSize(self: TcpSocket, value: u64) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]tcp-socket.set-send-buffer-size"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setSendBufferSize(self: TcpSocket, value: u64) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]tcp-socket.set-send-buffer-size"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
     pub fn deinit(self: TcpSocket) void {
         imp.@"[resource-drop]tcp-socket"(self.handle);
@@ -220,72 +216,72 @@ pub const UdpSocket = struct {
         extern "wasi:sockets/types@0.3.0" fn @"[resource-drop]udp-socket"(self: i32) void;
     };
 
-    pub fn create(address_family: IpAddressFamily) canon.Result(UdpSocket, TypesErrorCode) {
-        const address_family_s = canon.lowerFlat(IpAddressFamily, address_family, &abi.alloc);
-        imp.@"[static]udp-socket.create"(address_family_s[0], abi.retPtr());
-        return canon.lift(canon.Result(UdpSocket, TypesErrorCode), abi.retArea());
+    pub fn create(address_family: IpAddressFamily) wit_types.Result(UdpSocket, TypesErrorCode) {
+        const address_family_s = wit_types.lowerFlat(IpAddressFamily, address_family, &wit_types.alloc);
+        imp.@"[static]udp-socket.create"(address_family_s[0], wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(UdpSocket, TypesErrorCode), wit_types.retArea());
     }
-    pub fn bind(self: UdpSocket, local_address: IpSocketAddress) canon.Result(void, TypesErrorCode) {
-        const local_address_s = canon.lowerFlat(IpSocketAddress, local_address, &abi.alloc);
-        imp.@"[method]udp-socket.bind"(self.handle, local_address_s[0], local_address_s[1], local_address_s[2], local_address_s[3], local_address_s[4], local_address_s[5], local_address_s[6], local_address_s[7], local_address_s[8], local_address_s[9], local_address_s[10], local_address_s[11], abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn bind(self: UdpSocket, local_address: IpSocketAddress) wit_types.Result(void, TypesErrorCode) {
+        const local_address_s = wit_types.lowerFlat(IpSocketAddress, local_address, &wit_types.alloc);
+        imp.@"[method]udp-socket.bind"(self.handle, local_address_s[0], local_address_s[1], local_address_s[2], local_address_s[3], local_address_s[4], local_address_s[5], local_address_s[6], local_address_s[7], local_address_s[8], local_address_s[9], local_address_s[10], local_address_s[11], wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn connect(self: UdpSocket, remote_address: IpSocketAddress) canon.Result(void, TypesErrorCode) {
-        const remote_address_s = canon.lowerFlat(IpSocketAddress, remote_address, &abi.alloc);
-        imp.@"[method]udp-socket.connect"(self.handle, remote_address_s[0], remote_address_s[1], remote_address_s[2], remote_address_s[3], remote_address_s[4], remote_address_s[5], remote_address_s[6], remote_address_s[7], remote_address_s[8], remote_address_s[9], remote_address_s[10], remote_address_s[11], abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn connect(self: UdpSocket, remote_address: IpSocketAddress) wit_types.Result(void, TypesErrorCode) {
+        const remote_address_s = wit_types.lowerFlat(IpSocketAddress, remote_address, &wit_types.alloc);
+        imp.@"[method]udp-socket.connect"(self.handle, remote_address_s[0], remote_address_s[1], remote_address_s[2], remote_address_s[3], remote_address_s[4], remote_address_s[5], remote_address_s[6], remote_address_s[7], remote_address_s[8], remote_address_s[9], remote_address_s[10], remote_address_s[11], wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn disconnect(self: UdpSocket) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]udp-socket.disconnect"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn disconnect(self: UdpSocket) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]udp-socket.disconnect"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn send(self: UdpSocket, data: []const u8, remote_address: ?IpSocketAddress) canon.Result(void, TypesErrorCode) {
+    pub fn send(self: UdpSocket, data: []const u8, remote_address: ?IpSocketAddress) wit_types.Result(void, TypesErrorCode) {
         const __pargs = .{ self, data, remote_address };
-        const __pp = abi.alloc(canon.sizeOf(@TypeOf(__pargs)), canon.alignOf(@TypeOf(__pargs)));
-        canon.lower(@TypeOf(__pargs), __pargs, __pp, &abi.alloc);
-        const __status = imp.@"[method]udp-socket.send"(@intCast(@intFromPtr(__pp)), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));
+        wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);
+        const __status = imp.@"[method]udp-socket.send"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn receive(self: UdpSocket) canon.Result(canon.Tuple(.{ []const u8, IpSocketAddress }), TypesErrorCode) {
-        const __status = imp.@"[method]udp-socket.receive"(self.handle, abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result(canon.Tuple(.{ []const u8, IpSocketAddress }), TypesErrorCode), abi.retArea());
+    pub fn receive(self: UdpSocket) wit_types.Result(wit_types.Tuple(.{ []const u8, IpSocketAddress }), TypesErrorCode) {
+        const __status = imp.@"[method]udp-socket.receive"(self.handle, wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result(wit_types.Tuple(.{ []const u8, IpSocketAddress }), TypesErrorCode), wit_types.retArea());
     }
-    pub fn getLocalAddress(self: UdpSocket) canon.Result(IpSocketAddress, TypesErrorCode) {
-        imp.@"[method]udp-socket.get-local-address"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(IpSocketAddress, TypesErrorCode), abi.retArea());
+    pub fn getLocalAddress(self: UdpSocket) wit_types.Result(IpSocketAddress, TypesErrorCode) {
+        imp.@"[method]udp-socket.get-local-address"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(IpSocketAddress, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getRemoteAddress(self: UdpSocket) canon.Result(IpSocketAddress, TypesErrorCode) {
-        imp.@"[method]udp-socket.get-remote-address"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(IpSocketAddress, TypesErrorCode), abi.retArea());
+    pub fn getRemoteAddress(self: UdpSocket) wit_types.Result(IpSocketAddress, TypesErrorCode) {
+        imp.@"[method]udp-socket.get-remote-address"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(IpSocketAddress, TypesErrorCode), wit_types.retArea());
     }
     pub fn getAddressFamily(self: UdpSocket) IpAddressFamily {
-        return canon.liftResultFlat(IpAddressFamily, imp.@"[method]udp-socket.get-address-family"(self.handle));
+        return wit_types.liftResultFlat(IpAddressFamily, imp.@"[method]udp-socket.get-address-family"(self.handle));
     }
-    pub fn getUnicastHopLimit(self: UdpSocket) canon.Result(u8, TypesErrorCode) {
-        imp.@"[method]udp-socket.get-unicast-hop-limit"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u8, TypesErrorCode), abi.retArea());
+    pub fn getUnicastHopLimit(self: UdpSocket) wit_types.Result(u8, TypesErrorCode) {
+        imp.@"[method]udp-socket.get-unicast-hop-limit"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u8, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setUnicastHopLimit(self: UdpSocket, value: u8) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]udp-socket.set-unicast-hop-limit"(self.handle, @intCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setUnicastHopLimit(self: UdpSocket, value: u8) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]udp-socket.set-unicast-hop-limit"(self.handle, @intCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getReceiveBufferSize(self: UdpSocket) canon.Result(u64, TypesErrorCode) {
-        imp.@"[method]udp-socket.get-receive-buffer-size"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u64, TypesErrorCode), abi.retArea());
+    pub fn getReceiveBufferSize(self: UdpSocket) wit_types.Result(u64, TypesErrorCode) {
+        imp.@"[method]udp-socket.get-receive-buffer-size"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u64, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setReceiveBufferSize(self: UdpSocket, value: u64) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]udp-socket.set-receive-buffer-size"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setReceiveBufferSize(self: UdpSocket, value: u64) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]udp-socket.set-receive-buffer-size"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
-    pub fn getSendBufferSize(self: UdpSocket) canon.Result(u64, TypesErrorCode) {
-        imp.@"[method]udp-socket.get-send-buffer-size"(self.handle, abi.retPtr());
-        return canon.lift(canon.Result(u64, TypesErrorCode), abi.retArea());
+    pub fn getSendBufferSize(self: UdpSocket) wit_types.Result(u64, TypesErrorCode) {
+        imp.@"[method]udp-socket.get-send-buffer-size"(self.handle, wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(u64, TypesErrorCode), wit_types.retArea());
     }
-    pub fn setSendBufferSize(self: UdpSocket, value: u64) canon.Result(void, TypesErrorCode) {
-        imp.@"[method]udp-socket.set-send-buffer-size"(self.handle, @bitCast(value), abi.retPtr());
-        return canon.lift(canon.Result(void, TypesErrorCode), abi.retArea());
+    pub fn setSendBufferSize(self: UdpSocket, value: u64) wit_types.Result(void, TypesErrorCode) {
+        imp.@"[method]udp-socket.set-send-buffer-size"(self.handle, @bitCast(value), wit_types.retPtr());
+        return wit_types.lift(wit_types.Result(void, TypesErrorCode), wit_types.retArea());
     }
     pub fn deinit(self: UdpSocket) void {
         imp.@"[resource-drop]udp-socket"(self.handle);
@@ -301,11 +297,13 @@ pub const IpNameLookupErrorCode = union(enum) {
     other: ?[]const u8,
 };
 
-const __chan0 = canon.StreamOf(TcpSocket, "[stream]wasi:sockets/types@0.3.0#[method]tcp-socket.listen#0");
-const __chan1 = canon.FutureOf(canon.Result(void, TypesErrorCode), "[future]wasi:sockets/types@0.3.0#[method]tcp-socket.send#1");
+const __chan0 = wit_types.StreamOf(TcpSocket, "[stream]wasi:sockets/types@0.3.0#[method]tcp-socket.listen#0");
+const __chan1 = wit_types.FutureOf(wit_types.Result(void, TypesErrorCode), "[future]wasi:sockets/types@0.3.0#[method]tcp-socket.send#1");
 
 pub const types = struct {
-    const imp = struct {};
+    const imp = struct {
+    };
+
 };
 
 pub const ip_name_lookup = struct {
@@ -313,9 +311,10 @@ pub const ip_name_lookup = struct {
         extern "wasi:sockets/ip-name-lookup@0.3.0" fn @"resolve-addresses"(name_ptr: i32, name_len: i32, result_ptr: i32) i32;
     };
 
-    pub fn resolveAddresses(name: []const u8) canon.Result([]const IpAddress, IpNameLookupErrorCode) {
-        const __status = imp.@"resolve-addresses"(@intCast(@intFromPtr(name.ptr)), @intCast(name.len), abi.retPtr());
-        cm_async.awaitCall(__status);
-        return canon.lift(canon.Result([]const IpAddress, IpNameLookupErrorCode), abi.retArea());
+    pub fn resolveAddresses(name: []const u8) wit_types.Result([]const IpAddress, IpNameLookupErrorCode) {
+        const __status = imp.@"resolve-addresses"(@intCast(@intFromPtr(name.ptr)), @intCast(name.len), wit_types.retPtr());
+        wit_async.awaitCall(__status);
+        return wit_types.lift(wit_types.Result([]const IpAddress, IpNameLookupErrorCode), wit_types.retArea());
     }
 };
+

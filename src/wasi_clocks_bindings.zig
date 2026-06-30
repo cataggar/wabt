@@ -3,10 +3,6 @@
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm_async = wit_async;
-
 pub const Duration = u64;
 
 pub const Mark = u64;
@@ -18,39 +14,40 @@ pub const Instant = struct {
 
 pub const monotonic_clock = struct {
     const imp = struct {
-        extern "wasi:clocks/monotonic-clock@0.3.0" fn now() i64;
+        extern "wasi:clocks/monotonic-clock@0.3.0" fn @"now"() i64;
         extern "wasi:clocks/monotonic-clock@0.3.0" fn @"get-resolution"() i64;
         extern "wasi:clocks/monotonic-clock@0.3.0" fn @"wait-until"(when: i64) i32;
         extern "wasi:clocks/monotonic-clock@0.3.0" fn @"wait-for"(how_long: i64) i32;
     };
 
     pub fn now() Mark {
-        return canon.liftResultFlat(Mark, imp.now());
+        return wit_types.liftResultFlat(Mark, imp.@"now"());
     }
     pub fn getResolution() Duration {
-        return canon.liftResultFlat(Duration, imp.@"get-resolution"());
+        return wit_types.liftResultFlat(Duration, imp.@"get-resolution"());
     }
     pub fn waitUntil(when: Mark) void {
         const __status = imp.@"wait-until"(@bitCast(when));
-        cm_async.awaitCall(__status);
+        wit_async.awaitCall(__status);
     }
     pub fn waitFor(how_long: Duration) void {
         const __status = imp.@"wait-for"(@bitCast(how_long));
-        cm_async.awaitCall(__status);
+        wit_async.awaitCall(__status);
     }
 };
 
 pub const system_clock = struct {
     const imp = struct {
-        extern "wasi:clocks/system-clock@0.3.0" fn now(retptr: i32) void;
+        extern "wasi:clocks/system-clock@0.3.0" fn @"now"(retptr: i32) void;
         extern "wasi:clocks/system-clock@0.3.0" fn @"get-resolution"() i64;
     };
 
     pub fn now() Instant {
-        imp.now(abi.retPtr());
-        return canon.lift(Instant, abi.retArea());
+        imp.@"now"(wit_types.retPtr());
+        return wit_types.lift(Instant, wit_types.retArea());
     }
     pub fn getResolution() Duration {
-        return canon.liftResultFlat(Duration, imp.@"get-resolution"());
+        return wit_types.liftResultFlat(Duration, imp.@"get-resolution"());
     }
 };
+
