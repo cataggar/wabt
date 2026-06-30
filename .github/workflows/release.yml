@@ -1,0 +1,90 @@
+# Publishes a release for the example/petstore branch when a
+# `petstore-*` tag is pushed (e.g. petstore-0.1.0). This is a secondary release for the
+# repo, so it is always marked as a pre-release.
+
+on:
+  push:
+    tags:
+      - 'petstore-*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing petstore-* tag to release (e.g. petstore-0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish petstore.wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.inputs.tag }}
+
+      - name: Resolve tag and version
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#petstore-}" >> "$GITHUB_OUTPUT"
+
+      - name: Install zig and wabt
+        uses: cataggar/ghr/actions/install@v0.6.0
+        with:
+          tools: |
+            cataggar/zig@v0.16.0
+            RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/wabt@v3.0.0-dev.19
+            RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
+
+      - name: Build release components
+        run: zig build
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          cp zig-out/petstore.wasm petstore.wasm
+          cp zig-out/petstore-test.wasm petstore-test.wasm
+
+      - name: Sign with minisign
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ghr minisign sign petstore.wasm -t "timestamp:$(date +%s) file:petstore.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
+          ghr minisign sign petstore-test.wasm -t "timestamp:$(date +%s) file:petstore-test.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
+          test -f petstore.wasm.minisig
+          test -f petstore-test.wasm.minisig
+
+      - name: Create release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: petstore ${{ steps.meta.outputs.version }}
+          body: |
+            A `wasi:http` service with in-memory storage, built with Zig and WASI P3.
+
+            Installable with [ghr](https://github.com/cataggar/ghr):
+
+            ```
+            ghr install cataggar/wabt@${{ steps.meta.outputs.tag }}
+            RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
+            ```
+          files: |
+            petstore.wasm
+            petstore.wasm.ghr
+            petstore.wasm.minisig
+            petstore-test.wasm
+            petstore-test.wasm.ghr
+            petstore-test.wasm.minisig
+          draft: false
+          prerelease: true
