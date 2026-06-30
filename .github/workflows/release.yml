@@ -61,8 +61,10 @@ jobs:
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: |
           set -euo pipefail
-          ghr minisign sign petstore-serve.wasm -t "timestamp:$(date +%s) file:petstore-serve.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}" && test -f petstore-serve.wasm.minisig
-          ghr minisign sign petstore-test.wasm -t "timestamp:$(date +%s) file:petstore-test.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}" && test -f petstore-test.wasm.minisig
+          ghr minisign sign petstore-serve.wasm -t "timestamp:$(date +%s) file:petstore-serve.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
+          ghr minisign sign petstore-test.wasm -t "timestamp:$(date +%s) file:petstore-test.wasm commit:${GITHUB_SHA} tag:${{ steps.meta.outputs.tag }}"
+          test -f petstore-test.wasm.minisig
+          test -f petstore-serve.wasm.minisig
 
       - name: Create release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
