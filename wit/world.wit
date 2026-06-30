@@ -12,6 +12,27 @@ world storage {
     export store;
 }
 
+// A demo CLI client that walks every petstore endpoint in order. It makes
+// outgoing requests through the imported `wasi:http/client` (the host's
+// outgoing HTTP client) and prints a transcript to stdout.
+world client {
+    import wasi:http/types@0.3.0;
+    import wasi:http/client@0.3.0;
+    import wasi:cli/stdout@0.3.0;
+    import wasi:cli/stderr@0.3.0;
+    import wasi:cli/environment@0.3.0;
+    import wasi:cli/exit@0.3.0;
+    export wasi:cli/run@0.3.0;
+}
+
+// Import-only world used to generate the outgoing HTTP client bindings
+// (the `wasi:http/types` resources). The `wasi:http/client#send` call itself
+// is declared directly in `src/client.zig` as a one-line `extern`, so this
+// world stays types-only and the generated bindings need no async helper.
+world http-client {
+    import wasi:http/types@0.3.0;
+}
+
 /// A data storage interface.
 interface store {
     record pet {

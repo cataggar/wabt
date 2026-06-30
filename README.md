@@ -1,7 +1,8 @@
 # example/http — PetStore (composed)
 
-A `wasi:http@0.3.0` **service** written in Zig that implements the
-[TypeSpec petstore sample](https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp),
+A `wasi:http@0.3.0` **service** written in Zig and is based on the
+[petstore TypeSpec](https://github.com/microsoft/typespec/blob/main/packages/samples/specs/petstore/petstore.tsp).
+
 split into **two components linked with `wabt component compose`**:
 
 - a **frontend** that exports the async `wasi:http/handler@0.3.0#handle`, parses
@@ -99,12 +100,10 @@ corrupt each other.
 ## Build and serve
 
 ```sh
-git clone --branch example/http --single-branch https://github.com/cataggar/wabt.git petstore
-cd petstore
+git clone --branch example/http --single-branch https://github.com/cataggar/wabt.git example-http
+cd example-http
 zig build                 # builds both components + composes -> zig-out/petstore.wasm
 zig build serve           # wasmtime serve on 127.0.0.1:8080 (default)
-zig build bindgen         # write the generated store bindings to zig-out/generated/
-zig build check           # analyze the guest modules (used by ZLS); no install
 ```
 
 ### Editor / ZLS

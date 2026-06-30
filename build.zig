@@ -33,4 +33,44 @@ pub fn build(b: *std.Build) void {
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     _ = wasip3.wasmtimeServe(b, .{ .wasm = petstore, .description = "Serve with wasmtime" });
+
+    // ── demo client (a `wasi:cli` command that walks every endpoint) ──
+    // Generate the outgoing HTTP client bindings (`wasi:http/types` resources +
+    // the async `wasi:http/handler#handle` call) from the import-only world.
+    const client_bindings = wasip3.bindgen(b, dep, .{ .world = "http-client", .impl = "root" });
+    const bindgen_client = b.step("bindgen-client", "Write generated http-client bindings");
+    bindgen_client.dependOn(&b.addInstallFileWithDir(client_bindings, .prefix, "generated/http_client.zig").step);
+
+    // The generated bindings only need `wit_types`; the async `send` call and
+    // its `awaitCall` driver live directly in `src/client.zig` (via wasip3's
+    // `wit_async`), so the client source imports those wasip3 modules directly.
+    const client_imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_cli", "wit_types", "wit_async" }, &.{
+        .{ .name = "http_client", .path = client_bindings, .deps = &.{"wit_types"}, .root_dep = true },
+    });
+    const client_core = wasip3.zigBuildWasm(b, .{
+        .source = b.path("src/client.zig"),
+        .output = "client.core.wasm",
+        .imports = client_imports,
+    });
+    const client = wasip3.wabtComponentNew(b, .{ .wasm_core = client_core, .world = "client" });
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(client, .prefix, "client.wasm").step);
+
+    // `zig build run-client [-- 127.0.0.1:8080]` — needs the P3 async features
+    // plus the outgoing `wasi:http` and `wasi:cli` host support.
+    const run_cmd = b.addSystemCommand(&.{ wasip3.wasmtimeBin(b), "run" });
+    for ([_][]const u8{
+        "component-model-async",
+        "component-model-async-stackful",
+        "component-model-more-async-builtins",
+        "component-model-error-context",
+    }) |f| {
+        run_cmd.addArg("-W");
+        run_cmd.addArg(f);
+    }
+    run_cmd.addArg("-S");
+    run_cmd.addArg("p3,http,cli");
+    run_cmd.addFileArg(client);
+    if (b.args) |forwarded| run_cmd.addArgs(forwarded);
+    const run_client = b.step("run-client", "Run the demo client that walks every endpoint");
+    run_client.dependOn(&run_cmd.step);
 }
