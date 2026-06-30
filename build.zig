@@ -27,9 +27,9 @@ pub fn build(b: *std.Build) void {
     const petstore = wasip3.wabtComponentCompose(b, .{
         .consumer = web,
         .dependencies = &.{store},
-        .output = "petstore.wasm",
+        .output = "petstore-serve.wasm",
     });
-    b.getInstallStep().dependOn(&b.addInstallFileWithDir(petstore, .prefix, "petstore.wasm").step);
+    b.getInstallStep().dependOn(&b.addInstallFileWithDir(petstore, .prefix, "petstore-serve.wasm").step);
 
     // `zig build serve [-- --addr 127.0.0.1:8080]`
     _ = wasip3.wasmtimeServe(b, .{ .wasm = petstore, .description = "Serve with wasmtime" });
@@ -47,7 +47,7 @@ pub fn build(b: *std.Build) void {
     const client = wasip3.wabtComponentNew(b, .{ .wasm_core = client_core, .world = "client" });
     b.getInstallStep().dependOn(&b.addInstallFileWithDir(client, .prefix, "petstore-test.wasm").step);
 
-    // `zig build client [-- 127.0.0.1:8080]` — needs the P3 async features
+    // `zig build test [-- 127.0.0.1:8080]` — needs the P3 async features
     // plus the outgoing `wasi:http` and `wasi:cli` host support.
     const run_cmd = b.addSystemCommand(&.{ wasip3.wasmtimeBin(b), "run" });
     for ([_][]const u8{
@@ -63,6 +63,6 @@ pub fn build(b: *std.Build) void {
     run_cmd.addArg("p3,http,cli");
     run_cmd.addFileArg(client);
     if (b.args) |forwarded| run_cmd.addArgs(forwarded);
-    const run_client = b.step("client", "Run the demo client that walks every endpoint");
-    run_client.dependOn(&run_cmd.step);
+    const run_test = b.step("test", "Run the petstore integration test");
+    run_test.dependOn(&run_cmd.step);
 }

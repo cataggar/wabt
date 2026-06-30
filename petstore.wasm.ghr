@@ -1,8 +1,0 @@
-.{
-    .version = 1,
-    .runtime = "wasmtime",
-    .runtimeArgs = .{
-        "serve",
-        "-S", "cli-exit-with-code",
-    },
-}
