@@ -25,16 +25,12 @@ const b = @import("wasi_sockets_bindings");
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm = wit_async;
-
 const ByteStream = wit_types.Stream(u8);
 // The send/receive completion `future<result<_, error-code>>`, recovered by
 // reflection on the generated `tcp-socket.send` signature (its return type).
 const SendFut = @typeInfo(@TypeOf(b.TcpSocket.send)).@"fn".return_type.?;
 // The accept stream `stream<tcp-socket>` returned by `tcp-socket.listen`,
-// recovered from the `.ok` arm of its `canon.Result(stream, error-code)` return.
+// recovered from the `.ok` arm of its `wit_types.Result(stream, error-code)` return.
 const ListenRet = @typeInfo(@TypeOf(b.TcpSocket.listen)).@"fn".return_type.?;
 const AcceptStream = @typeInfo(ListenRet).@"union".fields[0].type;
 
@@ -61,7 +57,7 @@ pub const LookupErrorCode = b.IpNameLookupErrorCode;
 /// Resolve a host name (or a literal IP-address string, parsed without any
 /// external request) to a list of IP addresses. The result list borrows the
 /// scratch arena; copy out to retain. Never succeeds with zero results.
-pub fn resolveAddresses(name: []const u8) canon.Result([]const IpAddress, LookupErrorCode) {
+pub fn resolveAddresses(name: []const u8) wit_types.Result([]const IpAddress, LookupErrorCode) {
     return b.ip_name_lookup.resolveAddresses(name);
 }
 
@@ -84,10 +80,10 @@ pub fn familyOf(addr: IpSocketAddress) IpAddressFamily {
 
 /// Block on `waitable` until it makes progress; returns the event payload.
 fn waitCode(waitable: i32) u32 {
-    const set = cm.WaitableSet.create();
+    const set = wit_async.WaitableSet.create();
     set.add(waitable);
     _ = set.waitOne();
-    const code: u32 = abi.retWords()[1];
+    const code: u32 = wit_types.abi.retWords()[1];
     set.drop();
     return code;
 }
@@ -157,7 +153,7 @@ pub const TcpStream = struct {
 
 /// Open a TCP connection to `remote` (creating + connecting a socket of the
 /// matching address family). `connect` is async; it blocks until established.
-pub fn connect(remote: IpSocketAddress) canon.Result(TcpStream, ErrorCode) {
+pub fn connect(remote: IpSocketAddress) wit_types.Result(TcpStream, ErrorCode) {
     const sock = switch (TcpSocket.create(familyOf(remote))) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
@@ -200,7 +196,7 @@ pub const TcpListener = struct {
 
 /// Bind + listen on `local`; the returned listener's `accept` yields inbound
 /// `TcpStream`s.
-pub fn listen(local: IpSocketAddress) canon.Result(TcpListener, ErrorCode) {
+pub fn listen(local: IpSocketAddress) wit_types.Result(TcpListener, ErrorCode) {
     const sock = switch (TcpSocket.create(familyOf(local))) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
@@ -226,7 +222,7 @@ pub fn listen(local: IpSocketAddress) canon.Result(TcpListener, ErrorCode) {
 
 /// Create + `connect` a UDP socket to `remote` (so `udpSend`/`udpRecv` use it as
 /// the default peer).
-pub fn udpConnect(remote: IpSocketAddress) canon.Result(UdpSocket, ErrorCode) {
+pub fn udpConnect(remote: IpSocketAddress) wit_types.Result(UdpSocket, ErrorCode) {
     const sock = switch (UdpSocket.create(familyOf(remote))) {
         .ok => |s| s,
         .err => |e| return .{ .err = e },
@@ -242,12 +238,12 @@ pub fn udpConnect(remote: IpSocketAddress) canon.Result(UdpSocket, ErrorCode) {
 }
 
 /// Send a UDP datagram (`remote` = null uses the connected peer). Async.
-pub fn udpSend(sock: UdpSocket, bytes: []const u8, remote: ?IpSocketAddress) canon.Result(void, ErrorCode) {
+pub fn udpSend(sock: UdpSocket, bytes: []const u8, remote: ?IpSocketAddress) wit_types.Result(void, ErrorCode) {
     return sock.send(bytes, remote);
 }
 
 /// Receive a UDP datagram: the payload (borrows the scratch arena) + the sender
 /// address. Async.
-pub fn udpRecv(sock: UdpSocket) canon.Result(canon.Tuple(.{ []const u8, IpSocketAddress }), ErrorCode) {
+pub fn udpRecv(sock: UdpSocket) wit_types.Result(wit_types.Tuple(.{ []const u8, IpSocketAddress }), ErrorCode) {
     return sock.receive();
 }

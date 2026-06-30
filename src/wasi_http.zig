@@ -39,10 +39,6 @@ const b = @import("wasi_http_bindings");
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm = wit_async;
-
 // The private body/trailers future channel types, recovered by reflection on
 // the generated client signatures (the same trick the petstore example uses):
 // `consume-body`'s `res` param and `response.new`'s `trailers` param.
@@ -137,10 +133,10 @@ pub fn writeJson(res: *Responder, value: anytype) void {
 /// Block on `waitable` until it makes progress; returns the event payload
 /// (`waitable-set.wait` writes `[waitable, payload]` to the ret-area).
 fn waitCode(waitable: i32) u32 {
-    const set = cm.WaitableSet.create();
+    const set = wit_async.WaitableSet.create();
     set.add(waitable);
     _ = set.waitOne();
-    const code: u32 = abi.retWords()[1];
+    const code: u32 = wit_types.abi.retWords()[1];
     set.drop();
     return code;
 }
@@ -246,7 +242,7 @@ pub const body_capacity = 64 * 1024;
 pub fn handler(comptime impl: fn (req: *const Request, res: *Responder) void) void {
     const Wrapper = struct {
         fn handle(request: i32) callconv(.c) void {
-            abi.resetScratch();
+            wit_types.abi.resetScratch();
             var path_buf: [path_capacity]u8 = undefined;
             var body_buf: [request_body_capacity]u8 = undefined;
             var resp_buf: [body_capacity]u8 = undefined;

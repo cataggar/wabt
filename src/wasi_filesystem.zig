@@ -27,10 +27,6 @@ const b = @import("wasi_filesystem_bindings");
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm = wit_async;
-
 const ByteStream = wit_types.Stream(u8);
 
 /// Canonical `stream`/`future` status: blocked (operation pending).
@@ -48,16 +44,16 @@ pub const Filesize = b.Filesize;
 pub const DirectoryEntry = b.DirectoryEntry;
 
 /// A preopened directory paired with its name.
-pub const Preopen = canon.Tuple(.{ Descriptor, []const u8 });
+pub const Preopen = wit_types.Tuple(.{ Descriptor, []const u8 });
 
 // ── async helpers (drive the generated stream/future channels) ──────
 
 /// Block on `waitable` until it makes progress; returns the event payload.
 fn waitCode(waitable: i32) u32 {
-    const set = cm.WaitableSet.create();
+    const set = wit_async.WaitableSet.create();
     set.add(waitable);
     _ = set.waitOne();
-    const code: u32 = abi.retWords()[1];
+    const code: u32 = wit_types.abi.retWords()[1];
     set.drop();
     return code;
 }
@@ -124,11 +120,11 @@ pub fn writeAll(file: Descriptor, offset: Filesize, bytes: []const u8) void {
 // ── open conveniences ───────────────────────────────────────────────
 
 /// Open `path` (relative to `dir`) read-only, following symlinks.
-pub fn openRead(dir: Descriptor, path: []const u8) canon.Result(Descriptor, ErrorCode) {
+pub fn openRead(dir: Descriptor, path: []const u8) wit_types.Result(Descriptor, ErrorCode) {
     return dir.openAt(.{ .symlink_follow = true }, path, .{}, .{ .read = true });
 }
 
 /// Open (creating + truncating) `path` (relative to `dir`) for writing.
-pub fn createWrite(dir: Descriptor, path: []const u8) canon.Result(Descriptor, ErrorCode) {
+pub fn createWrite(dir: Descriptor, path: []const u8) wit_types.Result(Descriptor, ErrorCode) {
     return dir.openAt(.{ .symlink_follow = true }, path, .{ .create = true, .truncate = true }, .{ .write = true });
 }

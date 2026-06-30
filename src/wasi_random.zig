@@ -18,10 +18,8 @@
 const b = @import("wasi_random_bindings");
 const wit_types = @import("wit_types");
 
-const canon = wit_types;
-
 /// A 128-bit seed value as `{ a, b }`.
-pub const Seed = canon.Tuple(.{ u64, u64 });
+pub const Seed = wit_types.Tuple(.{ u64, u64 });
 
 // ── secure random ───────────────────────────────────────────────────
 

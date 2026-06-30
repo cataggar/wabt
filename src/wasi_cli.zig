@@ -25,10 +25,6 @@ const b = @import("wasi_cli_bindings");
 const wit_types = @import("wit_types");
 const wit_async = @import("wit_async");
 
-const canon = wit_types;
-const abi = wit_types.abi;
-const cm = wit_async;
-
 const ByteStream = wit_types.Stream(u8);
 
 /// Canonical `stream`/`future` status: blocked (operation pending).
@@ -44,10 +40,10 @@ pub const TerminalOutput = b.TerminalOutput;
 /// Block on `waitable` until it makes progress; returns the event payload
 /// (`waitable-set.wait` writes `[waitable, payload]` to the ret-area).
 fn waitCode(waitable: i32) u32 {
-    const set = cm.WaitableSet.create();
+    const set = wit_async.WaitableSet.create();
     set.add(waitable);
     _ = set.waitOne();
-    const code: u32 = abi.retWords()[1];
+    const code: u32 = wit_types.abi.retWords()[1];
     set.drop();
     return code;
 }
@@ -137,7 +133,7 @@ pub fn arguments() []const []const u8 {
 
 /// The POSIX-style environment as `(name, value)` pairs (borrows the scratch
 /// arena; copy out to retain).
-pub fn environment() []const canon.Tuple(.{ []const u8, []const u8 }) {
+pub fn environment() []const wit_types.Tuple(.{ []const u8, []const u8 }) {
     return b.environment.getEnvironment();
 }
 
@@ -193,7 +189,7 @@ const run_task = struct {
 pub fn run(comptime impl: fn () u8) void {
     const Wrapper = struct {
         fn run() callconv(.c) void {
-            abi.resetScratch();
+            wit_types.abi.resetScratch();
             const code = impl();
             if (code == 0) {
                 run_task.@"task-return"(0);
