@@ -51,6 +51,9 @@ jobs:
           set -euo pipefail
           cp zig-out/petstore.wasm petstore.wasm
           cp zig-out/petstore-test.wasm petstore-test.wasm
+          # .ghr manifest files are already in repo, verify they exist
+          test -f petstore.wasm.ghr
+          test -f petstore-test.wasm.ghr
 
       - name: Sign with minisign
         env:
