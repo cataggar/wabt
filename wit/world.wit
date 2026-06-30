@@ -25,14 +25,6 @@ world client {
     export wasi:cli/run@0.3.0;
 }
 
-// Import-only world used to generate the outgoing HTTP client bindings
-// (the `wasi:http/types` resources). The `wasi:http/client#send` call itself
-// is declared directly in `src/client.zig` as a one-line `extern`, so this
-// world stays types-only and the generated bindings need no async helper.
-world http-client {
-    import wasi:http/types@0.3.0;
-}
-
 /// A data storage interface.
 interface store {
     record pet {

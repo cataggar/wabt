@@ -35,18 +35,10 @@ pub fn build(b: *std.Build) void {
     _ = wasip3.wasmtimeServe(b, .{ .wasm = petstore, .description = "Serve with wasmtime" });
 
     // ── demo client (a `wasi:cli` command that walks every endpoint) ──
-    // Generate the outgoing HTTP client bindings (`wasi:http/types` resources +
-    // the async `wasi:http/handler#handle` call) from the import-only world.
-    const client_bindings = wasip3.bindgen(b, dep, .{ .world = "http-client", .impl = "root" });
-    const bindgen_client = b.step("bindgen-client", "Write generated http-client bindings");
-    bindgen_client.dependOn(&b.addInstallFileWithDir(client_bindings, .prefix, "generated/http_client.zig").step);
-
-    // The generated bindings only need `wit_types`; the async `send` call and
-    // its `awaitCall` driver live directly in `src/client.zig` (via wasip3's
-    // `wit_async`), so the client source imports those wasip3 modules directly.
-    const client_imports = wasip3.resolveWasmImportsWith(b, dep, &.{ "wasi_cli", "wit_types", "wit_async" }, &.{
-        .{ .name = "http_client", .path = client_bindings, .deps = &.{"wit_types"}, .root_dep = true },
-    });
+    // The outgoing-HTTP driver lives in wasip3's `wasi_http_client` (over the
+    // generated `wasi:http/types` resources), so the client source just imports
+    // `wasi_cli` + `wasi_http_client` — no per-package bindgen needed here.
+    const client_imports = wasip3.resolveWasmImports(b, dep, &.{ "wasi_cli", "wasi_http_client" });
     const client_core = wasip3.zigBuildWasm(b, .{
         .source = b.path("src/client.zig"),
         .output = "client.core.wasm",
