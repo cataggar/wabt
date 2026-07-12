@@ -1368,21 +1368,23 @@ fn assemble(in: Inputs) ![]u8 {
         break :blk try b.addCoreInstance(.{ .exports = exps });
     };
 
-    // The adapter imports `__main_module__.<entry>` for whatever the
-    // main module exports as its entry point. zig-hello / Rust's
-    // wasip1 builds export `_start`. Pass through every export the
-    // embed has of name we can find — but in practice this is the
-    // single `_start` symbol. If your embed uses a different name,
-    // expose all exports we can recognize; the adapter ignores
-    // anything it doesn't import.
-    //
-    // Reactor adapters have no `__main_module__.<x>` imports — they
-    // wrap long-lived embeds whose entry points come from the
-    // wrapping component's lifted exports, not `_start`. Skip the
-    // entire `__main_module__` plumbing in that case; assert the
-    // adapter has no such imports to surface a clean error if our
-    // shape detector misclassified.
-    const main_module_inst: ?u32 = if (in.shape == .command) blk: {
+    // The standard wasmtime preview1 adapters import `__main_module__.<f>` for
+    // functions they need from the embed: command adapters import the entry
+    // point (`_start`), and *both* command and reactor adapters import
+    // `__main_module__.cabi_realloc` so the adapter can allocate lists/strings in
+    // the guest's memory while translating preview1<->preview2. Wire every such
+    // import to the embed's matching export (or a generated fallback module for
+    // anything the embed lacks). Adapters with no `__main_module__` imports skip
+    // this plumbing entirely. Gating on the import set (not the command/reactor
+    // shape) is required for the reactor adapter — see cataggar/wabt#327.
+    var has_main_module_imports = false;
+    for (in.adapter_iface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, "__main_module__")) {
+            has_main_module_imports = true;
+            break;
+        }
+    }
+    const main_module_inst: ?u32 = if (has_main_module_imports) blk: {
         // Mirror the wasm-tools reference: alias every __main_module__
         // import the adapter requires. If the embed has a matching
         // export, alias the embed. Otherwise alias the fallback module.
@@ -1432,14 +1434,7 @@ fn assemble(in: Inputs) ![]u8 {
             });
         }
         break :blk try b.addCoreInstance(.{ .exports = try exps.toOwnedSlice(a) });
-    } else blk: {
-        for (in.adapter_iface.imports) |im| {
-            if (std.mem.eql(u8, im.module_name, "__main_module__")) {
-                return error.UnsupportedAdapterShape;
-            }
-        }
-        break :blk null;
-    };
+    } else null;
 
     // ── Step 7b: instantiate each secondary core module ──────────────
     // Secondaries are bare-shim host modules: they import only
@@ -3200,14 +3195,16 @@ test "spliceMany: end-to-end on reactor primary + bare secondary adapter pair" {
     try testing.expectEqual(@as(usize, 5), comp.core_modules.len);
 }
 
-test "splice: rejects a reactor-shaped adapter that imports __main_module__" {
+test "splice: accepts a reactor-shaped adapter that imports __main_module__" {
     const a = testing.allocator;
 
     // Hand-roll a "fake reactor" adapter: no `<iface>#name` exports
     // (so `detectShape` classifies it `.reactor`) but it imports
-    // `__main_module__._start` — illegal for a reactor. The
-    // assemble() Step 7 reactor branch must catch this and surface
-    // `error.UnsupportedAdapterShape`.
+    // `__main_module__._start`. The standard wasmtime preview1
+    // adapters (command *and* reactor) import from `__main_module__`
+    // (e.g. `cabi_realloc`), so assemble() Step 7 must wire those
+    // imports to the embed's exports (or a generated fallback),
+    // rather than reject the adapter. See cataggar/wabt#327.
     //
     // The fixture is otherwise structurally valid: env.memory +
     // wasi:cli/stdout.flush imports keep the GC happy, fd_write +
@@ -3291,10 +3288,12 @@ test "splice: rejects a reactor-shaped adapter that imports __main_module__" {
     const embed_bytes = try test_fixtures.buildSyntheticReactorEmbed(a);
     defer a.free(embed_bytes);
 
-    try testing.expectError(
-        error.UnsupportedAdapterShape,
-        splice(a, embed_bytes, ad.items, "wasi_snapshot_preview1"),
-    );
+    // A reactor adapter that imports `__main_module__.<f>` is now spliced
+    // (the import is wired to the embed export or a generated fallback),
+    // not rejected. See cataggar/wabt#327.
+    const out = try splice(a, embed_bytes, ad.items, "wasi_snapshot_preview1");
+    defer a.free(out);
+    try testing.expect(out.len > 0);
 }
 
 test "spliceMany: rejects zero non-env-import adapters" {

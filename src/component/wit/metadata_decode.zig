@@ -309,8 +309,12 @@ fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeEr
     // encoder always hoists referenced slots BEFORE the func that
     // uses them, so a single-pass slot table is sufficient.
     var slots = std.ArrayListUnmanaged(TypeSlot).empty;
-    const CapturedFunc = struct { slot: u32, sig: ctypes.FuncType, name: []const u8 };
-    var captured = std.ArrayListUnmanaged(CapturedFunc).empty;
+    // Func exports name a func type by slot index. The same func type may be
+    // shared by several exports, and an export need not immediately follow its
+    // type def, so collect exports here and resolve their sigs from the slot
+    // table after the walk (cataggar/wabt#327).
+    const FuncExport = struct { name: []const u8, slot: u32 };
+    var func_exports = std.ArrayListUnmanaged(FuncExport).empty;
 
     var j: usize = 0;
     while (j < inst.decls.len) {
@@ -346,36 +350,19 @@ fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeEr
                         },
                     },
                     .func => |func_type_idx| {
-                        // No type-slot allocation. The export must
-                        // refer to a `.type=.func` slot we already
-                        // captured — promote that captured entry
-                        // to a `FuncRef` under this export's name.
-                        // (We currently require the export to
-                        // immediately follow its func type def, so
-                        // the latest captured entry matches; the
-                        // encoder never interleaves.)
-                        if (captured.items.len == 0) return error.UnsupportedShape;
-                        const last = &captured.items[captured.items.len - 1];
-                        if (last.slot != func_type_idx) return error.UnsupportedShape;
-                        if (last.name.len != 0) return error.UnsupportedShape;
-                        last.name = e.name;
+                        // The export names a func type by slot index. A func
+                        // type may be shared by multiple exports and need not
+                        // immediately follow its type def, so just record the
+                        // (name, slot) pair; resolve after the walk.
+                        try func_exports.append(arena, .{ .name = e.name, .slot = func_type_idx });
                     },
                     else => return error.UnsupportedShape,
                 }
                 j += 1;
             },
             .type => |td| {
-                const slot_idx: u32 = @intCast(slots.items.len);
                 switch (td) {
                     .val => |v| try slots.append(arena, .{ .val = v }),
-                    .func => |sig| {
-                        try slots.append(arena, .{ .typedef = td });
-                        try captured.append(arena, .{
-                            .slot = slot_idx,
-                            .sig = sig,
-                            .name = "",
-                        });
-                    },
                     else => try slots.append(arena, .{ .typedef = td }),
                 }
                 j += 1;
@@ -384,13 +371,20 @@ fn decodeInterfaceBody(arena: Allocator, inst: ctypes.InstanceTypeDecl) DecodeEr
         }
     }
 
-    // Resolve captured func sigs against the completed slot table.
-    var funcs = try arena.alloc(FuncRef, captured.items.len);
-    for (captured.items, 0..) |c, idx| {
-        if (c.name.len == 0) return error.UnsupportedShape;
+    // Resolve each func export's sig from its func-type slot.
+    var funcs = try arena.alloc(FuncRef, func_exports.items.len);
+    for (func_exports.items, 0..) |fe, idx| {
+        if (fe.slot >= slots.items.len) return error.UnsupportedShape;
+        const sig = switch (slots.items[fe.slot]) {
+            .typedef => |slot_td| switch (slot_td) {
+                .func => |f| f,
+                else => return error.UnsupportedShape,
+            },
+            else => return error.UnsupportedShape,
+        };
         funcs[idx] = .{
-            .name = c.name,
-            .sig = try resolveFuncSig(arena, slots.items, c.sig),
+            .name = fe.name,
+            .sig = try resolveFuncSig(arena, slots.items, sig),
         };
     }
 
