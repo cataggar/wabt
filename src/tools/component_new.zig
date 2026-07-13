@@ -61,6 +61,7 @@ const writer = wabt.component.writer;
 const metadata_decode = wabt.component.wit.metadata_decode;
 const core_imports = wabt.component.adapter.core_imports;
 const lift_types = wabt.component.wit.lift_types;
+const resource_intrinsics = wabt.component.resource_intrinsics;
 
 pub const usage =
     \\Usage: wabt component new [options] <core.wasm>
@@ -683,8 +684,6 @@ fn rewriteSigForInstanceBody(
 // `canon resource.{drop,new,rep} <resource-type>` placed in the same
 // import bundle, exactly as wit-component / wasm-tools do.
 
-const IntrinsicKind = enum { drop, new, rep };
-
 const ResourceIntrinsic = struct {
     /// Import module name == the bundle key fed to the main core
     /// module's `(with …)` arg.
@@ -695,30 +694,8 @@ const ResourceIntrinsic = struct {
     field: []const u8,
     /// Bare resource name (e.g. `output-stream`).
     resource: []const u8,
-    kind: IntrinsicKind,
+    kind: resource_intrinsics.Kind,
 };
-
-/// Classify a core import field name as a resource built-in intrinsic.
-/// Returns null for ordinary names and the method-encoded forms
-/// (`[method]…`, `[static]…`, `[constructor]…`) which are real WIT
-/// funcs handled by the normal wiring path.
-fn classifyResourceIntrinsic(field: []const u8) ?struct {
-    kind: IntrinsicKind,
-    resource: []const u8,
-} {
-    const Pre = struct { p: []const u8, k: IntrinsicKind };
-    const pres = [_]Pre{
-        .{ .p = "[resource-drop]", .k = .drop },
-        .{ .p = "[resource-new]", .k = .new },
-        .{ .p = "[resource-rep]", .k = .rep },
-    };
-    for (pres) |pre| {
-        if (std.mem.startsWith(u8, field, pre.p)) {
-            return .{ .kind = pre.k, .resource = field[pre.p.len..] };
-        }
-    }
-    return null;
-}
 
 /// Scan the guest core module's imports for resource built-in
 /// intrinsics. Returns `ar`-owned copies. A core that fails to parse
@@ -732,7 +709,7 @@ fn collectResourceIntrinsics(
     var list = std.ArrayListUnmanaged(ResourceIntrinsic).empty;
     for (owned.interface.imports) |im| {
         if (im.kind != .func) continue;
-        const c = classifyResourceIntrinsic(im.field_name) orelse continue;
+        const c = resource_intrinsics.classify(im.field_name) orelse continue;
         try list.append(ar, .{
             .module = try ar.dupe(u8, im.module_name),
             .field = try ar.dupe(u8, im.field_name),
@@ -747,14 +724,12 @@ fn collectResourceIntrinsics(
 /// import must have (#251). All take the rep/handle `i32`; `new` and
 /// `rep` also return an `i32`, `drop` returns nothing.
 fn intrinsicExpectedSig(it: ResourceIntrinsic) ExpectedImportSig {
-    const param_i32 = &[_]wabt.types.ValType{.i32};
-    const result_i32 = &[_]wabt.types.ValType{.i32};
-    const no_results = &[_]wabt.types.ValType{};
+    const sig = it.kind.coreSignature();
     return .{
         .module = it.module,
         .field = it.field,
-        .params = param_i32,
-        .results = if (it.kind == .drop) no_results else result_i32,
+        .params = sig.params,
+        .results = sig.results,
     };
 }
 
@@ -780,7 +755,7 @@ fn validateResourceIntrinsicSigs(
 const ResolvedIntrinsic = struct {
     field: []const u8,
     resource: []const u8,
-    kind: IntrinsicKind,
+    kind: resource_intrinsics.Kind,
     /// Component-instance index of the import that declares `resource`
     /// as a sub_resource.
     owner_inst_idx: u32,
@@ -843,14 +818,6 @@ fn resolveResourceIntrinsicsByShape(
     var out = try ar.alloc([]const ResolvedIntrinsic, shape_qnames.len);
     for (by_shape, 0..) |*l, i| out[i] = try l.toOwnedSlice(ar);
     return out;
-}
-
-fn canonForIntrinsic(kind: IntrinsicKind, type_idx: u32) ctypes.Canon {
-    return switch (kind) {
-        .drop => .{ .resource_drop = type_idx },
-        .new => .{ .resource_new = type_idx },
-        .rep => .{ .resource_rep = type_idx },
-    };
 }
 
 // ── Guest-implemented (exported) resources (cataggar/wabt#250) ──────
@@ -967,7 +934,7 @@ const ExportSideIntrinsic = struct {
     field: []const u8,
     /// Bare resource name (e.g. `thing`).
     resource: []const u8,
-    kind: IntrinsicKind,
+    kind: resource_intrinsics.Kind,
 };
 
 /// Partition collected intrinsics into import-side (resolved against
@@ -1305,10 +1272,10 @@ fn instProvidesType(decls: []const ctypes.Decl) bool {
 fn primValType(name: []const u8) ?ctypes.ValType {
     const Pair = struct { n: []const u8, v: ctypes.ValType };
     const prims = [_]Pair{
-        .{ .n = "bool", .v = .bool },   .{ .n = "s8", .v = .s8 },     .{ .n = "u8", .v = .u8 },
-        .{ .n = "s16", .v = .s16 },     .{ .n = "u16", .v = .u16 },   .{ .n = "s32", .v = .s32 },
-        .{ .n = "u32", .v = .u32 },     .{ .n = "s64", .v = .s64 },   .{ .n = "u64", .v = .u64 },
-        .{ .n = "f32", .v = .f32 },     .{ .n = "f64", .v = .f64 },   .{ .n = "char", .v = .char },
+        .{ .n = "bool", .v = .bool },     .{ .n = "s8", .v = .s8 },   .{ .n = "u8", .v = .u8 },
+        .{ .n = "s16", .v = .s16 },       .{ .n = "u16", .v = .u16 }, .{ .n = "s32", .v = .s32 },
+        .{ .n = "u32", .v = .u32 },       .{ .n = "s64", .v = .s64 }, .{ .n = "u64", .v = .u64 },
+        .{ .n = "f32", .v = .f32 },       .{ .n = "f64", .v = .f64 }, .{ .n = "char", .v = .char },
         .{ .n = "string", .v = .string },
     };
     for (prims) |p| if (std.mem.eql(u8, p.n, name)) return p.v;
@@ -1939,7 +1906,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                 try intrinsic_resource_alias.put(ar, d.resource, idx);
                 break :blk idx;
             };
-            try canons.append(ar, canonForIntrinsic(d.kind, type_idx));
+            try canons.append(ar, d.kind.canon(type_idx));
             try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
             intrinsic_core_idxs[di] = core_func_idx;
             core_func_idx += 1;
@@ -1977,7 +1944,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         const bundle_exports = try ar.alloc(ctypes.CoreInlineExport, group.len);
         for (group, 0..) |it, gi| {
             const type_idx = exported_resource_type_idx.get(it.resource).?;
-            try canons.append(ar, canonForIntrinsic(it.kind, type_idx));
+            try canons.append(ar, it.kind.canon(type_idx));
             try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
             bundle_exports[gi] = .{
                 .name = it.field,
@@ -3735,7 +3702,7 @@ fn buildComponentShimFixup(
                 try intrinsic_resource_alias.put(ar, d.resource, idx);
                 break :blk idx;
             };
-            try canons.append(ar, canonForIntrinsic(d.kind, type_idx));
+            try canons.append(ar, d.kind.canon(type_idx));
             try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
             idxs[di] = core_func_idx;
             core_func_idx += 1;
@@ -3752,7 +3719,7 @@ fn buildComponentShimFixup(
         const idxs = try ar.alloc(u32, group.len);
         for (group, 0..) |it, j| {
             const type_idx = exported_resource_type_idx.get(it.resource).?;
-            try canons.append(ar, canonForIntrinsic(it.kind, type_idx));
+            try canons.append(ar, it.kind.canon(type_idx));
             try order.append(ar, .{ .kind = .canon, .start = @intCast(canons.items.len - 1), .count = 1 });
             idxs[j] = core_func_idx;
             core_func_idx += 1;
@@ -3773,16 +3740,23 @@ fn buildComponentShimFixup(
                 const element: ?ctypes.ValType = if (grp.elem_slots) |eslots| blk: {
                     if (grp.elem_raw) |raw| {
                         const er = HandleResolver{
-                            .ar = ar,                          .ext_slots = eslots,
-                            .types = &types,                   .aliases = &aliases,
-                            .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                            .ar = ar,
+                            .ext_slots = eslots,
+                            .types = &types,
+                            .aliases = &aliases,
+                            .resource_owner = &resource_owner,
+                            .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
-                            .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .type_owner = &type_owner,
+                            .type_alias_idx = &type_alias_idx,
                             .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
-                            .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
-                            .comp_type_idx = &comp_type_idx,   .order = &order,
-                            .elem_owner = grp.elem_owner,      .type_owners_all = &type_owners_all,
+                            .hoist_keys = &hoist_keys,
+                            .hoist_idxs = &hoist_idxs,
+                            .comp_type_idx = &comp_type_idx,
+                            .order = &order,
+                            .elem_owner = grp.elem_owner,
+                            .type_owners_all = &type_owners_all,
                         };
                         break :blk try er.rewriteValType(raw);
                     } else break :blk null;
@@ -3819,16 +3793,23 @@ fn buildComponentShimFixup(
                 const element: ?ctypes.ValType = if (grp.elem_slots) |eslots| blk: {
                     if (grp.elem_raw) |raw| {
                         const er = HandleResolver{
-                            .ar = ar,                          .ext_slots = eslots,
-                            .types = &types,                   .aliases = &aliases,
-                            .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                            .ar = ar,
+                            .ext_slots = eslots,
+                            .types = &types,
+                            .aliases = &aliases,
+                            .resource_owner = &resource_owner,
+                            .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
-                            .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                            .type_owner = &type_owner,
+                            .type_alias_idx = &type_alias_idx,
                             .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
-                            .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
-                            .comp_type_idx = &comp_type_idx,   .order = &order,
-                            .elem_owner = grp.elem_owner,      .type_owners_all = &type_owners_all,
+                            .hoist_keys = &hoist_keys,
+                            .hoist_idxs = &hoist_idxs,
+                            .comp_type_idx = &comp_type_idx,
+                            .order = &order,
+                            .elem_owner = grp.elem_owner,
+                            .type_owners_all = &type_owners_all,
                         };
                         break :blk try er.rewriteValType(raw);
                     } else break :blk null;
@@ -3915,15 +3896,21 @@ fn buildComponentShimFixup(
                     // (handler.handle) aliases the `response` resource instead
                     // of leaking a metadata-local slot index.
                     const er = HandleResolver{
-                        .ar = ar,                          .ext_slots = ext.type_slots,
-                        .types = &types,                   .aliases = &aliases,
-                        .resource_owner = &resource_owner, .import_inst_idx_for = &import_inst_idx_for,
+                        .ar = ar,
+                        .ext_slots = ext.type_slots,
+                        .types = &types,
+                        .aliases = &aliases,
+                        .resource_owner = &resource_owner,
+                        .import_inst_idx_for = &import_inst_idx_for,
                         .resource_alias_idx = &resource_alias_idx,
-                        .type_owner = &type_owner,         .type_alias_idx = &type_alias_idx,
+                        .type_owner = &type_owner,
+                        .type_alias_idx = &type_alias_idx,
                         .local_named_idx = &local_named_idx,
                         .exported_resource_type_idx = &exported_resource_type_idx,
-                        .hoist_keys = &hoist_keys,         .hoist_idxs = &hoist_idxs,
-                        .comp_type_idx = &comp_type_idx,   .order = &order,
+                        .hoist_keys = &hoist_keys,
+                        .hoist_idxs = &hoist_idxs,
+                        .comp_type_idx = &comp_type_idx,
+                        .order = &order,
                     };
                     for (ext.funcs) |fn_ref| {
                         if (!std.mem.eql(u8, fn_ref.name, fn_name)) continue;
@@ -4695,23 +4682,26 @@ test "buildComponent: builds a wrapping component for the adder fixture" {
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
         // type section: 1 type — (func (param i32 i32) (result i32))
-        0x01, 0x07,
-        0x01,
-        0x60, 0x02, 0x7f, 0x7f,
-        0x01, 0x7f,
+        0x01, 0x07, 0x01, 0x60,
+        0x02, 0x7f, 0x7f, 0x01,
+        0x7f,
         // function section: 1 func of type 0
-        0x03, 0x02,
-        0x01, 0x00,
+        0x03, 0x02, 0x01,
+        0x00,
         // export section: 1 export (1+22 name, 1 byte sort, 1 byte idx)
-        0x07, 25,
-        0x01,
-        23, 'd', 'o', 'c', 's', ':', 'a', 'd', 'd', 'e', 'r', '/', 'a', 'd', 'd', '@', '0', '.', '1', '.', '0', '#', 'a', 'd', 'd',
-        0x00, 0x00,
+        0x07, 25,   0x01,
+        23,   'd',  'o',  'c',
+        's',  ':',  'a',  'd',
+        'd',  'e',  'r',  '/',
+        'a',  'd',  'd',  '@',
+        '0',  '.',  '1',  '.',
+        '0',  '#',  'a',  'd',
+        'd',  0x00, 0x00,
         // code section: 1 body
-        0x0a, 0x09,
-        0x01,
-        0x07, 0x00,
-        0x20, 0x00, 0x20, 0x01, 0x6a, 0x0b,
+        0x0a,
+        0x09, 0x01, 0x07, 0x00,
+        0x20, 0x00, 0x20, 0x01,
+        0x6a, 0x0b,
     };
 
     // Compute the component-type:adder payload.
@@ -4781,19 +4771,27 @@ test "buildComponent #198: wraps cross-iface-use resources with import + alias +
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
         // type section: 1 type — (func (param i32 i32))
-        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 0x06, 0x01, 0x60,
+        0x02, 0x7f, 0x7f, 0x00,
         // function section: 1 func of type 0
         0x03, 0x02, 0x01, 0x00,
         // export section: 1 export
         //   body = 1(count) + 1(name_len) + 39(name) + 1(sort) + 1(idx) = 43
-        0x07, 43, 0x01,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0x00,
+        0x07, 43,   0x01, 39,
+        'w',  'a',  's',  'i',
+        ':',  'h',  't',  't',
+        'p',  '/',  'i',  'n',
+        'c',  'o',  'm',  'i',
+        'n',  'g',  '-',  'h',
+        'a',  'n',  'd',  'l',
+        'e',  'r',  '@',  '0',
+        '.',  '2',  '.',  '6',
+        '#',  'h',  'a',  'n',
+        'd',  'l',  'e',  0x00,
+        0x00,
         // code section: 1 body
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x0a, 0x04, 0x01,
+        0x02, 0x00, 0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -4937,32 +4935,48 @@ test "buildComponent #202: emits canon.lower + with-args for imported interface 
         // type section: 3 types
         //   body = 1(count) + 3(type 0: (func)) + 4(type 1: (func -> i32))
         //   + 5(type 2: (func i32 i32 -> )) = 13
-        0x01, 13, 3,
-        0x60, 0x00, 0x00,
-        0x60, 0x00, 0x01, 0x7f,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 13,   3,    0x60,
+        0x00, 0x00, 0x60, 0x00,
+        0x01, 0x7f, 0x60, 0x02,
+        0x7f, 0x7f, 0x00,
         // import section: 1 import — wasi:http/types@0.2.6 . [constructor]fields : (func -> i32)
         //   entry = 22(module: 1+21) + 20(field: 1+19) + 1(kind) + 1(typeidx) = 44
         //   body  = 1(count) + 44 = 45
-        0x02, 45, 1,
-        21, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 't', 'y', 'p', 'e', 's', '@', '0', '.', '2', '.', '6',
-        19, '[', 'c', 'o', 'n', 's', 't', 'r', 'u', 'c', 't',
-        'o', 'r', ']', 'f', 'i', 'e', 'l', 'd', 's',
+        0x02,
+        45,   1,    21,   'w',
+        'a',  's',  'i',  ':',
+        'h',  't',  't',  'p',
+        '/',  't',  'y',  'p',
+        'e',  's',  '@',  '0',
+        '.',  '2',  '.',  '6',
+        19,   '[',  'c',  'o',
+        'n',  's',  't',  'r',
+        'u',  'c',  't',  'o',
+        'r',  ']',  'f',  'i',
+        'e',  'l',  'd',  's',
         0x00, 1,
         // function section: 1 func of type 2 (the handle)
-        0x03, 2, 1, 2,
+           0x03, 2,
+        1,    2,
         // export section: handle export (defined-func idx 1)
         //   entry = 40(name: 1+39) + 1(sort) + 1(idx) = 42
         //   body  = 1(count) + 42 = 43
-        0x07, 43, 1,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 1,
+           0x07, 43,
+        1,    39,   'w',  'a',
+        's',  'i',  ':',  'h',
+        't',  't',  'p',  '/',
+        'i',  'n',  'c',  'o',
+        'm',  'i',  'n',  'g',
+        '-',  'h',  'a',  'n',
+        'd',  'l',  'e',  'r',
+        '@',  '0',  '.',  '2',
+        '.',  '6',  '#',  'h',
+        'a',  'n',  'd',  'l',
+        'e',  0x00, 1,
         // code section: 1 body (nop)
-        0x0a, 4, 1, 2, 0x00, 0x0b,
+           0x0a,
+        4,    1,    2,    0x00,
+        0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -5119,24 +5133,20 @@ test "buildComponent #203a: string/list params trigger shim+fixup + opts" {
     // path requires.
     const core_only = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 14, 2,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 14,   2,    0x60, 0x02, 0x7f, 0x7f, 0x00,
         0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
-        0x03, 3, 2, 0, 1,
-        0x05, 3, 1, 0x00, 0x01,
-        0x07, 67, 3,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0,
-        6, 'm', 'e', 'm', 'o', 'r', 'y',
-        0x02, 0,
-        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
-        0x00, 1,
-        0x0a, 9, 2,
-        2, 0x00, 0x0b,
-        4, 0x00, 0x41, 0x00, 0x0b,
+        0x03, 3,    2,    0,    1,    0x05, 3,    1,
+        0x00, 0x01, 0x07, 67,   3,    39,   'w',  'a',
+        's',  'i',  ':',  'h',  't',  't',  'p',  '/',
+        'i',  'n',  'c',  'o',  'm',  'i',  'n',  'g',
+        '-',  'h',  'a',  'n',  'd',  'l',  'e',  'r',
+        '@',  '0',  '.',  '2',  '.',  '6',  '#',  'h',
+        'a',  'n',  'd',  'l',  'e',  0x00, 0,    6,
+        'm',  'e',  'm',  'o',  'r',  'y',  0x02, 0,
+        12,   'c',  'a',  'b',  'i',  '_',  'r',  'e',
+        'a',  'l',  'l',  'o',  'c',  0x00, 1,    0x0a,
+        9,    2,    2,    0x00, 0x0b, 4,    0x00, 0x41,
+        0x00, 0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -5239,24 +5249,36 @@ test "buildComponent #203b: handle-only world stays on no-opts fast path" {
     const core_only = [_]u8{
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
-        0x01, 13, 3,
-        0x60, 0x00, 0x00,
-        0x60, 0x00, 0x01, 0x7f,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
-        0x02, 45, 1,
-        21, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 't', 'y', 'p', 'e', 's', '@', '0', '.', '2', '.', '6',
-        19, '[', 'c', 'o', 'n', 's', 't', 'r', 'u', 'c', 't',
-        'o', 'r', ']', 'f', 'i', 'e', 'l', 'd', 's',
-        0x00, 1,
-        0x03, 2, 1, 2,
-        0x07, 43, 1,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 1,
-        0x0a, 4, 1, 2, 0x00, 0x0b,
+        0x01, 13,   3,    0x60,
+        0x00, 0x00, 0x60, 0x00,
+        0x01, 0x7f, 0x60, 0x02,
+        0x7f, 0x7f, 0x00, 0x02,
+        45,   1,    21,   'w',
+        'a',  's',  'i',  ':',
+        'h',  't',  't',  'p',
+        '/',  't',  'y',  'p',
+        'e',  's',  '@',  '0',
+        '.',  '2',  '.',  '6',
+        19,   '[',  'c',  'o',
+        'n',  's',  't',  'r',
+        'u',  'c',  't',  'o',
+        'r',  ']',  'f',  'i',
+        'e',  'l',  'd',  's',
+        0x00, 1,    0x03, 2,
+        1,    2,    0x07, 43,
+        1,    39,   'w',  'a',
+        's',  'i',  ':',  'h',
+        't',  't',  'p',  '/',
+        'i',  'n',  'c',  'o',
+        'm',  'i',  'n',  'g',
+        '-',  'h',  'a',  'n',
+        'd',  'l',  'e',  'r',
+        '@',  '0',  '.',  '2',
+        '.',  '6',  '#',  'h',
+        'a',  'n',  'd',  'l',
+        'e',  0x00, 1,    0x0a,
+        4,    1,    2,    0x00,
+        0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -5319,15 +5341,22 @@ test "buildComponent #203c: shim/fixup needed but core lacks memory export → e
     const core_only = [_]u8{
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
-        0x01, 0x06, 0x01, 0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 0x06, 0x01, 0x60,
+        0x02, 0x7f, 0x7f, 0x00,
         0x03, 0x02, 0x01, 0x00,
-        0x07, 43, 0x01,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0x00,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x07, 43,   0x01, 39,
+        'w',  'a',  's',  'i',
+        ':',  'h',  't',  't',
+        'p',  '/',  'i',  'n',
+        'c',  'o',  'm',  'i',
+        'n',  'g',  '-',  'h',
+        'a',  'n',  'd',  'l',
+        'e',  'r',  '@',  '0',
+        '.',  '2',  '.',  '6',
+        '#',  'h',  'a',  'n',
+        'd',  'l',  'e',  0x00,
+        0x00, 0x0a, 0x04, 0x01,
+        0x02, 0x00, 0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -5392,24 +5421,20 @@ test "buildComponent #206: cross-iface use in imported method body triggers oute
     // still gets a canon.lower + shim slot.
     const core_only = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 14, 2,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 14,   2,    0x60, 0x02, 0x7f, 0x7f, 0x00,
         0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
-        0x03, 3, 2, 0, 1,
-        0x05, 3, 1, 0x00, 0x01,
-        0x07, 67, 3,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0,
-        6, 'm', 'e', 'm', 'o', 'r', 'y',
-        0x02, 0,
-        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
-        0x00, 1,
-        0x0a, 9, 2,
-        2, 0x00, 0x0b,
-        4, 0x00, 0x41, 0x00, 0x0b,
+        0x03, 3,    2,    0,    1,    0x05, 3,    1,
+        0x00, 0x01, 0x07, 67,   3,    39,   'w',  'a',
+        's',  'i',  ':',  'h',  't',  't',  'p',  '/',
+        'i',  'n',  'c',  'o',  'm',  'i',  'n',  'g',
+        '-',  'h',  'a',  'n',  'd',  'l',  'e',  'r',
+        '@',  '0',  '.',  '2',  '.',  '6',  '#',  'h',
+        'a',  'n',  'd',  'l',  'e',  0x00, 0,    6,
+        'm',  'e',  'm',  'o',  'r',  'y',  0x02, 0,
+        12,   'c',  'a',  'b',  'i',  '_',  'r',  'e',
+        'a',  'l',  'l',  'o',  'c',  0x00, 1,    0x0a,
+        9,    2,    2,    0x00, 0x0b, 4,    0x00, 0x41,
+        0x00, 0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,
@@ -5613,31 +5638,30 @@ test "buildComponent #195p5: canonical wasi-http proxy world e2e" {
         // type section: 2 types
         //   type 0: (func i32 i32) -> ()             — handle
         //   type 1: (func i32 i32 i32 i32) -> i32    — cabi_realloc
-        0x01, 14, 2,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 14,   2,    0x60, 0x02, 0x7f, 0x7f, 0x00,
         0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
         // function section: 2 funcs
-        0x03, 3, 2, 0, 1,
+        0x03, 3,    2,    0,    1,
         // memory section: 1 memory, initial=1 page, no max
-        0x05, 3, 1, 0x00, 0x01,
+           0x05, 3,    1,
+        0x00, 0x01,
         // export section: handle, memory, cabi_realloc
         //   body = 1(count) + 42(handle) + 9(memory) + 15(cabi) = 67
-        0x07, 67, 3,
-        39, 'w', 'a', 's', 'i', ':', 'h', 't', 't', 'p',
-        '/', 'i', 'n', 'c', 'o', 'm', 'i', 'n', 'g', '-',
-        'h', 'a', 'n', 'd', 'l', 'e', 'r', '@', '0', '.',
-        '2', '.', '6', '#', 'h', 'a', 'n', 'd', 'l', 'e',
-        0x00, 0,
-        6, 'm', 'e', 'm', 'o', 'r', 'y',
-        0x02, 0,
-        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
-        0x00, 1,
+        0x07, 67,   3,    39,   'w',  'a',
+        's',  'i',  ':',  'h',  't',  't',  'p',  '/',
+        'i',  'n',  'c',  'o',  'm',  'i',  'n',  'g',
+        '-',  'h',  'a',  'n',  'd',  'l',  'e',  'r',
+        '@',  '0',  '.',  '2',  '.',  '6',  '#',  'h',
+        'a',  'n',  'd',  'l',  'e',  0x00, 0,    6,
+        'm',  'e',  'm',  'o',  'r',  'y',  0x02, 0,
+        12,   'c',  'a',  'b',  'i',  '_',  'r',  'e',
+        'a',  'l',  'l',  'o',  'c',  0x00, 1,
         // code section: 2 bodies
         //   handle:        size=2, locals=0, end
         //   cabi_realloc:  size=4, locals=0, i32.const 0, end
-        0x0a, 9, 2,
-        2, 0x00, 0x0b,
-        4, 0x00, 0x41, 0x00, 0x0b,
+           0x0a,
+        9,    2,    2,    0x00, 0x0b, 4,    0x00, 0x41,
+        0x00, 0x0b,
     };
     var core_with_ct = std.ArrayListUnmanaged(u8).empty;
     defer core_with_ct.deinit(testing.allocator);
@@ -5737,15 +5761,19 @@ test "coreImportsModule: detects wasi_snapshot_preview1 import" {
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
         // type section: 1 type — (func)
-        0x01, 0x04,
-        0x01,
-        0x60, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60,
+        0x00, 0x00,
         // import section: 1 import — wasi_snapshot_preview1.fd_write (func type 0)
         0x02, 0x23,
-        0x01,
-        22, 'w', 'a', 's', 'i', '_', 's', 'n', 'a', 'p', 's', 'h', 'o', 't', '_', 'p', 'r', 'e', 'v', 'i', 'e', 'w', '1',
-        8, 'f', 'd', '_', 'w', 'r', 'i', 't', 'e',
-        0x00, 0x00,
+        0x01, 22,   'w',  'a',
+        's',  'i',  '_',  's',
+        'n',  'a',  'p',  's',
+        'h',  'o',  't',  '_',
+        'p',  'r',  'e',  'v',
+        'i',  'e',  'w',  '1',
+        8,    'f',  'd',  '_',
+        'w',  'r',  'i',  't',
+        'e',  0x00, 0x00,
     };
     try testing.expect(coreImportsModule(testing.allocator, &core, "wasi_snapshot_preview1"));
     try testing.expect(!coreImportsModule(testing.allocator, &core, "env"));
@@ -5921,11 +5949,14 @@ test "probeStartExport: core with `_start` func export -> .yes" {
         // type section: 1 type — (func)
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // function section: 1 func, type 0
-        0x03, 0x02, 0x01, 0x00,
+        0x03, 0x02,
+        0x01, 0x00,
         // export section: 1 export — "_start" func 0
-        0x07, 0x0a, 0x01, 6, '_', 's', 't', 'a', 'r', 't', 0x00, 0x00,
+        0x07, 0x0a, 0x01, 6,    '_',  's',
+        't',  'a',  'r',  't',  0x00, 0x00,
         // code section: 1 body — `(end)`
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x0a, 0x04,
+        0x01, 0x02, 0x00, 0x0b,
     };
     try testing.expectEqual(StartExportProbe.yes, probeStartExport(testing.allocator, &core));
 }
@@ -5934,10 +5965,10 @@ test "probeStartExport: core without `_start` export -> .no" {
     // Same shape as above but exports `other` instead of `_start`.
     const core = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x09, 0x01, 5, 'o', 't', 'h', 'e', 'r', 0x00, 0x00,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+        0x01, 0x00, 0x07, 0x09, 0x01, 5,    'o',  't',
+        'h',  'e',  'r',  0x00, 0x00, 0x0a, 0x04, 0x01,
+        0x02, 0x00, 0x0b,
     };
     try testing.expectEqual(StartExportProbe.no, probeStartExport(testing.allocator, &core));
 }
@@ -5959,10 +5990,10 @@ test "pickBuiltinAdapter: command core selects command-shape adapter" {
     // Re-use the `_start` export fixture from probeStartExport.
     const core = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x0a, 0x01, 6, '_', 's', 't', 'a', 'r', 't', 0x00, 0x00,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+        0x01, 0x00, 0x07, 0x0a, 0x01, 6,    '_',  's',
+        't',  'a',  'r',  't',  0x00, 0x00, 0x0a, 0x04,
+        0x01, 0x02, 0x00, 0x0b,
     };
     const picked = pickBuiltinAdapter(testing.allocator, &core);
     try testing.expectEqual(builtin_adapter.wasi_preview1_command_wasm.ptr, picked.ptr);
@@ -5971,10 +6002,10 @@ test "pickBuiltinAdapter: command core selects command-shape adapter" {
 test "pickBuiltinAdapter: reactor core (no _start) selects reactor-shape adapter" {
     const core = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
-        0x03, 0x02, 0x01, 0x00,
-        0x07, 0x09, 0x01, 5, 'o', 't', 'h', 'e', 'r', 0x00, 0x00,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+        0x01, 0x00, 0x07, 0x09, 0x01, 5,    'o',  't',
+        'h',  'e',  'r',  0x00, 0x00, 0x0a, 0x04, 0x01,
+        0x02, 0x00, 0x0b,
     };
     const picked = pickBuiltinAdapter(testing.allocator, &core);
     try testing.expectEqual(builtin_adapter.wasi_preview1_reactor_wasm.ptr, picked.ptr);
@@ -6004,22 +6035,18 @@ test "buildComponent #222: resource methods survive in wrapping component's impo
     // pin.
     const core_only = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 14, 2,
-        0x60, 0x02, 0x7f, 0x7f, 0x00,
+        0x01, 14,   2,    0x60, 0x02, 0x7f, 0x7f, 0x00,
         0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f,
-        0x03, 3, 2, 0, 1,
-        0x05, 3, 1, 0x00, 0x01,
-        0x07, 51, 3,
-        23, 'w', 'a', 's', 'i', ':', 'i', 'o', '/', 'p', 'o', 'l', 'l',
-        '@', '0', '.', '2', '.', '6', '#', 'p', 'o', 'l', 'l',
-        0x00, 0,
-        6, 'm', 'e', 'm', 'o', 'r', 'y',
-        0x02, 0,
-        12, 'c', 'a', 'b', 'i', '_', 'r', 'e', 'a', 'l', 'l', 'o', 'c',
-        0x00, 1,
-        0x0a, 9, 2,
-        2, 0x00, 0x0b,
-        4, 0x00, 0x41, 0x00, 0x0b,
+        0x03, 3,    2,    0,    1,    0x05, 3,    1,
+        0x00, 0x01, 0x07, 51,   3,    23,   'w',  'a',
+        's',  'i',  ':',  'i',  'o',  '/',  'p',  'o',
+        'l',  'l',  '@',  '0',  '.',  '2',  '.',  '6',
+        '#',  'p',  'o',  'l',  'l',  0x00, 0,    6,
+        'm',  'e',  'm',  'o',  'r',  'y',  0x02, 0,
+        12,   'c',  'a',  'b',  'i',  '_',  'r',  'e',
+        'a',  'l',  'l',  'o',  'c',  0x00, 1,    0x0a,
+        9,    2,    2,    0x00, 0x0b, 4,    0x00, 0x41,
+        0x00, 0x0b,
     };
 
     const ct_payload = try metadata_encode.encodeWorldFromSource(testing.allocator,

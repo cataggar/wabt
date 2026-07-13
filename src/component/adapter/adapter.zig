@@ -44,6 +44,7 @@ const world_gc = @import("world_gc.zig");
 const metadata_decode = @import("../wit/metadata_decode.zig");
 const lift_types = @import("../wit/lift_types.zig");
 const type_walk = @import("../type_walk.zig");
+const resource_intrinsics = @import("../resource_intrinsics.zig");
 const leb = @import("../../leb128.zig");
 
 pub const SpliceError = error{
@@ -86,6 +87,23 @@ pub const SpliceError = error{
     // Reactor-shape errors.
     MissingEmbedMetadata,
     InvalidComponentType,
+    // Metadata-backed embed-extra import errors.
+    InvalidEmbedMetadata,
+    EmbedMetadataNamespaceNotFound,
+    EmbedMetadataVersionMismatch,
+    EmbedMetadataFunctionNotFound,
+    EmbedMetadataFunctionMalformed,
+    EmbedMetadataResourceNotFound,
+    EmbedMetadataAliasMalformed,
+    EmbedMetadataAliasCycle,
+    EmbedImportSignatureMismatch,
+    EmbedResourceIntrinsicSignatureMismatch,
+    EmbedImportedResourceNewUnsupported,
+    EmbedImportedResourceRepUnsupported,
+    AdapterImportedResourceNewUnsupported,
+    AdapterImportedResourceRepUnsupported,
+    EmbedResourceMetadataRequired,
+    EmbedImportFieldConflict,
 } || writer.EncodeError;
 
 /// One preview1-style adapter to splice in. `name` is the core
@@ -168,26 +186,11 @@ pub fn splice(
 
     const hoisted = try types_import.hoist(a, world);
 
-    // The embed may carry its own `component-type` custom section
-    // (produced by `wasm-tools component embed --world …`). When
-    // present we use its declared FuncTypes to preserve original
-    // param names on lifted top-level imports. Absent (e.g. for a
-    // raw zig-hello core wasm), we synthesize p0/p1 names from the
-    // core sigs alone.
-    const embed_world: ?decode.AdapterWorld = blk: {
-        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
-        const payload = ct orelse break :blk null;
-        break :blk decode.parse(a, payload) catch null;
-    };
-
-    // Reactor mode needs per-export-interface FuncTypes for canon-lift,
-    // which `metadata_decode.decode` produces. Decode once here while
-    // the embed's component-type section is still attached.
-    const embed_metadata: ?metadata_decode.DecodedWorld = blk: {
-        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
-        const payload = ct orelse break :blk null;
-        break :blk metadata_decode.decode(a, payload) catch null;
-    };
+    // Decode once while the embed's component-type section is still
+    // attached. When present this metadata is authoritative for both
+    // reactor exports and direct component imports; malformed metadata
+    // must not silently fall back to flattened core signatures.
+    const embed_metadata = try decodeEmbedMetadata(a, embed_bytes);
 
     const preview1_slots = try collectPreview1Slots(a, embed_owned.interface, adapter_name);
     const buckets = try classifyAdapterImports(a, adapter_owned.interface, world, hoisted);
@@ -199,14 +202,15 @@ pub fn splice(
     // primary's indirect slots; the fixup module's table-population
     // pass canon.lowers each one with opts referencing main_inst's
     // memory + cabi_realloc.
-    const embed_extra_slot_infos = try collectEmbedExtraSlotInfos(
+    const embed_extra_plan = try buildEmbedExtraImportPlan(
         a,
         embed_owned.interface,
         embed_metadata,
-        embed_world,
         adapter_name,
         &.{},
+        hoisted,
     );
+    const embed_extra_slot_infos = embed_extra_plan.slot_infos;
     const embed_extra_slot_base: u32 = @intCast(preview1_slots.len + indirect_slots.len);
 
     var all_slots = try a.alloc(shim.Slot, preview1_slots.len + indirect_slots.len + embed_extra_slot_infos.len);
@@ -238,7 +242,6 @@ pub fn splice(
         .fixup_bytes = fixup_bytes,
         .adapter_name = adapter_name,
         .world = world,
-        .embed_world = embed_world,
         .hoisted = hoisted,
         .embed_iface = embed_owned.interface,
         .adapter_iface = adapter_owned.interface,
@@ -246,7 +249,7 @@ pub fn splice(
         .buckets = buckets,
         .shape = detectShape(adapter_owned.interface),
         .embed_metadata = embed_metadata,
-        .embed_extra_slot_infos = embed_extra_slot_infos,
+        .embed_extra_plan = embed_extra_plan,
         .embed_extra_slot_base = embed_extra_slot_base,
     });
 }
@@ -306,17 +309,7 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
 
     const hoisted = try types_import.hoist(a, world);
 
-    const embed_world: ?decode.AdapterWorld = blk: {
-        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
-        const payload = ct orelse break :blk null;
-        break :blk decode.parse(a, payload) catch null;
-    };
-
-    const embed_metadata: ?metadata_decode.DecodedWorld = blk: {
-        const ct = decode.extractEncodedWorld(embed_bytes) catch break :blk null;
-        const payload = ct orelse break :blk null;
-        break :blk metadata_decode.decode(a, payload) catch null;
-    };
+    const embed_metadata = try decodeEmbedMetadata(a, embed_bytes);
 
     const preview1_slots = try collectPreview1Slots(a, embed_owned.interface, primary.name);
     const buckets = try classifyAdapterImports(a, primary_owned.interface, world, hoisted);
@@ -381,14 +374,15 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
     //                       (canon.lowered, cataggar/wabt#230)
     const secondary_names = try a.alloc([]const u8, secondary_inputs.len);
     for (secondary_inputs, secondary_names) |sin, *out_name| out_name.* = sin.name;
-    const embed_extra_slot_infos = try collectEmbedExtraSlotInfos(
+    const embed_extra_plan = try buildEmbedExtraImportPlan(
         a,
         embed_owned.interface,
         embed_metadata,
-        embed_world,
         primary.name,
         secondary_names,
+        hoisted,
     );
+    const embed_extra_slot_infos = embed_extra_plan.slot_infos;
     const embed_extra_slot_base: u32 = @intCast(preview1_slots.len + total_secondary_slots + indirect_slots.len);
 
     var all_slots = try a.alloc(shim.Slot, preview1_slots.len + total_secondary_slots + indirect_slots.len + embed_extra_slot_infos.len);
@@ -428,7 +422,6 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
         .fixup_bytes = fixup_bytes,
         .adapter_name = primary.name,
         .world = world,
-        .embed_world = embed_world,
         .hoisted = hoisted,
         .embed_iface = embed_owned.interface,
         .adapter_iface = primary_owned.interface,
@@ -437,7 +430,7 @@ fn spliceN(gpa: Allocator, embed_bytes: []const u8, adapters: []const Adapter) !
         .shape = detectShape(primary_owned.interface),
         .secondaries = secondary_inputs,
         .embed_metadata = embed_metadata,
-        .embed_extra_slot_infos = embed_extra_slot_infos,
+        .embed_extra_plan = embed_extra_plan,
         .embed_extra_slot_base = embed_extra_slot_base,
     });
 }
@@ -821,7 +814,8 @@ fn collectPreview1Slots(
     return out.toOwnedSlice(arena);
 }
 
-const ResourceDrop = struct {
+const AdapterResourceDrop = struct {
+    field_name: []const u8,
     resource_name: []const u8,
 };
 
@@ -844,7 +838,7 @@ const NamespaceBucket = struct {
     name: []const u8,
     instance_idx: u32,
     body_type_idx: u32,
-    resource_drops: []ResourceDrop,
+    resource_drops: []AdapterResourceDrop,
     indirect_funcs: []IndirectFunc,
     direct_funcs: []DirectFunc,
 };
@@ -870,7 +864,7 @@ fn classifyAdapterImports(
     const buckets = try arena.alloc(NamespaceBucket, bucket_names.items.len);
 
     for (bucket_names.items, 0..) |bn, bi| {
-        var rd_list = std.ArrayListUnmanaged(ResourceDrop).empty;
+        var resource_drops = std.ArrayListUnmanaged(AdapterResourceDrop).empty;
         var ind_list = std.ArrayListUnmanaged(IndirectFunc).empty;
         var dir_list = std.ArrayListUnmanaged(DirectFunc).empty;
 
@@ -879,9 +873,19 @@ fn classifyAdapterImports(
         for (adapter_iface.imports) |im| {
             if (im.kind != .func) continue;
             if (!std.mem.eql(u8, im.module_name, bn)) continue;
-            if (std.mem.startsWith(u8, im.field_name, "[resource-drop]")) {
-                const rname = im.field_name["[resource-drop]".len..];
-                try rd_list.append(arena, .{ .resource_name = rname });
+            if (resource_intrinsics.classify(im.field_name)) |intrinsic| {
+                const sig = im.sig orelse return error.UnsupportedAdapterShape;
+                intrinsic.kind.validateCoreSignature(sig.params, sig.results) catch
+                    return error.EmbedResourceIntrinsicSignatureMismatch;
+                switch (intrinsic.kind) {
+                    .drop => {},
+                    .new => return error.AdapterImportedResourceNewUnsupported,
+                    .rep => return error.AdapterImportedResourceRepUnsupported,
+                }
+                try resource_drops.append(arena, .{
+                    .field_name = im.field_name,
+                    .resource_name = intrinsic.resource,
+                });
                 continue;
             }
 
@@ -906,7 +910,7 @@ fn classifyAdapterImports(
             .name = bn,
             .instance_idx = slot.instance_idx,
             .body_type_idx = slot.type_idx,
-            .resource_drops = try rd_list.toOwnedSlice(arena),
+            .resource_drops = try resource_drops.toOwnedSlice(arena),
             .indirect_funcs = try ind_list.toOwnedSlice(arena),
             .direct_funcs = try dir_list.toOwnedSlice(arena),
         };
@@ -955,7 +959,6 @@ const Inputs = struct {
     fixup_bytes: []const u8,
     adapter_name: []const u8,
     world: decode.AdapterWorld,
-    embed_world: ?decode.AdapterWorld,
     hoisted: types_import.Hoisted,
     embed_iface: core_imports.CoreInterface,
     adapter_iface: core_imports.CoreInterface,
@@ -981,15 +984,12 @@ const Inputs = struct {
     /// and one extra core module + core instance in the assembled
     /// component. Empty for the single-adapter case.
     secondaries: []const SecondaryInputs = &.{},
-    /// Embed-extra (non-WASI) import slot infos. Each entry maps
-    /// 1:1 to a shim slot at offset
-    /// `embed_extra_slot_base + i`. `assemble`'s fixup phase
-    /// emits one `canon.lower` per entry, with opts derived from
-    /// `info.opts` + `main_inst`'s memory/cabi_realloc aliases.
-    /// Cataggar/wabt#230 — routing embed-extras through the fixup
-    /// table avoids the forward-reference cycle between
-    /// `canon.lower(opts=...)` and `main_inst`.
-    embed_extra_slot_infos: []const EmbedExtraSlotInfo = &.{},
+    /// Arena-owned authoritative plan for the embed's direct component
+    /// imports. It is shared by slot construction and assembly so the
+    /// two phases cannot disagree about ordering or intrinsic fields.
+    /// Its ordinary `slot_infos` map 1:1 to shim slots at
+    /// `embed_extra_slot_base + i`; resource intrinsics are excluded.
+    embed_extra_plan: EmbedExtraImportPlan = .{},
     /// Global shim-table offset where this splice's embed-extra
     /// slots start. Computed in `splice`/`spliceN` as
     /// `preview1.len + Σ(secondaries) + indirect.len`.
@@ -1463,16 +1463,15 @@ fn assemble(in: Inputs) ![]u8 {
     for (in.buckets, 0..) |*bucket, bi| {
         var bundle = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
 
-        for (bucket.resource_drops) |rd| {
+        for (bucket.resource_drops) |drop| {
             const t_idx = try b.addAlias(.{ .instance_export = .{
                 .sort = .type,
                 .instance_idx = bucket.instance_idx,
-                .name = rd.resource_name,
+                .name = drop.resource_name,
             } });
             const cf_idx = try b.addCanon(.{ .resource_drop = t_idx });
-            const ename = try std.fmt.allocPrint(a, "[resource-drop]{s}", .{rd.resource_name});
             try bundle.append(a, .{
-                .name = ename,
+                .name = drop.field_name,
                 .sort_idx = .{ .sort = .func, .idx = cf_idx },
             });
         }
@@ -1550,7 +1549,7 @@ fn assemble(in: Inputs) ![]u8 {
     }
 
     var any_main_realloc = false;
-    for (in.embed_extra_slot_infos) |info| {
+    for (in.embed_extra_plan.slot_infos) |info| {
         if (info.opts.realloc) any_main_realloc = true;
     }
     var main_realloc_idx: u32 = 0;
@@ -1652,7 +1651,7 @@ fn assemble(in: Inputs) ![]u8 {
     // opts inside `buildEmbedExtraImports`, which validated only
     // for primitive-only sigs; routing them through the fixup
     // table breaks the forward-reference cycle.)
-    for (in.embed_extra_slot_infos, 0..) |info, i| {
+    for (in.embed_extra_plan.slot_infos, 0..) |info, i| {
         const iface_inst_idx = embed_extra_iface_inst_for_ns.get(info.ns) orelse
             return error.UnsupportedShape;
         const f_idx = try b.addAlias(.{ .instance_export = .{
@@ -2003,98 +2002,446 @@ pub const EmbedExtraSlotInfo = struct {
     world_decls: []const ctypes.Decl,
 };
 
-/// Walk the embed's core imports for non-WASI, non-`env`,
-/// non-`__main_module__` namespaces. For each func, recover its
-/// component-level FuncType (from the embed's component-type
-/// custom section when present; synthesized primitive sig
-/// otherwise), classify it via `abi.classifyFunc`, and emit one
-/// `EmbedExtraSlotInfo`. Iteration order matches
-/// `buildEmbedExtraImports`'s ns-then-func walk so slot indices
-/// line up by position.
-fn collectEmbedExtraSlotInfos(
+const EmbedExtraIntrinsic = struct {
+    field_name: []const u8,
+    resource_name: []const u8,
+};
+
+const EmbedExtraFieldPlan = union(enum) {
+    /// Index in `EmbedExtraImportPlan.slot_infos`.
+    ordinary_slot: u32,
+    intrinsic: EmbedExtraIntrinsic,
+};
+
+const EmbedExtraNamespacePlan = struct {
+    name: []const u8,
+    /// Present when an encoded WIT world authoritatively declares this
+    /// import. Null is reserved for metadata-free legacy core modules.
+    metadata_ext: ?metadata_decode.WorldExtern = null,
+    /// Core fields in first-declaration order. Exact duplicates with
+    /// the same validated contract are represented only once.
+    fields: []const EmbedExtraFieldPlan = &.{},
+};
+
+const EmbedExtraImportPlan = struct {
+    namespaces: []const EmbedExtraNamespacePlan = &.{},
+    /// Ordinary funcs only. Resource intrinsics deliberately have no
+    /// shim slot and therefore cannot be canon.lower'd in Step 10.
+    slot_infos: []const EmbedExtraSlotInfo = &.{},
+};
+
+fn decodeEmbedMetadata(
+    arena: Allocator,
+    embed_bytes: []const u8,
+) SpliceError!?metadata_decode.DecodedWorld {
+    const payload = decode.extractEncodedWorld(embed_bytes) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidEmbedMetadata,
+    };
+    const bytes = payload orelse return null;
+    return metadata_decode.decode(arena, bytes) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidEmbedMetadata,
+    };
+}
+
+fn isEmbedExtraModule(
+    name: []const u8,
+    adapter_name: []const u8,
+    secondary_names: []const []const u8,
+) bool {
+    if (std.mem.eql(u8, name, adapter_name) or
+        std.mem.eql(u8, name, "env") or
+        std.mem.eql(u8, name, "__main_module__"))
+    {
+        return false;
+    }
+    for (secondary_names) |secondary| {
+        if (std.mem.eql(u8, name, secondary)) return false;
+    }
+    return true;
+}
+
+fn namespaceWithoutVersion(name: []const u8) []const u8 {
+    const at = std.mem.lastIndexOfScalar(u8, name, '@') orelse return name;
+    return name[0..at];
+}
+
+fn sameNamespaceIgnoringVersion(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, namespaceWithoutVersion(a), namespaceWithoutVersion(b));
+}
+
+fn metadataFuncType(
+    ext: metadata_decode.WorldExtern,
+    name: []const u8,
+) SpliceError!ctypes.FuncType {
+    var found: ?ctypes.FuncType = null;
+    for (ext.funcs) |func| {
+        if (!std.mem.eql(u8, func.name, name)) continue;
+        if (found != null) return error.EmbedMetadataFunctionMalformed;
+        found = func.sig;
+    }
+    const ft = found orelse return error.EmbedMetadataFunctionNotFound;
+
+    // `DecodedWorld.funcs` is derived from these raw exports. Check
+    // that the identity-bearing body still has exactly one matching
+    // func export rather than trusting a malformed/ambiguous alias.
+    var export_count: usize = 0;
+    for (ext.inst_decls) |decl| switch (decl) {
+        .@"export" => |e| {
+            if (e.desc == .func and std.mem.eql(u8, e.name, name))
+                export_count += 1;
+        },
+        else => {},
+    };
+    if (export_count != 1) return error.EmbedMetadataFunctionMalformed;
+    return ft;
+}
+
+fn metadataHasFunc(ext: metadata_decode.WorldExtern, name: []const u8) bool {
+    for (ext.funcs) |func| {
+        if (std.mem.eql(u8, func.name, name)) return true;
+    }
+    return false;
+}
+
+fn metadataHasTypeExport(ext: metadata_decode.WorldExtern, name: []const u8) bool {
+    var count: usize = 0;
+    for (ext.inst_decls) |decl| switch (decl) {
+        .@"export" => |e| {
+            if (e.desc == .type and std.mem.eql(u8, e.name, name))
+                count += 1;
+        },
+        else => {},
+    };
+    return count == 1;
+}
+
+fn metadataHasDeclaredResource(
+    ext: metadata_decode.WorldExtern,
+    name: []const u8,
+) SpliceError!bool {
+    var count: usize = 0;
+    for (ext.inst_decls) |decl| switch (decl) {
+        .@"export" => |e| {
+            if (e.desc == .type and e.desc.type == .sub_resource and
+                std.mem.eql(u8, e.name, name))
+            {
+                count += 1;
+            }
+        },
+        else => {},
+    };
+    if (count > 1) return error.EmbedImportFieldConflict;
+    return count == 1;
+}
+
+fn synthesizePrimitiveFuncType(
+    arena: Allocator,
+    sig: core_imports.FuncSig,
+) SpliceError!ctypes.FuncType {
+    const params = try arena.alloc(ctypes.NamedValType, sig.params.len);
+    for (sig.params, 0..) |param, i| {
+        params[i] = .{
+            .name = try std.fmt.allocPrint(arena, "p{d}", .{i}),
+            .type = coreToCompValType(param) orelse
+                return error.EmbedImportSignatureMismatch,
+        };
+    }
+    const results: ctypes.FuncType.ResultList = if (sig.results.len == 0)
+        .none
+    else if (sig.results.len == 1)
+        .{ .unnamed = coreToCompValType(sig.results[0]) orelse
+            return error.EmbedImportSignatureMismatch }
+    else blk: {
+        const named = try arena.alloc(ctypes.NamedValType, sig.results.len);
+        for (sig.results, 0..) |result, i| {
+            named[i] = .{
+                .name = try std.fmt.allocPrint(arena, "r{d}", .{i}),
+                .type = coreToCompValType(result) orelse
+                    return error.EmbedImportSignatureMismatch,
+            };
+        }
+        break :blk .{ .named = named };
+    };
+    return .{ .params = params, .results = results };
+}
+
+fn coreSigMatches(
+    declared: core_imports.FuncSig,
+    params: []const wtypes.ValType,
+    results: []const wtypes.ValType,
+) bool {
+    return std.mem.eql(wtypes.ValType, declared.params, params) and
+        std.mem.eql(wtypes.ValType, declared.results, results);
+}
+
+const MetadataDependencyState = enum { ready, blocked };
+
+const MetadataAliasTarget = struct {
+    world_inst_idx: u32,
+    name: []const u8,
+};
+
+fn metadataAliasTarget(
+    tables: WorldTypeTables,
+    alias: ctypes.Alias,
+) SpliceError!MetadataAliasTarget {
+    return switch (alias) {
+        .outer => |outer| blk: {
+            if (outer.sort != .type or outer.outer_count != 1 or
+                outer.idx >= tables.type_kind.len)
+            {
+                return error.EmbedMetadataAliasMalformed;
+            }
+            break :blk switch (tables.type_kind[outer.idx]) {
+                .alias_instance_export => |target| .{
+                    .world_inst_idx = target.world_inst_idx,
+                    .name = target.name,
+                },
+                .other => return error.EmbedMetadataAliasMalformed,
+            };
+        },
+        // Metadata encoders also use this compact body-side form to
+        // refer directly to an instance in the outer world scope.
+        .instance_export => |ie| {
+            if (ie.sort != .type) return error.EmbedMetadataAliasMalformed;
+            return .{ .world_inst_idx = ie.instance_idx, .name = ie.name };
+        },
+    };
+}
+
+fn metadataDependenciesReady(
+    md: metadata_decode.DecodedWorld,
+    tables: WorldTypeTables,
+    ext: metadata_decode.WorldExtern,
+    import_index: *const std.StringHashMapUnmanaged(usize),
+    emitted: []const bool,
+    hoisted: types_import.Hoisted,
+) SpliceError!MetadataDependencyState {
+    for (ext.inst_decls) |decl| {
+        const target = switch (decl) {
+            .alias => |alias| try metadataAliasTarget(tables, alias),
+            else => continue,
+        };
+        if (target.world_inst_idx >= tables.inst_qname.len)
+            return error.EmbedMetadataAliasMalformed;
+        const provider_name = tables.inst_qname[target.world_inst_idx];
+        const provider_idx = import_index.get(provider_name) orelse
+            return error.EmbedMetadataAliasMalformed;
+        const provider = md.externs[provider_idx];
+        if (provider.is_export or !metadataHasTypeExport(provider, target.name))
+            return error.EmbedMetadataAliasMalformed;
+        if (findInstanceSlot(hoisted, provider_name) == null and
+            !emitted[provider_idx])
+        {
+            return .blocked;
+        }
+    }
+    return .ready;
+}
+
+fn orderMetadataImports(
+    arena: Allocator,
+    md: metadata_decode.DecodedWorld,
+    hoisted: types_import.Hoisted,
+) SpliceError![]const metadata_decode.WorldExtern {
+    // Map qualified import names to their DecodedWorld index. Exact
+    // names (including versions) are the identity key throughout.
+    var import_index = std.StringHashMapUnmanaged(usize).empty;
+    defer import_index.deinit(arena);
+    var import_count: usize = 0;
+    for (md.externs, 0..) |ext, i| {
+        if (ext.is_export) continue;
+        const gop = try import_index.getOrPut(arena, ext.qualified_name);
+        if (gop.found_existing) return error.EmbedImportFieldConflict;
+        gop.value_ptr.* = i;
+        import_count += 1;
+    }
+
+    const tables = try buildWorldTypeTables(arena, md.world_decls);
+    const emitted = try arena.alloc(bool, md.externs.len);
+    @memset(emitted, false);
+    var ordered = std.ArrayListUnmanaged(metadata_decode.WorldExtern).empty;
+    try ordered.ensureTotalCapacity(arena, import_count);
+
+    while (ordered.items.len < import_count) {
+        var made_progress = false;
+        for (md.externs, 0..) |ext, i| {
+            if (ext.is_export or emitted[i]) continue;
+            if (try metadataDependenciesReady(
+                md,
+                tables,
+                ext,
+                &import_index,
+                emitted,
+                hoisted,
+            ) == .blocked) continue;
+            emitted[i] = true;
+            ordered.appendAssumeCapacity(ext);
+            made_progress = true;
+        }
+        if (!made_progress) return error.EmbedMetadataAliasCycle;
+    }
+    return ordered.toOwnedSlice(arena);
+}
+
+/// Build one arena-owned plan shared by shim-slot collection and
+/// component assembly. With metadata, every WIT import body is kept
+/// intact and ordered after its cross-interface type providers.
+/// Without metadata, only ordinary primitive funcs use the legacy
+/// synthesis fallback; resource intrinsics are a hard error.
+fn buildEmbedExtraImportPlan(
     arena: Allocator,
     embed_iface: core_imports.CoreInterface,
     embed_metadata: ?metadata_decode.DecodedWorld,
-    embed_world: ?decode.AdapterWorld,
     adapter_name: []const u8,
     secondary_names: []const []const u8,
-) SpliceError![]const EmbedExtraSlotInfo {
-    const md_world_decls: []const ctypes.Decl = if (embed_metadata) |md| md.world_decls else &.{};
-    var ns_names = std.ArrayListUnmanaged([]const u8).empty;
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(arena);
+    hoisted: types_import.Hoisted,
+) SpliceError!EmbedExtraImportPlan {
+    var core_names = std.ArrayListUnmanaged([]const u8).empty;
+    var core_name_seen = std.StringHashMapUnmanaged(void).empty;
+    defer core_name_seen.deinit(arena);
 
     for (embed_iface.imports) |im| {
         if (im.kind != .func) continue;
-        if (std.mem.eql(u8, im.module_name, adapter_name)) continue;
-        if (std.mem.eql(u8, im.module_name, "env")) continue;
-        if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
-        var is_secondary = false;
-        for (secondary_names) |sn| if (std.mem.eql(u8, sn, im.module_name)) {
-            is_secondary = true;
-            break;
-        };
-        if (is_secondary) continue;
-        const gop = try seen.getOrPut(arena, im.module_name);
-        if (!gop.found_existing) try ns_names.append(arena, im.module_name);
+        if (!isEmbedExtraModule(im.module_name, adapter_name, secondary_names)) continue;
+        const gop = try core_name_seen.getOrPut(arena, im.module_name);
+        if (!gop.found_existing) try core_names.append(arena, im.module_name);
     }
 
-    var out = std.ArrayListUnmanaged(EmbedExtraSlotInfo).empty;
-    for (ns_names.items) |ns| {
-        const canonical_decls = lookupEmbedExtraInstDecls(embed_metadata, ns) orelse &.{};
+    const NamespaceSeed = struct {
+        name: []const u8,
+        ext: ?metadata_decode.WorldExtern,
+    };
+    var seeds = std.ArrayListUnmanaged(NamespaceSeed).empty;
+
+    if (embed_metadata) |md| {
+        const ordered = try orderMetadataImports(arena, md, hoisted);
+        for (core_names.items) |core_name| {
+            var exact = false;
+            var version_mismatch = false;
+            for (ordered) |ext| {
+                if (std.mem.eql(u8, ext.qualified_name, core_name)) {
+                    exact = true;
+                    break;
+                }
+                if (sameNamespaceIgnoringVersion(ext.qualified_name, core_name))
+                    version_mismatch = true;
+            }
+            if (!exact) {
+                if (version_mismatch) return error.EmbedMetadataVersionMismatch;
+                return error.EmbedMetadataNamespaceNotFound;
+            }
+        }
+        for (ordered) |ext| {
+            try seeds.append(arena, .{ .name = ext.qualified_name, .ext = ext });
+        }
+    } else {
+        for (core_names.items) |name| {
+            try seeds.append(arena, .{ .name = name, .ext = null });
+        }
+    }
+
+    var slot_infos = std.ArrayListUnmanaged(EmbedExtraSlotInfo).empty;
+    const namespaces = try arena.alloc(EmbedExtraNamespacePlan, seeds.items.len);
+    for (seeds.items, namespaces) |seed, *namespace| {
+        var fields = std.ArrayListUnmanaged(EmbedExtraFieldPlan).empty;
+        var field_seen = std.StringHashMapUnmanaged(void).empty;
+        defer field_seen.deinit(arena);
+
         for (embed_iface.imports) |im| {
             if (im.kind != .func) continue;
-            if (!std.mem.eql(u8, im.module_name, ns)) continue;
-            const sig = im.sig orelse continue;
-            const ft: ctypes.FuncType = lookupEmbedFuncType(embed_world, ns, im.field_name) orelse blk_ft: {
-                const params = try arena.alloc(ctypes.NamedValType, sig.params.len);
-                for (sig.params, 0..) |p, pi| {
-                    const pname = try std.fmt.allocPrint(arena, "p{d}", .{pi});
-                    params[pi] = .{ .name = pname, .type = coreToCompValType(p) };
+            if (!isEmbedExtraModule(im.module_name, adapter_name, secondary_names)) continue;
+            if (!std.mem.eql(u8, im.module_name, seed.name)) continue;
+            const declared = im.sig orelse return error.EmbedImportSignatureMismatch;
+
+            if (resource_intrinsics.classify(im.field_name)) |intrinsic| {
+                intrinsic.kind.validateCoreSignature(declared.params, declared.results) catch
+                    return error.EmbedResourceIntrinsicSignatureMismatch;
+                switch (intrinsic.kind) {
+                    .drop => {},
+                    .new => return error.EmbedImportedResourceNewUnsupported,
+                    .rep => return error.EmbedImportedResourceRepUnsupported,
                 }
-                const results: ctypes.FuncType.ResultList = if (sig.results.len == 0) .none else r: {
-                    if (sig.results.len == 1) {
-                        break :r .{ .unnamed = coreToCompValType(sig.results[0]) };
-                    }
-                    const named = try arena.alloc(ctypes.NamedValType, sig.results.len);
-                    for (sig.results, 0..) |r, ri| {
-                        const rname = try std.fmt.allocPrint(arena, "r{d}", .{ri});
-                        named[ri] = .{ .name = rname, .type = coreToCompValType(r) };
-                    }
-                    break :r .{ .named = named };
-                };
-                break :blk_ft .{ .params = params, .results = results };
-            };
+                const ext = seed.ext orelse return error.EmbedResourceMetadataRequired;
+                if (intrinsic.resource.len == 0 or
+                    !(try metadataHasDeclaredResource(ext, intrinsic.resource)))
+                {
+                    return error.EmbedMetadataResourceNotFound;
+                }
+                if (metadataHasFunc(ext, im.field_name))
+                    return error.EmbedImportFieldConflict;
+
+                const gop = try field_seen.getOrPut(arena, im.field_name);
+                if (gop.found_existing) continue;
+                try fields.append(arena, .{ .intrinsic = .{
+                    .field_name = im.field_name,
+                    .resource_name = intrinsic.resource,
+                } });
+                continue;
+            }
+
+            const canonical_decls: []const ctypes.Decl = if (seed.ext) |ext|
+                ext.inst_decls
+            else
+                &.{};
+            const world_decls: []const ctypes.Decl = if (embed_metadata) |md|
+                md.world_decls
+            else
+                &.{};
+            const ft = if (seed.ext) |ext|
+                try metadataFuncType(ext, im.field_name)
+            else
+                try synthesizePrimitiveFuncType(arena, declared);
             const resolver = abi.TypeResolver{
                 .inst_decls = canonical_decls,
-                .world_decls = md_world_decls,
+                .world_decls = world_decls,
             };
             const ftr = abi.FuncTypeRef{ .func = ft, .resolver = resolver };
+            const lowered = abi.lowerCoreSig(arena, ftr) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return if (seed.ext != null)
+                    error.EmbedMetadataFunctionMalformed
+                else
+                    error.EmbedImportSignatureMismatch,
+            };
+            if (!coreSigMatches(declared, lowered.params, lowered.results))
+                return error.EmbedImportSignatureMismatch;
+
+            const gop = try field_seen.getOrPut(arena, im.field_name);
+            if (gop.found_existing) continue;
+
             const cls = abi.classifyFunc(ftr);
-            try out.append(arena, .{
-                .ns = ns,
+            const slot_idx: u32 = @intCast(slot_infos.items.len);
+            try slot_infos.append(arena, .{
+                .ns = seed.name,
                 .fn_name = im.field_name,
                 .func_type = ft,
                 .opts = cls.opts,
                 .inst_decls = canonical_decls,
-                .world_decls = md_world_decls,
+                .world_decls = world_decls,
             });
+            try fields.append(arena, .{ .ordinary_slot = slot_idx });
         }
+
+        namespace.* = .{
+            .name = seed.name,
+            .metadata_ext = seed.ext,
+            .fields = try fields.toOwnedSlice(arena),
+        };
     }
-    return out.toOwnedSlice(arena);
+    return .{
+        .namespaces = namespaces,
+        .slot_infos = try slot_infos.toOwnedSlice(arena),
+    };
 }
 
-/// For each non-WASI-adapter module the embed imports, synthesize a
-/// top-level component instance import (with primitive-typed funcs
-/// derived from the core wasm sigs), canon-lower each func, and
-/// bundle the lowered funcs into a core instance the embed can
-/// consume. Returns one `EmbedExtraArg` per such module.
-///
-/// Works for primitive-only signatures (i32/i64/f32/f64). Funcs
-/// that need `string`/`list`/records cannot be expressed through
-/// this synthesis; for those the user should `wasm-tools component
-/// embed --world` first to embed a richer component-type and then
-/// use the no-adapter path.
+/// Materialize the shared import plan. Metadata-backed bodies are
+/// transplanted whole (after strict cross-interface alias rebasing);
+/// legacy metadata-free bodies are synthesized from primitive sigs.
+/// Ordinary funcs use shim slots, while resource drops directly
+/// contribute canon resource.drop operations to the satisfying core bundle.
 fn buildEmbedExtraImports(
     b: *Builder,
     a: Allocator,
@@ -2102,291 +2449,114 @@ fn buildEmbedExtraImports(
     shim_inst: u32,
     iface_inst_idx_for_ns: *std.StringHashMapUnmanaged(u32),
 ) SpliceError![]const EmbedExtraArg {
-    // Collect distinct namespaces in declaration order, mirroring
-    // `collectEmbedExtraSlotInfos`'s filter (skip primary adapter,
-    // env, __main_module__, and any secondary adapter name). The
-    // slot infos in `in.embed_extra_slot_infos` are emitted in
-    // this exact namespace+func order.
-    var ns_names = std.ArrayListUnmanaged([]const u8).empty;
-    var seen = std.StringHashMapUnmanaged(void).empty;
-    defer seen.deinit(a);
-
-    for (in.embed_iface.imports) |im| {
-        if (im.kind != .func) continue;
-        if (std.mem.eql(u8, im.module_name, in.adapter_name)) continue;
-        if (std.mem.eql(u8, im.module_name, "env")) continue;
-        if (std.mem.eql(u8, im.module_name, "__main_module__")) continue;
-        var is_secondary = false;
-        for (in.secondaries) |sec| if (std.mem.eql(u8, sec.name, im.module_name)) {
-            is_secondary = true;
-            break;
-        };
-        if (is_secondary) continue;
-        const gop = try seen.getOrPut(a, im.module_name);
-        if (!gop.found_existing) try ns_names.append(a, im.module_name);
-    }
-
-    if (ns_names.items.len == 0) return &.{};
-
-    // Pre-pass: when a provider namespace's instance body is pruned to
-    // just its own imported funcs, type-exports consumed only by a
-    // *sibling* namespace's body (e.g. `wasi:http/outgoing-handler`'s
-    // `handle` references `request-options` / `outgoing-request` /
-    // `future-incoming-response` / `error-code` from `wasi:http/types`)
-    // would be dropped, leaving the sibling's rebased
-    // `alias instance-export` pointing at a missing export. Collect
-    // those cross-iface type needs up front, keyed by provider
-    // namespace, and feed them into each body's prune as extra live
-    // type-exports.
-    var cross_needs = std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)).empty;
-    if (in.embed_metadata) |md| {
-        const tables = try buildWorldTypeTables(a, md.world_decls);
-        for (ns_names.items) |ns| {
-            const cbody = lookupEmbedExtraInstDecls(in.embed_metadata, ns) orelse continue;
-            try collectCrossIfaceTypeNeeds(a, tables, cbody, &cross_needs);
-        }
-    }
-
     var out = std.ArrayListUnmanaged(EmbedExtraArg).empty;
 
-    // Cumulative func position into `in.embed_extra_slot_infos` —
-    // matches the same iteration order. Used to map per-func shim
-    // slot indices.
-    var slot_cursor: usize = 0;
-
-    for (ns_names.items) |ns| {
-        // Gather funcs in this namespace (declaration order
-        // within the namespace; same order as the slot infos).
-        var funcs = std.ArrayListUnmanaged(struct {
-            name: []const u8,
-            sig: core_imports.FuncSig,
-        }).empty;
-        for (in.embed_iface.imports) |im| {
-            if (im.kind != .func) continue;
-            if (!std.mem.eql(u8, im.module_name, ns)) continue;
-            const sig = im.sig orelse continue;
-            try funcs.append(a, .{ .name = im.field_name, .sig = sig });
-        }
-        if (funcs.items.len == 0) continue;
-
-        // Build the instance type's body. Two paths:
-        //
-        //   * If the embed's `component-type:<world>` custom section
-        //     declares this namespace as an import with a body that
-        //     is self-contained (no aliases — i.e. no
-        //     `use other-iface.{T};` references), clone its decls
-        //     verbatim into the wrapping component's arena. This
-        //     preserves every supporting `Type(Defined(...))` decl
-        //     (Result/Record/Variant/List/etc.) the FuncTypes
-        //     reference via `type_idx`. Cataggar/wabt#228 motivated
-        //     this path: pre-fix the splicer only emitted
-        //     `Type(Func)` + `Export` decls per imported function,
-        //     dropping the Defined type-defs the funcs referenced
-        //     and producing a wrapping component with dangling
-        //     local-type-index operands.
-        //
-        //   * Otherwise (no embed component-type section, or its
-        //     body has cross-iface aliases we don't yet rebase),
-        //     fall back to the original per-func synthesis path
-        //     which builds a primitive-only body from the core
-        //     wasm sigs.
-        // Namespaces the adapter-hoisted world already imports (e.g.
-        // wasi:io/poll / wasi:io/streams, which the preview1 adapter
-        // imports for its own preview2 calls) must NOT be re-imported
-        // here — a second top-level import of the same name makes the
-        // component invalid ("import name conflicts"). Reuse the
-        // hoisted instance; the embed's own core imports for these
-        // funcs are still satisfied below via the shim/fixup bundle,
-        // whose canon.lower aliases each func from this shared instance.
-        const imp_inst_idx: u32 = if (findInstanceSlot(in.hoisted, ns)) |hslot| hslot.instance_idx else blk_imp: {
-        var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
-        const canonical_inst_decls = lookupEmbedExtraInstDecls(in.embed_metadata, ns);
-        // Prune the canonical body down to just the funcs the embed
-        // actually imports from this namespace. A body whose *full*
-        // form carries cross-iface `use` aliases (e.g. wasi:http/types
-        // pulling `duration` from wasi:clocks) reduces to an
-        // alias-free, self-contained body once only the imported funcs
-        // (and their transitive local type-deps — resources, `own`
-        // wrappers, records, …) are retained. Without this, such
-        // namespaces fall to the per-func synthesis path below, which
-        // drops the `Type(Defined(...))` decls the func results
-        // reference and emits dangling local `type_idx` operands
-        // (the `unknown type N` failure in cataggar/wabt#234).
-        const pruned_inst_decls: ?[]const ctypes.Decl = if (canonical_inst_decls) |decls| blk: {
-            const method_names = try a.alloc([]const u8, funcs.items.len);
-            for (funcs.items, 0..) |f, fi| method_names[fi] = f.name;
-            const extra_type_exports: []const []const u8 = if (cross_needs.get(ns)) |list|
-                list.items
-            else
-                &.{};
-            break :blk world_gc.gcInstanceBody(a, decls, method_names, extra_type_exports) catch null;
-        } else null;
-        const canonical_body = pruned_inst_decls orelse canonical_inst_decls;
-        const alias_free = canonical_body != null and
-            isInstBodyAliasFree(canonical_body.?);
-        // When the pruned canonical body is self-contained except for
-        // cross-iface `(alias outer 1 K)` references (e.g.
-        // wasi:http/types pulling `pollable` from wasi:io/poll and
-        // `input-stream` from wasi:io/streams via `use`), rebase those
-        // aliases onto the wrapping component's matching imported
-        // instances and use the canonical body anyway. Without this
-        // the namespace falls to the per-func synthesis fallback,
-        // which drops the `Type(Defined(...))` decls the func sigs
-        // reference and emits dangling local `type_idx` operands —
-        // the `unknown type N: type index out of bounds` failure
-        // wasmtime rejects (cataggar/wabt#234).
-        const rebased_body: ?[]const ctypes.Decl = if (canonical_body != null and !alias_free)
-            (rebaseCanonicalInstBody(b, a, in, canonical_body.?, iface_inst_idx_for_ns) catch null)
-        else
-            null;
-        const final_canonical: ?[]const ctypes.Decl = if (alias_free) canonical_body else rebased_body;
-        if (final_canonical) |decls| {
-            // Identity remap: `gcInstanceBody` already renumbered the
-            // pruned body's local type-slot layout consistently, so
-            // each `type_idx` operand still resolves to its Defined.
-            // Any cross-iface `(alias outer 1 K)` decls were rewritten
-            // by `rebaseCanonicalInstBody` to point at fresh top-level
-            // type slots; `cloneDecl` leaves those `outer` idxs verbatim.
-            const slot_count = countInstBodyTypeSlots(decls);
-            const identity_remap = try a.alloc(u32, @max(slot_count, 1));
-            for (identity_remap, 0..) |*x, i| x.* = @intCast(i);
-            for (decls) |d| {
-                try inst_decls.append(a, try type_walk.cloneDecl(a, d, identity_remap, &.{}));
-            }
-        } else {
-            // Fallback: per-func synthesis. One (export "<name>"
-            // (func F)) per func, with each func having a fresh
-            // component-level FuncType. Prefer pulling the
-            // FuncType verbatim from the embed's component-type
-            // if available (preserves original param names +
-            // non-primitive types). Otherwise synthesize a
-            // p0/p1-named primitive sig from the core sigs alone.
-            //
-            // Warning: this path silently substitutes primitive
-            // sigs when `lookupEmbedFuncType` returns null, so any
-            // func whose sig reaches a Defined type WITHOUT an
-            // embed component-type section will end up with the
-            // wrong shape. That's the same trade-off the code has
-            // always made; the canonical-body path above is
-            // strictly better when available.
-            var local_type_idx: u32 = 0;
-            for (funcs.items) |f| {
-                const ft: ctypes.FuncType = lookupEmbedFuncType(in.embed_world, ns, f.name) orelse blk_ft: {
-                    const params = try a.alloc(ctypes.NamedValType, f.sig.params.len);
-                    for (f.sig.params, 0..) |p, pi| {
-                        const pname = try std.fmt.allocPrint(a, "p{d}", .{pi});
-                        params[pi] = .{ .name = pname, .type = coreToCompValType(p) };
-                    }
-                    const results: ctypes.FuncType.ResultList = if (f.sig.results.len == 0) .none else blk: {
-                        if (f.sig.results.len == 1) {
-                            break :blk .{ .unnamed = coreToCompValType(f.sig.results[0]) };
-                        }
-                        const named = try a.alloc(ctypes.NamedValType, f.sig.results.len);
-                        for (f.sig.results, 0..) |r, ri| {
-                            const rname = try std.fmt.allocPrint(a, "r{d}", .{ri});
-                            named[ri] = .{ .name = rname, .type = coreToCompValType(r) };
-                        }
-                        break :blk .{ .named = named };
+    for (in.embed_extra_plan.namespaces) |namespace| {
+        const imp_inst_idx: u32 = if (findInstanceSlot(in.hoisted, namespace.name)) |slot|
+            slot.instance_idx
+        else blk: {
+            var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
+            if (namespace.metadata_ext) |ext| {
+                const rebased = try rebaseCanonicalInstBody(
+                    b,
+                    a,
+                    in,
+                    ext.inst_decls,
+                    iface_inst_idx_for_ns,
+                );
+                // The full metadata body is retained. Identity cloning
+                // preserves every local declaration/type relationship.
+                const decls = rebased;
+                const slot_count = countInstBodyTypeSlots(decls);
+                const identity_remap = try a.alloc(u32, @max(slot_count, 1));
+                for (identity_remap, 0..) |*x, i| x.* = @intCast(i);
+                for (decls) |d| {
+                    try inst_decls.append(a, try type_walk.cloneDecl(a, d, identity_remap, &.{}));
+                }
+            } else {
+                // Compatibility path for metadata-free primitive
+                // imports. Intrinsics were rejected while planning.
+                var local_type_idx: u32 = 0;
+                for (namespace.fields) |field| {
+                    const slot_idx = switch (field) {
+                        .ordinary_slot => |idx| idx,
+                        .intrinsic => unreachable,
                     };
-                    break :blk_ft .{ .params = params, .results = results };
-                };
-
-                try inst_decls.append(a, .{ .type = .{ .func = ft } });
-                const ftype_idx = local_type_idx;
-                local_type_idx += 1;
-                try inst_decls.append(a, .{ .@"export" = .{
-                    .name = f.name,
-                    .desc = .{ .func = ftype_idx },
-                } });
+                    const info = in.embed_extra_plan.slot_infos[slot_idx];
+                    try inst_decls.append(a, .{ .type = .{ .func = info.func_type } });
+                    const ftype_idx = local_type_idx;
+                    local_type_idx += 1;
+                    try inst_decls.append(a, .{ .@"export" = .{
+                        .name = info.fn_name,
+                        .desc = .{ .func = ftype_idx },
+                    } });
+                }
             }
-        }
 
-        const inst_type_idx = try b.addType(.{ .instance = .{
-            .decls = try inst_decls.toOwnedSlice(a),
-        } });
-        break :blk_imp try b.addImport(.{
-            .name = ns,
-            .desc = .{ .instance = inst_type_idx },
-        });
-        };
-        try iface_inst_idx_for_ns.put(a, ns, imp_inst_idx);
-
-        // For each func: alias the shim trampoline at this func's
-        // slot in the global shim table (`embed_extra_slot_base +
-        // slot_cursor`). The fixup module patches each trampoline
-        // with the canon-lowered func emitted in Step 10.
-        // (cataggar/wabt#230 — routing embed-extra funcs through
-        // the fixup table lets canon.lower reference
-        // `main.memory` + `main.cabi_realloc`, which aren't
-        // available before `main_inst` is instantiated below.)
-        var inline_exps = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
-        for (funcs.items, 0..) |f, fi| {
-            const slot_total: u32 = @intCast(in.embed_extra_slot_base + slot_cursor + fi);
-            const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
-            const f_idx = try b.addAlias(.{ .instance_export = .{
-                .sort = .{ .core = .func },
-                .instance_idx = shim_inst,
-                .name = slot_name,
+            const inst_type_idx = try b.addType(.{ .instance = .{
+                .decls = try inst_decls.toOwnedSlice(a),
             } });
-            try inline_exps.append(a, .{
-                .name = f.name,
-                .sort_idx = .{ .sort = .func, .idx = f_idx },
+            break :blk try b.addImport(.{
+                .name = namespace.name,
+                .desc = .{ .instance = inst_type_idx },
             });
-        }
-        slot_cursor += funcs.items.len;
+        };
+        try iface_inst_idx_for_ns.put(a, namespace.name, imp_inst_idx);
+
+        // Metadata-only type providers need a component import but no
+        // core `(with …)` argument.
+        if (namespace.fields.len == 0) continue;
+
+        var inline_exps = std.ArrayListUnmanaged(ctypes.CoreInlineExport).empty;
+        var resource_type_for_name = std.StringHashMapUnmanaged(u32).empty;
+        defer resource_type_for_name.deinit(a);
+        for (namespace.fields) |field| switch (field) {
+            .ordinary_slot => |slot_idx| {
+                const info = in.embed_extra_plan.slot_infos[slot_idx];
+                const slot_total = in.embed_extra_slot_base + slot_idx;
+                const slot_name = try std.fmt.allocPrint(a, "{d}", .{slot_total});
+                const f_idx = try b.addAlias(.{ .instance_export = .{
+                    .sort = .{ .core = .func },
+                    .instance_idx = shim_inst,
+                    .name = slot_name,
+                } });
+                try inline_exps.append(a, .{
+                    .name = info.fn_name,
+                    .sort_idx = .{ .sort = .func, .idx = f_idx },
+                });
+            },
+            .intrinsic => |intrinsic| {
+                const gop = try resource_type_for_name.getOrPut(a, intrinsic.resource_name);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = try b.addAlias(.{ .instance_export = .{
+                        .sort = .type,
+                        .instance_idx = imp_inst_idx,
+                        .name = intrinsic.resource_name,
+                    } });
+                }
+                const canon_idx = try b.addCanon(.{ .resource_drop = gop.value_ptr.* });
+                try inline_exps.append(a, .{
+                    .name = intrinsic.field_name,
+                    .sort_idx = .{ .sort = .func, .idx = canon_idx },
+                });
+            },
+        };
 
         const bundle_inst = try b.addCoreInstance(.{ .exports = try inline_exps.toOwnedSlice(a) });
-        try out.append(a, .{ .name = ns, .inst_idx = bundle_inst });
+        try out.append(a, .{ .name = namespace.name, .inst_idx = bundle_inst });
     }
 
     return out.toOwnedSlice(a);
 }
 
-fn coreToCompValType(v: wtypes.ValType) ctypes.ValType {
+fn coreToCompValType(v: wtypes.ValType) ?ctypes.ValType {
     return switch (v) {
         .i32 => .u32,
         .i64 => .u64,
         .f32 => .f32,
         .f64 => .f64,
-        else => .u32,
+        else => null,
     };
-}
-
-/// Look up the canonical instance-body decls the embed declared
-/// for `ns` in its `component-type:<world>` custom section. Used
-/// by `buildEmbedExtraImports` (cataggar/wabt#228) so the wrapping
-/// component's import body preserves every Defined typedef the
-/// embed's FuncTypes reference via `type_idx`.
-///
-/// Searches both imports and exports in `embed_metadata.externs`;
-/// returns the matching extern's `inst_decls`, or null when no
-/// component-type section was decoded or the namespace isn't
-/// present.
-fn lookupEmbedExtraInstDecls(maybe_metadata: ?metadata_decode.DecodedWorld, ns: []const u8) ?[]const ctypes.Decl {
-    const md = maybe_metadata orelse return null;
-    for (md.externs) |ext| {
-        if (!std.mem.eql(u8, ext.qualified_name, ns)) continue;
-        if (ext.is_export) continue;
-        return ext.inst_decls;
-    }
-    return null;
-}
-
-/// An instance body is "alias-free" when none of its decls is an
-/// `.alias` decl. Such bodies are self-contained and can be cloned
-/// verbatim into a new component's arena without rebasing
-/// cross-iface `(alias outer 1 K)` references — the simple
-/// fast-path that `buildEmbedExtraImports` (cataggar/wabt#228)
-/// takes for user-defined ifaces without `use` clauses.
-///
-/// Bodies that DO contain aliases would need outer-scope rebasing
-/// (`component_new.rebaseInstDecls` does this for the
-/// shim/fixup path); supporting that here is a follow-up if a
-/// real input demands it. For now alias-bearing bodies fall back
-/// to the per-func synthesis path.
-fn isInstBodyAliasFree(decls: []const ctypes.Decl) bool {
-    for (decls) |d| if (d == .alias) return false;
-    return true;
 }
 
 /// Classification of a type-allocating world-body slot, used to
@@ -2408,11 +2578,15 @@ const WorldTypeTables = struct {
     type_kind: []const WorldTypeKind,
 };
 
-fn buildWorldTypeTables(a: Allocator, world_decls: []const ctypes.Decl) !WorldTypeTables {
+fn buildWorldTypeTables(
+    a: Allocator,
+    world_decls: []const ctypes.Decl,
+) SpliceError!WorldTypeTables {
     var inst_qname = std.ArrayListUnmanaged([]const u8).empty;
     var type_kind = std.ArrayListUnmanaged(WorldTypeKind).empty;
     for (world_decls) |d| switch (d) {
-        .type, .core_type => try type_kind.append(a, .other),
+        .type => try type_kind.append(a, .other),
+        .core_type => {},
         .alias => |al| switch (al) {
             .instance_export => |ie| if (ie.sort == .type) try type_kind.append(a, .{
                 .alias_instance_export = .{ .world_inst_idx = ie.instance_idx, .name = ie.name },
@@ -2421,10 +2595,12 @@ fn buildWorldTypeTables(a: Allocator, world_decls: []const ctypes.Decl) !WorldTy
         },
         .import => |im| switch (im.desc) {
             .instance => try inst_qname.append(a, im.name),
+            .type => try type_kind.append(a, .other),
             else => {},
         },
         .@"export" => |e| switch (e.desc) {
             .instance => try inst_qname.append(a, e.name),
+            .type => try type_kind.append(a, .other),
             else => {},
         },
     };
@@ -2448,53 +2624,56 @@ fn buildWorldTypeTables(a: Allocator, world_decls: []const ctypes.Decl) !WorldTy
 /// `(alias outer 1 <new-top-level-type-slot>)`. Mirrors
 /// `component_new.rebaseInstDecls`.
 ///
-/// Returns `null` (caller falls back) when the metadata is absent or
-/// any alias target can't be resolved to an imported instance.
+/// Metadata is authoritative on this path: every malformed or
+/// unresolved alias is an explicit splice failure, never a signal to
+/// synthesize primitive types.
 fn rebaseCanonicalInstBody(
     b: *Builder,
     a: Allocator,
     in: Inputs,
     body: []const ctypes.Decl,
     iface_inst_idx_for_ns: *std.StringHashMapUnmanaged(u32),
-) !?[]const ctypes.Decl {
-    const md = in.embed_metadata orelse return null;
+) SpliceError![]const ctypes.Decl {
+    const md = in.embed_metadata orelse return error.InvalidEmbedMetadata;
     const tables = try buildWorldTypeTables(a, md.world_decls);
 
     const out = try a.alloc(ctypes.Decl, body.len);
     for (body, 0..) |d, i| {
         switch (d) {
-            .alias => |al| switch (al) {
-                .outer => |o| {
-                    if (o.sort != .type or o.outer_count != 1) return null;
-                    if (o.idx >= tables.type_kind.len) return null;
-                    switch (tables.type_kind[o.idx]) {
-                        .alias_instance_export => |ie| {
-                            if (ie.world_inst_idx >= tables.inst_qname.len) return null;
-                            const src_ns = tables.inst_qname[ie.world_inst_idx];
-                            const inst_idx: u32 = if (findInstanceSlot(in.hoisted, src_ns)) |slot|
-                                slot.instance_idx
-                            else if (iface_inst_idx_for_ns.get(src_ns)) |idx|
-                                idx
-                            else
-                                return null;
-                            const new_slot = try b.addAlias(.{ .instance_export = .{
-                                .sort = .type,
-                                .instance_idx = inst_idx,
-                                .name = ie.name,
-                            } });
-                            out[i] = .{ .alias = .{ .outer = .{
-                                .sort = .type,
-                                .outer_count = 1,
-                                .idx = new_slot,
-                            } } };
-                        },
-                        .other => return null,
-                    }
-                },
-                // A body-level `alias instance-export` would reference
-                // the world's instance indexspace, not reconstructed
-                // here; bail to the fallback rather than mis-encode.
-                .instance_export => return null,
+            .alias => |alias| {
+                const target = try metadataAliasTarget(tables, alias);
+                if (target.world_inst_idx >= tables.inst_qname.len)
+                    return error.EmbedMetadataAliasMalformed;
+                const src_ns = tables.inst_qname[target.world_inst_idx];
+                var provider: ?metadata_decode.WorldExtern = null;
+                for (md.externs) |ext| {
+                    if (ext.is_export or
+                        !std.mem.eql(u8, ext.qualified_name, src_ns)) continue;
+                    if (provider != null)
+                        return error.EmbedMetadataAliasMalformed;
+                    provider = ext;
+                }
+                if (provider == null or
+                    !metadataHasTypeExport(provider.?, target.name))
+                {
+                    return error.EmbedMetadataAliasMalformed;
+                }
+                const inst_idx: u32 = if (findInstanceSlot(in.hoisted, src_ns)) |slot|
+                    slot.instance_idx
+                else if (iface_inst_idx_for_ns.get(src_ns)) |idx|
+                    idx
+                else
+                    return error.EmbedMetadataAliasMalformed;
+                const new_slot = try b.addAlias(.{ .instance_export = .{
+                    .sort = .type,
+                    .instance_idx = inst_idx,
+                    .name = target.name,
+                } });
+                out[i] = .{ .alias = .{ .outer = .{
+                    .sort = .type,
+                    .outer_count = 1,
+                    .idx = new_slot,
+                } } };
             },
             else => out[i] = d,
         }
@@ -2502,60 +2681,18 @@ fn rebaseCanonicalInstBody(
     return out;
 }
 
-/// For an embed-extra instance body, collect the names of the
-/// type-exports it imports from OTHER namespaces via cross-iface
-/// `(alias outer 1 K)` decls, grouping them by the source namespace.
-/// Appends into `needs` (keyed by source namespace). Used so that
-/// when a provider namespace's body is pruned to its own live funcs,
-/// the type-exports consumed by sibling bodies (e.g.
-/// `wasi:http/outgoing-handler.handle` needing `request-options`,
-/// `outgoing-request`, … from `wasi:http/types`) are retained.
-fn collectCrossIfaceTypeNeeds(
-    a: Allocator,
-    tables: WorldTypeTables,
-    body: []const ctypes.Decl,
-    needs: *std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)),
-) !void {
-    for (body) |d| {
-        const o = switch (d) {
-            .alias => |al| switch (al) {
-                .outer => |outer| outer,
-                else => continue,
-            },
-            else => continue,
-        };
-        if (o.sort != .type or o.outer_count != 1) continue;
-        if (o.idx >= tables.type_kind.len) continue;
-        switch (tables.type_kind[o.idx]) {
-            .alias_instance_export => |ie| {
-                if (ie.world_inst_idx >= tables.inst_qname.len) continue;
-                const src_ns = tables.inst_qname[ie.world_inst_idx];
-                const gop = try needs.getOrPut(a, src_ns);
-                if (!gop.found_existing) gop.value_ptr.* = .empty;
-                // Dedup.
-                var present = false;
-                for (gop.value_ptr.items) |n| if (std.mem.eql(u8, n, ie.name)) {
-                    present = true;
-                    break;
-                };
-                if (!present) try gop.value_ptr.append(a, ie.name);
-            },
-            .other => {},
-        }
-    }
-}
-
 /// Count the local-type-slot allocations in an instance-body decl
 /// list. Mirrors `world_gc.allocatesWorldBodyTypeSlot` semantics
-/// at depth 1: every `.type` / `.core_type` decl and every
-/// type-sort `.alias` (whether `instance_export` or `outer`)
-/// bumps the local type indexspace by one. Used to size the
+/// at depth 1: every `.type` decl and every type-sort `.alias`
+/// (whether `instance_export` or `outer`) bumps the local component
+/// type indexspace by one. Core types occupy a separate indexspace. Used to size the
 /// identity remap passed to `type_walk.cloneDecl` in
 /// `buildEmbedExtraImports`.
 fn countInstBodyTypeSlots(decls: []const ctypes.Decl) u32 {
     var n: u32 = 0;
     for (decls) |d| switch (d) {
-        .type, .core_type => n += 1,
+        .type => n += 1,
+        .core_type => {},
         .alias => |a| {
             const sort: ctypes.Sort = switch (a) {
                 .instance_export => |ie| ie.sort,
@@ -2563,80 +2700,14 @@ fn countInstBodyTypeSlots(decls: []const ctypes.Decl) u32 {
             };
             if (sort == .type) n += 1;
         },
-        else => {},
+        .import => |im| if (im.desc == .type) {
+            n += 1;
+        },
+        .@"export" => |e| if (e.desc == .type) {
+            n += 1;
+        },
     };
     return n;
-}
-
-/// Walk the embed's world body to find an exported func type by
-/// `(namespace, func_name)`. Returns null if not present (e.g. the
-/// embed has no `component-type` section, the namespace isn't an
-/// instance import, or the export wasn't found).
-fn lookupEmbedFuncType(maybe_world: ?decode.AdapterWorld, ns: []const u8, func_name: []const u8) ?ctypes.FuncType {
-    const w = maybe_world orelse return null;
-    for (w.imports) |im| {
-        if (!std.mem.eql(u8, im.name, ns)) continue;
-        const inst_td = resolveTypeIdxAtTopLevel(w.body_decls, im.body_type_idx) orelse return null;
-        if (inst_td != .instance) return null;
-        for (inst_td.instance.decls) |d| switch (d) {
-            .@"export" => |e| {
-                if (e.desc != .func) continue;
-                if (!std.mem.eql(u8, e.name, func_name)) continue;
-                const ftd = resolveTypeIdxAtTopLevel(inst_td.instance.decls, e.desc.func) orelse return null;
-                if (ftd != .func) return null;
-                return ftd.func;
-            },
-            else => {},
-        };
-        return null;
-    }
-    return null;
-}
-
-/// Walk a decl list and return the TypeDef at the given indexspace
-/// position, following `(eq …)` aliases inside the same scope.
-/// Used at "top level" (a world body or instance body) where there
-/// is no outer alias chain to follow.
-fn resolveTypeIdxAtTopLevel(decls: []const ctypes.Decl, target: u32) ?ctypes.TypeDef {
-    var cursor: u32 = 0;
-    for (decls) |d| switch (d) {
-        .type => |td| {
-            if (cursor == target) return td;
-            cursor += 1;
-        },
-        .core_type => cursor += 1,
-        .alias => |al| {
-            const sort: ctypes.Sort = switch (al) {
-                .instance_export => |ie| ie.sort,
-                .outer => |o| o.sort,
-            };
-            if (sort == .type) {
-                if (cursor == target) {
-                    return switch (al) {
-                        .outer => |o| if (o.sort == .type)
-                            resolveTypeIdxAtTopLevel(decls, o.idx)
-                        else
-                            null,
-                        else => null,
-                    };
-                }
-                cursor += 1;
-            }
-        },
-        .@"export" => |e| {
-            if (e.desc == .type) {
-                if (cursor == target) {
-                    return switch (e.desc.type) {
-                        .eq => |i| resolveTypeIdxAtTopLevel(decls, i),
-                        .sub_resource => ctypes.TypeDef{ .resource = .{} },
-                    };
-                }
-                cursor += 1;
-            }
-        },
-        else => {},
-    };
-    return null;
 }
 
 /// Synthesize a tiny core module that exports trapping versions of
@@ -3783,4 +3854,853 @@ test "splice #241: resource-bearing embed-extra import keeps own/borrow/option (
         else => res.unnamed,
     };
     try testing.expect(res_vt == .own);
+}
+
+fn testImportInstanceBody(
+    comp: *const ctypes.Component,
+    name: []const u8,
+) ?[]const ctypes.Decl {
+    for (comp.imports) |im| {
+        if (!std.mem.eql(u8, im.name, name) or im.desc != .instance) continue;
+        if (im.desc.instance >= comp.type_indexspace.len) return null;
+        const contributor = comp.type_indexspace[im.desc.instance];
+        if (contributor != .type_def or contributor.type_def >= comp.types.len) return null;
+        const td = comp.types[contributor.type_def];
+        if (td != .instance) return null;
+        return td.instance.decls;
+    }
+    return null;
+}
+
+fn testCoreBundleContaining(
+    comp: *const ctypes.Component,
+    field: []const u8,
+) ?[]const ctypes.CoreInlineExport {
+    for (comp.core_instances) |instance| switch (instance) {
+        .exports => |exports| {
+            for (exports) |e| {
+                if (std.mem.eql(u8, e.name, field)) return exports;
+            }
+        },
+        else => {},
+    };
+    return null;
+}
+
+fn testImportedInstanceIndex(
+    comp: *const ctypes.Component,
+    import_idx: u32,
+) ?u32 {
+    for (comp.comp_instance_indexspace, 0..) |contributor, idx| switch (contributor) {
+        .import => |candidate| if (candidate == import_idx) return @intCast(idx),
+        else => {},
+    };
+    return null;
+}
+
+fn testExpectImportedResourceAlias(
+    comp: *const ctypes.Component,
+    type_idx: u32,
+    instance_idx: u32,
+    resource_name: []const u8,
+) !void {
+    if (type_idx >= comp.type_indexspace.len) return error.TestUnexpectedResult;
+    const contributor = comp.type_indexspace[type_idx];
+    if (contributor != .alias or contributor.alias >= comp.aliases.len)
+        return error.TestUnexpectedResult;
+    const alias = comp.aliases[contributor.alias];
+    if (alias != .instance_export) return error.TestUnexpectedResult;
+    try testing.expect(alias.instance_export.sort == .type);
+    try testing.expectEqual(instance_idx, alias.instance_export.instance_idx);
+    try testing.expectEqualStrings(resource_name, alias.instance_export.name);
+}
+
+fn testInstanceBodyTypeSlots(
+    allocator: Allocator,
+    decls: []const ctypes.Decl,
+) ![]const ?ctypes.TypeDef {
+    var slots = std.ArrayListUnmanaged(?ctypes.TypeDef).empty;
+    for (decls) |decl| switch (decl) {
+        .type => |ty| try slots.append(allocator, ty),
+        .alias => |alias| {
+            const sort: ctypes.Sort = switch (alias) {
+                .instance_export => |ie| ie.sort,
+                .outer => |outer| outer.sort,
+            };
+            if (sort == .type) try slots.append(allocator, null);
+        },
+        .import => |im| if (im.desc == .type) {
+            try slots.append(allocator, null);
+        },
+        .@"export" => |ex| if (ex.desc == .type) {
+            try slots.append(allocator, null);
+        },
+        .core_type => {},
+    };
+    return slots.toOwnedSlice(allocator);
+}
+
+fn testEmptyHoisted() types_import.Hoisted {
+    return .{
+        .types = &.{},
+        .imports = &.{},
+        .aliases = &.{},
+        .section_order = &.{},
+        .instances = &.{},
+        .exports = &.{},
+        .type_count = 0,
+    };
+}
+
+test "adapter imported resources wire drop and reject new and rep during classification" {
+    const source =
+        \\package fixtures:adapter-resources@0.1.0;
+        \\interface store { resource blob; }
+        \\world adapter { import store; }
+    ;
+    const ct = try metadata_encode_for_test.encodeWorldFromSource(
+        testing.allocator,
+        source,
+        "adapter",
+    );
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const world = try decode.parse(ar, ct);
+    const hoisted = try types_import.hoist(ar, world);
+    const namespace = hoisted.instances[0].name;
+    const one_i32 = [_]wtypes.ValType{.i32};
+
+    const drop_imports = [_]core_imports.ImportEntry{.{
+        .module_name = namespace,
+        .field_name = "[resource-drop]blob",
+        .kind = .func,
+        .sig = .{ .params = &one_i32, .results = &.{} },
+    }};
+    const buckets = try classifyAdapterImports(
+        ar,
+        .{ .imports = &drop_imports, .exports = &.{} },
+        world,
+        hoisted,
+    );
+    try testing.expectEqual(@as(usize, 1), buckets.len);
+    try testing.expectEqual(@as(usize, 1), buckets[0].resource_drops.len);
+    try testing.expectEqualStrings("[resource-drop]blob", buckets[0].resource_drops[0].field_name);
+    try testing.expectEqualStrings("blob", buckets[0].resource_drops[0].resource_name);
+    try testing.expectEqual(@as(usize, 0), buckets[0].direct_funcs.len);
+    try testing.expectEqual(@as(usize, 0), buckets[0].indirect_funcs.len);
+
+    const cases = [_]struct {
+        field_name: []const u8,
+        expected: anyerror,
+    }{
+        .{
+            .field_name = "[resource-new]blob",
+            .expected = error.AdapterImportedResourceNewUnsupported,
+        },
+        .{
+            .field_name = "[resource-rep]blob",
+            .expected = error.AdapterImportedResourceRepUnsupported,
+        },
+    };
+    for (cases) |case| {
+        const imports = [_]core_imports.ImportEntry{.{
+            .module_name = namespace,
+            .field_name = case.field_name,
+            .kind = .func,
+            .sig = .{ .params = &one_i32, .results = &one_i32 },
+        }};
+        try testing.expectError(
+            case.expected,
+            classifyAdapterImports(
+                ar,
+                .{ .imports = &imports, .exports = &.{} },
+                world,
+                hoisted,
+            ),
+        );
+    }
+}
+
+test "buildWorldTypeTables keeps core and component type index spaces separate" {
+    const decls = [_]ctypes.Decl{
+        .{ .core_type = .{ .func = .{ .params = &.{}, .results = &.{} } } },
+        .{ .alias = .{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = 4,
+            .name = "item",
+        } } },
+    };
+    const tables = try buildWorldTypeTables(testing.allocator, &decls);
+    defer testing.allocator.free(tables.inst_qname);
+    defer testing.allocator.free(tables.type_kind);
+
+    try testing.expectEqual(@as(usize, 1), tables.type_kind.len);
+    const target = try metadataAliasTarget(tables, .{ .outer = .{
+        .sort = .type,
+        .outer_count = 1,
+        .idx = 0,
+    } });
+    try testing.expectEqual(@as(u32, 4), target.world_inst_idx);
+    try testing.expectEqualStrings("item", target.name);
+    try testing.expectEqual(@as(u32, 1), countInstBodyTypeSlots(&decls));
+}
+
+test "splice #328: imported resource new and rep are rejected before assembly" {
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithDirectResourceImports(a);
+    defer a.free(embed_bytes);
+
+    // The full fixture declares rep before new, so splice reports rep
+    // rather than emitting an invalid canon resource.rep.
+    try testing.expectError(
+        error.EmbedImportedResourceRepUnsupported,
+        splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1"),
+    );
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    var owned = try core_imports.extract(a, embed_bytes);
+    defer owned.deinit();
+    const payload = (try decode.extractEncodedWorld(embed_bytes)) orelse
+        return error.TestUnexpectedResult;
+    const md = try metadata_decode.decode(ar, payload);
+
+    // Exercise new independently so both invalid imported-resource
+    // operations have a precise planning error.
+    var new_import: ?core_imports.ImportEntry = null;
+    for (owned.interface.imports) |im| {
+        if (std.mem.eql(u8, im.module_name, test_fixtures.DIRECT_RESOURCE_NAMESPACE) and
+            std.mem.eql(u8, im.field_name, test_fixtures.DIRECT_RESOURCE_NEW))
+        {
+            new_import = im;
+            break;
+        }
+    }
+    const only_new = [_]core_imports.ImportEntry{
+        new_import orelse return error.TestUnexpectedResult,
+    };
+    try testing.expectError(
+        error.EmbedImportedResourceNewUnsupported,
+        buildEmbedExtraImportPlan(
+            ar,
+            .{ .imports = &only_new, .exports = &.{} },
+            md,
+            "wasi_snapshot_preview1",
+            &.{},
+            testEmptyHoisted(),
+        ),
+    );
+}
+
+test "splice #328: resource-only metadata import has no shim slot and keeps its full instance body" {
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithDirectResourceImportsVariant(
+        a,
+        .resource_only,
+    );
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    const body = testImportInstanceBody(&comp, test_fixtures.DIRECT_RESOURCE_NAMESPACE) orelse
+        return error.TestUnexpectedResult;
+    var has_method = false;
+    for (body) |decl| switch (decl) {
+        .@"export" => |e| if (std.mem.eql(
+            u8,
+            e.name,
+            test_fixtures.DIRECT_RESOURCE_METHOD,
+        )) {
+            has_method = true;
+        },
+        else => {},
+    };
+    try testing.expect(has_method);
+
+    const bundle = testCoreBundleContaining(&comp, test_fixtures.DIRECT_RESOURCE_DROP) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 1), bundle.len);
+    const contributor = comp.core_func_indexspace[bundle[0].sort_idx.idx];
+    try testing.expect(contributor == .canon);
+    try testing.expect(comp.canons[contributor.canon] == .resource_drop);
+}
+
+test "splice #328: cross-interface imported resource identity survives direct-import wiring" {
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticReactorAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes =
+        try test_fixtures.buildSyntheticReactorEmbedWithCrossInterfaceImports(a);
+    defer a.free(embed_bytes);
+
+    var embed_owned = try core_imports.extract(a, embed_bytes);
+    defer embed_owned.deinit();
+    var core_provider_pos: ?usize = null;
+    var core_consumer_pos: ?usize = null;
+    for (embed_owned.interface.imports, 0..) |im, idx| {
+        if (std.mem.eql(
+            u8,
+            im.module_name,
+            test_fixtures.CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        ) and core_provider_pos == null) {
+            core_provider_pos = idx;
+        }
+        if (std.mem.eql(
+            u8,
+            im.module_name,
+            test_fixtures.CROSS_INTERFACE_CONSUMER_NAMESPACE,
+        ) and core_consumer_pos == null) {
+            core_consumer_pos = idx;
+        }
+    }
+    try testing.expect(
+        (core_consumer_pos orelse return error.TestUnexpectedResult) <
+            (core_provider_pos orelse return error.TestUnexpectedResult),
+    );
+
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const payload = (try decode.extractEncodedWorld(embed_bytes)) orelse
+        return error.TestUnexpectedResult;
+    const md = try metadata_decode.decode(ar, payload);
+    var metadata_provider_pos: ?usize = null;
+    var metadata_consumer_pos: ?usize = null;
+    for (md.externs, 0..) |ext, idx| {
+        if (std.mem.eql(
+            u8,
+            ext.qualified_name,
+            test_fixtures.CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        )) metadata_provider_pos = idx;
+        if (std.mem.eql(
+            u8,
+            ext.qualified_name,
+            test_fixtures.CROSS_INTERFACE_CONSUMER_NAMESPACE,
+        )) metadata_consumer_pos = idx;
+    }
+    try testing.expect(
+        (metadata_provider_pos orelse return error.TestUnexpectedResult) <
+            (metadata_consumer_pos orelse return error.TestUnexpectedResult),
+    );
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+    const comp = try loader.load(out, ar);
+
+    // The reactor path exports only the fixture's guest interface.
+    try testing.expectEqual(@as(usize, 1), comp.exports.len);
+    try testing.expectEqualStrings(
+        test_fixtures.CROSS_INTERFACE_GUEST_NAMESPACE,
+        comp.exports[0].name,
+    );
+    try testing.expect(comp.exports[0].desc == .instance);
+
+    var provider_count: usize = 0;
+    var consumer_count: usize = 0;
+    var provider_import_pos: ?usize = null;
+    var consumer_import_pos: ?usize = null;
+    var provider_import_idx: ?u32 = null;
+    for (comp.imports, 0..) |im, idx| {
+        if (sameNamespaceIgnoringVersion(
+            im.name,
+            test_fixtures.CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        )) {
+            try testing.expectEqualStrings(
+                test_fixtures.CROSS_INTERFACE_PROVIDER_NAMESPACE,
+                im.name,
+            );
+            try testing.expect(im.desc == .instance);
+            provider_count += 1;
+            provider_import_pos = idx;
+            provider_import_idx = @intCast(idx);
+        }
+        if (sameNamespaceIgnoringVersion(
+            im.name,
+            test_fixtures.CROSS_INTERFACE_CONSUMER_NAMESPACE,
+        )) {
+            try testing.expectEqualStrings(
+                test_fixtures.CROSS_INTERFACE_CONSUMER_NAMESPACE,
+                im.name,
+            );
+            try testing.expect(im.desc == .instance);
+            consumer_count += 1;
+            consumer_import_pos = idx;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), provider_count);
+    try testing.expectEqual(@as(usize, 1), consumer_count);
+    try testing.expect(
+        (provider_import_pos orelse return error.TestUnexpectedResult) <
+            (consumer_import_pos orelse return error.TestUnexpectedResult),
+    );
+    const provider_instance_idx = testImportedInstanceIndex(
+        &comp,
+        provider_import_idx orelse return error.TestUnexpectedResult,
+    ) orelse return error.TestUnexpectedResult;
+
+    const provider_body = testImportInstanceBody(
+        &comp,
+        test_fixtures.CROSS_INTERFACE_PROVIDER_NAMESPACE,
+    ) orelse return error.TestUnexpectedResult;
+    const consumer_body = testImportInstanceBody(
+        &comp,
+        test_fixtures.CROSS_INTERFACE_CONSUMER_NAMESPACE,
+    ) orelse return error.TestUnexpectedResult;
+
+    var provider_ctor_slot: ?u32 = null;
+    var provider_method_slot: ?u32 = null;
+    var provider_has_sub_resource = false;
+    for (provider_body) |decl| switch (decl) {
+        .@"export" => |ex| {
+            try testing.expect(!std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            ));
+            if (std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_RESOURCE,
+            )) {
+                try testing.expect(ex.desc == .type);
+                try testing.expect(ex.desc.type == .sub_resource);
+                provider_has_sub_resource = true;
+            } else if (std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_CTOR,
+            )) {
+                try testing.expect(ex.desc == .func);
+                provider_ctor_slot = ex.desc.func;
+            } else if (std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_METHOD,
+            )) {
+                try testing.expect(ex.desc == .func);
+                provider_method_slot = ex.desc.func;
+            }
+        },
+        else => {},
+    };
+    try testing.expect(provider_has_sub_resource);
+
+    const provider_slots = try testInstanceBodyTypeSlots(ar, provider_body);
+    try testing.expectEqual(@as(usize, 7), provider_slots.len);
+    const provider_own = provider_slots[1] orelse return error.TestUnexpectedResult;
+    try testing.expect(provider_own == .val and provider_own.val == .own);
+    try testing.expectEqual(@as(u32, 0), provider_own.val.own);
+    const provider_borrow = provider_slots[3] orelse return error.TestUnexpectedResult;
+    try testing.expect(provider_borrow == .val and provider_borrow.val == .borrow);
+    try testing.expectEqual(@as(u32, 0), provider_borrow.val.borrow);
+    const provider_list = provider_slots[4] orelse return error.TestUnexpectedResult;
+    try testing.expect(provider_list == .list);
+    try testing.expect(provider_list.list.element == .u8);
+    const provider_result = provider_slots[5] orelse return error.TestUnexpectedResult;
+    try testing.expect(provider_result == .result);
+    try testing.expect(provider_result.result.ok.? == .string);
+    try testing.expect(provider_result.result.err.? == .u32);
+
+    const provider_ctor =
+        provider_slots[provider_ctor_slot orelse return error.TestUnexpectedResult] orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(provider_ctor == .func);
+    try testing.expectEqual(@as(usize, 1), provider_ctor.func.params.len);
+    try testing.expect(provider_ctor.func.params[0].type == .string);
+    try testing.expect(provider_ctor.func.results == .unnamed);
+    try testing.expect(provider_ctor.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 1), provider_ctor.func.results.unnamed.type_idx);
+
+    const provider_method =
+        provider_slots[provider_method_slot orelse return error.TestUnexpectedResult] orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(provider_method == .func);
+    try testing.expectEqual(@as(usize, 2), provider_method.func.params.len);
+    try testing.expect(provider_method.func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 3), provider_method.func.params[0].type.type_idx);
+    try testing.expect(provider_method.func.params[1].type == .type_idx);
+    try testing.expectEqual(@as(u32, 4), provider_method.func.params[1].type.type_idx);
+    try testing.expect(provider_method.func.results == .unnamed);
+    try testing.expect(provider_method.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 5), provider_method.func.results.unnamed.type_idx);
+
+    var consumer_outer: ?ctypes.Alias = null;
+    var consumer_func_slot: ?u32 = null;
+    var consumer_resource_eq = false;
+    for (consumer_body) |decl| switch (decl) {
+        .alias => |alias| consumer_outer = alias,
+        .@"export" => |ex| {
+            try testing.expect(!std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            ));
+            if (std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_RESOURCE,
+            )) {
+                try testing.expect(ex.desc == .type);
+                try testing.expect(ex.desc.type == .eq);
+                try testing.expectEqual(@as(u32, 0), ex.desc.type.eq);
+                consumer_resource_eq = true;
+            } else if (std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_FUNC,
+            )) {
+                try testing.expect(ex.desc == .func);
+                consumer_func_slot = ex.desc.func;
+            }
+        },
+        else => {},
+    };
+    try testing.expect(consumer_resource_eq);
+    const outer_alias = consumer_outer orelse return error.TestUnexpectedResult;
+    try testing.expect(outer_alias == .outer);
+    try testing.expect(outer_alias.outer.sort == .type);
+    try testing.expectEqual(@as(u32, 1), outer_alias.outer.outer_count);
+    try testExpectImportedResourceAlias(
+        &comp,
+        outer_alias.outer.idx,
+        provider_instance_idx,
+        test_fixtures.CROSS_INTERFACE_RESOURCE,
+    );
+
+    const consumer_slots = try testInstanceBodyTypeSlots(ar, consumer_body);
+    try testing.expectEqual(@as(usize, 6), consumer_slots.len);
+    const consumer_borrow = consumer_slots[2] orelse return error.TestUnexpectedResult;
+    try testing.expect(consumer_borrow == .val and consumer_borrow.val == .borrow);
+    try testing.expectEqual(@as(u32, 1), consumer_borrow.val.borrow);
+    const consumer_list = consumer_slots[3] orelse return error.TestUnexpectedResult;
+    try testing.expect(consumer_list == .list);
+    try testing.expect(consumer_list.list.element == .u8);
+    const consumer_result = consumer_slots[4] orelse return error.TestUnexpectedResult;
+    try testing.expect(consumer_result == .result);
+    try testing.expect(consumer_result.result.ok.? == .type_idx);
+    try testing.expectEqual(@as(u32, 3), consumer_result.result.ok.?.type_idx);
+    try testing.expect(consumer_result.result.err.? == .string);
+    const consumer_func =
+        consumer_slots[consumer_func_slot orelse return error.TestUnexpectedResult] orelse
+        return error.TestUnexpectedResult;
+    try testing.expect(consumer_func == .func);
+    try testing.expectEqual(@as(usize, 2), consumer_func.func.params.len);
+    try testing.expect(consumer_func.func.params[0].type == .type_idx);
+    try testing.expectEqual(@as(u32, 2), consumer_func.func.params[0].type.type_idx);
+    try testing.expect(consumer_func.func.params[1].type == .string);
+    try testing.expect(consumer_func.func.results == .unnamed);
+    try testing.expect(consumer_func.func.results.unnamed == .type_idx);
+    try testing.expectEqual(@as(u32, 4), consumer_func.func.results.unnamed.type_idx);
+
+    // Resource drops are core glue only: no component instance type,
+    // component inline instance, top-level export, or component-func
+    // alias advertises the synthetic field.
+    for (comp.types) |ty| if (ty == .instance) {
+        for (ty.instance.decls) |decl| switch (decl) {
+            .@"export" => |ex| try testing.expect(!std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            )),
+            else => {},
+        };
+    };
+    for (comp.instances) |instance| switch (instance) {
+        .exports => |exports| for (exports) |ex| {
+            try testing.expect(!std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            ));
+        },
+        else => {},
+    };
+    for (comp.exports) |ex| {
+        try testing.expect(!std.mem.eql(
+            u8,
+            ex.name,
+            test_fixtures.CROSS_INTERFACE_DROP,
+        ));
+    }
+    for (comp.aliases) |alias| switch (alias) {
+        .instance_export => |ie| if (ie.sort == .func) {
+            try testing.expect(!std.mem.eql(
+                u8,
+                ie.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            ));
+        },
+        else => {},
+    };
+
+    var lower_count: usize = 0;
+    var resource_drop_count: usize = 0;
+    var resource_new_count: usize = 0;
+    var resource_rep_count: usize = 0;
+    var drop_type_idx: ?u32 = null;
+    for (comp.canons) |canon| switch (canon) {
+        .lower => lower_count += 1,
+        .resource_drop => |idx| {
+            resource_drop_count += 1;
+            drop_type_idx = idx;
+        },
+        .resource_new => resource_new_count += 1,
+        .resource_rep => resource_rep_count += 1,
+        else => {},
+    };
+    // One adapter lower plus the three ordinary direct imports. The
+    // resource drop consumes neither a fourth direct-import lower nor
+    // a fifth shim slot.
+    try testing.expectEqual(@as(usize, 4), lower_count);
+    try testing.expectEqual(@as(usize, 1), resource_drop_count);
+    try testing.expectEqual(@as(usize, 0), resource_new_count);
+    try testing.expectEqual(@as(usize, 0), resource_rep_count);
+    try testExpectImportedResourceAlias(
+        &comp,
+        drop_type_idx orelse return error.TestUnexpectedResult,
+        provider_instance_idx,
+        test_fixtures.CROSS_INTERFACE_RESOURCE,
+    );
+
+    var drop_core_export_count: usize = 0;
+    for (comp.core_instances) |instance| switch (instance) {
+        .exports => |exports| for (exports) |ex| {
+            if (!std.mem.eql(
+                u8,
+                ex.name,
+                test_fixtures.CROSS_INTERFACE_DROP,
+            )) continue;
+            drop_core_export_count += 1;
+            try testing.expect(ex.sort_idx.sort == .func);
+            const contributor = comp.core_func_indexspace[ex.sort_idx.idx];
+            try testing.expect(contributor == .canon);
+            const canon = comp.canons[contributor.canon];
+            try testing.expect(canon == .resource_drop);
+            try testing.expectEqual(drop_type_idx.?, canon.resource_drop);
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), drop_core_export_count);
+
+    var shim_module_count: usize = 0;
+    var shim_func_slot_count: usize = 0;
+    for (comp.core_modules) |module| {
+        var owned = try core_imports.extract(a, module.data);
+        defer owned.deinit();
+        const table_export = owned.interface.findExport("$imports") orelse continue;
+        try testing.expect(table_export.kind == .table);
+        shim_module_count += 1;
+        for (owned.interface.exports) |ex| {
+            if (ex.kind != .func) continue;
+            _ = std.fmt.parseUnsigned(u32, ex.name, 10) catch continue;
+            shim_func_slot_count += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), shim_module_count);
+    try testing.expectEqual(@as(usize, 4), shim_func_slot_count);
+}
+
+test "splice #328: metadata inconsistencies are explicit hard failures" {
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+
+    const cases = [_]struct {
+        variant: test_fixtures.DirectResourceEmbedVariant,
+        expected: anyerror,
+    }{
+        .{ .variant = .version_mismatch, .expected = error.EmbedMetadataVersionMismatch },
+        .{ .variant = .unknown_resource, .expected = error.EmbedMetadataResourceNotFound },
+        .{ .variant = .unknown_function, .expected = error.EmbedMetadataFunctionNotFound },
+        .{
+            .variant = .malformed_intrinsic_signature,
+            .expected = error.EmbedResourceIntrinsicSignatureMismatch,
+        },
+    };
+    for (cases) |case| {
+        const embed_bytes = try test_fixtures.buildSyntheticEmbedWithDirectResourceImportsVariant(
+            a,
+            case.variant,
+        );
+        defer a.free(embed_bytes);
+        try testing.expectError(
+            case.expected,
+            splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1"),
+        );
+    }
+}
+
+test "splice #328: ordinary metadata-backed imports are planned and ABI checked" {
+    const a = testing.allocator;
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithDirectResourceImports(a);
+    defer a.free(embed_bytes);
+
+    var owned = try core_imports.extract(a, embed_bytes);
+    defer owned.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const imports = try ar.dupe(core_imports.ImportEntry, owned.interface.imports);
+    const payload = (try decode.extractEncodedWorld(embed_bytes)) orelse
+        return error.TestUnexpectedResult;
+    const md = try metadata_decode.decode(ar, payload);
+
+    var ordinary = std.ArrayListUnmanaged(core_imports.ImportEntry).empty;
+    for (imports) |im| {
+        if (std.mem.eql(u8, im.module_name, test_fixtures.DIRECT_RESOURCE_NAMESPACE) and
+            resource_intrinsics.classify(im.field_name) == null)
+        {
+            try ordinary.append(ar, im);
+        }
+    }
+    const plan = try buildEmbedExtraImportPlan(
+        ar,
+        .{ .imports = ordinary.items, .exports = owned.interface.exports },
+        md,
+        "wasi_snapshot_preview1",
+        &.{},
+        testEmptyHoisted(),
+    );
+    try testing.expectEqual(@as(usize, 3), plan.slot_infos.len);
+    try testing.expect(plan.namespaces.len > 0);
+
+    for (imports) |*im| {
+        if (std.mem.eql(u8, im.module_name, test_fixtures.DIRECT_RESOURCE_NAMESPACE) and
+            std.mem.eql(u8, im.field_name, test_fixtures.DIRECT_RESOURCE_FUNC))
+        {
+            // Metadata says `ping: func() -> u32`; deliberately give
+            // the flattened core import an extra parameter.
+            im.sig = .{ .params = &.{.i32}, .results = &.{.i32} };
+        }
+    }
+    try testing.expectError(
+        error.EmbedImportSignatureMismatch,
+        buildEmbedExtraImportPlan(
+            ar,
+            .{ .imports = imports, .exports = owned.interface.exports },
+            md,
+            "wasi_snapshot_preview1",
+            &.{},
+            testEmptyHoisted(),
+        ),
+    );
+}
+
+test "splice #328: resource names and duplicate intrinsic fields are namespace scoped" {
+    const source =
+        \\package fixtures:twins@0.1.0;
+        \\interface left { resource item; }
+        \\interface right { resource item; }
+        \\world twins { import left; import right; }
+    ;
+    const ct = try metadata_encode_for_test.encodeWorldFromSource(
+        testing.allocator,
+        source,
+        "twins",
+    );
+    defer testing.allocator.free(ct);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+    const md = try metadata_decode.decode(ar, ct);
+    const one_i32 = [_]wtypes.ValType{.i32};
+    const imports = [_]core_imports.ImportEntry{
+        .{
+            .module_name = "fixtures:twins/left@0.1.0",
+            .field_name = "[resource-drop]item",
+            .kind = .func,
+            .sig = .{ .params = &one_i32, .results = &.{} },
+        },
+        // Exact duplicate: one satisfying core export is sufficient.
+        .{
+            .module_name = "fixtures:twins/left@0.1.0",
+            .field_name = "[resource-drop]item",
+            .kind = .func,
+            .sig = .{ .params = &one_i32, .results = &.{} },
+        },
+        .{
+            .module_name = "fixtures:twins/right@0.1.0",
+            .field_name = "[resource-drop]item",
+            .kind = .func,
+            .sig = .{ .params = &one_i32, .results = &.{} },
+        },
+    };
+    const plan = try buildEmbedExtraImportPlan(
+        ar,
+        .{ .imports = &imports, .exports = &.{} },
+        md,
+        "wasi_snapshot_preview1",
+        &.{},
+        testEmptyHoisted(),
+    );
+    try testing.expectEqual(@as(usize, 2), plan.namespaces.len);
+    try testing.expectEqual(@as(usize, 0), plan.slot_infos.len);
+    try testing.expectEqual(@as(usize, 1), plan.namespaces[0].fields.len);
+    try testing.expectEqual(@as(usize, 1), plan.namespaces[1].fields.len);
+
+    var conflicting = imports;
+    conflicting[1].sig = .{ .params = &one_i32, .results = &one_i32 };
+    try testing.expectError(
+        error.EmbedResourceIntrinsicSignatureMismatch,
+        buildEmbedExtraImportPlan(
+            ar,
+            .{ .imports = &conflicting, .exports = &.{} },
+            md,
+            "wasi_snapshot_preview1",
+            &.{},
+            testEmptyHoisted(),
+        ),
+    );
+
+    try testing.expectError(
+        error.EmbedResourceMetadataRequired,
+        buildEmbedExtraImportPlan(
+            ar,
+            .{ .imports = imports[0..1], .exports = &.{} },
+            null,
+            "wasi_snapshot_preview1",
+            &.{},
+            testEmptyHoisted(),
+        ),
+    );
+}
+
+test "splice #328: metadata-free primitive embed-extra compatibility is unchanged" {
+    const a = testing.allocator;
+    const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
+    defer a.free(adapter_bytes);
+    const embed_bytes = try test_fixtures.buildSyntheticEmbedWithDirectResourceImportsVariant(
+        a,
+        .metadata_free_primitive,
+    );
+    defer a.free(embed_bytes);
+
+    const out = try splice(a, embed_bytes, adapter_bytes, "wasi_snapshot_preview1");
+    defer a.free(out);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const comp = try loader.load(out, arena.allocator());
+
+    const body = testImportInstanceBody(&comp, test_fixtures.DIRECT_RESOURCE_NAMESPACE) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 2), body.len);
+    try testing.expect(body[0] == .type and body[0].type == .func);
+    try testing.expect(body[0].type.func.results == .unnamed);
+    try testing.expect(body[0].type.func.results.unnamed == .u32);
+    try testing.expect(body[1] == .@"export");
+    try testing.expectEqualStrings(test_fixtures.DIRECT_RESOURCE_FUNC, body[1].@"export".name);
 }
