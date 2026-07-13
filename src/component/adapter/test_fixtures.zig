@@ -203,6 +203,115 @@ pub const EXTRA_RESOURCE_METHOD = "[method]thing.configure";
 pub const EXTRA_RESOURCE_EMBED_CT_SECTION_NAME =
     "component-type:docs:res@0.1.0:res:encoded world";
 
+/// Metadata and flattened core-import names for the direct-resource
+/// regression fixture used by cataggar/wabt#328. The core import
+/// order intentionally differs from the WIT declaration order.
+const DIRECT_RESOURCE_EMBED_WIT =
+    \\package fixtures:resources@0.2.10;
+    \\
+    \\interface store {
+    \\    resource blob {
+    \\        constructor(name: string);
+    \\        read: func(peer: borrow<blob>, bytes: list<u8>) -> result<list<u8>, string>;
+    \\    }
+    \\    ping: func() -> u32;
+    \\}
+    \\
+    \\world direct-imports {
+    \\    import store;
+    \\}
+;
+
+const DIRECT_RESOURCE_MISMATCH_WIT =
+    \\package fixtures:resources@0.2.11;
+    \\
+    \\interface store {
+    \\    resource blob {
+    \\        constructor(name: string);
+    \\        read: func(peer: borrow<blob>, bytes: list<u8>) -> result<list<u8>, string>;
+    \\    }
+    \\    ping: func() -> u32;
+    \\}
+    \\
+    \\world direct-imports {
+    \\    import store;
+    \\}
+;
+
+pub const DIRECT_RESOURCE_NAMESPACE = "fixtures:resources/store@0.2.10";
+pub const DIRECT_RESOURCE_MISMATCH_NAMESPACE = "fixtures:resources/store@0.2.11";
+pub const DIRECT_RESOURCE_NAME = "blob";
+pub const DIRECT_RESOURCE_DROP = "[resource-drop]blob";
+pub const DIRECT_RESOURCE_NEW = "[resource-new]blob";
+pub const DIRECT_RESOURCE_REP = "[resource-rep]blob";
+pub const DIRECT_RESOURCE_CTOR = "[constructor]blob";
+pub const DIRECT_RESOURCE_METHOD = "[method]blob.read";
+pub const DIRECT_RESOURCE_FUNC = "ping";
+pub const DIRECT_RESOURCE_EMBED_CT_SECTION_NAME =
+    "component-type:fixtures:resources@0.2.10:direct-imports:encoded world";
+pub const DIRECT_RESOURCE_MISMATCH_CT_SECTION_NAME =
+    "component-type:fixtures:resources@0.2.11:direct-imports:encoded world";
+
+/// Two exact-version direct imports where `consumer`'s instance body
+/// contains an `alias outer` for `provider.sub-resource`. Metadata
+/// lists the dependency first, while the flattened core imports list
+/// the consumer first, forcing #328's import planner to topologically
+/// rebase the consumer rather than relying on encounter order.
+const CROSS_INTERFACE_EMBED_WIT =
+    \\package fixtures:cross-interface@0.2.10;
+    \\
+    \\interface provider {
+    \\    resource sub-resource {
+    \\        constructor(label: string);
+    \\        inspect: func(bytes: list<u8>) -> result<string, u32>;
+    \\    }
+    \\}
+    \\
+    \\interface consumer {
+    \\    use provider.{sub-resource};
+    \\    consume: func(item: borrow<sub-resource>, input: string) -> result<list<u8>, string>;
+    \\}
+    \\
+    \\interface guest {
+    \\    touch: func() -> u32;
+    \\}
+    \\
+    \\world cross-interface {
+    \\    import provider;
+    \\    import consumer;
+    \\    export guest;
+    \\}
+;
+
+pub const CROSS_INTERFACE_PROVIDER_NAMESPACE =
+    "fixtures:cross-interface/provider@0.2.10";
+pub const CROSS_INTERFACE_CONSUMER_NAMESPACE =
+    "fixtures:cross-interface/consumer@0.2.10";
+pub const CROSS_INTERFACE_GUEST_NAMESPACE =
+    "fixtures:cross-interface/guest@0.2.10";
+pub const CROSS_INTERFACE_RESOURCE = "sub-resource";
+pub const CROSS_INTERFACE_DROP = "[resource-drop]sub-resource";
+pub const CROSS_INTERFACE_CTOR = "[constructor]sub-resource";
+pub const CROSS_INTERFACE_METHOD = "[method]sub-resource.inspect";
+pub const CROSS_INTERFACE_FUNC = "consume";
+pub const CROSS_INTERFACE_GUEST_EXPORT =
+    "fixtures:cross-interface/guest@0.2.10#touch";
+pub const CROSS_INTERFACE_EMBED_CT_SECTION_NAME =
+    "component-type:fixtures:cross-interface@0.2.10:cross-interface:encoded world";
+
+/// Focused negative/compatibility forms of the #328 fixture. These
+/// deliberately vary one dimension at a time so adapter tests can
+/// assert a precise diagnostic without byte-level fixture mutation.
+pub const DirectResourceEmbedVariant = enum {
+    full,
+    resource_only,
+    version_mismatch,
+    unknown_resource,
+    unknown_function,
+    malformed_intrinsic_signature,
+    metadata_free_primitive,
+};
+
 pub const ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:command:encoded world";
 pub const REACTOR_ADAPTER_CT_SECTION_NAME = "component-type:wit-bindgen:0.0.0-mock:wasi:cli@0.1.0:reactor:encoded world";
 pub const EMBED_CT_SECTION_NAME = "component-type:embed-mock";
@@ -415,8 +524,8 @@ pub fn buildSyntheticEmbed(allocator: Allocator) ![]u8 {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
         try b.append(allocator, 0x01);
-        try b.append(allocator, 0x05);                            // body size
-        try b.append(allocator, 0x00);                            // 0 locals
+        try b.append(allocator, 0x05); // body size
+        try b.append(allocator, 0x00); // 0 locals
         try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x1a, 0x0b }); // i32.const 0; drop; end
         try writeSection(allocator, &out, 0x0a, b.items);
     }
@@ -920,7 +1029,8 @@ pub fn buildSyntheticReactorEmbedWithSecondary(allocator: Allocator) ![]u8 {
 ///
 /// Imports:
 ///   * `wasi_snapshot_preview1.fd_write`     (func, () -> i32)
-///   * `docs:demo/api@0.1.0.compute`         (func, () -> i32)
+///   * `docs:demo/api@0.1.0.compute`         (func, (i32) -> ())
+///                                               — indirect result pointer
 ///
 /// Exports:
 ///   * `_start`                              (func, () -> ())
@@ -947,13 +1057,15 @@ pub fn buildSyntheticEmbedWithExtraDefinedImport(allocator: Allocator) ![]u8 {
 
     try writeMagic(allocator, &out);
 
-    // Type section: 2 types — () -> i32 (preview1 + compute), () -> () (_start).
+    // Type section: preview1, compute's canonical indirect-result
+    // lowering, and _start.
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
-        try b.append(allocator, 0x02);
+        try b.append(allocator, 0x03);
         try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f }); // type 0: () -> i32
-        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 }); // type 1: () -> ()
+        try b.appendSlice(allocator, &.{ 0x60, 0x01, 0x7f, 0x00 }); // type 1: (i32) -> ()
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 }); // type 2: () -> ()
         try writeSection(allocator, &out, 0x01, b.items);
     }
 
@@ -969,16 +1081,16 @@ pub fn buildSyntheticEmbedWithExtraDefinedImport(allocator: Allocator) ![]u8 {
         try writeName(allocator, &b, EXTRA_DEFINED_NAMESPACE);
         try writeName(allocator, &b, EXTRA_DEFINED_FUNC);
         try b.append(allocator, 0x00); // func
-        try b.append(allocator, 0x00); // typeidx 0
+        try b.append(allocator, 0x01); // typeidx 1
         try writeSection(allocator, &out, 0x02, b.items);
     }
 
-    // Function section: 1 defined func (_start, type 1)
+    // Function section: 1 defined func (_start, type 2)
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
         try b.append(allocator, 0x01);
-        try b.append(allocator, 0x01);
+        try b.append(allocator, 0x02);
         try writeSection(allocator, &out, 0x03, b.items);
     }
 
@@ -1284,6 +1396,328 @@ pub fn buildSyntheticEmbedWithResourceImport(allocator: Allocator) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
+const DirectResourceCoreImport = struct {
+    field_name: []const u8,
+    type_idx: u8,
+};
+
+/// Build the default metadata-backed direct-resource embed for #328.
+pub fn buildSyntheticEmbedWithDirectResourceImports(allocator: Allocator) ![]u8 {
+    return buildSyntheticEmbedWithDirectResourceImportsVariant(allocator, .full);
+}
+
+/// Build a command-shaped embed whose direct core imports are the
+/// canonical-ABI flattened form of `DIRECT_RESOURCE_EMBED_WIT`.
+///
+/// The full core order is `ping`, method, rep, drop, constructor,
+/// new, unlike the metadata's resource/constructor/method/`ping`
+/// order. The exported `_start` calls every import so none can be
+/// discarded by a core-wasm GC pass.
+pub fn buildSyntheticEmbedWithDirectResourceImportsVariant(
+    allocator: Allocator,
+    variant: DirectResourceEmbedVariant,
+) ![]u8 {
+    const full_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = DIRECT_RESOURCE_FUNC, .type_idx = 0 },
+        .{ .field_name = DIRECT_RESOURCE_METHOD, .type_idx = 2 },
+        .{ .field_name = DIRECT_RESOURCE_REP, .type_idx = 3 },
+        .{ .field_name = DIRECT_RESOURCE_DROP, .type_idx = 1 },
+        .{ .field_name = DIRECT_RESOURCE_CTOR, .type_idx = 4 },
+        .{ .field_name = DIRECT_RESOURCE_NEW, .type_idx = 3 },
+    };
+    const resource_only_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = DIRECT_RESOURCE_DROP, .type_idx = 1 },
+    };
+    const unknown_resource_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = "[resource-drop]missing", .type_idx = 1 },
+    };
+    const unknown_function_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = "[method]blob.missing", .type_idx = 1 },
+    };
+    const malformed_intrinsic_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = DIRECT_RESOURCE_DROP, .type_idx = 0 },
+    };
+    const primitive_imports = [_]DirectResourceCoreImport{
+        .{ .field_name = DIRECT_RESOURCE_FUNC, .type_idx = 0 },
+    };
+
+    const direct_imports: []const DirectResourceCoreImport = switch (variant) {
+        .full, .version_mismatch => &full_imports,
+        .resource_only => &resource_only_imports,
+        .unknown_resource => &unknown_resource_imports,
+        .unknown_function => &unknown_function_imports,
+        .malformed_intrinsic_signature => &malformed_intrinsic_imports,
+        .metadata_free_primitive => &primitive_imports,
+    };
+
+    const Metadata = struct {
+        source: []const u8,
+        world: []const u8,
+        section_name: []const u8,
+    };
+    const metadata: ?Metadata = switch (variant) {
+        .version_mismatch => .{
+            .source = DIRECT_RESOURCE_MISMATCH_WIT,
+            .world = "direct-imports",
+            .section_name = DIRECT_RESOURCE_MISMATCH_CT_SECTION_NAME,
+        },
+        .metadata_free_primitive => null,
+        else => .{
+            .source = DIRECT_RESOURCE_EMBED_WIT,
+            .world = "direct-imports",
+            .section_name = DIRECT_RESOURCE_EMBED_CT_SECTION_NAME,
+        },
+    };
+
+    const ct: ?[]u8 = if (metadata) |m|
+        try metadata_encode.encodeWorldFromSource(allocator, m.source, m.world)
+    else
+        null;
+    defer if (ct) |bytes| allocator.free(bytes);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+
+    try writeMagic(allocator, &out);
+
+    // Core signatures:
+    //   0: () -> i32                         preview1, ping
+    //   1: (i32) -> ()                      resource.drop
+    //   2: (i32,i32,i32,i32,i32) -> ()     lowered read + retptr
+    //   3: (i32) -> i32                     resource.new/rep
+    //   4: (i32,i32) -> i32                 constructor(string)
+    //   5: () -> ()                         _start
+    //   6: (i32,i32,i32,i32) -> i32         cabi_realloc
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x07);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x01, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x05, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x01, 0x7f, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f });
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    // preview1 first, then the deliberately metadata-order-independent
+    // direct imports.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, @intCast(1 + direct_imports.len));
+        try writeName(allocator, &b, "wasi_snapshot_preview1");
+        try writeName(allocator, &b, PREVIEW1_EXPORT);
+        try b.appendSlice(allocator, &.{ 0x00, 0x00 });
+        for (direct_imports) |im| {
+            try writeName(allocator, &b, DIRECT_RESOURCE_NAMESPACE);
+            try writeName(allocator, &b, im.field_name);
+            try b.append(allocator, 0x00);
+            try b.append(allocator, im.type_idx);
+        }
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // _start + realloc.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, &.{ 0x02, 0x05, 0x06 });
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, &.{ 0x01, 0x00, 0x00 });
+        try writeSection(allocator, &out, 0x05, b.items);
+    }
+
+    const imported_func_count: u8 = @intCast(1 + direct_imports.len);
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x03);
+        try writeName(allocator, &b, "_start");
+        try b.appendSlice(allocator, &.{ 0x00, imported_func_count });
+        try writeName(allocator, &b, "memory");
+        try b.appendSlice(allocator, &.{ 0x02, 0x00 });
+        try writeName(allocator, &b, "cabi_realloc");
+        try b.appendSlice(allocator, &.{ 0x00, imported_func_count + 1 });
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // _start invokes preview1 and every direct import with zero-valued
+    // flattened operands. This is structural only; tests never execute it.
+    {
+        var start = std.ArrayListUnmanaged(u8).empty;
+        defer start.deinit(allocator);
+        try start.append(allocator, 0x00); // no locals
+        try start.appendSlice(allocator, &.{ 0x10, 0x00, 0x1a }); // fd_write
+        for (direct_imports, 0..) |im, i| {
+            const arg_count: u8 = switch (im.type_idx) {
+                0 => 0,
+                1, 3 => 1,
+                2 => 5,
+                4 => 2,
+                else => unreachable,
+            };
+            for (0..arg_count) |_| try start.appendSlice(allocator, &.{ 0x41, 0x00 });
+            try start.appendSlice(allocator, &.{ 0x10, @intCast(i + 1) });
+            if (im.type_idx == 0 or im.type_idx == 3 or im.type_idx == 4)
+                try start.append(allocator, 0x1a);
+        }
+        try start.append(allocator, 0x0b);
+
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try b.append(allocator, @intCast(start.items.len));
+        try b.appendSlice(allocator, start.items);
+        try b.appendSlice(allocator, &.{ 0x04, 0x00, 0x41, 0x00, 0x0b });
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    if (metadata) |m|
+        try appendCustomSection(allocator, &out, m.section_name, ct.?);
+
+    return out.toOwnedSlice(allocator);
+}
+
+/// Build a reactor-shaped, metadata-backed #328 fixture with a
+/// cross-interface resource alias. Every imported function is called
+/// by the exported `guest.touch`, so core GC cannot erase the shape.
+///
+/// Imported resource glue intentionally contains only
+/// `[resource-drop]sub-resource`; imported resources must not carry
+/// `[resource-new]` or `[resource-rep]`.
+pub fn buildSyntheticReactorEmbedWithCrossInterfaceImports(allocator: Allocator) ![]u8 {
+    const ct = try metadata_encode.encodeWorldFromSource(
+        allocator,
+        CROSS_INTERFACE_EMBED_WIT,
+        "cross-interface",
+    );
+    defer allocator.free(ct);
+
+    const imports = [_]struct {
+        module_name: []const u8,
+        field_name: []const u8,
+        type_idx: u8,
+    }{
+        // Consumer-before-provider is the opposite of metadata's
+        // dependency order and is the core of the regression shape.
+        .{
+            .module_name = CROSS_INTERFACE_CONSUMER_NAMESPACE,
+            .field_name = CROSS_INTERFACE_FUNC,
+            .type_idx = 3,
+        },
+        .{
+            .module_name = CROSS_INTERFACE_PROVIDER_NAMESPACE,
+            .field_name = CROSS_INTERFACE_METHOD,
+            .type_idx = 3,
+        },
+        .{
+            .module_name = CROSS_INTERFACE_PROVIDER_NAMESPACE,
+            .field_name = CROSS_INTERFACE_DROP,
+            .type_idx = 1,
+        },
+        .{
+            .module_name = CROSS_INTERFACE_PROVIDER_NAMESPACE,
+            .field_name = CROSS_INTERFACE_CTOR,
+            .type_idx = 2,
+        },
+    };
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(allocator);
+    try writeMagic(allocator, &out);
+
+    // 0: () -> i32                         preview1 + guest.touch
+    // 1: (i32) -> ()                      resource.drop
+    // 2: (i32,i32) -> i32                 constructor(string)
+    // 3: (i32,i32,i32,i32) -> ()         method/consumer + retptr
+    // 4: (i32,i32,i32,i32) -> i32         cabi_realloc
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x05);
+        try b.appendSlice(allocator, &.{ 0x60, 0x00, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x01, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7f });
+        try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x00 });
+        try b.appendSlice(allocator, &.{ 0x60, 0x04, 0x7f, 0x7f, 0x7f, 0x7f, 0x01, 0x7f });
+        try writeSection(allocator, &out, 0x01, b.items);
+    }
+
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 1 + imports.len);
+        try writeName(allocator, &b, "wasi_snapshot_preview1");
+        try writeName(allocator, &b, PREVIEW1_EXPORT);
+        try b.appendSlice(allocator, &.{ 0x00, 0x00 });
+        for (imports) |im| {
+            try writeName(allocator, &b, im.module_name);
+            try writeName(allocator, &b, im.field_name);
+            try b.appendSlice(allocator, &.{ 0x00, im.type_idx });
+        }
+        try writeSection(allocator, &out, 0x02, b.items);
+    }
+
+    // guest.touch and cabi_realloc.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, &.{ 0x02, 0x00, 0x04 });
+        try writeSection(allocator, &out, 0x03, b.items);
+    }
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.appendSlice(allocator, &.{ 0x01, 0x00, 0x00 });
+        try writeSection(allocator, &out, 0x05, b.items);
+    }
+
+    const imported_func_count: u8 = 1 + imports.len;
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x03);
+        try writeName(allocator, &b, CROSS_INTERFACE_GUEST_EXPORT);
+        try b.appendSlice(allocator, &.{ 0x00, imported_func_count });
+        try writeName(allocator, &b, "memory");
+        try b.appendSlice(allocator, &.{ 0x02, 0x00 });
+        try writeName(allocator, &b, "cabi_realloc");
+        try b.appendSlice(allocator, &.{ 0x00, imported_func_count + 1 });
+        try writeSection(allocator, &out, 0x07, b.items);
+    }
+
+    // Call preview1 and all four direct imports with structural zero
+    // operands, then return zero from guest.touch.
+    {
+        var b = std.ArrayListUnmanaged(u8).empty;
+        defer b.deinit(allocator);
+        try b.append(allocator, 0x02);
+        try b.append(allocator, 0x26);
+        try b.appendSlice(allocator, &.{
+            0x00, // no locals
+            0x10, 0x00, 0x1a, // preview1.fd_write
+            0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0x10, 0x01, // consumer
+            0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0x10, 0x02, // method
+            0x41, 0x00, 0x10, 0x03, // drop
+            0x41, 0x00, 0x41, 0x00, 0x10, 0x04, 0x1a, // constructor
+            0x41, 0x00, 0x0b, // return 0
+        });
+        try b.appendSlice(allocator, &.{ 0x04, 0x00, 0x41, 0x00, 0x0b });
+        try writeSection(allocator, &out, 0x0a, b.items);
+    }
+
+    try appendCustomSection(allocator, &out, CROSS_INTERFACE_EMBED_CT_SECTION_NAME, ct);
+    return out.toOwnedSlice(allocator);
+}
+
 // ── byte-stream helpers ──────────────────────────────────────────────────
 
 fn writeMagic(allocator: Allocator, out: *std.ArrayListUnmanaged(u8)) !void {
@@ -1515,4 +1949,268 @@ test "buildSyntheticReactorEmbed: encoded-world section decodes the api export" 
     try testing.expectEqualStrings(REACTOR_API_NAMESPACE, decoded.externs[0].qualified_name);
     try testing.expectEqual(@as(usize, 1), decoded.externs[0].funcs.len);
     try testing.expectEqualStrings(REACTOR_API_FUNC, decoded.externs[0].funcs[0].name);
+}
+
+test "direct resource fixture: core order and metadata preserve canonical resource types" {
+    const bytes = try buildSyntheticEmbedWithDirectResourceImports(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var owned = try core_imports.extract(testing.allocator, bytes);
+    defer owned.deinit();
+
+    const expected_fields = [_][]const u8{
+        DIRECT_RESOURCE_FUNC,
+        DIRECT_RESOURCE_METHOD,
+        DIRECT_RESOURCE_REP,
+        DIRECT_RESOURCE_DROP,
+        DIRECT_RESOURCE_CTOR,
+        DIRECT_RESOURCE_NEW,
+    };
+    var direct_idx: usize = 0;
+    for (owned.interface.imports) |im| {
+        if (!std.mem.eql(u8, im.module_name, DIRECT_RESOURCE_NAMESPACE)) continue;
+        try testing.expectEqualStrings(expected_fields[direct_idx], im.field_name);
+        direct_idx += 1;
+    }
+    try testing.expectEqual(expected_fields.len, direct_idx);
+    try testing.expect(owned.interface.findExport("_start") != null);
+    try testing.expect(owned.interface.findExport("cabi_realloc") != null);
+
+    const ct_payload = (try decode.extractEncodedWorld(bytes)) orelse
+        return error.TestUnexpectedResult;
+    const metadata_decode = @import("../wit/metadata_decode.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try metadata_decode.decode(arena.allocator(), ct_payload);
+    try testing.expectEqual(@as(usize, 1), decoded.externs.len);
+    const ext = decoded.externs[0];
+    try testing.expect(!ext.is_export);
+    try testing.expectEqualStrings(DIRECT_RESOURCE_NAMESPACE, ext.qualified_name);
+
+    var has_resource = false;
+    var has_own = false;
+    var has_borrow = false;
+    var has_list = false;
+    var has_result = false;
+    var has_intrinsic_export = false;
+    for (ext.inst_decls) |decl| switch (decl) {
+        .@"export" => |e| {
+            if (e.desc == .type and e.desc.type == .sub_resource and
+                std.mem.eql(u8, e.name, DIRECT_RESOURCE_NAME))
+            {
+                has_resource = true;
+            }
+            if (std.mem.startsWith(u8, e.name, "[resource-"))
+                has_intrinsic_export = true;
+        },
+        .type => |td| switch (td) {
+            .val => |v| switch (v) {
+                .own => has_own = true,
+                .borrow => has_borrow = true,
+                else => {},
+            },
+            .list => has_list = true,
+            .result => has_result = true,
+            else => {},
+        },
+        else => {},
+    };
+    try testing.expect(has_resource);
+    try testing.expect(has_own);
+    try testing.expect(has_borrow);
+    try testing.expect(has_list);
+    try testing.expect(has_result);
+    try testing.expect(!has_intrinsic_export);
+
+    // Keep the hand-written flattened method signature in lockstep
+    // with the canonical ABI derived from metadata.
+    const abi = @import("abi.zig");
+    const adapter_world = try decode.parseFromAdapterCore(arena.allocator(), bytes);
+    var store_type_idx: ?u32 = null;
+    for (adapter_world.imports) |im| {
+        if (std.mem.eql(u8, im.name, DIRECT_RESOURCE_NAMESPACE)) {
+            store_type_idx = im.body_type_idx;
+        }
+    }
+    const method_ref = try abi.findFuncImport(
+        adapter_world,
+        store_type_idx orelse return error.TestUnexpectedResult,
+        DIRECT_RESOURCE_METHOD,
+    );
+    const lowered_method = try abi.lowerCoreSig(arena.allocator(), method_ref);
+    try testing.expectEqual(@as(usize, 5), lowered_method.params.len);
+    try testing.expectEqual(@as(usize, 0), lowered_method.results.len);
+    for (lowered_method.params) |param| try testing.expect(param == .i32);
+
+    var saw_ctor_string = false;
+    for (ext.funcs) |func| {
+        if (!std.mem.eql(u8, func.name, DIRECT_RESOURCE_CTOR)) continue;
+        try testing.expectEqual(@as(usize, 1), func.sig.params.len);
+        try testing.expect(func.sig.params[0].type == .string);
+        saw_ctor_string = true;
+    }
+    try testing.expect(saw_ctor_string);
+}
+
+test "cross-interface fixture: metadata dependency order and core encounter order differ" {
+    const bytes = try buildSyntheticReactorEmbedWithCrossInterfaceImports(testing.allocator);
+    defer testing.allocator.free(bytes);
+
+    var owned = try core_imports.extract(testing.allocator, bytes);
+    defer owned.deinit();
+
+    const expected_modules = [_][]const u8{
+        CROSS_INTERFACE_CONSUMER_NAMESPACE,
+        CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        CROSS_INTERFACE_PROVIDER_NAMESPACE,
+    };
+    const expected_fields = [_][]const u8{
+        CROSS_INTERFACE_FUNC,
+        CROSS_INTERFACE_METHOD,
+        CROSS_INTERFACE_DROP,
+        CROSS_INTERFACE_CTOR,
+    };
+    for (expected_fields, 0..) |field, i| {
+        const im = owned.interface.imports[i + 1];
+        try testing.expectEqualStrings(expected_modules[i], im.module_name);
+        try testing.expectEqualStrings(field, im.field_name);
+        try testing.expect(!std.mem.startsWith(u8, field, "[resource-new]"));
+        try testing.expect(!std.mem.startsWith(u8, field, "[resource-rep]"));
+        if (std.mem.eql(u8, field, CROSS_INTERFACE_DROP)) {
+            try testing.expectEqual(@as(usize, 1), im.sig.?.params.len);
+            try testing.expectEqual(@as(usize, 0), im.sig.?.results.len);
+        }
+    }
+    try testing.expect(owned.interface.findExport("_start") == null);
+    try testing.expect(owned.interface.findExport(CROSS_INTERFACE_GUEST_EXPORT) != null);
+
+    // Parse the generated metadata and pin provider-before-consumer,
+    // despite the core module encountering consumer first.
+    const payload = (try decode.extractEncodedWorld(bytes)) orelse
+        return error.TestUnexpectedResult;
+    const metadata_decode = @import("../wit/metadata_decode.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try metadata_decode.decode(arena.allocator(), payload);
+    try testing.expectEqual(@as(usize, 3), decoded.externs.len);
+    try testing.expectEqualStrings(
+        CROSS_INTERFACE_PROVIDER_NAMESPACE,
+        decoded.externs[0].qualified_name,
+    );
+    try testing.expectEqualStrings(
+        CROSS_INTERFACE_CONSUMER_NAMESPACE,
+        decoded.externs[1].qualified_name,
+    );
+    try testing.expectEqualStrings(
+        CROSS_INTERFACE_GUEST_NAMESPACE,
+        decoded.externs[2].qualified_name,
+    );
+
+    var saw_sub_resource = false;
+    for (decoded.externs[0].type_slots) |slot| {
+        if (slot == .sub_resource and
+            std.mem.eql(u8, slot.sub_resource, CROSS_INTERFACE_RESOURCE))
+        {
+            saw_sub_resource = true;
+        }
+    }
+    var saw_outer_alias = false;
+    var saw_borrow = false;
+    for (decoded.externs[1].type_slots) |slot| switch (slot) {
+        .alias_outer => saw_outer_alias = true,
+        .val => |val| if (val == .borrow) {
+            saw_borrow = true;
+        },
+        else => {},
+    };
+    try testing.expect(saw_sub_resource);
+    try testing.expect(saw_outer_alias);
+    try testing.expect(saw_borrow);
+
+    // Keep the hand-lowered core signatures synchronized with WIT.
+    const abi = @import("abi.zig");
+    const world = try decode.parseFromAdapterCore(arena.allocator(), bytes);
+    var provider_idx: ?u32 = null;
+    var consumer_idx: ?u32 = null;
+    for (world.imports) |im| {
+        if (std.mem.eql(u8, im.name, CROSS_INTERFACE_PROVIDER_NAMESPACE))
+            provider_idx = im.body_type_idx;
+        if (std.mem.eql(u8, im.name, CROSS_INTERFACE_CONSUMER_NAMESPACE))
+            consumer_idx = im.body_type_idx;
+    }
+    const method = try abi.findFuncImport(
+        world,
+        provider_idx orelse return error.TestUnexpectedResult,
+        CROSS_INTERFACE_METHOD,
+    );
+    const lowered_method = try abi.lowerCoreSig(arena.allocator(), method);
+    try testing.expectEqual(@as(usize, 4), lowered_method.params.len);
+    try testing.expectEqual(@as(usize, 0), lowered_method.results.len);
+
+    const ctor = try abi.findFuncImport(
+        world,
+        provider_idx orelse return error.TestUnexpectedResult,
+        CROSS_INTERFACE_CTOR,
+    );
+    const lowered_ctor = try abi.lowerCoreSig(arena.allocator(), ctor);
+    try testing.expectEqual(@as(usize, 2), lowered_ctor.params.len);
+    try testing.expectEqual(@as(usize, 1), lowered_ctor.results.len);
+
+    const consume = try abi.findFuncImport(
+        world,
+        consumer_idx orelse return error.TestUnexpectedResult,
+        CROSS_INTERFACE_FUNC,
+    );
+    const lowered_consume = try abi.lowerCoreSig(arena.allocator(), consume);
+    try testing.expectEqual(@as(usize, 4), lowered_consume.params.len);
+    try testing.expectEqual(@as(usize, 0), lowered_consume.results.len);
+}
+
+test "direct resource fixture: focused negative and compatibility variants" {
+    const Cases = struct {
+        variant: DirectResourceEmbedVariant,
+        field: []const u8,
+    };
+    const cases = [_]Cases{
+        .{ .variant = .resource_only, .field = DIRECT_RESOURCE_DROP },
+        .{ .variant = .unknown_resource, .field = "[resource-drop]missing" },
+        .{ .variant = .unknown_function, .field = "[method]blob.missing" },
+        .{ .variant = .malformed_intrinsic_signature, .field = DIRECT_RESOURCE_DROP },
+        .{ .variant = .metadata_free_primitive, .field = DIRECT_RESOURCE_FUNC },
+    };
+    for (cases) |case| {
+        const bytes = try buildSyntheticEmbedWithDirectResourceImportsVariant(
+            testing.allocator,
+            case.variant,
+        );
+        defer testing.allocator.free(bytes);
+
+        var owned = try core_imports.extract(testing.allocator, bytes);
+        defer owned.deinit();
+        try testing.expectEqual(@as(usize, 2), owned.interface.imports.len);
+        try testing.expectEqualStrings(DIRECT_RESOURCE_NAMESPACE, owned.interface.imports[1].module_name);
+        try testing.expectEqualStrings(case.field, owned.interface.imports[1].field_name);
+
+        if (case.variant == .malformed_intrinsic_signature) {
+            const sig = owned.interface.imports[1].sig.?;
+            try testing.expectEqual(@as(usize, 0), sig.params.len);
+            try testing.expectEqual(@as(usize, 1), sig.results.len);
+        }
+        if (case.variant == .metadata_free_primitive)
+            try testing.expect((try decode.extractEncodedWorld(bytes)) == null);
+    }
+
+    const mismatch = try buildSyntheticEmbedWithDirectResourceImportsVariant(
+        testing.allocator,
+        .version_mismatch,
+    );
+    defer testing.allocator.free(mismatch);
+    const payload = (try decode.extractEncodedWorld(mismatch)) orelse
+        return error.TestUnexpectedResult;
+    const metadata_decode = @import("../wit/metadata_decode.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const decoded = try metadata_decode.decode(arena.allocator(), payload);
+    try testing.expectEqualStrings(DIRECT_RESOURCE_MISMATCH_NAMESPACE, decoded.externs[0].qualified_name);
 }
