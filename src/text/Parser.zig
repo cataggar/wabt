@@ -2760,10 +2760,10 @@ const Parser = struct {
         // Check for (param ...) (result ...), (result <valtype>+), or bare (param ...)
         var param_count: u32 = 0;
         var param_types_buf: [16]types.ValType = undefined;
-        var param_tidxs_buf: [16]u32 = .{0xFFFFFFFF} ** 16;
+        var param_tidxs_buf: [16]u32 = @splat(0xFFFFFFFF);
         var result_count: u32 = 0;
         var result_types_buf: [16]types.ValType = undefined;
-        var result_tidxs_buf: [16]u32 = .{0xFFFFFFFF} ** 16;
+        var result_tidxs_buf: [16]u32 = @splat(0xFFFFFFFF);
 
         // Consume all (param ...) blocks
         while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
@@ -6327,4 +6327,3 @@ fn normalizeIdentifier(allocator: std.mem.Allocator, text: []const u8) []const u
     }
     return result.toOwnedSlice(allocator) catch text;
 }
-
