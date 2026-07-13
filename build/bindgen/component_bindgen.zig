@@ -5,13 +5,15 @@
 //! lower/lift to the `canon` runtime library. This closes the gap Zig comptime
 //! can't: synthesizing each function's flattened core signature.
 //!
-//!   wabt component bindgen --wit <dir> --world <name> [--impl <module>] -o <out.zig>
+//!   wabt component bindgen --wit <dir> --world <name>
+//!       [--impl <module> | --dispatch <module>] -o <out.zig>
 //!
 //! For each interface the world **imports**, a `pub const <iface> = struct { … }`
 //! with `extern` decls + typed wrappers (params lowered, results lifted via
 //! `canon`). For each interface the world **exports**, top-level `export fn`
-//! shells that lift params (`canon.liftParams`), call `Impl.<fn>` (the
-//! user-supplied implementation imported via `--impl`), and encode the result
+//! shells that lift params (`canon.liftParams`), call either `Impl.<fn>` (the
+//! user-supplied implementation imported via `--impl`) or a generic
+//! `__wit_dispatch.call` imported via `--dispatch`, and encode the result
 //! (`canon.returnResult`).
 //!
 //! Supports primitives, `string`, `option<T>`, `list<T>`, named
@@ -39,6 +41,11 @@ pub const usage =
     \\                      defines more than one world)
     \\  --impl <module>     Import name for the user implementation of exported
     \\                      interfaces (default: "impl")
+    \\  --dispatch <module> Import a generic export dispatcher instead of a
+    \\                      per-function implementation. The module must expose:
+    \\                        pub fn call(comptime export_name: []const u8,
+    \\                          comptime Result: type, args: anytype) Result
+    \\                      Mutually exclusive with --impl.
     \\  --manual-return <fn>
     \\                      Generate an async export `<fn>` in manual-return form:
     \\                      the shell calls `Impl.<fn>(params)` (returning void)
@@ -60,6 +67,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var wit_path: ?[]const u8 = null;
     var world_arg: ?[]const u8 = null;
     var impl_arg: []const u8 = "impl";
+    var impl_explicit = false;
+    var dispatch_arg: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
     var manual_returns = std.ArrayListUnmanaged([]const u8).empty;
     defer manual_returns.deinit(alloc);
@@ -76,6 +85,10 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--impl")) {
             i += 1;
             impl_arg = nextArg(sub_args, i, arg);
+            impl_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--dispatch")) {
+            i += 1;
+            dispatch_arg = nextArg(sub_args, i, arg);
         } else if (std.mem.eql(u8, arg, "--manual-return")) {
             i += 1;
             manual_returns.append(alloc, nextArg(sub_args, i, arg)) catch @panic("OOM");
@@ -86,6 +99,11 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             std.debug.print("error: unknown argument '{s}'. Use `wabt component bindgen help`.\n", .{arg});
             std.process.exit(1);
         }
+    }
+
+    if (impl_explicit and dispatch_arg != null) {
+        std.debug.print("error: --impl and --dispatch are mutually exclusive.\n", .{});
+        std.process.exit(1);
     }
 
     const wp = wit_path orelse {
@@ -112,7 +130,13 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg, .manual_returns = manual_returns.items };
+    var g = Gen{
+        .ar = ar,
+        .resolver = resolver,
+        .impl = impl_arg,
+        .dispatch = dispatch_arg,
+        .manual_returns = manual_returns.items,
+    };
     g.generate(world, world_name) catch |err| {
         std.debug.print("error: generating bindings for world '{s}': {s}\n", .{ world_name, @errorName(err) });
         std.process.exit(1);
@@ -167,6 +191,7 @@ const Gen = struct {
     ar: Allocator,
     resolver: wit.resolver.Resolver,
     impl: []const u8,
+    dispatch: ?[]const u8 = null,
     /// Async export func names to generate in manual-return form (`--manual-return`).
     manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -362,7 +387,11 @@ const Gen = struct {
             if (tf.is_export) have_exports = true;
         }
         if (have_exports) {
-            self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
+            if (self.dispatch) |dispatch| {
+                self.print("const __wit_dispatch = @import(\"{s}\");\n\n", .{dispatch});
+            } else {
+                self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
+            }
         }
 
         // ── imports ──
@@ -560,7 +589,7 @@ const Gen = struct {
     /// Shared body for a synchronous export shell. `export_sym` is the
     /// exact wasm core export name (`<iface>#<func>` for an interface
     /// func, or the plain func name for a top-level world func); `name`
-    /// drives the `Impl.<fn>` call.
+    /// drives the `Impl.<fn>` call or is passed to `__wit_dispatch.call`.
     fn emitSyncExportFuncSym(self: *Gen, export_sym: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const result_zig = try self.resultZig(func);
 
@@ -571,9 +600,26 @@ const Gen = struct {
 
         try self.emitLiftParams(func.params);
 
-        // Call the user impl + encode the result.
+        // Call the user implementation or generic dispatcher, then encode the result.
         const args = try self.implArgList(func.params);
-        if (func.result == null) {
+        if (self.dispatch != null) {
+            const dispatch_args = if (args.len == 0)
+                ".{}"
+            else
+                try std.fmt.allocPrint(self.ar, ".{{ {s} }}", .{args});
+            if (func.result == null) {
+                self.print(
+                    "    __wit_dispatch.call(\"{s}\", void, {s});\n",
+                    .{ export_sym, dispatch_args },
+                );
+                self.raw("    return;\n");
+            } else {
+                self.print(
+                    "    return wit_types.returnResult({s}, __wit_dispatch.call(\"{s}\", {s}, {s}), &wit_types.alloc);\n",
+                    .{ result_zig, export_sym, result_zig, dispatch_args },
+                );
+            }
+        } else if (func.result == null) {
             self.print("    Impl.{s}({s});\n", .{ try camel(self.ar, name), args });
             self.raw("    return;\n");
         } else {
@@ -1556,8 +1602,10 @@ test "generate: export shells + import wrappers" {
     };
     const pet_ref = ast.Type{ .name = "pet" };
     const opt_pet = ast.Type{ .option = &pet_ref };
+    const dispatch_ty: ast.Type = .u32;
     const iface_items = [_]ast.InterfaceItem{
         .{ .type = .{ .name = "pet", .kind = .{ .record = &pet_fields } } },
+        .{ .type = .{ .name = "dispatch", .kind = .{ .alias = dispatch_ty } } },
         .{ .func = .{ .name = "ping", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32 } } },
         .{ .func = .{ .name = "get", .func = .{ .params = &.{.{ .name = "id", .type = .u32 }}, .result = opt_pet } } },
     };
@@ -1589,6 +1637,24 @@ test "generate: export shells + import wrappers" {
         // No stray module-scope statement after an export shell's closing brace
         // (regression: a duplicate resetScratch was emitted at container scope).
         try testing.expect(std.mem.indexOf(u8, out, "}\n\n    wit_types.resetScratch();") == null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "const __wit_dispatch = @import(\"js_dispatch\");") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Dispatch = u32;") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/store#ping\", u32, .{ __params.x })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/store#get\", ?Pet, .{ __params.id })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Impl.") == null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
@@ -1941,6 +2007,12 @@ test "generate #286: named_func export emits a module-scope export shell" {
     try testing.expect(std.mem.indexOf(u8, out, "export fn @\"run\"() wit_types.CoreReturn(void) {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Impl.run();") != null);
     try testing.expect(std.mem.indexOf(u8, out, "#run") == null);
+
+    var dispatch_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try dispatch_g.generate(world, "cmd");
+    const dispatch_out = dispatch_g.out.items;
+    try testing.expect(std.mem.indexOf(u8, dispatch_out, "__wit_dispatch.call(\"run\", void, .{});") != null);
+    try testing.expect(std.mem.indexOf(u8, dispatch_out, "Impl.") == null);
 }
 
 test "generate #286: named_func export with a primitive result" {
