@@ -263,6 +263,38 @@ fn DiscInt(comptime n: usize) type {
     return if (n <= 0x100) u8 else if (n <= 0x10000) u16 else u32;
 }
 
+fn fieldNames(comptime T: type) []const [:0]const u8 {
+    return std.meta.fieldNames(T);
+}
+
+fn fieldTypes(comptime T: type) []const type {
+    if (comptime @hasDecl(std.meta, "fieldTypes")) return std.meta.fieldTypes(T);
+    return comptime blk: {
+        const fields = switch (@typeInfo(T)) {
+            .@"struct" => |s| s.fields,
+            .@"union" => |u| u.fields,
+            else => @compileError("canon: expected struct or union type"),
+        };
+        var types: [fields.len]type = undefined;
+        for (fields, 0..) |field, i| types[i] = field.type;
+        const final = types;
+        break :blk &final;
+    };
+}
+
+fn fieldCount(comptime T: type) usize {
+    return fieldNames(T).len;
+}
+
+fn repeatedType(comptime T: type, comptime n: usize) []const type {
+    return comptime blk: {
+        var types: [n]type = undefined;
+        for (&types) |*item| item.* = T;
+        const final = types;
+        break :blk &final;
+    };
+}
+
 // ── Variant / result (Zig `union(enum)`) helpers ────────────────────
 //
 // A WIT `variant` / `result<T, E>` lowers to a tagged union: a discriminant
@@ -273,8 +305,8 @@ fn DiscInt(comptime n: usize) type {
 /// Max canonical alignment among a union's case payloads (1 if all `void`).
 fn unionPayloadAlign(comptime T: type) usize {
     var a: usize = 1;
-    inline for (@typeInfo(T).@"union".fields) |f| {
-        if (f.type != void) a = @max(a, alignOf(f.type));
+    inline for (comptime fieldTypes(T)) |FieldType| {
+        if (FieldType != void) a = @max(a, alignOf(FieldType));
     }
     return a;
 }
@@ -282,8 +314,8 @@ fn unionPayloadAlign(comptime T: type) usize {
 /// Max canonical size among a union's case payloads (0 if all `void`).
 fn unionPayloadSize(comptime T: type) usize {
     var s: usize = 0;
-    inline for (@typeInfo(T).@"union".fields) |f| {
-        if (f.type != void) s = @max(s, sizeOf(f.type));
+    inline for (comptime fieldTypes(T)) |FieldType| {
+        if (FieldType != void) s = @max(s, sizeOf(FieldType));
     }
     return s;
 }
@@ -291,7 +323,7 @@ fn unionPayloadSize(comptime T: type) usize {
 /// Byte offset of a union payload: past the discriminant, padded to the
 /// payload alignment.
 fn unionPayloadOffset(comptime T: type) usize {
-    const disc = @sizeOf(DiscInt(@typeInfo(T).@"union".fields.len));
+    const disc = @sizeOf(DiscInt(fieldCount(T)));
     return alignTo(disc, unionPayloadAlign(T));
 }
 
@@ -311,7 +343,7 @@ pub fn Result(comptime T: type, comptime E: type) type {
 /// it is identical across modules. `Ts` is a tuple of element types, e.g.
 /// `canon.Tuple(.{ u32, []const u8 })`.
 pub fn Tuple(comptime Ts: anytype) type {
-    return std.meta.Tuple(&Ts);
+    return @Tuple(&Ts);
 }
 
 /// The WIT spelling of a primitive type, for the `[stream]stream<…>` /
@@ -498,15 +530,15 @@ pub fn alignOf(comptime T: type) usize {
         .bool => 1,
         .int => |i| intBytes(i.bits),
         .float => |f| intBytes(f.bits),
-        .@"enum" => |e| @sizeOf(DiscInt(e.fields.len)),
+        .@"enum" => @sizeOf(DiscInt(fieldCount(T))),
         .optional => |o| @max(@as(usize, 1), alignOf(o.child)),
         .pointer => |p| if (p.size == .slice) @alignOf(usize) else unsupported(T),
         .@"struct" => |s| if (s.layout == .@"packed") @alignOf(T) else blk: {
             var a: usize = 1;
-            inline for (s.fields) |f| a = @max(a, alignOf(f.type));
+            inline for (comptime fieldTypes(T)) |FieldType| a = @max(a, alignOf(FieldType));
             break :blk a;
         },
-        .@"union" => |u| @max(@as(usize, @sizeOf(DiscInt(u.fields.len))), unionPayloadAlign(T)),
+        .@"union" => @max(@as(usize, @sizeOf(DiscInt(fieldCount(T)))), unionPayloadAlign(T)),
         else => unsupported(T),
     };
 }
@@ -517,7 +549,7 @@ pub fn sizeOf(comptime T: type) usize {
         .bool => 1,
         .int => |i| intBytes(i.bits),
         .float => |f| intBytes(f.bits),
-        .@"enum" => |e| @sizeOf(DiscInt(e.fields.len)),
+        .@"enum" => @sizeOf(DiscInt(fieldCount(T))),
         .optional => |o| blk: {
             const pa = alignOf(o.child);
             break :blk alignTo(alignTo(1, pa) + sizeOf(o.child), @max(@as(usize, 1), pa));
@@ -525,8 +557,8 @@ pub fn sizeOf(comptime T: type) usize {
         .pointer => |p| if (p.size == .slice) 2 * @sizeOf(usize) else unsupported(T),
         .@"struct" => |s| if (s.layout == .@"packed") @sizeOf(T) else blk: {
             var off: usize = 0;
-            inline for (s.fields) |f| {
-                off = alignTo(off, alignOf(f.type)) + sizeOf(f.type);
+            inline for (comptime fieldTypes(T)) |FieldType| {
+                off = alignTo(off, alignOf(FieldType)) + sizeOf(FieldType);
             }
             break :blk alignTo(off, alignOf(T));
         },
@@ -537,12 +569,12 @@ pub fn sizeOf(comptime T: type) usize {
 
 /// Byte offset of struct field `idx` within `T`'s canonical record layout.
 fn fieldOffset(comptime T: type, comptime idx: usize) usize {
-    const fields = @typeInfo(T).@"struct".fields;
+    const types = comptime fieldTypes(T);
     var off: usize = 0;
-    inline for (fields, 0..) |f, i| {
-        off = alignTo(off, alignOf(f.type));
+    inline for (types, 0..) |FieldType, i| {
+        off = alignTo(off, alignOf(FieldType));
         if (i == idx) return off;
-        off += sizeOf(f.type);
+        off += sizeOf(FieldType);
     }
     @compileError("canon: field index out of range");
 }
@@ -571,7 +603,7 @@ pub fn lower(comptime T: type, value: T, base: [*]u8, ra: Realloc) void {
         .bool => base[0] = @intFromBool(value),
         .int => store(T, base, value),
         .float => store(T, base, value),
-        .@"enum" => |e| store(DiscInt(e.fields.len), base, @intCast(@intFromEnum(value))),
+        .@"enum" => store(DiscInt(fieldCount(T)), base, @intCast(@intFromEnum(value))),
         .optional => |o| if (value) |v| {
             base[0] = 1;
             lower(o.child, v, base + payloadOffset(T), ra);
@@ -581,17 +613,17 @@ pub fn lower(comptime T: type, value: T, base: [*]u8, ra: Realloc) void {
         .pointer => |p| lowerSlice(p.child, value, base, ra),
         .@"struct" => |s| if (s.layout == .@"packed") {
             store(PackedInt(T), base, @bitCast(value));
-        } else inline for (s.fields, 0..) |f, i| {
-            lower(f.type, @field(value, f.name), base + fieldOffset(T, i), ra);
+        } else inline for (comptime fieldNames(T), comptime fieldTypes(T), 0..) |name, FieldType, i| {
+            lower(FieldType, @field(value, name), base + fieldOffset(T, i), ra);
         },
         .@"union" => |u| {
             const Tag = u.tag_type.?;
             const tag = std.meta.activeTag(value);
-            store(DiscInt(u.fields.len), base, @intCast(@intFromEnum(tag)));
-            inline for (u.fields) |f| {
-                if (comptime f.type != void) {
-                    if (tag == @field(Tag, f.name)) {
-                        lower(f.type, @field(value, f.name), base + unionPayloadOffset(T), ra);
+            store(DiscInt(fieldCount(T)), base, @intCast(@intFromEnum(tag)));
+            inline for (comptime fieldNames(T), comptime fieldTypes(T)) |name, FieldType| {
+                if (comptime FieldType != void) {
+                    if (tag == @field(Tag, name)) {
+                        lower(FieldType, @field(value, name), base + unionPayloadOffset(T), ra);
                     }
                 }
             }
@@ -632,27 +664,27 @@ pub fn lift(comptime T: type, base: [*]const u8) T {
         .bool => base[0] != 0,
         .int => load(T, base),
         .float => load(T, base),
-        .@"enum" => |e| @enumFromInt(load(DiscInt(e.fields.len), base)),
+        .@"enum" => @enumFromInt(load(DiscInt(fieldCount(T)), base)),
         .optional => |o| if (base[0] == 0) null else lift(o.child, base + payloadOffset(T)),
         .pointer => |p| liftSlice(p.child, base),
         .@"struct" => |s| if (s.layout == .@"packed")
             @as(T, @bitCast(load(PackedInt(T), base)))
         else blk: {
             var result: T = undefined;
-            inline for (s.fields, 0..) |f, i| {
-                @field(result, f.name) = lift(f.type, base + fieldOffset(T, i));
+            inline for (comptime fieldNames(T), comptime fieldTypes(T), 0..) |name, FieldType, i| {
+                @field(result, name) = lift(FieldType, base + fieldOffset(T, i));
             }
             break :blk result;
         },
         .@"union" => |u| blk: {
             const Tag = u.tag_type.?;
-            const disc = load(DiscInt(u.fields.len), base);
-            inline for (u.fields) |f| {
-                if (disc == @intFromEnum(@field(Tag, f.name))) {
-                    break :blk if (f.type == void)
-                        @unionInit(T, f.name, {})
+            const disc = load(DiscInt(fieldCount(T)), base);
+            inline for (comptime fieldNames(T), comptime fieldTypes(T)) |name, FieldType| {
+                if (disc == @intFromEnum(@field(Tag, name))) {
+                    break :blk if (FieldType == void)
+                        @unionInit(T, name, {})
                     else
-                        @unionInit(T, f.name, lift(f.type, base + unionPayloadOffset(T)));
+                        @unionInit(T, name, lift(FieldType, base + unionPayloadOffset(T)));
                 }
             }
             unreachable;
@@ -674,9 +706,9 @@ fn layoutMatches(comptime E: type) bool {
         .@"struct" => |s| blk: {
             if (s.layout == .@"packed") break :blk sizeOf(E) == @sizeOf(E);
             if (sizeOf(E) != @sizeOf(E) or alignOf(E) != @alignOf(E)) break :blk false;
-            inline for (s.fields, 0..) |f, i| {
-                if (@offsetOf(E, f.name) != fieldOffset(E, i)) break :blk false;
-                if (!layoutMatches(f.type)) break :blk false;
+            inline for (comptime fieldNames(E), comptime fieldTypes(E), 0..) |name, FieldType, i| {
+                if (@offsetOf(E, name) != fieldOffset(E, i)) break :blk false;
+                if (!layoutMatches(FieldType)) break :blk false;
             }
             break :blk true;
         },
@@ -744,15 +776,15 @@ pub fn flatCount(comptime T: type) usize {
             (@bitSizeOf(PackedInt(T)) + 31) / 32
         else blk: {
             var c: usize = 0;
-            inline for (s.fields) |f| c += flatCount(f.type);
+            inline for (comptime fieldTypes(T)) |FieldType| c += flatCount(FieldType);
             break :blk c;
         },
-        .@"union" => |u| blk: {
+        .@"union" => blk: {
             // discriminant + the widest case's flattened payload (the canonical
             // ABI joins case payloads element-wise; the count is the max).
             var m: usize = 0;
-            inline for (u.fields) |f| {
-                if (f.type != void) m = @max(m, flatCount(f.type));
+            inline for (comptime fieldTypes(T)) |FieldType| {
+                if (FieldType != void) m = @max(m, flatCount(FieldType));
             }
             break :blk 1 + m;
         },
@@ -766,7 +798,7 @@ fn CoreScalar(comptime T: type) type {
         .bool, .@"enum" => i32,
         .int => |i| if (i.bits <= 32) i32 else i64,
         .float => |f| if (f.bits == 32) f32 else f64,
-        .@"struct" => |s| if (s.layout == .@"packed") i32 else CoreScalar(s.fields[0].type), // packed=flags(i32), single-field record
+        .@"struct" => |s| if (s.layout == .@"packed") i32 else CoreScalar(fieldTypes(T)[0]), // packed=flags(i32), single-field record
         .@"union" => i32, // 1-slot union = bare discriminant (all-void cases)
         else => unsupported(T),
     };
@@ -803,7 +835,7 @@ fn toCore(comptime T: type, value: T) CoreScalar(T) {
         else
             @intCast(value),
         .float => value,
-        .@"struct" => |s| if (s.layout == .@"packed") packedToCore(T, value) else toCore(s.fields[0].type, @field(value, s.fields[0].name)),
+        .@"struct" => |s| if (s.layout == .@"packed") packedToCore(T, value) else toCore(fieldTypes(T)[0], @field(value, fieldNames(T)[0])),
         .@"union" => @intCast(@intFromEnum(std.meta.activeTag(value))),
         else => unsupported(T),
     };
@@ -822,13 +854,13 @@ fn fromCore(comptime T: type, core: CoreScalar(T)) T {
         .float => core,
         .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, core) else blk: {
             var r: T = undefined;
-            @field(r, s.fields[0].name) = fromCore(s.fields[0].type, core);
+            @field(r, fieldNames(T)[0]) = fromCore(fieldTypes(T)[0], core);
             break :blk r;
         },
         .@"union" => |u| blk: {
             const Tag = u.tag_type.?;
-            inline for (u.fields) |f| {
-                if (core == @intFromEnum(@field(Tag, f.name))) break :blk @unionInit(T, f.name, {});
+            inline for (comptime fieldNames(T)) |name| {
+                if (core == @intFromEnum(@field(Tag, name))) break :blk @unionInit(T, name, {});
             }
             unreachable;
         },
@@ -874,11 +906,11 @@ fn coreSlotTo(comptime T: type, slot: anytype) T {
 }
 
 fn flatFieldOffset(comptime T: type, comptime idx: usize) usize {
-    const fields = @typeInfo(T).@"struct".fields;
+    const types = comptime fieldTypes(T);
     var off: usize = 0;
-    inline for (fields, 0..) |f, i| {
+    inline for (types, 0..) |FieldType, i| {
         if (i == idx) return off;
-        off += flatCount(f.type);
+        off += flatCount(FieldType);
     }
     return off;
 }
@@ -895,8 +927,8 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
         .optional => |o| if (slots[start] == 0) null else flatLift(o.child, slots, start + 1),
         .@"struct" => |s| if (s.layout == .@"packed") packedFromCore(T, slots[start]) else blk: {
             var v: T = undefined;
-            inline for (s.fields, 0..) |f, i| {
-                @field(v, f.name) = flatLift(f.type, slots, start + comptime flatFieldOffset(T, i));
+            inline for (comptime fieldNames(T), comptime fieldTypes(T), 0..) |name, FieldType, i| {
+                @field(v, name) = flatLift(FieldType, slots, start + comptime flatFieldOffset(T, i));
             }
             break :blk v;
         },
@@ -905,12 +937,12 @@ fn flatLift(comptime T: type, slots: anytype, comptime start: usize) T {
             // joined slots beginning at `start + 1` (matching-width cases only).
             const Tag = u.tag_type.?;
             const disc = slots[start];
-            inline for (u.fields) |f| {
-                if (disc == @intFromEnum(@field(Tag, f.name))) {
-                    break :blk if (f.type == void)
-                        @unionInit(T, f.name, {})
+            inline for (comptime fieldNames(T), comptime fieldTypes(T)) |name, FieldType| {
+                if (disc == @intFromEnum(@field(Tag, name))) {
+                    break :blk if (FieldType == void)
+                        @unionInit(T, name, {})
                     else
-                        @unionInit(T, f.name, flatLift(f.type, slots, start + 1));
+                        @unionInit(T, name, flatLift(FieldType, slots, start + 1));
                 }
             }
             unreachable;
@@ -948,17 +980,17 @@ fn flatTypeList(comptime T: type) []const type {
         .pointer => &[_]type{ i32, i32 }, // (ptr, len)
         .optional => |o| concatTypes(&[_]type{i32}, flatTypeList(o.child)),
         .@"struct" => |s| if (s.layout == .@"packed")
-            &([_]type{i32} ** ((@bitSizeOf(PackedInt(T)) + 31) / 32))
+            repeatedType(i32, (@bitSizeOf(PackedInt(T)) + 31) / 32)
         else blk: {
             comptime var list: []const type = &[_]type{};
-            inline for (s.fields) |f| list = concatTypes(list, flatTypeList(f.type));
+            inline for (comptime fieldTypes(T)) |FieldType| list = concatTypes(list, flatTypeList(FieldType));
             break :blk list;
         },
-        .@"union" => |u| blk: {
+        .@"union" => blk: {
             comptime var list: []const type = &[_]type{i32}; // discriminant
-            inline for (u.fields) |f| {
-                if (f.type != void) {
-                    const cl = flatTypeList(f.type);
+            inline for (comptime fieldTypes(T)) |FieldType| {
+                if (FieldType != void) {
+                    const cl = flatTypeList(FieldType);
                     inline for (cl, 0..) |ct, i| {
                         const idx = 1 + i;
                         if (idx < list.len) {
@@ -981,7 +1013,7 @@ fn concatTypes(comptime a: []const type, comptime b: []const type) []const type 
 
 /// The tuple type of `T`'s flattened core slots.
 pub fn FlatParams(comptime T: type) type {
-    return std.meta.Tuple(flatTypeList(T));
+    return @Tuple(flatTypeList(T));
 }
 
 fn zeroOf(comptime S: type) S {
@@ -1032,19 +1064,19 @@ fn fillFlat(comptime T: type, value: T, out: anytype, comptime start: usize, ra:
             setSlot(out, start, packedToCore(T, value))
         else {
             comptime var idx = start;
-            inline for (s.fields) |f| {
-                fillFlat(f.type, @field(value, f.name), out, idx, ra);
-                idx += comptime flatCount(f.type);
+            inline for (comptime fieldNames(T), comptime fieldTypes(T)) |name, FieldType| {
+                fillFlat(FieldType, @field(value, name), out, idx, ra);
+                idx += comptime flatCount(FieldType);
             }
         },
         .@"union" => |u| {
             const Tag = u.tag_type.?;
             setSlot(out, start, @as(i32, @intCast(@intFromEnum(std.meta.activeTag(value)))));
             zeroSlots(out, start + 1, flatCount(T) - 1);
-            inline for (u.fields) |f| {
-                if (comptime f.type != void) {
-                    if (std.meta.activeTag(value) == @field(Tag, f.name)) {
-                        fillFlat(f.type, @field(value, f.name), out, start + 1, ra);
+            inline for (comptime fieldNames(T), comptime fieldTypes(T)) |name, FieldType| {
+                if (comptime FieldType != void) {
+                    if (std.meta.activeTag(value) == @field(Tag, name)) {
+                        fillFlat(FieldType, @field(value, name), out, start + 1, ra);
                     }
                 }
             }
@@ -1222,7 +1254,7 @@ test "lowerFlat round-trips through liftParams" {
 
     // FlatParams of a `method`/`other(string)` shape = disc + (ptr, len) = 3 slots.
     const Method = union(enum) { get, other: []const u8 };
-    try testing.expectEqual(@as(usize, 3), @typeInfo(FlatParams(Method)).@"struct".fields.len);
+    try testing.expectEqual(@as(usize, 3), fieldCount(FlatParams(Method)));
 }
 
 test "result flattening decision and core types" {
