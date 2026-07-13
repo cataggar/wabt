@@ -104,7 +104,7 @@ pub const SpliceError = error{
     AdapterImportedResourceRepUnsupported,
     EmbedResourceMetadataRequired,
     EmbedImportFieldConflict,
-} || writer.EncodeError;
+} || writer.EncodeError || world_gc.Error;
 
 /// One preview1-style adapter to splice in. `name` is the core
 /// import module name the embed uses to refer to this adapter (e.g.
@@ -1184,6 +1184,18 @@ const Builder = struct {
         const start: u32 = @intCast(self.exports.items.len);
         try self.exports.append(self.arena, e);
         try self.addSection(.@"export", start);
+        if (e.sort_idx) |si| switch (si.sort) {
+            .func => self.func_cursor += 1,
+            .type => self.type_cursor += 1,
+            .instance => self.instance_cursor += 1,
+            .core => |sort| switch (sort) {
+                .func => self.core_func_cursor += 1,
+                .table => self.core_table_cursor += 1,
+                .memory => self.core_mem_cursor += 1,
+                else => {},
+            },
+            else => {},
+        };
     }
 
     /// Append a top-level component-level import. The caller is
@@ -1217,20 +1229,83 @@ const Builder = struct {
     }
 };
 
-/// Adapter-side context for the shared `lift_types` transcriber: it
-/// hoists compound value types via the `Builder` and leaves resource
-/// handles / aliased `use`d types untouched (the reactor lift path
-/// doesn't rewrite those — preserving pre-#246 behaviour).
+test "Builder: top-level instance exports advance the instance indexspace" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var b = Builder{ .arena = arena.allocator() };
+    const first = try b.addInstance(.{ .exports = &.{} });
+    try testing.expectEqual(@as(u32, 0), first);
+    try b.addExport(.{
+        .name = "first",
+        .desc = .{ .instance = 0 },
+        .sort_idx = .{ .sort = .instance, .idx = first },
+    });
+    const second = try b.addInstance(.{ .exports = &.{} });
+    try testing.expectEqual(@as(u32, 2), second);
+}
+
+/// Adapter-side context for the shared `lift_types` transcriber. Compound
+/// value types and resource handles are hoisted into the wrapping
+/// component's type space before reactor exports are lifted.
 const ReactorLiftCtx = struct {
     b: *Builder,
+    ext_slots: []const metadata_decode.TypeSlot,
+    hoisted: *const types_import.Hoisted,
+    embed_extra_iface_inst_for_ns: *const std.StringHashMapUnmanaged(u32),
+    resource_owner: *const std.StringHashMapUnmanaged([]const u8),
+    resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+    own_handle_idx: *std.StringHashMapUnmanaged(u32),
+    borrow_handle_idx: *std.StringHashMapUnmanaged(u32),
 
     pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
         return self.b.addType(td);
     }
 
     pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
-        _ = self;
-        return v;
+        return switch (v) {
+            .own => |slot| .{ .type_idx = try self.hoistHandle(slot, .own) },
+            .borrow => |slot| .{ .type_idx = try self.hoistHandle(slot, .borrow) },
+            else => v,
+        };
+    }
+
+    fn resourceAlias(self: @This(), name: []const u8) lift_types.Error!u32 {
+        if (self.resource_alias_idx.get(name)) |idx| return idx;
+        const owner = self.resource_owner.get(name) orelse
+            return error.UnresolvedResource;
+        const provider_idx = if (findInstanceSlot(self.hoisted.*, owner)) |provider|
+            provider.instance_idx
+        else
+            self.embed_extra_iface_inst_for_ns.get(owner) orelse
+                return error.UnresolvedResource;
+        const idx = try self.b.addAlias(.{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = provider_idx,
+            .name = name,
+        } });
+        try self.resource_alias_idx.put(self.b.arena, name, idx);
+        return idx;
+    }
+
+    fn hoistHandle(
+        self: @This(),
+        slot: u32,
+        comptime kind: enum { own, borrow },
+    ) lift_types.Error!u32 {
+        const name = metadata_decode.resourceNameForSlot(self.ext_slots, slot) orelse
+            return error.UnresolvedResource;
+        const cache = if (kind == .own) self.own_handle_idx else self.borrow_handle_idx;
+        if (cache.get(name)) |idx| return idx;
+
+        const resource_idx = try self.resourceAlias(name);
+        const val: ctypes.ValType = if (kind == .own)
+            .{ .own = resource_idx }
+        else
+            .{ .borrow = resource_idx };
+        const idx = try self.b.addType(.{ .val = val });
+        try cache.put(self.b.arena, name, idx);
+        return idx;
     }
 };
 
@@ -1746,6 +1821,26 @@ fn assemble(in: Inputs) ![]u8 {
         };
         if (!any_export) return error.UnsupportedAdapterShape;
 
+        var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+        var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+        var own_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+        var borrow_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+        for (decoded.externs) |ext| {
+            if (ext.is_export) continue;
+            for (ext.type_slots) |slot| switch (slot) {
+                .sub_resource => |name| {
+                    const gop = try resource_owner.getOrPut(a, name);
+                    if (gop.found_existing and
+                        !std.mem.eql(u8, gop.value_ptr.*, ext.qualified_name))
+                    {
+                        return error.UnsupportedAdapterShape;
+                    }
+                    gop.value_ptr.* = ext.qualified_name;
+                },
+                else => {},
+            };
+        }
+
         for (decoded.externs) |ext| {
             if (!ext.is_export) continue;
 
@@ -1765,7 +1860,16 @@ fn assemble(in: Inputs) ![]u8 {
                 } });
                 const rewritten_sig = try lift_types.transcribeFuncSig(
                     a,
-                    ReactorLiftCtx{ .b = &b },
+                    ReactorLiftCtx{
+                        .b = &b,
+                        .ext_slots = ext.type_slots,
+                        .hoisted = &in.hoisted,
+                        .embed_extra_iface_inst_for_ns = &embed_extra_iface_inst_for_ns,
+                        .resource_owner = &resource_owner,
+                        .resource_alias_idx = &resource_alias_idx,
+                        .own_handle_idx = &own_handle_idx,
+                        .borrow_handle_idx = &borrow_handle_idx,
+                    },
                     ext.type_slots,
                     fn_ref.sig,
                 );
@@ -2457,15 +2561,48 @@ fn buildEmbedExtraImports(
         else blk: {
             var inst_decls = std.ArrayListUnmanaged(ctypes.Decl).empty;
             if (namespace.metadata_ext) |ext| {
+                var live_methods = std.ArrayListUnmanaged([]const u8).empty;
+                var live_method_seen = std.StringHashMapUnmanaged(void).empty;
+                var live_types = std.ArrayListUnmanaged([]const u8).empty;
+                var live_type_seen = std.StringHashMapUnmanaged(void).empty;
+
+                for (namespace.fields) |field| switch (field) {
+                    .ordinary_slot => |slot_idx| {
+                        const name = in.embed_extra_plan.slot_infos[slot_idx].fn_name;
+                        const gop = try live_method_seen.getOrPut(a, name);
+                        if (!gop.found_existing) try live_methods.append(a, name);
+                    },
+                    .intrinsic => |intrinsic| {
+                        const gop = try live_type_seen.getOrPut(a, intrinsic.resource_name);
+                        if (!gop.found_existing)
+                            try live_types.append(a, intrinsic.resource_name);
+                    },
+                };
+                // Keep the interface's declared type surface while pruning
+                // functions the core module does not actually import.
+                for (ext.inst_decls) |decl| switch (decl) {
+                    .@"export" => |exp| if (exp.desc == .type) {
+                        const gop = try live_type_seen.getOrPut(a, exp.name);
+                        if (!gop.found_existing) try live_types.append(a, exp.name);
+                    },
+                    else => {},
+                };
+
+                const pruned = try world_gc.gcInstanceBody(
+                    a,
+                    ext.inst_decls,
+                    live_methods.items,
+                    live_types.items,
+                );
                 const rebased = try rebaseCanonicalInstBody(
                     b,
                     a,
                     in,
-                    ext.inst_decls,
+                    pruned,
                     iface_inst_idx_for_ns,
                 );
-                // The full metadata body is retained. Identity cloning
-                // preserves every local declaration/type relationship.
+                // Identity cloning preserves every remaining local
+                // declaration/type relationship after pruning and rebasing.
                 const decls = rebased;
                 const slot_count = countInstBodyTypeSlots(decls);
                 const identity_remap = try a.alloc(u32, @max(slot_count, 1));
@@ -4098,7 +4235,7 @@ test "splice #328: imported resource new and rep are rejected before assembly" {
     );
 }
 
-test "splice #328: resource-only metadata import has no shim slot and keeps its full instance body" {
+test "splice #328: resource-only metadata import prunes unused methods" {
     const a = testing.allocator;
     const adapter_bytes = try test_fixtures.buildSyntheticAdapter(a);
     defer a.free(adapter_bytes);
@@ -4117,17 +4254,28 @@ test "splice #328: resource-only metadata import has no shim slot and keeps its 
     const body = testImportInstanceBody(&comp, test_fixtures.DIRECT_RESOURCE_NAMESPACE) orelse
         return error.TestUnexpectedResult;
     var has_method = false;
+    var has_resource = false;
     for (body) |decl| switch (decl) {
-        .@"export" => |e| if (std.mem.eql(
-            u8,
-            e.name,
-            test_fixtures.DIRECT_RESOURCE_METHOD,
-        )) {
-            has_method = true;
+        .@"export" => |e| {
+            if (std.mem.eql(
+                u8,
+                e.name,
+                test_fixtures.DIRECT_RESOURCE_METHOD,
+            )) {
+                has_method = true;
+            }
+            if (std.mem.eql(
+                u8,
+                e.name,
+                test_fixtures.DIRECT_RESOURCE_NAME,
+            )) {
+                has_resource = true;
+            }
         },
         else => {},
     };
-    try testing.expect(has_method);
+    try testing.expect(!has_method);
+    try testing.expect(has_resource);
 
     const bundle = testCoreBundleContaining(&comp, test_fixtures.DIRECT_RESOURCE_DROP) orelse
         return error.TestUnexpectedResult;
