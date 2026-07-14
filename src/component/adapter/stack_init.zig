@@ -17,13 +17,11 @@
 //!    from the main module don't recurse into stack allocation
 //!    before it's set up. If absent, emit the bare allocation
 //!    sequence.
-//!  * Synthesize a local `realloc_via_memory_grow` function (it
-//!    only accepts page-sized allocations and uses `memory.grow`),
-//!    OR reuse an imported `__main_module__.cabi_realloc` when the
-//!    embed exports it. The current splicer always falls through to
-//!    the synthesized helper because wabt leaves the import in
-//!    place (its `__main_module__` fallback module supplies trap
-//!    stubs for embeds that don't export `cabi_realloc`).
+//!  * Synthesize a local `realloc_via_memory_grow` function. It only
+//!    accepts page-sized allocations and uses `memory.grow`. The eager
+//!    initializer must not consume the main module's allocator capacity;
+//!    using an imported `__main_module__.cabi_realloc` here can exhaust a
+//!    fixed-size arena before the component handles its first call.
 //!  * Synthesize an `allocate_stack` function of type `() -> ()`.
 //!  * Set the module's start var to `allocate_stack`'s new func
 //!    index.
@@ -53,23 +51,7 @@ pub fn augment(gpa: Allocator, mod: *Mod.Module) Error!void {
 
     const empty_type_idx = try findOrAddEmptyFuncType(gpa, mod);
 
-    // Prefer the existing `__main_module__::cabi_realloc` import
-    // when present — the caller's component-level wiring routes it
-    // to either the embed's `cabi_realloc` or the fallback module's
-    // `realloc_via_memory_grow` (see
-    // `buildMainModuleFallback` in adapter.zig). Re-using it keeps
-    // the GC'd adapter size minimal.
-    //
-    // Only when no cabi_realloc import exists do we synthesize a
-    // local `realloc_via_memory_grow` for `allocate_stack` to call.
-    const realloc_func_idx: u32 = if (findCabiReallocImportIdx(mod)) |idx|
-        idx
-    else blk: {
-        const realloc_type_idx = try findOrAddReallocFuncType(gpa, mod);
-        const idx: u32 = @intCast(mod.funcs.items.len);
-        try appendDefinedFunc(gpa, mod, realloc_type_idx, &.{wtypes.ValType.i32}, try buildReallocViaMemoryGrowBody(gpa));
-        break :blk idx;
-    };
+    const realloc_func_idx = try appendStackRealloc(gpa, mod);
 
     const allocate_stack_idx: u32 = @intCast(mod.funcs.items.len);
     const body = try buildAllocateStackBody(gpa, realloc_func_idx, sp_idx, state_idx);
@@ -78,18 +60,17 @@ pub fn augment(gpa: Allocator, mod: *Mod.Module) Error!void {
     mod.start_var = .{ .index = allocate_stack_idx };
 }
 
-fn findCabiReallocImportIdx(mod: *const Mod.Module) ?u32 {
-    var fidx: u32 = 0;
-    for (mod.imports.items) |im| {
-        if (im.kind != .func) continue;
-        if (std.mem.eql(u8, im.module_name, "__main_module__") and
-            std.mem.eql(u8, im.field_name, "cabi_realloc"))
-        {
-            return fidx;
-        }
-        fidx += 1;
-    }
-    return null;
+fn appendStackRealloc(gpa: Allocator, mod: *Mod.Module) Error!u32 {
+    const realloc_type_idx = try findOrAddReallocFuncType(gpa, mod);
+    const idx: u32 = @intCast(mod.funcs.items.len);
+    try appendDefinedFunc(
+        gpa,
+        mod,
+        realloc_type_idx,
+        &.{wtypes.ValType.i32},
+        try buildReallocViaMemoryGrowBody(gpa),
+    );
+    return idx;
 }
 
 // ── Name-section helpers ───────────────────────────────────────────────
@@ -397,4 +378,18 @@ test "parseGlobalNameForMatch ignores other subsections" {
 
     try testing.expectEqual(@as(?u32, null), try parseGlobalNameForMatch(buf.items, "foo"));
     try testing.expectEqual(@as(?u32, 3), try parseGlobalNameForMatch(buf.items, "__stack_pointer"));
+}
+
+test "shadow stack realloc grows memory without consuming the main allocator" {
+    var mod = Mod.Module.init(testing.allocator);
+    defer mod.deinit();
+
+    const idx = try appendStackRealloc(testing.allocator, &mod);
+    try testing.expectEqual(@as(u32, 0), idx);
+    try testing.expectEqual(@as(usize, 1), mod.funcs.items.len);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        mod.funcs.items[0].code_bytes,
+        &.{ 0x40, 0x00 },
+    ) != null);
 }
