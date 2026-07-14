@@ -201,6 +201,14 @@ fn findWorld(doc: ast.Document, name: []const u8) ?ast.World {
     return null;
 }
 
+fn findInterfaceType(iface: ast.Interface, name: []const u8) ?ast.TypeDef {
+    for (iface.items) |item| switch (item) {
+        .type => |td| if (std.mem.eql(u8, td.name, name)) return td,
+        else => {},
+    };
+    return null;
+}
+
 const Core = enum { i32, i64, f32, f64 };
 
 /// A generated nominal type for a complex (non-primitive-element) future/stream
@@ -211,6 +219,10 @@ const ChanDecl = struct { name: []const u8, rhs: []const u8 };
 /// drives the emitted Zig identifier (the definer — itself for a local type, or
 /// the source for a `use`d type).
 const ScopedType = struct { kind: ast.TypeDefKind, def_iface: []const u8 };
+
+/// A named type pulled in through a `use`. `scope_id` is the interface that
+/// owns the type body's references, while `name` is the name emitted in Zig.
+const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, scope_id: []const u8 };
 
 const GenError = error{ OutOfMemory, UnsupportedWitType, UnknownInterface, UnknownType };
 
@@ -243,7 +255,7 @@ const Gen = struct {
     // interface can reference (its locals + `use`d types). `def_iface` is the
     // interface whose name drives the emitted Zig identifier.
     scoped: std.StringHashMapUnmanaged(ScopedType) = .empty,
-    // Names defined *locally* by ≥2 interfaces — their Zig identifier is
+    // Names emitted from ≥2 defining interfaces — their Zig identifier is
     // disambiguated by the defining interface.
     colliding: std.StringHashMapUnmanaged(void) = .empty,
     // Interface basename → number of world interfaces with that basename.
@@ -346,12 +358,17 @@ const Gen = struct {
         // package context of the interface that contains the `use`). World
         // items share the `$root` scope used while emitting root-function
         // wrappers, so world-local types and aliases resolve there too.
-        const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, iface_id: []const u8 };
         var used_types = std.ArrayListUnmanaged(UsedType).empty;
         var world_types = std.ArrayListUnmanaged(ast.TypeDef).empty;
-        // #303: detect names defined *locally* by more than one interface so we
-        // can disambiguate their Zig identifiers. Keyed by name → first
-        // defining interface; a second distinct definer marks a collision.
+        // Source-interface definitions reached through a `use` are walked once
+        // per interface/name pair. Their transitive named dependencies must be
+        // indexed and emitted too: an alias body is resolved in the source
+        // interface's scope, not in `$root`.
+        var indexed_source_types = std.StringHashMapUnmanaged(void).empty;
+        var emitted_used_types = std.StringHashMapUnmanaged(void).empty;
+        // #303: detect names emitted from more than one interface so we can
+        // disambiguate their Zig identifiers. Keyed by name → first defining
+        // interface; a second distinct definer marks a collision.
         var local_def_iface = std.StringHashMapUnmanaged([]const u8).empty;
         for (world.items) |item| switch (item) {
             .type => |td| {
@@ -370,15 +387,27 @@ const Gen = struct {
                 const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                 for (use_item.names) |un| {
                     const local = un.rename orelse un.name;
-                    for (hit.iface.items) |sit| switch (sit) {
-                        .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
-                            try self.scoped.put(self.ar, self.scopeKey("$root", local), .{ .kind = td.kind, .def_iface = src_id });
-                            if (self.types.contains(local)) continue;
-                            try self.types.put(self.ar, local, td.kind);
-                            try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
-                        },
-                        else => {},
-                    };
+                    const td = findInterfaceType(hit.iface, un.name) orelse continue;
+                    try self.indexSourceType(
+                        &indexed_source_types,
+                        &emitted_used_types,
+                        &used_types,
+                        &local_def_iface,
+                        hit.iface,
+                        src_id,
+                        un.name,
+                        false,
+                    );
+                    try self.scoped.put(self.ar, self.scopeKey("$root", local), .{ .kind = td.kind, .def_iface = src_id });
+                    try self.types.put(self.ar, local, td.kind);
+                    try self.queueUsedType(
+                        &emitted_used_types,
+                        &used_types,
+                        &local_def_iface,
+                        local,
+                        td.kind,
+                        src_id,
+                    );
                 }
             },
             else => {},
@@ -400,17 +429,29 @@ const Gen = struct {
                     const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                     for (use_item.names) |un| {
                         const local = un.rename orelse un.name;
-                        for (hit.iface.items) |sit| switch (sit) {
-                            .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
-                                // The consuming interface can reference `local`,
-                                // bound to the source's structure + name.
-                                try self.scoped.put(self.ar, self.scopeKey(u.id, local), .{ .kind = td.kind, .def_iface = src_id });
-                                if (self.types.contains(local)) continue;
-                                try self.types.put(self.ar, local, td.kind);
-                                try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
-                            },
-                            else => {},
-                        };
+                        const td = findInterfaceType(hit.iface, un.name) orelse continue;
+                        try self.indexSourceType(
+                            &indexed_source_types,
+                            &emitted_used_types,
+                            &used_types,
+                            &local_def_iface,
+                            hit.iface,
+                            src_id,
+                            un.name,
+                            false,
+                        );
+                        // The consuming interface can reference `local`,
+                        // bound to the source's structure + name.
+                        try self.scoped.put(self.ar, self.scopeKey(u.id, local), .{ .kind = td.kind, .def_iface = src_id });
+                        try self.types.put(self.ar, local, td.kind);
+                        try self.queueUsedType(
+                            &emitted_used_types,
+                            &used_types,
+                            &local_def_iface,
+                            local,
+                            td.kind,
+                            src_id,
+                        );
                     }
                 },
                 else => {},
@@ -456,8 +497,8 @@ const Gen = struct {
 
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
-            self.current_iface = ut.iface_id;
-            try self.emitTypeDef(ut.iface_id, .{ .name = ut.name, .kind = ut.kind });
+            self.current_iface = ut.scope_id;
+            try self.emitTypeDef(ut.scope_id, .{ .name = ut.name, .kind = ut.kind });
         }
         self.current_iface = "$root";
         for (world_types.items) |td| try self.emitTypeDef("$root", td);
@@ -516,6 +557,132 @@ const Gen = struct {
         // (`--js-imports`) ──
         if (self.js_imports) {
             try self.emitJsImportBridge(uses.items, top_funcs.items);
+        }
+    }
+
+    /// Queue one type imported from another interface for emission and account
+    /// for its Zig name alongside ordinary interface and world definitions.
+    fn queueUsedType(
+        self: *Gen,
+        emitted: *std.StringHashMapUnmanaged(void),
+        used_types: *std.ArrayListUnmanaged(UsedType),
+        local_def_iface: *std.StringHashMapUnmanaged([]const u8),
+        name: []const u8,
+        kind: ast.TypeDefKind,
+        scope_id: []const u8,
+    ) GenError!void {
+        const key = self.scopeKey(scope_id, name);
+        if (emitted.contains(key)) return;
+        try emitted.put(self.ar, key, {});
+        try used_types.append(self.ar, .{ .name = name, .kind = kind, .scope_id = scope_id });
+
+        const gop = try local_def_iface.getOrPut(self.ar, name);
+        if (gop.found_existing) {
+            if (!std.mem.eql(u8, gop.value_ptr.*, scope_id))
+                try self.colliding.put(self.ar, name, {});
+        } else gop.value_ptr.* = scope_id;
+    }
+
+    /// Index a type from the interface that owns its definition. If a selected
+    /// `use`d type is an alias/record/variant referring to other named types,
+    /// those source-scope dependencies are recursively indexed and queued for
+    /// emission before the selected alias is emitted in its consumer's scope.
+    fn indexSourceType(
+        self: *Gen,
+        indexed: *std.StringHashMapUnmanaged(void),
+        emitted: *std.StringHashMapUnmanaged(void),
+        used_types: *std.ArrayListUnmanaged(UsedType),
+        local_def_iface: *std.StringHashMapUnmanaged([]const u8),
+        iface: ast.Interface,
+        iface_id: []const u8,
+        name: []const u8,
+        emit: bool,
+    ) GenError!void {
+        const td = findInterfaceType(iface, name) orelse return;
+        const key = self.scopeKey(iface_id, name);
+        if (!indexed.contains(key)) {
+            try indexed.put(self.ar, key, {});
+            try self.scoped.put(self.ar, key, .{ .kind = td.kind, .def_iface = iface_id });
+            try self.types.put(self.ar, name, td.kind);
+            try self.indexTypeDefDependencies(
+                indexed,
+                emitted,
+                used_types,
+                local_def_iface,
+                iface,
+                iface_id,
+                td.kind,
+            );
+        }
+        if (emit) try self.queueUsedType(emitted, used_types, local_def_iface, td.name, td.kind, iface_id);
+    }
+
+    fn indexTypeDefDependencies(
+        self: *Gen,
+        indexed: *std.StringHashMapUnmanaged(void),
+        emitted: *std.StringHashMapUnmanaged(void),
+        used_types: *std.ArrayListUnmanaged(UsedType),
+        local_def_iface: *std.StringHashMapUnmanaged([]const u8),
+        iface: ast.Interface,
+        iface_id: []const u8,
+        kind: ast.TypeDefKind,
+    ) GenError!void {
+        switch (kind) {
+            .record => |fields| for (fields) |field| {
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, field.type);
+            },
+            .variant => |cases| for (cases) |case| {
+                if (case.type) |ty| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ty);
+                }
+            },
+            .alias => |ty| try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ty),
+            .resource => |methods| for (methods) |method| {
+                for (method.func.params) |param| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, param.type);
+                }
+                if (method.func.result) |result| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, result);
+                }
+            },
+            .@"enum", .flags => {},
+        }
+    }
+
+    fn indexTypeDependencies(
+        self: *Gen,
+        indexed: *std.StringHashMapUnmanaged(void),
+        emitted: *std.StringHashMapUnmanaged(void),
+        used_types: *std.ArrayListUnmanaged(UsedType),
+        local_def_iface: *std.StringHashMapUnmanaged([]const u8),
+        iface: ast.Interface,
+        iface_id: []const u8,
+        ty: ast.Type,
+    ) GenError!void {
+        switch (ty) {
+            .option, .list => |element| {
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, element.*);
+            },
+            .result => |result| {
+                if (result.ok) |ok| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ok.*);
+                }
+                if (result.err) |err| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, err.*);
+                }
+            },
+            .tuple => |elements| for (elements) |element| {
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, element);
+            },
+            .future, .stream => |element| {
+                if (element) |value| {
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, value.*);
+                }
+            },
+            .name, .own, .borrow => |name| {
+                try self.indexSourceType(indexed, emitted, used_types, local_def_iface, iface, iface_id, name, true);
+            },
+            else => {},
         }
     }
 
@@ -2485,7 +2652,7 @@ test "generate: dispatch mode preserves exact u64/s64 params, results, and neste
             .result = .s64,
         } } },
         .{ .func = .{ .name = "tag-point", .func = .{
-            .params = &.{ .{ .name = "p", .type = point_ref } },
+            .params = &.{.{ .name = "p", .type = point_ref }},
             .result = big_point_ref,
         } } },
     };

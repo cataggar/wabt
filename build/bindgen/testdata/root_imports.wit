@@ -1,22 +1,41 @@
 package test:root-imports@0.1.0;
 
 interface host {
+  record point {
+    x: u32,
+    y: u32,
+  }
+
   twice: func(value: u32) -> u32;
 }
 
 interface shared {
-  record shared-point {
+  record point {
     x: u32,
     y: u32,
   }
+
+  record inner {
+    x: u32,
+    y: u32,
+  }
+
+  variant outer {
+    empty,
+    item(inner),
+  }
+
+  type alias = outer;
 }
 
 world guest {
-  use shared.{shared-point as imported-point};
+  // `alias` reaches a variant and record through the source interface's
+  // scope. `point` intentionally collides with the imported `host` type.
+  use shared.{alias, point};
 
   record root-record {
     label: string,
-    point: imported-point,
+    point: point,
   }
 
   variant root-choice {
@@ -30,6 +49,7 @@ world guest {
   import notify: func(message: string);
   import reshape: func(value: root-record) -> root-record;
   import flip-choice: func(value: root-choice-alias) -> root-choice-alias;
-  import translate: func(value: imported-point) -> imported-point;
+  import flip-chain: func(value: alias) -> alias;
+  import translate: func(value: point) -> point;
   import host;
 }
