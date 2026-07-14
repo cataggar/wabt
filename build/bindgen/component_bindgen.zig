@@ -207,6 +207,10 @@ const Gen = struct {
     // Names defined *locally* by ≥2 interfaces — their Zig identifier is
     // disambiguated by the defining interface.
     colliding: std.StringHashMapUnmanaged(void) = .empty,
+    // Interface basename → number of world interfaces with that basename.
+    // Duplicate names such as wasi:filesystem/types and wasi:http/types need
+    // package-qualified Zig namespaces and type prefixes.
+    iface_name_counts: std.StringHashMapUnmanaged(usize) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
     // Distinct complex (non-primitive-element) future/stream channels → the
@@ -274,6 +278,17 @@ const Gen = struct {
                 .named_func => |nf| {
                     try top_funcs.append(self.ar, .{ .name = nf.name, .func = nf.func, .is_export = ei.is_export });
                 },
+            }
+        }
+        for (uses.items) |u| {
+            const gop = try self.iface_name_counts.getOrPut(
+                self.ar,
+                ifaceBaseName(u.id),
+            );
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+            } else {
+                gop.value_ptr.* = 1;
             }
         }
 
@@ -722,7 +737,7 @@ const Gen = struct {
 
     fn emitImportIface(self: *Gen, u: Use) GenError!void {
         self.current_iface = u.id;
-        const mod = try snake(self.ar, lastSegment(u.id));
+        const mod = try self.interfaceModuleName(u.id);
         self.print("pub const {s} = struct {{\n", .{mod});
         // The flattened `extern` import decls live in a private `imp`
         // namespace: their names are the exact WIT function names, which would
@@ -1120,7 +1135,30 @@ const Gen = struct {
         else
             self.current_iface;
         if (def_iface.len == 0) return pascal(self.ar, name);
-        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ try pascal(self.ar, ifaceBaseName(def_iface)), try pascal(self.ar, name) });
+        return std.fmt.allocPrint(self.ar, "{s}{s}", .{
+            try pascal(self.ar, self.interfaceDisambiguator(def_iface)),
+            try pascal(self.ar, name),
+        });
+    }
+
+    fn interfaceModuleName(self: *Gen, iface_id: []const u8) GenError![]const u8 {
+        return snake(self.ar, self.interfaceDisambiguator(iface_id));
+    }
+
+    fn interfaceDisambiguator(self: *Gen, iface_id: []const u8) []const u8 {
+        const base = ifaceBaseName(iface_id);
+        if ((self.iface_name_counts.get(base) orelse 0) < 2) return base;
+
+        const slash = std.mem.lastIndexOfScalar(u8, iface_id, '/') orelse return base;
+        const package_start = if (std.mem.lastIndexOfScalar(u8, iface_id[0..slash], ':')) |colon|
+            colon + 1
+        else
+            0;
+        return std.fmt.allocPrint(
+            self.ar,
+            "{s}-{s}",
+            .{ iface_id[package_start..slash], base },
+        ) catch @panic("OOM");
     }
 
     fn resolveAlias(self: *Gen, ty: ast.Type) ast.Type {
@@ -1607,6 +1645,27 @@ test "name helpers" {
         defer a.free(s);
         try testing.expectEqualStrings("@\"error\"", s);
     }
+}
+
+test "duplicate interface basenames use package-qualified Zig names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var g = Gen{
+        .ar = a,
+        .resolver = undefined,
+        .impl = "impl",
+    };
+    try g.iface_name_counts.put(a, "types", 2);
+    try testing.expectEqualStrings(
+        "filesystem_types",
+        try g.interfaceModuleName("wasi:filesystem/types@0.2.10"),
+    );
+    try testing.expectEqualStrings(
+        "http_types",
+        try g.interfaceModuleName("wasi:http/types@0.2.10"),
+    );
 }
 
 test "generate: export shells + import wrappers" {
