@@ -489,9 +489,20 @@ const Gen = struct {
             .s64 => "i64",
             .f32 => "f32",
             .f64 => "f64",
-            .char => "u32",
+            // `char` and `list<u8>` are only disambiguated from a bare
+            // `u32`/`string` in `--dispatch` (generic export dispatch) mode:
+            // that is the sole consumer needing to tell them apart at
+            // runtime (see `wit_types.Char`/`wit_types.ByteList`'s doc
+            // comments). `--impl` mode (every other WIT world this generator
+            // serves: `wasi:*` bindings, hand-written guest code) keeps the
+            // exact same `u32`/`[]const u8` spelling it always has, so this
+            // is a zero-ripple, dispatch-mode-local change.
+            .char => if (self.dispatch != null) "wit_types.Char" else "u32",
             .string => "[]const u8",
-            .list => |e| try std.fmt.allocPrint(self.ar, "[]const {s}", .{try self.zigType(e.*)}),
+            .list => |e| blk: {
+                if (self.dispatch != null and e.* == .u8) break :blk "wit_types.ByteList";
+                break :blk try std.fmt.allocPrint(self.ar, "[]const {s}", .{try self.zigType(e.*)});
+            },
             .option => |e| try std.fmt.allocPrint(self.ar, "?{s}", .{try self.zigType(e.*)}),
             .result => |r| blk: {
                 const ok = if (r.ok) |t| try self.zigType(t.*) else "void";
@@ -1744,6 +1755,88 @@ test "generate: export shells + import wrappers" {
         try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(u32, imp.@\"ping\"(@bitCast(x)));") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:t/store\" fn @\"get\"(id: i32, retptr: i32) void;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(?Pet, wit_types.retArea());") != null);
+    }
+}
+
+test "zigType: char/list<u8> disambiguate only in --dispatch mode" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const u8_ty: ast.Type = .u8;
+    const list_u8 = ast.Type{ .list = &u8_ty };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "echo-char", .func = .{
+            .params = &.{.{ .name = "c", .type = .char }},
+            .result = .char,
+        } } },
+        .{ .func = .{ .name = "echo-bytes", .func = .{
+            .params = &.{.{ .name = "b", .type = list_u8 }},
+            .result = list_u8,
+        } } },
+        .{ .func = .{ .name = "echo-string", .func = .{
+            .params = &.{.{ .name = "s", .type = .string }},
+            .result = .string,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "bytes-api", .items = &iface_items };
+    const exp_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "bytes-api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "t" },
+        .items = &.{ .{ .interface = iface }, .{ .world = exp_world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    // `--impl` mode: unaffected, still bare `u32`/`[]const u8` for both
+    // `char` and `list<u8>` (every other consumer of this generator, e.g.
+    // `wasi:*` bindings, must see zero change).
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.Char") == null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.ByteList") == null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "wit_types.returnResult(u32, Impl.echoChar(__params.c), &wit_types.alloc)",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "wit_types.returnResult([]const u8, Impl.echoBytes(__params.b), &wit_types.alloc)",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "wit_types.returnResult([]const u8, Impl.echoString(__params.s), &wit_types.alloc)",
+        ) != null);
+    }
+    // `--dispatch` mode: `char`/`list<u8>` get the disambiguating wrapper;
+    // plain `string` is untouched.
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/bytes-api#echo-char\", wit_types.Char, .{ __params.c })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/bytes-api#echo-bytes\", wit_types.ByteList, .{ __params.b })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/bytes-api#echo-string\", []const u8, .{ __params.s })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.CoreReturn(wit_types.Char)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "wit_types.CoreReturn(wit_types.ByteList)") != null);
     }
 }
 

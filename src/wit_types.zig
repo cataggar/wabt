@@ -222,6 +222,8 @@ test "readResultHandle decodes the ok and err arms" {
 //   | `enum`                      | `enum`         |
 //   | `struct { … }`              | `record`       |
 //   | tuple `struct { T, U }`     | `tuple<T, U>`  |
+//   | `Char` (`--dispatch` only)  | `char`         |
+//   | `ByteList` (`--dispatch` only) | `list<u8>`  |
 //
 // ## Layout rules (canonical ABI)
 //
@@ -345,6 +347,36 @@ pub fn Result(comptime T: type, comptime E: type) type {
 pub fn Tuple(comptime Ts: anytype) type {
     return @Tuple(&Ts);
 }
+
+/// A nominal wrapper distinguishing a WIT `char` (a canonical-ABI-validated
+/// Unicode scalar value, 0..0x10FFFF excluding the surrogate range
+/// 0xD800..0xDFFF, encoded as a single core `u32`) from a plain WIT `u32`
+/// integer -- the two are otherwise structurally identical once lowered
+/// (both a bare 4-byte core value), so a consumer working only from a Zig
+/// type has no way to tell them apart. `sizeOf`/`alignOf`/`lower`/`lift`
+/// already handle this correctly as an ordinary 1-field record (no core ABI
+/// change: a record with a single field has the same layout as that field
+/// alone), so no dedicated marshalling code is needed here -- this is purely
+/// a type-identity marker for callers (e.g. a native JS dispatch bridge) that
+/// need to know a `u32`-shaped value actually originated from `char` in
+/// order to apply `char`-specific validation/encoding (Unicode scalar value
+/// range checks, one-codepoint-string representation, ...).
+///
+/// Only emitted by the bindgen generator's `--dispatch` (generic export
+/// dispatch) mode -- see `component_bindgen.zig`'s `zigType` -- so every
+/// other consumer of this generator (`--impl` mode: `wasi:*` bindings,
+/// hand-written guest implementations) is completely unaffected and keeps
+/// using a bare `u32` for `char`, exactly as before this type existed.
+pub const Char = struct { codepoint: u32 };
+
+/// A nominal wrapper distinguishing a WIT `list<u8>` (an opaque byte array)
+/// from a WIT `string` (UTF-8 text) -- both lower to the identical
+/// canonical-ABI shape (a `(ptr: u32, len: u32)` pair over `u8` bytes) and
+/// are therefore structurally indistinguishable as a bare `[]const u8`.
+/// Exactly the `Char` situation above, but for lists of bytes; see that
+/// type's doc comment for why a 1-field wrapper record needs no dedicated
+/// marshalling code and is only emitted in `--dispatch` mode.
+pub const ByteList = struct { bytes: []const u8 };
 
 /// The WIT spelling of a primitive type, for the `[stream]stream<…>` /
 /// `[future]future<…>` async-intrinsic module names. Non-primitive elements
@@ -1392,6 +1424,34 @@ test "Result constructor is memoized and round-trips" {
     }
     // result<_, _> flattens to a flat discriminant.
     try testing.expect(resultIsFlat(Result(void, void)));
+}
+
+test "Char/ByteList wrappers have the same canonical layout as their bare payload" {
+    // `Char` must match plain `u32`'s layout exactly (a single core value):
+    // this is what lets `--dispatch` mode swap in the wrapper with zero ABI
+    // change relative to the bare `u32` every other (`--impl`) consumer of
+    // this generator still uses for `char`.
+    try testing.expectEqual(sizeOf(u32), sizeOf(Char));
+    try testing.expectEqual(alignOf(u32), alignOf(Char));
+    try testing.expectEqual(flatCount(u32), flatCount(Char));
+
+    test_top = 0;
+    var char_buf: [sizeOf(Char)]u8 align(8) = undefined;
+    lower(Char, .{ .codepoint = 0x1F600 }, &char_buf, &testAlloc);
+    try testing.expectEqual(@as(u32, 0x1F600), lift(Char, &char_buf).codepoint);
+
+    // `ByteList` must match plain `[]const u8`'s layout exactly (a
+    // `(ptr, len)` pair): same rationale as `Char` above, for `list<u8>`
+    // vs. `string`.
+    try testing.expectEqual(sizeOf([]const u8), sizeOf(ByteList));
+    try testing.expectEqual(alignOf([]const u8), alignOf(ByteList));
+    try testing.expectEqual(flatCount([]const u8), flatCount(ByteList));
+
+    test_top = 0;
+    var bytes_buf: [sizeOf(ByteList)]u8 align(8) = undefined;
+    const raw_bytes = [_]u8{ 0, 1, 2, 0xff };
+    lower(ByteList, .{ .bytes = &raw_bytes }, &bytes_buf, &testAlloc);
+    try testing.expectEqualSlices(u8, &raw_bytes, lift(ByteList, &bytes_buf).bytes);
 }
 
 test "Tuple / Future / Stream constructors marshal correctly" {
