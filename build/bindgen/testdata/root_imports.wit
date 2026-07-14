@@ -1,0 +1,11 @@
+package test:root-imports@0.1.0;
+
+interface host {
+  twice: func(value: u32) -> u32;
+}
+
+world guest {
+  import add-one: func(value: u32) -> u32;
+  import notify: func(message: string);
+  import host;
+}
