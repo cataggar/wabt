@@ -536,6 +536,9 @@ const Gen = struct {
                 self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
             }
         }
+        if (self.dispatch != null) {
+            try self.emitJsExportManifest(uses.items, top_funcs.items);
+        }
 
         // ── imports ──
         for (uses.items) |u| {
@@ -858,6 +861,61 @@ const Gen = struct {
     }
 
     // ── exports ──────────────────────────────────────────────────────
+
+    /// Emit the exact core export names dispatched to JavaScript. The host
+    /// runtime consumes this manifest after module evaluation to reject a
+    /// missing namespace/member or non-callable export before snapshot/AOT
+    /// publication. Keep this in dispatch mode only: `--impl` worlds do not
+    /// resolve their implementations from a JavaScript module namespace.
+    fn emitJsExportManifest(self: *Gen, uses: []const Use, top_funcs: []const TopFunc) GenError!void {
+        var count: usize = 0;
+        for (uses) |u| {
+            if (!u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| if (!fd.func.is_async) {
+                    count += 1;
+                },
+                else => {},
+            };
+        }
+        for (top_funcs) |tf| {
+            if (tf.is_export and !tf.func.is_async) count += 1;
+        }
+        if (count == 0) return;
+
+        self.raw(
+            \\// Exact dispatch keys for componentization-time JavaScript export validation.
+            \\// "I\t<interface-id>#<function>\n" preserves named-interface topology;
+            \\// "R\t<function>\n" identifies a world-level root export.
+            \\pub const js_export_manifest: []const u8 =
+            \\
+        );
+        for (uses) |u| {
+            if (!u.is_export) continue;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| {
+                    if (fd.func.is_async) continue;
+                    self.print("    \"I\\t{s}#{s}\\n\" ++\n", .{ u.id, fd.name });
+                },
+                else => {},
+            };
+        }
+        for (top_funcs) |tf| {
+            if (tf.is_export and !tf.func.is_async) {
+                self.print("    \"R\\t{s}\\n\" ++\n", .{tf.name});
+            }
+        }
+        self.raw(
+            \\    "";
+            \\
+            \\pub export fn starling_js_exports_manifest(out_len: *usize) callconv(.c) [*]const u8 {
+            \\    out_len.* = js_export_manifest.len;
+            \\    return js_export_manifest.ptr;
+            \\}
+            \\
+            \\
+        );
+    }
 
     fn emitExportIface(self: *Gen, u: Use) GenError!void {
         self.current_iface = u.id;
@@ -4565,6 +4623,71 @@ test "generate: aggregate params (variant / record) lower via canon.lowerFlat" {
     try testing.expect(std.mem.indexOf(u8, out, "extern \"demo:m/api\" fn @\"move-to\"(p_0: i32, p_1: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(Point, p, &wit_types.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"move-to\"(p_s[0], p_s[1])") != null);
+}
+
+test "generate: dispatch mode emits exact synchronous JavaScript export manifest" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "do-thing", .func = .{
+            .params = &.{.{ .name = "value", .type = .u32 }},
+            .result = .u32,
+        } } },
+        .{ .func = .{ .name = "later", .func = .{
+            .params = &.{},
+            .result = .u32,
+            .is_async = true,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const world = ast.World{ .name = "js-exports", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+        .{ .@"export" = .{ .named_func = .{ .name = "root-add", .func = .{
+            .params = &.{
+                .{ .name = "a", .type = .u32 },
+                .{ .name = "b", .type = .u32 },
+            },
+            .result = .u32,
+        } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{
+            .namespace = "test",
+            .name = "preflight",
+            .version = "1.2.3",
+        },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+        try g.generate(world, "js-exports");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"I\\ttest:preflight/api@1.2.3#do-thing\\n\" ++",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "\"R\\troot-add\\n\" ++") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "api@1.2.3#later\\n") == null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "pub export fn starling_js_exports_manifest(out_len: *usize) callconv(.c) [*]const u8 {",
+        ) != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+        try g.generate(world, "js-exports");
+        try testing.expect(std.mem.indexOf(u8, g.out.items, "js_export_manifest") == null);
+        try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_exports_manifest") == null);
+    }
 }
 
 test "generate: use-imported types are indexed and emitted" {
