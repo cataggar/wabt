@@ -343,13 +343,46 @@ const Gen = struct {
 
         // Index every named type so `.name` refs resolve, plus any types pulled
         // in from another interface via `use pkg:iface.{ … }` (resolved in the
-        // package context of the interface that contains the `use`).
+        // package context of the interface that contains the `use`). World
+        // items share the `$root` scope used while emitting root-function
+        // wrappers, so world-local types and aliases resolve there too.
         const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, iface_id: []const u8 };
         var used_types = std.ArrayListUnmanaged(UsedType).empty;
+        var world_types = std.ArrayListUnmanaged(ast.TypeDef).empty;
         // #303: detect names defined *locally* by more than one interface so we
         // can disambiguate their Zig identifiers. Keyed by name → first
         // defining interface; a second distinct definer marks a collision.
         var local_def_iface = std.StringHashMapUnmanaged([]const u8).empty;
+        for (world.items) |item| switch (item) {
+            .type => |td| {
+                try self.types.put(self.ar, td.name, td.kind);
+                try self.scoped.put(self.ar, self.scopeKey("$root", td.name), .{ .kind = td.kind, .def_iface = "$root" });
+                try world_types.append(self.ar, td);
+                const gop = try local_def_iface.getOrPut(self.ar, td.name);
+                if (gop.found_existing) {
+                    if (!std.mem.eql(u8, gop.value_ptr.*, "$root"))
+                        try self.colliding.put(self.ar, td.name, {});
+                } else gop.value_ptr.* = "$root";
+            },
+            .use => |use_item| {
+                const hit = self.resolver.findInterfaceWithPkgCtx(use_item.from, doc_pkg) orelse continue;
+                const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
+                const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
+                for (use_item.names) |un| {
+                    const local = un.rename orelse un.name;
+                    for (hit.iface.items) |sit| switch (sit) {
+                        .type => |td| if (std.mem.eql(u8, td.name, un.name)) {
+                            try self.scoped.put(self.ar, self.scopeKey("$root", local), .{ .kind = td.kind, .def_iface = src_id });
+                            if (self.types.contains(local)) continue;
+                            try self.types.put(self.ar, local, td.kind);
+                            try used_types.append(self.ar, .{ .name = local, .kind = td.kind, .iface_id = src_id });
+                        },
+                        else => {},
+                    };
+                }
+            },
+            else => {},
+        };
         for (uses.items) |u| {
             for (u.iface.items) |it| switch (it) {
                 .type => |td| {
@@ -419,13 +452,15 @@ const Gen = struct {
         // Register complex (non-primitive-element) future/stream channels so
         // their nominal types are shared across import wrappers and the user
         // impl. Must run after `self.types` is fully indexed.
-        try self.registerChannels(uses.items);
+        try self.registerChannels(uses.items, top_funcs.items);
 
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
             self.current_iface = ut.iface_id;
             try self.emitTypeDef(ut.iface_id, .{ .name = ut.name, .kind = ut.kind });
         }
+        self.current_iface = "$root";
+        for (world_types.items) |td| try self.emitTypeDef("$root", td);
         for (uses.items) |u| {
             self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
@@ -1743,7 +1778,7 @@ const Gen = struct {
     /// from the world's imported functions, binding each to a function-reference
     /// intrinsic module. Each distinct structural channel is bound to one
     /// canonical site (any valid site resolves to the same structure).
-    fn registerChannels(self: *Gen, uses: []const Use) GenError!void {
+    fn registerChannels(self: *Gen, uses: []const Use, top_funcs: []const TopFunc) GenError!void {
         for (uses) |u| {
             // Imports only for now: complex channels in the worlds we target are
             // import-side; the export-side intrinsic form is a later refinement.
@@ -1759,6 +1794,10 @@ const Gen = struct {
                 },
                 else => {},
             };
+        }
+        self.current_iface = "$root";
+        for (top_funcs) |tf| {
+            if (!tf.is_export) try self.registerFuncChannels("$root", tf.name, tf.func);
         }
         self.current_iface = "";
     }

@@ -254,7 +254,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_wit_types_tests.step);
     test_step.dependOn(&run_bindgen_tests.step);
     test_step.dependOn(root_import_gen_step);
-    test_step.dependOn(root_component_step);
+    // Component wrapping uses the separately installed `wasm-tools` CLI.
+    // Keep it opt-in so a documented clean `zig build test` needs only this
+    // package's declared Zig dependencies; semantic root-import codegen stays
+    // covered above by `root_import_gen_step`.
 }
 
 // ?? Build helpers (ported from cataggar/wamr) ??????????????????????

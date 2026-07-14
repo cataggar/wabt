@@ -92,9 +92,17 @@ adds `--dir`, sockets adds `-S allow-ip-name-lookup`).
 ## Build
 
 ```sh
-zig build test     # native unit tests for wit_types.zig (cabi_realloc + ret-area)
+zig build test     # native + bindgen unit tests and semantic codegen checks
 ```
 
 The `wasi_*` / `cm_async` wrappers are wasm-only (their `extern` host imports
 link only for `wasm32-freestanding`), so they are type-checked by compiling a
 guest, not by native tests.
+
+`zig build test` is hermetic with respect to external CLI tools. The optional
+component-wrapping integration check requires a separately installed
+[`wasm-tools`](https://github.com/bytecodealliance/wasm-tools) on `PATH`:
+
+```sh
+zig build root-import-component-test
+```

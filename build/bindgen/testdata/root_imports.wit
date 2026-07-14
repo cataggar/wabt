@@ -4,8 +4,32 @@ interface host {
   twice: func(value: u32) -> u32;
 }
 
+interface shared {
+  record shared-point {
+    x: u32,
+    y: u32,
+  }
+}
+
 world guest {
+  use shared.{shared-point as imported-point};
+
+  record root-record {
+    label: string,
+    point: imported-point,
+  }
+
+  variant root-choice {
+    empty,
+    item(root-record),
+  }
+
+  type root-choice-alias = root-choice;
+
   import add-one: func(value: u32) -> u32;
   import notify: func(message: string);
+  import reshape: func(value: root-record) -> root-record;
+  import flip-choice: func(value: root-choice-alias) -> root-choice-alias;
+  import translate: func(value: imported-point) -> imported-point;
   import host;
 }
