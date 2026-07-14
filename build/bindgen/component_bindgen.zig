@@ -1049,6 +1049,33 @@ const Gen = struct {
         for (uses) |u| {
             if (u.is_export) continue;
             self.current_iface = u.id;
+            // An imported interface that defines *any* resource (regardless
+            // of whether it has methods) cannot be bridged to JavaScript as
+            // a whole: `--js-imports` has no handle-lifetime story for
+            // resources yet (see `nativeBridgeSupported`'s doc comment).
+            // Reject the *entire interface* here, deterministically, before
+            // considering any of its functions -- otherwise a mixed
+            // interface (a resource type alongside free-standing functions
+            // that never reference it) would silently bridge the free
+            // functions while the resource's own methods are dropped with
+            // no diagnostic at all, since the loop below only ever switches
+            // on `.func` items and treats `.type` as `else => {}`. Checking
+            // this first, in its own pass over `u.iface.items`, guarantees
+            // the rejection fires regardless of item order or whether any
+            // bridged function actually touches the resource.
+            for (u.iface.items) |it| {
+                if (it == .type and it.type.kind == .resource) {
+                    return self.fail(
+                        "imported interface '{s}' defines resource '{s}' and cannot be bridged to " ++
+                            "JavaScript as a whole (--js-imports has no handle-lifetime story for " ++
+                            "resources yet); this applies even when the interface also has free-standing " ++
+                            "bridgeable functions that never reference the resource -- move the resource to " ++
+                            "its own interface (so the free functions' interface has none), or drop " ++
+                            "--js-imports for this world",
+                        .{ u.id, it.type.name },
+                    );
+                }
+            }
             for (u.iface.items) |it| switch (it) {
                 .func => |fd| {
                     if (fd.func.is_async) {
@@ -1178,7 +1205,15 @@ const Gen = struct {
                 self.print("        out_result.* = js_dispatch.encodeNative({s}, __result, __alloc);\n", .{e.result_zig});
             } else {
                 self.print("        {s}.{s}({s});\n", .{ e.mod, e.camel_name, call_args.items });
-                self.raw("        out_result.* = .{ .tag = .bool_ };\n");
+                // A WIT import with no result must surface to JavaScript as
+                // `undefined` -- never a coerced-looking `false`/`null` --
+                // matching ComponentizeJS's observable behavior for a void
+                // host call. Goes through `encodeNative`'s own `void` arm
+                // (tag `.undefined_`) rather than hand-rolling a literal
+                // `NativeValue` here, so the *one* place that knows the
+                // shared ABI tag vocabulary is js_dispatch.zig, not this
+                // generator (see js_dispatch.h's `StarlingJsTag`).
+                self.raw("        out_result.* = js_dispatch.encodeNative(void, {}, __alloc);\n");
             }
             self.raw("        out_arena.* = __arena;\n");
             self.raw("        return 0;\n");
@@ -2655,12 +2690,19 @@ test "generate --js-imports: an imported resource parameter is a deterministic b
     defer arena.deinit();
     const ar = arena.allocator();
 
-    // interface counters { resource counter { … } } / imports { take: func(c: own<counter>); }
+    // interface counters { resource counter { … } } / imports { use counters.{counter};
+    // take: func(c: own<counter>); } -- "counters" is reached only via the
+    // `use` (not imported by the world directly), so this test exercises the
+    // parameter-type diagnostic in isolation from the "imported interface
+    // defines a resource" diagnostic (covered by its own dedicated test
+    // below, which fires whenever an *imported* interface itself declares a
+    // resource, regardless of what its functions' parameters look like).
     const counter_items = [_]ast.InterfaceItem{
         .{ .type = .{ .name = "counter", .kind = .{ .resource = &.{} } } },
     };
     const counters_iface = ast.Interface{ .name = "counters", .items = &counter_items };
     const imports_items = [_]ast.InterfaceItem{
+        .{ .use = .{ .from = .{ .name = "counters" }, .names = &.{.{ .name = "counter" }} } },
         .{ .func = .{ .name = "take", .func = .{
             .params = &.{.{ .name = "c", .type = ast.Type{ .name = "counter" } }},
             .result = null,
@@ -2668,7 +2710,6 @@ test "generate --js-imports: an imported resource parameter is a deterministic b
     };
     const imports_iface = ast.Interface{ .name = "imports", .items = &imports_items };
     const world = ast.World{ .name = "guest", .items = &.{
-        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "counters" } } } },
         .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "imports" } } } },
     } };
     const doc = ast.Document{
@@ -2681,6 +2722,58 @@ test "generate --js-imports: an imported resource parameter is a deterministic b
     try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
     try testing.expect(std.mem.indexOf(u8, g.diag, "take") != null);
     try testing.expect(std.mem.indexOf(u8, g.diag, "'c'") != null);
+}
+
+test "generate --js-imports: a mixed resource + free-function interface is rejected as a whole, not silently bridged" {
+    // interface host {
+    //   resource counter { … }             // never referenced by `add`
+    //   add: func(a: s32, b: s32) -> s32;   // fully bridgeable on its own
+    // }
+    // Before the fix, this silently emitted a manifest/dispatch entry for
+    // `add` and simply dropped `counter` with no diagnostic at all (the
+    // per-item loop only switched on `.func`, treating `.type` as
+    // `else => {}`). The whole imported interface must instead be rejected
+    // deterministically, precisely because it contains a resource -- even
+    // though `add` alone would satisfy `nativeBridgeSupported` and neither
+    // `add`'s params/result nor its body reference `counter` at all.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const host_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "counter", .kind = .{ .resource = &.{
+            .{ .kind = .method, .name = "get", .func = .{ .params = &.{}, .result = .s32 } },
+        } } } },
+        .{ .func = .{ .name = "add", .func = .{
+            .params = &.{
+                .{ .name = "a", .type = .s32 },
+                .{ .name = "b", .type = .s32 },
+            },
+            .result = .s32,
+        } } },
+    };
+    const host_iface = ast.Interface{ .name = "host", .items = &host_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "mixed" },
+        .items = &.{ .{ .interface = host_iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    // Names the offending interface and resource, not the unrelated `add`.
+    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "counter") != null);
+    // No JS-bridge manifest/dispatch trampoline is emitted on failure (the
+    // interface's normal, unrelated typed import wrapper for `add` -- from
+    // `emitImportIface`, always emitted before the `--js-imports` pass runs
+    // -- is unaffected and may still appear in `g.out`; only the JS-bridge
+    // artifacts must be absent).
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
 }
 
 test "generate --js-imports: an imported async function is a deterministic build diagnostic, not a silent skip" {
@@ -2739,6 +2832,48 @@ test "generate --js-imports: two interfaces contribute independent dispatch entr
     try testing.expect(std.mem.indexOf(u8, out, "if (std.mem.eql(u8, name, \"test:multi/b#pong\")) {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const __result = a.ping();") != null);
     try testing.expect(std.mem.indexOf(u8, out, "b.pong();") != null);
+    // `pong` has no result: its dispatch arm must produce JavaScript
+    // `undefined` via `encodeNative`'s own `void` tag, not a hand-rolled
+    // `.tag = .bool_` (which used to decode to JS `false`) -- see the
+    // dedicated round-trip test below for the C++/Zig encode contract.
+    try testing.expect(std.mem.indexOf(u8, out, "js_dispatch.encodeNative(void, {}, __alloc)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, ".tag = .bool_") == null);
+}
+
+test "generate --js-imports: a void-result import encodes to the dedicated undefined tag, never bool/option" {
+    // interface host { ack: func(); } -- no parameters, no result. JavaScript
+    // calling `host.ack()` must observe `undefined`, matching
+    // ComponentizeJS's canonical-ABI-void behavior; before this fix the
+    // generator hard-coded `.tag = .bool_` (JS `false`) here.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "ack", .func = .{ .params = &.{}, .result = null } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "void" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "if (std.mem.eql(u8, name, \"test:void/host#ack\")) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "host.ack();") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "out_result.* = js_dispatch.encodeNative(void, {}, __alloc);") != null);
+    // Never the pre-fix placeholder (JS `false`) nor an option-none
+    // encoding (JS `null`) -- void must be its own tag, not borrowed from
+    // either.
+    try testing.expect(std.mem.indexOf(u8, out, ".tag = .bool_") == null);
+    try testing.expect(std.mem.indexOf(u8, out, ".tag = .option_none") == null);
 }
 
 test "generate: imported resource with async methods (#300)" {
