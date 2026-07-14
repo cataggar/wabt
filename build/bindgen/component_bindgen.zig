@@ -990,27 +990,44 @@ const Gen = struct {
     // synthesize without per-world C++ glue.
     //
     // A function whose signature includes a type the native bridge doesn't
-    // cover (resource, variant, enum, flags, tuple, `result<T,E>`, `char`,
-    // future/stream) is a deterministic `error.UnsupportedWitType` generation
-    // failure (via `fail`, naming the offending function/type) rather than a
-    // silently-missing JS export -- see `nativeBridgeSupported`. An *async*
-    // imported function is likewise rejected for now (`wit_async.awaitCall`
-    // has no equivalent on this synchronous JS-call path); it is a distinct,
-    // separately diagnosed follow-up, not silently skipped either.
+    // cover (resource, future/stream, error-context) is a deterministic
+    // `error.UnsupportedWitType` generation failure (via `fail`, naming the
+    // offending function/type) rather than a silently-missing JS export --
+    // see `nativeBridgeSupported`. An *async* imported function is likewise
+    // rejected for now (`wit_async.awaitCall` has no equivalent on this
+    // synchronous JS-call path); it is a distinct, separately diagnosed
+    // follow-up, not silently skipped either.
 
     /// Whether `ty`'s type graph is entirely within the set `js_dispatch`'s
     /// `NativeValue` encode/decode pair supports: `bool`/integers/`f32`/`f64`,
-    /// `string`, `option<T>`, `list<T>`, and `record` (recursively, for any of
-    /// those). Everything else -- `char`, `tuple`, `result<T,E>`, `variant`,
-    /// `enum`, `flags`, resource handles (`own`/`borrow`), `future`/`stream`,
-    /// `error-context` -- is unsupported (matches the Zig-type cases
-    /// `encodeNative`/`decodeNative` actually implement in `js_dispatch.zig`;
-    /// keep this in sync with that switch if it ever grows).
+    /// `char`, `string`, `option<T>`, `list<T>` (including `list<u8>`,
+    /// bridged as `wit_types.ByteList`), `tuple`, `record`, `variant`,
+    /// `enum`, `flags`, and `result<T,E>` (recursively, for any of those).
+    /// Everything else -- resource handles (`own`/`borrow`), `future`/
+    /// `stream`, `error-context` -- is unsupported (matches the Zig-type
+    /// cases `encodeNative`/`decodeNative` actually implement in
+    /// `js_dispatch.zig`; keep this in sync with that switch if it ever
+    /// grows).
     fn nativeBridgeSupported(self: *Gen, ty: ast.Type) GenError!bool {
         return switch (ty) {
-            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string => true,
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string, .char => true,
             .list => |e| try self.nativeBridgeSupported(e.*),
             .option => |e| try self.nativeBridgeSupported(e.*),
+            .tuple => |elems| r: {
+                for (elems) |e| {
+                    if (!try self.nativeBridgeSupported(e)) break :r false;
+                }
+                break :r true;
+            },
+            .result => |r| blk: {
+                if (r.ok) |t| {
+                    if (!try self.nativeBridgeSupported(t.*)) break :blk false;
+                }
+                if (r.err) |t| {
+                    if (!try self.nativeBridgeSupported(t.*)) break :blk false;
+                }
+                break :blk true;
+            },
             .name => |n| blk: {
                 const kind = self.typeKind(n) orelse return error.UnknownType;
                 break :blk switch (kind) {
@@ -1021,14 +1038,28 @@ const Gen = struct {
                         break :r true;
                     },
                     .alias => |t| try self.nativeBridgeSupported(t),
-                    // variant/enum/flags/resource: not representable by the
-                    // native bridge's tag vocabulary (see js_dispatch.h).
-                    else => false,
+                    .variant => |cases| r: {
+                        for (cases) |c| {
+                            if (c.type) |t| {
+                                if (!try self.nativeBridgeSupported(t)) break :r false;
+                            }
+                        }
+                        break :r true;
+                    },
+                    // `enum`/`flags` carry no payload types to recurse into
+                    // -- both encode/decode to a plain JS string / a plain
+                    // JS object of camelCased booleans respectively (see
+                    // js_dispatch.zig's `encodeNative`/`decodeNative`).
+                    .@"enum", .flags => true,
+                    // resource: not representable by the native bridge's
+                    // tag vocabulary (see js_dispatch.h) -- no
+                    // handle-lifetime story on this synchronous JS-call path.
+                    .resource => false,
                 };
             },
-            // char, tuple, result<T,E>, future/stream, error-context, own/borrow
-            // resource handles: none of these have an `encodeNative`/
-            // `decodeNative` case in js_dispatch.zig today.
+            // future/stream/error-context, own/borrow resource handles: none
+            // of these have an `encodeNative`/`decodeNative` case in
+            // js_dispatch.zig today.
             else => false,
         };
     }
@@ -1090,9 +1121,10 @@ const Gen = struct {
                         if (!try self.nativeBridgeSupported(p.type)) {
                             return self.fail(
                                 "imported function '{s}#{s}': parameter '{s}' has a WIT type not " ++
-                                    "supported by the JS import bridge (bool/integers/f32/f64/string/" ++
-                                    "option<T>/list<T>/record only -- resource, variant, enum, flags, " ++
-                                    "tuple, result<T,E>, char, future/stream need a further WABT phase)",
+                                    "supported by the JS import bridge (bool/integers/f32/f64/char/" ++
+                                    "string/option<T>/list<T>/tuple/record/variant/enum/flags/" ++
+                                    "result<T,E> only -- resource, future/stream, error-context need a " ++
+                                    "further WABT phase)",
                                 .{ u.id, fd.name, p.name },
                             );
                         }
@@ -1101,8 +1133,8 @@ const Gen = struct {
                         if (!try self.nativeBridgeSupported(r)) {
                             return self.fail(
                                 "imported function '{s}#{s}': its result type is not supported by the " ++
-                                    "JS import bridge (bool/integers/f32/f64/string/option<T>/list<T>/" ++
-                                    "record only)",
+                                    "JS import bridge (bool/integers/f32/f64/char/string/option<T>/" ++
+                                    "list<T>/tuple/record/variant/enum/flags/result<T,E> only)",
                                 .{ u.id, fd.name },
                             );
                         }
@@ -1641,6 +1673,35 @@ const Gen = struct {
             if (self.isHandleLike(rty)) {
                 try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}.handle", .{pn}));
                 continue;
+            }
+            // In `--dispatch` mode (the mode `--js-imports` always runs in),
+            // `zigType` maps `char` / a *direct* `list<u8>` one level deeper
+            // than everywhere else, to the wrapper structs `wit_types.Char`
+            // / `wit_types.ByteList` (so the JS bridge can tell them apart
+            // from a bare `u32` / a generic `list<T>` at runtime -- see
+            // those structs' own doc comments). The scalar/slice fast paths
+            // below assume the bare payload type (true in `--impl` mode, and
+            // true here for every *other* dispatch-mode type), so route
+            // these two through the generic, reflection-based
+            // `lowerAggregateParam` instead -- it already lowers `Char`/
+            // `ByteList` correctly (single-field structs fall out of its
+            // `wit_types.lowerFlat` call for free; see wit_types.zig's
+            // "Char/ByteList wrappers have the same canonical layout as
+            // their bare payload" test) rather than trying to `@intCast` or
+            // `.ptr`/`.len` a field that doesn't exist on the wrapper.
+            if (self.dispatch != null) {
+                var wrapped = false;
+                switch (rty) {
+                    .char => wrapped = true,
+                    .list => |e| if (e.* == .u8) {
+                        wrapped = true;
+                    },
+                    else => {},
+                }
+                if (wrapped) {
+                    try self.lowerAggregateParam(&args, pn, p.type);
+                    continue;
+                }
             }
             switch (rty) {
                 .string, .list => {
@@ -2973,6 +3034,157 @@ test "generate --js-imports: a void-result import encodes to the dedicated undef
     // either.
     try testing.expect(std.mem.indexOf(u8, out, ".tag = .bool_") == null);
     try testing.expect(std.mem.indexOf(u8, out, ".tag = .option_none") == null);
+}
+
+test "generate --js-imports: char and list<u8> (bytes) params lower through their dispatch-mode wrapper structs' real fields" {
+    // Regression test for a real bug: `zigType` maps `char`/a direct
+    // `list<u8>` to the wrapper structs `wit_types.Char`/`wit_types.ByteList`
+    // in `--dispatch` mode (which `--js-imports` always runs in), but
+    // `lowerParams`'s scalar/slice fast paths used to assume the bare
+    // payload type -- emitting `@intCast(c)` (fails to compile: `c` is a
+    // struct, not an int) / `b.ptr`/`b.len` (fails to compile: no such
+    // field on `wit_types.ByteList`, which wraps a `bytes: []const u8`
+    // field) -- a genuine Zig **compile** error caught only by actually
+    // building the generated output (see tests/e2e/wit-imports/run.sh, the
+    // integration test that first surfaced this), not by generation-time
+    // rejection or by string-matching alone. This asserts the corrected
+    // field accesses appear instead.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface host {
+    //   identity-char: func(c: char) -> char;
+    //   identity-bytes: func(b: list<u8>) -> list<u8>;
+    // }
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "identity-char", .func = .{
+            .params = &.{.{ .name = "c", .type = .char }},
+            .result = .char,
+        } } },
+        .{ .func = .{ .name = "identity-bytes", .func = .{
+            .params = &.{.{ .name = "b", .type = .{ .list = &.{ .u8 = {} } } }},
+            .result = .{ .list = &.{ .u8 = {} } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "bytes-char" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Typed import wrapper: params declared with the wrapper struct types...
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityChar(c: wit_types.Char) wit_types.Char {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityBytes(b: wit_types.ByteList) wit_types.ByteList {") != null);
+    // ...and lowered via the generic `lowerFlat` aggregate path (correct:
+    // reflects into `.codepoint`/`.bytes` for free), never a direct
+    // `@intCast(c)` or `c.ptr`/`c.len` on the wrapper struct itself.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(wit_types.Char, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const b_s = wit_types.lowerFlat(wit_types.ByteList, b, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "@intCast(c)") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.ptr") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.len") == null);
+
+    // The JS-callable reverse bridge (decodeNative/encodeNative side) is
+    // unaffected by this fix -- js_dispatch already special-cases
+    // `wit_types.Char`/`wit_types.ByteList` by type identity (see
+    // js_dispatch.zig's `encodeNative`/`decodeNative`) -- confirm both
+    // functions are still bridged (the type-gate fix below is what allows
+    // this in the first place; this test's focus is the codegen fix, so it
+    // only checks the bridge entries exist, not their exact bodies).
+    try testing.expect(std.mem.indexOf(u8, out, "test:bytes-char/host#identity-char") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:bytes-char/host#identity-bytes") != null);
+}
+
+test "generate --js-imports: tuple, enum, flags, variant, and result<T,E> are no longer rejected by the native-bridge type gate" {
+    // Regression test for `nativeBridgeSupported`'s allow-list: before this
+    // fix, every function below failed generation with
+    // `error.UnsupportedWitType` (a conservative allow-list written before
+    // js_dispatch.zig grew encodeNative/decodeNative support for these
+    // shapes). None of these types need any *codegen* change -- the
+    // generic lower/lift path (`lowerAggregateParam` / `wit_types.lift`)
+    // already handles them structurally; only the gate itself was stale.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // flags perms { read, write, exec }
+    // variant shape { circle(f64), origin }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const perms_labels = [_][]const u8{ "read", "write", "exec" };
+    const f64_ty: ast.Type = .f64;
+    const shape_cases = [_]ast.Case{
+        .{ .name = "circle", .type = f64_ty },
+        .{ .name = "origin", .type = null },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "perms", .kind = .{ .flags = &perms_labels } } },
+        .{ .type = .{ .name = "shape", .kind = .{ .variant = &shape_cases } } },
+        // color -> color (named enum, round-trip)
+        .{ .func = .{ .name = "next-color", .func = .{
+            .params = &.{.{ .name = "c", .type = ast.Type{ .name = "color" } }},
+            .result = ast.Type{ .name = "color" },
+        } } },
+        // perms -> perms (named flags, round-trip)
+        .{ .func = .{ .name = "toggle-perms", .func = .{
+            .params = &.{.{ .name = "p", .type = ast.Type{ .name = "perms" } }},
+            .result = ast.Type{ .name = "perms" },
+        } } },
+        // shape -> string (named variant param)
+        .{ .func = .{ .name = "classify", .func = .{
+            .params = &.{.{ .name = "s", .type = ast.Type{ .name = "shape" } }},
+            .result = .string,
+        } } },
+        // tuple<u32, string> -> tuple<string, u32> (anonymous tuple, both directions)
+        .{ .func = .{ .name = "swap-tuple", .func = .{
+            .params = &.{.{ .name = "t", .type = .{ .tuple = &.{ .u32, .string } } }},
+            .result = .{ .tuple = &.{ .string, .u32 } },
+        } } },
+        // result<s32, string> (anonymous result, both an ok and an err payload)
+        .{ .func = .{ .name = "checked-div", .func = .{
+            .params = &.{
+                .{ .name = "a", .type = .s32 },
+                .{ .name = "b", .type = .s32 },
+            },
+            .result = .{ .result = .{ .ok = &ast.Type{ .s32 = {} }, .err = &ast.Type{ .string = {} } } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "adv" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    // The headline assertion: generation must SUCCEED (not
+    // error.UnsupportedWitType) for all five of these types.
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Every function actually made it into the manifest / dispatch bridge,
+    // not just "didn't error" (e.g. a swallowed/skipped entry would also
+    // make the call above succeed).
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#next-color") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#toggle-perms") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#classify") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#swap-tuple") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#checked-div") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
 }
 
 test "generate: imported resource with async methods (#300)" {
