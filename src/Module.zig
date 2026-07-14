@@ -504,8 +504,7 @@ test "Const" {
 }
 
 test "ExprType count" {
-    const info = @typeInfo(ExprType);
-    try std.testing.expectEqual(@as(usize, 71), info.@"enum".fields.len);
+    try std.testing.expectEqual(@as(usize, 71), std.enums.values(ExprType).len);
 }
 
 test "Module getExport" {

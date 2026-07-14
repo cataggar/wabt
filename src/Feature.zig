@@ -31,7 +31,7 @@ pub const Set = packed struct {
     compact_imports: bool = false,
     wide_arithmetic: bool = false,
 
-    const fields = @typeInfo(Set).@"struct".fields;
+    const field_names = std.meta.fieldNames(Set);
 
     /// Default feature set — features enabled by their default values.
     pub const mvp = Set{};
@@ -63,32 +63,23 @@ pub const Set = packed struct {
     /// Return a Set with every feature enabled.
     pub fn enableAll() Set {
         var s: Set = undefined;
-        inline for (fields) |f| {
-            @field(s, f.name) = true;
+        inline for (field_names) |name| {
+            @field(s, name) = true;
         }
         return s;
     }
 
     /// Check whether the named feature is at its default value.
     pub fn isDefault(self: Set, comptime feature: []const u8) bool {
-        const default_val = comptime blk: {
-            for (fields) |f| {
-                if (std.mem.eql(u8, f.name, feature)) {
-                    const ptr: *const bool = @ptrCast(f.default_value_ptr.?);
-                    break :blk ptr.*;
-                }
-            }
-            @compileError("unknown feature: " ++ feature);
-        };
-        return @field(self, feature) == default_val;
+        return @field(self, feature) == @field(Set{}, feature);
     }
 
     /// Count features whose current value differs from the default.
     pub fn count(self: Set) usize {
         var n: usize = 0;
         const defaults = Set{};
-        inline for (fields) |f| {
-            if (@field(self, f.name) != @field(defaults, f.name)) n += 1;
+        inline for (field_names) |name| {
+            if (@field(self, name) != @field(defaults, name)) n += 1;
         }
         return n;
     }
