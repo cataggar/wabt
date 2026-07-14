@@ -97,7 +97,7 @@ fn walkSections(allocator: std.mem.Allocator, bytes: []const u8) WalkError!Walk 
     if (bytes.len < 8) return error.UnexpectedEnd;
 
     var section_order: std.ArrayListUnmanaged(SectionId) = .empty;
-    var seen = [_]bool{false} ** 13;
+    var seen: [13]bool = @splat(false);
     var custom_names: std.ArrayListUnmanaged([]const u8) = .empty;
     var custom_count: usize = 0;
 

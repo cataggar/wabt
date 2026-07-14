@@ -1975,7 +1975,7 @@ fn parseV128Const(lane_type: []const u8, sexpr: []const u8, start: usize) ?Inter
     var i = start;
 
     // Read lane values
-    var bytes: [16]u8 = .{0} ** 16;
+    var bytes: [16]u8 = @splat(0);
     if (std.mem.eql(u8, lane_type, "i8x16")) {
         for (0..16) |idx| {
             const tok = nextToken(sexpr, &i) orelse return null;

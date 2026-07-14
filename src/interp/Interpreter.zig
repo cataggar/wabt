@@ -4109,7 +4109,7 @@ pub const Interpreter = struct {
         const mem = self.instance.getMemory(mem_idx);
         if (memOob(addr, size, mem.items.len)) return error.OutOfBoundsMemoryAccess;
         const idx: usize = @intCast(addr);
-        var result: [16]u8 = [_]u8{0} ** 16;
+        var result: [16]u8 = @splat(0);
         @memcpy(result[0..size], mem.items[idx..][0..size]);
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
@@ -6291,4 +6291,3 @@ test "dispatch: block with br" {
     try interp.callFunc(0, &[_]Value{.{ .i32 = 99 }});
     try std.testing.expectEqual(@as(i32, 99), interp.stack.items[interp.stack.items.len - 1].i32);
 }
-
