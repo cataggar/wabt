@@ -53,7 +53,7 @@ pub fn transcribeFuncSig(
             break :n .{ .named = dst };
         },
     };
-    return .{ .params = params, .results = results };
+    return .{ .params = params, .results = results, .is_async = sig.is_async };
 }
 
 /// Transcribe one value type. Compound `.type_idx` slots are hoisted
@@ -71,8 +71,15 @@ pub fn transcribeValType(
             if (slot < ext_slots.len) {
                 switch (ext_slots[slot]) {
                     .typedef => |td| {
+                        if (comptime @hasDecl(@TypeOf(ctx), "lookupType")) {
+                            if (ctx.lookupType(slot)) |idx| return .{ .type_idx = idx };
+                        }
                         const new_td = try transcribeTypeDef(arena, ctx, ext_slots, td);
-                        return .{ .type_idx = try ctx.addType(new_td) };
+                        const idx = try ctx.addType(new_td);
+                        if (comptime @hasDecl(@TypeOf(ctx), "cacheType")) {
+                            try ctx.cacheType(slot, idx);
+                        }
+                        return .{ .type_idx = idx };
                     },
                     .val => |vt| return try transcribeValType(arena, ctx, ext_slots, vt),
                     // alias / sub_resource slots are leaves the builder
@@ -265,4 +272,23 @@ test "transcribeFuncSig: () -> result yields a hoisted result return (#246)" {
     try testing.expectEqual(@as(u32, 2), out.results.unnamed.type_idx);
     try testing.expectEqual(@as(usize, 1), added.items.len);
     try testing.expect(added.items[0] == .result);
+}
+
+test "transcribeFuncSig preserves async function types" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var added = std.ArrayListUnmanaged(ctypes.TypeDef).empty;
+    const ctx = TestCtx{
+        .added = &added,
+        .arena = arena.allocator(),
+        .base = 0,
+    };
+    const out = try transcribeFuncSig(
+        arena.allocator(),
+        ctx,
+        &.{},
+        .{ .params = &.{}, .results = .none, .is_async = true },
+    );
+    try testing.expect(out.is_async);
 }

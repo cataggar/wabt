@@ -1245,18 +1245,125 @@ test "Builder: top-level instance exports advance the instance indexspace" {
     try testing.expectEqual(@as(u32, 2), second);
 }
 
+const ImportedTypeSource = struct {
+    owner: []const u8,
+    name: []const u8,
+};
+
+const WorldTypeSource = struct {
+    instance_idx: u32,
+    name: []const u8,
+};
+
+fn slotTarget(slots: []const metadata_decode.TypeSlot, slot: u32) u32 {
+    if (slot >= slots.len) return slot;
+    return switch (slots[slot]) {
+        .export_eq => |type_export| type_export.target,
+        else => slot,
+    };
+}
+
+fn findWorldTypeSource(decls: []const ctypes.Decl, target: u32) ?WorldTypeSource {
+    var type_idx: u32 = 0;
+    for (decls) |decl| switch (decl) {
+        .type => type_idx += 1,
+        .core_type => {},
+        .alias => |alias| {
+            const sort = switch (alias) {
+                .instance_export => |instance_export| instance_export.sort,
+                .outer => |outer| outer.sort,
+            };
+            if (sort != .type) continue;
+            if (type_idx == target) return switch (alias) {
+                .instance_export => |instance_export| .{
+                    .instance_idx = instance_export.instance_idx,
+                    .name = instance_export.name,
+                },
+                .outer => null,
+            };
+            type_idx += 1;
+        },
+        .import => |import| if (import.desc == .type) {
+            if (type_idx == target) return switch (import.desc.type) {
+                .eq => |idx| findWorldTypeSource(decls, idx),
+                .sub_resource => null,
+            };
+            type_idx += 1;
+        },
+        .@"export" => |export_| if (export_.desc == .type) {
+            if (type_idx == target) return switch (export_.desc.type) {
+                .eq => |idx| findWorldTypeSource(decls, idx),
+                .sub_resource => null,
+            };
+            type_idx += 1;
+        },
+    };
+    return null;
+}
+
+fn findWorldInstanceName(decls: []const ctypes.Decl, target: u32) ?[]const u8 {
+    var instance_idx: u32 = 0;
+    for (decls) |decl| switch (decl) {
+        .alias => |alias| {
+            const sort = switch (alias) {
+                .instance_export => |instance_export| instance_export.sort,
+                .outer => |outer| outer.sort,
+            };
+            if (sort != .instance) continue;
+            if (instance_idx == target) return null;
+            instance_idx += 1;
+        },
+        .import => |import| if (import.desc == .instance) {
+            if (instance_idx == target) return import.name;
+            instance_idx += 1;
+        },
+        .@"export" => |export_| if (export_.desc == .instance) {
+            if (instance_idx == target) return export_.name;
+            instance_idx += 1;
+        },
+        else => {},
+    };
+    return null;
+}
+
+test "world type provenance resolves the providing interface" {
+    const decls = [_]ctypes.Decl{
+        .{ .core_type = .{ .func = .{ .params = &.{}, .results = &.{} } } },
+        .{ .type = .{ .instance = .{ .decls = &.{} } } },
+        .{ .import = .{ .name = "test:types/provider", .desc = .{ .instance = 0 } } },
+        .{ .alias = .{ .instance_export = .{
+            .sort = .type,
+            .instance_idx = 0,
+            .name = "source-name",
+        } } },
+    };
+    const source = findWorldTypeSource(&decls, 1) orelse
+        return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0), source.instance_idx);
+    try testing.expectEqualStrings("source-name", source.name);
+    try testing.expectEqualStrings(
+        "test:types/provider",
+        findWorldInstanceName(&decls, source.instance_idx) orelse
+            return error.TestUnexpectedResult,
+    );
+}
+
 /// Adapter-side context for the shared `lift_types` transcriber. Compound
 /// value types and resource handles are hoisted into the wrapping
 /// component's type space before reactor exports are lifted.
 const ReactorLiftCtx = struct {
     b: *Builder,
     ext_slots: []const metadata_decode.TypeSlot,
+    world_decls: []const ctypes.Decl,
     hoisted: *const types_import.Hoisted,
     embed_extra_iface_inst_for_ns: *const std.StringHashMapUnmanaged(u32),
     resource_owner: *const std.StringHashMapUnmanaged([]const u8),
+    type_owner: *const std.StringHashMapUnmanaged([]const u8),
     resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+    type_alias_idx: *std.StringHashMapUnmanaged(u32),
     own_handle_idx: *std.StringHashMapUnmanaged(u32),
     borrow_handle_idx: *std.StringHashMapUnmanaged(u32),
+    value_type_idx: *std.AutoHashMapUnmanaged(u32, u32),
 
     pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
         return self.b.addType(td);
@@ -1266,14 +1373,87 @@ const ReactorLiftCtx = struct {
         return switch (v) {
             .own => |slot| .{ .type_idx = try self.hoistHandle(slot, .own) },
             .borrow => |slot| .{ .type_idx = try self.hoistHandle(slot, .borrow) },
+            .type_idx => |slot| blk: {
+                if (self.importedTypeSource(slotTarget(self.ext_slots, slot))) |source| {
+                    break :blk .{
+                        .type_idx = try self.importedTypeAlias(source.owner, source.name),
+                    };
+                }
+                const name = metadata_decode.typeNameForSlot(self.ext_slots, slot) orelse
+                    break :blk v;
+                break :blk .{ .type_idx = try self.exportedType(name, slotTarget(self.ext_slots, slot)) };
+            },
             else => v,
         };
+    }
+
+    pub fn lookupType(self: @This(), slot: u32) ?u32 {
+        return self.value_type_idx.get(slot);
+    }
+
+    pub fn cacheType(self: @This(), slot: u32, idx: u32) lift_types.Error!void {
+        try self.value_type_idx.put(self.b.arena, slot, idx);
+    }
+
+    fn exportedType(self: @This(), name: []const u8, target: u32) lift_types.Error!u32 {
+        if (target < self.ext_slots.len) switch (self.ext_slots[target]) {
+            .typedef, .val => return self.localType(target),
+            else => {},
+        };
+        if (self.importedTypeSource(target)) |source| {
+            return self.importedTypeAlias(source.owner, source.name);
+        }
+        if (self.resource_owner.contains(name)) return self.resourceAlias(name);
+        if (self.type_owner.contains(name)) return self.typeAlias(name);
+        return self.localType(target);
+    }
+
+    fn localType(self: @This(), target: u32) lift_types.Error!u32 {
+        if (self.value_type_idx.get(target)) |idx| return idx;
+        if (target >= self.ext_slots.len) return error.UnresolvedResource;
+        switch (self.ext_slots[target]) {
+            .typedef, .val => {},
+            else => return error.UnresolvedResource,
+        }
+        const transcribed = try lift_types.transcribeValType(
+            self.b.arena,
+            self,
+            self.ext_slots,
+            .{ .type_idx = target },
+        );
+        const idx = switch (transcribed) {
+            .type_idx => |idx| idx,
+            else => |val| blk: {
+                const idx = try self.addType(.{ .val = val });
+                break :blk idx;
+            },
+        };
+        try self.cacheType(target, idx);
+        return idx;
     }
 
     fn resourceAlias(self: @This(), name: []const u8) lift_types.Error!u32 {
         if (self.resource_alias_idx.get(name)) |idx| return idx;
         const owner = self.resource_owner.get(name) orelse
             return error.UnresolvedResource;
+        const idx = try self.importedTypeAlias(owner, name);
+        try self.resource_alias_idx.put(self.b.arena, name, idx);
+        return idx;
+    }
+
+    fn typeAlias(self: @This(), name: []const u8) lift_types.Error!u32 {
+        const owner = self.type_owner.get(name) orelse
+            return error.UnresolvedResource;
+        return self.importedTypeAlias(owner, name);
+    }
+
+    fn importedTypeAlias(
+        self: @This(),
+        owner: []const u8,
+        name: []const u8,
+    ) lift_types.Error!u32 {
+        const key = try std.fmt.allocPrint(self.b.arena, "{s}|{s}", .{ owner, name });
+        if (self.type_alias_idx.get(key)) |idx| return idx;
         const provider_idx = if (findInstanceSlot(self.hoisted.*, owner)) |provider|
             provider.instance_idx
         else
@@ -1284,8 +1464,28 @@ const ReactorLiftCtx = struct {
             .instance_idx = provider_idx,
             .name = name,
         } });
-        try self.resource_alias_idx.put(self.b.arena, name, idx);
+        try self.type_alias_idx.put(self.b.arena, key, idx);
         return idx;
+    }
+
+    fn importedTypeSource(self: @This(), target: u32) ?ImportedTypeSource {
+        if (target >= self.ext_slots.len) return null;
+        const source = switch (self.ext_slots[target]) {
+            .alias_outer => |world_type_idx| blk: {
+                const world_source = findWorldTypeSource(
+                    self.world_decls,
+                    world_type_idx,
+                ) orelse return null;
+                break :blk world_source;
+            },
+            .alias_instance_export => |instance_export| WorldTypeSource{
+                .instance_idx = instance_export.instance_idx,
+                .name = instance_export.name,
+            },
+            else => return null,
+        };
+        const owner = findWorldInstanceName(self.world_decls, source.instance_idx) orelse return null;
+        return .{ .owner = owner, .name = source.name };
     }
 
     fn hoistHandle(
@@ -1295,19 +1495,91 @@ const ReactorLiftCtx = struct {
     ) lift_types.Error!u32 {
         const name = metadata_decode.resourceNameForSlot(self.ext_slots, slot) orelse
             return error.UnresolvedResource;
+        const target = slotTarget(self.ext_slots, slot);
+        const source = self.importedTypeSource(target);
+        const key = if (source) |imported|
+            try std.fmt.allocPrint(
+                self.b.arena,
+                "{s}|{s}",
+                .{ imported.owner, imported.name },
+            )
+        else
+            name;
         const cache = if (kind == .own) self.own_handle_idx else self.borrow_handle_idx;
-        if (cache.get(name)) |idx| return idx;
+        if (cache.get(key)) |idx| return idx;
 
-        const resource_idx = try self.resourceAlias(name);
+        const resource_idx = if (source) |imported|
+            try self.importedTypeAlias(imported.owner, imported.name)
+        else
+            try self.resourceAlias(name);
         const val: ctypes.ValType = if (kind == .own)
             .{ .own = resource_idx }
         else
             .{ .borrow = resource_idx };
         const idx = try self.b.addType(.{ .val = val });
-        try cache.put(self.b.arena, name, idx);
+        try cache.put(self.b.arena, key, idx);
         return idx;
     }
 };
+
+test "ReactorLiftCtx: named export and function share one value type" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const fields = [_]ctypes.Field{
+        .{ .name = "x", .type = .s32 },
+        .{ .name = "y", .type = .s32 },
+    };
+    const slots = [_]metadata_decode.TypeSlot{
+        .{ .typedef = .{ .record = .{ .fields = &fields } } },
+        .{ .export_eq = .{ .name = "point", .target = 0 } },
+    };
+    var b = Builder{ .arena = a };
+    const hoisted = types_import.Hoisted{
+        .types = &.{},
+        .imports = &.{},
+        .aliases = &.{},
+        .section_order = &.{},
+        .instances = &.{},
+        .exports = &.{},
+        .type_count = 0,
+    };
+    var extra_interfaces = std.StringHashMapUnmanaged(u32).empty;
+    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    try type_owner.put(a, "point", "unrelated:types/provider");
+    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    var own_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+    var borrow_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+    var value_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
+    const ctx = ReactorLiftCtx{
+        .b = &b,
+        .ext_slots = &slots,
+        .world_decls = &.{},
+        .hoisted = &hoisted,
+        .embed_extra_iface_inst_for_ns = &extra_interfaces,
+        .resource_owner = &resource_owner,
+        .type_owner = &type_owner,
+        .resource_alias_idx = &resource_alias_idx,
+        .type_alias_idx = &type_alias_idx,
+        .own_handle_idx = &own_handle_idx,
+        .borrow_handle_idx = &borrow_handle_idx,
+        .value_type_idx = &value_type_idx,
+    };
+
+    const exported_idx = try ctx.exportedType("point", 0);
+    const function_type = try lift_types.transcribeValType(
+        a,
+        ctx,
+        &slots,
+        .{ .type_idx = 0 },
+    );
+    try testing.expectEqual(@as(u32, 0), exported_idx);
+    try testing.expectEqual(exported_idx, function_type.type_idx);
+    try testing.expectEqual(@as(usize, 1), b.types.items.len);
+}
 
 fn assemble(in: Inputs) ![]u8 {
     const a = in.arena;
@@ -1627,6 +1899,24 @@ fn assemble(in: Inputs) ![]u8 {
     for (in.embed_extra_plan.slot_infos) |info| {
         if (info.opts.realloc) any_main_realloc = true;
     }
+    if (in.shape == .reactor) {
+        const decoded = in.embed_metadata orelse return error.MissingEmbedMetadata;
+        for (decoded.externs) |ext| {
+            if (!ext.is_export) continue;
+            const resolver = abi.TypeResolver{
+                .inst_decls = ext.inst_decls,
+                .world_decls = decoded.world_decls,
+            };
+            for (ext.funcs) |fn_ref| {
+                if (abi.classifyFuncLift(.{
+                    .func = fn_ref.sig,
+                    .resolver = resolver,
+                }).realloc) {
+                    any_main_realloc = true;
+                }
+            }
+        }
+    }
     var main_realloc_idx: u32 = 0;
     if (any_main_realloc) {
         if (in.embed_iface.findExport("cabi_realloc") == null) {
@@ -1822,7 +2112,9 @@ fn assemble(in: Inputs) ![]u8 {
         if (!any_export) return error.UnsupportedAdapterShape;
 
         var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+        var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
         var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+        var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
         var own_handle_idx = std.StringHashMapUnmanaged(u32).empty;
         var borrow_handle_idx = std.StringHashMapUnmanaged(u32).empty;
         for (decoded.externs) |ext| {
@@ -1837,6 +2129,10 @@ fn assemble(in: Inputs) ![]u8 {
                     }
                     gop.value_ptr.* = ext.qualified_name;
                 },
+                .export_eq => |type_export| {
+                    const gop = try type_owner.getOrPut(a, type_export.name);
+                    if (!gop.found_existing) gop.value_ptr.* = ext.qualified_name;
+                },
                 else => {},
             };
         }
@@ -1848,7 +2144,38 @@ fn assemble(in: Inputs) ![]u8 {
             // instance, build the component func type, canon-lift,
             // append to the per-interface inline-export bundle.
             var inline_exports = std.ArrayListUnmanaged(ctypes.InlineExport).empty;
+            var value_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
+            const lift_ctx = ReactorLiftCtx{
+                .b = &b,
+                .ext_slots = ext.type_slots,
+                .world_decls = decoded.world_decls,
+                .hoisted = &in.hoisted,
+                .embed_extra_iface_inst_for_ns = &embed_extra_iface_inst_for_ns,
+                .resource_owner = &resource_owner,
+                .type_owner = &type_owner,
+                .resource_alias_idx = &resource_alias_idx,
+                .type_alias_idx = &type_alias_idx,
+                .own_handle_idx = &own_handle_idx,
+                .borrow_handle_idx = &borrow_handle_idx,
+                .value_type_idx = &value_type_idx,
+            };
+            for (ext.type_slots) |slot| switch (slot) {
+                .export_eq => |type_export| {
+                    try inline_exports.append(a, .{
+                        .name = type_export.name,
+                        .sort_idx = .{
+                            .sort = .type,
+                            .idx = try lift_ctx.exportedType(
+                                type_export.name,
+                                type_export.target,
+                            ),
+                        },
+                    });
+                },
+                else => {},
+            };
             for (ext.funcs) |fn_ref| {
+                if (fn_ref.sig.is_async) return error.UnsupportedAdapterShape;
                 const core_export_name = try std.fmt.allocPrint(a, "{s}#{s}", .{ ext.qualified_name, fn_ref.name });
                 if (in.embed_iface.findExport(core_export_name) == null) {
                     return error.EmbedMissingRequiredExport;
@@ -1860,24 +2187,44 @@ fn assemble(in: Inputs) ![]u8 {
                 } });
                 const rewritten_sig = try lift_types.transcribeFuncSig(
                     a,
-                    ReactorLiftCtx{
-                        .b = &b,
-                        .ext_slots = ext.type_slots,
-                        .hoisted = &in.hoisted,
-                        .embed_extra_iface_inst_for_ns = &embed_extra_iface_inst_for_ns,
-                        .resource_owner = &resource_owner,
-                        .resource_alias_idx = &resource_alias_idx,
-                        .own_handle_idx = &own_handle_idx,
-                        .borrow_handle_idx = &borrow_handle_idx,
-                    },
+                    lift_ctx,
                     ext.type_slots,
                     fn_ref.sig,
                 );
                 const ftype_idx = try b.addType(.{ .func = rewritten_sig });
+                const lift_opts = abi.classifyFuncLift(.{
+                    .func = fn_ref.sig,
+                    .resolver = .{
+                        .inst_decls = ext.inst_decls,
+                        .world_decls = decoded.world_decls,
+                    },
+                });
+                var post_return_core_idx: ?u32 = null;
+                if (lift_opts.needs_post_return) {
+                    const post_return_name = try std.fmt.allocPrint(
+                        a,
+                        "cabi_post_{s}",
+                        .{core_export_name},
+                    );
+                    if (in.embed_iface.findExport(post_return_name) != null) {
+                        post_return_core_idx = try b.addAlias(.{ .instance_export = .{
+                            .sort = .{ .core = .func },
+                            .instance_idx = main_inst,
+                            .name = post_return_name,
+                        } });
+                    }
+                }
+                const canon_opts = try buildCanonLiftOpts(
+                    a,
+                    lift_opts,
+                    memory_idx,
+                    main_realloc_idx,
+                    post_return_core_idx,
+                );
                 const lifted_idx = try b.addCanon(.{ .lift = .{
                     .core_func_idx = core_func_idx,
                     .type_idx = ftype_idx,
-                    .opts = &.{},
+                    .opts = canon_opts,
                 } });
                 try inline_exports.append(a, .{
                     .name = fn_ref.name,
@@ -1995,6 +2342,28 @@ pub fn buildCanonLiftOpts(
         i += 1;
     }
     return opts;
+}
+
+test "buildCanonLiftOpts emits memory realloc and UTF-8" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const opts = try buildCanonLiftOpts(
+        arena.allocator(),
+        .{
+            .memory = true,
+            .realloc = true,
+            .string_encoding = true,
+            .needs_post_return = false,
+        },
+        7,
+        11,
+        null,
+    );
+    try testing.expectEqual(@as(usize, 3), opts.len);
+    try testing.expectEqual(@as(u32, 7), opts[0].memory);
+    try testing.expectEqual(@as(u32, 11), opts[1].realloc);
+    try testing.expectEqual(ctypes.StringEncoding.utf8, opts[2].string_encoding);
 }
 
 const RunInstanceExport = struct {
