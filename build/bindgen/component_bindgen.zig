@@ -525,8 +525,27 @@ const Gen = struct {
             .flags => |labels| {
                 // A bitset: one bool bit per label (LSB-first) in a backing
                 // integer sized to the canonical ABI (1/2/4 bytes for ≤8/≤16/≤32
-                // labels). >32 labels (multi-i32) is a later phase.
-                if (labels.len > 32) return error.UnsupportedWitType;
+                // labels). >32 labels (multi-i32 canonical-ABI representation)
+                // is full multiword `flags` support -- a broader phase than
+                // this generator implements today (see `nativeBridgeSupported`'s
+                // doc comment, which this constraint must stay consistent
+                // with). Reject deterministically, by name, here -- the single
+                // place every `flags` typedef in the world passes through
+                // (used-type indexing and each interface's own `.type` items,
+                // *before* any import/export/JS-bridge emission in `generate`)
+                // -- rather than a bare `error.UnsupportedWitType` that names
+                // neither the offending type nor the actual constraint.
+                if (labels.len > 32) {
+                    return self.fail(
+                        "flags type '{s}' (interface '{s}') has {d} labels, but this generator's " ++
+                            "`flags` representation only supports up to 32 labels (a single packed " ++
+                            "integer per the canonical ABI's ≤32-label case); >32 labels needs a " ++
+                            "multi-i32 bitset, which is a separate, broader multiword-`flags` phase, " ++
+                            "not implemented here -- split '{s}' into ≤32-label `flags` groups, or drop " ++
+                            "the interface that declares it from this world",
+                        .{ td.name, iface_id, labels.len, td.name },
+                    );
+                }
                 const bits: usize = if (labels.len <= 8) 8 else if (labels.len <= 16) 16 else 32;
                 self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try self.typeName(td.name), bits });
                 for (labels) |l| self.print("    {s}: bool = false,\n", .{try snake(self.ar, l)});
@@ -990,27 +1009,46 @@ const Gen = struct {
     // synthesize without per-world C++ glue.
     //
     // A function whose signature includes a type the native bridge doesn't
-    // cover (resource, variant, enum, flags, tuple, `result<T,E>`, `char`,
-    // future/stream) is a deterministic `error.UnsupportedWitType` generation
-    // failure (via `fail`, naming the offending function/type) rather than a
-    // silently-missing JS export -- see `nativeBridgeSupported`. An *async*
-    // imported function is likewise rejected for now (`wit_async.awaitCall`
-    // has no equivalent on this synchronous JS-call path); it is a distinct,
-    // separately diagnosed follow-up, not silently skipped either.
+    // cover (resource, future/stream, error-context) is a deterministic
+    // `error.UnsupportedWitType` generation failure (via `fail`, naming the
+    // offending function/type) rather than a silently-missing JS export --
+    // see `nativeBridgeSupported`. An *async* imported function is likewise
+    // rejected for now (`wit_async.awaitCall` has no equivalent on this
+    // synchronous JS-call path); it is a distinct, separately diagnosed
+    // follow-up, not silently skipped either.
 
     /// Whether `ty`'s type graph is entirely within the set `js_dispatch`'s
     /// `NativeValue` encode/decode pair supports: `bool`/integers/`f32`/`f64`,
-    /// `string`, `option<T>`, `list<T>`, and `record` (recursively, for any of
-    /// those). Everything else -- `char`, `tuple`, `result<T,E>`, `variant`,
-    /// `enum`, `flags`, resource handles (`own`/`borrow`), `future`/`stream`,
-    /// `error-context` -- is unsupported (matches the Zig-type cases
-    /// `encodeNative`/`decodeNative` actually implement in `js_dispatch.zig`;
-    /// keep this in sync with that switch if it ever grows).
+    /// `char`, `string`, `option<T>`, `list<T>` (including `list<u8>`,
+    /// bridged as `wit_types.ByteList`), `tuple`, `record`, `variant`,
+    /// `enum`, `flags` with ≤32 labels, and `result<T,E>` (recursively, for
+    /// any of those). Everything else -- resource handles (`own`/`borrow`),
+    /// `future`/`stream`, `error-context`, and a `flags` type with >32
+    /// labels (multiword `flags`, which `emitTypeDef` itself doesn't
+    /// generate -- see its doc comment) -- is unsupported (matches the
+    /// Zig-type cases `encodeNative`/`decodeNative` actually implement in
+    /// `js_dispatch.zig`; keep this in sync with that switch if it ever
+    /// grows).
     fn nativeBridgeSupported(self: *Gen, ty: ast.Type) GenError!bool {
         return switch (ty) {
-            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string => true,
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string, .char => true,
             .list => |e| try self.nativeBridgeSupported(e.*),
             .option => |e| try self.nativeBridgeSupported(e.*),
+            .tuple => |elems| r: {
+                for (elems) |e| {
+                    if (!try self.nativeBridgeSupported(e)) break :r false;
+                }
+                break :r true;
+            },
+            .result => |r| blk: {
+                if (r.ok) |t| {
+                    if (!try self.nativeBridgeSupported(t.*)) break :blk false;
+                }
+                if (r.err) |t| {
+                    if (!try self.nativeBridgeSupported(t.*)) break :blk false;
+                }
+                break :blk true;
+            },
             .name => |n| blk: {
                 const kind = self.typeKind(n) orelse return error.UnknownType;
                 break :blk switch (kind) {
@@ -1021,14 +1059,35 @@ const Gen = struct {
                         break :r true;
                     },
                     .alias => |t| try self.nativeBridgeSupported(t),
-                    // variant/enum/flags/resource: not representable by the
-                    // native bridge's tag vocabulary (see js_dispatch.h).
-                    else => false,
+                    .variant => |cases| r: {
+                        for (cases) |c| {
+                            if (c.type) |t| {
+                                if (!try self.nativeBridgeSupported(t)) break :r false;
+                            }
+                        }
+                        break :r true;
+                    },
+                    // `enum`/`flags` carry no payload types to recurse into
+                    // -- both encode/decode to a plain JS string / a plain
+                    // JS object of camelCased booleans respectively (see
+                    // js_dispatch.zig's `encodeNative`/`decodeNative`). A
+                    // `flags` type with >32 labels, though, is rejected by
+                    // `emitTypeDef` (only ≤32-label `flags` -- a single
+                    // packed integer -- is implemented; see its doc
+                    // comment) -- this gate must say so too, or it falsely
+                    // advertises >32-label `flags` as bridgeable when
+                    // generation is actually guaranteed to fail on it.
+                    .@"enum" => true,
+                    .flags => |labels| labels.len <= 32,
+                    // resource: not representable by the native bridge's
+                    // tag vocabulary (see js_dispatch.h) -- no
+                    // handle-lifetime story on this synchronous JS-call path.
+                    .resource => false,
                 };
             },
-            // char, tuple, result<T,E>, future/stream, error-context, own/borrow
-            // resource handles: none of these have an `encodeNative`/
-            // `decodeNative` case in js_dispatch.zig today.
+            // future/stream/error-context, own/borrow resource handles: none
+            // of these have an `encodeNative`/`decodeNative` case in
+            // js_dispatch.zig today.
             else => false,
         };
     }
@@ -1090,9 +1149,11 @@ const Gen = struct {
                         if (!try self.nativeBridgeSupported(p.type)) {
                             return self.fail(
                                 "imported function '{s}#{s}': parameter '{s}' has a WIT type not " ++
-                                    "supported by the JS import bridge (bool/integers/f32/f64/string/" ++
-                                    "option<T>/list<T>/record only -- resource, variant, enum, flags, " ++
-                                    "tuple, result<T,E>, char, future/stream need a further WABT phase)",
+                                    "supported by the JS import bridge (bool/integers/f32/f64/char/" ++
+                                    "string/option<T>/list<T>/tuple/record/variant/enum/flags " ++
+                                    "(≤32 labels)/result<T,E> only -- resource, future/stream, " ++
+                                    "error-context, and >32-label (multiword) flags need a further WABT " ++
+                                    "phase)",
                                 .{ u.id, fd.name, p.name },
                             );
                         }
@@ -1101,8 +1162,10 @@ const Gen = struct {
                         if (!try self.nativeBridgeSupported(r)) {
                             return self.fail(
                                 "imported function '{s}#{s}': its result type is not supported by the " ++
-                                    "JS import bridge (bool/integers/f32/f64/string/option<T>/list<T>/" ++
-                                    "record only)",
+                                    "JS import bridge (bool/integers/f32/f64/char/string/option<T>/" ++
+                                    "list<T>/tuple/record/variant/enum/flags (≤32 labels)/" ++
+                                    "result<T,E> only -- resource, future/stream, error-context, and " ++
+                                    ">32-label (multiword) flags need a further WABT phase)",
                                 .{ u.id, fd.name },
                             );
                         }
@@ -1642,6 +1705,35 @@ const Gen = struct {
                 try args.appendSlice(self.ar, try std.fmt.allocPrint(self.ar, "{s}.handle", .{pn}));
                 continue;
             }
+            // In `--dispatch` mode (the mode `--js-imports` always runs in),
+            // `zigType` maps `char` / a *direct* `list<u8>` one level deeper
+            // than everywhere else, to the wrapper structs `wit_types.Char`
+            // / `wit_types.ByteList` (so the JS bridge can tell them apart
+            // from a bare `u32` / a generic `list<T>` at runtime -- see
+            // those structs' own doc comments). The scalar/slice fast paths
+            // below assume the bare payload type (true in `--impl` mode, and
+            // true here for every *other* dispatch-mode type), so route
+            // these two through the generic, reflection-based
+            // `lowerAggregateParam` instead -- it already lowers `Char`/
+            // `ByteList` correctly (single-field structs fall out of its
+            // `wit_types.lowerFlat` call for free; see wit_types.zig's
+            // "Char/ByteList wrappers have the same canonical layout as
+            // their bare payload" test) rather than trying to `@intCast` or
+            // `.ptr`/`.len` a field that doesn't exist on the wrapper.
+            if (self.dispatch != null) {
+                var wrapped = false;
+                switch (rty) {
+                    .char => wrapped = true,
+                    .list => |e| if (e.* == .u8) {
+                        wrapped = true;
+                    },
+                    else => {},
+                }
+                if (wrapped) {
+                    try self.lowerAggregateParam(&args, pn, p.type);
+                    continue;
+                }
+            }
             switch (rty) {
                 .string, .list => {
                     // `string` / `list<T>`: pass the guest slice's (ptr, len).
@@ -1649,7 +1741,31 @@ const Gen = struct {
                 },
                 .option => |e| {
                     const inner = self.resolveAlias(e.*);
-                    if (inner == .string or (try self.flatCount(inner)) == 1) {
+                    // `lowerOptionParam`'s fast path hand-emits the payload
+                    // expression assuming `inner`'s *Zig* representation is
+                    // either a handle (`.handle` field) or a value already
+                    // usable inline as the scalar it appears to be (a bare
+                    // Zig int/float/bool -- what `scalarLowerExpr` knows how
+                    // to cast). That assumption fails for any `inner` whose
+                    // `zigType` is actually a wrapper/aggregate Zig value even
+                    // though it flattens to a single core slot: `char` in
+                    // `--dispatch` mode (`wit_types.Char`, a struct), a named
+                    // `enum` (a Zig `enum`, not an int -- needs
+                    // `@intFromEnum`), a named `flags` with ≤32 labels (a
+                    // `packed struct`), a single-field `record`, a
+                    // single-element `tuple`, or an all-void `variant`/
+                    // `result` (a union needing its tag). All of those are
+                    // exactly what the generic, reflection-based
+                    // `wit_types.lowerFlat` (driven by `lowerAggregateParam`)
+                    // already lowers correctly for every other aggregate
+                    // param -- it introspects the *actual* generated Zig type
+                    // via `@typeInfo` instead of guessing from the WIT shape,
+                    // so it can't go stale as `zigType`/`nativeBridgeSupported`
+                    // grow new representable shapes. Route everything except
+                    // `string` and genuine scalars/handles through it.
+                    if (inner == .string) {
+                        try self.lowerOptionParam(&args, pn, inner);
+                    } else if (self.isHandleLike(inner) or self.isPlainZigScalar(inner)) {
                         try self.lowerOptionParam(&args, pn, inner);
                     } else {
                         try self.lowerAggregateParam(&args, pn, p.type);
@@ -1678,8 +1794,13 @@ const Gen = struct {
     }
 
     /// Lower an `option<inner>` param: a discriminant plus the (null-zeroed)
-    /// payload slots. `string` is the (ptr, len) special case; otherwise the
-    /// payload must flatten to a single core slot (a scalar or a handle).
+    /// payload slots. `string` is the (ptr, len) special case; otherwise
+    /// `inner` must be a genuine Zig scalar (`isPlainZigScalar`) or handle-like
+    /// (`isHandleLike`) -- the caller (`lowerParams`) routes every other
+    /// shape (including single-flat-slot aggregates/wrappers such as `char`
+    /// in `--dispatch` mode, `enum`, `flags`, a single-field `record`, …)
+    /// through `lowerAggregateParam` instead, which lowers via the real
+    /// generated Zig type rather than assuming it casts like a bare number.
     fn lowerOptionParam(self: *Gen, args: *std.ArrayListUnmanaged(u8), pn: []const u8, inner: ast.Type) GenError!void {
         self.print("        const {s}_disc: i32 = if ({s} != null) 1 else 0;\n", .{ pn, pn });
         if (inner == .string) {
@@ -1871,6 +1992,28 @@ const Gen = struct {
         return switch (ty) {
             .own, .borrow, .future, .stream, .error_context => true,
             .name => |n| if (self.typeKind(n)) |k| k == .resource else false,
+            else => false,
+        };
+    }
+
+    /// True when `ty`'s `zigType` is a bare Zig number/bool primitive that
+    /// `scalarLowerExpr` can cast inline (`@intCast`/`@bitCast`/etc. on the
+    /// value itself) -- i.e. NOT a struct/enum/packed-struct/union wrapper.
+    /// This is strictly narrower than "flattens to one core slot": `char` in
+    /// `--dispatch` mode, a named `enum`, a named `flags`, a single-field
+    /// `record`, a single-element `tuple`, and an all-void `variant`/`result`
+    /// all flatten to one (or, for `result`, one-plus-void) core slot too,
+    /// but each is a Zig aggregate value that `scalarLowerExpr` cannot cast
+    /// as if it were already an int/float/bool -- those must go through the
+    /// reflection-based `wit_types.lowerFlat` (`lowerAggregateParam`)
+    /// instead, which introspects the real Zig type via `@typeInfo`. `char`
+    /// is the sole *mode-dependent* case: it's only "plain" in `--impl` mode
+    /// where `zigType(.char)` is a bare `u32`; in `--dispatch` mode it's the
+    /// `wit_types.Char` wrapper struct.
+    fn isPlainZigScalar(self: *Gen, ty: ast.Type) bool {
+        return switch (ty) {
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64 => true,
+            .char => self.dispatch == null,
             else => false,
         };
     }
@@ -2973,6 +3116,507 @@ test "generate --js-imports: a void-result import encodes to the dedicated undef
     // either.
     try testing.expect(std.mem.indexOf(u8, out, ".tag = .bool_") == null);
     try testing.expect(std.mem.indexOf(u8, out, ".tag = .option_none") == null);
+}
+
+test "generate --js-imports: char and list<u8> (bytes) params lower through their dispatch-mode wrapper structs' real fields" {
+    // Regression test for a real bug: `zigType` maps `char`/a direct
+    // `list<u8>` to the wrapper structs `wit_types.Char`/`wit_types.ByteList`
+    // in `--dispatch` mode (which `--js-imports` always runs in), but
+    // `lowerParams`'s scalar/slice fast paths used to assume the bare
+    // payload type -- emitting `@intCast(c)` (fails to compile: `c` is a
+    // struct, not an int) / `b.ptr`/`b.len` (fails to compile: no such
+    // field on `wit_types.ByteList`, which wraps a `bytes: []const u8`
+    // field) -- a genuine Zig **compile** error caught only by actually
+    // building the generated output (see tests/e2e/wit-imports/run.sh, the
+    // integration test that first surfaced this), not by generation-time
+    // rejection or by string-matching alone. This asserts the corrected
+    // field accesses appear instead.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface host {
+    //   identity-char: func(c: char) -> char;
+    //   identity-bytes: func(b: list<u8>) -> list<u8>;
+    // }
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "identity-char", .func = .{
+            .params = &.{.{ .name = "c", .type = .char }},
+            .result = .char,
+        } } },
+        .{ .func = .{ .name = "identity-bytes", .func = .{
+            .params = &.{.{ .name = "b", .type = .{ .list = &.{ .u8 = {} } } }},
+            .result = .{ .list = &.{ .u8 = {} } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "bytes-char" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Typed import wrapper: params declared with the wrapper struct types...
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityChar(c: wit_types.Char) wit_types.Char {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityBytes(b: wit_types.ByteList) wit_types.ByteList {") != null);
+    // ...and lowered via the generic `lowerFlat` aggregate path (correct:
+    // reflects into `.codepoint`/`.bytes` for free), never a direct
+    // `@intCast(c)` or `c.ptr`/`c.len` on the wrapper struct itself.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(wit_types.Char, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const b_s = wit_types.lowerFlat(wit_types.ByteList, b, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "@intCast(c)") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.ptr") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.len") == null);
+
+    // The JS-callable reverse bridge (decodeNative/encodeNative side) is
+    // unaffected by this fix -- js_dispatch already special-cases
+    // `wit_types.Char`/`wit_types.ByteList` by type identity (see
+    // js_dispatch.zig's `encodeNative`/`decodeNative`) -- confirm both
+    // functions are still bridged (the type-gate fix below is what allows
+    // this in the first place; this test's focus is the codegen fix, so it
+    // only checks the bridge entries exist, not their exact bodies).
+    try testing.expect(std.mem.indexOf(u8, out, "test:bytes-char/host#identity-char") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:bytes-char/host#identity-bytes") != null);
+}
+
+test "generate --js-imports: tuple, enum, flags, variant, and result<T,E> are no longer rejected by the native-bridge type gate" {
+    // Regression test for `nativeBridgeSupported`'s allow-list: before this
+    // fix, every function below failed generation with
+    // `error.UnsupportedWitType` (a conservative allow-list written before
+    // js_dispatch.zig grew encodeNative/decodeNative support for these
+    // shapes). None of these types need any *codegen* change -- the
+    // generic lower/lift path (`lowerAggregateParam` / `wit_types.lift`)
+    // already handles them structurally; only the gate itself was stale.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // flags perms { read, write, exec }
+    // variant shape { circle(f64), origin }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const perms_labels = [_][]const u8{ "read", "write", "exec" };
+    const f64_ty: ast.Type = .f64;
+    const shape_cases = [_]ast.Case{
+        .{ .name = "circle", .type = f64_ty },
+        .{ .name = "origin", .type = null },
+    };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "perms", .kind = .{ .flags = &perms_labels } } },
+        .{ .type = .{ .name = "shape", .kind = .{ .variant = &shape_cases } } },
+        // color -> color (named enum, round-trip)
+        .{ .func = .{ .name = "next-color", .func = .{
+            .params = &.{.{ .name = "c", .type = ast.Type{ .name = "color" } }},
+            .result = ast.Type{ .name = "color" },
+        } } },
+        // perms -> perms (named flags, round-trip)
+        .{ .func = .{ .name = "toggle-perms", .func = .{
+            .params = &.{.{ .name = "p", .type = ast.Type{ .name = "perms" } }},
+            .result = ast.Type{ .name = "perms" },
+        } } },
+        // shape -> string (named variant param)
+        .{ .func = .{ .name = "classify", .func = .{
+            .params = &.{.{ .name = "s", .type = ast.Type{ .name = "shape" } }},
+            .result = .string,
+        } } },
+        // tuple<u32, string> -> tuple<string, u32> (anonymous tuple, both directions)
+        .{ .func = .{ .name = "swap-tuple", .func = .{
+            .params = &.{.{ .name = "t", .type = .{ .tuple = &.{ .u32, .string } } }},
+            .result = .{ .tuple = &.{ .string, .u32 } },
+        } } },
+        // result<s32, string> (anonymous result, both an ok and an err payload)
+        .{ .func = .{ .name = "checked-div", .func = .{
+            .params = &.{
+                .{ .name = "a", .type = .s32 },
+                .{ .name = "b", .type = .s32 },
+            },
+            .result = .{ .result = .{ .ok = &ast.Type{ .s32 = {} }, .err = &ast.Type{ .string = {} } } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "adv" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    // The headline assertion: generation must SUCCEED (not
+    // error.UnsupportedWitType) for all five of these types.
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Every function actually made it into the manifest / dispatch bridge,
+    // not just "didn't error" (e.g. a swallowed/skipped entry would also
+    // make the call above succeed).
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#next-color") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#toggle-perms") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#classify") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#swap-tuple") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#checked-div") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
+}
+
+test "generate --js-imports: a directly-used >32-label flags type is a precise Gen.fail, not a bare internal error, and emits no partial manifest/dispatch output" {
+    // `nativeBridgeSupported` used to accept every `flags` type
+    // unconditionally, while `emitTypeDef` unconditionally rejects any
+    // `flags` typedef with >32 labels via a bare `error.UnsupportedWitType`
+    // (no `self.fail` detail at all) -- a contradiction: the type gate
+    // claimed support that generation could never actually deliver, and the
+    // resulting build failure named neither the offending type nor the
+    // actual constraint. This is the direct case: a >32-label `flags` type
+    // used straight as an imported function's parameter type.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // flags wide { l0, l1, …, l32 } -- 33 labels, one past the ≤32-label
+    // single-packed-integer representation this generator implements.
+    var labels_buf: [33][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "wide", .kind = .{ .flags = labels } } },
+        .{ .func = .{ .name = "use-wide", .func = .{
+            .params = &.{.{ .name = "w", .type = ast.Type{ .name = "wide" } }},
+            .result = null,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "wide-flags" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    // Names the offending flags type, its interface, and its actual label
+    // count -- not just "UnsupportedWitType".
+    try testing.expect(std.mem.indexOf(u8, g.diag, "wide") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "33") != null);
+    // No partial JS-bridge manifest/dispatch output survives the failure.
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: a >32-label flags type reached only through a nested record field and an alias chain is still a precise Gen.fail" {
+    // The nested/aliased case: the offending `flags` typedef is never the
+    // function's own parameter type directly -- it's the field of a
+    // `record`, itself reached only via a `type … = …` alias. Whatever path
+    // reaches it, the underlying `flags` typedef is always its own
+    // `.type` item in some interface `generate` walks (WIT has no way to
+    // declare a `flags` type inline/anonymously), so `emitTypeDef` sees it
+    // and must still reject it deterministically and by name -- not
+    // silently accept it because it's several hops away from the function
+    // signature that actually needs it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // flags big { l0, …, l39 } (40 labels)
+    var labels_buf: [40][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    // type big-alias = big;
+    // record wrapper { p: big-alias }
+    // use-wrapper: func(w: wrapper);
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "big", .kind = .{ .flags = labels } } },
+        .{ .type = .{ .name = "big-alias", .kind = .{ .alias = ast.Type{ .name = "big" } } } },
+        .{ .type = .{ .name = "wrapper", .kind = .{ .record = &.{
+            .{ .name = "p", .type = ast.Type{ .name = "big-alias" } },
+        } } } },
+        .{ .func = .{ .name = "use-wrapper", .func = .{
+            .params = &.{.{ .name = "w", .type = ast.Type{ .name = "wrapper" } }},
+            .result = null,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "wide-flags-nested" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    // Names the actual offending `flags` typedef ("big"), not the alias or
+    // the record that merely reference it.
+    try testing.expect(std.mem.indexOf(u8, g.diag, "big") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "40") != null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: exactly 32 labels is still the boundary success case, packed into a single u32" {
+    // The flip side of the two tests above: ≤32 labels must keep working
+    // end-to-end through the JS import bridge (manifest + dispatch entry),
+    // not just "not rejected" -- and the generated backing integer is
+    // exactly `u32` at the boundary (33 is the first rejected size).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    var labels_buf: [32][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "exact32", .kind = .{ .flags = labels } } },
+        .{ .func = .{ .name = "use-exact32", .func = .{
+            .params = &.{.{ .name = "f", .type = ast.Type{ .name = "exact32" } }},
+            .result = ast.Type{ .name = "exact32" },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "flags32" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(u8, out, "pub const Exact32 = packed struct(u32) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:flags32/host#use-exact32") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
+}
+
+test "generate --js-imports: option<char> lowers through wit_types.Char's real field, not @intCast(v) on the struct" {
+    // Regression test for a real bug: `option<char>` passes
+    // `nativeBridgeSupported`'s gate (char is individually supported), and
+    // `lowerParams` routed it to the "single flat slot" fast path
+    // (`lowerOptionParam`) because `flatCount(char) == 1` -- but in
+    // `--dispatch` mode (which `--js-imports` always runs in), `zigType(char)`
+    // is `wit_types.Char` (a `struct { codepoint: u32 }`), not a bare `u32`.
+    // `lowerOptionParam` then called `scalarLowerExpr("v", .char)`, which
+    // unconditionally emits `@intCast(v)` assuming `v` is already an int --
+    // a genuine Zig **compile** error (`@intCast` on a struct) that
+    // `nativeBridgeSupported`'s type-level gate and a plain generation-time
+    // success can't catch. Confirmed against the pre-fix source (see
+    // `build/bindgen/testdata/force_analysis_driver.zig` + the `gen-regress`
+    // build step) that this actually fails `zig build-obj`, not just an
+    // assertion here.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface host { identity-opt-char: func(c: option<char>) -> option<char>; }
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "identity-opt-char", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .char = {} } } }},
+            .result = .{ .option = &ast.Type{ .char = {} } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-char" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // The typed wrapper takes/returns the wrapper struct...
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityOptChar(c: ?wit_types.Char) ?wit_types.Char {") != null);
+    // ...and lowers via the generic aggregate path over the *whole*
+    // `option<char>`, which reflects into `.codepoint` for free -- never a
+    // direct `@intCast` on the unwrapped struct value.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?wit_types.Char, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"identity-opt-char\"(c_s[0], c_s[1], wit_types.retPtr());") != null);
+    // Negative control: none of the old broken fast-path shape survives --
+    // `lowerOptionParam`'s hand-rolled `c_disc`/`c_0` temps (the "extern"
+    // decl's own `c_disc: i32` parameter name is unrelated: `flattenSlots`
+    // always names option slots that way regardless of which lowering path
+    // the call site takes, so this checks the *body* shape specifically).
+    try testing.expect(std.mem.indexOf(u8, out, "@intCast(v)") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_disc: i32 = if (c != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_0:") == null);
+}
+
+test "generate --js-imports: option<enum> and option<flags> lower via the generic aggregate path, not an internal UnsupportedWitType" {
+    // Regression test for a real bug: `option<enum>`/`option<flags>` pass
+    // `nativeBridgeSupported`'s gate (both are unconditionally supported --
+    // no payload types to recurse into), and `lowerParams` routed them to
+    // the "single flat slot" fast path (`lowerOptionParam`) because
+    // `flatCount` is 1 for both -- but `lowerOptionParam` then called
+    // `scalarLowerExpr("v", .name(...))`, whose `switch` has no arm for a
+    // named type at all, falling to `else => error.UnsupportedWitType`. So
+    // despite the gate saying "supported", generation itself failed with a
+    // bare, undiagnosed `error.UnsupportedWitType` -- the exact contradiction
+    // `nativeBridgeSupported`'s doc comment promises never happens for
+    // anything the gate accepts.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // flags perms { read, write, exec }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const perms_labels = [_][]const u8{ "read", "write", "exec" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "perms", .kind = .{ .flags = &perms_labels } } },
+        .{ .func = .{ .name = "toggle-opt-color", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color" } } }},
+            .result = .{ .option = &ast.Type{ .name = "color" } },
+        } } },
+        .{ .func = .{ .name = "toggle-opt-perms", .func = .{
+            .params = &.{.{ .name = "p", .type = .{ .option = &ast.Type{ .name = "perms" } } }},
+            .result = .{ .option = &ast.Type{ .name = "perms" } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-enum-flags" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    // The headline assertion: generation must SUCCEED, matching what
+    // `nativeBridgeSupported` already promises for these types.
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn toggleOptColor(c: ?Color) ?Color {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?Color, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn toggleOptPerms(p: ?Perms) ?Perms {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(?Perms, p, &wit_types.alloc);") != null);
+    // Negative control: no hand-rolled discriminant + scalar-cast temps (the
+    // shape that used to hit `scalarLowerExpr`'s `else => UnsupportedWitType`
+    // -- the "extern" decl's own `c_disc`/`p_disc: i32` parameter names are
+    // unrelated; `flattenSlots` always names option slots that way).
+    try testing.expect(std.mem.indexOf(u8, out, "const c_disc: i32 = if (c != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_0:") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_disc: i32 = if (p != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_0:") == null);
+}
+
+test "generate --js-imports: nested single-flat-slot option payloads (alias chain, single-field record, single-element tuple) all use the generic aggregate path" {
+    // Broader coverage for the same class of bug: any `option<T>` where `T`
+    // flattens to one core slot but isn't literally a bare Zig int/float/
+    // bool -- an alias chain resolving down to `char`/`enum`, a single-field
+    // `record`, or a single-element `tuple` -- must not reach
+    // `lowerOptionParam`'s scalar fast path either. A function mixing a
+    // genuine scalar option (`option<u32>`) with one of these in the same
+    // call also checks the two lowering paths compose correctly
+    // (no argument-count/order mismatch when both appear in one call).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // type color-alias = color;
+    // record point { x: u32 }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "color-alias", .kind = .{ .alias = ast.Type{ .name = "color" } } } },
+        .{ .type = .{ .name = "point", .kind = .{ .record = &.{
+            .{ .name = "x", .type = .u32 },
+        } } } },
+        // option<alias to enum> -- resolveAlias must see through the alias
+        // before the fast-path/aggregate-path decision.
+        .{ .func = .{ .name = "opt-alias-color", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color-alias" } } }},
+            .result = .{ .option = &ast.Type{ .name = "color-alias" } },
+        } } },
+        // option<single-field record>
+        .{ .func = .{ .name = "opt-single-field-record", .func = .{
+            .params = &.{.{ .name = "p", .type = .{ .option = &ast.Type{ .name = "point" } } }},
+            .result = .{ .option = &ast.Type{ .name = "point" } },
+        } } },
+        // option<single-element tuple>
+        .{ .func = .{ .name = "opt-single-elem-tuple", .func = .{
+            .params = &.{.{ .name = "t", .type = .{ .option = &ast.Type{ .tuple = &.{.u32} } } }},
+            .result = .{ .option = &ast.Type{ .tuple = &.{.u32} } },
+        } } },
+        // option<u32> (genuine scalar fast path) alongside option<color>
+        // (generic aggregate path) in the same call.
+        .{ .func = .{ .name = "mix-opt-scalar-and-color", .func = .{
+            .params = &.{
+                .{ .name = "n", .type = .{ .option = &ast.Type{ .u32 = {} } } },
+                .{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color" } } },
+            },
+            .result = .bool,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-nested" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Alias chain: the fast-path/aggregate decision must resolve through
+    // `color-alias` down to `color` (a named enum), landing on the generic
+    // aggregate path -- exactly as if the param had been declared
+    // `option<color>` directly.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn optAliasColor(c: ?ColorAlias) ?ColorAlias {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?ColorAlias, c, &wit_types.alloc);") != null);
+
+    // Single-field record: also the generic aggregate path (a record is a
+    // Zig `struct`, never a bare scalar `scalarLowerExpr` can cast).
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn optSingleFieldRecord(p: ?Point) ?Point {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(?Point, p, &wit_types.alloc);") != null);
+
+    // Single-element tuple: same reasoning (`wit_types.Tuple(.{u32})` is a
+    // struct wrapper, not `u32` itself).
+    try testing.expect(std.mem.indexOf(u8, out, "const t_s = wit_types.lowerFlat(?wit_types.Tuple(.{ u32 }), t, &wit_types.alloc);") != null);
+
+    // Mixed call: the genuine scalar (`option<u32>`) keeps the fast path
+    // (its own `_disc`/cast temps)...
+    try testing.expect(std.mem.indexOf(u8, out, "const n_disc: i32 = if (n != null) 1 else 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const n_0: i32 = if (n) |v| @bitCast(v) else 0;") != null);
+    // ...while `option<color>` in the same call still takes the aggregate
+    // path, and both sets of args are passed to the extern call in the
+    // right relative order.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?Color, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"mix-opt-scalar-and-color\"(n_disc, n_0, c_s[0], c_s[1])") != null);
 }
 
 test "generate: imported resource with async methods (#300)" {
