@@ -4200,7 +4200,7 @@ pub const Interpreter = struct {
         const lanes: [count]T = @bitCast(v.v128);
         if (@sizeOf(T) <= 4) {
             if (signed) {
-                const s: i32 = @as(i32, @as(std.meta.Int(.signed, @bitSizeOf(T)), @bitCast(lanes[lane])));
+                const s: i32 = @as(i32, @as(@Int(.signed, @bitSizeOf(T)), @bitCast(lanes[lane])));
                 try self.pushValue(.{ .i32 = s });
             } else {
                 const u_val: u32 = @as(u32, lanes[lane]);
@@ -4285,18 +4285,18 @@ pub const Interpreter = struct {
 
     /// Compare op: pop two v128, compare per lane, push v128 with all-1s or all-0s per lane.
     fn simdCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
-        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const Unsigned = @Int(.unsigned, @bitSizeOf(T));
         const count = 16 / @sizeOf(T);
         const b: [count]T = @bitCast((try self.popValue()).v128);
         const a: [count]T = @bitCast((try self.popValue()).v128);
         var result: [count]Unsigned = undefined;
-        for (0..count) |i| result[i] = if (op(a[i], b[i])) @as(Unsigned, @bitCast(@as(std.meta.Int(.signed, @bitSizeOf(T)), -1))) else 0;
+        for (0..count) |i| result[i] = if (op(a[i], b[i])) @as(Unsigned, @bitCast(@as(@Int(.signed, @bitSizeOf(T)), -1))) else 0;
         try self.pushValue(.{ .v128 = @bitCast(result) });
     }
 
     /// Float compare op: pop two v128 of float type, compare per lane.
     fn simdFloatCmpOp(self: *Interpreter, comptime T: type, comptime op: fn (T, T) bool) TrapError!void {
-        const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(T));
+        const Unsigned = @Int(.unsigned, @bitSizeOf(T));
         const count = 16 / @sizeOf(T);
         const b: [count]T = @bitCast((try self.popValue()).v128);
         const a: [count]T = @bitCast((try self.popValue()).v128);
@@ -4308,8 +4308,8 @@ pub const Interpreter = struct {
     /// Shift op: pop i32 shift amount, pop v128, shift each lane, push result.
     fn simdShiftOp(self: *Interpreter, comptime T: type, comptime dir: enum { left, right_s, right_u }) TrapError!void {
         const bits = @bitSizeOf(T);
-        const Unsigned = std.meta.Int(.unsigned, bits);
-        const Signed = std.meta.Int(.signed, bits);
+        const Unsigned = @Int(.unsigned, bits);
+        const Signed = @Int(.signed, bits);
         const ShiftT = std.math.Log2Int(Unsigned);
         const count = 16 / @sizeOf(T);
         const shift_raw: i32 = try self.popI32();
@@ -4340,7 +4340,7 @@ pub const Interpreter = struct {
     /// bitmask: extract high bit of each lane, pack into i32.
     fn simdBitmask(self: *Interpreter, comptime T: type) TrapError!void {
         const bits = @bitSizeOf(T);
-        const Unsigned = std.meta.Int(.unsigned, bits);
+        const Unsigned = @Int(.unsigned, bits);
         const count = 16 / @sizeOf(T);
         const lanes: [count]T = @bitCast((try self.popValue()).v128);
         var mask: u32 = 0;
@@ -4380,7 +4380,7 @@ pub const Interpreter = struct {
     fn intAbs(comptime T: type) fn (T) T {
         return struct {
             fn f(a: T) T {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 const s: Signed = @bitCast(a);
                 if (s == std.math.minInt(Signed)) return a; // min value stays
                 return @bitCast(if (s < 0) -s else s);
@@ -4392,7 +4392,7 @@ pub const Interpreter = struct {
     fn intAddSatS(comptime T: type) fn (T, T) T {
         return struct {
             fn f(a: T, b: T) T {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 const sa: Signed = @bitCast(a);
                 const sb: Signed = @bitCast(b);
                 return @bitCast(sa +| sb);
@@ -4403,7 +4403,7 @@ pub const Interpreter = struct {
     fn intSubSatS(comptime T: type) fn (T, T) T {
         return struct {
             fn f(a: T, b: T) T {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 const sa: Signed = @bitCast(a);
                 const sb: Signed = @bitCast(b);
                 return @bitCast(sa -| sb);
@@ -4427,7 +4427,7 @@ pub const Interpreter = struct {
     fn intMinS(comptime T: type) fn (T, T) T {
         return struct {
             fn f(a: T, b: T) T {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 const sa: Signed = @bitCast(a);
                 const sb: Signed = @bitCast(b);
                 return @bitCast(@min(sa, sb));
@@ -4444,7 +4444,7 @@ pub const Interpreter = struct {
     fn intMaxS(comptime T: type) fn (T, T) T {
         return struct {
             fn f(a: T, b: T) T {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 const sa: Signed = @bitCast(a);
                 const sb: Signed = @bitCast(b);
                 return @bitCast(@max(sa, sb));
@@ -4461,7 +4461,7 @@ pub const Interpreter = struct {
     fn intAvgrU(comptime T: type) fn (T, T) T {
         return struct {
             fn f(a: T, b: T) T {
-                const Wide = std.meta.Int(.unsigned, @bitSizeOf(T) * 2);
+                const Wide = @Int(.unsigned, @bitSizeOf(T) * 2);
                 return @intCast((@as(Wide, a) + @as(Wide, b) + 1) / 2);
             }
         }.f;
@@ -4478,7 +4478,7 @@ pub const Interpreter = struct {
     fn cmpLtS(comptime T: type) fn (T, T) bool {
         return struct {
             fn f(a: T, b: T) bool {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 return @as(Signed, @bitCast(a)) < @as(Signed, @bitCast(b));
             }
         }.f;
@@ -4489,7 +4489,7 @@ pub const Interpreter = struct {
     fn cmpGtS(comptime T: type) fn (T, T) bool {
         return struct {
             fn f(a: T, b: T) bool {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 return @as(Signed, @bitCast(a)) > @as(Signed, @bitCast(b));
             }
         }.f;
@@ -4500,7 +4500,7 @@ pub const Interpreter = struct {
     fn cmpLeS(comptime T: type) fn (T, T) bool {
         return struct {
             fn f(a: T, b: T) bool {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 return @as(Signed, @bitCast(a)) <= @as(Signed, @bitCast(b));
             }
         }.f;
@@ -4511,7 +4511,7 @@ pub const Interpreter = struct {
     fn cmpGeS(comptime T: type) fn (T, T) bool {
         return struct {
             fn f(a: T, b: T) bool {
-                const Signed = std.meta.Int(.signed, @bitSizeOf(T));
+                const Signed = @Int(.signed, @bitSizeOf(T));
                 return @as(Signed, @bitCast(a)) >= @as(Signed, @bitCast(b));
             }
         }.f;
@@ -4606,7 +4606,7 @@ pub const Interpreter = struct {
                 if (std.math.isNan(b)) return canonicalNan(T);
                 // -0 < +0
                 if (a == b) {
-                    const Uint = std.meta.Int(.unsigned, @bitSizeOf(T));
+                    const Uint = @Int(.unsigned, @bitSizeOf(T));
                     const ab: Uint = @bitCast(a);
                     const bb: Uint = @bitCast(b);
                     return @bitCast(ab | bb); // -0 wins over +0
@@ -4623,7 +4623,7 @@ pub const Interpreter = struct {
                 if (std.math.isNan(a)) return canonicalNan(T);
                 if (std.math.isNan(b)) return canonicalNan(T);
                 if (a == b) {
-                    const Uint = std.meta.Int(.unsigned, @bitSizeOf(T));
+                    const Uint = @Int(.unsigned, @bitSizeOf(T));
                     const ab: Uint = @bitCast(a);
                     const bb: Uint = @bitCast(b);
                     return @bitCast(ab & bb); // +0 wins over -0
@@ -4699,8 +4699,8 @@ pub const Interpreter = struct {
     fn simdNarrowS(self: *Interpreter, comptime Src: type, comptime Dst: type) TrapError!void {
         const src_count = 16 / @sizeOf(Src);
         const dst_count = 16 / @sizeOf(Dst);
-        const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-        const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+        const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+        const DstSigned = @Int(.signed, @bitSizeOf(Dst));
         const b: [src_count]Src = @bitCast((try self.popValue()).v128);
         const a: [src_count]Src = @bitCast((try self.popValue()).v128);
         var result: [dst_count]Dst = undefined;
@@ -4720,7 +4720,7 @@ pub const Interpreter = struct {
     fn simdNarrowU(self: *Interpreter, comptime Src: type, comptime Dst: type) TrapError!void {
         const src_count = 16 / @sizeOf(Src);
         const dst_count = 16 / @sizeOf(Dst);
-        const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
+        const SrcSigned = @Int(.signed, @bitSizeOf(Src));
         const b: [src_count]Src = @bitCast((try self.popValue()).v128);
         const a: [src_count]Src = @bitCast((try self.popValue()).v128);
         var result: [dst_count]Dst = undefined;
@@ -4756,8 +4756,8 @@ pub const Interpreter = struct {
         var result: [dst_count]Dst = undefined;
         for (0..dst_count) |i| {
             if (signed) {
-                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+                const DstSigned = @Int(.signed, @bitSizeOf(Dst));
                 const sv: SrcSigned = @bitCast(a[i]);
                 const extended: DstSigned = sv;
                 result[i] = @bitCast(extended);
@@ -4775,8 +4775,8 @@ pub const Interpreter = struct {
         var result: [dst_count]Dst = undefined;
         for (0..dst_count) |i| {
             if (signed) {
-                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+                const DstSigned = @Int(.signed, @bitSizeOf(Dst));
                 const sv: SrcSigned = @bitCast(a[dst_count + i]);
                 const extended: DstSigned = sv;
                 result[i] = @bitCast(extended);
@@ -4797,8 +4797,8 @@ pub const Interpreter = struct {
         var result: [dst_count]Dst = undefined;
         for (0..dst_count) |i| {
             if (signed) {
-                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+                const DstSigned = @Int(.signed, @bitSizeOf(Dst));
                 const sa: DstSigned = @as(SrcSigned, @bitCast(a[i]));
                 const sb: DstSigned = @as(SrcSigned, @bitCast(b[i]));
                 result[i] = @bitCast(sa *% sb);
@@ -4819,8 +4819,8 @@ pub const Interpreter = struct {
         var result: [dst_count]Dst = undefined;
         for (0..dst_count) |i| {
             if (signed) {
-                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+                const DstSigned = @Int(.signed, @bitSizeOf(Dst));
                 const sa: DstSigned = @as(SrcSigned, @bitCast(a[dst_count + i]));
                 const sb: DstSigned = @as(SrcSigned, @bitCast(b[dst_count + i]));
                 result[i] = @bitCast(sa *% sb);
@@ -4881,8 +4881,8 @@ pub const Interpreter = struct {
         var result: [dst_count]Dst = undefined;
         for (0..dst_count) |i| {
             if (signed) {
-                const SrcSigned = std.meta.Int(.signed, @bitSizeOf(Src));
-                const DstSigned = std.meta.Int(.signed, @bitSizeOf(Dst));
+                const SrcSigned = @Int(.signed, @bitSizeOf(Src));
+                const DstSigned = @Int(.signed, @bitSizeOf(Dst));
                 const s0: DstSigned = @as(SrcSigned, @bitCast(a[i * 2]));
                 const s1: DstSigned = @as(SrcSigned, @bitCast(a[i * 2 + 1]));
                 result[i] = @bitCast(s0 + s1);

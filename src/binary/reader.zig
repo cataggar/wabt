@@ -65,8 +65,8 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
 
 /// Safe enum cast: returns null if the integer doesn't match any tag.
 fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E {
-    inline for (@typeInfo(E).@"enum".fields) |field| {
-        if (value == field.value) return @enumFromInt(value);
+    inline for (@typeInfo(E).@"enum".field_values) |field_value| {
+        if (value == field_value) return @enumFromInt(value);
     }
     return null;
 }
