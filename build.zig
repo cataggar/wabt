@@ -175,6 +175,60 @@ pub fn build(b: *std.Build) void {
     );
     gen_regress_step.dependOn(&gen_regress_obj.step);
 
+    // Generate a mixed root-function + interface-import world in
+    // `--js-imports` mode and compile every generated wrapper/bridge body for
+    // wasm32. The exported force-analysis driver keeps the typed wrappers
+    // reachable, catching semantic codegen failures that generator
+    // string-fragment assertions cannot.
+    const root_import_run = b.addRunArtifact(bindgen_exe);
+    root_import_run.addArgs(&.{"--wit"});
+    root_import_run.addFileArg(b.path("build/bindgen/testdata/root_imports.wit"));
+    root_import_run.addArgs(&.{ "--world", "guest", "--dispatch", "js_dispatch", "--js-imports", "-o" });
+    const root_import_generated = root_import_run.addOutputFileArg("root_imports_generated.zig");
+
+    const root_import_generated_mod = b.createModule(.{
+        .root_source_file = root_import_generated,
+        .target = wasm32_freestanding,
+    });
+    root_import_generated_mod.addImport("wit_types", wit_types);
+    root_import_generated_mod.addImport("js_dispatch", b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/js_dispatch_stub.zig"),
+        .target = wasm32_freestanding,
+    }));
+
+    const root_import_driver_mod = b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/root_import_force_driver.zig"),
+        .target = wasm32_freestanding,
+        .imports = &.{.{ .name = "generated", .module = root_import_generated_mod }},
+    });
+    const root_import_exe = b.addExecutable(.{
+        .name = "root_imports_gen_check",
+        .root_module = root_import_driver_mod,
+    });
+    root_import_exe.entry = .disabled;
+    root_import_exe.rdynamic = true;
+
+    const root_import_gen_step = b.step(
+        "root-import-gen-check",
+        "Compile generated root-function imports and JS bridge for wasm32",
+    );
+    root_import_gen_step.dependOn(&root_import_exe.step);
+
+    // Wrap that real generated core module with reference component tooling.
+    // Successful wrapping proves the externs use canonical `$root` module /
+    // verbatim-field names; the script also asserts the root functions and
+    // existing named interface all survive in the component WIT surface.
+    const root_component_check = b.addSystemCommand(&.{"bash"});
+    root_component_check.addFileArg(b.path("build/bindgen/testdata/check_root_component.sh"));
+    root_component_check.addFileArg(b.path("build/bindgen/testdata/root_imports.wit"));
+    root_component_check.addArtifactArg(root_import_exe);
+    _ = root_component_check.addOutputFileArg("root-imports.component.wasm");
+    const root_component_step = b.step(
+        "root-import-component-test",
+        "Wrap and validate a generated component with root and interface imports",
+    );
+    root_component_step.dependOn(&root_component_check.step);
+
     // ── Tests ────────────────────────────────────────────────────────
     // Native unit tests for the host-import-free canonical-ABI core in
     // `wit_types.zig` (abi + canon internals). The `wasi_*` wrappers
@@ -199,6 +253,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native unit tests");
     test_step.dependOn(&run_wit_types_tests.step);
     test_step.dependOn(&run_bindgen_tests.step);
+    test_step.dependOn(root_import_gen_step);
+    // Component wrapping uses the separately installed `wasm-tools` CLI.
+    // Keep it opt-in so a documented clean `zig build test` needs only this
+    // package's declared Zig dependencies; semantic root-import codegen stays
+    // covered above by `root_import_gen_step`.
 }
 
 // ?? Build helpers (ported from cataggar/wamr) ??????????????????????
