@@ -1747,6 +1747,105 @@ test "generate: export shells + import wrappers" {
     }
 }
 
+// Companion to the StarlingMonkey typed-native-bridge spike
+// (runtime/js_dispatch.{h,cpp,zig} in the StarlingMonkey worktree): that
+// bridge is only reachable when a dispatched export's argument/result type
+// graph contains a `u64`/`s64` (see `needsNative` there), so it depends on
+// this generator continuing to emit exact `u64`/`s64` typed shells --
+// **not** widened to `f64` or routed through any JSON-only representation --
+// for `--dispatch` mode, including when a `u64` is nested inside a record
+// embedded in another record. This test locks that down at the generator
+// level: no code changes were needed in this bindgen to support the spike,
+// but its correctness is exactly what the spike's native bridge relies on.
+test "generate: dispatch mode preserves exact u64/s64 params, results, and nested records" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // record point { x: u32, y: u32 }
+    // record big-point { p: point, id: u64 }
+    // big-add: func(a: u64, b: u64) -> u64
+    // big-sub: func(a: s64, b: s64) -> s64
+    // tag-point: func(p: point, id: u64) -> big-point
+    const point_fields = [_]ast.Field{
+        .{ .name = "x", .type = .u32 },
+        .{ .name = "y", .type = .u32 },
+    };
+    const point_ref = ast.Type{ .name = "point" };
+    const big_point_fields = [_]ast.Field{
+        .{ .name = "p", .type = point_ref },
+        .{ .name = "id", .type = .u64 },
+    };
+    const big_point_ref = ast.Type{ .name = "big-point" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "point", .kind = .{ .record = &point_fields } } },
+        .{ .type = .{ .name = "big-point", .kind = .{ .record = &big_point_fields } } },
+        .{ .func = .{ .name = "big-add", .func = .{
+            .params = &.{ .{ .name = "a", .type = .u64 }, .{ .name = "b", .type = .u64 } },
+            .result = .u64,
+        } } },
+        .{ .func = .{ .name = "big-sub", .func = .{
+            .params = &.{ .{ .name = "a", .type = .s64 }, .{ .name = "b", .type = .s64 } },
+            .result = .s64,
+        } } },
+        .{ .func = .{ .name = "tag-point", .func = .{
+            .params = &.{ .{ .name = "p", .type = point_ref } },
+            .result = big_point_ref,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "api", .items = &iface_items };
+    const exp_world = ast.World{ .name = "js-exports", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "starling", .name = "js" },
+        .items = &.{
+            .{ .interface = iface },
+            .{ .world = exp_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try g.generate(exp_world, "js-exports");
+    const out = g.out.items;
+
+    // Nested record type generation: `BigPoint.id` stays `u64`, not widened
+    // to a JSON-safe/f64-ish type.
+    try testing.expect(std.mem.indexOf(u8, out, "pub const Point = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const BigPoint = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "p: Point,") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "id: u64,") != null);
+
+    // u64 params/result dispatched with an exact `u64` Zig type, not `f64`.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "export fn @\"starling:js/api#big-add\"(a: i64, b: i64) wit_types.CoreReturn(u64)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "__wit_dispatch.call(\"starling:js/api#big-add\", u64, .{ __params.a, __params.b })",
+    ) != null);
+
+    // s64 params/result likewise stay exact `i64`.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "__wit_dispatch.call(\"starling:js/api#big-sub\", i64, .{ __params.a, __params.b })",
+    ) != null);
+
+    // Nested-record result: dispatched with the generated `BigPoint` type,
+    // not decomposed into flat scalars or a JSON-only representation.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "__wit_dispatch.call(\"starling:js/api#tag-point\", BigPoint, .{ __params.p })",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Impl.") == null);
+}
+
 test "generate: result<T,E> returns (indirect + flat all-void)" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
