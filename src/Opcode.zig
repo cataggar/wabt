@@ -1959,7 +1959,7 @@ test "isEnabled — MVP opcodes always enabled" {
 test "isEnabled — feature-gated opcodes respect flags" {
     const none = comptime blk: {
         var s: Feature.Set = undefined;
-        for (@typeInfo(Feature.Set).@"struct".field_names) |name| {
+        for (std.meta.fieldNames(Feature.Set)) |name| {
             @field(s, name) = false;
         }
         break :blk s;
