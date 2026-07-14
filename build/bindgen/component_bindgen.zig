@@ -53,6 +53,25 @@ pub const usage =
     \\                      the impl calls when ready. Lets the handler keep
     \\                      running after `task.return` (e.g. to write a
     \\                      `wasi:http` response body stream). Repeatable.
+    \\  --js-imports        Also emit a JS-callable reverse bridge for every
+    \\                      imported interface function: a `starling_js_import_dispatch`
+    \\                      trampoline (keyed by "<iface>#<fn>", mirroring the
+    \\                      export dispatch key) that decodes arguments from --
+    \\                      and encodes its result back to -- the same
+    \\                      `js_dispatch.NativeValue` tree the export-side native
+    \\                      bridge uses, plus a `starling_js_imports_manifest`
+    \\                      byte string (one "<iface>\t<fn-name>\t<iface>#<fn>\t<arity>\n"
+    \\                      line per bridged function) so the host runtime can
+    \\                      register a builtin ES module per imported interface
+    \\                      without per-world C++ glue. Requires --dispatch (the
+    \\                      bridge reuses its `js_dispatch` module). Every
+    \\                      imported function's parameter/result types must be
+    \\                      within the native bridge's supported set (bool,
+    \\                      integers, f32/f64, string, option<T>, list<T>,
+    \\                      record); anything else (resource, variant, enum,
+    \\                      flags, tuple, result<T,E>, future, stream, char) is a
+    \\                      deterministic `error.UnsupportedWitType` generation
+    \\                      failure, not a silently-skipped export.
     \\  -o, --output <file> Output .zig file (default: stdout)
     \\
 ;
@@ -69,6 +88,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var impl_arg: []const u8 = "impl";
     var impl_explicit = false;
     var dispatch_arg: ?[]const u8 = null;
+    var js_imports_arg = false;
     var output_file: ?[]const u8 = null;
     var manual_returns = std.ArrayListUnmanaged([]const u8).empty;
     defer manual_returns.deinit(alloc);
@@ -89,6 +109,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--dispatch")) {
             i += 1;
             dispatch_arg = nextArg(sub_args, i, arg);
+        } else if (std.mem.eql(u8, arg, "--js-imports")) {
+            js_imports_arg = true;
         } else if (std.mem.eql(u8, arg, "--manual-return")) {
             i += 1;
             manual_returns.append(alloc, nextArg(sub_args, i, arg)) catch @panic("OOM");
@@ -103,6 +125,11 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 
     if (impl_explicit and dispatch_arg != null) {
         std.debug.print("error: --impl and --dispatch are mutually exclusive.\n", .{});
+        std.process.exit(1);
+    }
+
+    if (js_imports_arg and dispatch_arg == null) {
+        std.debug.print("error: --js-imports requires --dispatch (the JS import bridge reuses the same js_dispatch module).\n", .{});
         std.process.exit(1);
     }
 
@@ -136,9 +163,13 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         .impl = impl_arg,
         .dispatch = dispatch_arg,
         .manual_returns = manual_returns.items,
+        .js_imports = js_imports_arg,
     };
     g.generate(world, world_name) catch |err| {
         std.debug.print("error: generating bindings for world '{s}': {s}\n", .{ world_name, @errorName(err) });
+        if (g.diag.len != 0) {
+            std.debug.print("  {s}\n", .{g.diag});
+        }
         std.process.exit(1);
     };
     const src = g.out.items;
@@ -192,6 +223,17 @@ const Gen = struct {
     resolver: wit.resolver.Resolver,
     impl: []const u8,
     dispatch: ?[]const u8 = null,
+    /// When true (`--js-imports`), also emit the JS-callable reverse bridge
+    /// (`starling_js_import_dispatch` + `starling_js_imports_manifest`) for
+    /// every imported interface function -- see `emitJsImportBridge` below.
+    js_imports: bool = false,
+    /// Extra detail for the most recent `error.UnsupportedWitType` (or other
+    /// `GenError`) returned by `generate`, set via `fail`. Empty when no error
+    /// has occurred, or when the error came from a call site that didn't set
+    /// one (e.g. an interface/type lookup miss). `run()` prints this after
+    /// the bare error name so a build failure names the offending
+    /// function/type instead of just the error tag.
+    diag: []const u8 = "",
     /// Async export func names to generate in manual-return form (`--manual-return`).
     manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -233,6 +275,16 @@ const Gen = struct {
     fn print(self: *Gen, comptime fmt: []const u8, args: anytype) void {
         const s = std.fmt.allocPrint(self.ar, fmt, args) catch @panic("OOM");
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
+    }
+
+    /// Records a human-readable detail message (surfaced by `run()` after the
+    /// bare `GenError` name) and returns `error.UnsupportedWitType`. Used by
+    /// checks that reject a specific unsupported construct so the resulting
+    /// build failure names the offending function/type instead of leaving
+    /// the caller to guess from `error.UnsupportedWitType` alone.
+    fn fail(self: *Gen, comptime fmt: []const u8, args: anytype) GenError {
+        self.diag = std.fmt.allocPrint(self.ar, fmt, args) catch @panic("OOM");
+        return error.UnsupportedWitType;
     }
 
     const Use = struct { id: []const u8, iface: ast.Interface, is_export: bool, pkg: ?ast.PackageId };
@@ -426,8 +478,20 @@ const Gen = struct {
             } else {
                 // Top-level func *imports* are not yet wired by
                 // `component new` (they'd dangle); a later phase.
-                return error.UnsupportedWitType;
+                return self.fail(
+                    "world-level function import '{s}' is not supported (only interface imports are); " ++
+                        "`component new`/`component link` have no canonical-ABI module+field spelling for a " ++
+                        "bare world-level function import, only for one nested in an interface -- wrap it in " ++
+                        "an `interface {{ … }}` (or a named inline `import foo: interface {{ … }};`) instead of " ++
+                        "importing it directly at the world's top level",
+                    .{tf.name},
+                );
             }
+        }
+
+        // ── JS-callable reverse bridge for imported interfaces (`--js-imports`) ──
+        if (self.js_imports) {
+            try self.emitJsImportBridge(uses.items);
         }
     }
 
@@ -902,6 +966,234 @@ const Gen = struct {
             self.raw("        wit_async.awaitCall(__status);\n");
         }
         self.raw("    }\n");
+    }
+
+    // ── JS-callable reverse bridge for imported interfaces (`--js-imports`) ──
+    //
+    // For every *synchronous* imported interface function whose signature is
+    // entirely within the native dispatch bridge's supported type set (see
+    // `nativeBridgeSupported`), emits one `if` arm inside a single
+    // `starling_js_import_dispatch` trampoline that: decodes each argument
+    // from the generic `js_dispatch.NativeValue` tree the host runtime built
+    // out of the calling JS value (reusing `js_dispatch.decodeNative` -- the
+    // exact function the export shells' native bridge already uses to decode
+    // a JS *result* onto a concrete Zig type; here it decodes JS *arguments*
+    // onto the concrete WIT param types instead, per the encode/decode
+    // reversal noted in `runtime/js_dispatch.h`), calls the already-emitted
+    // typed import wrapper (`<mod>.<fn>(...)`, from `emitImportIface` above),
+    // and encodes the result back with `js_dispatch.encodeNative` -- the same
+    // function the export shells' native bridge uses to encode a JS
+    // *argument*, here encoding the host's *result* instead. Also emits a
+    // `starling_js_imports_manifest` byte string (one TSV line per bridged
+    // function: `<iface-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n`) so
+    // the host runtime can discover which builtin ES modules/exports to
+    // synthesize without per-world C++ glue.
+    //
+    // A function whose signature includes a type the native bridge doesn't
+    // cover (resource, variant, enum, flags, tuple, `result<T,E>`, `char`,
+    // future/stream) is a deterministic `error.UnsupportedWitType` generation
+    // failure (via `fail`, naming the offending function/type) rather than a
+    // silently-missing JS export -- see `nativeBridgeSupported`. An *async*
+    // imported function is likewise rejected for now (`wit_async.awaitCall`
+    // has no equivalent on this synchronous JS-call path); it is a distinct,
+    // separately diagnosed follow-up, not silently skipped either.
+
+    /// Whether `ty`'s type graph is entirely within the set `js_dispatch`'s
+    /// `NativeValue` encode/decode pair supports: `bool`/integers/`f32`/`f64`,
+    /// `string`, `option<T>`, `list<T>`, and `record` (recursively, for any of
+    /// those). Everything else -- `char`, `tuple`, `result<T,E>`, `variant`,
+    /// `enum`, `flags`, resource handles (`own`/`borrow`), `future`/`stream`,
+    /// `error-context` -- is unsupported (matches the Zig-type cases
+    /// `encodeNative`/`decodeNative` actually implement in `js_dispatch.zig`;
+    /// keep this in sync with that switch if it ever grows).
+    fn nativeBridgeSupported(self: *Gen, ty: ast.Type) GenError!bool {
+        return switch (ty) {
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string => true,
+            .list => |e| try self.nativeBridgeSupported(e.*),
+            .option => |e| try self.nativeBridgeSupported(e.*),
+            .name => |n| blk: {
+                const kind = self.typeKind(n) orelse return error.UnknownType;
+                break :blk switch (kind) {
+                    .record => |fields| r: {
+                        for (fields) |f| {
+                            if (!try self.nativeBridgeSupported(f.type)) break :r false;
+                        }
+                        break :r true;
+                    },
+                    .alias => |t| try self.nativeBridgeSupported(t),
+                    // variant/enum/flags/resource: not representable by the
+                    // native bridge's tag vocabulary (see js_dispatch.h).
+                    else => false,
+                };
+            },
+            // char, tuple, result<T,E>, future/stream, error-context, own/borrow
+            // resource handles: none of these have an `encodeNative`/
+            // `decodeNative` case in js_dispatch.zig today.
+            else => false,
+        };
+    }
+
+    const JsImportEntry = struct {
+        iface_id: []const u8,
+        js_name: []const u8, // the raw WIT function name (kebab-case, verbatim).
+        dispatch_key: []const u8, // "<iface_id>#<js_name>", the lookup key.
+        mod: []const u8, // Zig namespace emitted by `emitImportIface`.
+        camel_name: []const u8, // Zig identifier inside `mod` (possibly `@"…"`-quoted).
+        param_ziq: []const []const u8,
+        result_zig: []const u8,
+        has_result: bool,
+    };
+
+    fn emitJsImportBridge(self: *Gen, uses: []const Use) GenError!void {
+        var entries = std.ArrayListUnmanaged(JsImportEntry).empty;
+        for (uses) |u| {
+            if (u.is_export) continue;
+            self.current_iface = u.id;
+            for (u.iface.items) |it| switch (it) {
+                .func => |fd| {
+                    if (fd.func.is_async) {
+                        return self.fail(
+                            "imported async function '{s}#{s}' cannot be bridged to JavaScript yet " ++
+                                "(--js-imports only supports synchronous imports so far); remove it from " ++
+                                "the world's JS-facing import surface or drop --js-imports for this world",
+                            .{ u.id, fd.name },
+                        );
+                    }
+                    for (fd.func.params) |p| {
+                        if (!try self.nativeBridgeSupported(p.type)) {
+                            return self.fail(
+                                "imported function '{s}#{s}': parameter '{s}' has a WIT type not " ++
+                                    "supported by the JS import bridge (bool/integers/f32/f64/string/" ++
+                                    "option<T>/list<T>/record only -- resource, variant, enum, flags, " ++
+                                    "tuple, result<T,E>, char, future/stream need a further WABT phase)",
+                                .{ u.id, fd.name, p.name },
+                            );
+                        }
+                    }
+                    if (fd.func.result) |r| {
+                        if (!try self.nativeBridgeSupported(r)) {
+                            return self.fail(
+                                "imported function '{s}#{s}': its result type is not supported by the " ++
+                                    "JS import bridge (bool/integers/f32/f64/string/option<T>/list<T>/" ++
+                                    "record only)",
+                                .{ u.id, fd.name },
+                            );
+                        }
+                    }
+                    var param_ziq = std.ArrayListUnmanaged([]const u8).empty;
+                    for (fd.func.params) |p| {
+                        param_ziq.append(self.ar, try self.zigType(p.type)) catch @panic("OOM");
+                    }
+                    entries.append(self.ar, .{
+                        .iface_id = u.id,
+                        .js_name = fd.name,
+                        .dispatch_key = try std.fmt.allocPrint(self.ar, "{s}#{s}", .{ u.id, fd.name }),
+                        .mod = try self.interfaceModuleName(u.id),
+                        .camel_name = try camel(self.ar, fd.name),
+                        .param_ziq = param_ziq.items,
+                        .result_zig = try self.resultZig(fd.func),
+                        .has_result = fd.func.result != null,
+                    }) catch @panic("OOM");
+                },
+                else => {},
+            };
+        }
+        self.current_iface = "";
+        // A world with no imported interfaces (or a world importing only
+        // async funcs / resources, rejected above) has nothing to bridge --
+        // emit nothing rather than a manifest-of-nothing plus a dispatch
+        // function that can only ever return "not found". This keeps
+        // `--js-imports` a no-op (not just "harmless") for components with
+        // no custom imports, matching default export-only behavior exactly.
+        if (entries.items.len == 0) return;
+
+        // Reuses whatever module name `--dispatch` named (validated non-null
+        // by `run()` whenever `--js-imports` is set); binding it again here
+        // under the fixed local name `js_dispatch` is harmless even when the
+        // header above already imported the same module as `__wit_dispatch`
+        // (e.g. because the world also has exports) -- Zig allows importing
+        // one module under multiple local names in the same file.
+        self.print("const js_dispatch = @import(\"{s}\");\n", .{self.dispatch.?});
+        // `std.mem.eql`/`std.heap.*` below need this; nothing before this
+        // point in a `--js-imports`-only (no plain `--dispatch` exports)
+        // generated file otherwise references `std`.
+        self.raw("const std = @import(\"std\");\n\n");
+
+        self.raw(
+            \\// Generated for `--js-imports`: one TSV line per JS-bridged import,
+            \\// "<iface-id>\t<js-export-name>\t<dispatch-key>\t<arity>\n". Consumed by
+            \\// the host runtime (see runtime/js_dispatch.h) to synthesize one builtin
+            \\// ES module per <iface-id>, each exposing <js-export-name> as a native
+            \\// function that forwards to starling_js_import_dispatch(<dispatch-key>, …).
+            \\pub const js_import_manifest: []const u8 =
+            \\
+        );
+        for (entries.items) |e| {
+            self.print(
+                "    \"{s}\\t{s}\\t{s}\\t{d}\\n\" ++\n",
+                .{ e.iface_id, e.js_name, e.dispatch_key, e.param_ziq.len },
+            );
+        }
+        self.raw("    \"\";\n\n");
+
+        self.raw(
+            \\pub export fn starling_js_imports_manifest(out_len: *usize) callconv(.c) [*]const u8 {
+            \\    out_len.* = js_import_manifest.len;
+            \\    return js_import_manifest.ptr;
+            \\}
+            \\
+            \\
+        );
+
+        self.raw(
+            \\pub export fn starling_js_import_dispatch(
+            \\    name_ptr: [*]const u8,
+            \\    name_len: usize,
+            \\    argv_ptr: [*]const js_dispatch.NativeValue,
+            \\    argv_len: usize,
+            \\    out_result: *js_dispatch.NativeValue,
+            \\    out_arena: *?*anyopaque,
+            \\) callconv(.c) u32 {
+            \\    const name = name_ptr[0..name_len];
+            \\
+        );
+        for (entries.items) |e| {
+            self.print("    if (std.mem.eql(u8, name, \"{s}\")) {{\n", .{e.dispatch_key});
+            self.print(
+                "        if (argv_len != {d}) @panic(\"js import dispatch: wrong argument count for {s}\");\n",
+                .{ e.param_ziq.len, e.dispatch_key },
+            );
+            self.raw("        const __arena = std.heap.wasm_allocator.create(std.heap.ArenaAllocator) catch @panic(\"OOM\");\n");
+            self.raw("        __arena.* = std.heap.ArenaAllocator.init(std.heap.wasm_allocator);\n");
+            self.raw("        const __alloc = __arena.allocator();\n");
+            var call_args: std.ArrayListUnmanaged(u8) = .empty;
+            for (e.param_ziq, 0..) |pty, idx| {
+                if (idx != 0) call_args.appendSlice(self.ar, ", ") catch @panic("OOM");
+                self.print("        const a{d} = js_dispatch.decodeNative({s}, &argv_ptr[{d}], __alloc);\n", .{ idx, pty, idx });
+                const arg_name = std.fmt.allocPrint(self.ar, "a{d}", .{idx}) catch @panic("OOM");
+                call_args.appendSlice(self.ar, arg_name) catch @panic("OOM");
+            }
+            if (e.has_result) {
+                self.print("        const __result = {s}.{s}({s});\n", .{ e.mod, e.camel_name, call_args.items });
+                self.print("        out_result.* = js_dispatch.encodeNative({s}, __result, __alloc);\n", .{e.result_zig});
+            } else {
+                self.print("        {s}.{s}({s});\n", .{ e.mod, e.camel_name, call_args.items });
+                self.raw("        out_result.* = .{ .tag = .bool_ };\n");
+            }
+            self.raw("        out_arena.* = __arena;\n");
+            self.raw("        return 0;\n");
+            self.raw("    }\n");
+        }
+        self.raw("    return 1;\n");
+        self.raw("}\n\n");
+
+        self.raw(
+            \\pub export fn starling_js_import_result_free(arena: ?*anyopaque) callconv(.c) void {
+            \\    js_dispatch.freeNativeArena(arena);
+            \\}
+            \\
+            \\
+        );
     }
 
     // ── resources (imported) ─────────────────────────────────────────
@@ -2229,6 +2521,224 @@ test "generate #286: top-level func import is rejected (later phase)" {
 
     var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
     try testing.expectError(error.UnsupportedWitType, g.generate(world, "cmd"));
+    try testing.expect(std.mem.indexOf(u8, g.diag, "compute") != null);
+}
+
+test "generate --js-imports: manifest + dispatch trampoline for a versioned interface import" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // wit: package test:flags@1.2.3; interface imports { get-flag: func(name: string) -> u32; }
+    // world guest { import imports: interface { … }; }
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "get-flag", .func = .{
+            .params = &.{.{ .name = "name", .type = .string }},
+            .result = .u32,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "imports", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "imports" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "flags", .version = "1.2.3" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Typed import wrapper (existing, unaffected by --js-imports).
+    try testing.expect(std.mem.indexOf(u8, out, "pub const imports = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn getFlag(name: []const u8) u32 {") != null);
+
+    // Manifest: one TSV line naming the ComponentizeJS-compatible versioned
+    // module specifier, the verbatim (kebab-case) JS export name, the
+    // "<iface>#<fn>" dispatch key, and the arity.
+    try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"test:flags/imports@1.2.3\\tget-flag\\ttest:flags/imports@1.2.3#get-flag\\t1\\n\"",
+    ) != null);
+
+    // Dispatch trampoline: decodes the string arg, calls the typed wrapper,
+    // encodes the u32 result -- reusing js_dispatch's encode/decode, not a
+    // duplicate codec.
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "if (std.mem.eql(u8, name, \"test:flags/imports@1.2.3#get-flag\")) {",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a0 = js_dispatch.decodeNative([]const u8, &argv_ptr[0], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __result = imports.getFlag(a0);") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "out_result.* = js_dispatch.encodeNative(u32, __result, __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_imports_manifest(out_len: *usize) callconv(.c) [*]const u8 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_result_free(arena: ?*anyopaque) callconv(.c) void {") != null);
+
+    // The dispatch trampoline body uses `std.mem.eql`/`std.heap.*`; the
+    // generated file must actually import `std` for this to compile (a
+    // real bug caught only by compiling the generated output, not by
+    // string-matching it -- see tests/e2e/wit-imports/run.sh).
+    try testing.expect(std.mem.indexOf(u8, out, "const std = @import(\"std\");") != null);
+}
+
+test "generate: --js-imports is opt-in -- default (--dispatch alone) emits no import bridge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "get-flag", .func = .{
+            .params = &.{.{ .name = "name", .type = .string }},
+            .result = .u32,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "imports", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "imports" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "flags" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    // No `.js_imports = true` here -- matches components with no custom
+    // JS-import bridge requested; default export-only behavior must be
+    // unaffected.
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(u8, out, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: world with only supported-elsewhere imports but nothing to bridge stays a no-op" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // A world with only exports (no interface imports at all): --js-imports
+    // must not synthesize a manifest-of-nothing or a dispatch function that
+    // can only ever report "not found".
+    const world = ast.World{ .name = "cmd", .items = &.{
+        .{ .@"export" = .{ .named_func = .{ .name = "run", .func = .{ .params = &.{}, .result = null } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "local", .name = "nf" },
+        .items = &.{.{ .world = world }},
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "cmd");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(u8, out, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: an imported resource parameter is a deterministic build diagnostic, not a silent skip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface counters { resource counter { … } } / imports { take: func(c: own<counter>); }
+    const counter_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "counter", .kind = .{ .resource = &.{} } } },
+    };
+    const counters_iface = ast.Interface{ .name = "counters", .items = &counter_items };
+    const imports_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "take", .func = .{
+            .params = &.{.{ .name = "c", .type = ast.Type{ .name = "counter" } }},
+            .result = null,
+        } } },
+    };
+    const imports_iface = ast.Interface{ .name = "imports", .items = &imports_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "counters" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "imports" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "res" },
+        .items = &.{ .{ .interface = counters_iface }, .{ .interface = imports_iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    try testing.expect(std.mem.indexOf(u8, g.diag, "take") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "'c'") != null);
+}
+
+test "generate --js-imports: an imported async function is a deterministic build diagnostic, not a silent skip" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "wait", .func = .{ .params = &.{}, .result = null, .is_async = true } } },
+    };
+    const iface = ast.Interface{ .name = "imports", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "imports" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "async" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    try testing.expect(std.mem.indexOf(u8, g.diag, "wait") != null);
+}
+
+test "generate --js-imports: two interfaces contribute independent dispatch entries and manifest lines" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const a_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "ping", .func = .{ .params = &.{}, .result = .bool } } },
+    };
+    const b_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "pong", .func = .{ .params = &.{}, .result = null } } },
+    };
+    const a_iface = ast.Interface{ .name = "a", .items = &a_items };
+    const b_iface = ast.Interface{ .name = "b", .items = &b_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "a" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "b" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "multi" },
+        .items = &.{ .{ .interface = a_iface }, .{ .interface = b_iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "\"test:multi/a\\tping\\ttest:multi/a#ping\\t0\\n\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"test:multi/b\\tpong\\ttest:multi/b#pong\\t0\\n\"") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "if (std.mem.eql(u8, name, \"test:multi/a#ping\")) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "if (std.mem.eql(u8, name, \"test:multi/b#pong\")) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __result = a.ping();") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "b.pong();") != null);
 }
 
 test "generate: imported resource with async methods (#300)" {
