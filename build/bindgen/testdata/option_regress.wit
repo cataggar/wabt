@@ -1,0 +1,55 @@
+// Fixture for the `gen-regress` build step (see `build.zig`): a world whose
+// import params exercise `lowerParams`/`lowerOptionParam`'s option-payload
+// dispatch decision in `--dispatch` mode -- the exact path that used to emit
+// uncompilable Zig (`option<char>`: `@intCast(v)` on a `wit_types.Char`
+// struct) or bail out with an internal `error.UnsupportedWitType` despite
+// `nativeBridgeSupported` accepting the type (`option<enum>`/`option<flags>`),
+// plus nested shapes that hit the same single-flat-slot-but-not-a-bare-scalar
+// case: an alias chain down to `char`/`enum`, a single-field `record`, and a
+// single-element `tuple`. `mix-opt-scalar-and-color` combines the untouched
+// fast path (`option<u32>`) with the generalized aggregate path
+// (`option<color>`) in one call to check positional-argument correctness
+// when both co-exist. See `build/bindgen/testdata/force_analysis_driver.zig`
+// for how the generated bindings get fully semantically analyzed (not just
+// generated).
+package test:option-regress@0.1.0;
+
+interface types {
+  enum color {
+    red,
+    green,
+    blue,
+  }
+
+  flags perms {
+    read,
+    write,
+    exec,
+  }
+
+  variant shape {
+    circle(f64),
+    origin,
+  }
+
+  record point {
+    x: u32,
+  }
+
+  type char-alias = char;
+  type color-alias = color;
+
+  identity-opt-char: func(c: option<char>) -> option<char>;
+  toggle-opt-color: func(c: option<color>) -> option<color>;
+  toggle-opt-perms: func(p: option<perms>) -> option<perms>;
+  classify-opt-shape: func(s: option<shape>) -> option<string>;
+  mix-opt-scalar-and-color: func(n: option<u32>, c: option<color>) -> bool;
+  opt-alias-char: func(c: option<char-alias>) -> option<char-alias>;
+  opt-alias-color: func(c: option<color-alias>) -> option<color-alias>;
+  opt-single-field-record: func(p: option<point>) -> option<point>;
+  opt-single-elem-tuple: func(t: option<tuple<u32>>) -> option<tuple<u32>>;
+}
+
+world guest {
+  import types;
+}

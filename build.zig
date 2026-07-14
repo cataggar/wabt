@@ -123,7 +123,59 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(bindgen_exe);
 
-    // ?? Tests ??????????????????????????????????????????????????????
+    // ── `gen-regress`: compile actual generated bindings (not just generate
+    // them) for a synthetic option<char>/enum/flags/tuple/record world ──
+    // Regression coverage for `lowerParams`/`lowerOptionParam`: in
+    // `--dispatch` mode, an `option<T>` param whose `T` flattens to a single
+    // core slot but whose *generated Zig type* is a wrapper/aggregate value
+    // (not a bare Zig int/float/bool) -- `char` (`wit_types.Char`), a named
+    // `enum`, a named `flags`, a single-field `record`, a single-element
+    // `tuple`, or an alias chain down to any of those -- used to either emit
+    // uncompilable Zig (`char`: `@intCast` on a struct) or bail out of
+    // generation entirely with an internal `error.UnsupportedWitType` (enum/
+    // flags) despite `nativeBridgeSupported` accepting the type. Generation
+    // succeeding (or a `bindgen_tests` string-fragment assertion passing)
+    // doesn't prove the output actually compiles -- this step runs the real
+    // vendored generator against a checked-in fixture WIT world
+    // (`build/bindgen/testdata/option_regress.wit`) and feeds the *literal*
+    // generated output through `zig build-obj` for `wasm32-freestanding`
+    // (the real guest target), forcing full semantic analysis of every
+    // generated function body via a small static driver
+    // (`build/bindgen/testdata/force_analysis_driver.zig`) that calls each
+    // one — so a lowering regression here is a `zig build gen-regress`
+    // compile failure, not just a missing string.
+    const gen_regress_run = b.addRunArtifact(bindgen_exe);
+    gen_regress_run.addArgs(&.{"--wit"});
+    gen_regress_run.addFileArg(b.path("build/bindgen/testdata/option_regress.wit"));
+    gen_regress_run.addArgs(&.{ "--world", "guest", "--dispatch", "stub_dispatch", "-o" });
+    const gen_regress_out = gen_regress_run.addOutputFileArg("option_regress_generated.zig");
+
+    const wasm32_freestanding = b.resolveTargetQuery(
+        std.Target.Query.parse(.{ .arch_os_abi = "wasm32-freestanding" }) catch unreachable,
+    );
+    const gen_regress_generated_mod = b.createModule(.{
+        .root_source_file = gen_regress_out,
+        .target = wasm32_freestanding,
+    });
+    gen_regress_generated_mod.addImport("wit_types", wit_types);
+
+    const gen_regress_driver_mod = b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/force_analysis_driver.zig"),
+        .target = wasm32_freestanding,
+        .imports = &.{.{ .name = "generated", .module = gen_regress_generated_mod }},
+    });
+    const gen_regress_obj = b.addObject(.{
+        .name = "option_regress_gen_check",
+        .root_module = gen_regress_driver_mod,
+    });
+
+    const gen_regress_step = b.step(
+        "gen-regress",
+        "Compile actual generated bindings for option<char>/enum/flags/tuple/record to catch dispatch-mode lowering regressions",
+    );
+    gen_regress_step.dependOn(&gen_regress_obj.step);
+
+    // ── Tests ────────────────────────────────────────────────────────
     // Native unit tests for the host-import-free canonical-ABI core in
     // `wit_types.zig` (abi + canon internals). The `wasi_*` wrappers
     // can't be tested natively ? their public functions call `extern`

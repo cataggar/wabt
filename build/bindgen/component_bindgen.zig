@@ -1710,7 +1710,31 @@ const Gen = struct {
                 },
                 .option => |e| {
                     const inner = self.resolveAlias(e.*);
-                    if (inner == .string or (try self.flatCount(inner)) == 1) {
+                    // `lowerOptionParam`'s fast path hand-emits the payload
+                    // expression assuming `inner`'s *Zig* representation is
+                    // either a handle (`.handle` field) or a value already
+                    // usable inline as the scalar it appears to be (a bare
+                    // Zig int/float/bool -- what `scalarLowerExpr` knows how
+                    // to cast). That assumption fails for any `inner` whose
+                    // `zigType` is actually a wrapper/aggregate Zig value even
+                    // though it flattens to a single core slot: `char` in
+                    // `--dispatch` mode (`wit_types.Char`, a struct), a named
+                    // `enum` (a Zig `enum`, not an int -- needs
+                    // `@intFromEnum`), a named `flags` with ≤32 labels (a
+                    // `packed struct`), a single-field `record`, a
+                    // single-element `tuple`, or an all-void `variant`/
+                    // `result` (a union needing its tag). All of those are
+                    // exactly what the generic, reflection-based
+                    // `wit_types.lowerFlat` (driven by `lowerAggregateParam`)
+                    // already lowers correctly for every other aggregate
+                    // param -- it introspects the *actual* generated Zig type
+                    // via `@typeInfo` instead of guessing from the WIT shape,
+                    // so it can't go stale as `zigType`/`nativeBridgeSupported`
+                    // grow new representable shapes. Route everything except
+                    // `string` and genuine scalars/handles through it.
+                    if (inner == .string) {
+                        try self.lowerOptionParam(&args, pn, inner);
+                    } else if (self.isHandleLike(inner) or self.isPlainZigScalar(inner)) {
                         try self.lowerOptionParam(&args, pn, inner);
                     } else {
                         try self.lowerAggregateParam(&args, pn, p.type);
@@ -1739,8 +1763,13 @@ const Gen = struct {
     }
 
     /// Lower an `option<inner>` param: a discriminant plus the (null-zeroed)
-    /// payload slots. `string` is the (ptr, len) special case; otherwise the
-    /// payload must flatten to a single core slot (a scalar or a handle).
+    /// payload slots. `string` is the (ptr, len) special case; otherwise
+    /// `inner` must be a genuine Zig scalar (`isPlainZigScalar`) or handle-like
+    /// (`isHandleLike`) -- the caller (`lowerParams`) routes every other
+    /// shape (including single-flat-slot aggregates/wrappers such as `char`
+    /// in `--dispatch` mode, `enum`, `flags`, a single-field `record`, …)
+    /// through `lowerAggregateParam` instead, which lowers via the real
+    /// generated Zig type rather than assuming it casts like a bare number.
     fn lowerOptionParam(self: *Gen, args: *std.ArrayListUnmanaged(u8), pn: []const u8, inner: ast.Type) GenError!void {
         self.print("        const {s}_disc: i32 = if ({s} != null) 1 else 0;\n", .{ pn, pn });
         if (inner == .string) {
@@ -1932,6 +1961,28 @@ const Gen = struct {
         return switch (ty) {
             .own, .borrow, .future, .stream, .error_context => true,
             .name => |n| if (self.typeKind(n)) |k| k == .resource else false,
+            else => false,
+        };
+    }
+
+    /// True when `ty`'s `zigType` is a bare Zig number/bool primitive that
+    /// `scalarLowerExpr` can cast inline (`@intCast`/`@bitCast`/etc. on the
+    /// value itself) -- i.e. NOT a struct/enum/packed-struct/union wrapper.
+    /// This is strictly narrower than "flattens to one core slot": `char` in
+    /// `--dispatch` mode, a named `enum`, a named `flags`, a single-field
+    /// `record`, a single-element `tuple`, and an all-void `variant`/`result`
+    /// all flatten to one (or, for `result`, one-plus-void) core slot too,
+    /// but each is a Zig aggregate value that `scalarLowerExpr` cannot cast
+    /// as if it were already an int/float/bool -- those must go through the
+    /// reflection-based `wit_types.lowerFlat` (`lowerAggregateParam`)
+    /// instead, which introspects the real Zig type via `@typeInfo`. `char`
+    /// is the sole *mode-dependent* case: it's only "plain" in `--impl` mode
+    /// where `zigType(.char)` is a bare `u32`; in `--dispatch` mode it's the
+    /// `wit_types.Char` wrapper struct.
+    fn isPlainZigScalar(self: *Gen, ty: ast.Type) bool {
+        return switch (ty) {
+            .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64 => true,
+            .char => self.dispatch == null,
             else => false,
         };
     }
@@ -3185,6 +3236,215 @@ test "generate --js-imports: tuple, enum, flags, variant, and result<T,E> are no
     try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#checked-div") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
+}
+
+test "generate --js-imports: option<char> lowers through wit_types.Char's real field, not @intCast(v) on the struct" {
+    // Regression test for a real bug: `option<char>` passes
+    // `nativeBridgeSupported`'s gate (char is individually supported), and
+    // `lowerParams` routed it to the "single flat slot" fast path
+    // (`lowerOptionParam`) because `flatCount(char) == 1` -- but in
+    // `--dispatch` mode (which `--js-imports` always runs in), `zigType(char)`
+    // is `wit_types.Char` (a `struct { codepoint: u32 }`), not a bare `u32`.
+    // `lowerOptionParam` then called `scalarLowerExpr("v", .char)`, which
+    // unconditionally emits `@intCast(v)` assuming `v` is already an int --
+    // a genuine Zig **compile** error (`@intCast` on a struct) that
+    // `nativeBridgeSupported`'s type-level gate and a plain generation-time
+    // success can't catch. Confirmed against the pre-fix source (see
+    // `build/bindgen/testdata/force_analysis_driver.zig` + the `gen-regress`
+    // build step) that this actually fails `zig build-obj`, not just an
+    // assertion here.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // interface host { identity-opt-char: func(c: option<char>) -> option<char>; }
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .func = .{ .name = "identity-opt-char", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .char = {} } } }},
+            .result = .{ .option = &ast.Type{ .char = {} } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-char" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // The typed wrapper takes/returns the wrapper struct...
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn identityOptChar(c: ?wit_types.Char) ?wit_types.Char {") != null);
+    // ...and lowers via the generic aggregate path over the *whole*
+    // `option<char>`, which reflects into `.codepoint` for free -- never a
+    // direct `@intCast` on the unwrapped struct value.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?wit_types.Char, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"identity-opt-char\"(c_s[0], c_s[1], wit_types.retPtr());") != null);
+    // Negative control: none of the old broken fast-path shape survives --
+    // `lowerOptionParam`'s hand-rolled `c_disc`/`c_0` temps (the "extern"
+    // decl's own `c_disc: i32` parameter name is unrelated: `flattenSlots`
+    // always names option slots that way regardless of which lowering path
+    // the call site takes, so this checks the *body* shape specifically).
+    try testing.expect(std.mem.indexOf(u8, out, "@intCast(v)") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_disc: i32 = if (c != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_0:") == null);
+}
+
+test "generate --js-imports: option<enum> and option<flags> lower via the generic aggregate path, not an internal UnsupportedWitType" {
+    // Regression test for a real bug: `option<enum>`/`option<flags>` pass
+    // `nativeBridgeSupported`'s gate (both are unconditionally supported --
+    // no payload types to recurse into), and `lowerParams` routed them to
+    // the "single flat slot" fast path (`lowerOptionParam`) because
+    // `flatCount` is 1 for both -- but `lowerOptionParam` then called
+    // `scalarLowerExpr("v", .name(...))`, whose `switch` has no arm for a
+    // named type at all, falling to `else => error.UnsupportedWitType`. So
+    // despite the gate saying "supported", generation itself failed with a
+    // bare, undiagnosed `error.UnsupportedWitType` -- the exact contradiction
+    // `nativeBridgeSupported`'s doc comment promises never happens for
+    // anything the gate accepts.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // flags perms { read, write, exec }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const perms_labels = [_][]const u8{ "read", "write", "exec" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "perms", .kind = .{ .flags = &perms_labels } } },
+        .{ .func = .{ .name = "toggle-opt-color", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color" } } }},
+            .result = .{ .option = &ast.Type{ .name = "color" } },
+        } } },
+        .{ .func = .{ .name = "toggle-opt-perms", .func = .{
+            .params = &.{.{ .name = "p", .type = .{ .option = &ast.Type{ .name = "perms" } } }},
+            .result = .{ .option = &ast.Type{ .name = "perms" } },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-enum-flags" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    // The headline assertion: generation must SUCCEED, matching what
+    // `nativeBridgeSupported` already promises for these types.
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn toggleOptColor(c: ?Color) ?Color {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?Color, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn toggleOptPerms(p: ?Perms) ?Perms {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(?Perms, p, &wit_types.alloc);") != null);
+    // Negative control: no hand-rolled discriminant + scalar-cast temps (the
+    // shape that used to hit `scalarLowerExpr`'s `else => UnsupportedWitType`
+    // -- the "extern" decl's own `c_disc`/`p_disc: i32` parameter names are
+    // unrelated; `flattenSlots` always names option slots that way).
+    try testing.expect(std.mem.indexOf(u8, out, "const c_disc: i32 = if (c != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_0:") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_disc: i32 = if (p != null) 1 else 0;") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_0:") == null);
+}
+
+test "generate --js-imports: nested single-flat-slot option payloads (alias chain, single-field record, single-element tuple) all use the generic aggregate path" {
+    // Broader coverage for the same class of bug: any `option<T>` where `T`
+    // flattens to one core slot but isn't literally a bare Zig int/float/
+    // bool -- an alias chain resolving down to `char`/`enum`, a single-field
+    // `record`, or a single-element `tuple` -- must not reach
+    // `lowerOptionParam`'s scalar fast path either. A function mixing a
+    // genuine scalar option (`option<u32>`) with one of these in the same
+    // call also checks the two lowering paths compose correctly
+    // (no argument-count/order mismatch when both appear in one call).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // enum color { red, green, blue }
+    // type color-alias = color;
+    // record point { x: u32 }
+    const color_names = [_][]const u8{ "red", "green", "blue" };
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "color", .kind = .{ .@"enum" = &color_names } } },
+        .{ .type = .{ .name = "color-alias", .kind = .{ .alias = ast.Type{ .name = "color" } } } },
+        .{ .type = .{ .name = "point", .kind = .{ .record = &.{
+            .{ .name = "x", .type = .u32 },
+        } } } },
+        // option<alias to enum> -- resolveAlias must see through the alias
+        // before the fast-path/aggregate-path decision.
+        .{ .func = .{ .name = "opt-alias-color", .func = .{
+            .params = &.{.{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color-alias" } } }},
+            .result = .{ .option = &ast.Type{ .name = "color-alias" } },
+        } } },
+        // option<single-field record>
+        .{ .func = .{ .name = "opt-single-field-record", .func = .{
+            .params = &.{.{ .name = "p", .type = .{ .option = &ast.Type{ .name = "point" } } }},
+            .result = .{ .option = &ast.Type{ .name = "point" } },
+        } } },
+        // option<single-element tuple>
+        .{ .func = .{ .name = "opt-single-elem-tuple", .func = .{
+            .params = &.{.{ .name = "t", .type = .{ .option = &ast.Type{ .tuple = &.{.u32} } } }},
+            .result = .{ .option = &ast.Type{ .tuple = &.{.u32} } },
+        } } },
+        // option<u32> (genuine scalar fast path) alongside option<color>
+        // (generic aggregate path) in the same call.
+        .{ .func = .{ .name = "mix-opt-scalar-and-color", .func = .{
+            .params = &.{
+                .{ .name = "n", .type = .{ .option = &ast.Type{ .u32 = {} } } },
+                .{ .name = "c", .type = .{ .option = &ast.Type{ .name = "color" } } },
+            },
+            .result = .bool,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "opt-nested" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    // Alias chain: the fast-path/aggregate decision must resolve through
+    // `color-alias` down to `color` (a named enum), landing on the generic
+    // aggregate path -- exactly as if the param had been declared
+    // `option<color>` directly.
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn optAliasColor(c: ?ColorAlias) ?ColorAlias {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?ColorAlias, c, &wit_types.alloc);") != null);
+
+    // Single-field record: also the generic aggregate path (a record is a
+    // Zig `struct`, never a bare scalar `scalarLowerExpr` can cast).
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn optSingleFieldRecord(p: ?Point) ?Point {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const p_s = wit_types.lowerFlat(?Point, p, &wit_types.alloc);") != null);
+
+    // Single-element tuple: same reasoning (`wit_types.Tuple(.{u32})` is a
+    // struct wrapper, not `u32` itself).
+    try testing.expect(std.mem.indexOf(u8, out, "const t_s = wit_types.lowerFlat(?wit_types.Tuple(.{ u32 }), t, &wit_types.alloc);") != null);
+
+    // Mixed call: the genuine scalar (`option<u32>`) keeps the fast path
+    // (its own `_disc`/cast temps)...
+    try testing.expect(std.mem.indexOf(u8, out, "const n_disc: i32 = if (n != null) 1 else 0;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const n_0: i32 = if (n) |v| @bitCast(v) else 0;") != null);
+    // ...while `option<color>` in the same call still takes the aggregate
+    // path, and both sets of args are passed to the extern call in the
+    // right relative order.
+    try testing.expect(std.mem.indexOf(u8, out, "const c_s = wit_types.lowerFlat(?Color, c, &wit_types.alloc);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"mix-opt-scalar-and-color\"(n_disc, n_0, c_s[0], c_s[1])") != null);
 }
 
 test "generate: imported resource with async methods (#300)" {
