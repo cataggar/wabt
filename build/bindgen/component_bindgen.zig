@@ -525,8 +525,27 @@ const Gen = struct {
             .flags => |labels| {
                 // A bitset: one bool bit per label (LSB-first) in a backing
                 // integer sized to the canonical ABI (1/2/4 bytes for ≤8/≤16/≤32
-                // labels). >32 labels (multi-i32) is a later phase.
-                if (labels.len > 32) return error.UnsupportedWitType;
+                // labels). >32 labels (multi-i32 canonical-ABI representation)
+                // is full multiword `flags` support -- a broader phase than
+                // this generator implements today (see `nativeBridgeSupported`'s
+                // doc comment, which this constraint must stay consistent
+                // with). Reject deterministically, by name, here -- the single
+                // place every `flags` typedef in the world passes through
+                // (used-type indexing and each interface's own `.type` items,
+                // *before* any import/export/JS-bridge emission in `generate`)
+                // -- rather than a bare `error.UnsupportedWitType` that names
+                // neither the offending type nor the actual constraint.
+                if (labels.len > 32) {
+                    return self.fail(
+                        "flags type '{s}' (interface '{s}') has {d} labels, but this generator's " ++
+                            "`flags` representation only supports up to 32 labels (a single packed " ++
+                            "integer per the canonical ABI's ≤32-label case); >32 labels needs a " ++
+                            "multi-i32 bitset, which is a separate, broader multiword-`flags` phase, " ++
+                            "not implemented here -- split '{s}' into ≤32-label `flags` groups, or drop " ++
+                            "the interface that declares it from this world",
+                        .{ td.name, iface_id, labels.len, td.name },
+                    );
+                }
                 const bits: usize = if (labels.len <= 8) 8 else if (labels.len <= 16) 16 else 32;
                 self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try self.typeName(td.name), bits });
                 for (labels) |l| self.print("    {s}: bool = false,\n", .{try snake(self.ar, l)});
@@ -1002,10 +1021,12 @@ const Gen = struct {
     /// `NativeValue` encode/decode pair supports: `bool`/integers/`f32`/`f64`,
     /// `char`, `string`, `option<T>`, `list<T>` (including `list<u8>`,
     /// bridged as `wit_types.ByteList`), `tuple`, `record`, `variant`,
-    /// `enum`, `flags`, and `result<T,E>` (recursively, for any of those).
-    /// Everything else -- resource handles (`own`/`borrow`), `future`/
-    /// `stream`, `error-context` -- is unsupported (matches the Zig-type
-    /// cases `encodeNative`/`decodeNative` actually implement in
+    /// `enum`, `flags` with ≤32 labels, and `result<T,E>` (recursively, for
+    /// any of those). Everything else -- resource handles (`own`/`borrow`),
+    /// `future`/`stream`, `error-context`, and a `flags` type with >32
+    /// labels (multiword `flags`, which `emitTypeDef` itself doesn't
+    /// generate -- see its doc comment) -- is unsupported (matches the
+    /// Zig-type cases `encodeNative`/`decodeNative` actually implement in
     /// `js_dispatch.zig`; keep this in sync with that switch if it ever
     /// grows).
     fn nativeBridgeSupported(self: *Gen, ty: ast.Type) GenError!bool {
@@ -1049,8 +1070,15 @@ const Gen = struct {
                     // `enum`/`flags` carry no payload types to recurse into
                     // -- both encode/decode to a plain JS string / a plain
                     // JS object of camelCased booleans respectively (see
-                    // js_dispatch.zig's `encodeNative`/`decodeNative`).
-                    .@"enum", .flags => true,
+                    // js_dispatch.zig's `encodeNative`/`decodeNative`). A
+                    // `flags` type with >32 labels, though, is rejected by
+                    // `emitTypeDef` (only ≤32-label `flags` -- a single
+                    // packed integer -- is implemented; see its doc
+                    // comment) -- this gate must say so too, or it falsely
+                    // advertises >32-label `flags` as bridgeable when
+                    // generation is actually guaranteed to fail on it.
+                    .@"enum" => true,
+                    .flags => |labels| labels.len <= 32,
                     // resource: not representable by the native bridge's
                     // tag vocabulary (see js_dispatch.h) -- no
                     // handle-lifetime story on this synchronous JS-call path.
@@ -1122,9 +1150,10 @@ const Gen = struct {
                             return self.fail(
                                 "imported function '{s}#{s}': parameter '{s}' has a WIT type not " ++
                                     "supported by the JS import bridge (bool/integers/f32/f64/char/" ++
-                                    "string/option<T>/list<T>/tuple/record/variant/enum/flags/" ++
-                                    "result<T,E> only -- resource, future/stream, error-context need a " ++
-                                    "further WABT phase)",
+                                    "string/option<T>/list<T>/tuple/record/variant/enum/flags " ++
+                                    "(≤32 labels)/result<T,E> only -- resource, future/stream, " ++
+                                    "error-context, and >32-label (multiword) flags need a further WABT " ++
+                                    "phase)",
                                 .{ u.id, fd.name, p.name },
                             );
                         }
@@ -1134,7 +1163,9 @@ const Gen = struct {
                             return self.fail(
                                 "imported function '{s}#{s}': its result type is not supported by the " ++
                                     "JS import bridge (bool/integers/f32/f64/char/string/option<T>/" ++
-                                    "list<T>/tuple/record/variant/enum/flags/result<T,E> only)",
+                                    "list<T>/tuple/record/variant/enum/flags (≤32 labels)/" ++
+                                    "result<T,E> only -- resource, future/stream, error-context, and " ++
+                                    ">32-label (multiword) flags need a further WABT phase)",
                                 .{ u.id, fd.name },
                             );
                         }
@@ -3234,6 +3265,147 @@ test "generate --js-imports: tuple, enum, flags, variant, and result<T,E> are no
     try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#classify") != null);
     try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#swap-tuple") != null);
     try testing.expect(std.mem.indexOf(u8, out, "test:adv/host#checked-div") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
+}
+
+test "generate --js-imports: a directly-used >32-label flags type is a precise Gen.fail, not a bare internal error, and emits no partial manifest/dispatch output" {
+    // `nativeBridgeSupported` used to accept every `flags` type
+    // unconditionally, while `emitTypeDef` unconditionally rejects any
+    // `flags` typedef with >32 labels via a bare `error.UnsupportedWitType`
+    // (no `self.fail` detail at all) -- a contradiction: the type gate
+    // claimed support that generation could never actually deliver, and the
+    // resulting build failure named neither the offending type nor the
+    // actual constraint. This is the direct case: a >32-label `flags` type
+    // used straight as an imported function's parameter type.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // flags wide { l0, l1, …, l32 } -- 33 labels, one past the ≤32-label
+    // single-packed-integer representation this generator implements.
+    var labels_buf: [33][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "wide", .kind = .{ .flags = labels } } },
+        .{ .func = .{ .name = "use-wide", .func = .{
+            .params = &.{.{ .name = "w", .type = ast.Type{ .name = "wide" } }},
+            .result = null,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "wide-flags" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    // Names the offending flags type, its interface, and its actual label
+    // count -- not just "UnsupportedWitType".
+    try testing.expect(std.mem.indexOf(u8, g.diag, "wide") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "33") != null);
+    // No partial JS-bridge manifest/dispatch output survives the failure.
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: a >32-label flags type reached only through a nested record field and an alias chain is still a precise Gen.fail" {
+    // The nested/aliased case: the offending `flags` typedef is never the
+    // function's own parameter type directly -- it's the field of a
+    // `record`, itself reached only via a `type … = …` alias. Whatever path
+    // reaches it, the underlying `flags` typedef is always its own
+    // `.type` item in some interface `generate` walks (WIT has no way to
+    // declare a `flags` type inline/anonymously), so `emitTypeDef` sees it
+    // and must still reject it deterministically and by name -- not
+    // silently accept it because it's several hops away from the function
+    // signature that actually needs it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    // flags big { l0, …, l39 } (40 labels)
+    var labels_buf: [40][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    // type big-alias = big;
+    // record wrapper { p: big-alias }
+    // use-wrapper: func(w: wrapper);
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "big", .kind = .{ .flags = labels } } },
+        .{ .type = .{ .name = "big-alias", .kind = .{ .alias = ast.Type{ .name = "big" } } } },
+        .{ .type = .{ .name = "wrapper", .kind = .{ .record = &.{
+            .{ .name = "p", .type = ast.Type{ .name = "big-alias" } },
+        } } } },
+        .{ .func = .{ .name = "use-wrapper", .func = .{
+            .params = &.{.{ .name = "w", .type = ast.Type{ .name = "wrapper" } }},
+            .result = null,
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "wide-flags-nested" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
+    // Names the actual offending `flags` typedef ("big"), not the alias or
+    // the record that merely reference it.
+    try testing.expect(std.mem.indexOf(u8, g.diag, "big") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
+    try testing.expect(std.mem.indexOf(u8, g.diag, "40") != null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
+    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
+}
+
+test "generate --js-imports: exactly 32 labels is still the boundary success case, packed into a single u32" {
+    // The flip side of the two tests above: ≤32 labels must keep working
+    // end-to-end through the JS import bridge (manifest + dispatch entry),
+    // not just "not rejected" -- and the generated backing integer is
+    // exactly `u32` at the boundary (33 is the first rejected size).
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    var labels_buf: [32][]const u8 = undefined;
+    for (&labels_buf, 0..) |*l, i| l.* = std.fmt.allocPrint(ar, "l{d}", .{i}) catch @panic("OOM");
+    const labels = labels_buf[0..];
+
+    const iface_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "exact32", .kind = .{ .flags = labels } } },
+        .{ .func = .{ .name = "use-exact32", .func = .{
+            .params = &.{.{ .name = "f", .type = ast.Type{ .name = "exact32" } }},
+            .result = ast.Type{ .name = "exact32" },
+        } } },
+    };
+    const iface = ast.Interface{ .name = "host", .items = &iface_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "flags32" },
+        .items = &.{ .{ .interface = iface }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(u8, out, "pub const Exact32 = packed struct(u32) {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "test:flags32/host#use-exact32") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub const js_import_manifest: []const u8 =") != null);
     try testing.expect(std.mem.indexOf(u8, out, "pub export fn starling_js_import_dispatch(") != null);
 }
