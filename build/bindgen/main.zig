@@ -5,7 +5,8 @@
 //! canonical-ABI guest bindings for a world. Arguments mirror the old
 //! `wabt component bindgen` subcommand:
 //!
-//!   bindgen --wit <dir> --world <name> [--impl <module>]
+//!   bindgen --wit <dir> --world <name>
+//!           [--impl <module> | --dispatch <module>]
 //!           [--manual-return <fn>]... [-o <file>]
 
 const std = @import("std");

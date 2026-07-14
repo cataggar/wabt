@@ -5,13 +5,15 @@
 //! lower/lift to the `canon` runtime library. This closes the gap Zig comptime
 //! can't: synthesizing each function's flattened core signature.
 //!
-//!   wabt component bindgen --wit <dir> --world <name> [--impl <module>] -o <out.zig>
+//!   wabt component bindgen --wit <dir> --world <name>
+//!       [--impl <module> | --dispatch <module>] -o <out.zig>
 //!
 //! For each interface the world **imports**, a `pub const <iface> = struct { … }`
 //! with `extern` decls + typed wrappers (params lowered, results lifted via
 //! `canon`). For each interface the world **exports**, top-level `export fn`
-//! shells that lift params (`canon.liftParams`), call `Impl.<fn>` (the
-//! user-supplied implementation imported via `--impl`), and encode the result
+//! shells that lift params (`canon.liftParams`), call either `Impl.<fn>` (the
+//! user-supplied implementation imported via `--impl`) or a generic
+//! `__wit_dispatch.call` imported via `--dispatch`, and encode the result
 //! (`canon.returnResult`).
 //!
 //! Supports primitives, `string`, `option<T>`, `list<T>`, named
@@ -39,6 +41,11 @@ pub const usage =
     \\                      defines more than one world)
     \\  --impl <module>     Import name for the user implementation of exported
     \\                      interfaces (default: "impl")
+    \\  --dispatch <module> Import a generic export dispatcher instead of a
+    \\                      per-function implementation. The module must expose:
+    \\                        pub fn call(comptime export_name: []const u8,
+    \\                          comptime Result: type, args: anytype) Result
+    \\                      Mutually exclusive with --impl.
     \\  --manual-return <fn>
     \\                      Generate an async export `<fn>` in manual-return form:
     \\                      the shell calls `Impl.<fn>(params)` (returning void)
@@ -60,6 +67,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var wit_path: ?[]const u8 = null;
     var world_arg: ?[]const u8 = null;
     var impl_arg: []const u8 = "impl";
+    var impl_explicit = false;
+    var dispatch_arg: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
     var manual_returns = std.ArrayListUnmanaged([]const u8).empty;
     defer manual_returns.deinit(alloc);
@@ -76,6 +85,10 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         } else if (std.mem.eql(u8, arg, "--impl")) {
             i += 1;
             impl_arg = nextArg(sub_args, i, arg);
+            impl_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--dispatch")) {
+            i += 1;
+            dispatch_arg = nextArg(sub_args, i, arg);
         } else if (std.mem.eql(u8, arg, "--manual-return")) {
             i += 1;
             manual_returns.append(alloc, nextArg(sub_args, i, arg)) catch @panic("OOM");
@@ -86,6 +99,11 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
             std.debug.print("error: unknown argument '{s}'. Use `wabt component bindgen help`.\n", .{arg});
             std.process.exit(1);
         }
+    }
+
+    if (impl_explicit and dispatch_arg != null) {
+        std.debug.print("error: --impl and --dispatch are mutually exclusive.\n", .{});
+        std.process.exit(1);
     }
 
     const wp = wit_path orelse {
@@ -112,7 +130,13 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         std.process.exit(1);
     };
 
-    var g = Gen{ .ar = ar, .resolver = resolver, .impl = impl_arg, .manual_returns = manual_returns.items };
+    var g = Gen{
+        .ar = ar,
+        .resolver = resolver,
+        .impl = impl_arg,
+        .dispatch = dispatch_arg,
+        .manual_returns = manual_returns.items,
+    };
     g.generate(world, world_name) catch |err| {
         std.debug.print("error: generating bindings for world '{s}': {s}\n", .{ world_name, @errorName(err) });
         std.process.exit(1);
@@ -167,6 +191,7 @@ const Gen = struct {
     ar: Allocator,
     resolver: wit.resolver.Resolver,
     impl: []const u8,
+    dispatch: ?[]const u8 = null,
     /// Async export func names to generate in manual-return form (`--manual-return`).
     manual_returns: []const []const u8 = &.{},
     out: std.ArrayListUnmanaged(u8) = .empty,
@@ -182,6 +207,10 @@ const Gen = struct {
     // Names defined *locally* by ≥2 interfaces — their Zig identifier is
     // disambiguated by the defining interface.
     colliding: std.StringHashMapUnmanaged(void) = .empty,
+    // Interface basename → number of world interfaces with that basename.
+    // Duplicate names such as wasi:filesystem/types and wasi:http/types need
+    // package-qualified Zig namespaces and type prefixes.
+    iface_name_counts: std.StringHashMapUnmanaged(usize) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
     // Distinct complex (non-primitive-element) future/stream channels → the
@@ -249,6 +278,17 @@ const Gen = struct {
                 .named_func => |nf| {
                     try top_funcs.append(self.ar, .{ .name = nf.name, .func = nf.func, .is_export = ei.is_export });
                 },
+            }
+        }
+        for (uses.items) |u| {
+            const gop = try self.iface_name_counts.getOrPut(
+                self.ar,
+                ifaceBaseName(u.id),
+            );
+            if (gop.found_existing) {
+                gop.value_ptr.* += 1;
+            } else {
+                gop.value_ptr.* = 1;
             }
         }
 
@@ -362,7 +402,11 @@ const Gen = struct {
             if (tf.is_export) have_exports = true;
         }
         if (have_exports) {
-            self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
+            if (self.dispatch) |dispatch| {
+                self.print("const __wit_dispatch = @import(\"{s}\");\n\n", .{dispatch});
+            } else {
+                self.print("const Impl = @import(\"{s}\");\n\n", .{self.impl});
+            }
         }
 
         // ── imports ──
@@ -560,7 +604,7 @@ const Gen = struct {
     /// Shared body for a synchronous export shell. `export_sym` is the
     /// exact wasm core export name (`<iface>#<func>` for an interface
     /// func, or the plain func name for a top-level world func); `name`
-    /// drives the `Impl.<fn>` call.
+    /// drives the `Impl.<fn>` call or is passed to `__wit_dispatch.call`.
     fn emitSyncExportFuncSym(self: *Gen, export_sym: []const u8, name: []const u8, func: ast.Func) GenError!void {
         const result_zig = try self.resultZig(func);
 
@@ -571,9 +615,26 @@ const Gen = struct {
 
         try self.emitLiftParams(func.params);
 
-        // Call the user impl + encode the result.
+        // Call the user implementation or generic dispatcher, then encode the result.
         const args = try self.implArgList(func.params);
-        if (func.result == null) {
+        if (self.dispatch != null) {
+            const dispatch_args = if (args.len == 0)
+                ".{}"
+            else
+                try std.fmt.allocPrint(self.ar, ".{{ {s} }}", .{args});
+            if (func.result == null) {
+                self.print(
+                    "    __wit_dispatch.call(\"{s}\", void, {s});\n",
+                    .{ export_sym, dispatch_args },
+                );
+                self.raw("    return;\n");
+            } else {
+                self.print(
+                    "    return wit_types.returnResult({s}, __wit_dispatch.call(\"{s}\", {s}, {s}), &wit_types.alloc);\n",
+                    .{ result_zig, export_sym, result_zig, dispatch_args },
+                );
+            }
+        } else if (func.result == null) {
             self.print("    Impl.{s}({s});\n", .{ try camel(self.ar, name), args });
             self.raw("    return;\n");
         } else {
@@ -676,7 +737,7 @@ const Gen = struct {
 
     fn emitImportIface(self: *Gen, u: Use) GenError!void {
         self.current_iface = u.id;
-        const mod = try snake(self.ar, lastSegment(u.id));
+        const mod = try self.interfaceModuleName(u.id);
         self.print("pub const {s} = struct {{\n", .{mod});
         // The flattened `extern` import decls live in a private `imp`
         // namespace: their names are the exact WIT function names, which would
@@ -1074,7 +1135,30 @@ const Gen = struct {
         else
             self.current_iface;
         if (def_iface.len == 0) return pascal(self.ar, name);
-        return std.fmt.allocPrint(self.ar, "{s}{s}", .{ try pascal(self.ar, ifaceBaseName(def_iface)), try pascal(self.ar, name) });
+        return std.fmt.allocPrint(self.ar, "{s}{s}", .{
+            try pascal(self.ar, self.interfaceDisambiguator(def_iface)),
+            try pascal(self.ar, name),
+        });
+    }
+
+    fn interfaceModuleName(self: *Gen, iface_id: []const u8) GenError![]const u8 {
+        return snake(self.ar, self.interfaceDisambiguator(iface_id));
+    }
+
+    fn interfaceDisambiguator(self: *Gen, iface_id: []const u8) []const u8 {
+        const base = ifaceBaseName(iface_id);
+        if ((self.iface_name_counts.get(base) orelse 0) < 2) return base;
+
+        const slash = std.mem.lastIndexOfScalar(u8, iface_id, '/') orelse return base;
+        const package_start = if (std.mem.lastIndexOfScalar(u8, iface_id[0..slash], ':')) |colon|
+            colon + 1
+        else
+            0;
+        return std.fmt.allocPrint(
+            self.ar,
+            "{s}-{s}",
+            .{ iface_id[package_start..slash], base },
+        ) catch @panic("OOM");
     }
 
     fn resolveAlias(self: *Gen, ty: ast.Type) ast.Type {
@@ -1497,6 +1581,11 @@ fn snake(ar: Allocator, s: []const u8) ![]u8 {
     for (out) |*c| if (c.* == '-') {
         c.* = '_';
     };
+    if (std.zig.Token.getKeyword(out) != null) {
+        const quoted = try std.fmt.allocPrint(ar, "@\"{s}\"", .{out});
+        ar.free(out);
+        return quoted;
+    }
     return out;
 }
 
@@ -1517,6 +1606,11 @@ fn pascal(ar: Allocator, s: []const u8) ![]u8 {
 fn camel(ar: Allocator, s: []const u8) ![]u8 {
     const p = try pascal(ar, s);
     if (p.len > 0) p[0] = std.ascii.toLower(p[0]);
+    if (std.zig.Token.getKeyword(p) != null) {
+        const quoted = try std.fmt.allocPrint(ar, "@\"{s}\"", .{p});
+        ar.free(p);
+        return quoted;
+    }
     return p;
 }
 
@@ -1541,6 +1635,37 @@ test "name helpers" {
         defer a.free(s);
         try testing.expectEqualStrings("petAt", s);
     }
+    {
+        const s = try snake(a, "error");
+        defer a.free(s);
+        try testing.expectEqualStrings("@\"error\"", s);
+    }
+    {
+        const s = try camel(a, "error");
+        defer a.free(s);
+        try testing.expectEqualStrings("@\"error\"", s);
+    }
+}
+
+test "duplicate interface basenames use package-qualified Zig names" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var g = Gen{
+        .ar = a,
+        .resolver = undefined,
+        .impl = "impl",
+    };
+    try g.iface_name_counts.put(a, "types", 2);
+    try testing.expectEqualStrings(
+        "filesystem_types",
+        try g.interfaceModuleName("wasi:filesystem/types@0.2.10"),
+    );
+    try testing.expectEqualStrings(
+        "http_types",
+        try g.interfaceModuleName("wasi:http/types@0.2.10"),
+    );
 }
 
 test "generate: export shells + import wrappers" {
@@ -1556,8 +1681,10 @@ test "generate: export shells + import wrappers" {
     };
     const pet_ref = ast.Type{ .name = "pet" };
     const opt_pet = ast.Type{ .option = &pet_ref };
+    const dispatch_ty: ast.Type = .u32;
     const iface_items = [_]ast.InterfaceItem{
         .{ .type = .{ .name = "pet", .kind = .{ .record = &pet_fields } } },
+        .{ .type = .{ .name = "dispatch", .kind = .{ .alias = dispatch_ty } } },
         .{ .func = .{ .name = "ping", .func = .{ .params = &.{.{ .name = "x", .type = .u32 }}, .result = .u32 } } },
         .{ .func = .{ .name = "get", .func = .{ .params = &.{.{ .name = "id", .type = .u32 }}, .result = opt_pet } } },
     };
@@ -1589,6 +1716,24 @@ test "generate: export shells + import wrappers" {
         // No stray module-scope statement after an export shell's closing brace
         // (regression: a duplicate resetScratch was emitted at container scope).
         try testing.expect(std.mem.indexOf(u8, out, "}\n\n    wit_types.resetScratch();") == null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+        try testing.expect(std.mem.indexOf(u8, out, "const __wit_dispatch = @import(\"js_dispatch\");") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Dispatch = u32;") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/store#ping\", u32, .{ __params.x })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:t/store#get\", ?Pet, .{ __params.id })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "Impl.") == null);
     }
     {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
@@ -1941,6 +2086,12 @@ test "generate #286: named_func export emits a module-scope export shell" {
     try testing.expect(std.mem.indexOf(u8, out, "export fn @\"run\"() wit_types.CoreReturn(void) {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "Impl.run();") != null);
     try testing.expect(std.mem.indexOf(u8, out, "#run") == null);
+
+    var dispatch_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try dispatch_g.generate(world, "cmd");
+    const dispatch_out = dispatch_g.out.items;
+    try testing.expect(std.mem.indexOf(u8, dispatch_out, "__wit_dispatch.call(\"run\", void, .{});") != null);
+    try testing.expect(std.mem.indexOf(u8, dispatch_out, "Impl.") == null);
 }
 
 test "generate #286: named_func export with a primitive result" {

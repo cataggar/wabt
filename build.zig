@@ -135,9 +135,18 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_wit_types_tests = b.addRunArtifact(wit_types_tests);
+    const bindgen_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("build/bindgen/component_bindgen.zig"),
+            .target = b.graph.host,
+            .imports = &.{.{ .name = "wabt", .module = wabt_mod }},
+        }),
+    });
+    const run_bindgen_tests = b.addRunArtifact(bindgen_tests);
 
     const test_step = b.step("test", "Run native unit tests");
     test_step.dependOn(&run_wit_types_tests.step);
+    test_step.dependOn(&run_bindgen_tests.step);
 }
 
 // ?? Build helpers (ported from cataggar/wamr) ??????????????????????
@@ -528,8 +537,11 @@ pub const Bindgen = struct {
     world: []const u8,
     /// Module the generated export shells delegate to as their `Impl`;
     /// `"root"` makes them call `@import("root")`. Ignored for an import-only
-    /// world (no export shells are emitted).
+    /// world (no export shells are emitted), or when `dispatch` is set.
     impl: []const u8 = "root",
+    /// Module exposing one generic `call(export_name, Result, args)` function.
+    /// When set, generated export shells delegate to it instead of `Impl`.
+    dispatch: ?[]const u8 = null,
     /// WIT package directory to read. Defaults to `wit/`.
     wit_dir: ?std.Build.LazyPath = null,
     /// Output basename for the generated `.zig` source. Defaults to the world
@@ -553,7 +565,12 @@ pub fn bindgen(b: *std.Build, dep: *std.Build.Dependency, opts: Bindgen) std.Bui
     const cmd = b.addRunArtifact(dep.artifact("wasip3-bindgen"));
     cmd.addArg("--wit");
     addWitArg(b, cmd, opts.wit_dir orelse b.path("wit"));
-    cmd.addArgs(&.{ "--world", opts.world, "--impl", opts.impl });
+    cmd.addArgs(&.{ "--world", opts.world });
+    if (opts.dispatch) |dispatch| {
+        cmd.addArgs(&.{ "--dispatch", dispatch });
+    } else {
+        cmd.addArgs(&.{ "--impl", opts.impl });
+    }
     for (opts.manual_returns) |fn_name| cmd.addArgs(&.{ "--manual-return", fn_name });
     cmd.addArg("-o");
     cmd.setName(b.fmt("wasip3 bindgen {s}", .{opts.world}));
