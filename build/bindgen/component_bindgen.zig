@@ -1672,6 +1672,10 @@ const Gen = struct {
     }
 
     fn interfaceDisambiguator(self: *Gen, iface_id: []const u8) []const u8 {
+        // Root-function types use the internal `$root` scope. Its name is not
+        // a valid Zig identifier when a world type collides with an interface
+        // type, so normalize it before it becomes a type-name prefix.
+        if (std.mem.eql(u8, iface_id, "$root")) return "root";
         const base = ifaceBaseName(iface_id);
         if ((self.iface_name_counts.get(base) orelse 0) < 2) return base;
 
