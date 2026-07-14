@@ -1543,6 +1543,11 @@ fn snake(ar: Allocator, s: []const u8) ![]u8 {
     for (out) |*c| if (c.* == '-') {
         c.* = '_';
     };
+    if (std.zig.Token.getKeyword(out) != null) {
+        const quoted = try std.fmt.allocPrint(ar, "@\"{s}\"", .{out});
+        ar.free(out);
+        return quoted;
+    }
     return out;
 }
 
@@ -1563,6 +1568,11 @@ fn pascal(ar: Allocator, s: []const u8) ![]u8 {
 fn camel(ar: Allocator, s: []const u8) ![]u8 {
     const p = try pascal(ar, s);
     if (p.len > 0) p[0] = std.ascii.toLower(p[0]);
+    if (std.zig.Token.getKeyword(p) != null) {
+        const quoted = try std.fmt.allocPrint(ar, "@\"{s}\"", .{p});
+        ar.free(p);
+        return quoted;
+    }
     return p;
 }
 
@@ -1586,6 +1596,16 @@ test "name helpers" {
         const s = try camel(a, "pet-at");
         defer a.free(s);
         try testing.expectEqualStrings("petAt", s);
+    }
+    {
+        const s = try snake(a, "error");
+        defer a.free(s);
+        try testing.expectEqualStrings("@\"error\"", s);
+    }
+    {
+        const s = try camel(a, "error");
+        defer a.free(s);
+        try testing.expectEqualStrings("@\"error\"", s);
     }
 }
 
