@@ -222,7 +222,14 @@ const ScopedType = struct { kind: ast.TypeDefKind, def_iface: []const u8 };
 
 /// A named type pulled in through a `use`. `scope_id` is the interface that
 /// owns the type body's references, while `name` is the name emitted in Zig.
-const UsedType = struct { name: []const u8, kind: ast.TypeDefKind, scope_id: []const u8 };
+const UsedType = struct {
+    name: []const u8,
+    kind: ast.TypeDefKind,
+    /// Scope used to resolve references in the type body.
+    scope_id: []const u8,
+    /// Scope used to resolve the emitted declaration's Zig identifier.
+    name_scope_id: []const u8,
+};
 
 const GenError = error{ OutOfMemory, UnsupportedWitType, UnknownInterface, UnknownType };
 
@@ -262,6 +269,11 @@ const Gen = struct {
     // Duplicate names such as wasi:filesystem/types and wasi:http/types need
     // package-qualified Zig namespaces and type prefixes.
     iface_name_counts: std.StringHashMapUnmanaged(usize) = .empty,
+    // Package/interface disambiguator → number of canonical interfaces using
+    // it. A namespace/version-qualified fallback is required when these also
+    // collide.
+    iface_short_name_counts: std.StringHashMapUnmanaged(usize) = .empty,
+    counted_ifaces: std.StringHashMapUnmanaged(void) = .empty,
     // Monotonic counter for naming per-export `[task-return]` helper structs.
     task_counter: usize = 0,
     // Distinct complex (non-primitive-element) future/stream channels → the
@@ -341,17 +353,7 @@ const Gen = struct {
                 },
             }
         }
-        for (uses.items) |u| {
-            const gop = try self.iface_name_counts.getOrPut(
-                self.ar,
-                ifaceBaseName(u.id),
-            );
-            if (gop.found_existing) {
-                gop.value_ptr.* += 1;
-            } else {
-                gop.value_ptr.* = 1;
-            }
-        }
+        for (uses.items) |u| try self.noteInterface(u.id);
 
         // Index every named type so `.name` refs resolve, plus any types pulled
         // in from another interface via `use pkg:iface.{ … }` (resolved in the
@@ -386,27 +388,17 @@ const Gen = struct {
                 const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
                 const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                 for (use_item.names) |un| {
-                    const local = un.rename orelse un.name;
-                    const td = findInterfaceType(hit.iface, un.name) orelse continue;
-                    try self.indexSourceType(
+                    try self.indexUsedType(
                         &indexed_source_types,
                         &emitted_used_types,
                         &used_types,
                         &local_def_iface,
+                        "$root",
                         hit.iface,
+                        hit.pkg,
                         src_id,
                         un.name,
-                        false,
-                    );
-                    try self.scoped.put(self.ar, self.scopeKey("$root", local), .{ .kind = td.kind, .def_iface = src_id });
-                    try self.types.put(self.ar, local, td.kind);
-                    try self.queueUsedType(
-                        &emitted_used_types,
-                        &used_types,
-                        &local_def_iface,
-                        local,
-                        td.kind,
-                        src_id,
+                        un.rename,
                     );
                 }
             },
@@ -428,29 +420,17 @@ const Gen = struct {
                     const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
                     const src_id = try ifaceId(self.ar, src_ref, doc_pkg);
                     for (use_item.names) |un| {
-                        const local = un.rename orelse un.name;
-                        const td = findInterfaceType(hit.iface, un.name) orelse continue;
-                        try self.indexSourceType(
+                        try self.indexUsedType(
                             &indexed_source_types,
                             &emitted_used_types,
                             &used_types,
                             &local_def_iface,
+                            u.id,
                             hit.iface,
+                            hit.pkg,
                             src_id,
                             un.name,
-                            false,
-                        );
-                        // The consuming interface can reference `local`,
-                        // bound to the source's structure + name.
-                        try self.scoped.put(self.ar, self.scopeKey(u.id, local), .{ .kind = td.kind, .def_iface = src_id });
-                        try self.types.put(self.ar, local, td.kind);
-                        try self.queueUsedType(
-                            &emitted_used_types,
-                            &used_types,
-                            &local_def_iface,
-                            local,
-                            td.kind,
-                            src_id,
+                            un.rename,
                         );
                     }
                 },
@@ -467,6 +447,12 @@ const Gen = struct {
         , .{world_name});
         // A world that imports an async func drives the async-lowered call
         // through `wit_async.awaitCall`.
+        for (used_types.items) |ut| switch (ut.kind) {
+            .resource => |methods| for (methods) |m| {
+                if (m.func.is_async) self.needs_cm_async = true;
+            },
+            else => {},
+        };
         for (uses.items) |u| {
             if (u.is_export) continue;
             for (u.iface.items) |it| switch (it) {
@@ -493,15 +479,17 @@ const Gen = struct {
         // Register complex (non-primitive-element) future/stream channels so
         // their nominal types are shared across import wrappers and the user
         // impl. Must run after `self.types` is fully indexed.
-        try self.registerChannels(uses.items, top_funcs.items);
+        try self.registerChannels(uses.items, top_funcs.items, used_types.items);
 
         // ── named types (use-imported first, then locally-defined) ──
         for (used_types.items) |ut| {
+            self.current_iface = ut.name_scope_id;
+            const emitted_name = try self.typeName(ut.name);
             self.current_iface = ut.scope_id;
-            try self.emitTypeDef(ut.scope_id, .{ .name = ut.name, .kind = ut.kind });
+            try self.emitTypeDef(ut.scope_id, .{ .name = ut.name, .kind = ut.kind }, emitted_name);
         }
         self.current_iface = "$root";
-        for (world_types.items) |td| try self.emitTypeDef("$root", td);
+        for (world_types.items) |td| try self.emitTypeDef("$root", td, null);
         for (uses.items) |u| {
             self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
@@ -509,7 +497,12 @@ const Gen = struct {
                     // Exported resources (guest-implemented, resource-new/rep) are
                     // a later phase; imported resources are handled below.
                     if (td.kind == .resource and u.is_export) return error.UnsupportedWitType;
-                    try self.emitTypeDef(u.id, td);
+                    // A resource reached through `use` is emitted under its
+                    // canonical provider/name above. If that provider is also
+                    // imported directly, do not emit the same Zig type twice.
+                    if (td.kind == .resource and emitted_used_types.contains(self.scopeKey(u.id, td.name)))
+                        continue;
+                    try self.emitTypeDef(u.id, td, null);
                 },
                 else => {},
             };
@@ -573,17 +566,91 @@ const Gen = struct {
         name: []const u8,
         kind: ast.TypeDefKind,
         scope_id: []const u8,
+        name_scope_id: []const u8,
     ) GenError!void {
         const key = self.scopeKey(scope_id, name);
         if (emitted.contains(key)) return;
         try emitted.put(self.ar, key, {});
-        try used_types.append(self.ar, .{ .name = name, .kind = kind, .scope_id = scope_id });
+        try used_types.append(self.ar, .{
+            .name = name,
+            .kind = kind,
+            .scope_id = scope_id,
+            .name_scope_id = name_scope_id,
+        });
 
         const gop = try local_def_iface.getOrPut(self.ar, name);
         if (gop.found_existing) {
             if (!std.mem.eql(u8, gop.value_ptr.*, scope_id))
                 try self.colliding.put(self.ar, name, {});
         } else gop.value_ptr.* = scope_id;
+    }
+
+    /// Index one `use` name and expose it in the consuming scope while keeping
+    /// the source interface's canonical type identity through rename chains.
+    fn indexUsedType(
+        self: *Gen,
+        indexed: *std.StringHashMapUnmanaged(void),
+        emitted: *std.StringHashMapUnmanaged(void),
+        used_types: *std.ArrayListUnmanaged(UsedType),
+        local_def_iface: *std.StringHashMapUnmanaged([]const u8),
+        consumer_scope: []const u8,
+        source_iface: ast.Interface,
+        source_pkg: ?ast.PackageId,
+        source_id: []const u8,
+        source_name: []const u8,
+        rename: ?[]const u8,
+    ) GenError!void {
+        try self.indexSourceType(
+            indexed,
+            emitted,
+            used_types,
+            local_def_iface,
+            source_iface,
+            source_pkg,
+            source_id,
+            source_name,
+            false,
+        );
+        const source = self.scoped.get(self.scopeKey(source_id, source_name)) orelse
+            return error.UnknownType;
+        const local = rename orelse source_name;
+        try self.scoped.put(self.ar, self.scopeKey(consumer_scope, local), source);
+        try self.types.put(self.ar, local, source.kind);
+
+        if (source.kind == .resource) {
+            try self.indexSourceType(
+                indexed,
+                emitted,
+                used_types,
+                local_def_iface,
+                source_iface,
+                source_pkg,
+                source_id,
+                source_name,
+                true,
+            );
+            if (!std.mem.eql(u8, local, source_name)) {
+                try self.queueUsedType(
+                    emitted,
+                    used_types,
+                    local_def_iface,
+                    local,
+                    .{ .alias = .{ .name = source_name } },
+                    source_id,
+                    consumer_scope,
+                );
+            }
+        } else {
+            try self.queueUsedType(
+                emitted,
+                used_types,
+                local_def_iface,
+                local,
+                source.kind,
+                source.def_iface,
+                consumer_scope,
+            );
+        }
     }
 
     /// Index a type from the interface that owns its definition. If a selected
@@ -597,11 +664,81 @@ const Gen = struct {
         used_types: *std.ArrayListUnmanaged(UsedType),
         local_def_iface: *std.StringHashMapUnmanaged([]const u8),
         iface: ast.Interface,
+        iface_pkg: ?ast.PackageId,
         iface_id: []const u8,
         name: []const u8,
         emit: bool,
     ) GenError!void {
-        const td = findInterfaceType(iface, name) orelse return;
+        try self.noteInterface(iface_id);
+        const td = findInterfaceType(iface, name) orelse {
+            for (iface.items) |item| switch (item) {
+                .use => |use_item| {
+                    for (use_item.names) |un| {
+                        const local = un.rename orelse un.name;
+                        if (!std.mem.eql(u8, local, name)) continue;
+
+                        const hit = self.resolver.findInterfaceWithPkgCtx(use_item.from, iface_pkg) orelse
+                            return error.UnknownInterface;
+                        const src_ref = ast.InterfaceRef{ .name = use_item.from.name, .package = hit.pkg };
+                        const src_id = try ifaceId(self.ar, src_ref, self.resolver.main.package);
+                        try self.indexSourceType(
+                            indexed,
+                            emitted,
+                            used_types,
+                            local_def_iface,
+                            hit.iface,
+                            hit.pkg,
+                            src_id,
+                            un.name,
+                            false,
+                        );
+                        const source = self.scoped.get(self.scopeKey(src_id, un.name)) orelse
+                            return error.UnknownType;
+                        try self.scoped.put(self.ar, self.scopeKey(iface_id, local), source);
+                        try self.types.put(self.ar, local, source.kind);
+
+                        if (!emit) return;
+                        if (source.kind == .resource) {
+                            try self.indexSourceType(
+                                indexed,
+                                emitted,
+                                used_types,
+                                local_def_iface,
+                                hit.iface,
+                                hit.pkg,
+                                src_id,
+                                un.name,
+                                true,
+                            );
+                            if (!std.mem.eql(u8, local, un.name)) {
+                                try self.queueUsedType(
+                                    emitted,
+                                    used_types,
+                                    local_def_iface,
+                                    local,
+                                    .{ .alias = .{ .name = un.name } },
+                                    src_id,
+                                    iface_id,
+                                );
+                            }
+                        } else {
+                            try self.queueUsedType(
+                                emitted,
+                                used_types,
+                                local_def_iface,
+                                local,
+                                source.kind,
+                                source.def_iface,
+                                iface_id,
+                            );
+                        }
+                        return;
+                    }
+                },
+                else => {},
+            };
+            return;
+        };
         const key = self.scopeKey(iface_id, name);
         if (!indexed.contains(key)) {
             try indexed.put(self.ar, key, {});
@@ -613,11 +750,12 @@ const Gen = struct {
                 used_types,
                 local_def_iface,
                 iface,
+                iface_pkg,
                 iface_id,
                 td.kind,
             );
         }
-        if (emit) try self.queueUsedType(emitted, used_types, local_def_iface, td.name, td.kind, iface_id);
+        if (emit) try self.queueUsedType(emitted, used_types, local_def_iface, td.name, td.kind, iface_id, iface_id);
     }
 
     fn indexTypeDefDependencies(
@@ -627,25 +765,26 @@ const Gen = struct {
         used_types: *std.ArrayListUnmanaged(UsedType),
         local_def_iface: *std.StringHashMapUnmanaged([]const u8),
         iface: ast.Interface,
+        iface_pkg: ?ast.PackageId,
         iface_id: []const u8,
         kind: ast.TypeDefKind,
     ) GenError!void {
         switch (kind) {
             .record => |fields| for (fields) |field| {
-                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, field.type);
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, field.type);
             },
             .variant => |cases| for (cases) |case| {
                 if (case.type) |ty| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ty);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, ty);
                 }
             },
-            .alias => |ty| try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ty),
+            .alias => |ty| try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, ty),
             .resource => |methods| for (methods) |method| {
                 for (method.func.params) |param| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, param.type);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, param.type);
                 }
                 if (method.func.result) |result| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, result);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, result);
                 }
             },
             .@"enum", .flags => {},
@@ -659,31 +798,32 @@ const Gen = struct {
         used_types: *std.ArrayListUnmanaged(UsedType),
         local_def_iface: *std.StringHashMapUnmanaged([]const u8),
         iface: ast.Interface,
+        iface_pkg: ?ast.PackageId,
         iface_id: []const u8,
         ty: ast.Type,
     ) GenError!void {
         switch (ty) {
             .option, .list => |element| {
-                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, element.*);
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, element.*);
             },
             .result => |result| {
                 if (result.ok) |ok| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, ok.*);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, ok.*);
                 }
                 if (result.err) |err| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, err.*);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, err.*);
                 }
             },
             .tuple => |elements| for (elements) |element| {
-                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, element);
+                try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, element);
             },
             .future, .stream => |element| {
                 if (element) |value| {
-                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_id, value.*);
+                    try self.indexTypeDependencies(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, value.*);
                 }
             },
             .name, .own, .borrow => |name| {
-                try self.indexSourceType(indexed, emitted, used_types, local_def_iface, iface, iface_id, name, true);
+                try self.indexSourceType(indexed, emitted, used_types, local_def_iface, iface, iface_pkg, iface_id, name, true);
             },
             else => {},
         }
@@ -691,22 +831,23 @@ const Gen = struct {
 
     // ── type emission ────────────────────────────────────────────────
 
-    fn emitTypeDef(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
+    fn emitTypeDef(self: *Gen, iface_id: []const u8, td: ast.TypeDef, name_override: ?[]const u8) GenError!void {
+        const type_name = name_override orelse try self.typeName(td.name);
         switch (td.kind) {
             .record => |fields| {
-                self.print("pub const {s} = struct {{\n", .{try self.typeName(td.name)});
+                self.print("pub const {s} = struct {{\n", .{type_name});
                 for (fields) |f| {
                     self.print("    {s}: {s},\n", .{ try snake(self.ar, f.name), try self.zigType(f.type) });
                 }
                 self.raw("};\n\n");
             },
             .@"enum" => |cases| {
-                self.print("pub const {s} = enum {{\n", .{try self.typeName(td.name)});
+                self.print("pub const {s} = enum {{\n", .{type_name});
                 for (cases) |c| self.print("    {s},\n", .{try snake(self.ar, c)});
                 self.raw("};\n\n");
             },
             .variant => |cases| {
-                self.print("pub const {s} = union(enum) {{\n", .{try self.typeName(td.name)});
+                self.print("pub const {s} = union(enum) {{\n", .{type_name});
                 for (cases) |c| {
                     if (c.type) |t| {
                         self.print("    {s}: {s},\n", .{ try snake(self.ar, c.name), try self.zigType(t) });
@@ -741,15 +882,15 @@ const Gen = struct {
                     );
                 }
                 const bits: usize = if (labels.len <= 8) 8 else if (labels.len <= 16) 16 else 32;
-                self.print("pub const {s} = packed struct(u{d}) {{\n", .{ try self.typeName(td.name), bits });
+                self.print("pub const {s} = packed struct(u{d}) {{\n", .{ type_name, bits });
                 for (labels) |l| self.print("    {s}: bool = false,\n", .{try snake(self.ar, l)});
                 if (bits > labels.len) self.print("    _padding: u{d} = 0,\n", .{bits - labels.len});
                 self.raw("};\n\n");
             },
             .alias => |t| {
-                self.print("pub const {s} = {s};\n\n", .{ try self.typeName(td.name), try self.zigType(t) });
+                self.print("pub const {s} = {s};\n\n", .{ type_name, try self.zigType(t) });
             },
-            .resource => try self.emitResource(iface_id, td),
+            .resource => try self.emitResource(iface_id, td, type_name),
         }
     }
 
@@ -805,8 +946,16 @@ const Gen = struct {
             else
                 try std.fmt.allocPrint(self.ar, "wit_types.Stream({s})", .{if (e) |t| try self.zigType(t.*) else "void"}),
             .error_context => "wit_types.ErrorContextHandle",
-            .own, .borrow => |r| try self.typeName(r), // resource handle wrapper
-            .name => |n| try self.typeName(n),
+            .own => |r| try std.fmt.allocPrint(self.ar, "wit_types.Own({s})", .{try self.typeName(r)}),
+            .borrow => |r| try std.fmt.allocPrint(self.ar, "wit_types.Borrow({s})", .{try self.typeName(r)}),
+            .name => |n| blk: {
+                const name = try self.typeName(n);
+                if (self.typeKind(n)) |kind| {
+                    if (kind == .resource)
+                        break :blk try std.fmt.allocPrint(self.ar, "wit_types.Own({s})", .{name});
+                }
+                break :blk name;
+            },
         };
     }
 
@@ -1658,17 +1807,37 @@ const Gen = struct {
     /// Emit an imported resource as a handle-wrapper struct: an `i32` handle, a
     /// private `imp` namespace of the canonical resource externs, typed
     /// method/static/constructor wrappers, and a `deinit` that drops the handle.
-    fn emitResource(self: *Gen, iface_id: []const u8, td: ast.TypeDef) GenError!void {
+    fn emitResource(self: *Gen, iface_id: []const u8, td: ast.TypeDef, R: []const u8) GenError!void {
         const methods = td.kind.resource;
-        const R = try self.typeName(td.name);
 
         self.print("pub const {s} = struct {{\n", .{R});
         self.raw("    handle: i32,\n\n");
+        self.print(
+            "    pub const __wit_resource = wit_types.ResourceDescriptor{{ .provider = \"{s}\", .name = \"{s}\" }};\n",
+            .{ iface_id, td.name },
+        );
+        self.raw("    pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;\n\n");
 
         self.raw("    const imp = struct {\n");
         for (methods) |m| try self.emitResourceExtern(iface_id, td.name, m);
         self.print("        extern \"{s}\" fn @\"[resource-drop]{s}\"(self: i32) void;\n", .{ iface_id, td.name });
         self.raw("    };\n\n");
+
+        self.raw("    pub const Borrowed = struct {\n");
+        self.raw("        handle: i32,\n\n");
+        self.print(
+            "        pub const __wit_resource = wit_types.ResourceDescriptor{{ .provider = \"{s}\", .name = \"{s}\" }};\n",
+            .{ iface_id, td.name },
+        );
+        self.raw("        pub const __wit_resource_ownership: wit_types.ResourceOwnership = .borrow;\n\n");
+        for (methods) |m| {
+            if (m.kind == .method) try self.emitBorrowedResourceMethod(R, m);
+        }
+        self.raw("    };\n\n");
+
+        self.print("    pub fn __wit_borrow(self: {s}) Borrowed {{\n", .{R});
+        self.raw("        return .{ .handle = self.handle };\n");
+        self.raw("    }\n\n");
 
         for (methods) |m| try self.emitResourceWrapper(R, td.name, m);
 
@@ -1710,6 +1879,25 @@ const Gen = struct {
         } else {
             self.raw(") void;\n");
         }
+    }
+
+    /// Emit a borrowed receiver method that delegates to the owned wrapper's
+    /// method implementation without exposing an owned value to the caller.
+    fn emitBorrowedResourceMethod(self: *Gen, R: []const u8, m: ast.ResourceMethod) GenError!void {
+        std.debug.assert(m.kind == .method);
+        const name = try camel(self.ar, m.name);
+
+        self.print("        pub fn {s}(self: Borrowed", .{name});
+        if (m.func.params.len > 0) self.raw(", ");
+        try self.emitTypedParamDecls(m.func.params);
+        self.print(") {s} {{\n", .{try self.resultZig(m.func)});
+        self.print("            return ({s}{{ .handle = self.handle }}).{s}(", .{ R, name });
+        for (m.func.params, 0..) |p, idx| {
+            if (idx != 0) self.raw(", ");
+            self.raw(try snake(self.ar, p.name));
+        }
+        self.raw(");\n");
+        self.raw("        }\n");
     }
 
     /// Emit the `extern` for an **async** resource method/static: the canonical
@@ -1769,7 +1957,7 @@ const Gen = struct {
         }
         try self.emitTypedParamDecls(func.params);
         if (m.kind == .constructor) {
-            self.print(") {s} {{\n", .{R});
+            self.print(") wit_types.Own({s}) {{\n", .{R});
         } else {
             self.print(") {s} {{\n", .{try self.resultZig(func)});
         }
@@ -1875,6 +2063,25 @@ const Gen = struct {
         return s;
     }
 
+    fn noteInterface(self: *Gen, iface_id: []const u8) GenError!void {
+        if (self.counted_ifaces.contains(iface_id)) return;
+        try self.counted_ifaces.put(self.ar, iface_id, {});
+        const gop = try self.iface_name_counts.getOrPut(self.ar, ifaceBaseName(iface_id));
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+
+        const short_name = self.packageInterfaceDisambiguator(iface_id);
+        const short_gop = try self.iface_short_name_counts.getOrPut(self.ar, short_name);
+        if (short_gop.found_existing) {
+            short_gop.value_ptr.* += 1;
+        } else {
+            short_gop.value_ptr.* = 1;
+        }
+    }
+
     /// The Zig identifier for a named type. Unique names keep their plain
     /// PascalCase; a name defined by several interfaces is prefixed with its
     /// defining interface (e.g. `IpNameLookupErrorCode`) so the bindings compile
@@ -1904,6 +2111,27 @@ const Gen = struct {
         const base = ifaceBaseName(iface_id);
         if ((self.iface_name_counts.get(base) orelse 0) < 2) return base;
 
+        const short_name = self.packageInterfaceDisambiguator(iface_id);
+        if ((self.iface_short_name_counts.get(short_name) orelse 0) < 2)
+            return short_name;
+
+        var full_name = std.ArrayListUnmanaged(u8).empty;
+        var separator = false;
+        for (iface_id) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '_') {
+                if (separator and full_name.items.len != 0)
+                    full_name.append(self.ar, '-') catch @panic("OOM");
+                full_name.append(self.ar, std.ascii.toLower(c)) catch @panic("OOM");
+                separator = false;
+            } else {
+                separator = true;
+            }
+        }
+        return full_name.toOwnedSlice(self.ar) catch @panic("OOM");
+    }
+
+    fn packageInterfaceDisambiguator(self: *Gen, iface_id: []const u8) []const u8 {
+        const base = ifaceBaseName(iface_id);
         const slash = std.mem.lastIndexOfScalar(u8, iface_id, '/') orelse return base;
         const package_start = if (std.mem.lastIndexOfScalar(u8, iface_id[0..slash], ':')) |colon|
             colon + 1
@@ -2007,7 +2235,25 @@ const Gen = struct {
     /// from the world's imported functions, binding each to a function-reference
     /// intrinsic module. Each distinct structural channel is bound to one
     /// canonical site (any valid site resolves to the same structure).
-    fn registerChannels(self: *Gen, uses: []const Use, top_funcs: []const TopFunc) GenError!void {
+    fn registerChannels(
+        self: *Gen,
+        uses: []const Use,
+        top_funcs: []const TopFunc,
+        used_types: []const UsedType,
+    ) GenError!void {
+        for (used_types) |ut| switch (ut.kind) {
+            .resource => |methods| {
+                self.current_iface = ut.scope_id;
+                for (methods) |m| {
+                    try self.registerFuncChannels(
+                        ut.scope_id,
+                        try self.resourceExternName(ut.name, m),
+                        m.func,
+                    );
+                }
+            },
+            else => {},
+        };
         for (uses) |u| {
             // Imports only for now: complex channels in the worlds we target are
             // import-side; the export-side intrinsic form is a later refinement.
@@ -2504,6 +2750,32 @@ test "duplicate interface basenames use package-qualified Zig names" {
     try testing.expectEqualStrings(
         "http_types",
         try g.interfaceModuleName("wasi:http/types@0.2.10"),
+    );
+
+    var counted = Gen{
+        .ar = a,
+        .resolver = undefined,
+        .impl = "impl",
+    };
+    try counted.noteInterface("wasi:filesystem/types@0.2.10");
+    try counted.noteInterface("wasi:http/types@0.2.10");
+    try counted.noteInterface("wasi:http/types@0.2.10");
+    try testing.expectEqual(@as(usize, 2), counted.iface_name_counts.get("types").?);
+
+    var namespace_collision = Gen{
+        .ar = a,
+        .resolver = undefined,
+        .impl = "impl",
+    };
+    try namespace_collision.noteInterface("acme:common/types@1.0.0");
+    try namespace_collision.noteInterface("contoso:common/types@2.0.0");
+    try testing.expectEqualStrings(
+        "acme_common_types_1_0_0",
+        try namespace_collision.interfaceModuleName("acme:common/types@1.0.0"),
+    );
+    try testing.expectEqualStrings(
+        "contoso_common_types_2_0_0",
+        try namespace_collision.interfaceModuleName("contoso:common/types@2.0.0"),
     );
 }
 
@@ -3004,6 +3276,14 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
     };
     const iface_items = [_]ast.InterfaceItem{
         .{ .type = .{ .name = "counter", .kind = .{ .resource = &counter_methods } } },
+        .{ .func = .{ .name = "transfer", .func = .{
+            .params = &.{.{ .name = "value", .type = .{ .own = "counter" } }},
+            .result = .{ .own = "counter" },
+        } } },
+        .{ .func = .{ .name = "inspect", .func = .{
+            .params = &.{.{ .name = "value", .type = .{ .borrow = "counter" } }},
+            .result = .u32,
+        } } },
     };
     const iface = ast.Interface{ .name = "counters", .items = &iface_items };
     const imp_world = ast.World{ .name = "guest", .items = &.{
@@ -3028,19 +3308,52 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         const out = g.out.items;
         try testing.expect(std.mem.indexOf(u8, out, "pub const Counter = struct {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "    handle: i32,") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "pub const __wit_resource = wit_types.ResourceDescriptor{ .provider = \"test:res/counters\", .name = \"counter\" };",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Borrowed = struct {") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "pub const __wit_resource_ownership: wit_types.ResourceOwnership = .borrow;",
+        ) != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn __wit_borrow(self: Counter) Borrowed {") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "pub fn increment(self: Borrowed, by: u32) u32 {",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "return (Counter{ .handle = self.handle }).increment(by);",
+        ) != null);
         // canonical resource externs (module = iface id).
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[constructor]counter\"(start: i32) i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[method]counter.increment\"(self: i32, by: i32) i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[static]counter.make-zero\"() i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[resource-drop]counter\"(self: i32) void;") != null);
         // typed wrappers.
-        try testing.expect(std.mem.indexOf(u8, out, "pub fn init(start: u32) Counter {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn init(start: u32) wit_types.Own(Counter) {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return .{ .handle = imp.@\"[constructor]counter\"(@bitCast(start)) };") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn increment(self: Counter, by: u32) u32 {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]counter.increment\"(self.handle, @bitCast(by))") != null);
         // a static returning own<counter> lifts the handle into the wrapper struct.
-        try testing.expect(std.mem.indexOf(u8, out, "pub fn makeZero() Counter {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(Counter, imp.@\"[static]counter.make-zero\"());") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn makeZero() wit_types.Own(Counter) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(wit_types.Own(Counter), imp.@\"[static]counter.make-zero\"());") != null);
+        // Explicit own/borrow modes stay nominally distinct while both lower
+        // to the same one-i32 canonical handle.
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn transfer(value: wit_types.Own(Counter)) wit_types.Own(Counter) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"transfer\"(value.handle)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn inspect(value: wit_types.Borrow(Counter)) u32 {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"inspect\"(value.handle)") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn deinit(self: Counter) void {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[resource-drop]counter\"(self.handle);") != null);
     }
@@ -3049,6 +3362,121 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
     }
+}
+
+test "generate: same-named resources keep provider identity and alias ownership" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const item_ref = ast.Type{ .name = "item" };
+    const a_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "item", .kind = .{ .resource = &.{} } } },
+        .{ .type = .{ .name = "item-alias", .kind = .{ .alias = item_ref } } },
+        .{ .func = .{ .name = "transfer", .func = .{
+            .params = &.{
+                .{ .name = "owned", .type = .{ .own = "item-alias" } },
+                .{ .name = "borrowed", .type = .{ .borrow = "item-alias" } },
+            },
+            .result = .{ .own = "item-alias" },
+        } } },
+    };
+    const b_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "item", .kind = .{ .resource = &.{} } } },
+        .{ .type = .{ .name = "item-alias", .kind = .{ .alias = item_ref } } },
+        .{ .func = .{ .name = "inspect", .func = .{
+            .params = &.{.{ .name = "value", .type = .{ .borrow = "item-alias" } }},
+            .result = .u32,
+        } } },
+    };
+    const iface_a = ast.Interface{ .name = "provider-a", .items = &a_items };
+    const iface_b = ast.Interface{ .name = "provider-b", .items = &b_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-a" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-b" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "demo", .name = "duplicate", .version = "1.2.3" },
+        .items = &.{ .{ .interface = iface_a }, .{ .interface = iface_b }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(u8, out, "pub const ProviderAItem = struct {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub const ProviderBItem = struct {") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "ResourceDescriptor{ .provider = \"demo:duplicate/provider-a@1.2.3\", .name = \"item\" }",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "ResourceDescriptor{ .provider = \"demo:duplicate/provider-b@1.2.3\", .name = \"item\" }",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub const ProviderAItemAlias = wit_types.Own(ProviderAItem);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub const ProviderBItemAlias = wit_types.Own(ProviderBItem);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub fn transfer(owned: wit_types.Own(ProviderAItemAlias), borrowed: wit_types.Borrow(ProviderAItemAlias)) wit_types.Own(ProviderAItemAlias)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "pub fn inspect(value: wit_types.Borrow(ProviderBItemAlias)) u32",
+    ) != null);
+}
+
+test "generate: async resource reached through use imports wit_async" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const methods = [_]ast.ResourceMethod{
+        .{
+            .kind = .method,
+            .name = "ping",
+            .func = .{ .params = &.{}, .result = .u32, .is_async = true },
+        },
+    };
+    const provider_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "item", .kind = .{ .resource = &methods } } },
+    };
+    const facade_items = [_]ast.InterfaceItem{
+        .{ .use = .{
+            .from = .{ .name = "provider" },
+            .names = &.{.{ .name = "item", .rename = "renamed-item" }},
+        } },
+    };
+    const provider = ast.Interface{ .name = "provider", .items = &provider_items };
+    const facade = ast.Interface{ .name = "facade", .items = &facade_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "facade" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "async-resource" },
+        .items = &.{ .{ .interface = provider }, .{ .interface = facade }, .{ .world = world } },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(u8, out, "const wit_async = @import(\"wit_async\");") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn ping(self: Borrowed) u32 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "wit_async.awaitCall(__status);") != null);
 }
 
 test "generate #286: named_interface import emits a plain-named import struct" {
