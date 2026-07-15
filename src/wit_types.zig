@@ -436,6 +436,97 @@ pub fn Borrow(comptime Resource: type) type {
     };
 }
 
+fn typeContainsResource(comptime T: type) bool {
+    if (resourceInfo(T) != null) return true;
+    return switch (@typeInfo(T)) {
+        .optional => |o| typeContainsResource(o.child),
+        .pointer => |p| p.size == .slice and typeContainsResource(p.child),
+        .@"struct" => |s| blk: {
+            for (s.field_types) |Field| {
+                if (typeContainsResource(Field)) break :blk true;
+            }
+            break :blk false;
+        },
+        .@"union" => |u| blk: {
+            for (u.field_types) |Field| {
+                if (Field != void and typeContainsResource(Field)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
+}
+
+/// Recursively rewrite every nominal resource value in `value`, preserving its
+/// surrounding WIT shape. The generated export bindings use this to translate
+/// guest-defined resource handles to JavaScript representation ids on the way
+/// into dispatch and back to canonical handles on the way out. Lists that
+/// contain resources are copied into `ra`; resource-free values are returned
+/// unchanged and allocate nothing.
+pub fn mapResources(
+    comptime T: type,
+    value: T,
+    comptime mapResource: anytype,
+    ra: Realloc,
+) T {
+    if (!comptime typeContainsResource(T)) return value;
+    if (comptime resourceInfo(T) != null) return mapResource(T, value);
+
+    return switch (@typeInfo(T)) {
+        .optional => |o| if (value) |payload|
+            mapResources(o.child, payload, mapResource, ra)
+        else
+            null,
+        .pointer => |p| blk: {
+            if (p.size != .slice) unsupported(T);
+            if (value.len == 0) break :blk value;
+            const bytes = ra(value.len * @sizeOf(p.child), @alignOf(p.child));
+            const mapped: [*]p.child = @ptrCast(@alignCast(bytes));
+            for (value, 0..) |element, i| {
+                mapped[i] = mapResources(p.child, element, mapResource, ra);
+            }
+            break :blk mapped[0..value.len];
+        },
+        .@"struct" => |s| blk: {
+            var mapped = value;
+            inline for (s.field_names, s.field_types) |field_name, Field| {
+                if (comptime typeContainsResource(Field)) {
+                    @field(mapped, field_name) = mapResources(
+                        Field,
+                        @field(value, field_name),
+                        mapResource,
+                        ra,
+                    );
+                }
+            }
+            break :blk mapped;
+        },
+        .@"union" => |u| blk: {
+            const Tag = u.tag_type.?;
+            const active = std.meta.activeTag(value);
+            inline for (u.field_names, u.field_types) |field_name, Field| {
+                if (active == @field(Tag, field_name)) {
+                    break :blk if (Field == void)
+                        value
+                    else
+                        @unionInit(
+                            T,
+                            field_name,
+                            mapResources(
+                                Field,
+                                @field(value, field_name),
+                                mapResource,
+                                ra,
+                            ),
+                        );
+                }
+            }
+            unreachable;
+        },
+        else => unsupported(T),
+    };
+}
+
 /// A nominal wrapper distinguishing a WIT `char` (a canonical-ABI-validated
 /// Unicode scalar value, 0..0x10FFFF excluding the surrogate range
 /// 0xD800..0xDFFF, encoded as a single core `u32`) from a plain WIT `u32`
@@ -1587,6 +1678,50 @@ test "resource wrappers preserve identity, ownership, and one-i32 ABI" {
     try testing.expectEqual(@as(i32, 23), borrowed.handle);
     try testing.expectEqual(@as(i32, 17), lowerFlat(AOwn, own, &testAlloc)[0]);
     try testing.expectEqual(@as(i32, 23), lowerFlat(ABorrow, borrowed, &testAlloc)[0]);
+}
+
+test "mapResources recursively rewrites nominal handles" {
+    const Thing = struct {
+        handle: i32,
+        pub const __wit_resource = ResourceDescriptor{
+            .provider = "test:resources/provider",
+            .name = "thing",
+        };
+        pub const __wit_resource_ownership: ResourceOwnership = .own;
+    };
+    const BorrowedThing = Borrow(Thing);
+    const Payload = struct {
+        owned: Thing,
+        borrowed: ?[]const BorrowedThing,
+    };
+    const Choice = union(enum) {
+        none,
+        payload: Payload,
+    };
+    const Mapper = struct {
+        fn map(comptime T: type, value: T) T {
+            return .{ .handle = value.handle + 100 };
+        }
+    };
+
+    const borrowed = [_]BorrowedThing{
+        .{ .handle = 2 },
+        .{ .handle = 3 },
+    };
+    const value = Choice{ .payload = .{
+        .owned = .{ .handle = 1 },
+        .borrowed = &borrowed,
+    } };
+
+    test_top = 0;
+    const mapped = mapResources(Choice, value, Mapper.map, &testAlloc);
+    try testing.expectEqual(@as(i32, 101), mapped.payload.owned.handle);
+    try testing.expectEqual(@as(i32, 102), mapped.payload.borrowed.?[0].handle);
+    try testing.expectEqual(@as(i32, 103), mapped.payload.borrowed.?[1].handle);
+    try testing.expectEqual(@as(i32, 2), borrowed[0].handle);
+
+    test_top = 0;
+    try testing.expectEqual(@as(u32, 7), mapResources(u32, 7, Mapper.map, &testAlloc));
 }
 
 test "Tuple / Future / Stream constructors marshal correctly" {
