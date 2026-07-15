@@ -175,6 +175,40 @@ pub fn build(b: *std.Build) void {
     );
     gen_regress_step.dependOn(&gen_regress_obj.step);
 
+    // Generate two providers that each define `resource item`, with explicit
+    // own/borrow signatures and aliases, then force semantic analysis of the
+    // generated wrappers and their comptime descriptor contract.
+    const resource_descriptor_run = b.addRunArtifact(bindgen_exe);
+    resource_descriptor_run.addArgs(&.{"--wit"});
+    resource_descriptor_run.addFileArg(b.path("build/bindgen/testdata/resource_descriptors.wit"));
+    resource_descriptor_run.addArgs(&.{ "--world", "guest", "--dispatch", "stub_dispatch", "-o" });
+    const resource_descriptor_generated = resource_descriptor_run.addOutputFileArg("resource_descriptors_generated.zig");
+
+    const resource_descriptor_generated_mod = b.createModule(.{
+        .root_source_file = resource_descriptor_generated,
+        .target = wasm32_freestanding,
+    });
+    resource_descriptor_generated_mod.addImport("wit_types", wit_types);
+
+    const resource_descriptor_driver_mod = b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/resource_descriptor_force_driver.zig"),
+        .target = wasm32_freestanding,
+        .imports = &.{
+            .{ .name = "generated", .module = resource_descriptor_generated_mod },
+            .{ .name = "wit_types", .module = wit_types },
+        },
+    });
+    const resource_descriptor_obj = b.addObject(.{
+        .name = "resource_descriptor_gen_check",
+        .root_module = resource_descriptor_driver_mod,
+    });
+
+    const resource_descriptor_step = b.step(
+        "resource-descriptor-gen-check",
+        "Compile generated resource descriptors and own/borrow wrappers for wasm32",
+    );
+    resource_descriptor_step.dependOn(&resource_descriptor_obj.step);
+
     // Generate a mixed root-function + interface-import world in
     // `--js-imports` mode and compile every generated wrapper/bridge body for
     // wasm32. The exported force-analysis driver keeps the typed wrappers
@@ -253,6 +287,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run native unit tests");
     test_step.dependOn(&run_wit_types_tests.step);
     test_step.dependOn(&run_bindgen_tests.step);
+    test_step.dependOn(resource_descriptor_step);
     test_step.dependOn(root_import_gen_step);
     // Component wrapping uses the separately installed `wasm-tools` CLI.
     // Keep it opt-in so a documented clean `zig build test` needs only this

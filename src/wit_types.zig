@@ -348,6 +348,94 @@ pub fn Tuple(comptime Ts: anytype) type {
     return @Tuple(&Ts);
 }
 
+// ── Resources ──────────────────────────────────────────────────────
+
+/// Canonical WIT identity for a resource. The provider is the full interface
+/// id (`namespace:package/interface@version` when versioned); `name` is the
+/// resource's original WIT name in that interface. Runtimes may assign compact
+/// numeric ids to this collision-free pair when installing a generated world.
+pub const ResourceDescriptor = struct {
+    provider: []const u8,
+    name: []const u8,
+
+    pub fn eql(a: ResourceDescriptor, b: ResourceDescriptor) bool {
+        return std.mem.eql(u8, a.provider, b.provider) and
+            std.mem.eql(u8, a.name, b.name);
+    }
+};
+
+pub const ResourceOwnership = enum {
+    own,
+    borrow,
+};
+
+pub const ResourceInfo = struct {
+    descriptor: ResourceDescriptor,
+    ownership: ResourceOwnership,
+};
+
+/// Return the generated resource metadata carried by `T`, or `null` for an
+/// ordinary Zig type. This is the stable reflection entry point for dispatch
+/// runtimes; callers do not need to parse generated Zig type names.
+pub fn resourceInfo(comptime T: type) ?ResourceInfo {
+    if (@typeInfo(T) != .@"struct") return null;
+    if (!@hasDecl(T, "__wit_resource") or
+        !@hasDecl(T, "__wit_resource_ownership"))
+    {
+        return null;
+    }
+    return .{
+        .descriptor = T.__wit_resource,
+        .ownership = T.__wit_resource_ownership,
+    };
+}
+
+fn requireOwnedResource(comptime Resource: type) ResourceInfo {
+    const info = resourceInfo(Resource) orelse
+        @compileError("wit_types: expected a generated resource type, got " ++ @typeName(Resource));
+    if (info.ownership != .own) {
+        @compileError("wit_types: resource wrapper must be parameterized by its owned resource type");
+    }
+    return info;
+}
+
+/// The owned handle type for `Resource`. Generated imported resource structs
+/// are already nominal one-field owned handles (and carry their methods), so
+/// preserving that type here keeps existing `resource.init().method()` source
+/// compatible while making explicit `own<Resource>` spelling visible in
+/// generated signatures.
+pub fn Own(comptime Resource: type) type {
+    _ = requireOwnedResource(Resource);
+    return Resource;
+}
+
+/// A nominal borrowed handle for `Resource`. It has the same one-`i32`
+/// canonical representation as `Own(Resource)`, but is a distinct Zig type and
+/// carries `.borrow` metadata for comptime dispatch reflection. Generated
+/// resources provide a resource-specific borrowed type so borrowed handles
+/// retain their resource methods.
+pub fn Borrow(comptime Resource: type) type {
+    const info = requireOwnedResource(Resource);
+    if (@hasDecl(Resource, "Borrowed")) {
+        const BorrowedType = Resource.Borrowed;
+        const borrowed_info = resourceInfo(BorrowedType) orelse
+            @compileError("wit_types: generated Borrowed type is missing resource metadata");
+        if (borrowed_info.ownership != .borrow or
+            !borrowed_info.descriptor.eql(info.descriptor))
+        {
+            @compileError("wit_types: generated Borrowed type has inconsistent resource metadata");
+        }
+        return BorrowedType;
+    }
+    return struct {
+        handle: i32,
+
+        pub const __wit_resource = info.descriptor;
+        pub const __wit_resource_ownership: ResourceOwnership = .borrow;
+        pub const ResourceType = Resource;
+    };
+}
+
 /// A nominal wrapper distinguishing a WIT `char` (a canonical-ABI-validated
 /// Unicode scalar value, 0..0x10FFFF excluding the surrogate range
 /// 0xD800..0xDFFF, encoded as a single core `u32`) from a plain WIT `u32`
@@ -1452,6 +1540,53 @@ test "Char/ByteList wrappers have the same canonical layout as their bare payloa
     const raw_bytes = [_]u8{ 0, 1, 2, 0xff };
     lower(ByteList, .{ .bytes = &raw_bytes }, &bytes_buf, &testAlloc);
     try testing.expectEqualSlices(u8, &raw_bytes, lift(ByteList, &bytes_buf).bytes);
+}
+
+test "resource wrappers preserve identity, ownership, and one-i32 ABI" {
+    const ProviderAThing = struct {
+        handle: i32,
+        pub const __wit_resource = ResourceDescriptor{
+            .provider = "test:resources/provider-a@1.0.0",
+            .name = "thing",
+        };
+        pub const __wit_resource_ownership: ResourceOwnership = .own;
+    };
+    const ProviderBThing = struct {
+        handle: i32,
+        pub const __wit_resource = ResourceDescriptor{
+            .provider = "test:resources/provider-b@1.0.0",
+            .name = "thing",
+        };
+        pub const __wit_resource_ownership: ResourceOwnership = .own;
+    };
+    const AOwn = Own(ProviderAThing);
+    const ABorrow = Borrow(ProviderAThing);
+    const AAlias = ProviderAThing;
+
+    try testing.expect(AOwn == ProviderAThing);
+    try testing.expect(ABorrow != AOwn);
+    try testing.expectEqual(@as(usize, 1), flatCount(AOwn));
+    try testing.expectEqual(@as(usize, 1), flatCount(ABorrow));
+    try testing.expectEqual(@as(usize, 4), sizeOf(AOwn));
+    try testing.expectEqual(@as(usize, 4), sizeOf(ABorrow));
+
+    const own_info = resourceInfo(AOwn).?;
+    const borrow_info = resourceInfo(ABorrow).?;
+    const alias_info = resourceInfo(AAlias).?;
+    const other_info = resourceInfo(ProviderBThing).?;
+    try testing.expectEqual(ResourceOwnership.own, own_info.ownership);
+    try testing.expectEqual(ResourceOwnership.borrow, borrow_info.ownership);
+    try testing.expect(own_info.descriptor.eql(borrow_info.descriptor));
+    try testing.expect(own_info.descriptor.eql(alias_info.descriptor));
+    try testing.expect(!own_info.descriptor.eql(other_info.descriptor));
+    try testing.expect(resourceInfo(u32) == null);
+
+    const own = liftResultFlat(AOwn, @as(i32, 17));
+    const borrowed = liftResultFlat(ABorrow, @as(i32, 23));
+    try testing.expectEqual(@as(i32, 17), own.handle);
+    try testing.expectEqual(@as(i32, 23), borrowed.handle);
+    try testing.expectEqual(@as(i32, 17), lowerFlat(AOwn, own, &testAlloc)[0]);
+    try testing.expectEqual(@as(i32, 23), lowerFlat(ABorrow, borrowed, &testAlloc)[0]);
 }
 
 test "Tuple / Future / Stream constructors marshal correctly" {

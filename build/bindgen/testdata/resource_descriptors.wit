@@ -1,0 +1,87 @@
+package test:resource-descriptors@1.0.0;
+
+interface value-provider {
+  resource value;
+}
+
+interface provider-a {
+  resource item {
+    constructor();
+    inspect-method: func() -> u32;
+  }
+  type item-alias = item;
+
+  transfer: func(owned: own<item-alias>) -> own<item-alias>;
+  inspect: func(borrowed: borrow<item-alias>) -> u32;
+}
+
+interface provider-b {
+  resource item;
+  type item-alias = item;
+
+  transfer: func(owned: own<item-alias>) -> own<item-alias>;
+  inspect: func(borrowed: borrow<item-alias>) -> u32;
+}
+
+interface nested-provider {
+  use value-provider.{value as source-value};
+
+  record payload {
+    value: u32,
+  }
+
+  resource holder {
+    inspect-other: func(other: borrow<source-value>) -> u32;
+    receive: func(value: future<payload>);
+  }
+}
+
+interface facade {
+  use provider-a.{item as renamed-item};
+  inspect-renamed: func(value: borrow<renamed-item>) -> u32;
+}
+
+interface middle {
+  use nested-provider.{holder as renamed-holder};
+}
+
+interface transitive-facade {
+  use middle.{renamed-holder as nested-holder};
+}
+
+interface collision-provider {
+  resource nested-holder;
+}
+
+interface record-source {
+  record thing {
+    value: u32,
+  }
+  record box {
+    value: thing,
+  }
+}
+
+interface record-middle {
+  use record-source.{box as middle-box};
+}
+
+interface record-facade {
+  use record-middle.{middle-box as final-box};
+}
+
+interface record-collision {
+  record thing {
+    value: string,
+  }
+}
+
+world guest {
+  import provider-a;
+  import provider-b;
+  import facade;
+  import transitive-facade;
+  import collision-provider;
+  import record-facade;
+  import record-collision;
+}
