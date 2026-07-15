@@ -62,6 +62,12 @@ const metadata_decode = wabt.component.wit.metadata_decode;
 const core_imports = wabt.component.adapter.core_imports;
 const lift_types = wabt.component.wit.lift_types;
 const resource_intrinsics = wabt.component.resource_intrinsics;
+const ResourceIdentity = metadata_decode.ResourceIdentity;
+const ResourceRegistry = metadata_decode.ResourceRegistry;
+
+fn ResourceMap(comptime Value: type) type {
+    return metadata_decode.ResourceIdentityMap(Value);
+}
 
 pub const usage =
     \\Usage: wabt component new [options] <core.wasm>
@@ -754,10 +760,9 @@ fn validateResourceIntrinsicSigs(
 /// instance_export sort=type` source the canon operand needs).
 const ResolvedIntrinsic = struct {
     field: []const u8,
-    resource: []const u8,
+    resource: ResourceIdentity,
     kind: resource_intrinsics.Kind,
-    /// Component-instance index of the import that declares `resource`
-    /// as a sub_resource.
+    /// Component-instance index of `resource.provider`.
     owner_inst_idx: u32,
 };
 
@@ -771,7 +776,7 @@ fn resolveResourceIntrinsicsByShape(
     ar: std.mem.Allocator,
     intrinsics: []const ResourceIntrinsic,
     shape_qnames: []const []const u8,
-    resource_owner: *const std.StringHashMapUnmanaged([]const u8),
+    resources: *const ResourceRegistry,
     import_inst_idx_for: *const std.StringHashMapUnmanaged(u32),
 ) ![]const []const ResolvedIntrinsic {
     var by_shape = try ar.alloc(std.ArrayListUnmanaged(ResolvedIntrinsic), shape_qnames.len);
@@ -792,25 +797,25 @@ fn resolveResourceIntrinsicsByShape(
             );
             return error.UnresolvedResourceIntrinsic;
         };
-        const owner_qname = resource_owner.get(it.resource) orelse {
+        const identity = resources.identityForVisible(it.module, it.resource) orelse {
             std.debug.print(
                 "error: core import `{s}` of `{s}` references resource `{s}`, " ++
-                    "which no imported interface in the world provides\n",
+                    "which that imported interface does not provide\n",
                 .{ it.field, it.module, it.resource },
             );
             return error.UnresolvedResourceIntrinsic;
         };
-        const owner_inst_idx = import_inst_idx_for.get(owner_qname) orelse {
+        const owner_inst_idx = import_inst_idx_for.get(identity.provider) orelse {
             std.debug.print(
                 "error: core import `{s}` of `{s}` references resource `{s}`, " ++
                     "whose providing interface `{s}` was not wired as an import instance\n",
-                .{ it.field, it.module, it.resource, owner_qname },
+                .{ it.field, it.module, it.resource, identity.provider },
             );
             return error.UnresolvedResourceIntrinsic;
         };
         try by_shape[si].append(ar, .{
             .field = it.field,
-            .resource = it.resource,
+            .resource = identity,
             .kind = it.kind,
             .owner_inst_idx = owner_inst_idx,
         });
@@ -932,8 +937,8 @@ const ExportSideIntrinsic = struct {
     module: []const u8,
     /// Canonical field name (e.g. `[resource-new]thing`).
     field: []const u8,
-    /// Bare resource name (e.g. `thing`).
-    resource: []const u8,
+    /// Provider-qualified identity of the guest-defined resource.
+    resource: ResourceIdentity,
     kind: resource_intrinsics.Kind,
 };
 
@@ -955,9 +960,12 @@ fn partitionResourceIntrinsics(
     var exp = std.ArrayListUnmanaged(ExportSideIntrinsic).empty;
     for (intrinsics) |it| {
         if (std.mem.startsWith(u8, it.module, export_intrinsic_prefix)) {
+            const provider = it.module[export_intrinsic_prefix.len..];
             var found = false;
             for (exported) |er| {
-                if (std.mem.eql(u8, er.name, it.resource)) {
+                if (std.mem.eql(u8, er.ext_qualified, provider) and
+                    std.mem.eql(u8, er.name, it.resource))
+                {
                     found = true;
                     break;
                 }
@@ -973,7 +981,7 @@ fn partitionResourceIntrinsics(
             try exp.append(ar, .{
                 .module = it.module,
                 .field = it.field,
-                .resource = it.resource,
+                .resource = .{ .provider = provider, .name = it.resource },
                 .kind = it.kind,
             });
         } else {
@@ -1531,12 +1539,10 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     // (qualified_name -> [resource names], [funcs], ext_slots) shape so
     // we can emit an instance-type import that lets the exported funcs
     // reach those resources by name AND can lower the imported funcs
-    // back into the core wasm. Cross-extern resource names must be
-    // unique within a world; ambiguity is a user-facing error (#198
-    // scope is the wasi-http reproducer pattern, which uses unique
-    // names — wider scoping is a follow-up). Imports with neither
-    // resources nor funcs are skipped (no surface to wire).
-    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    // back into the core wasm. Resource identity is the defining
+    // interface plus canonical source name; same-named resources from
+    // different providers therefore remain distinct.
+    const resource_registry = try ResourceRegistry.init(ar, decoded);
     const ImportShape = struct {
         qualified_name: []const u8,
         resources: []const []const u8,
@@ -1561,11 +1567,6 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             .ext_slots = ext.type_slots,
             .inst_decls = ext.inst_decls,
         });
-        for (owned) |name| {
-            const gop = try resource_owner.getOrPut(ar, name);
-            if (gop.found_existing) return error.AmbiguousResourceName;
-            gop.value_ptr.* = ext.qualified_name;
-        }
     }
 
     // ── Phase 1.5: classify every imported func to decide whether
@@ -1791,12 +1792,16 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     //    no destructor. `own`/`borrow` refs in exported func sigs and
     //    the `[export]…` `resource.{new,rep,drop}` intrinsics below
     //    resolve to these slots.
-    var exported_resource_type_idx = std.StringHashMapUnmanaged(u32).empty;
+    var exported_resource_type_idx = ResourceMap(u32).empty;
     for (exported_resources) |er| {
-        if (exported_resource_type_idx.contains(er.name)) continue;
+        const identity = ResourceIdentity{
+            .provider = er.ext_qualified,
+            .name = er.name,
+        };
+        if (exported_resource_type_idx.contains(identity)) continue;
         try types.append(ar, .{ .resource = .{ .destructor = null } });
         try Section.appendType(&order, ar, types.items.len);
-        try exported_resource_type_idx.put(ar, er.name, comp_type_idx);
+        try exported_resource_type_idx.put(ar, identity, comp_type_idx);
         comp_type_idx += 1;
     }
 
@@ -1817,14 +1822,14 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         ar,
         parts.import_side,
         shape_qnames,
-        &resource_owner,
+        &resource_registry,
         &import_inst_idx_for,
     );
     const export_groups = try groupExportSideByModule(ar, parts.export_side);
     // Resource-name → component type idx of the alias from its
     // providing import instance. Shared across the intrinsic canons
     // emitted in Phase 2.5.
-    var intrinsic_resource_alias = std.StringHashMapUnmanaged(u32).empty;
+    var intrinsic_resource_alias = ResourceMap(u32).empty;
 
     // ── Phase 2.5: wire each imported func through to the core wasm.
     //
@@ -1898,7 +1903,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
                 try aliases.append(ar, .{ .instance_export = .{
                     .sort = .type,
                     .instance_idx = d.owner_inst_idx,
-                    .name = d.resource,
+                    .name = d.resource.name,
                 } });
                 try Section.appendAlias(&order, ar, aliases.items.len);
                 const idx = comp_type_idx;
@@ -2269,59 +2274,53 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
     // ── Phase 3: walk export externs, hoisting resource handles
     //    referenced by their func sigs.
     //
-    // Cache of resource-name -> component-level type idx of the
-    // alias from the providing import instance. Reused across
-    // exports referencing the same resource.
-    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
-    // Cache of (resource_name, handle_kind) -> component-level type
-    // idx of the hoisted `(type (own/borrow alias_slot))` typedef.
-    // Reused across funcs/exports referencing the same handle.
+    // Provider-qualified caches keep same-named resources from different
+    // interfaces distinct.
+    var resource_alias_idx = ResourceMap(u32).empty;
     const HandleKind = enum { own, borrow };
-    const HandleKey = struct { name: []const u8, kind: HandleKind };
-    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
-    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
+    var own_handle_idx = ResourceMap(u32).empty;
+    var borrow_handle_idx = ResourceMap(u32).empty;
 
     const HandleResolver = struct {
         ar: std.mem.Allocator,
+        ext: metadata_decode.WorldExtern,
+        world_decls: []const ctypes.Decl,
         ext_slots: []const metadata_decode.TypeSlot,
         types: *std.ArrayListUnmanaged(ctypes.TypeDef),
         aliases: *std.ArrayListUnmanaged(ctypes.Alias),
-        resource_owner: *std.StringHashMapUnmanaged([]const u8),
+        resources: *const ResourceRegistry,
         import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
-        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
-        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
-        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
-        hoist_idxs: *std.ArrayListUnmanaged(u32),
+        resource_alias_idx: *ResourceMap(u32),
+        exported_resource_type_idx: *ResourceMap(u32),
+        own_handle_idx: *ResourceMap(u32),
+        borrow_handle_idx: *ResourceMap(u32),
         comp_type_idx: *u32,
         order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
 
-        fn resourceAlias(self: @This(), name: []const u8) !u32 {
+        fn resourceAlias(self: @This(), identity: ResourceIdentity) !u32 {
             // #250: a guest-defined (exported) resource resolves to the
             // resource type declared in this component — no import
             // alias needed.
-            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
-            if (self.resource_alias_idx.get(name)) |idx| return idx;
-            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
-            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
+            if (self.exported_resource_type_idx.get(identity)) |idx| return idx;
+            if (self.resource_alias_idx.get(identity)) |idx| return idx;
+            const inst_idx = self.import_inst_idx_for.get(identity.provider) orelse
+                return error.UnresolvedResource;
             try self.aliases.append(self.ar, .{ .instance_export = .{
                 .sort = .type,
                 .instance_idx = inst_idx,
-                .name = name,
+                .name = identity.name,
             } });
             try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
             const slot = self.comp_type_idx.*;
             self.comp_type_idx.* += 1;
-            try self.resource_alias_idx.put(self.ar, name, slot);
+            try self.resource_alias_idx.put(self.ar, identity, slot);
             return slot;
         }
 
-        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
-            for (self.hoist_keys.items, 0..) |k, i| {
-                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
-                    return self.hoist_idxs.items[i];
-                }
-            }
-            const alias_slot = try self.resourceAlias(name);
+        fn hoistHandle(self: @This(), identity: ResourceIdentity, kind: HandleKind) !u32 {
+            const cache = if (kind == .own) self.own_handle_idx else self.borrow_handle_idx;
+            if (cache.get(identity)) |idx| return idx;
+            const alias_slot = try self.resourceAlias(identity);
             const vt: ctypes.ValType = switch (kind) {
                 .own => .{ .own = alias_slot },
                 .borrow => .{ .borrow = alias_slot },
@@ -2330,8 +2329,7 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             try Section.appendType(self.order, self.ar, self.types.items.len);
             const slot = self.comp_type_idx.*;
             self.comp_type_idx.* += 1;
-            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
-            try self.hoist_idxs.append(self.ar, slot);
+            try cache.put(self.ar, identity, slot);
             return slot;
         }
 
@@ -2356,12 +2354,20 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
             return switch (v) {
                 .own => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
+                    const identity = self.resources.identityForSlot(
+                        self.ext,
+                        self.world_decls,
+                        k,
+                    ) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(identity, .own) };
                 },
                 .borrow => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
+                    const identity = self.resources.identityForSlot(
+                        self.ext,
+                        self.world_decls,
+                        k,
+                    ) orelse return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(identity, .borrow) };
                 },
                 else => v,
             };
@@ -2425,15 +2431,17 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
         if (!ext.is_export) continue;
         const resolver = HandleResolver{
             .ar = ar,
+            .ext = ext,
+            .world_decls = decoded.world_decls,
             .ext_slots = ext.type_slots,
             .types = &types,
             .aliases = &aliases,
-            .resource_owner = &resource_owner,
+            .resources = &resource_registry,
             .import_inst_idx_for = &import_inst_idx_for,
             .resource_alias_idx = &resource_alias_idx,
             .exported_resource_type_idx = &exported_resource_type_idx,
-            .hoist_keys = &hoist_keys,
-            .hoist_idxs = &hoist_idxs,
+            .own_handle_idx = &own_handle_idx,
+            .borrow_handle_idx = &borrow_handle_idx,
             .comp_type_idx = &comp_type_idx,
             .order = &order,
         };
@@ -2590,9 +2598,13 @@ pub fn buildComponent(alloc: std.mem.Allocator, core_bytes: []const u8) ![]u8 {
             const comp_idx: u32 = @intCast(nested_components.items.len - 1);
             var args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
             for (res_names.items) |rn| {
+                const identity = ResourceIdentity{
+                    .provider = es.ext.qualified_name,
+                    .name = rn,
+                };
                 try args.append(ar, .{
                     .name = try nestedTypeImportName(ar, rn),
-                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(rn).? },
+                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(identity).? },
                 });
             }
             for (0..fn_count) |i| {
@@ -2729,7 +2741,7 @@ fn buildComponentShimFixup(
     if (decoded.func_externs.len > 0) return error.UnsupportedShape;
 
     // ── Phase 1: re-collect import shapes (same as the fast path).
-    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    const resource_registry = try ResourceRegistry.init(ar, decoded);
     // #280: name → owning import-instance qname for named (non-resource)
     // types (e.g. `error-code`, `method`). Used to alias such a type out of
     // its providing import instance when a transcribed top-level type
@@ -2764,11 +2776,6 @@ fn buildComponentShimFixup(
             .ext_slots = ext.type_slots,
             .inst_decls = ext.inst_decls,
         });
-        for (owned) |name| {
-            const gop = try resource_owner.getOrPut(ar, name);
-            if (gop.found_existing) return error.AmbiguousResourceName;
-            gop.value_ptr.* = ext.qualified_name;
-        }
         // #280: register this instance's named-type exports (export_eq
         // slots) so they can be aliased to top level when referenced by a
         // transcribed future/stream element or lifted export result.
@@ -3369,20 +3376,20 @@ fn buildComponentShimFixup(
         ar,
         parts.import_side,
         shape_qnames,
-        &resource_owner,
+        &resource_registry,
         &import_inst_idx_for,
     );
     const export_groups = try groupExportSideByModule(ar, parts.export_side);
-    var intrinsic_resource_alias = std.StringHashMapUnmanaged(u32).empty;
-    // #250: resource name → component type idx of the exported
-    // resource type declared below (Step 2.5).
-    var exported_resource_type_idx = std.StringHashMapUnmanaged(u32).empty;
+    var intrinsic_resource_alias = ResourceMap(u32).empty;
+    // #250: provider-qualified resource identity → component type idx of
+    // the exported resource type declared below (Step 2.5).
+    var exported_resource_type_idx = ResourceMap(u32).empty;
 
     // #280: resource-aware handle resolver — defined here (before the async
     // canon loop) so `[future]`/`[stream]` complex element transcription and
     // `[task-return]` resource results share the same resource aliases as the
     // export-side sig lifting below. Dedup maps are function-level.
-    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    var resource_alias_idx = ResourceMap(u32).empty;
     // #280: named non-resource type alias dedup (name → top-level type idx).
     var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
     // Locally-defined named value types (e.g. a `record` declared in an
@@ -3390,24 +3397,25 @@ fn buildComponentShimFixup(
     // type space, deduped by name so repeated references share one type.
     var local_named_idx = std.StringHashMapUnmanaged(u32).empty;
     const HandleKind = enum { own, borrow };
-    const HandleKey = struct { name: []const u8, kind: HandleKind };
-    var hoist_keys = std.ArrayListUnmanaged(HandleKey).empty;
-    var hoist_idxs = std.ArrayListUnmanaged(u32).empty;
+    var own_handle_idx = ResourceMap(u32).empty;
+    var borrow_handle_idx = ResourceMap(u32).empty;
 
     const HandleResolver = struct {
         ar: std.mem.Allocator,
+        resource_iface: []const u8,
+        world_decls: []const ctypes.Decl,
         ext_slots: []const metadata_decode.TypeSlot,
         types: *std.ArrayListUnmanaged(ctypes.TypeDef),
         aliases: *std.ArrayListUnmanaged(ctypes.Alias),
-        resource_owner: *std.StringHashMapUnmanaged([]const u8),
+        resources: *const ResourceRegistry,
         import_inst_idx_for: *std.StringHashMapUnmanaged(u32),
-        resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+        resource_alias_idx: *ResourceMap(u32),
         type_owner: *std.StringHashMapUnmanaged([]const u8),
         type_alias_idx: *std.StringHashMapUnmanaged(u32),
         local_named_idx: *std.StringHashMapUnmanaged(u32),
-        exported_resource_type_idx: *std.StringHashMapUnmanaged(u32),
-        hoist_keys: *std.ArrayListUnmanaged(HandleKey),
-        hoist_idxs: *std.ArrayListUnmanaged(u32),
+        exported_resource_type_idx: *ResourceMap(u32),
+        own_handle_idx: *ResourceMap(u32),
+        borrow_handle_idx: *ResourceMap(u32),
         comp_type_idx: *u32,
         order: *std.ArrayListUnmanaged(ctypes.SectionEntry),
         /// #302: when transcribing a future/stream element, the element's owning
@@ -3417,22 +3425,22 @@ fn buildComponentShimFixup(
         /// #302: name → all owners, for the package-scoped pick above.
         type_owners_all: ?*std.StringHashMapUnmanaged(std.ArrayListUnmanaged([]const u8)) = null,
 
-        fn resourceAlias(self: @This(), name: []const u8) !u32 {
+        fn resourceAlias(self: @This(), identity: ResourceIdentity) !u32 {
             // #250: guest-defined (exported) resource → its declared
             // resource type in this component.
-            if (self.exported_resource_type_idx.get(name)) |idx| return idx;
-            if (self.resource_alias_idx.get(name)) |idx| return idx;
-            const owner = self.resource_owner.get(name) orelse return error.UnresolvedResource;
-            const inst_idx = self.import_inst_idx_for.get(owner) orelse return error.UnresolvedResource;
+            if (self.exported_resource_type_idx.get(identity)) |idx| return idx;
+            if (self.resource_alias_idx.get(identity)) |idx| return idx;
+            const inst_idx = self.import_inst_idx_for.get(identity.provider) orelse
+                return error.UnresolvedResource;
             try self.aliases.append(self.ar, .{ .instance_export = .{
                 .sort = .type,
                 .instance_idx = inst_idx,
-                .name = name,
+                .name = identity.name,
             } });
             try Section.appendAlias(self.order, self.ar, self.aliases.items.len);
             const slot = self.comp_type_idx.*;
             self.comp_type_idx.* += 1;
-            try self.resource_alias_idx.put(self.ar, name, slot);
+            try self.resource_alias_idx.put(self.ar, identity, slot);
             return slot;
         }
 
@@ -3510,13 +3518,10 @@ fn buildComponentShimFixup(
             return idx;
         }
 
-        fn hoistHandle(self: @This(), name: []const u8, kind: HandleKind) !u32 {
-            for (self.hoist_keys.items, 0..) |k, i| {
-                if (k.kind == kind and std.mem.eql(u8, k.name, name)) {
-                    return self.hoist_idxs.items[i];
-                }
-            }
-            const alias_slot = try self.resourceAlias(name);
+        fn hoistHandle(self: @This(), identity: ResourceIdentity, kind: HandleKind) !u32 {
+            const cache = if (kind == .own) self.own_handle_idx else self.borrow_handle_idx;
+            if (cache.get(identity)) |idx| return idx;
+            const alias_slot = try self.resourceAlias(identity);
             const vt: ctypes.ValType = switch (kind) {
                 .own => .{ .own = alias_slot },
                 .borrow => .{ .borrow = alias_slot },
@@ -3525,8 +3530,7 @@ fn buildComponentShimFixup(
             try Section.appendType(self.order, self.ar, self.types.items.len);
             const slot = self.comp_type_idx.*;
             self.comp_type_idx.* += 1;
-            try self.hoist_keys.append(self.ar, .{ .name = name, .kind = kind });
-            try self.hoist_idxs.append(self.ar, slot);
+            try cache.put(self.ar, identity, slot);
             return slot;
         }
 
@@ -3553,12 +3557,26 @@ fn buildComponentShimFixup(
         pub fn rewriteLeaf(self: @This(), v: ctypes.ValType) lift_types.Error!ctypes.ValType {
             return switch (v) {
                 .own => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .own) };
+                    const identity = metadata_decode.resourceIdentityForSlot(
+                        self.resource_iface,
+                        self.ext_slots,
+                        self.world_decls,
+                        k,
+                    ) orelse return error.UnresolvedResource;
+                    if (!self.resources.definitions.contains(identity))
+                        return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(identity, .own) };
                 },
                 .borrow => |k| blk: {
-                    const name = metadata_decode.resourceNameForSlot(self.ext_slots, k) orelse return error.UnresolvedResource;
-                    break :blk .{ .type_idx = try self.hoistHandle(name, .borrow) };
+                    const identity = metadata_decode.resourceIdentityForSlot(
+                        self.resource_iface,
+                        self.ext_slots,
+                        self.world_decls,
+                        k,
+                    ) orelse return error.UnresolvedResource;
+                    if (!self.resources.definitions.contains(identity))
+                        return error.UnresolvedResource;
+                    break :blk .{ .type_idx = try self.hoistHandle(identity, .borrow) };
                 },
                 .type_idx => |slot| blk: {
                     if (metadata_decode.typeNameForSlot(self.ext_slots, slot)) |name| {
@@ -3663,11 +3681,17 @@ fn buildComponentShimFixup(
     //    types must precede the export-side intrinsic canons and the
     //    Phase 5 lifted func types that reference them.
     for (exported_resources) |er| {
-        if (exported_resource_type_idx.contains(er.name)) continue;
+        const identity = ResourceIdentity{
+            .provider = er.ext_qualified,
+            .name = er.name,
+        };
+        if (exported_resource_type_idx.contains(identity)) continue;
         var dtor_idx: ?u32 = null;
         if (er.dtor_export != null) {
             for (dtor_resources.items, 0..) |dr, d| {
-                if (std.mem.eql(u8, dr.name, er.name)) {
+                if (std.mem.eql(u8, dr.ext_qualified, er.ext_qualified) and
+                    std.mem.eql(u8, dr.name, er.name))
+                {
                     dtor_idx = dtor_stub_core_base + @as(u32, @intCast(d));
                     break;
                 }
@@ -3675,7 +3699,7 @@ fn buildComponentShimFixup(
         }
         try types.append(ar, .{ .resource = .{ .destructor = dtor_idx } });
         try Section.appendType(&order, ar, types.items.len);
-        try exported_resource_type_idx.put(ar, er.name, comp_type_idx);
+        try exported_resource_type_idx.put(ar, identity, comp_type_idx);
         comp_type_idx += 1;
     }
 
@@ -3694,7 +3718,7 @@ fn buildComponentShimFixup(
                 try aliases.append(ar, .{ .instance_export = .{
                     .sort = .type,
                     .instance_idx = d.owner_inst_idx,
-                    .name = d.resource,
+                    .name = d.resource.name,
                 } });
                 try Section.appendAlias(&order, ar, aliases.items.len);
                 const idx = comp_type_idx;
@@ -3741,18 +3765,20 @@ fn buildComponentShimFixup(
                     if (grp.elem_raw) |raw| {
                         const er = HandleResolver{
                             .ar = ar,
+                            .resource_iface = grp.elem_owner orelse return error.UnresolvedResource,
+                            .world_decls = decoded.world_decls,
                             .ext_slots = eslots,
                             .types = &types,
                             .aliases = &aliases,
-                            .resource_owner = &resource_owner,
+                            .resources = &resource_registry,
                             .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
                             .type_owner = &type_owner,
                             .type_alias_idx = &type_alias_idx,
                             .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
-                            .hoist_keys = &hoist_keys,
-                            .hoist_idxs = &hoist_idxs,
+                            .own_handle_idx = &own_handle_idx,
+                            .borrow_handle_idx = &borrow_handle_idx,
                             .comp_type_idx = &comp_type_idx,
                             .order = &order,
                             .elem_owner = grp.elem_owner,
@@ -3794,18 +3820,20 @@ fn buildComponentShimFixup(
                     if (grp.elem_raw) |raw| {
                         const er = HandleResolver{
                             .ar = ar,
+                            .resource_iface = grp.elem_owner orelse return error.UnresolvedResource,
+                            .world_decls = decoded.world_decls,
                             .ext_slots = eslots,
                             .types = &types,
                             .aliases = &aliases,
-                            .resource_owner = &resource_owner,
+                            .resources = &resource_registry,
                             .import_inst_idx_for = &import_inst_idx_for,
                             .resource_alias_idx = &resource_alias_idx,
                             .type_owner = &type_owner,
                             .type_alias_idx = &type_alias_idx,
                             .local_named_idx = &local_named_idx,
                             .exported_resource_type_idx = &exported_resource_type_idx,
-                            .hoist_keys = &hoist_keys,
-                            .hoist_idxs = &hoist_idxs,
+                            .own_handle_idx = &own_handle_idx,
+                            .borrow_handle_idx = &borrow_handle_idx,
                             .comp_type_idx = &comp_type_idx,
                             .order = &order,
                             .elem_owner = grp.elem_owner,
@@ -3897,18 +3925,20 @@ fn buildComponentShimFixup(
                     // of leaking a metadata-local slot index.
                     const er = HandleResolver{
                         .ar = ar,
+                        .resource_iface = ext.qualified_name,
+                        .world_decls = decoded.world_decls,
                         .ext_slots = ext.type_slots,
                         .types = &types,
                         .aliases = &aliases,
-                        .resource_owner = &resource_owner,
+                        .resources = &resource_registry,
                         .import_inst_idx_for = &import_inst_idx_for,
                         .resource_alias_idx = &resource_alias_idx,
                         .type_owner = &type_owner,
                         .type_alias_idx = &type_alias_idx,
                         .local_named_idx = &local_named_idx,
                         .exported_resource_type_idx = &exported_resource_type_idx,
-                        .hoist_keys = &hoist_keys,
-                        .hoist_idxs = &hoist_idxs,
+                        .own_handle_idx = &own_handle_idx,
+                        .borrow_handle_idx = &borrow_handle_idx,
                         .comp_type_idx = &comp_type_idx,
                         .order = &order,
                     };
@@ -4314,18 +4344,20 @@ fn buildComponentShimFixup(
         if (!ext.is_export) continue;
         const resolver = HandleResolver{
             .ar = ar,
+            .resource_iface = ext.qualified_name,
+            .world_decls = decoded.world_decls,
             .ext_slots = ext.type_slots,
             .types = &types,
             .aliases = &aliases,
-            .resource_owner = &resource_owner,
+            .resources = &resource_registry,
             .import_inst_idx_for = &import_inst_idx_for,
             .resource_alias_idx = &resource_alias_idx,
             .type_owner = &type_owner,
             .type_alias_idx = &type_alias_idx,
             .local_named_idx = &local_named_idx,
             .exported_resource_type_idx = &exported_resource_type_idx,
-            .hoist_keys = &hoist_keys,
-            .hoist_idxs = &hoist_idxs,
+            .own_handle_idx = &own_handle_idx,
+            .borrow_handle_idx = &borrow_handle_idx,
             .comp_type_idx = &comp_type_idx,
             .order = &order,
         };
@@ -4469,9 +4501,13 @@ fn buildComponentShimFixup(
             const comp_idx: u32 = @intCast(nested_components.items.len - 1);
             var args = std.ArrayListUnmanaged(ctypes.InstantiateArg).empty;
             for (res_names.items) |rn| {
+                const identity = ResourceIdentity{
+                    .provider = es.ext.qualified_name,
+                    .name = rn,
+                };
                 try args.append(ar, .{
                     .name = try nestedTypeImportName(ar, rn),
-                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(rn).? },
+                    .sort_idx = .{ .sort = .type, .idx = exported_resource_type_idx.get(identity).? },
                 });
             }
             for (0..fn_count) |i| {
@@ -6289,6 +6325,15 @@ fn countResourceDrops(loaded: anytype) usize {
     return n;
 }
 
+fn countResourceTypeDefs(loaded: anytype) usize {
+    var n: usize = 0;
+    for (loaded.types) |t| switch (t) {
+        .resource => n += 1,
+        else => {},
+    };
+    return n;
+}
+
 fn mainWithArgFor(loaded: anytype, name: []const u8) bool {
     for (loaded.core_instances) |ci| switch (ci) {
         .instantiate => |inst| for (inst.args) |arg| {
@@ -6297,6 +6342,158 @@ fn mainWithArgFor(loaded: anytype, name: []const u8) bool {
         else => {},
     };
     return false;
+}
+
+fn hasTypeAliasFrom(loaded: anytype, instance_idx: u32, name: []const u8) bool {
+    for (loaded.aliases) |alias| switch (alias) {
+        .instance_export => |ie| {
+            if (ie.sort == .type and ie.instance_idx == instance_idx and
+                std.mem.eql(u8, ie.name, name))
+            {
+                return true;
+            }
+        },
+        else => {},
+    };
+    return false;
+}
+
+test "buildComponent: same-named resources from two provider interfaces stay distinct" {
+    const wit =
+        \\package test:resource-identity@0.1.0;
+        \\
+        \\interface left { resource item; }
+        \\interface right { resource item; }
+        \\interface runner { run: func(); }
+        \\
+        \\world w {
+        \\    import left;
+        \\    import right;
+        \\    export runner;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "test:resource-identity/left@0.1.0" "[resource-drop]item" (func (param i32)))
+        \\  (import "test:resource-identity/right@0.1.0" "[resource-drop]item" (func (param i32)))
+        \\  (func (export "test:resource-identity/runner@0.1.0#run"))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), countResourceDrops(loaded));
+    try testing.expect(hasTypeAliasFrom(loaded, 0, "item"));
+    try testing.expect(hasTypeAliasFrom(loaded, 1, "item"));
+    try testing.expect(mainWithArgFor(loaded, "test:resource-identity/left@0.1.0"));
+    try testing.expect(mainWithArgFor(loaded, "test:resource-identity/right@0.1.0"));
+}
+
+test "buildComponent: renamed resource alias retains provider canonical identity" {
+    const wit =
+        \\package test:resource-alias@0.1.0;
+        \\
+        \\interface provider { resource canonical; }
+        \\interface consumer {
+        \\    use provider.{canonical as renamed};
+        \\    take: func(value: renamed, label: string);
+        \\}
+        \\
+        \\world w {
+        \\    import provider;
+        \\    export consumer;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (func (export "test:resource-alias/consumer@0.1.0#take") (param i32 i32 i32))
+        \\  (memory (export "memory") 1)
+        \\  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 3), loaded.core_modules.len);
+    try testing.expect(hasTypeAliasFrom(loaded, 0, "canonical"));
+    try testing.expect(!hasTypeAliasFrom(loaded, 0, "renamed"));
+}
+
+test "buildComponent: exported resource intrinsic matching is interface-qualified" {
+    const wit =
+        \\package test:exported-resource-identity@0.1.0;
+        \\
+        \\interface left { resource item; }
+        \\interface right { resource other; }
+        \\
+        \\world w {
+        \\    export left;
+        \\    export right;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:exported-resource-identity/right@0.1.0" "[resource-new]item" (func (param i32) (result i32)))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    try testing.expectError(
+        error.UnresolvedResourceIntrinsic,
+        buildComponent(testing.allocator, core),
+    );
+}
+
+test "buildComponent: same-named exported resources keep separate identities" {
+    const wit =
+        \\package test:exported-resource-twins@0.1.0;
+        \\
+        \\interface left { resource item; }
+        \\interface right { resource item; }
+        \\
+        \\world w {
+        \\    export left;
+        \\    export right;
+        \\}
+    ;
+    const wat =
+        \\(module
+        \\  (import "[export]test:exported-resource-twins/left@0.1.0" "[resource-new]item" (func (param i32) (result i32)))
+        \\  (import "[export]test:exported-resource-twins/right@0.1.0" "[resource-rep]item" (func (param i32) (result i32)))
+        \\)
+    ;
+    const core = try buildCoreFromWat(testing.allocator, wat, wit, "w");
+    defer testing.allocator.free(core);
+    const comp_bytes = try buildComponent(testing.allocator, core);
+    defer testing.allocator.free(comp_bytes);
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const loaded = try loader.load(comp_bytes, arena.allocator());
+
+    try testing.expectEqual(@as(usize, 2), countResourceTypeDefs(loaded));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_new));
+    try testing.expectEqual(@as(usize, 1), countCanon(loaded, .resource_rep));
+    try testing.expect(mainWithArgFor(
+        loaded,
+        "[export]test:exported-resource-twins/left@0.1.0",
+    ));
+    try testing.expect(mainWithArgFor(
+        loaded,
+        "[export]test:exported-resource-twins/right@0.1.0",
+    ));
 }
 
 fn countTaskReturns(loaded: anytype) usize {

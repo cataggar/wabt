@@ -99,6 +99,37 @@ pub const TypeSlot = union(enum) {
     typedef: ctypes.TypeDef,
 };
 
+/// Canonical identity of a WIT resource. Resource names are scoped to the
+/// interface that defines them, so both fields participate in identity.
+pub const ResourceIdentity = struct {
+    provider: []const u8,
+    name: []const u8,
+};
+
+const ResourceIdentityContext = struct {
+    pub fn hash(_: ResourceIdentityContext, key: ResourceIdentity) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(key.provider);
+        h.update("\x00");
+        h.update(key.name);
+        return h.final();
+    }
+
+    pub fn eql(_: ResourceIdentityContext, a: ResourceIdentity, b: ResourceIdentity) bool {
+        return std.mem.eql(u8, a.provider, b.provider) and
+            std.mem.eql(u8, a.name, b.name);
+    }
+};
+
+pub fn ResourceIdentityMap(comptime Value: type) type {
+    return std.HashMapUnmanaged(
+        ResourceIdentity,
+        Value,
+        ResourceIdentityContext,
+        std.hash_map.default_max_load_percentage,
+    );
+}
+
 pub const WorldExtern = struct {
     is_export: bool,
     /// Qualified name on the wire (e.g. `docs:adder/add@0.1.0`).
@@ -153,12 +184,144 @@ pub const DecodedWorld = struct {
     world_decls: []const ctypes.Decl,
 };
 
-/// Return the WIT-visible name of the resource bound at `slot`,
-/// or null if the slot doesn't carry a name. A resource's
-/// canonical name is on its `.sub_resource` slot (locally
-/// declared) or `.export_eq` slot (use-imported) — both carry the
-/// WIT name directly. Alias slots are anonymous in the local
-/// interface scope.
+pub const ResourceRegistryError = error{
+    OutOfMemory,
+    ConflictingResourceIdentity,
+};
+
+/// Canonical resource definitions and interface-visible bindings from one
+/// decoded world. Visible bindings are resolved to a fixed point so chains of
+/// `use` re-exports retain the original provider and source name.
+pub const ResourceRegistry = struct {
+    definitions: ResourceIdentityMap(void),
+    visible: ResourceIdentityMap(ResourceIdentity),
+
+    pub fn init(
+        ar: Allocator,
+        decoded: DecodedWorld,
+    ) ResourceRegistryError!ResourceRegistry {
+        return initFiltered(ar, decoded, true);
+    }
+
+    /// Build the registry used by adapter/reactor lifting. Guest-defined
+    /// exported resources are deliberately excluded so the existing
+    /// unsupported-resource gates remain authoritative.
+    pub fn initImports(
+        ar: Allocator,
+        decoded: DecodedWorld,
+    ) ResourceRegistryError!ResourceRegistry {
+        return initFiltered(ar, decoded, false);
+    }
+
+    fn initFiltered(
+        ar: Allocator,
+        decoded: DecodedWorld,
+        include_exports: bool,
+    ) ResourceRegistryError!ResourceRegistry {
+        var definitions = ResourceIdentityMap(void).empty;
+        for (decoded.externs) |ext| {
+            if (ext.is_export and !include_exports) continue;
+            for (ext.type_slots) |slot| switch (slot) {
+                .sub_resource => |name| try definitions.put(ar, .{
+                    .provider = ext.qualified_name,
+                    .name = name,
+                }, {}),
+                else => {},
+            };
+        }
+
+        var visible = ResourceIdentityMap(ResourceIdentity).empty;
+        var def_it = definitions.iterator();
+        while (def_it.next()) |entry| {
+            try visible.put(ar, entry.key_ptr.*, entry.key_ptr.*);
+        }
+
+        var made_progress = true;
+        while (made_progress) {
+            made_progress = false;
+            for (decoded.externs) |ext| {
+                for (ext.type_slots, 0..) |slot, i| {
+                    const visible_name = switch (slot) {
+                        .export_eq => |e| e.name,
+                        else => continue,
+                    };
+                    const raw_identity = resourceIdentityForSlot(
+                        ext.qualified_name,
+                        ext.type_slots,
+                        decoded.world_decls,
+                        @intCast(i),
+                    ) orelse continue;
+                    const identity = if (definitions.contains(raw_identity))
+                        raw_identity
+                    else
+                        visible.get(raw_identity) orelse continue;
+                    const visible_identity = ResourceIdentity{
+                        .provider = ext.qualified_name,
+                        .name = visible_name,
+                    };
+                    const gop = try visible.getOrPut(ar, visible_identity);
+                    if (gop.found_existing) {
+                        if (!ResourceIdentityContext.eql(
+                            .{},
+                            gop.value_ptr.*,
+                            identity,
+                        )) return error.ConflictingResourceIdentity;
+                        continue;
+                    }
+                    gop.value_ptr.* = identity;
+                    made_progress = true;
+                }
+            }
+        }
+        return .{ .definitions = definitions, .visible = visible };
+    }
+
+    pub fn canonicalIdentity(
+        self: *const @This(),
+        identity: ResourceIdentity,
+    ) ?ResourceIdentity {
+        var current = identity;
+        var hops: usize = 0;
+        while (hops <= self.visible.count()) : (hops += 1) {
+            if (self.definitions.contains(current)) return current;
+            current = self.visible.get(current) orelse return null;
+        }
+        return null;
+    }
+
+    pub fn identityForSlot(
+        self: *const @This(),
+        ext: WorldExtern,
+        world_decls: []const ctypes.Decl,
+        slot: u32,
+    ) ?ResourceIdentity {
+        const identity = resourceIdentityForSlot(
+            ext.qualified_name,
+            ext.type_slots,
+            world_decls,
+            slot,
+        ) orelse return null;
+        return self.canonicalIdentity(identity);
+    }
+
+    pub fn identityForVisible(
+        self: *const @This(),
+        iface: []const u8,
+        name: []const u8,
+    ) ?ResourceIdentity {
+        const identity = self.visible.get(.{
+            .provider = iface,
+            .name = name,
+        }) orelse return null;
+        return self.canonicalIdentity(identity);
+    }
+};
+
+/// Return the interface-visible name of the resource bound at `slot`, or null
+/// if the slot doesn't carry a name. For a renamed `use`, `.export_eq` carries
+/// the local alias; use `resourceIdentityForSlot` when canonical provider
+/// identity is required. Alias slots are anonymous in the local interface
+/// scope.
 pub fn resourceNameForSlot(slots: []const TypeSlot, slot: u32) ?[]const u8 {
     if (slot >= slots.len) return null;
     return switch (slots[slot]) {
@@ -166,6 +329,108 @@ pub fn resourceNameForSlot(slots: []const TypeSlot, slot: u32) ?[]const u8 {
         .export_eq => |e| e.name,
         else => null,
     };
+}
+
+/// Resolve a resource slot to its defining interface and canonical source
+/// name. For `use source.{resource as renamed}`, the local `.export_eq`
+/// contributes `renamed`, but its outer alias still points at
+/// `(source, resource)`; this helper follows that provenance instead of
+/// treating the visible alias as a new resource identity.
+pub fn resourceIdentityForSlot(
+    local_iface: []const u8,
+    slots: []const TypeSlot,
+    world_decls: []const ctypes.Decl,
+    slot: u32,
+) ?ResourceIdentity {
+    var cur = slot;
+    var hops: usize = 0;
+    while (hops <= slots.len) : (hops += 1) {
+        if (cur >= slots.len) return null;
+        switch (slots[cur]) {
+            .sub_resource => |name| return .{
+                .provider = local_iface,
+                .name = name,
+            },
+            .export_eq => |e| cur = e.target,
+            .alias_outer => |world_slot| return worldResourceIdentity(world_decls, world_slot),
+            .alias_instance_export => |ie| return .{
+                .provider = worldInstanceName(world_decls, ie.instance_idx) orelse return null,
+                .name = ie.name,
+            },
+            .val => |v| switch (v) {
+                .type_idx, .own, .borrow => |target| cur = target,
+                else => return null,
+            },
+            .typedef => return null,
+        }
+    }
+    return null;
+}
+
+fn worldResourceIdentity(
+    world_decls: []const ctypes.Decl,
+    target: u32,
+) ?ResourceIdentity {
+    var type_idx: u32 = 0;
+    for (world_decls) |decl| switch (decl) {
+        .type => type_idx += 1,
+        .core_type => {},
+        .alias => |alias| {
+            const sort = switch (alias) {
+                .instance_export => |ie| ie.sort,
+                .outer => |outer| outer.sort,
+            };
+            if (sort != .type) continue;
+            if (type_idx == target) return switch (alias) {
+                .instance_export => |ie| .{
+                    .provider = worldInstanceName(world_decls, ie.instance_idx) orelse return null,
+                    .name = ie.name,
+                },
+                .outer => null,
+            };
+            type_idx += 1;
+        },
+        .import => |im| if (im.desc == .type) {
+            if (type_idx == target) return switch (im.desc.type) {
+                .eq => |idx| worldResourceIdentity(world_decls, idx),
+                .sub_resource => null,
+            };
+            type_idx += 1;
+        },
+        .@"export" => |e| if (e.desc == .type) {
+            if (type_idx == target) return switch (e.desc.type) {
+                .eq => |idx| worldResourceIdentity(world_decls, idx),
+                .sub_resource => null,
+            };
+            type_idx += 1;
+        },
+    };
+    return null;
+}
+
+fn worldInstanceName(world_decls: []const ctypes.Decl, target: u32) ?[]const u8 {
+    var instance_idx: u32 = 0;
+    for (world_decls) |decl| switch (decl) {
+        .alias => |alias| {
+            const sort = switch (alias) {
+                .instance_export => |ie| ie.sort,
+                .outer => |outer| outer.sort,
+            };
+            if (sort != .instance) continue;
+            if (instance_idx == target) return null;
+            instance_idx += 1;
+        },
+        .import => |im| if (im.desc == .instance) {
+            if (instance_idx == target) return im.name;
+            instance_idx += 1;
+        },
+        .@"export" => |e| if (e.desc == .instance) {
+            if (instance_idx == target) return e.name;
+            instance_idx += 1;
+        },
+        else => {},
+    };
+    return null;
 }
 
 /// Return the WIT-visible name of the named (non-resource) type bound at

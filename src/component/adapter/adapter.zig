@@ -46,6 +46,12 @@ const lift_types = @import("../wit/lift_types.zig");
 const type_walk = @import("../type_walk.zig");
 const resource_intrinsics = @import("../resource_intrinsics.zig");
 const leb = @import("../../leb128.zig");
+const ResourceIdentity = metadata_decode.ResourceIdentity;
+const ResourceRegistry = metadata_decode.ResourceRegistry;
+
+fn ResourceMap(comptime Value: type) type {
+    return metadata_decode.ResourceIdentityMap(Value);
+}
 
 pub const SpliceError = error{
     OutOfMemory,
@@ -1353,16 +1359,17 @@ test "world type provenance resolves the providing interface" {
 /// component's type space before reactor exports are lifted.
 const ReactorLiftCtx = struct {
     b: *Builder,
+    ext_qualified: []const u8,
     ext_slots: []const metadata_decode.TypeSlot,
     world_decls: []const ctypes.Decl,
     hoisted: *const types_import.Hoisted,
     embed_extra_iface_inst_for_ns: *const std.StringHashMapUnmanaged(u32),
-    resource_owner: *const std.StringHashMapUnmanaged([]const u8),
+    resources: *const ResourceRegistry,
     type_owner: *const std.StringHashMapUnmanaged([]const u8),
-    resource_alias_idx: *std.StringHashMapUnmanaged(u32),
+    resource_alias_idx: *ResourceMap(u32),
     type_alias_idx: *std.StringHashMapUnmanaged(u32),
-    own_handle_idx: *std.StringHashMapUnmanaged(u32),
-    borrow_handle_idx: *std.StringHashMapUnmanaged(u32),
+    own_handle_idx: *ResourceMap(u32),
+    borrow_handle_idx: *ResourceMap(u32),
     value_type_idx: *std.AutoHashMapUnmanaged(u32, u32),
 
     pub fn addType(self: @This(), td: ctypes.TypeDef) lift_types.Error!u32 {
@@ -1403,7 +1410,15 @@ const ReactorLiftCtx = struct {
         if (self.importedTypeSource(target)) |source| {
             return self.importedTypeAlias(source.owner, source.name);
         }
-        if (self.resource_owner.contains(name)) return self.resourceAlias(name);
+        if (metadata_decode.resourceIdentityForSlot(
+            self.ext_qualified,
+            self.ext_slots,
+            self.world_decls,
+            target,
+        )) |visible_identity| {
+            if (self.resources.canonicalIdentity(visible_identity)) |identity|
+                return self.resourceAlias(identity);
+        }
         if (self.type_owner.contains(name)) return self.typeAlias(name);
         return self.localType(target);
     }
@@ -1432,12 +1447,10 @@ const ReactorLiftCtx = struct {
         return idx;
     }
 
-    fn resourceAlias(self: @This(), name: []const u8) lift_types.Error!u32 {
-        if (self.resource_alias_idx.get(name)) |idx| return idx;
-        const owner = self.resource_owner.get(name) orelse
-            return error.UnresolvedResource;
-        const idx = try self.importedTypeAlias(owner, name);
-        try self.resource_alias_idx.put(self.b.arena, name, idx);
+    fn resourceAlias(self: @This(), identity: ResourceIdentity) lift_types.Error!u32 {
+        if (self.resource_alias_idx.get(identity)) |idx| return idx;
+        const idx = try self.importedTypeAlias(identity.provider, identity.name);
+        try self.resource_alias_idx.put(self.b.arena, identity, idx);
         return idx;
     }
 
@@ -1493,31 +1506,25 @@ const ReactorLiftCtx = struct {
         slot: u32,
         comptime kind: enum { own, borrow },
     ) lift_types.Error!u32 {
-        const name = metadata_decode.resourceNameForSlot(self.ext_slots, slot) orelse
+        const visible_identity = metadata_decode.resourceIdentityForSlot(
+            self.ext_qualified,
+            self.ext_slots,
+            self.world_decls,
+            slot,
+        ) orelse
             return error.UnresolvedResource;
-        const target = slotTarget(self.ext_slots, slot);
-        const source = self.importedTypeSource(target);
-        const key = if (source) |imported|
-            try std.fmt.allocPrint(
-                self.b.arena,
-                "{s}|{s}",
-                .{ imported.owner, imported.name },
-            )
-        else
-            name;
+        const identity = self.resources.canonicalIdentity(visible_identity) orelse
+            return error.UnresolvedResource;
         const cache = if (kind == .own) self.own_handle_idx else self.borrow_handle_idx;
-        if (cache.get(key)) |idx| return idx;
+        if (cache.get(identity)) |idx| return idx;
 
-        const resource_idx = if (source) |imported|
-            try self.importedTypeAlias(imported.owner, imported.name)
-        else
-            try self.resourceAlias(name);
+        const resource_idx = try self.resourceAlias(identity);
         const val: ctypes.ValType = if (kind == .own)
             .{ .own = resource_idx }
         else
             .{ .borrow = resource_idx };
         const idx = try self.b.addType(.{ .val = val });
-        try cache.put(self.b.arena, key, idx);
+        try cache.put(self.b.arena, identity, idx);
         return idx;
     }
 };
@@ -1546,21 +1553,25 @@ test "ReactorLiftCtx: named export and function share one value type" {
         .type_count = 0,
     };
     var extra_interfaces = std.StringHashMapUnmanaged(u32).empty;
-    var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+    const resources = ResourceRegistry{
+        .definitions = .empty,
+        .visible = .empty,
+    };
     var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
     try type_owner.put(a, "point", "unrelated:types/provider");
-    var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+    var resource_alias_idx = ResourceMap(u32).empty;
     var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
-    var own_handle_idx = std.StringHashMapUnmanaged(u32).empty;
-    var borrow_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+    var own_handle_idx = ResourceMap(u32).empty;
+    var borrow_handle_idx = ResourceMap(u32).empty;
     var value_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
     const ctx = ReactorLiftCtx{
         .b = &b,
+        .ext_qualified = "test:types/consumer",
         .ext_slots = &slots,
         .world_decls = &.{},
         .hoisted = &hoisted,
         .embed_extra_iface_inst_for_ns = &extra_interfaces,
-        .resource_owner = &resource_owner,
+        .resources = &resources,
         .type_owner = &type_owner,
         .resource_alias_idx = &resource_alias_idx,
         .type_alias_idx = &type_alias_idx,
@@ -2111,24 +2122,18 @@ fn assemble(in: Inputs) ![]u8 {
         };
         if (!any_export) return error.UnsupportedAdapterShape;
 
-        var resource_owner = std.StringHashMapUnmanaged([]const u8).empty;
+        const resources = ResourceRegistry.initImports(a, decoded) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ConflictingResourceIdentity => return error.UnsupportedAdapterShape,
+        };
         var type_owner = std.StringHashMapUnmanaged([]const u8).empty;
-        var resource_alias_idx = std.StringHashMapUnmanaged(u32).empty;
+        var resource_alias_idx = ResourceMap(u32).empty;
         var type_alias_idx = std.StringHashMapUnmanaged(u32).empty;
-        var own_handle_idx = std.StringHashMapUnmanaged(u32).empty;
-        var borrow_handle_idx = std.StringHashMapUnmanaged(u32).empty;
+        var own_handle_idx = ResourceMap(u32).empty;
+        var borrow_handle_idx = ResourceMap(u32).empty;
         for (decoded.externs) |ext| {
             if (ext.is_export) continue;
             for (ext.type_slots) |slot| switch (slot) {
-                .sub_resource => |name| {
-                    const gop = try resource_owner.getOrPut(a, name);
-                    if (gop.found_existing and
-                        !std.mem.eql(u8, gop.value_ptr.*, ext.qualified_name))
-                    {
-                        return error.UnsupportedAdapterShape;
-                    }
-                    gop.value_ptr.* = ext.qualified_name;
-                },
                 .export_eq => |type_export| {
                     const gop = try type_owner.getOrPut(a, type_export.name);
                     if (!gop.found_existing) gop.value_ptr.* = ext.qualified_name;
@@ -2147,11 +2152,12 @@ fn assemble(in: Inputs) ![]u8 {
             var value_type_idx = std.AutoHashMapUnmanaged(u32, u32).empty;
             const lift_ctx = ReactorLiftCtx{
                 .b = &b,
+                .ext_qualified = ext.qualified_name,
                 .ext_slots = ext.type_slots,
                 .world_decls = decoded.world_decls,
                 .hoisted = &in.hoisted,
                 .embed_extra_iface_inst_for_ns = &embed_extra_iface_inst_for_ns,
-                .resource_owner = &resource_owner,
+                .resources = &resources,
                 .type_owner = &type_owner,
                 .resource_alias_idx = &resource_alias_idx,
                 .type_alias_idx = &type_alias_idx,
