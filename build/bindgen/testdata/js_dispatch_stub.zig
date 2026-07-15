@@ -28,6 +28,16 @@ pub fn dropExportResource(
     _ = rep;
 }
 
+pub fn prepareExportResourceOwn(
+    comptime provider: []const u8,
+    comptime resource_name: []const u8,
+    rep: i32,
+) void {
+    _ = provider;
+    _ = resource_name;
+    _ = rep;
+}
+
 pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.Allocator) T {
     _ = value;
     _ = allocator;
@@ -54,6 +64,10 @@ pub fn commitNativeResources(
     _ = value;
     _ = allocator;
     return true;
+}
+
+pub fn completeNativeResult(comptime T: type, value: T) void {
+    _ = value;
 }
 
 pub fn freeNativeArena(arena: ?*anyopaque) void {

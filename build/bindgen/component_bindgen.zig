@@ -1301,6 +1301,12 @@ const Gen = struct {
             self.raw(
                 "    const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);\n",
             );
+            self.raw(
+                "    _ = wit_types.mapResources(@TypeOf(__dispatch_params), __dispatch_params, __wit_prepare_export_resource, &wit_types.alloc);\n",
+            );
+            self.raw(
+                "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+            );
         }
 
         const args = try self.implArgListFrom(method.func.params, "__dispatch_params");
@@ -1319,11 +1325,6 @@ const Gen = struct {
                 "    __wit_dispatch.call(\"{s}\", void, {s});\n",
                 .{ export_sym, dispatch_args.items },
             );
-            if (method.func.params.len != 0) {
-                self.raw(
-                    "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
-                );
-            }
             self.raw("    return;\n");
         } else {
             self.print(
@@ -1334,11 +1335,10 @@ const Gen = struct {
                 "    const __canonical_result = wit_types.mapResources({s}, __result, __wit_lower_export_resource, &wit_types.alloc);\n",
                 .{result_zig},
             );
-            if (method.func.params.len != 0) {
-                self.raw(
-                    "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
-                );
-            }
+            self.print(
+                "    __wit_dispatch.completeNativeResult({s}, __result);\n",
+                .{result_zig},
+            );
             self.print(
                 "    return wit_types.returnResult({s}, __canonical_result, &wit_types.alloc);\n",
                 .{result_zig},
@@ -1412,6 +1412,12 @@ const Gen = struct {
             self.raw(
                 "    const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);\n",
             );
+            self.raw(
+                "    _ = wit_types.mapResources(@TypeOf(__dispatch_params), __dispatch_params, __wit_prepare_export_resource, &wit_types.alloc);\n",
+            );
+            self.raw(
+                "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+            );
         }
         const args = try self.implArgListFrom(
             func.params,
@@ -1427,11 +1433,6 @@ const Gen = struct {
                     "    __wit_dispatch.call(\"{s}\", void, {s});\n",
                     .{ export_sym, dispatch_args },
                 );
-                if (map_resources and func.params.len != 0) {
-                    self.raw(
-                        "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
-                    );
-                }
                 self.raw("    return;\n");
             } else {
                 self.print(
@@ -1443,10 +1444,9 @@ const Gen = struct {
                         "    const __canonical_result = wit_types.mapResources({s}, __result, __wit_lower_export_resource, &wit_types.alloc);\n",
                         .{result_zig},
                     );
-                }
-                if (map_resources and func.params.len != 0) {
-                    self.raw(
-                        "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+                    self.print(
+                        "    __wit_dispatch.completeNativeResult({s}, __result);\n",
+                        .{result_zig},
                     );
                 }
                 self.print(
@@ -2720,8 +2720,8 @@ const Gen = struct {
     /// Emit the provider-qualified callbacks used by
     /// `wit_types.mapResources`. Incoming canonical handles become reps before
     /// JavaScript dispatch; returned owned reps become fresh canonical handles;
-    /// incoming owned handles are consumed after the dispatch result has been
-    /// lowered, while borrows remain live.
+    /// incoming owned handles are pinned across their pre-dispatch canonical
+    /// drop, while borrows remain live.
     fn emitExportResourceMappers(self: *Gen) GenError!void {
         self.raw(
             \\fn __wit_lift_export_resource(comptime T: type, value: T) T {
@@ -2738,6 +2738,29 @@ const Gen = struct {
                 "        return .{{ .handle = if (comptime info.ownership == .own) {s}.__wit_rep(value.handle) else value.handle }};\n",
                 .{R},
             );
+            self.raw("    }\n");
+        }
+        self.raw(
+            \\    return value;
+            \\}
+            \\
+            \\fn __wit_prepare_export_resource(comptime T: type, value: T) T {
+            \\    const info = comptime wit_types.resourceInfo(T).?;
+            \\
+        );
+        for (self.export_resources.items) |resource| {
+            const R = try self.exportResourceTypeName(resource);
+            self.print(
+                "    if (comptime {s}.__wit_resource.eql(info.descriptor)) {{\n",
+                .{R},
+            );
+            self.raw("        if (comptime info.ownership == .own) {\n");
+            self.print(
+                "            __wit_dispatch.prepareExportResourceOwn(\"{s}\", \"{s}\", value.handle);\n",
+                .{ resource.provider, resource.name },
+            );
+            self.raw("        }\n");
+            self.raw("        return value;\n");
             self.raw("    }\n");
         }
         self.raw(
@@ -4420,8 +4443,8 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         ) != null);
 
         // Ordinary exported functions map resource handles recursively through
-        // reps, lower returned own reps through resource-new, and consume only
-        // incoming own canonical handles after dispatch.
+        // reps, consume incoming own canonical handles before dispatch so
+        // throws cannot leak them, then lower and commit returned resources.
         try testing.expect(std.mem.indexOf(
             u8,
             out,
@@ -4432,10 +4455,13 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
             out,
             "const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);",
         ) != null);
-        try testing.expect(std.mem.indexOf(
-            u8,
-            out,
-            "_ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);",
+        try testing.expect(std.mem.indexOf(u8, out,
+            \\    const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);
+            \\    _ = wit_types.mapResources(@TypeOf(__dispatch_params), __dispatch_params, __wit_prepare_export_resource, &wit_types.alloc);
+            \\    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);
+            \\    const __result = __wit_dispatch.call("test:res/counters#transfer", wit_types.Own(Counter), .{ __dispatch_params.value });
+            \\    const __canonical_result = wit_types.mapResources(wit_types.Own(Counter), __result, __wit_lower_export_resource, &wit_types.alloc);
+            \\    __wit_dispatch.completeNativeResult(wit_types.Own(Counter), __result);
         ) != null);
         try testing.expect(std.mem.indexOf(
             u8,
