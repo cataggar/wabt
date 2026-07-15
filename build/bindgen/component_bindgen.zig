@@ -59,15 +59,21 @@ pub const usage =
     \\                      manifest convention is:
     \\                        interface: <iface>\t<fn>\t<iface>#<fn>\t<arity>
     \\                        root:      <fn>\tdefault\t$root#<fn>\t<arity>
+    \\                        resource:  R\t<provider>\t<name>\t<class>
+    \\                        operation: C|M|S\t<provider>\t<name>\t<js-name>
+    \\                                   \t<canonical-dispatch-key>\t<arity>
     \\                      The root form matches ComponentizeJS default imports.
     \\                      Requires --dispatch. Every imported function's
     \\                      parameter/result types must be within the native
     \\                      bridge's supported set (bool, integers, f32/f64,
-    \\                      char, string, option<T>, list<T>, tuple, record,
+    \\                      char, string, resources (with exact own/borrow
+    \\                      ownership), option<T>, list<T>, tuple, record,
     \\                      variant, enum, <=32-label flags, and result<T,E>,
-    \\                      recursively). Resources, future/stream,
-    \\                      error-context, async functions, and >32-label flags
-    \\                      fail deterministically rather than being skipped.
+    \\                      recursively). Imported resource classes include
+    \\                      constructors, methods, statics, and finalizer-driven
+    \\                      canonical drops. Future/stream, error-context,
+    \\                      canonical async functions, and >32-label flags fail
+    \\                      deterministically rather than being skipped.
     \\  -o, --output <file> Output .zig file (default: stdout)
     \\
 ;
@@ -218,7 +224,14 @@ const ChanDecl = struct { name: []const u8, rhs: []const u8 };
 /// Per-interface view of a named type: its kind and the interface whose name
 /// drives the emitted Zig identifier (the definer — itself for a local type, or
 /// the source for a `use`d type).
-const ScopedType = struct { kind: ast.TypeDefKind, def_iface: []const u8 };
+const ScopedType = struct {
+    kind: ast.TypeDefKind,
+    def_iface: []const u8,
+    /// Original name in `def_iface`. Unlike the consumer-visible lookup key,
+    /// this survives `use ... as ...` chains and identifies resources without
+    /// falling back to a collision-prone bare resource name.
+    def_name: []const u8,
+};
 
 /// A named type pulled in through a `use`. `scope_id` is the interface that
 /// owns the type body's references, while `name` is the name emitted in Zig.
@@ -375,7 +388,11 @@ const Gen = struct {
         for (world.items) |item| switch (item) {
             .type => |td| {
                 try self.types.put(self.ar, td.name, td.kind);
-                try self.scoped.put(self.ar, self.scopeKey("$root", td.name), .{ .kind = td.kind, .def_iface = "$root" });
+                try self.scoped.put(self.ar, self.scopeKey("$root", td.name), .{
+                    .kind = td.kind,
+                    .def_iface = "$root",
+                    .def_name = td.name,
+                });
                 try world_types.append(self.ar, td);
                 const gop = try local_def_iface.getOrPut(self.ar, td.name);
                 if (gop.found_existing) {
@@ -408,7 +425,11 @@ const Gen = struct {
             for (u.iface.items) |it| switch (it) {
                 .type => |td| {
                     try self.types.put(self.ar, td.name, td.kind);
-                    try self.scoped.put(self.ar, self.scopeKey(u.id, td.name), .{ .kind = td.kind, .def_iface = u.id });
+                    try self.scoped.put(self.ar, self.scopeKey(u.id, td.name), .{
+                        .kind = td.kind,
+                        .def_iface = u.id,
+                        .def_name = td.name,
+                    });
                     const gop = try local_def_iface.getOrPut(self.ar, td.name);
                     if (gop.found_existing) {
                         if (!std.mem.eql(u8, gop.value_ptr.*, u.id))
@@ -742,7 +763,11 @@ const Gen = struct {
         const key = self.scopeKey(iface_id, name);
         if (!indexed.contains(key)) {
             try indexed.put(self.ar, key, {});
-            try self.scoped.put(self.ar, key, .{ .kind = td.kind, .def_iface = iface_id });
+            try self.scoped.put(self.ar, key, .{
+                .kind = td.kind,
+                .def_iface = iface_id,
+                .def_name = td.name,
+            });
             try self.types.put(self.ar, name, td.kind);
             try self.indexTypeDefDependencies(
                 indexed,
@@ -1308,6 +1333,15 @@ const Gen = struct {
     /// `self` expression to prepend for a method (null for a free func/static).
     /// Returns the pointer argument expression for the call.
     fn emitAsyncSpill(self: *Gen, params: []const ast.Param, self_field: ?[]const u8) GenError![]const u8 {
+        return self.emitAsyncSpillWithPrefix(params, self_field, "");
+    }
+
+    fn emitAsyncSpillWithPrefix(
+        self: *Gen,
+        params: []const ast.Param,
+        self_field: ?[]const u8,
+        prefix: []const u8,
+    ) GenError![]const u8 {
         self.raw("        const __pargs = .{ ");
         var first = true;
         if (self_field) |sf| {
@@ -1317,7 +1351,7 @@ const Gen = struct {
         for (params) |p| {
             if (!first) self.raw(", ");
             first = false;
-            self.raw(try snake(self.ar, p.name));
+            self.print("{s}{s}", .{ prefix, try snake(self.ar, p.name) });
         }
         self.raw(" };\n");
         self.raw("        const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));\n");
@@ -1446,35 +1480,52 @@ const Gen = struct {
     // and encodes the result back with `js_dispatch.encodeNative` -- the same
     // function the export shells' native bridge uses to encode a JS
     // *argument*, here encoding the host's *result* instead. Also emits a
-    // `starling_js_imports_manifest` byte string (one TSV line per bridged
-    // function: `<js-module>\t<js-export-name>\t<dispatch-key>\t<arity>\n`) so
-    // the host runtime can discover which builtin ES modules/exports to
-    // synthesize without per-world C++ glue. Interface functions retain their
-    // `<iface-id>` module and verbatim function export. A root function `foo`
-    // uses module `foo`, export `default`, and dispatch key `$root#foo`,
-    // matching ComponentizeJS 0.21 while remaining unambiguous.
+    // `starling_js_imports_manifest` byte string so the host runtime can
+    // discover which builtin ES modules/functions and resource classes to
+    // synthesize without per-world C++ glue. Ordinary functions retain the
+    // original four-column TSV record. Uppercase-tagged R/C/M/S records
+    // declare a resource class and its constructor/method/static operations;
+    // uppercase is outside WIT's module-id grammar, keeping the extension
+    // unambiguous. Resource operation dispatch keys are their canonical core
+    // field names qualified by the exact provider interface. Interface
+    // functions retain their `<iface-id>` module and verbatim function export.
+    // A root function `foo` uses module `foo`, export `default`, and dispatch
+    // key `$root#foo`, matching ComponentizeJS 0.21.
+    //
+    // Resource arguments are all decoded before `commitNativeResources`
+    // atomically transfers any nested own handles. Method receivers decode as
+    // Borrow(Resource), constructors/results retain Own(Resource), and a
+    // strong `starling_js_resource_drop` routes generation-safe finalizer
+    // requests to exactly one canonical `[resource-drop]` extern by matching
+    // the generated ResourceDescriptor's provider/name pair.
     //
     // A function whose signature includes a type the native bridge doesn't
-    // cover (resource, future/stream, error-context) is a deterministic
+    // cover (future/stream or error-context) is a deterministic
     // `error.UnsupportedWitType` generation failure (via `fail`, naming the
     // offending function/type) rather than a silently-missing JS export --
-    // see `nativeBridgeSupported`. An *async* imported function is likewise
-    // rejected for now (`wit_async.awaitCall` has no equivalent on this
-    // synchronous JS-call path); it is a distinct, separately diagnosed
-    // follow-up, not silently skipped either.
+    // see `nativeBridgeSupported`. Canonical async imports and future/stream
+    // resource operations are explicitly rejected because ComponentizeJS
+    // 0.21 rejects those canonical async types; they are not silently skipped.
 
     /// Whether `ty`'s type graph is entirely within the set `js_dispatch`'s
     /// `NativeValue` encode/decode pair supports: `bool`/integers/`f32`/`f64`,
     /// `char`, `string`, `option<T>`, `list<T>` (including `list<u8>`,
     /// bridged as `wit_types.ByteList`), `tuple`, `record`, `variant`,
-    /// `enum`, `flags` with ≤32 labels, and `result<T,E>` (recursively, for
-    /// any of those). Everything else -- resource handles (`own`/`borrow`),
-    /// `future`/`stream`, `error-context`, and a `flags` type with >32
-    /// labels (multiword `flags`, which `emitTypeDef` itself doesn't
-    /// generate -- see its doc comment) -- is unsupported (matches the
-    /// Zig-type cases `encodeNative`/`decodeNative` actually implement in
-    /// `js_dispatch.zig`; keep this in sync with that switch if it ever
-    /// grows).
+    /// `enum`, `flags` with ≤32 labels, resource handles with their exact
+    /// provider-qualified identity and own/borrow mode, and `result<T,E>`
+    /// (recursively, for any of those). Everything else -- `future`/`stream`,
+    /// `error-context`, and a `flags` type with >32 labels (multiword `flags`,
+    /// which `emitTypeDef` itself doesn't generate -- see its doc comment) --
+    /// is unsupported. This matches the Zig-type cases `encodeNative`/
+    /// `decodeNative` implement in `js_dispatch.zig`; keep this in sync with
+    /// that switch if it ever grows.
+    fn nativeBridgeSupportedIn(self: *Gen, scope: []const u8, ty: ast.Type) GenError!bool {
+        const saved = self.current_iface;
+        self.current_iface = scope;
+        defer self.current_iface = saved;
+        return self.nativeBridgeSupported(ty);
+    }
+
     fn nativeBridgeSupported(self: *Gen, ty: ast.Type) GenError!bool {
         return switch (ty) {
             .bool, .u8, .u16, .u32, .u64, .s8, .s16, .s32, .s64, .f32, .f64, .string, .char => true,
@@ -1496,19 +1547,20 @@ const Gen = struct {
                 break :blk true;
             },
             .name => |n| blk: {
-                const kind = self.typeKind(n) orelse return error.UnknownType;
-                break :blk switch (kind) {
+                const info = self.scoped.get(self.scopeKey(self.current_iface, n)) orelse
+                    return error.UnknownType;
+                break :blk switch (info.kind) {
                     .record => |fields| r: {
                         for (fields) |f| {
-                            if (!try self.nativeBridgeSupported(f.type)) break :r false;
+                            if (!try self.nativeBridgeSupportedIn(info.def_iface, f.type)) break :r false;
                         }
                         break :r true;
                     },
-                    .alias => |t| try self.nativeBridgeSupported(t),
+                    .alias => |t| try self.nativeBridgeSupportedIn(info.def_iface, t),
                     .variant => |cases| r: {
                         for (cases) |c| {
                             if (c.type) |t| {
-                                if (!try self.nativeBridgeSupported(t)) break :r false;
+                                if (!try self.nativeBridgeSupportedIn(info.def_iface, t)) break :r false;
                             }
                         }
                         break :r true;
@@ -1525,104 +1577,436 @@ const Gen = struct {
                     // generation is actually guaranteed to fail on it.
                     .@"enum" => true,
                     .flags => |labels| labels.len <= 32,
-                    // resource: not representable by the native bridge's
-                    // tag vocabulary (see js_dispatch.h) -- no
-                    // handle-lifetime story on this synchronous JS-call path.
-                    .resource => false,
+                    .resource => true,
                 };
             },
-            // future/stream/error-context, own/borrow resource handles: none
-            // of these have an `encodeNative`/`decodeNative` case in
-            // js_dispatch.zig today.
+            .own, .borrow => |n| (try self.resolveBridgeResource(self.current_iface, n)) != null,
+            // ComponentizeJS 0.21 rejects canonical async value types, and
+            // error-context has no JavaScript bridge representation.
+            else => false,
+        };
+    }
+
+    const JsBridgeResource = struct {
+        provider: []const u8,
+        name: []const u8,
+        zig_type: []const u8,
+        methods: []const ast.ResourceMethod,
+    };
+
+    /// Resolve a resource through the current scope's aliases and `use`
+    /// renames. The returned provider/name always comes from the defining
+    /// resource declaration, never from a consumer-visible alias.
+    fn resolveBridgeResource(self: *Gen, scope: []const u8, name: []const u8) GenError!?JsBridgeResource {
+        const info = self.scoped.get(self.scopeKey(scope, name)) orelse return error.UnknownType;
+        return switch (info.kind) {
+            .resource => |methods| blk: {
+                const saved = self.current_iface;
+                self.current_iface = info.def_iface;
+                defer self.current_iface = saved;
+                break :blk .{
+                    .provider = info.def_iface,
+                    .name = info.def_name,
+                    .zig_type = try self.typeName(info.def_name),
+                    .methods = methods,
+                };
+            },
+            .alias => |ty| switch (ty) {
+                .name, .own, .borrow => |target| try self.resolveBridgeResource(info.def_iface, target),
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    fn appendBridgeResource(
+        self: *Gen,
+        resources: *std.ArrayListUnmanaged(JsBridgeResource),
+        seen_resources: *std.StringHashMapUnmanaged(void),
+        resource: JsBridgeResource,
+    ) GenError!void {
+        const key = self.scopeKey(resource.provider, resource.name);
+        if (seen_resources.contains(key)) return;
+        try seen_resources.put(self.ar, key, {});
+        try resources.append(self.ar, resource);
+    }
+
+    /// Collect every resource in `ty`'s supported aggregate graph while
+    /// retaining the scope in which named references must be resolved.
+    fn collectBridgeResourcesFromType(
+        self: *Gen,
+        scope: []const u8,
+        ty: ast.Type,
+        resources: *std.ArrayListUnmanaged(JsBridgeResource),
+        seen_resources: *std.StringHashMapUnmanaged(void),
+        seen_types: *std.StringHashMapUnmanaged(void),
+    ) GenError!void {
+        switch (ty) {
+            .list, .option => |element| try self.collectBridgeResourcesFromType(
+                scope,
+                element.*,
+                resources,
+                seen_resources,
+                seen_types,
+            ),
+            .result => |result| {
+                if (result.ok) |ok| try self.collectBridgeResourcesFromType(
+                    scope,
+                    ok.*,
+                    resources,
+                    seen_resources,
+                    seen_types,
+                );
+                if (result.err) |err| try self.collectBridgeResourcesFromType(
+                    scope,
+                    err.*,
+                    resources,
+                    seen_resources,
+                    seen_types,
+                );
+            },
+            .tuple => |elements| for (elements) |element| {
+                try self.collectBridgeResourcesFromType(
+                    scope,
+                    element,
+                    resources,
+                    seen_resources,
+                    seen_types,
+                );
+            },
+            .future, .stream => |element| if (element) |value| {
+                try self.collectBridgeResourcesFromType(
+                    scope,
+                    value.*,
+                    resources,
+                    seen_resources,
+                    seen_types,
+                );
+            },
+            .name, .own, .borrow => |name| {
+                if (try self.resolveBridgeResource(scope, name)) |resource| {
+                    try self.appendBridgeResource(resources, seen_resources, resource);
+                    return;
+                }
+                const key = self.scopeKey(scope, name);
+                if (seen_types.contains(key)) return;
+                try seen_types.put(self.ar, key, {});
+                const info = self.scoped.get(key) orelse return error.UnknownType;
+                switch (info.kind) {
+                    .record => |fields| for (fields) |field| {
+                        try self.collectBridgeResourcesFromType(
+                            info.def_iface,
+                            field.type,
+                            resources,
+                            seen_resources,
+                            seen_types,
+                        );
+                    },
+                    .variant => |cases| for (cases) |case| {
+                        if (case.type) |case_type| try self.collectBridgeResourcesFromType(
+                            info.def_iface,
+                            case_type,
+                            resources,
+                            seen_resources,
+                            seen_types,
+                        );
+                    },
+                    .alias => |target| try self.collectBridgeResourcesFromType(
+                        info.def_iface,
+                        target,
+                        resources,
+                        seen_resources,
+                        seen_types,
+                    ),
+                    .resource, .@"enum", .flags => {},
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn typeContainsResource(self: *Gen, scope: []const u8, ty: ast.Type) GenError!bool {
+        return switch (ty) {
+            .list, .option => |element| try self.typeContainsResource(scope, element.*),
+            .result => |result| blk: {
+                if (result.ok) |ok| {
+                    if (try self.typeContainsResource(scope, ok.*)) break :blk true;
+                }
+                if (result.err) |err| {
+                    if (try self.typeContainsResource(scope, err.*)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |elements| blk: {
+                for (elements) |element| {
+                    if (try self.typeContainsResource(scope, element)) break :blk true;
+                }
+                break :blk false;
+            },
+            .name, .own, .borrow => |name| blk: {
+                if ((try self.resolveBridgeResource(scope, name)) != null) break :blk true;
+                const info = self.scoped.get(self.scopeKey(scope, name)) orelse return error.UnknownType;
+                break :blk switch (info.kind) {
+                    .record => |fields| r: {
+                        for (fields) |field| {
+                            if (try self.typeContainsResource(info.def_iface, field.type)) break :r true;
+                        }
+                        break :r false;
+                    },
+                    .variant => |cases| r: {
+                        for (cases) |case| {
+                            if (case.type) |case_type| {
+                                if (try self.typeContainsResource(info.def_iface, case_type)) break :r true;
+                            }
+                        }
+                        break :r false;
+                    },
+                    .alias => |target| try self.typeContainsResource(info.def_iface, target),
+                    .resource => true,
+                    .@"enum", .flags => false,
+                };
+            },
             else => false,
         };
     }
 
     const JsImportEntry = struct {
+        manifest_kind: []const u8,
         module: []const u8,
+        resource_name: []const u8,
         js_name: []const u8,
         dispatch_key: []const u8,
+        manifest_arity: usize,
         call_target: []const u8,
         param_ziq: []const []const u8,
         result_zig: []const u8,
         has_result: bool,
+        has_resource_params: bool,
     };
+
+    fn validateJsBridgeFunc(self: *Gen, context: []const u8, func: ast.Func) GenError!void {
+        if (func.is_async) {
+            return self.fail(
+                "{s} cannot be bridged to JavaScript: canonical async functions are explicitly " ++
+                    "unsupported because ComponentizeJS 0.21 rejects canonical async types",
+                .{context},
+            );
+        }
+        for (func.params) |param| {
+            if (!try self.nativeBridgeSupported(param.type)) {
+                return self.fail(
+                    "{s}: parameter '{s}' has a WIT type not supported by the JS import bridge " ++
+                        "(supported recursively: bool/integers/f32/f64/char/string/resources with " ++
+                        "exact own/borrow ownership/option<T>/list<T>/tuple/record/variant/enum/" ++
+                        "flags (≤32 labels)/result<T,E>; future/stream, error-context, and >32-label " ++
+                        "multiword flags remain explicitly unsupported)",
+                    .{ context, param.name },
+                );
+            }
+        }
+        if (func.result) |result| {
+            if (!try self.nativeBridgeSupported(result)) {
+                return self.fail(
+                    "{s}: its result has a WIT type not supported by the JS import bridge " ++
+                        "(supported recursively: bool/integers/f32/f64/char/string/resources with " ++
+                        "exact own/borrow ownership/option<T>/list<T>/tuple/record/variant/enum/" ++
+                        "flags (≤32 labels)/result<T,E>; future/stream, error-context, and >32-label " ++
+                        "multiword flags remain explicitly unsupported)",
+                    .{context},
+                );
+            }
+        }
+    }
 
     fn emitJsImportBridge(self: *Gen, uses: []const Use, top_funcs: []const TopFunc) GenError!void {
         var entries = std.ArrayListUnmanaged(JsImportEntry).empty;
+        var resources = std.ArrayListUnmanaged(JsBridgeResource).empty;
+        var seen_resources = std.StringHashMapUnmanaged(void).empty;
+        var seen_types = std.StringHashMapUnmanaged(void).empty;
+
+        // Discover resources from each imported interface's complete type
+        // surface and function signatures. Resolution uses `ScopedType`'s
+        // defining provider/name, so aliases and transitive `use` chains
+        // cannot accidentally bind to another provider's same-named resource.
         for (uses) |u| {
             if (u.is_export) continue;
             self.current_iface = u.id;
-            // An imported interface that defines *any* resource (regardless
-            // of whether it has methods) cannot be bridged to JavaScript as
-            // a whole: `--js-imports` has no handle-lifetime story for
-            // resources yet (see `nativeBridgeSupported`'s doc comment).
-            // Reject the *entire interface* here, deterministically, before
-            // considering any of its functions -- otherwise a mixed
-            // interface (a resource type alongside free-standing functions
-            // that never reference it) would silently bridge the free
-            // functions while the resource's own methods are dropped with
-            // no diagnostic at all, since the loop below only ever switches
-            // on `.func` items and treats `.type` as `else => {}`. Checking
-            // this first, in its own pass over `u.iface.items`, guarantees
-            // the rejection fires regardless of item order or whether any
-            // bridged function actually touches the resource.
-            for (u.iface.items) |it| {
-                if (it == .type and it.type.kind == .resource) {
-                    return self.fail(
-                        "imported interface '{s}' defines resource '{s}' and cannot be bridged to " ++
-                            "JavaScript as a whole (--js-imports has no handle-lifetime story for " ++
-                            "resources yet); this applies even when the interface also has free-standing " ++
-                            "bridgeable functions that never reference the resource -- move the resource to " ++
-                            "its own interface (so the free functions' interface has none), or drop " ++
-                            "--js-imports for this world",
-                        .{ u.id, it.type.name },
+            for (u.iface.items) |it| switch (it) {
+                .type => |td| try self.collectBridgeResourcesFromType(
+                    u.id,
+                    .{ .name = td.name },
+                    &resources,
+                    &seen_resources,
+                    &seen_types,
+                ),
+                .func => |fd| {
+                    for (fd.func.params) |param| try self.collectBridgeResourcesFromType(
+                        u.id,
+                        param.type,
+                        &resources,
+                        &seen_resources,
+                        &seen_types,
                     );
-                }
+                    if (fd.func.result) |result| try self.collectBridgeResourcesFromType(
+                        u.id,
+                        result,
+                        &resources,
+                        &seen_resources,
+                        &seen_types,
+                    );
+                },
+                else => {},
+            };
+        }
+        for (top_funcs) |tf| {
+            if (tf.is_export) continue;
+            for (tf.func.params) |param| try self.collectBridgeResourcesFromType(
+                "$root",
+                param.type,
+                &resources,
+                &seen_resources,
+                &seen_types,
+            );
+            if (tf.func.result) |result| try self.collectBridgeResourcesFromType(
+                "$root",
+                result,
+                &resources,
+                &seen_resources,
+                &seen_types,
+            );
+        }
+
+        // Resource methods may themselves mention resources from other
+        // providers. Walk to a fixed point so all such transitive identities
+        // receive class metadata and exact drop routing.
+        var resource_index: usize = 0;
+        while (resource_index < resources.items.len) : (resource_index += 1) {
+            const resource = resources.items[resource_index];
+            for (resource.methods) |method| {
+                for (method.func.params) |param| try self.collectBridgeResourcesFromType(
+                    resource.provider,
+                    param.type,
+                    &resources,
+                    &seen_resources,
+                    &seen_types,
+                );
+                if (method.func.result) |result| try self.collectBridgeResourcesFromType(
+                    resource.provider,
+                    result,
+                    &resources,
+                    &seen_resources,
+                    &seen_types,
+                );
             }
+        }
+
+        // Resource operations use canonical core field names as dispatch keys.
+        // A method's implicit receiver is decoded as Borrow(Resource), while a
+        // constructor produces Own(Resource); neither ownership mode is
+        // structurally collapsed.
+        for (resources.items) |resource| {
+            self.current_iface = resource.provider;
+            for (resource.methods) |method| {
+                const extern_name = try self.resourceExternName(resource.name, method);
+                const dispatch_key = try std.fmt.allocPrint(
+                    self.ar,
+                    "{s}#{s}",
+                    .{ resource.provider, extern_name },
+                );
+                const context = try std.fmt.allocPrint(
+                    self.ar,
+                    "imported resource operation '{s}'",
+                    .{dispatch_key},
+                );
+                try self.validateJsBridgeFunc(context, method.func);
+
+                var param_ziq = std.ArrayListUnmanaged([]const u8).empty;
+                var has_resource_params = method.kind == .method;
+                if (method.kind == .method) try param_ziq.append(
+                    self.ar,
+                    try std.fmt.allocPrint(
+                        self.ar,
+                        "wit_types.Borrow({s})",
+                        .{resource.zig_type},
+                    ),
+                );
+                for (method.func.params) |param| {
+                    try param_ziq.append(self.ar, try self.zigType(param.type));
+                    has_resource_params = has_resource_params or
+                        try self.typeContainsResource(resource.provider, param.type);
+                }
+
+                const manifest_kind: []const u8 = switch (method.kind) {
+                    .constructor => "C",
+                    .method => "M",
+                    .static => "S",
+                };
+                const js_name = switch (method.kind) {
+                    .constructor => try pascal(self.ar, resource.name),
+                    .method, .static => try camel(self.ar, method.name),
+                };
+                const call_target = switch (method.kind) {
+                    .constructor => try std.fmt.allocPrint(
+                        self.ar,
+                        "{s}.init",
+                        .{resource.zig_type},
+                    ),
+                    .method => try std.fmt.allocPrint(
+                        self.ar,
+                        "{s}.Borrowed.{s}",
+                        .{ resource.zig_type, try camel(self.ar, method.name) },
+                    ),
+                    .static => try std.fmt.allocPrint(
+                        self.ar,
+                        "{s}.{s}",
+                        .{ resource.zig_type, try camel(self.ar, method.name) },
+                    ),
+                };
+                const result_zig = if (method.kind == .constructor)
+                    try std.fmt.allocPrint(self.ar, "wit_types.Own({s})", .{resource.zig_type})
+                else
+                    try self.resultZig(method.func);
+                try entries.append(self.ar, .{
+                    .manifest_kind = manifest_kind,
+                    .module = resource.provider,
+                    .resource_name = resource.name,
+                    .js_name = js_name,
+                    .dispatch_key = dispatch_key,
+                    .manifest_arity = method.func.params.len,
+                    .call_target = call_target,
+                    .param_ziq = param_ziq.items,
+                    .result_zig = result_zig,
+                    .has_result = method.kind == .constructor or method.func.result != null,
+                    .has_resource_params = has_resource_params,
+                });
+            }
+        }
+
+        for (uses) |u| {
+            if (u.is_export) continue;
+            self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
                 .func => |fd| {
-                    if (fd.func.is_async) {
-                        return self.fail(
-                            "imported async function '{s}#{s}' cannot be bridged to JavaScript yet " ++
-                                "(--js-imports only supports synchronous imports so far); remove it from " ++
-                                "the world's JS-facing import surface or drop --js-imports for this world",
-                            .{ u.id, fd.name },
-                        );
-                    }
-                    for (fd.func.params) |p| {
-                        if (!try self.nativeBridgeSupported(p.type)) {
-                            return self.fail(
-                                "imported function '{s}#{s}': parameter '{s}' has a WIT type not " ++
-                                    "supported by the JS import bridge (bool/integers/f32/f64/char/" ++
-                                    "string/option<T>/list<T>/tuple/record/variant/enum/flags " ++
-                                    "(≤32 labels)/result<T,E> only -- resource, future/stream, " ++
-                                    "error-context, and >32-label (multiword) flags need a further WABT " ++
-                                    "phase)",
-                                .{ u.id, fd.name, p.name },
-                            );
-                        }
-                    }
-                    if (fd.func.result) |r| {
-                        if (!try self.nativeBridgeSupported(r)) {
-                            return self.fail(
-                                "imported function '{s}#{s}': its result type is not supported by the " ++
-                                    "JS import bridge (bool/integers/f32/f64/char/string/option<T>/" ++
-                                    "list<T>/tuple/record/variant/enum/flags (≤32 labels)/" ++
-                                    "result<T,E> only -- resource, future/stream, error-context, and " ++
-                                    ">32-label (multiword) flags need a further WABT phase)",
-                                .{ u.id, fd.name },
-                            );
-                        }
-                    }
+                    const context = try std.fmt.allocPrint(
+                        self.ar,
+                        "imported function '{s}#{s}'",
+                        .{ u.id, fd.name },
+                    );
+                    try self.validateJsBridgeFunc(context, fd.func);
                     var param_ziq = std.ArrayListUnmanaged([]const u8).empty;
-                    for (fd.func.params) |p| {
-                        param_ziq.append(self.ar, try self.zigType(p.type)) catch @panic("OOM");
+                    var has_resource_params = false;
+                    for (fd.func.params) |param| {
+                        try param_ziq.append(self.ar, try self.zigType(param.type));
+                        has_resource_params = has_resource_params or
+                            try self.typeContainsResource(u.id, param.type);
                     }
-                    entries.append(self.ar, .{
+                    try entries.append(self.ar, .{
+                        .manifest_kind = "F",
                         .module = u.id,
+                        .resource_name = "",
                         .js_name = fd.name,
                         .dispatch_key = try std.fmt.allocPrint(self.ar, "{s}#{s}", .{ u.id, fd.name }),
+                        .manifest_arity = fd.func.params.len,
                         .call_target = try std.fmt.allocPrint(
                             self.ar,
                             "{s}.{s}",
@@ -1631,7 +2015,8 @@ const Gen = struct {
                         .param_ziq = param_ziq.items,
                         .result_zig = try self.resultZig(fd.func),
                         .has_result = fd.func.result != null,
-                    }) catch @panic("OOM");
+                        .has_resource_params = has_resource_params,
+                    });
                 },
                 else => {},
             };
@@ -1639,60 +2024,35 @@ const Gen = struct {
         self.current_iface = "$root";
         for (top_funcs) |tf| {
             if (tf.is_export) continue;
-            if (tf.func.is_async) {
-                return self.fail(
-                    "imported async root function '{s}' cannot be bridged to JavaScript yet " ++
-                        "(--js-imports only supports synchronous imports so far); remove it from " ++
-                        "the world's JS-facing import surface or drop --js-imports for this world",
-                    .{tf.name},
-                );
-            }
-            for (tf.func.params) |p| {
-                if (!try self.nativeBridgeSupported(p.type)) {
-                    return self.fail(
-                        "imported root function '{s}': parameter '{s}' has a WIT type not " ++
-                            "supported by the JS import bridge (bool/integers/f32/f64/char/" ++
-                            "string/option<T>/list<T>/tuple/record/variant/enum/flags " ++
-                            "(≤32 labels)/result<T,E> only -- resource, future/stream, " ++
-                            "error-context, and >32-label (multiword) flags need a further WABT phase)",
-                        .{ tf.name, p.name },
-                    );
-                }
-            }
-            if (tf.func.result) |r| {
-                if (!try self.nativeBridgeSupported(r)) {
-                    return self.fail(
-                        "imported root function '{s}': its result type is not supported by the " ++
-                            "JS import bridge (bool/integers/f32/f64/char/string/option<T>/" ++
-                            "list<T>/tuple/record/variant/enum/flags (≤32 labels)/" ++
-                            "result<T,E> only -- resource, future/stream, error-context, and " ++
-                            ">32-label (multiword) flags need a further WABT phase)",
-                        .{tf.name},
-                    );
-                }
-            }
+            const context = try std.fmt.allocPrint(
+                self.ar,
+                "imported root function '{s}'",
+                .{tf.name},
+            );
+            try self.validateJsBridgeFunc(context, tf.func);
             var param_ziq = std.ArrayListUnmanaged([]const u8).empty;
-            for (tf.func.params) |p| {
-                param_ziq.append(self.ar, try self.zigType(p.type)) catch @panic("OOM");
+            var has_resource_params = false;
+            for (tf.func.params) |param| {
+                try param_ziq.append(self.ar, try self.zigType(param.type));
+                has_resource_params = has_resource_params or
+                    try self.typeContainsResource("$root", param.type);
             }
-            entries.append(self.ar, .{
+            try entries.append(self.ar, .{
+                .manifest_kind = "F",
                 .module = tf.name,
+                .resource_name = "",
                 .js_name = "default",
                 .dispatch_key = try std.fmt.allocPrint(self.ar, "$root#{s}", .{tf.name}),
+                .manifest_arity = tf.func.params.len,
                 .call_target = try camel(self.ar, tf.name),
                 .param_ziq = param_ziq.items,
                 .result_zig = try self.resultZig(tf.func),
                 .has_result = tf.func.result != null,
-            }) catch @panic("OOM");
+                .has_resource_params = has_resource_params,
+            });
         }
         self.current_iface = "";
-        // A world with no imported interfaces or root functions (or a world
-        // importing only async funcs / resources, rejected above) has nothing to bridge --
-        // emit nothing rather than a manifest-of-nothing plus a dispatch
-        // function that can only ever return "not found". This keeps
-        // `--js-imports` a no-op (not just "harmless") for components with
-        // no custom imports, matching default export-only behavior exactly.
-        if (entries.items.len == 0) return;
+        if (entries.items.len == 0 and resources.items.len == 0) return;
 
         // Reuses whatever module name `--dispatch` named (validated non-null
         // by `run()` whenever `--js-imports` is set); binding it again here
@@ -1707,20 +2067,50 @@ const Gen = struct {
         self.raw("const std = @import(\"std\");\n\n");
 
         self.raw(
-            \\// Generated for `--js-imports`: one TSV line per JS-bridged import,
-            \\// "<js-module>\t<js-export-name>\t<dispatch-key>\t<arity>\n". Consumed by
-            \\// the host runtime (see runtime/js_dispatch.h) to synthesize one builtin
-            \\// ES module per <js-module>, each exposing <js-export-name> as a native
-            \\// function that forwards to starling_js_import_dispatch(<dispatch-key>, …).
-            \\// Interface imports use module=<iface-id>, export=<WIT func>; root imports
-            \\// use module=<WIT func>, export=default, dispatch-key=$root#<WIT func>.
+            \\// Generated for `--js-imports`. Ordinary function records retain the
+            \\// backwards-compatible four-column form:
+            \\//   "<module>\t<js-name>\t<dispatch-key>\t<arity>\n"
+            \\// Resource records begin with an uppercase tag (not a legal WIT module
+            \\// id), so they cannot collide with the legacy form:
+            \\//   "R\t<provider>\t<resource>\t<class-name>\n"
+            \\//   "C|M|S\t<provider>\t<resource>\t<js-name>\t<dispatch-key>\t<arity>\n"
+            \\// C/M/S identify constructor, prototype method, and static method.
+            \\// Resource dispatch keys use the exact canonical core field spelling
+            \\// (<provider>#[constructor|method|static]...), preserving provider identity.
             \\pub const js_import_manifest: []const u8 =
             \\
         );
-        for (entries.items) |e| {
+
+        for (resources.items) |resource| {
+            self.print(
+                "    \"R\\t{s}\\t{s}\\t{s}\\n\" ++\n",
+                .{ resource.provider, resource.name, try pascal(self.ar, resource.name) },
+            );
+            for (entries.items) |entry| {
+                if (std.mem.eql(u8, entry.manifest_kind, "F") or
+                    !std.mem.eql(u8, entry.module, resource.provider) or
+                    !std.mem.eql(u8, entry.resource_name, resource.name))
+                {
+                    continue;
+                }
+                self.print(
+                    "    \"{s}\\t{s}\\t{s}\\t{s}\\t{s}\\t{d}\\n\" ++\n",
+                    .{
+                        entry.manifest_kind,
+                        entry.module,
+                        entry.resource_name,
+                        entry.js_name,
+                        entry.dispatch_key,
+                        entry.manifest_arity,
+                    },
+                );
+            }
+        }
+        for (entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.manifest_kind, "F")) continue;
             self.print(
                 "    \"{s}\\t{s}\\t{s}\\t{d}\\n\" ++\n",
-                .{ e.module, e.js_name, e.dispatch_key, e.param_ziq.len },
+                .{ entry.module, entry.js_name, entry.dispatch_key, entry.manifest_arity },
             );
         }
         self.raw("    \"\";\n\n");
@@ -1733,6 +2123,40 @@ const Gen = struct {
             \\
             \\
         );
+
+        if (resources.items.len != 0) {
+            self.raw(
+                \\pub export fn starling_js_resource_drop(
+                \\    provider_ptr: [*]const u8,
+                \\    provider_len: usize,
+                \\    name_ptr: [*]const u8,
+                \\    name_len: usize,
+                \\    handle: i32,
+                \\) callconv(.c) u32 {
+                \\    const provider = provider_ptr[0..provider_len];
+                \\    const resource_name = name_ptr[0..name_len];
+                \\
+            );
+            for (resources.items) |resource| {
+                self.print(
+                    "    if (std.mem.eql(u8, provider, {s}.__wit_resource.provider) and\n",
+                    .{resource.zig_type},
+                );
+                self.print(
+                    "        std.mem.eql(u8, resource_name, {s}.__wit_resource.name)) {{\n",
+                    .{resource.zig_type},
+                );
+                self.print("        {s}.__wit_drop(handle);\n", .{resource.zig_type});
+                self.raw("        return 0;\n");
+                self.raw("    }\n");
+            }
+            self.raw(
+                \\    return 1;
+                \\}
+                \\
+                \\
+            );
+        }
 
         self.raw(
             \\pub export fn starling_js_import_dispatch(
@@ -1761,6 +2185,23 @@ const Gen = struct {
                 self.print("        const a{d} = js_dispatch.decodeNative({s}, &argv_ptr[{d}], __alloc);\n", .{ idx, pty, idx });
                 const arg_name = std.fmt.allocPrint(self.ar, "a{d}", .{idx}) catch @panic("OOM");
                 call_args.appendSlice(self.ar, arg_name) catch @panic("OOM");
+            }
+            if (e.has_resource_params) {
+                self.print("        const __decoded_args = .{{ {s} }};\n", .{call_args.items});
+                self.raw(
+                    \\        const __native_args = js_dispatch.NativeValue{
+                    \\            .tag = .list_,
+                    \\            .list_ptr = argv_ptr,
+                    \\            .list_len = argv_len,
+                    \\        };
+                    \\        if (!js_dispatch.commitNativeResources(
+                    \\            @TypeOf(__decoded_args),
+                    \\            __decoded_args,
+                    \\            &__native_args,
+                    \\            __alloc,
+                    \\        )) @panic("js import dispatch: resource transfer transaction failed");
+                    \\
+                );
             }
             if (e.has_result) {
                 self.print("        const __result = {s}({s});\n", .{ e.call_target, call_args.items });
@@ -1841,8 +2282,12 @@ const Gen = struct {
 
         for (methods) |m| try self.emitResourceWrapper(R, td.name, m);
 
+        self.raw("    pub fn __wit_drop(handle: i32) void {\n");
+        self.print("        imp.@\"[resource-drop]{s}\"(handle);\n", .{td.name});
+        self.raw("    }\n\n");
+
         self.print("    pub fn deinit(self: {s}) void {{\n", .{R});
-        self.print("        imp.@\"[resource-drop]{s}\"(self.handle);\n", .{td.name});
+        self.raw("        __wit_drop(self.handle);\n");
         self.raw("    }\n");
         self.raw("};\n\n");
     }
@@ -1863,7 +2308,7 @@ const Gen = struct {
             for (slots) |s| {
                 if (!first) self.raw(", ");
                 first = false;
-                self.print("{s}: {s}", .{ s.name, @tagName(s.core) });
+                self.print("arg_{s}: {s}", .{ s.name, @tagName(s.core) });
             }
         }
         if (m.kind == .constructor) {
@@ -1889,12 +2334,12 @@ const Gen = struct {
 
         self.print("        pub fn {s}(self: Borrowed", .{name});
         if (m.func.params.len > 0) self.raw(", ");
-        try self.emitTypedParamDecls(m.func.params);
+        try self.emitTypedParamDeclsWithPrefix(m.func.params, "arg_");
         self.print(") {s} {{\n", .{try self.resultZig(m.func)});
         self.print("            return ({s}{{ .handle = self.handle }}).{s}(", .{ R, name });
         for (m.func.params, 0..) |p, idx| {
             if (idx != 0) self.raw(", ");
-            self.raw(try snake(self.ar, p.name));
+            self.print("arg_{s}", .{try snake(self.ar, p.name)});
         }
         self.raw(");\n");
         self.raw("        }\n");
@@ -1908,7 +2353,17 @@ const Gen = struct {
     /// async constructor (not used by WASI 0.3) is rejected.
     fn emitAsyncResourceExtern(self: *Gen, iface_id: []const u8, ext: []const u8, m: ast.ResourceMethod) GenError!void {
         const func = m.func;
-        if (m.kind == .constructor) return error.UnsupportedWitType;
+        if (m.kind == .constructor) {
+            if (self.js_imports) {
+                return self.fail(
+                    "imported resource operation '{s}#{s}' cannot be bridged to JavaScript: " ++
+                        "canonical async constructors are explicitly unsupported because " ++
+                        "ComponentizeJS 0.21 rejects canonical async types",
+                    .{ iface_id, ext },
+                );
+            }
+            return error.UnsupportedWitType;
+        }
         const self_slot: usize = if (m.kind == .method) 1 else 0;
         const spill = self_slot + try self.paramFlatCount(func.params) > 4;
 
@@ -1930,7 +2385,7 @@ const Gen = struct {
             for (slots) |s| {
                 if (!first) self.raw(", ");
                 first = false;
-                self.print("{s}: {s}", .{ s.name, @tagName(s.core) });
+                self.print("arg_{s}: {s}", .{ s.name, @tagName(s.core) });
             }
         }
         if (func.result != null) {
@@ -1955,7 +2410,7 @@ const Gen = struct {
             self.print("self: {s}", .{R});
             if (func.params.len > 0) self.raw(", ");
         }
-        try self.emitTypedParamDecls(func.params);
+        try self.emitTypedParamDeclsWithPrefix(func.params, "arg_");
         if (m.kind == .constructor) {
             self.print(") wit_types.Own({s}) {{\n", .{R});
         } else {
@@ -1963,7 +2418,7 @@ const Gen = struct {
         }
 
         // lower params → arg expressions (emitting temps as needed)
-        const call_args = try self.lowerParams(func.params);
+        const call_args = try self.lowerParamsWithPrefix(func.params, "arg_");
         const args = if (is_method) blk: {
             if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
             break :blk "self.handle";
@@ -2009,14 +2464,18 @@ const Gen = struct {
             self.print("self: {s}", .{R});
             if (func.params.len > 0) self.raw(", ");
         }
-        try self.emitTypedParamDecls(func.params);
+        try self.emitTypedParamDeclsWithPrefix(func.params, "arg_");
         self.print(") {s} {{\n", .{try self.resultZig(func)});
 
         // lower params → arg expressions (emitting temps / a spilled block).
         const args = if (spill)
-            try self.emitAsyncSpill(func.params, if (is_method) "self" else null)
+            try self.emitAsyncSpillWithPrefix(
+                func.params,
+                if (is_method) "self" else null,
+                "arg_",
+            )
         else blk: {
-            const call_args = try self.lowerParams(func.params);
+            const call_args = try self.lowerParamsWithPrefix(func.params, "arg_");
             if (is_method) {
                 if (call_args.len > 0) break :blk try std.fmt.allocPrint(self.ar, "self.handle, {s}", .{call_args});
                 break :blk "self.handle";
@@ -2300,9 +2759,21 @@ const Gen = struct {
     /// Lower each high-level param into the flat call arguments, emitting temp
     /// statements for `option<…>`. Returns the comma-joined argument list.
     fn lowerParams(self: *Gen, params: []const ast.Param) GenError![]const u8 {
+        return self.lowerParamsWithPrefix(params, "");
+    }
+
+    fn lowerParamsWithPrefix(
+        self: *Gen,
+        params: []const ast.Param,
+        prefix: []const u8,
+    ) GenError![]const u8 {
         var args = std.ArrayListUnmanaged(u8).empty;
         for (params) |p| {
-            const pn = try snake(self.ar, p.name);
+            const pn = try std.fmt.allocPrint(
+                self.ar,
+                "{s}{s}",
+                .{ prefix, try snake(self.ar, p.name) },
+            );
             if (args.items.len != 0) try args.appendSlice(self.ar, ", ");
             const rty = self.resolveAlias(p.type);
             if (self.isHandleLike(rty)) {
@@ -2461,9 +2932,21 @@ const Gen = struct {
     }
 
     fn emitTypedParamDecls(self: *Gen, params: []const ast.Param) GenError!void {
+        return self.emitTypedParamDeclsWithPrefix(params, "");
+    }
+
+    fn emitTypedParamDeclsWithPrefix(
+        self: *Gen,
+        params: []const ast.Param,
+        prefix: []const u8,
+    ) GenError!void {
         for (params, 0..) |p, idx| {
             if (idx != 0) self.raw(", ");
-            self.print("{s}: {s}", .{ try snake(self.ar, p.name), try self.zigType(p.type) });
+            self.print("{s}{s}: {s}", .{
+                prefix,
+                try snake(self.ar, p.name),
+                try self.zigType(p.type),
+            });
         }
     }
 
@@ -3328,23 +3811,23 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         try testing.expect(std.mem.indexOf(
             u8,
             out,
-            "pub fn increment(self: Borrowed, by: u32) u32 {",
+            "pub fn increment(self: Borrowed, arg_by: u32) u32 {",
         ) != null);
         try testing.expect(std.mem.indexOf(
             u8,
             out,
-            "return (Counter{ .handle = self.handle }).increment(by);",
+            "return (Counter{ .handle = self.handle }).increment(arg_by);",
         ) != null);
         // canonical resource externs (module = iface id).
-        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[constructor]counter\"(start: i32) i32;") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[method]counter.increment\"(self: i32, by: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[constructor]counter\"(arg_start: i32) i32;") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[method]counter.increment\"(self: i32, arg_by: i32) i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[static]counter.make-zero\"() i32;") != null);
         try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/counters\" fn @\"[resource-drop]counter\"(self: i32) void;") != null);
         // typed wrappers.
-        try testing.expect(std.mem.indexOf(u8, out, "pub fn init(start: u32) wit_types.Own(Counter) {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "return .{ .handle = imp.@\"[constructor]counter\"(@bitCast(start)) };") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "pub fn increment(self: Counter, by: u32) u32 {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]counter.increment\"(self.handle, @bitCast(by))") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn init(arg_start: u32) wit_types.Own(Counter) {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "return .{ .handle = imp.@\"[constructor]counter\"(@bitCast(arg_start)) };") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn increment(self: Counter, arg_by: u32) u32 {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]counter.increment\"(self.handle, @bitCast(arg_by))") != null);
         // a static returning own<counter> lifts the handle into the wrapper struct.
         try testing.expect(std.mem.indexOf(u8, out, "pub fn makeZero() wit_types.Own(Counter) {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "return wit_types.liftResultFlat(wit_types.Own(Counter), imp.@\"[static]counter.make-zero\"());") != null);
@@ -3354,8 +3837,10 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"transfer\"(value.handle)") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn inspect(value: wit_types.Borrow(Counter)) u32 {") != null);
         try testing.expect(std.mem.indexOf(u8, out, "imp.@\"inspect\"(value.handle)") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "pub fn __wit_drop(handle: i32) void {") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[resource-drop]counter\"(handle);") != null);
         try testing.expect(std.mem.indexOf(u8, out, "pub fn deinit(self: Counter) void {") != null);
-        try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[resource-drop]counter\"(self.handle);") != null);
+        try testing.expect(std.mem.indexOf(u8, out, "__wit_drop(self.handle);") != null);
     }
     {
         // Exported (guest-implemented) resources are not supported yet.
@@ -3805,18 +4290,16 @@ test "generate --js-imports: world with only supported-elsewhere imports but not
     try testing.expect(std.mem.indexOf(u8, out, "starling_js_import_dispatch") == null);
 }
 
-test "generate --js-imports: an imported resource parameter is a deterministic build diagnostic, not a silent skip" {
+test "generate --js-imports: a resource reached through use keeps identity and ownership" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
 
     // interface counters { resource counter { … } } / imports { use counters.{counter};
     // take: func(c: own<counter>); } -- "counters" is reached only via the
-    // `use` (not imported by the world directly), so this test exercises the
-    // parameter-type diagnostic in isolation from the "imported interface
-    // defines a resource" diagnostic (covered by its own dedicated test
-    // below, which fires whenever an *imported* interface itself declares a
-    // resource, regardless of what its functions' parameters look like).
+    // `use` (not imported by the world directly). The class/drop metadata
+    // must still name counters/counter, while the free function remains in
+    // the imports module.
     const counter_items = [_]ast.InterfaceItem{
         .{ .type = .{ .name = "counter", .kind = .{ .resource = &.{} } } },
     };
@@ -3839,23 +4322,42 @@ test "generate --js-imports: an imported resource parameter is a deterministic b
     const res = wit.resolver.Resolver.init(doc, &.{});
 
     var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
-    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
-    try testing.expect(std.mem.indexOf(u8, g.diag, "take") != null);
-    try testing.expect(std.mem.indexOf(u8, g.diag, "'c'") != null);
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"R\\ttest:res/counters\\tcounter\\tCounter\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"test:res/imports\\ttake\\ttest:res/imports#take\\t1\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a0 = js_dispatch.decodeNative(wit_types.Own(Counter), &argv_ptr[0], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "js_dispatch.commitNativeResources(") != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, provider, Counter.__wit_resource.provider)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, resource_name, Counter.__wit_resource.name)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "Counter.__wit_drop(handle);") != null);
 }
 
-test "generate --js-imports: a mixed resource + free-function interface is rejected as a whole, not silently bridged" {
+test "generate --js-imports: a mixed resource and free-function interface bridges both" {
     // interface host {
     //   resource counter { … }             // never referenced by `add`
     //   add: func(a: s32, b: s32) -> s32;   // fully bridgeable on its own
     // }
-    // Before the fix, this silently emitted a manifest/dispatch entry for
-    // `add` and simply dropped `counter` with no diagnostic at all (the
-    // per-item loop only switched on `.func`, treating `.type` as
-    // `else => {}`). The whole imported interface must instead be rejected
-    // deterministically, precisely because it contains a resource -- even
-    // though `add` alone would satisfy `nativeBridgeSupported` and neither
-    // `add`'s params/result nor its body reference `counter` at all.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const ar = arena.allocator();
@@ -3883,17 +4385,231 @@ test "generate --js-imports: a mixed resource + free-function interface is rejec
     const res = wit.resolver.Resolver.init(doc, &.{});
 
     var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
-    try testing.expectError(error.UnsupportedWitType, g.generate(world, "guest"));
-    // Names the offending interface and resource, not the unrelated `add`.
-    try testing.expect(std.mem.indexOf(u8, g.diag, "host") != null);
-    try testing.expect(std.mem.indexOf(u8, g.diag, "counter") != null);
-    // No JS-bridge manifest/dispatch trampoline is emitted on failure (the
-    // interface's normal, unrelated typed import wrapper for `add` -- from
-    // `emitImportIface`, always emitted before the `--js-imports` pass runs
-    // -- is unaffected and may still appear in `g.out`; only the JS-bridge
-    // artifacts must be absent).
-    try testing.expect(std.mem.indexOf(u8, g.out.items, "js_import_manifest") == null);
-    try testing.expect(std.mem.indexOf(u8, g.out.items, "starling_js_import_dispatch") == null);
+    try g.generate(world, "guest");
+    const out = g.out.items;
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"R\\ttest:mixed/host\\tcounter\\tCounter\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"M\\ttest:mixed/host\\tcounter\\tget\\ttest:mixed/host#[method]counter.get\\t0\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"test:mixed/host\\tadd\\ttest:mixed/host#add\\t2\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a0 = js_dispatch.decodeNative(wit_types.Borrow(Counter), &argv_ptr[0], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __result = Counter.Borrowed.get(a0);") != null);
+}
+
+test "generate --js-imports: resource operations preserve aliases, ownership, and provider collisions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const a_methods = [_]ast.ResourceMethod{
+        .{
+            .kind = .constructor,
+            .name = "",
+            .func = .{ .params = &.{.{ .name = "seed", .type = .u32 }}, .result = null },
+        },
+        .{
+            .kind = .method,
+            .name = "replace-with",
+            .func = .{
+                .params = &.{.{ .name = "next", .type = .{ .own = "item-alias" } }},
+                .result = .{ .own = "item-alias" },
+            },
+        },
+        .{
+            .kind = .static,
+            .name = "from-borrow",
+            .func = .{
+                .params = &.{.{ .name = "source", .type = .{ .borrow = "item-alias" } }},
+                .result = .{ .own = "item-alias" },
+            },
+        },
+    };
+    const a_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "item", .kind = .{ .resource = &a_methods } } },
+        .{ .type = .{ .name = "item-alias", .kind = .{ .alias = .{ .name = "item" } } } },
+        .{ .type = .{ .name = "box", .kind = .{ .record = &.{
+            .{ .name = "value", .type = .{ .own = "item-alias" } },
+        } } } },
+        .{ .func = .{ .name = "transfer", .func = .{
+            .params = &.{
+                .{ .name = "owned", .type = .{ .own = "item-alias" } },
+                .{ .name = "borrowed", .type = .{ .borrow = "item-alias" } },
+                .{ .name = "nested", .type = .{ .option = &.{ .name = "box" } } },
+            },
+            .result = .{ .own = "item-alias" },
+        } } },
+    };
+    const b_items = [_]ast.InterfaceItem{
+        .{ .type = .{ .name = "item", .kind = .{ .resource = &.{} } } },
+        .{ .type = .{ .name = "item-alias", .kind = .{ .alias = .{ .name = "item" } } } },
+        .{ .func = .{ .name = "borrow-back", .func = .{
+            .params = &.{.{ .name = "value", .type = .{ .borrow = "item-alias" } }},
+            .result = .{ .borrow = "item-alias" },
+        } } },
+    };
+    const provider_a = ast.Interface{ .name = "provider-a", .items = &a_items };
+    const provider_b = ast.Interface{ .name = "provider-b", .items = &b_items };
+    const world = ast.World{ .name = "guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-a" } } } },
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-b" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "resource-js", .version = "1.0.0" },
+        .items = &.{
+            .{ .interface = provider_a },
+            .{ .interface = provider_b },
+            .{ .world = world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try g.generate(world, "guest");
+    const out = g.out.items;
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"R\\ttest:resource-js/provider-a@1.0.0\\titem\\tItem\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"R\\ttest:resource-js/provider-b@1.0.0\\titem\\tItem\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"C\\ttest:resource-js/provider-a@1.0.0\\titem\\tItem\\ttest:resource-js/provider-a@1.0.0#[constructor]item\\t1\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"M\\ttest:resource-js/provider-a@1.0.0\\titem\\treplaceWith\\ttest:resource-js/provider-a@1.0.0#[method]item.replace-with\\t1\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "\"S\\ttest:resource-js/provider-a@1.0.0\\titem\\tfromBorrow\\ttest:resource-js/provider-a@1.0.0#[static]item.from-borrow\\t1\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a0 = js_dispatch.decodeNative(wit_types.Borrow(ProviderAItem), &argv_ptr[0], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a1 = js_dispatch.decodeNative(wit_types.Own(ProviderAItemAlias), &argv_ptr[1], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const __result = ProviderAItem.Borrowed.replaceWith(a0, a1);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "out_result.* = js_dispatch.encodeNative(wit_types.Own(ProviderAItemAlias), __result, __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "const a2 = js_dispatch.decodeNative(?Box, &argv_ptr[2], __alloc);",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __decoded_args = .{ a0, a1, a2 };") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "js_dispatch.commitNativeResources(") != null);
+
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, provider, ProviderAItem.__wit_resource.provider)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, provider, ProviderBItem.__wit_resource.provider)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, resource_name, ProviderAItem.__wit_resource.name)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        out,
+        "std.mem.eql(u8, resource_name, ProviderBItem.__wit_resource.name)",
+    ) != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ProviderAItem.__wit_drop(handle);") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "ProviderBItem.__wit_drop(handle);") != null);
+}
+
+test "generate --js-imports: resource canonical async and channel operations are explicit diagnostics" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const async_methods = [_]ast.ResourceMethod{.{
+        .kind = .constructor,
+        .name = "",
+        .func = .{ .params = &.{}, .result = null, .is_async = true },
+    }};
+    const async_iface = ast.Interface{ .name = "async-host", .items = &.{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &async_methods } } },
+    } };
+    const async_world = ast.World{ .name = "async-guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "async-host" } } } },
+    } };
+    const u32_type: ast.Type = .u32;
+    const channel_methods = [_]ast.ResourceMethod{.{
+        .kind = .static,
+        .name = "from-stream",
+        .func = .{
+            .params = &.{.{ .name = "values", .type = .{ .stream = &u32_type } }},
+            .result = .{ .name = "thing" },
+        },
+    }};
+    const channel_iface = ast.Interface{ .name = "channel-host", .items = &.{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &channel_methods } } },
+    } };
+    const channel_world = ast.World{ .name = "channel-guest", .items = &.{
+        .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "channel-host" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "unsupported-resource-js" },
+        .items = &.{
+            .{ .interface = async_iface },
+            .{ .interface = channel_iface },
+            .{ .world = async_world },
+            .{ .world = channel_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var async_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, async_g.generate(async_world, "async-guest"));
+    try testing.expect(std.mem.indexOf(u8, async_g.diag, "[constructor]thing") != null);
+    try testing.expect(std.mem.indexOf(u8, async_g.diag, "canonical async") != null);
+
+    var channel_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch", .js_imports = true };
+    try testing.expectError(error.UnsupportedWitType, channel_g.generate(channel_world, "channel-guest"));
+    try testing.expect(std.mem.indexOf(u8, channel_g.diag, "[static]thing.from-stream") != null);
+    try testing.expect(std.mem.indexOf(u8, channel_g.diag, "'values'") != null);
+    try testing.expect(std.mem.indexOf(u8, channel_g.diag, "future/stream") != null);
 }
 
 test "generate --js-imports: an imported async function is a deterministic build diagnostic, not a silent skip" {
@@ -4533,12 +5249,12 @@ test "generate: imported resource with async methods (#300)" {
     try testing.expect(std.mem.indexOf(u8, out, "const wit_async = @import(\"wit_async\");") != null);
 
     // Async externs: `(self?, flat params, result_ptr?) -> i32` (packed callstatus).
-    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.bump\"(self: i32, by: i32, result_ptr: i32) i32;") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.bump\"(self: i32, arg_by: i32, result_ptr: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.label\"(self: i32, result_ptr: i32) i32;") != null);
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.reset\"(self: i32) i32;") != null);
 
     // Async wrappers drive the subtask via awaitCall then lift from memory.
-    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.bump\"(self.handle, @bitCast(by), wit_types.retPtr());") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __status = imp.@\"[method]thing.bump\"(self.handle, @bitCast(arg_by), wit_types.retPtr());") != null);
     try testing.expect(std.mem.indexOf(u8, out, "wit_async.awaitCall(__status);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(u32, wit_types.retArea());") != null);
     try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift([]const u8, wit_types.retArea());") != null);
@@ -4591,7 +5307,7 @@ test "generate: async param spill past MAX_FLAT_ASYNC_PARAMS (#300)" {
     // block) + a result pointer; the wrapper lowers the whole param tuple
     // (self first) to a scratch buffer and passes the pointer.
     try testing.expect(std.mem.indexOf(u8, out, "extern \"test:res/things\" fn @\"[method]thing.openish\"(args_ptr: i32, result_ptr: i32) i32;") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "const __pargs = .{ self, a, name, b, c };") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "const __pargs = .{ self, arg_a, arg_name, arg_b, arg_c };") != null);
     try testing.expect(std.mem.indexOf(u8, out, "const __pp = wit_types.alloc(wit_types.sizeOf(@TypeOf(__pargs)), wit_types.alignOf(@TypeOf(__pargs)));") != null);
     try testing.expect(std.mem.indexOf(u8, out, "wit_types.lower(@TypeOf(__pargs), __pargs, __pp, &wit_types.alloc);") != null);
     try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]thing.openish\"(@intCast(@intFromPtr(__pp)), wit_types.retPtr());") != null);
@@ -4818,8 +5534,8 @@ test "generate: future / stream / tuple in signatures" {
     try testing.expect(std.mem.indexOf(u8, out, "pub fn body(self: Pipe) wit_types.Tuple(.{ wit_types.Stream(u8), wit_types.Future(u32) }) {") != null);
     try testing.expect(std.mem.indexOf(u8, out, "return wit_types.lift(wit_types.Tuple(.{ wit_types.Stream(u8), wit_types.Future(u32) }), wit_types.retArea());") != null);
     // future<u32> param lowers to its i32 handle.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn signal(self: Pipe, f: wit_types.Future(u32)) bool {") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, f.handle)") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn signal(self: Pipe, arg_f: wit_types.Future(u32)) bool {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "imp.@\"[method]pipe.signal\"(self.handle, arg_f.handle)") != null);
     // free function returning tuple<u32, string>.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn makePair() wit_types.Tuple(.{ u32, []const u8 }) {") != null);
 }
@@ -4875,7 +5591,7 @@ test "generate: complex future/stream channels (function-reference intrinsics)" 
     try testing.expect(std.mem.indexOf(u8, out, "const __chan1 = wit_types.StreamOf([]const u8, \"[stream]demo:x/api@0.1.0#sink#0\");") != null);
     // The static wrapper: primitive param stays `canon.Future(u32)`; the complex
     // result is the shared nominal `__chan0`.
-    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(seed: wit_types.Future(u32)) __chan0 {") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "pub fn open(arg_seed: wit_types.Future(u32)) __chan0 {") != null);
     // The complex stream is a param typed as the shared nominal `__chan1`.
     try testing.expect(std.mem.indexOf(u8, out, "pub fn sink(s: __chan1) bool {") != null);
 }
