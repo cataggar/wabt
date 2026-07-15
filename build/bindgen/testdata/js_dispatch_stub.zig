@@ -11,6 +11,23 @@ pub const NativeValue = extern struct {
     list_len: usize = 0,
 };
 
+pub fn call(comptime export_name: []const u8, comptime Result: type, args: anytype) Result {
+    _ = export_name;
+    _ = args;
+    if (comptime Result == void) return;
+    return undefined;
+}
+
+pub fn dropExportResource(
+    comptime provider: []const u8,
+    comptime resource_name: []const u8,
+    rep: i32,
+) void {
+    _ = provider;
+    _ = resource_name;
+    _ = rep;
+}
+
 pub fn decodeNative(comptime T: type, value: *const NativeValue, allocator: std.mem.Allocator) T {
     _ = value;
     _ = allocator;

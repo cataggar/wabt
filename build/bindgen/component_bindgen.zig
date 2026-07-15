@@ -22,7 +22,8 @@
 //! resources, async exports (`task.return`), and `future<T>`/`stream<T>` —
 //! primitive elements via `canon.Future`/`Stream`, complex (aggregate /
 //! resource-bearing) elements via `canon.FutureOf`/`StreamOf` bound to a
-//! function-reference intrinsic `[future]<iface>#<fn>#<idx>`.
+//! function-reference intrinsic `[future]<iface>#<fn>#<idx>`, and synchronous
+//! JavaScript-backed exported resources in `--dispatch` mode.
 
 const std = @import("std");
 const wabt = @import("wabt");
@@ -46,7 +47,14 @@ pub const usage =
     \\                      per-function implementation. The module must expose:
     \\                        pub fn call(comptime export_name: []const u8,
     \\                          comptime Result: type, args: anytype) Result
+    \\                        pub fn dropExportResource(
+    \\                          comptime provider: []const u8,
+    \\                          comptime resource_name: []const u8, rep: i32) void
     \\                      Mutually exclusive with --impl.
+    \\                      Exported resources require this mode. Their class
+    \\                      operations use `<iface>#[constructor|method|static]…`
+    \\                      dispatch keys; `<iface>#[dtor]R` is an internal
+    \\                      release callback, not a JavaScript method.
     \\  --manual-return <fn>
     \\                      Generate an async export `<fn>` in manual-return form:
     \\                      the shell calls `Impl.<fn>(params)` (returning void)
@@ -302,6 +310,10 @@ const Gen = struct {
     current_iface: []const u8 = "",
     // True when the world imports an async func (the wrappers need `cm_async`).
     needs_cm_async: bool = false,
+    // Guest-defined resources from exported interfaces, in deterministic WIT
+    // declaration order. Identity is always provider + original resource name;
+    // aliases and same-named resources in other providers never collapse.
+    export_resources: std.ArrayListUnmanaged(ExportResource) = .empty,
 
     fn raw(self: *Gen, s: []const u8) void {
         self.out.appendSlice(self.ar, s) catch @panic("OOM");
@@ -321,8 +333,42 @@ const Gen = struct {
         return error.UnsupportedWitType;
     }
 
+    fn appendExportResource(self: *Gen, resource: ExportResource) GenError!void {
+        for (self.export_resources.items) |existing| {
+            if (std.mem.eql(u8, existing.provider, resource.provider) and
+                std.mem.eql(u8, existing.name, resource.name))
+            {
+                return;
+            }
+        }
+        try self.export_resources.append(self.ar, resource);
+    }
+
+    fn isExportResource(self: *Gen, provider: []const u8, name: []const u8) bool {
+        for (self.export_resources.items) |resource| {
+            if (std.mem.eql(u8, resource.provider, provider) and
+                std.mem.eql(u8, resource.name, name))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn exportResourceTypeName(self: *Gen, resource: ExportResource) GenError![]const u8 {
+        const saved = self.current_iface;
+        self.current_iface = resource.provider;
+        defer self.current_iface = saved;
+        return self.typeName(resource.name);
+    }
+
     const Use = struct { id: []const u8, iface: ast.Interface, is_export: bool, pkg: ?ast.PackageId };
     const TopFunc = struct { name: []const u8, func: ast.Func, is_export: bool };
+    const ExportResource = struct {
+        provider: []const u8,
+        name: []const u8,
+        methods: []const ast.ResourceMethod,
+    };
 
     fn generate(self: *Gen, world: ast.World, world_name: []const u8) GenError!void {
         const doc_pkg = self.resolver.main.package;
@@ -367,6 +413,26 @@ const Gen = struct {
             }
         }
         for (uses.items) |u| try self.noteInterface(u.id);
+        for (uses.items) |u| {
+            if (!u.is_export) continue;
+            for (u.iface.items) |item| switch (item) {
+                .type => |td| switch (td.kind) {
+                    .resource => |methods| try self.appendExportResource(.{
+                        .provider = u.id,
+                        .name = td.name,
+                        .methods = methods,
+                    }),
+                    else => {},
+                },
+                else => {},
+            };
+        }
+        if (self.export_resources.items.len != 0 and self.dispatch == null) {
+            return self.fail(
+                "exported WIT resources require --dispatch so their representations can be backed by JavaScript objects",
+                .{},
+            );
+        }
 
         // Index every named type so `.name` refs resolve, plus any types pulled
         // in from another interface via `use pkg:iface.{ … }` (resolved in the
@@ -515,9 +581,6 @@ const Gen = struct {
             self.current_iface = u.id;
             for (u.iface.items) |it| switch (it) {
                 .type => |td| {
-                    // Exported resources (guest-implemented, resource-new/rep) are
-                    // a later phase; imported resources are handled below.
-                    if (td.kind == .resource and u.is_export) return error.UnsupportedWitType;
                     // A resource reached through `use` is emitted under its
                     // canonical provider/name above. If that provider is also
                     // imported directly, do not emit the same Zig type twice.
@@ -529,6 +592,10 @@ const Gen = struct {
             };
         }
         self.current_iface = "";
+
+        if (self.export_resources.items.len != 0) {
+            try self.emitExportResourceMappers();
+        }
 
         // ── complex future/stream channel types (after their element types) ──
         for (self.chan_decls.items) |d| {
@@ -1055,12 +1122,17 @@ const Gen = struct {
         for (top_funcs) |tf| {
             if (tf.is_export and !tf.func.is_async) count += 1;
         }
+        count += self.export_resources.items.len;
         if (count == 0) return;
 
         self.raw(
             \\// Exact dispatch keys for componentization-time JavaScript export validation.
             \\// "I\t<interface-id>#<function>\n" preserves named-interface topology;
             \\// "R\t<function>\n" identifies a world-level root export.
+            \\// JavaScript-backed exported resources use direction-explicit records:
+            \\// "ER\t<provider>\t<resource>\t<class>\n"
+            \\// "EC|EM|ES\t<provider>\t<resource>\t<js-name>\t<dispatch-key>\t<arity>\n"
+            \\// "ED\t<provider>\t<resource>\t<dispatch-key>\n"
             \\pub const js_export_manifest: []const u8 =
             \\
         );
@@ -1073,6 +1145,41 @@ const Gen = struct {
                 },
                 else => {},
             };
+        }
+        for (self.export_resources.items) |resource| {
+            const class_name = try pascal(self.ar, resource.name);
+            self.print(
+                "    \"ER\\t{s}\\t{s}\\t{s}\\n\" ++\n",
+                .{ resource.provider, resource.name, class_name },
+            );
+            for (resource.methods) |method| {
+                const tag: []const u8 = switch (method.kind) {
+                    .constructor => "EC",
+                    .method => "EM",
+                    .static => "ES",
+                };
+                const js_name = if (method.kind == .constructor)
+                    class_name
+                else
+                    try camel(self.ar, method.name);
+                const operation = try self.resourceExternName(resource.name, method);
+                self.print(
+                    "    \"{s}\\t{s}\\t{s}\\t{s}\\t{s}#{s}\\t{d}\\n\" ++\n",
+                    .{
+                        tag,
+                        resource.provider,
+                        resource.name,
+                        js_name,
+                        resource.provider,
+                        operation,
+                        method.func.params.len,
+                    },
+                );
+            }
+            self.print(
+                "    \"ED\\t{s}\\t{s}\\t{s}#[dtor]{s}\\n\" ++\n",
+                .{ resource.provider, resource.name, resource.provider, resource.name },
+            );
         }
         for (top_funcs) |tf| {
             if (tf.is_export and !tf.func.is_async) {
@@ -1096,9 +1203,168 @@ const Gen = struct {
         self.print("// exports: {s}\n", .{u.id});
         for (u.iface.items) |it| switch (it) {
             .func => |fd| try self.emitExportFunc(u.id, fd.name, fd.func),
+            .type => |td| switch (td.kind) {
+                .resource => try self.emitExportResourceOperations(u.id, td),
+                else => {},
+            },
             else => {},
         };
         self.raw("\n");
+    }
+
+    fn emitExportResourceOperations(
+        self: *Gen,
+        iface_id: []const u8,
+        td: ast.TypeDef,
+    ) GenError!void {
+        const R = try self.typeName(td.name);
+        for (td.kind.resource) |method| {
+            try self.emitExportResourceOperation(iface_id, td.name, R, method);
+        }
+        try self.emitExportResourceDtor(iface_id, td.name);
+    }
+
+    fn validateExportResourceOperation(
+        self: *Gen,
+        iface_id: []const u8,
+        resource_name: []const u8,
+        method: ast.ResourceMethod,
+    ) GenError!void {
+        const operation = try self.resourceExternName(resource_name, method);
+        const context = try std.fmt.allocPrint(
+            self.ar,
+            "exported resource operation '{s}#{s}'",
+            .{ iface_id, operation },
+        );
+        if (method.func.is_async) {
+            return self.fail(
+                "{s} cannot be dispatched to JavaScript: canonical async resource operations are not supported",
+                .{context},
+            );
+        }
+        for (method.func.params) |param| {
+            if (!try self.nativeBridgeSupported(param.type)) {
+                return self.fail(
+                    "{s}: parameter '{s}' has a WIT type not supported by JavaScript resource dispatch",
+                    .{ context, param.name },
+                );
+            }
+        }
+        if (method.func.result) |result| {
+            if (!try self.nativeBridgeSupported(result)) {
+                return self.fail(
+                    "{s}: its result has a WIT type not supported by JavaScript resource dispatch",
+                    .{context},
+                );
+            }
+            if (try self.typeContainsExportBorrow(self.current_iface, result)) {
+                return self.fail(
+                    "{s}: borrowed exported resources cannot be returned",
+                    .{context},
+                );
+            }
+        }
+    }
+
+    fn emitExportResourceOperation(
+        self: *Gen,
+        iface_id: []const u8,
+        resource_name: []const u8,
+        R: []const u8,
+        method: ast.ResourceMethod,
+    ) GenError!void {
+        try self.validateExportResourceOperation(iface_id, resource_name, method);
+        const operation = try self.resourceExternName(resource_name, method);
+        const export_sym = try std.fmt.allocPrint(self.ar, "{s}#{s}", .{ iface_id, operation });
+        const result_zig = if (method.kind == .constructor)
+            try std.fmt.allocPrint(self.ar, "wit_types.Own({s})", .{R})
+        else
+            try self.resultZig(method.func);
+
+        self.print("export fn @\"{s}\"(", .{export_sym});
+        if (method.kind == .method) {
+            self.raw("self: i32");
+            if (method.func.params.len != 0) self.raw(", ");
+        }
+        try self.emitFlatParamDecls(method.func.params);
+        self.print(") wit_types.CoreReturn({s}) {{\n", .{result_zig});
+        self.raw("    wit_types.resetScratch();\n");
+
+        if (method.kind == .method) {
+            self.print(
+                "    const __self = {s}.Borrowed{{ .handle = self }};\n",
+                .{R},
+            );
+        }
+        try self.emitLiftParams(method.func.params);
+        if (method.func.params.len != 0) {
+            self.raw(
+                "    const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);\n",
+            );
+        }
+
+        const args = try self.implArgListFrom(method.func.params, "__dispatch_params");
+        var dispatch_args = std.ArrayListUnmanaged(u8).empty;
+        try dispatch_args.appendSlice(self.ar, ".{ ");
+        if (method.kind == .method) try dispatch_args.appendSlice(self.ar, "__self");
+        if (args.len != 0) {
+            if (method.kind == .method) try dispatch_args.appendSlice(self.ar, ", ");
+            try dispatch_args.appendSlice(self.ar, args);
+        }
+        try dispatch_args.appendSlice(self.ar, " }");
+
+        const has_result = method.kind == .constructor or method.func.result != null;
+        if (!has_result) {
+            self.print(
+                "    __wit_dispatch.call(\"{s}\", void, {s});\n",
+                .{ export_sym, dispatch_args.items },
+            );
+            if (method.func.params.len != 0) {
+                self.raw(
+                    "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+                );
+            }
+            self.raw("    return;\n");
+        } else {
+            self.print(
+                "    const __result = __wit_dispatch.call(\"{s}\", {s}, {s});\n",
+                .{ export_sym, result_zig, dispatch_args.items },
+            );
+            self.print(
+                "    const __canonical_result = wit_types.mapResources({s}, __result, __wit_lower_export_resource, &wit_types.alloc);\n",
+                .{result_zig},
+            );
+            if (method.func.params.len != 0) {
+                self.raw(
+                    "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+                );
+            }
+            self.print(
+                "    return wit_types.returnResult({s}, __canonical_result, &wit_types.alloc);\n",
+                .{result_zig},
+            );
+        }
+        self.raw("}\n\n");
+    }
+
+    fn emitExportResourceDtor(
+        self: *Gen,
+        iface_id: []const u8,
+        resource_name: []const u8,
+    ) GenError!void {
+        const export_sym = try std.fmt.allocPrint(
+            self.ar,
+            "{s}#[dtor]{s}",
+            .{ iface_id, resource_name },
+        );
+        self.print("export fn @\"{s}\"(rep: i32) void {{\n", .{export_sym});
+        // resource-drop can invoke this synchronously while its caller still
+        // holds a scratch-backed nested result, so a dtor must not reset it.
+        self.print(
+            "    __wit_dispatch.dropExportResource(\"{s}\", \"{s}\", rep);\n",
+            .{ iface_id, resource_name },
+        );
+        self.raw("}\n\n");
     }
 
     fn emitExportFunc(self: *Gen, iface_id: []const u8, name: []const u8, func: ast.Func) GenError!void {
@@ -1123,6 +1389,14 @@ const Gen = struct {
     /// func, or the plain func name for a top-level world func); `name`
     /// drives the `Impl.<fn>` call or is passed to `__wit_dispatch.call`.
     fn emitSyncExportFuncSym(self: *Gen, export_sym: []const u8, name: []const u8, func: ast.Func) GenError!void {
+        if (func.result) |result| {
+            if (try self.typeContainsExportBorrow(self.current_iface, result)) {
+                return self.fail(
+                    "exported function '{s}' cannot return a borrowed exported resource",
+                    .{export_sym},
+                );
+            }
+        }
         const result_zig = try self.resultZig(func);
 
         self.print("export fn @\"{s}\"(", .{export_sym});
@@ -1133,7 +1407,16 @@ const Gen = struct {
         try self.emitLiftParams(func.params);
 
         // Call the user implementation or generic dispatcher, then encode the result.
-        const args = try self.implArgList(func.params);
+        const map_resources = self.dispatch != null and self.export_resources.items.len != 0;
+        if (map_resources and func.params.len != 0) {
+            self.raw(
+                "    const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);\n",
+            );
+        }
+        const args = try self.implArgListFrom(
+            func.params,
+            if (map_resources) "__dispatch_params" else "__params",
+        );
         if (self.dispatch != null) {
             const dispatch_args = if (args.len == 0)
                 ".{}"
@@ -1144,11 +1427,31 @@ const Gen = struct {
                     "    __wit_dispatch.call(\"{s}\", void, {s});\n",
                     .{ export_sym, dispatch_args },
                 );
+                if (map_resources and func.params.len != 0) {
+                    self.raw(
+                        "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+                    );
+                }
                 self.raw("    return;\n");
             } else {
                 self.print(
-                    "    return wit_types.returnResult({s}, __wit_dispatch.call(\"{s}\", {s}, {s}), &wit_types.alloc);\n",
-                    .{ result_zig, export_sym, result_zig, dispatch_args },
+                    "    const __result = __wit_dispatch.call(\"{s}\", {s}, {s});\n",
+                    .{ export_sym, result_zig, dispatch_args },
+                );
+                if (map_resources) {
+                    self.print(
+                        "    const __canonical_result = wit_types.mapResources({s}, __result, __wit_lower_export_resource, &wit_types.alloc);\n",
+                        .{result_zig},
+                    );
+                }
+                if (map_resources and func.params.len != 0) {
+                    self.raw(
+                        "    _ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);\n",
+                    );
+                }
+                self.print(
+                    "    return wit_types.returnResult({s}, {s}, &wit_types.alloc);\n",
+                    .{ result_zig, if (map_resources) "__canonical_result" else "__result" },
                 );
             }
         } else if (func.result == null) {
@@ -1240,11 +1543,16 @@ const Gen = struct {
         }
     }
 
-    fn implArgList(self: *Gen, params: []const ast.Param) GenError![]const u8 {
+    fn implArgListFrom(
+        self: *Gen,
+        params: []const ast.Param,
+        base: []const u8,
+    ) GenError![]const u8 {
         var buf = std.ArrayListUnmanaged(u8).empty;
         for (params, 0..) |p, idx| {
             if (idx != 0) try buf.appendSlice(self.ar, ", ");
-            try buf.appendSlice(self.ar, "__params.");
+            try buf.appendSlice(self.ar, base);
+            try buf.append(self.ar, '.');
             try buf.appendSlice(self.ar, try snake(self.ar, p.name));
         }
         return buf.items;
@@ -1770,6 +2078,61 @@ const Gen = struct {
         };
     }
 
+    fn typeContainsExportBorrow(
+        self: *Gen,
+        scope: []const u8,
+        ty: ast.Type,
+    ) GenError!bool {
+        return switch (ty) {
+            .list, .option => |element| try self.typeContainsExportBorrow(scope, element.*),
+            .result => |result| blk: {
+                if (result.ok) |ok| {
+                    if (try self.typeContainsExportBorrow(scope, ok.*)) break :blk true;
+                }
+                if (result.err) |err| {
+                    if (try self.typeContainsExportBorrow(scope, err.*)) break :blk true;
+                }
+                break :blk false;
+            },
+            .tuple => |elements| blk: {
+                for (elements) |element| {
+                    if (try self.typeContainsExportBorrow(scope, element)) break :blk true;
+                }
+                break :blk false;
+            },
+            .borrow => |name| blk: {
+                const resource = try self.resolveBridgeResource(scope, name) orelse
+                    break :blk false;
+                break :blk self.isExportResource(resource.provider, resource.name);
+            },
+            .name => |name| blk: {
+                const info = self.scoped.get(self.scopeKey(scope, name)) orelse
+                    return error.UnknownType;
+                break :blk switch (info.kind) {
+                    .record => |fields| r: {
+                        for (fields) |field| {
+                            if (try self.typeContainsExportBorrow(info.def_iface, field.type))
+                                break :r true;
+                        }
+                        break :r false;
+                    },
+                    .variant => |cases| r: {
+                        for (cases) |case| {
+                            if (case.type) |case_type| {
+                                if (try self.typeContainsExportBorrow(info.def_iface, case_type))
+                                    break :r true;
+                            }
+                        }
+                        break :r false;
+                    },
+                    .alias => |target| try self.typeContainsExportBorrow(info.def_iface, target),
+                    .resource, .@"enum", .flags => false,
+                };
+            },
+            else => false,
+        };
+    }
+
     const JsImportEntry = struct {
         manifest_kind: []const u8,
         module: []const u8,
@@ -2249,6 +2612,9 @@ const Gen = struct {
     /// private `imp` namespace of the canonical resource externs, typed
     /// method/static/constructor wrappers, and a `deinit` that drops the handle.
     fn emitResource(self: *Gen, iface_id: []const u8, td: ast.TypeDef, R: []const u8) GenError!void {
+        if (self.isExportResource(iface_id, td.name)) {
+            return self.emitExportResourceType(iface_id, td.name, R);
+        }
         const methods = td.kind.resource;
 
         self.print("pub const {s} = struct {{\n", .{R});
@@ -2290,6 +2656,139 @@ const Gen = struct {
         self.raw("        __wit_drop(self.handle);\n");
         self.raw("    }\n");
         self.raw("};\n\n");
+    }
+
+    /// Emit the nominal representation type for a JavaScript-backed resource
+    /// defined by a guest export. Its `.handle` stores the runtime's stable rep
+    /// id, never an imported-resource host handle. Canonical handles cross the
+    /// component boundary only through the three `[export]<iface>` intrinsics.
+    fn emitExportResourceType(
+        self: *Gen,
+        iface_id: []const u8,
+        resource_name: []const u8,
+        R: []const u8,
+    ) GenError!void {
+        self.print("pub const {s} = struct {{\n", .{R});
+        self.raw("    handle: i32,\n\n");
+        self.print(
+            "    pub const __wit_resource = wit_types.ResourceDescriptor{{ .provider = \"{s}\", .name = \"{s}\" }};\n",
+            .{ iface_id, resource_name },
+        );
+        self.raw("    pub const __wit_resource_ownership: wit_types.ResourceOwnership = .own;\n");
+        self.raw("    pub const ResourceType = @This();\n\n");
+
+        self.raw("    const imp = struct {\n");
+        self.print(
+            "        extern \"[export]{s}\" fn @\"[resource-new]{s}\"(rep: i32) i32;\n",
+            .{ iface_id, resource_name },
+        );
+        self.print(
+            "        extern \"[export]{s}\" fn @\"[resource-rep]{s}\"(handle: i32) i32;\n",
+            .{ iface_id, resource_name },
+        );
+        self.print(
+            "        extern \"[export]{s}\" fn @\"[resource-drop]{s}\"(handle: i32) void;\n",
+            .{ iface_id, resource_name },
+        );
+        self.raw("    };\n\n");
+
+        self.raw("    pub const Borrowed = struct {\n");
+        self.raw("        handle: i32,\n\n");
+        self.print(
+            "        pub const __wit_resource = wit_types.ResourceDescriptor{{ .provider = \"{s}\", .name = \"{s}\" }};\n",
+            .{ iface_id, resource_name },
+        );
+        self.raw("        pub const __wit_resource_ownership: wit_types.ResourceOwnership = .borrow;\n");
+        self.print("        pub const ResourceType = {s};\n", .{R});
+        self.raw("    };\n\n");
+
+        self.print("    pub fn __wit_borrow(self: {s}) Borrowed {{\n", .{R});
+        self.raw("        return .{ .handle = self.handle };\n");
+        self.raw("    }\n\n");
+        self.raw("    pub fn __wit_new(rep: i32) i32 {\n");
+        self.print("        return imp.@\"[resource-new]{s}\"(rep);\n", .{resource_name});
+        self.raw("    }\n\n");
+        self.raw("    pub fn __wit_rep(handle: i32) i32 {\n");
+        self.print("        return imp.@\"[resource-rep]{s}\"(handle);\n", .{resource_name});
+        self.raw("    }\n\n");
+        self.raw("    pub fn __wit_drop(handle: i32) void {\n");
+        self.print("        imp.@\"[resource-drop]{s}\"(handle);\n", .{resource_name});
+        self.raw("    }\n");
+        self.raw("};\n\n");
+    }
+
+    /// Emit the provider-qualified callbacks used by
+    /// `wit_types.mapResources`. Incoming canonical handles become reps before
+    /// JavaScript dispatch; returned owned reps become fresh canonical handles;
+    /// incoming owned handles are consumed after the dispatch result has been
+    /// lowered, while borrows remain live.
+    fn emitExportResourceMappers(self: *Gen) GenError!void {
+        self.raw(
+            \\fn __wit_lift_export_resource(comptime T: type, value: T) T {
+            \\    const info = comptime wit_types.resourceInfo(T).?;
+            \\
+        );
+        for (self.export_resources.items) |resource| {
+            const R = try self.exportResourceTypeName(resource);
+            self.print(
+                "    if (comptime {s}.__wit_resource.eql(info.descriptor)) {{\n",
+                .{R},
+            );
+            self.print(
+                "        return .{{ .handle = if (comptime info.ownership == .own) {s}.__wit_rep(value.handle) else value.handle }};\n",
+                .{R},
+            );
+            self.raw("    }\n");
+        }
+        self.raw(
+            \\    return value;
+            \\}
+            \\
+            \\fn __wit_lower_export_resource(comptime T: type, value: T) T {
+            \\    const info = comptime wit_types.resourceInfo(T).?;
+            \\
+        );
+        for (self.export_resources.items) |resource| {
+            const R = try self.exportResourceTypeName(resource);
+            self.print(
+                "    if (comptime {s}.__wit_resource.eql(info.descriptor)) {{\n",
+                .{R},
+            );
+            self.raw(
+                \\        if (comptime info.ownership != .own) {
+                \\            @compileError("borrowed exported resources cannot be returned");
+                \\        }
+                \\
+            );
+            self.print("        return .{{ .handle = {s}.__wit_new(value.handle) }};\n", .{R});
+            self.raw("    }\n");
+        }
+        self.raw(
+            \\    return value;
+            \\}
+            \\
+            \\fn __wit_consume_export_resource(comptime T: type, value: T) T {
+            \\    const info = comptime wit_types.resourceInfo(T).?;
+            \\
+        );
+        for (self.export_resources.items) |resource| {
+            const R = try self.exportResourceTypeName(resource);
+            self.print(
+                "    if (comptime {s}.__wit_resource.eql(info.descriptor)) {{\n",
+                .{R},
+            );
+            self.raw("        if (comptime info.ownership == .own) {\n");
+            self.print("            {s}.__wit_drop(value.handle);\n", .{R});
+            self.raw("        }\n");
+            self.raw("        return value;\n");
+            self.raw("    }\n");
+        }
+        self.raw(
+            \\    return value;
+            \\}
+            \\
+            \\
+        );
     }
 
     fn emitResourceExtern(self: *Gen, iface_id: []const u8, rname: []const u8, m: ast.ResourceMethod) GenError!void {
@@ -3843,9 +4342,132 @@ test "generate: imported resource handle struct + methods/static/ctor/drop" {
         try testing.expect(std.mem.indexOf(u8, out, "__wit_drop(self.handle);") != null);
     }
     {
-        // Exported (guest-implemented) resources are not supported yet.
         var g = Gen{ .ar = ar, .resolver = res, .impl = "impl" };
         try testing.expectError(error.UnsupportedWitType, g.generate(exp_world, "host"));
+        try testing.expect(std.mem.indexOf(u8, g.diag, "require --dispatch") != null);
+    }
+    {
+        var g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+        try g.generate(exp_world, "host");
+        const out = g.out.items;
+
+        try testing.expect(std.mem.indexOf(u8, out, "pub const Counter = struct {") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "extern \"[export]test:res/counters\" fn @\"[resource-new]counter\"(rep: i32) i32;",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "extern \"[export]test:res/counters\" fn @\"[resource-rep]counter\"(handle: i32) i32;",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "extern \"[export]test:res/counters\" fn @\"[resource-drop]counter\"(handle: i32) void;",
+        ) != null);
+
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "export fn @\"test:res/counters#[constructor]counter\"(start: i32) wit_types.CoreReturn(wit_types.Own(Counter))",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:res/counters#[constructor]counter\", wit_types.Own(Counter), .{ __dispatch_params.start })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "const __canonical_result = wit_types.mapResources(wit_types.Own(Counter), __result, __wit_lower_export_resource, &wit_types.alloc);",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "export fn @\"test:res/counters#[method]counter.increment\"(self: i32, by: i32) wit_types.CoreReturn(u32)",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "const __self = Counter.Borrowed{ .handle = self };",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "if (comptime info.ownership == .own) Counter.__wit_rep(value.handle) else value.handle",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.call(\"test:res/counters#[method]counter.increment\", u32, .{ __self, __dispatch_params.by })",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "export fn @\"test:res/counters#[static]counter.make-zero\"() wit_types.CoreReturn(wit_types.Own(Counter))",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "export fn @\"test:res/counters#[dtor]counter\"(rep: i32) void",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "__wit_dispatch.dropExportResource(\"test:res/counters\", \"counter\", rep);",
+        ) != null);
+
+        // Ordinary exported functions map resource handles recursively through
+        // reps, lower returned own reps through resource-new, and consume only
+        // incoming own canonical handles after dispatch.
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "export fn @\"test:res/counters#transfer\"(value: i32) wit_types.CoreReturn(wit_types.Own(Counter))",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "const __dispatch_params = wit_types.mapResources(@TypeOf(__params), __params, __wit_lift_export_resource, &wit_types.alloc);",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "_ = wit_types.mapResources(@TypeOf(__params), __params, __wit_consume_export_resource, &wit_types.alloc);",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "if (comptime info.ownership == .own)",
+        ) != null);
+
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"ER\\ttest:res/counters\\tcounter\\tCounter\\n\"",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"EC\\ttest:res/counters\\tcounter\\tCounter\\ttest:res/counters#[constructor]counter\\t1\\n\"",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"EM\\ttest:res/counters\\tcounter\\tincrement\\ttest:res/counters#[method]counter.increment\\t1\\n\"",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"ES\\ttest:res/counters\\tcounter\\tmakeZero\\ttest:res/counters#[static]counter.make-zero\\t0\\n\"",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            out,
+            "\"ED\\ttest:res/counters\\tcounter\\ttest:res/counters#[dtor]counter\\n\"",
+        ) != null);
     }
 }
 
@@ -3880,9 +4502,18 @@ test "generate: same-named resources keep provider identity and alias ownership"
         .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-a" } } } },
         .{ .import = .{ .interface_ref = .{ .ref = .{ .name = "provider-b" } } } },
     } };
+    const export_world = ast.World{ .name = "host", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "provider-a" } } } },
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "provider-b" } } } },
+    } };
     const doc = ast.Document{
         .package = .{ .namespace = "demo", .name = "duplicate", .version = "1.2.3" },
-        .items = &.{ .{ .interface = iface_a }, .{ .interface = iface_b }, .{ .world = world } },
+        .items = &.{
+            .{ .interface = iface_a },
+            .{ .interface = iface_b },
+            .{ .world = world },
+            .{ .world = export_world },
+        },
     };
     const res = wit.resolver.Resolver.init(doc, &.{});
 
@@ -3922,6 +4553,108 @@ test "generate: same-named resources keep provider identity and alias ownership"
         out,
         "pub fn inspect(value: wit_types.Borrow(ProviderBItemAlias)) u32",
     ) != null);
+
+    var export_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try export_g.generate(export_world, "host");
+    const export_out = export_g.out.items;
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "extern \"[export]demo:duplicate/provider-a@1.2.3\" fn @\"[resource-new]item\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "extern \"[export]demo:duplicate/provider-b@1.2.3\" fn @\"[resource-new]item\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "\"ER\\tdemo:duplicate/provider-a@1.2.3\\titem\\tItem\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "\"ER\\tdemo:duplicate/provider-b@1.2.3\\titem\\tItem\\n\"",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "export fn @\"demo:duplicate/provider-a@1.2.3#[dtor]item\"(rep: i32) void",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        export_out,
+        "export fn @\"demo:duplicate/provider-b@1.2.3#[dtor]item\"(rep: i32) void",
+    ) != null);
+}
+
+test "generate: exported resource unsupported operations fail deterministically" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
+    const u32_type: ast.Type = .u32;
+    const async_methods = [_]ast.ResourceMethod{.{
+        .kind = .method,
+        .name = "later",
+        .func = .{ .params = &.{}, .result = .u32, .is_async = true },
+    }};
+    const channel_methods = [_]ast.ResourceMethod{.{
+        .kind = .static,
+        .name = "from-stream",
+        .func = .{
+            .params = &.{.{ .name = "values", .type = .{ .stream = &u32_type } }},
+            .result = .{ .name = "thing" },
+        },
+    }};
+    const borrowed_result_methods = [_]ast.ResourceMethod{.{
+        .kind = .static,
+        .name = "borrowed",
+        .func = .{ .params = &.{}, .result = .{ .borrow = "thing" } },
+    }};
+    const async_iface = ast.Interface{ .name = "async-api", .items = &.{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &async_methods } } },
+    } };
+    const channel_iface = ast.Interface{ .name = "channel-api", .items = &.{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &channel_methods } } },
+    } };
+    const borrowed_iface = ast.Interface{ .name = "borrowed-api", .items = &.{
+        .{ .type = .{ .name = "thing", .kind = .{ .resource = &borrowed_result_methods } } },
+    } };
+    const async_world = ast.World{ .name = "async-world", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "async-api" } } } },
+    } };
+    const channel_world = ast.World{ .name = "channel-world", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "channel-api" } } } },
+    } };
+    const borrowed_world = ast.World{ .name = "borrowed-world", .items = &.{
+        .{ .@"export" = .{ .interface_ref = .{ .ref = .{ .name = "borrowed-api" } } } },
+    } };
+    const doc = ast.Document{
+        .package = .{ .namespace = "test", .name = "unsupported-export-resource" },
+        .items = &.{
+            .{ .interface = async_iface },
+            .{ .interface = channel_iface },
+            .{ .interface = borrowed_iface },
+            .{ .world = async_world },
+            .{ .world = channel_world },
+            .{ .world = borrowed_world },
+        },
+    };
+    const res = wit.resolver.Resolver.init(doc, &.{});
+
+    var async_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try testing.expectError(error.UnsupportedWitType, async_g.generate(async_world, "async-world"));
+    try testing.expect(std.mem.indexOf(u8, async_g.diag, "canonical async resource operations") != null);
+
+    var channel_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try testing.expectError(error.UnsupportedWitType, channel_g.generate(channel_world, "channel-world"));
+    try testing.expect(std.mem.indexOf(u8, channel_g.diag, "parameter 'values'") != null);
+
+    var borrowed_g = Gen{ .ar = ar, .resolver = res, .impl = "impl", .dispatch = "js_dispatch" };
+    try testing.expectError(error.UnsupportedWitType, borrowed_g.generate(borrowed_world, "borrowed-world"));
+    try testing.expect(std.mem.indexOf(u8, borrowed_g.diag, "borrowed exported resources cannot be returned") != null);
 }
 
 test "generate: async resource reached through use imports wit_async" {

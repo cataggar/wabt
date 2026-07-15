@@ -286,6 +286,62 @@ pub fn build(b: *std.Build) void {
     );
     js_import_resource_step.dependOn(&js_import_resource_exe.step);
 
+    // Generate JavaScript-backed exported resource classes and force semantic
+    // analysis of constructor/method/static/dtor shells, recursive own/borrow
+    // conversion, aliases, nested transfers, and provider collisions.
+    const js_export_resource_run = b.addRunArtifact(bindgen_exe);
+    js_export_resource_run.addArgs(&.{"--wit"});
+    js_export_resource_run.addFileArg(b.path("build/bindgen/testdata/js_export_resources.wit"));
+    js_export_resource_run.addArgs(&.{ "--world", "guest", "--dispatch", "js_dispatch", "-o" });
+    const js_export_resource_generated = js_export_resource_run.addOutputFileArg("js_export_resources_generated.zig");
+
+    const js_export_resource_generated_mod = b.createModule(.{
+        .root_source_file = js_export_resource_generated,
+        .target = wasm32_freestanding,
+    });
+    js_export_resource_generated_mod.addImport("wit_types", wit_types);
+    js_export_resource_generated_mod.addImport("js_dispatch", b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/js_dispatch_stub.zig"),
+        .target = wasm32_freestanding,
+    }));
+
+    const js_export_resource_driver_mod = b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/js_export_resource_force_driver.zig"),
+        .target = wasm32_freestanding,
+        .imports = &.{.{ .name = "generated", .module = js_export_resource_generated_mod }},
+    });
+    const js_export_resource_exe = b.addExecutable(.{
+        .name = "js_export_resources_gen_check",
+        .root_module = js_export_resource_driver_mod,
+    });
+    js_export_resource_exe.entry = .disabled;
+    js_export_resource_exe.rdynamic = true;
+
+    const js_export_resource_step = b.step(
+        "js-export-resource-gen-check",
+        "Compile generated JavaScript exported-resource bindings for wasm32",
+    );
+    js_export_resource_step.dependOn(&js_export_resource_exe.step);
+
+    const js_export_resource_component_check = b.addSystemCommand(&.{"bash"});
+    js_export_resource_component_check.addFileArg(
+        b.path("build/bindgen/testdata/check_js_export_resource_component.sh"),
+    );
+    js_export_resource_component_check.addFileArg(
+        b.path("build/bindgen/testdata/js_export_resources.wit"),
+    );
+    js_export_resource_component_check.addArtifactArg(js_export_resource_exe);
+    _ = js_export_resource_component_check.addOutputFileArg(
+        "js-export-resources.component.wasm",
+    );
+    const js_export_resource_component_step = b.step(
+        "js-export-resource-component-test",
+        "Wrap and validate a generated component with exported resources",
+    );
+    js_export_resource_component_step.dependOn(
+        &js_export_resource_component_check.step,
+    );
+
     // Wrap that real generated core module with reference component tooling.
     // Successful wrapping proves the externs use canonical `$root` module /
     // verbatim-field names; the script also asserts the root functions and
@@ -328,6 +384,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(resource_descriptor_step);
     test_step.dependOn(root_import_gen_step);
     test_step.dependOn(js_import_resource_step);
+    test_step.dependOn(js_export_resource_step);
     // Component wrapping uses the separately installed `wasm-tools` CLI.
     // Keep it opt-in so a documented clean `zig build test` needs only this
     // package's declared Zig dependencies; semantic root-import codegen stays
