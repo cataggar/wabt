@@ -1,0 +1,59 @@
+package test:js-imported-resources@1.0.0;
+
+interface origin {
+  resource token;
+}
+
+interface provider-a {
+  resource item {
+    constructor(seed: u32);
+    replace-with: func(next: own<item>) -> item;
+    inspect: func(other: borrow<item>) -> u32;
+    from-borrow: static func(source: borrow<item>) -> item;
+  }
+
+  type item-alias = item;
+
+  record owned-box {
+    value: own<item-alias>,
+  }
+
+  transfer: func(
+    owned: own<item-alias>,
+    borrowed: borrow<item-alias>,
+    nested: option<owned-box>,
+  ) -> own<item-alias>;
+}
+
+interface provider-b {
+  resource item {
+    constructor(seed: u32);
+    from-double: static func(value: u32) -> item;
+    value: func() -> u32;
+  }
+
+  type item-alias = item;
+  inspect: func(value: borrow<item-alias>) -> u32;
+}
+
+interface facade {
+  use provider-a.{item as facade-item};
+  use origin.{token as source-token};
+
+  record payload {
+    item: own<facade-item>,
+    token: option<source-token>,
+  }
+
+  route: func(
+    owned: own<facade-item>,
+    borrowed: borrow<facade-item>,
+    nested: option<payload>,
+  ) -> own<facade-item>;
+}
+
+world guest {
+  import provider-a;
+  import provider-b;
+  import facade;
+}

@@ -248,6 +248,44 @@ pub fn build(b: *std.Build) void {
     );
     root_import_gen_step.dependOn(&root_import_exe.step);
 
+    // Generate imported resource classes/operations in `--js-imports` mode
+    // and force semantic analysis of constructor, method, static, free
+    // function, own/borrow, nested aggregate, alias, provider-collision, and
+    // strong drop-hook code paths on the real wasm32 guest target.
+    const js_import_resource_run = b.addRunArtifact(bindgen_exe);
+    js_import_resource_run.addArgs(&.{"--wit"});
+    js_import_resource_run.addFileArg(b.path("build/bindgen/testdata/js_import_resources.wit"));
+    js_import_resource_run.addArgs(&.{ "--world", "guest", "--dispatch", "js_dispatch", "--js-imports", "-o" });
+    const js_import_resource_generated = js_import_resource_run.addOutputFileArg("js_import_resources_generated.zig");
+
+    const js_import_resource_generated_mod = b.createModule(.{
+        .root_source_file = js_import_resource_generated,
+        .target = wasm32_freestanding,
+    });
+    js_import_resource_generated_mod.addImport("wit_types", wit_types);
+    js_import_resource_generated_mod.addImport("js_dispatch", b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/js_dispatch_stub.zig"),
+        .target = wasm32_freestanding,
+    }));
+
+    const js_import_resource_driver_mod = b.createModule(.{
+        .root_source_file = b.path("build/bindgen/testdata/js_import_resource_force_driver.zig"),
+        .target = wasm32_freestanding,
+        .imports = &.{.{ .name = "generated", .module = js_import_resource_generated_mod }},
+    });
+    const js_import_resource_exe = b.addExecutable(.{
+        .name = "js_import_resources_gen_check",
+        .root_module = js_import_resource_driver_mod,
+    });
+    js_import_resource_exe.entry = .disabled;
+    js_import_resource_exe.rdynamic = true;
+
+    const js_import_resource_step = b.step(
+        "js-import-resource-gen-check",
+        "Compile generated JavaScript imported-resource bindings for wasm32",
+    );
+    js_import_resource_step.dependOn(&js_import_resource_exe.step);
+
     // Wrap that real generated core module with reference component tooling.
     // Successful wrapping proves the externs use canonical `$root` module /
     // verbatim-field names; the script also asserts the root functions and
@@ -289,6 +327,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_bindgen_tests.step);
     test_step.dependOn(resource_descriptor_step);
     test_step.dependOn(root_import_gen_step);
+    test_step.dependOn(js_import_resource_step);
     // Component wrapping uses the separately installed `wasm-tools` CLI.
     // Keep it opt-in so a documented clean `zig build test` needs only this
     // package's declared Zig dependencies; semantic root-import codegen stays
