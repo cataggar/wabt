@@ -6,17 +6,18 @@ Unit tests live alongside the code; run them with:
 $ zig build test
 ```
 
-Wasm 3.0 spec tests — run the full [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) (257 `.wast` files, 65k+ assertions) and compare against the pinned baseline at [`spec-baseline.tsv`](spec-baseline.tsv):
+Wasm 3.0 spec tests — `wabt` does not execute WebAssembly, so the
+[WebAssembly/testsuite](https://github.com/WebAssembly/testsuite)
+conformance run lives in
+[cataggar/wamr](https://github.com/cataggar/wamr), which uses the
+`.wast` helpers from this repository to convert the suite into commands
+and then runs them on the WAMR engine. See `zig build spec-testsuite`
+there.
+
+To convert a single `.wast` file to JSON + `.wasm` modules:
 
 ```console
-$ zig build -Doptimize=ReleaseSafe
-$ python3 scripts/check_spec_baseline.py
-```
-
-To run a single file:
-
-```console
-$ ./zig-out/bin/wabt spec run third_party/testsuite/i32.wast
+$ ./zig-out/bin/wabt spec to-json input.wast
 ```
 
 ## Legacy C++-era test corpus

@@ -51,7 +51,6 @@ pub fn build(b: *std.Build) void {
         "src/tools/decompile.zig",
         "src/tools/stats.zig",
         "src/tools/desugar.zig",
-        "src/tools/spectest.zig",
         "src/tools/shrink.zig",
         "src/tools/component.zig",
         "src/tools/component_embed.zig",
@@ -348,7 +347,7 @@ pub fn build(b: *std.Build) void {
             .{ "text", "parse", "<input.wat>" },
             .{ "module", "validate", "<input.wasm>" },
             .{ "component", "new", "<input.wasm>" },
-            .{ "spec", "run", "<input.wast>" },
+            .{ "spec", "to-json", "<input.wast>" },
         };
         inline for (help_cases) |c| {
             const subject = c[0];
