@@ -1716,7 +1716,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
         0x06, 0x07, 0x08, 0x09, 0x0a, // try, catch, throw, rethrow, throw_ref
         0x12, 0x13, 0x14, 0x15, // return_call, return_call_indirect, call_ref, return_call_ref
         0x18, 0x19, 0x1f, // delegate, catch_all, try_table
-        0xd4, 0xd5, 0xd6, // ref.as_non_null, br_on_null, br_on_non_null
+        0xd3, 0xd4, 0xd5, 0xd6, // ref.eq, ref.as_non_null, br_on_null, br_on_non_null
     };
     const alloc = std.testing.allocator;
     var checked: usize = 0;
@@ -1743,4 +1743,20 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     }
     // Guard against the loop silently stopping to exercise anything.
     try std.testing.expect(checked > 150);
+}
+
+test "ref.eq is a declared opcode, not a malformed encoding (issue #350)" {
+    // 0xd3 was absent from Opcode.Code while text/Parser.zig emitted it, so
+    // wabt rejected its own output and told the author the source was
+    // malformed. It must classify like its neighbours: a real instruction
+    // that is not type-checked yet, not a meaningless byte.
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(null, 0xd3));
+    for ([_]u8{ 0xd3, 0xd4 }) |op| {
+        const body = [_]u8{ op, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    }
+    try std.testing.expectEqualStrings("ref.eq", Opcode.Code.ref_eq.name());
 }

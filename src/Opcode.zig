@@ -243,6 +243,7 @@ pub const Code = enum(u32) {
     ref_null = 0xd0,
     ref_is_null = 0xd1,
     ref_func = 0xd2,
+    ref_eq = 0xd3,
     ref_as_non_null = 0xd4,
     br_on_null = 0xd5,
     br_on_non_null = 0xd6,
@@ -798,6 +799,9 @@ pub const Code = enum(u32) {
             .ref_is_null,
             .ref_func,
             => features.reference_types,
+
+            // Garbage collection
+            .ref_eq => features.gc,
 
             // Multi-value (select_t enabled by default)
             .select_t => features.multi_value,
@@ -1520,6 +1524,7 @@ pub const Code = enum(u32) {
             .ref_is_null => "ref.is_null",
             .ref_func => "ref.func",
             .ref_as_non_null => "ref.as_non_null",
+            .ref_eq => "ref.eq",
             .br_on_null => "br_on_null",
             .br_on_non_null => "br_on_non_null",
             .i32_trunc_sat_f32_s => "i32.trunc_sat_f32_s",
