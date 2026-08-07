@@ -56,7 +56,7 @@ jobs:
           submodules: true
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.1
+        uses: cataggar/ghr/actions/install@v0.7.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -140,7 +140,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install ghr
-        run: pipx install ghr-bin==0.6.1
+        run: pipx install ghr-bin==0.7.0
 
       - name: Sign archives with minisign (per-asset .minisig sidecars)
         env:

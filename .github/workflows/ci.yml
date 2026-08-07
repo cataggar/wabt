@@ -22,7 +22,7 @@ jobs:
           submodules: true
 
       - name: Install Zig via ghr
-        uses: cataggar/ghr/actions/install@v0.6.1
+        uses: cataggar/ghr/actions/install@v0.7.0
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
