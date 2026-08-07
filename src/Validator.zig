@@ -39,6 +39,10 @@ pub const Error = error{
     /// Reported rather than skipped: a validator that stops checking is
     /// not entitled to report success. See issue #347.
     UnsupportedOpcode,
+    /// A lane index immediate selects a lane the operand shape does not have.
+    InvalidLaneIndex,
+    /// An instruction's immediate operands run past the end of the body.
+    UnexpectedEnd,
     OutOfMemory,
 };
 
@@ -476,7 +480,14 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: ValTypeOrUn
 /// SIMD module fail validation with an error naming a cause that did not
 /// exist. See issue #347.
 fn classifyOpcode(prefix: ?u8, code: u32) Error {
-    const disc: u32 = if (prefix) |p| (@as(u32, p) << 8) | code else code;
+    // Opcode.Code packs prefixed opcodes at variable width: 0xPPCC for
+    // sub-opcodes that fit in a byte, 0xPPCCC for the wider ones (relaxed
+    // SIMD starts at 0xfd100). Mirror Opcode.getPrefix/getCode exactly --
+    // a fixed <<8 would fold 0xfd 0x100 onto 0xfd00, i.e. v128.load.
+    const disc: u32 = if (prefix) |p|
+        (if (code <= 0xff) (@as(u32, p) << 8) | code else (@as(u32, p) << 12) | code)
+    else
+        code;
     const tag: Opcode.Code = @enumFromInt(disc);
     if (std.enums.tagName(Opcode.Code, tag) == null) return error.UnknownOpcode;
     return error.UnsupportedOpcode;
@@ -1150,9 +1161,10 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 return classifyOpcode(Opcode.prefix_threads, sub);
             },
             0xfd => {
-                // SIMD prefix. Not type-checked yet; see issue #347.
                 const sub = readU32(bytes, &pos);
-                return classifyOpcode(Opcode.prefix_simd, sub);
+                const simd_sig = simdSig(sub) orelse
+                    return classifyOpcode(Opcode.prefix_simd, sub);
+                try checkSimd(m, bytes, &pos, &val_stack, &ctrl_stack, simd_sig, gpa(m));
             },
             0xfb => {
                 // GC prefix. `Opcode.Code` does not enumerate the GC
@@ -1360,6 +1372,368 @@ fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack
     if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(val_stack, ctrl_stack, value_type);
     try popExpect(val_stack, ctrl_stack, .i32);
+}
+
+
+// ── SIMD (0xfd) instruction signatures ──────────────────────────────────
+
+/// Shape of the immediate operands that follow a SIMD opcode.
+const SimdImm = enum {
+    /// No immediate.
+    none,
+    /// align + optional memory index + offset.
+    memarg,
+    /// memarg followed by a single lane index byte.
+    memarg_lane,
+    /// A single lane index byte.
+    lane,
+    /// 16 raw bytes (v128.const).
+    const16,
+    /// 16 lane index bytes (i8x16.shuffle), each selecting from two vectors.
+    shuffle,
+};
+
+/// Static type signature of one SIMD instruction.
+const SimdSig = struct {
+    /// Operands in stack order, bottom first; popped in reverse.
+    params: []const ValTypeOrUnknown,
+    results: []const ValTypeOrUnknown,
+    imm: SimdImm,
+    /// Exclusive upper bound for lane index immediates. 32 for shuffle,
+    /// whose bytes index a concatenation of two vectors. 0 when unused.
+    lanes: u8,
+    /// log2 of the maximum permitted alignment for memarg forms.
+    max_align: u8,
+};
+
+/// Signature for a 0xfd sub-opcode, or null if this build does not know it.
+///
+/// Generated from the opcode list in Opcode.zig; the drift-guard test below
+/// asserts the two stay in sync, so a SIMD opcode cannot be added to
+/// Opcode.zig without either a signature here or an explicit exemption.
+/// Read a single lane index byte and bounds-check it against `limit`.
+fn readLane(bytes: []const u8, pos: *usize, limit: u8) Error!void {
+    if (pos.* >= bytes.len) return error.UnexpectedEnd;
+    const lane = bytes[pos.*];
+    pos.* += 1;
+    if (lane >= limit) return error.InvalidLaneIndex;
+}
+
+/// Type-check one SIMD instruction: consume its immediates, then apply its
+/// stack effect.
+fn checkSimd(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    pos: *usize,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    sig: SimdSig,
+    alloc: std.mem.Allocator,
+) Error!void {
+    var mem_idx: u32 = 0;
+    switch (sig.imm) {
+        .none => {},
+        .const16 => {
+            if (pos.* + 16 > bytes.len) return error.UnexpectedEnd;
+            pos.* += 16;
+        },
+        .shuffle => {
+            // Each of the 16 bytes selects a lane from the two operand
+            // vectors concatenated, so the bound is 32, not 16.
+            if (pos.* + 16 > bytes.len) return error.UnexpectedEnd;
+            for (bytes[pos.*..][0..16]) |lane| {
+                if (lane >= sig.lanes) return error.InvalidLaneIndex;
+            }
+            pos.* += 16;
+        },
+        .lane => try readLane(bytes, pos, sig.lanes),
+        .memarg, .memarg_lane => {
+            const memarg = readMemArg(bytes, pos);
+            if (memarg.align_val > sig.max_align) return error.InvalidAlignment;
+            if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len)
+                return error.InvalidMemoryIndex;
+            mem_idx = memarg.mem_idx;
+            if (sig.imm == .memarg_lane) try readLane(bytes, pos, sig.lanes);
+        },
+    }
+
+    // Operands are listed bottom-of-stack first, so pop in reverse.
+    var i = sig.params.len;
+    while (i > 0) {
+        i -= 1;
+        var expected = sig.params[i];
+        // The address operand of a memarg form widens to i64 under memory64.
+        // It is always the bottom-most operand.
+        if (i == 0 and (sig.imm == .memarg or sig.imm == .memarg_lane) and
+            m.memories.items[mem_idx].is_memory64)
+        {
+            expected = .i64;
+        }
+        try popExpect(val_stack, ctrl_stack, expected);
+    }
+    for (sig.results) |r| val_stack.append(alloc, r) catch return error.OutOfMemory;
+}
+
+fn simdSig(sub: u32) ?SimdSig {
+    return switch (sub) {
+        0x00 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 4 }, // v128_load
+        0x01 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load8x8_s
+        0x02 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load8x8_u
+        0x03 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load16x4_s
+        0x04 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load16x4_u
+        0x05 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load32x2_s
+        0x06 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load32x2_u
+        0x07 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 0 }, // v128_load8_splat
+        0x08 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 1 }, // v128_load16_splat
+        0x09 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 2 }, // v128_load32_splat
+        0x0a => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load64_splat
+        0x0b => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg, .lanes = 0, .max_align = 4 }, // v128_store
+        0x0c => .{ .params = &.{}, .results = &.{.v128}, .imm = .const16, .lanes = 0, .max_align = 0 }, // v128_const
+        0x0d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .shuffle, .lanes = 32, .max_align = 0 }, // i8x16_shuffle
+        0x0e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_swizzle
+        0x0f => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_splat
+        0x10 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_splat
+        0x11 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_splat
+        0x12 => .{ .params = &.{.i64}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_splat
+        0x13 => .{ .params = &.{.f32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_splat
+        0x14 => .{ .params = &.{.f64}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_splat
+        0x15 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_extract_lane_s
+        0x16 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_extract_lane_u
+        0x17 => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_replace_lane
+        0x18 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_extract_lane_s
+        0x19 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_extract_lane_u
+        0x1a => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_replace_lane
+        0x1b => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 4, .max_align = 0 }, // i32x4_extract_lane
+        0x1c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // i32x4_replace_lane
+        0x1d => .{ .params = &.{.v128}, .results = &.{.i64}, .imm = .lane, .lanes = 2, .max_align = 0 }, // i64x2_extract_lane
+        0x1e => .{ .params = &.{.v128, .i64}, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // i64x2_replace_lane
+        0x1f => .{ .params = &.{.v128}, .results = &.{.f32}, .imm = .lane, .lanes = 4, .max_align = 0 }, // f32x4_extract_lane
+        0x20 => .{ .params = &.{.v128, .f32}, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // f32x4_replace_lane
+        0x21 => .{ .params = &.{.v128}, .results = &.{.f64}, .imm = .lane, .lanes = 2, .max_align = 0 }, // f64x2_extract_lane
+        0x22 => .{ .params = &.{.v128, .f64}, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // f64x2_replace_lane
+        0x23 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_eq
+        0x24 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ne
+        0x25 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_s
+        0x26 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_u
+        0x27 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_s
+        0x28 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_u
+        0x29 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_s
+        0x2a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_u
+        0x2b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_s
+        0x2c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_u
+        0x2d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_eq
+        0x2e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ne
+        0x2f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_s
+        0x30 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_u
+        0x31 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_s
+        0x32 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_u
+        0x33 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_s
+        0x34 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_u
+        0x35 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_s
+        0x36 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_u
+        0x37 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_eq
+        0x38 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ne
+        0x39 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_s
+        0x3a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_u
+        0x3b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_s
+        0x3c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_u
+        0x3d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_s
+        0x3e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_u
+        0x3f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_s
+        0x40 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_u
+        0x41 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_eq
+        0x42 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ne
+        0x43 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_lt
+        0x44 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_gt
+        0x45 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_le
+        0x46 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ge
+        0x47 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_eq
+        0x48 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ne
+        0x49 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_lt
+        0x4a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_gt
+        0x4b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_le
+        0x4c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ge
+        0x4d => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_not
+        0x4e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_and
+        0x4f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_andnot
+        0x50 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_or
+        0x51 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_xor
+        0x52 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_bitselect
+        0x53 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_any_true
+        0x54 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_load8_lane
+        0x55 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_load16_lane
+        0x56 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_load32_lane
+        0x57 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_load64_lane
+        0x58 => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_store8_lane
+        0x59 => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_store16_lane
+        0x5a => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_store32_lane
+        0x5b => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_store64_lane
+        0x5c => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 2 }, // v128_load32_zero
+        0x5d => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load64_zero
+        0x5e => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_demote_f64x2_zero
+        0x5f => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_promote_low_f32x4
+        0x60 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_abs
+        0x61 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_neg
+        0x62 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_popcnt
+        0x63 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_all_true
+        0x64 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_bitmask
+        0x65 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_s
+        0x66 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_u
+        0x67 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ceil
+        0x68 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_floor
+        0x69 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_trunc
+        0x6a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_nearest
+        0x6b => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shl
+        0x6c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_s
+        0x6d => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_u
+        0x6e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add
+        0x6f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_s
+        0x70 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_u
+        0x71 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub
+        0x72 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_s
+        0x73 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_u
+        0x74 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ceil
+        0x75 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_floor
+        0x76 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_s
+        0x77 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_u
+        0x78 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_s
+        0x79 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_u
+        0x7a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_trunc
+        0x7b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_avgr_u
+        0x7c => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extadd_pairwise_i8x16_s
+        0x7d => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extadd_pairwise_i8x16_u
+        0x7e => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extadd_pairwise_i16x8_s
+        0x7f => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extadd_pairwise_i16x8_u
+        0x80 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_abs
+        0x81 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_neg
+        0x82 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_q15mulr_sat_s
+        0x83 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_all_true
+        0x84 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_bitmask
+        0x85 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_s
+        0x86 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_u
+        0x87 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_low_i8x16_s
+        0x88 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_high_i8x16_s
+        0x89 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_low_i8x16_u
+        0x8a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_high_i8x16_u
+        0x8b => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shl
+        0x8c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_s
+        0x8d => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_u
+        0x8e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add
+        0x8f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_s
+        0x90 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_u
+        0x91 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub
+        0x92 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_s
+        0x93 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_u
+        0x94 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_nearest
+        0x95 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_mul
+        0x96 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_s
+        0x97 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_u
+        0x98 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_s
+        0x99 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_u
+        0x9b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_avgr_u
+        0x9c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_s
+        0x9d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_s
+        0x9e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_u
+        0x9f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_u
+        0xa0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_abs
+        0xa1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_neg
+        0xa3 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_all_true
+        0xa4 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_bitmask
+        0xa7 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_low_i16x8_s
+        0xa8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_high_i16x8_s
+        0xa9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_low_i16x8_u
+        0xaa => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_high_i16x8_u
+        0xab => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shl
+        0xac => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_s
+        0xad => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_u
+        0xae => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_add
+        0xb1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_sub
+        0xb5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_mul
+        0xb6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_s
+        0xb7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_u
+        0xb8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_s
+        0xb9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_u
+        0xba => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i16x8_s
+        0xbc => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_s
+        0xbd => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_s
+        0xbe => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_u
+        0xbf => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_u
+        0xc0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_abs
+        0xc1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_neg
+        0xc3 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_all_true
+        0xc4 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_bitmask
+        0xc7 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_low_i32x4_s
+        0xc8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_high_i32x4_s
+        0xc9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_low_i32x4_u
+        0xca => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_high_i32x4_u
+        0xcb => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shl
+        0xcc => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_s
+        0xcd => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_u
+        0xce => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_add
+        0xd1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_sub
+        0xd5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_mul
+        0xd6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_eq
+        0xd7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ne
+        0xd8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_lt_s
+        0xd9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_gt_s
+        0xda => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_le_s
+        0xdb => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ge_s
+        0xdc => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_s
+        0xdd => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_s
+        0xde => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_u
+        0xdf => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_u
+        0xe0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_abs
+        0xe1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_neg
+        0xe3 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_sqrt
+        0xe4 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_add
+        0xe5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_sub
+        0xe6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_mul
+        0xe7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_div
+        0xe8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_min
+        0xe9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_max
+        0xea => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmin
+        0xeb => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmax
+        0xec => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_abs
+        0xed => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_neg
+        0xef => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_sqrt
+        0xf0 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_add
+        0xf1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_sub
+        0xf2 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_mul
+        0xf3 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_div
+        0xf4 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_min
+        0xf5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_max
+        0xf6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmin
+        0xf7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmax
+        0xf8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f32x4_s
+        0xf9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f32x4_u
+        0xfa => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_convert_i32x4_s
+        0xfb => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_convert_i32x4_u
+        0xfc => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f64x2_s_zero
+        0xfd => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f64x2_u_zero
+        0xfe => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_convert_low_i32x4_s
+        0xff => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_convert_low_i32x4_u
+        0x100 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_swizzle
+        0x101 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f32x4_s
+        0x102 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f32x4_u
+        0x103 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f64x2_s_zero
+        0x104 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f64x2_u_zero
+        0x105 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_madd
+        0x106 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_nmadd
+        0x107 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_madd
+        0x108 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_nmadd
+        0x109 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_laneselect
+        0x10a => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_laneselect
+        0x10b => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_laneselect
+        0x10c => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_relaxed_laneselect
+        0x10d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_min
+        0x10e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_max
+        0x10f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_min
+        0x110 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_max
+        0x111 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_q15mulr_s
+        0x112 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_dot_i8x16_i7x16_s
+        0x113 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i8x16_i7x16_add_s
+        else => null,
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1655,9 +2029,10 @@ test "unchecked 0xfc sub-opcodes are reported, not ignored" {
     try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
 }
 
-test "SIMD reports UnsupportedOpcode rather than a bogus TypeMismatch" {
-    // A *valid* body: v128.const 0; drop. It cannot be type-checked yet, but
-    // the reported reason must not claim a type mismatch that does not exist.
+test "valid SIMD modules now validate (issue #347 D2)" {
+    // v128.const 0; drop. Before SIMD type-checking this was rejected --
+    // first as a bogus TypeMismatch, then honestly as UnsupportedOpcode.
+    // It is a valid module and must now be accepted.
     const alloc = std.testing.allocator;
     const body = [_]u8{
         0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // v128.const 0
@@ -1666,7 +2041,7 @@ test "SIMD reports UnsupportedOpcode rather than a bogus TypeMismatch" {
     };
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
-    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    try validate(&module, .{});
 }
 
 test "tail-call opcodes are reported as unsupported" {
@@ -1700,6 +2075,11 @@ test "classifyOpcode separates declared opcodes from undeclared encodings" {
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(null, 0x27)); // unassigned
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x0c)); // v128.const
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_simd, 0xffff));
+    // Relaxed SIMD lives above 0xff, where Opcode.Code switches to 0xPPCCC.
+    // A fixed <<8 would fold 0x100 onto 0xfd00 (v128.load) and answer the
+    // wrong question.
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x100));
+    try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_simd, 0x1fe));
 }
 
 test "every declared single-byte opcode is handled or explicitly unsupported" {
@@ -1759,4 +2139,177 @@ test "ref.eq is a declared opcode, not a malformed encoding (issue #350)" {
         try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
     }
     try std.testing.expectEqualStrings("ref.eq", Opcode.Code.ref_eq.name());
+}
+
+// ── SIMD type checking (issue #347, D2) ─────────────────────────────────
+
+test "every declared SIMD opcode has a signature" {
+    // Drift guard: Opcode.zig and simdSig must agree. Adding a 0xfd opcode
+    // to Opcode.zig without a signature here would silently send it back to
+    // classifyOpcode and re-reject valid modules, which is the bug D2 was.
+    var checked: usize = 0;
+    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
+        if (f.value > 0xff) {
+            const code: Opcode.Code = @enumFromInt(f.value);
+            if (code.getPrefix() == Opcode.prefix_simd) {
+                checked += 1;
+                if (simdSig(code.getCode()) == null) {
+                    std.debug.print(
+                        "SIMD opcode 0x{x} ({s}) has no signature in simdSig\n",
+                        .{ f.value, f.name },
+                    );
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 256), checked);
+}
+
+test "SIMD signatures type-check operands" {
+    const alloc = std.testing.allocator;
+
+    // i32.const 0; i32.const 0; i8x16.splat -> wrong: splat takes one i32
+    // and leaves a v128, so the extra i32 remains and the body is not empty
+    // at end. Use drop to make the shape explicit instead.
+    {
+        // v128.const 0; v128.const 0; i8x16.add; drop  -- well typed
+        const body = [_]u8{
+            0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0xfd, 0x6e, // i8x16.add
+            0x1a, 0x0b,
+        };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+    {
+        // i32.const 0; i8x16.add -- operand is i32, not v128
+        const body = [_]u8{ 0x41, 0x00, 0xfd, 0x6e, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+    {
+        // i32.const 0; i8x16.splat; drop -- splat consumes i32, yields v128
+        const body = [_]u8{ 0x41, 0x00, 0xfd, 0x0f, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+    {
+        // f32.const 0; i8x16.splat -- splat wants i32
+        const body = [_]u8{ 0x43, 0, 0, 0, 0, 0xfd, 0x0f, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "SIMD extract_lane yields the lane's scalar type" {
+    const alloc = std.testing.allocator;
+    // v128.const 0; i64x2.extract_lane 0; drop -- yields i64
+    const body = [_]u8{
+        0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xfd, 0x1d, 0x00, // i64x2.extract_lane 0
+        0x1a, 0x0b,
+    };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try validate(&module, .{});
+
+    // ...and it really is i64, not i32: i32.eqz on it must fail.
+    const body2 = [_]u8{
+        0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xfd, 0x1d, 0x00,
+        0x45, // i32.eqz
+        0x1a, 0x0b,
+    };
+    var m2 = try testModuleWithBody(alloc, &body2);
+    defer m2.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m2, .{}));
+}
+
+test "SIMD lane indices are bounds-checked" {
+    const alloc = std.testing.allocator;
+    // i64x2 has 2 lanes, so lane 2 is out of range.
+    const body = [_]u8{
+        0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xfd, 0x1d, 0x02, // i64x2.extract_lane 2
+        0x1a, 0x0b,
+    };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.InvalidLaneIndex, validate(&module, .{}));
+
+    // i8x16.shuffle indices select from two concatenated vectors, so 31 is
+    // in range and 32 is not.
+    const ok = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0c } ++
+        [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0d } ++ [_]u8{31} ** 16 ++ [_]u8{ 0x1a, 0x0b };
+    var m_ok = try testModuleWithBody(alloc, &ok);
+    defer m_ok.deinit();
+    try validate(&m_ok, .{});
+
+    const bad = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0c } ++
+        [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0d } ++ [_]u8{32} ** 16 ++ [_]u8{ 0x1a, 0x0b };
+    var m_bad = try testModuleWithBody(alloc, &bad);
+    defer m_bad.deinit();
+    try std.testing.expectError(error.InvalidLaneIndex, validate(&m_bad, .{}));
+}
+
+test "SIMD memarg alignment is bounds-checked" {
+    const alloc = std.testing.allocator;
+    // v128.load accesses 16 bytes, so align=4 is the natural maximum.
+    const ok = [_]u8{ 0x41, 0x00, 0xfd, 0x00, 0x04, 0x00, 0x1a, 0x0b };
+    var m_ok = try testModuleWithBody(alloc, &ok);
+    defer m_ok.deinit();
+    try validate(&m_ok, .{});
+
+    const bad = [_]u8{ 0x41, 0x00, 0xfd, 0x00, 0x05, 0x00, 0x1a, 0x0b };
+    var m_bad = try testModuleWithBody(alloc, &bad);
+    defer m_bad.deinit();
+    try std.testing.expectError(error.InvalidAlignment, validate(&m_bad, .{}));
+
+    // v128.load8_splat reads one byte: align=0 only.
+    const bad8 = [_]u8{ 0x41, 0x00, 0xfd, 0x07, 0x01, 0x00, 0x1a, 0x0b };
+    var m_bad8 = try testModuleWithBody(alloc, &bad8);
+    defer m_bad8.deinit();
+    try std.testing.expectError(error.InvalidAlignment, validate(&m_bad8, .{}));
+}
+
+test "SIMD store consumes its operands and leaves nothing" {
+    const alloc = std.testing.allocator;
+    // i32.const 0; v128.const 0; v128.store
+    const body = [_]u8{ 0x41, 0x00, 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++
+        [_]u8{ 0xfd, 0x0b, 0x04, 0x00, 0x0b };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try validate(&module, .{});
+
+    // Operands reversed: v128 address, i32 value.
+    const rev = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++
+        [_]u8{ 0x41, 0x00, 0xfd, 0x0b, 0x04, 0x00, 0x0b };
+    var m_rev = try testModuleWithBody(alloc, &rev);
+    defer m_rev.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m_rev, .{}));
+}
+
+test "SIMD immediates that run off the end are rejected" {
+    const alloc = std.testing.allocator;
+    // v128.const with only 3 of its 16 bytes present.
+    const body = [_]u8{ 0xfd, 0x0c, 0, 0, 0 };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+}
+
+test "relaxed SIMD opcodes above 0xff are type-checked" {
+    const alloc = std.testing.allocator;
+    // f32x4.relaxed_madd (0xfd 0x105) is ternary over v128.
+    const three = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16;
+    const body = three ++ three ++ three ++ [_]u8{ 0xfd, 0x85, 0x02, 0x1a, 0x0b };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try validate(&module, .{});
 }
