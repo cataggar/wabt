@@ -1174,15 +1174,10 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 }
             },
             0xfe => {
-                // Atomic prefix (threads proposal). Not type-checked yet.
-                //
-                // This arm used to skip the sub-opcode and memarg and then
-                // carry on validating, without modelling the instruction's
-                // stack effects. Every later instruction was then checked
-                // against a value stack that no longer described the
-                // program, so invalid modules were accepted. Reject instead.
                 const sub = readU32(bytes, &pos);
-                return classifyOpcode(Opcode.prefix_threads, sub);
+                const at_sig = atomicSig(sub) orelse
+                    return classifyOpcode(Opcode.prefix_threads, sub);
+                try checkAtomic(m, bytes, &pos, &val_stack, &ctrl_stack, at_sig, gpa(m));
             },
             0xfd => {
                 const sub = readU32(bytes, &pos);
@@ -1417,6 +1412,149 @@ fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack
     try popExpect(val_stack, ctrl_stack, .i32);
 }
 
+
+
+// ── Atomic (0xfe) instruction signatures ────────────────────────────────
+
+/// Shape of the immediate operands that follow an atomic opcode.
+const AtomicImm = enum {
+    /// align + optional memory index + offset.
+    memarg,
+    /// A single reserved byte, which must be zero (atomic.fence).
+    fence,
+};
+
+/// Static type signature of one atomic instruction.
+const AtomicSig = struct {
+    /// Operands in stack order, bottom first; popped in reverse.
+    params: []const ValTypeOrUnknown,
+    results: []const ValTypeOrUnknown,
+    imm: AtomicImm,
+    /// Required alignment, as log2 of the accessed width. Unlike ordinary
+    /// memory instructions, atomics must be *exactly* naturally aligned --
+    /// an under-aligned atomic access is not a valid module.
+    align_log2: u8,
+};
+
+/// Signature for a 0xfe sub-opcode, or null if this build does not know it.
+///
+/// Generated from the opcode list in Opcode.zig; the drift-guard test below
+/// asserts the two stay in sync.
+fn atomicSig(sub: u32) ?AtomicSig {
+    return switch (sub) {
+        0x00 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_notify
+        0x01 => .{ .params = &.{.i32, .i32, .i64}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_wait32
+        0x02 => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 3 }, // memory_atomic_wait64
+        0x03 => .{ .params = &.{}, .results = &.{}, .imm = .fence, .align_log2 = 0 }, // atomic_fence
+        0x10 => .{ .params = &.{.i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_load
+        0x11 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_load
+        0x12 => .{ .params = &.{.i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_load8_u
+        0x13 => .{ .params = &.{.i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_load16_u
+        0x14 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_load8_u
+        0x15 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_load16_u
+        0x16 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_load32_u
+        0x17 => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_store
+        0x18 => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_store
+        0x19 => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_store8
+        0x1a => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_store16
+        0x1b => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_store8
+        0x1c => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_store16
+        0x1d => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_store32
+        0x1e => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_add
+        0x1f => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_add
+        0x20 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_add_u
+        0x21 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_add_u
+        0x22 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_add_u
+        0x23 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_add_u
+        0x24 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_add_u
+        0x25 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_sub
+        0x26 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_sub
+        0x27 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_sub_u
+        0x28 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_sub_u
+        0x29 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_sub_u
+        0x2a => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_sub_u
+        0x2b => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_sub_u
+        0x2c => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_and
+        0x2d => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_and
+        0x2e => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_and_u
+        0x2f => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_and_u
+        0x30 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_and_u
+        0x31 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_and_u
+        0x32 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_and_u
+        0x33 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_or
+        0x34 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_or
+        0x35 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_or_u
+        0x36 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_or_u
+        0x37 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_or_u
+        0x38 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_or_u
+        0x39 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_or_u
+        0x3a => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xor
+        0x3b => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xor
+        0x3c => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xor_u
+        0x3d => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xor_u
+        0x3e => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xor_u
+        0x3f => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xor_u
+        0x40 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xor_u
+        0x41 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xchg
+        0x42 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xchg
+        0x43 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xchg_u
+        0x44 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xchg_u
+        0x45 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xchg_u
+        0x46 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xchg_u
+        0x47 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xchg_u
+        0x48 => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_cmpxchg
+        0x49 => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_cmpxchg
+        0x4a => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_cmpxchg_u
+        0x4b => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_cmpxchg_u
+        0x4c => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_cmpxchg_u
+        0x4d => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_cmpxchg_u
+        0x4e => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_cmpxchg_u
+        else => null,
+    };
+}
+
+/// Type-check one atomic instruction: consume its immediates, then apply
+/// its stack effect.
+fn checkAtomic(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    pos: *usize,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    sig: AtomicSig,
+    alloc: std.mem.Allocator,
+) Error!void {
+    var mem_idx: u32 = 0;
+    switch (sig.imm) {
+        .fence => {
+            if (pos.* >= bytes.len) return error.UnexpectedEnd;
+            // The byte is reserved for a future memory index.
+            if (bytes[pos.*] != 0) return error.InvalidMemoryIndex;
+            pos.* += 1;
+        },
+        .memarg => {
+            const memarg = readMemArg(bytes, pos);
+            // Exact, not maximum: atomics may not be under-aligned.
+            if (memarg.align_val != sig.align_log2) return error.InvalidAlignment;
+            if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len)
+                return error.InvalidMemoryIndex;
+            mem_idx = memarg.mem_idx;
+        },
+    }
+
+    // Operands are listed bottom-of-stack first, so pop in reverse.
+    var i = sig.params.len;
+    while (i > 0) {
+        i -= 1;
+        var expected = sig.params[i];
+        // The address operand widens to i64 under memory64.
+        if (i == 0 and sig.imm == .memarg and m.memories.items[mem_idx].is_memory64) {
+            expected = .i64;
+        }
+        try popExpect(val_stack, ctrl_stack, expected);
+    }
+    for (sig.results) |r| val_stack.append(alloc, r) catch return error.OutOfMemory;
+}
 
 // ── SIMD (0xfd) instruction signatures ──────────────────────────────────
 
@@ -2041,7 +2179,7 @@ fn testModuleWithBody(alloc: std.mem.Allocator, body: []const u8) !Mod.Module {
     return module;
 }
 
-test "atomics are not silently accepted without type checking" {
+test "atomics are type-checked, not silently accepted" {
     // Regression for issue #347. The 0xfe arm used to skip the sub-opcode
     // and memarg and keep going without modelling stack effects, so every
     // later instruction was checked against a stale value stack and invalid
@@ -2059,7 +2197,7 @@ test "atomics are not silently accepted without type checking" {
     };
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
-    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
 }
 
 test "unchecked 0xfc sub-opcodes are reported, not ignored" {
@@ -2525,4 +2663,154 @@ test "call_ref and return_call_ref stay rejected" {
         defer m.deinit();
         try std.testing.expectError(error.UnsupportedOpcode, validate(&m, .{}));
     }
+}
+
+// ── Atomics (issue #347, D3) ────────────────────────────────────────────
+
+test "every declared atomic opcode has a signature" {
+    // Drift guard: Opcode.zig and atomicSig must agree.
+    var checked: usize = 0;
+    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
+        if (f.value > 0xff) {
+            const code: Opcode.Code = @enumFromInt(f.value);
+            if (code.getPrefix() == Opcode.prefix_threads) {
+                checked += 1;
+                if (atomicSig(code.getCode()) == null) {
+                    std.debug.print(
+                        "atomic opcode 0x{x} ({s}) has no signature in atomicSig\n",
+                        .{ f.value, f.name },
+                    );
+                    return error.TestUnexpectedResult;
+                }
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 67), checked);
+}
+
+test "valid atomic modules now validate" {
+    const alloc = std.testing.allocator;
+    // i32.const 0; i32.atomic.load align=2; drop
+    const body = [_]u8{ 0x41, 0x00, 0xfe, 0x10, 0x02, 0x00, 0x1a, 0x0b };
+    var m = try testModuleWithBody(alloc, &body);
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "atomic alignment must be exact, not merely bounded" {
+    const alloc = std.testing.allocator;
+    // i32.atomic.load accesses 4 bytes, so align must be exactly 2.
+    // Ordinary loads permit anything up to the natural alignment; atomics
+    // do not, because an under-aligned atomic access is not well defined.
+    for ([_]u8{ 0x00, 0x01, 0x03 }) |bad_align| {
+        const body = [_]u8{ 0x41, 0x00, 0xfe, 0x10, bad_align, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidAlignment, validate(&m, .{}));
+    }
+    // i32.atomic.load8_u accesses 1 byte: align must be exactly 0.
+    const ok = [_]u8{ 0x41, 0x00, 0xfe, 0x12, 0x00, 0x00, 0x1a, 0x0b };
+    var m_ok = try testModuleWithBody(alloc, &ok);
+    defer m_ok.deinit();
+    try validate(&m_ok, .{});
+
+    const bad = [_]u8{ 0x41, 0x00, 0xfe, 0x12, 0x02, 0x00, 0x1a, 0x0b };
+    var m_bad = try testModuleWithBody(alloc, &bad);
+    defer m_bad.deinit();
+    try std.testing.expectError(error.InvalidAlignment, validate(&m_bad, .{}));
+}
+
+test "atomic rmw and cmpxchg consume the right operand shapes" {
+    const alloc = std.testing.allocator;
+    // i32.const 0 (addr); i32.const 1 (val); i32.atomic.rmw.add; drop
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x01, 0xfe, 0x1e, 0x02, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // cmpxchg takes addr, expected, replacement -- three operands.
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x01, 0x41, 0x02, 0xfe, 0x48, 0x02, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // ...and rejects two.
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x01, 0xfe, 0x48, 0x02, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // i64 rmw wants an i64 value, not an i32.
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x01, 0xfe, 0x1f, 0x03, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "atomic loads yield the declared width's type" {
+    const alloc = std.testing.allocator;
+    // i64.atomic.load8_u yields i64, so i32.eqz on it is a type error.
+    const body = [_]u8{ 0x41, 0x00, 0xfe, 0x14, 0x00, 0x00, 0x45, 0x1a, 0x0b };
+    var m = try testModuleWithBody(alloc, &body);
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+
+    // i64.eqz is fine.
+    const ok = [_]u8{ 0x41, 0x00, 0xfe, 0x14, 0x00, 0x00, 0x50, 0x1a, 0x0b };
+    var m_ok = try testModuleWithBody(alloc, &ok);
+    defer m_ok.deinit();
+    try validate(&m_ok, .{});
+}
+
+test "memory.atomic.wait and notify signatures" {
+    const alloc = std.testing.allocator;
+    // memory.atomic.wait32: addr i32, expected i32, timeout i64 -> i32
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x42, 0x00, 0xfe, 0x01, 0x02, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // wait64 wants an i64 expected value; an i32 is a type error.
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x42, 0x00, 0xfe, 0x02, 0x03, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // memory.atomic.notify: addr i32, count i32 -> i32
+    {
+        const body = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0xfe, 0x00, 0x02, 0x00, 0x1a, 0x0b };
+        var m = try testModuleWithBody(alloc, &body);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+}
+
+test "atomic.fence takes a reserved zero byte and no operands" {
+    const alloc = std.testing.allocator;
+    const ok = [_]u8{ 0xfe, 0x03, 0x00, 0x0b };
+    var m_ok = try testModuleWithBody(alloc, &ok);
+    defer m_ok.deinit();
+    try validate(&m_ok, .{});
+
+    const bad = [_]u8{ 0xfe, 0x03, 0x01, 0x0b };
+    var m_bad = try testModuleWithBody(alloc, &bad);
+    defer m_bad.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&m_bad, .{}));
+}
+
+test "atomics require a memory to be declared" {
+    const alloc = std.testing.allocator;
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    const body = [_]u8{ 0x41, 0x00, 0xfe, 0x10, 0x02, 0x00, 0x1a, 0x0b };
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&m, .{}));
 }
