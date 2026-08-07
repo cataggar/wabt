@@ -1,6 +1,6 @@
 # WABT: The WebAssembly Binary Toolkit
 
-A rewrite of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) in Zig, maintained with AI assistance. It supports the Wasm 3.0 proposals and passes the [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) at 65k+ assertions.
+A rewrite of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) in Zig, maintained with AI assistance. It supports the Wasm 3.0 proposals. `wabt` does not execute WebAssembly — its parser, validator and binary writer are exercised against the full [WebAssembly/testsuite](https://github.com/WebAssembly/testsuite) (257 `.wast` files, 65k+ assertions) by [cataggar/wamr](https://github.com/cataggar/wamr), which runs the resulting modules on the WAMR engine.
 
 ## Install
 

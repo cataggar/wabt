@@ -5,7 +5,7 @@ data/scripts/ wheel layout. The binary is placed directly in the scripts
 directory by pip and does not require Python at runtime.
 
 Invoke subcommands as `wabt text parse`, `wabt module validate`,
-`wabt spec run`, etc. Run `wabt help` for a full list of subjects
+`wabt spec to-json`, etc. Run `wabt help` for a full list of subjects
 and `wabt help <subject>` for the verbs in that subject.
 """
 

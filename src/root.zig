@@ -1,8 +1,12 @@
 //! wabt — WebAssembly Binary Toolkit
 //!
 //! A Zig implementation of tools for working with WebAssembly.
-//! Provides parsing, validation, interpretation, and transformation
-//! of WebAssembly modules in both binary (.wasm) and text (.wat) formats.
+//! Provides parsing, validation, and transformation of WebAssembly
+//! modules in both binary (.wasm) and text (.wat) formats.
+//!
+//! wabt does not execute WebAssembly. Conformance testing against the
+//! WebAssembly spec suite lives in cataggar/wamr, which consumes the
+//! `wast_runner` helpers here to convert `.wast` files into commands.
 
 pub const types = @import("types.zig");
 pub const Opcode = @import("Opcode.zig");
@@ -24,10 +28,6 @@ pub const text = struct {
     pub const Lexer = @import("text/Lexer.zig");
     pub const Parser = @import("text/Parser.zig");
     pub const Writer = @import("text/Writer.zig");
-};
-
-pub const interp = struct {
-    pub const Interpreter = @import("interp/Interpreter.zig");
 };
 
 pub const component = struct {
@@ -97,5 +97,4 @@ test {
     _ = @import("component/adapter/world_gc.zig");
     _ = @import("component/adapter/test_fixtures.zig");
     _ = @import("integration_tests.zig");
-    _ = @import("spec_tests.zig");
 }

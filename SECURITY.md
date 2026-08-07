@@ -41,7 +41,7 @@ you informed of what we decide to do with yours.
 - A description of the vulnerability and its impact
 - How to reproduce it, including the input module — a `.wasm`, `.wat`, or
   `.wast` file, or the steps to generate one
-- Which `wabt` subcommand is affected (for example `wabt spec run`,
+- Which `wabt` subcommand is affected (for example `wabt spec to-json`,
   `wabt module validate`, `wabt component new`)
 - The commit SHA or release tag you observed it on
 - The build you tested: `zig version` and the `-Doptimize` mode, or the
@@ -57,7 +57,13 @@ the right things first.
 
 The `wabt` tools are expected to be run on **untrusted input**. Someone
 who can hand you a crafted module should not be able to do anything worse
-than make the tool exit with an error. The following are in scope:
+than make the tool exit with an error.
+
+`wabt` does not execute WebAssembly. It parses, validates, transforms and
+prints modules; it has no interpreter, JIT, or AOT compiler, and it never
+runs guest code. Conformance testing against the WebAssembly spec suite
+lives in [cataggar/wamr](https://github.com/cataggar/wamr), which is where
+execution-related reports belong. The following are in scope:
 
 - Crashes, panics, assertion failures, or unbounded memory growth
   triggered by a crafted module
@@ -66,9 +72,9 @@ than make the tool exit with an error. The following are in scope:
 - Reads or writes outside the bounds of a buffer, and any other
   memory-safety failure
 - **Validator gaps** — a module that should be rejected by validation but
-  is accepted, and then reaches the interpreter or a code generator that
-  assumed validation had already ruled it out. The validator is a trust
-  boundary for everything downstream of it, so a missing check there is a
+  is accepted, and then reaches a code generator or consumer that assumed
+  validation had already ruled it out. The validator is a trust boundary
+  for everything downstream of it, so a missing check there is a
   security issue even when the immediately observable symptom is mild.
 - Incorrect output that would let a module smuggle behaviour past a tool
   used as a filter or verifier

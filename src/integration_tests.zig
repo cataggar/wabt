@@ -14,7 +14,6 @@ const text_parser = @import("text/Parser.zig");
 const text_writer = @import("text/Writer.zig");
 const CWriter = @import("CWriter.zig");
 const Decompiler = @import("Decompiler.zig");
-const Interp = @import("interp/Interpreter.zig");
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -249,78 +248,7 @@ test "decompiler produces output for module with memory" {
     try std.testing.expect(containsSubstring(output, "Memories: 1"));
 }
 
-// ── 8. Interpreter arithmetic ───────────────────────────────────────────
-
-test "interpreter i32 arithmetic" {
-    const allocator = std.testing.allocator;
-
-    // Create a minimal module for the interpreter
-    var module = Mod.Module.init(allocator);
-    defer module.deinit();
-
-    var instance = try Interp.Instance.init(allocator, &module);
-    defer instance.deinit();
-
-    var interp = Interp.Interpreter.init(allocator, &instance);
-    defer interp.deinit();
-
-    // Push 30 and 12, add them
-    try interp.i32Const(30);
-    try interp.i32Const(12);
-    try interp.i32Add();
-    const result = try interp.popI32();
-    try std.testing.expectEqual(@as(i32, 42), result);
-
-    // Subtraction
-    try interp.i32Const(100);
-    try interp.i32Const(58);
-    try interp.i32Sub();
-    const sub_result = try interp.popI32();
-    try std.testing.expectEqual(@as(i32, 42), sub_result);
-
-    // Multiplication
-    try interp.i32Const(6);
-    try interp.i32Const(7);
-    try interp.i32Mul();
-    const mul_result = try interp.popI32();
-    try std.testing.expectEqual(@as(i32, 42), mul_result);
-}
-
-// ── 9. Interpreter memory ───────────────────────────────────────────────
-
-test "interpreter memory store and load" {
-    const allocator = std.testing.allocator;
-
-    // Module with 1 page of memory
-    var module = Mod.Module.init(allocator);
-    defer module.deinit();
-
-    try module.memories.append(allocator, .{
-        .@"type" = .{ .limits = .{ .initial = 1 } },
-    });
-
-    var instance = try Interp.Instance.init(allocator, &module);
-    defer instance.deinit();
-
-    // Verify memory was allocated (1 page = 65536 bytes)
-    try std.testing.expectEqual(@as(usize, 65536), instance.memories.items[0].items.len);
-
-    var interp = Interp.Interpreter.init(allocator, &instance);
-    defer interp.deinit();
-
-    // Store 0xDEADBEEF at address 0, offset 100
-    try interp.i32Const(0); // base address
-    try interp.i32Const(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))));
-    try interp.i32Store(0, 100); // mem_idx=0, offset=100
-
-    // Load it back
-    try interp.i32Const(0); // base address
-    try interp.i32Load(0, 100); // mem_idx=0, offset=100
-    const loaded = try interp.popI32();
-    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0xDEADBEEF))), loaded);
-}
-
-// ── 10. Multi-section binary ────────────────────────────────────────────
+// ── 8. Multi-section binary ─────────────────────────────────────────────
 
 test "multi-section binary: type+import+func+memory+export+code" {
     const allocator = std.testing.allocator;
