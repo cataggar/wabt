@@ -878,6 +878,30 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], ft.params);
                 pushVals(&val_stack, ft.results, gpa(m)) catch return error.OutOfMemory;
             },
+            0x12 => { // return_call
+                const idx = readU32(bytes, &pos);
+                if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                const callee_sig = resolveSig(m, m.funcs.items[idx].decl);
+                try checkTailCallResults(&ctrl_stack, callee_sig.results);
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], callee_sig.params);
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x13 => { // return_call_indirect
+                const type_idx = readU32(bytes, &pos);
+                const table_idx = readU32(bytes, &pos);
+                if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+                if (m.tables.items.len == 0) return error.InvalidTableIndex;
+                if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
+                const ft = switch (m.module_types.items[type_idx]) {
+                    .func_type => |ft| ft,
+                    else => Mod.FuncSignature{},
+                };
+                try checkTailCallResults(&ctrl_stack, ft.results);
+                try popExpect(&val_stack, &ctrl_stack, .i32); // table index operand
+                try popVals(&val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], ft.params);
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
             0x1a => { // drop
                 _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
             },
@@ -1327,6 +1351,25 @@ fn setUnreachable(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(Ctrl
     const frame = &ctrl_stack.items[ctrl_stack.items.len - 1];
     val_stack.shrinkRetainingCapacity(frame.height);
     frame.unreachable_flag = true;
+}
+
+/// A tail call replaces the caller's frame, so the callee's results become
+/// the caller's results directly. The spec therefore requires them to be
+/// exactly the enclosing function's result types -- there is no room for
+/// the usual subtyping slack, because nothing runs afterwards to adapt them.
+///
+/// The enclosing function's results live in the frame seeded at the bottom
+/// of the control stack, the same one `return` uses.
+fn checkTailCallResults(
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    callee_results: []const types.ValType,
+) Error!void {
+    if (ctrl_stack.items.len == 0) return error.TypeMismatch;
+    const func_results = ctrl_stack.items[0].end_types;
+    if (callee_results.len != func_results.len) return error.TypeMismatch;
+    for (callee_results, func_results) |a, b| {
+        if (a != b) return error.TypeMismatch;
+    }
 }
 
 fn labelTypes(frame: *const CtrlFrame) []const types.ValType {
@@ -2044,13 +2087,13 @@ test "valid SIMD modules now validate (issue #347 D2)" {
     try validate(&module, .{});
 }
 
-test "tail-call opcodes are reported as unsupported" {
-    // return_call / return_call_indirect / return_call_ref — the opcodes
-    // behind GHSA-hv37-vjx6-rm9j. They have no validator arm.
+test "reference-typed call opcodes are reported as unsupported" {
+    // return_call and return_call_indirect are type-checked as of the tail
+    // call work below. call_ref and return_call_ref are not: their operand
+    // is a typed reference and ValType carries no type index.
     const alloc = std.testing.allocator;
     for ([_][]const u8{
-        &[_]u8{ 0x12, 0x00, 0x0b }, // return_call 0
-        &[_]u8{ 0x13, 0x00, 0x00, 0x0b }, // return_call_indirect 0 0
+        &[_]u8{ 0x14, 0x00, 0x0b }, // call_ref 0
         &[_]u8{ 0x15, 0x00, 0x0b }, // return_call_ref 0
     }) |body| {
         var module = try testModuleWithBody(alloc, body);
@@ -2094,7 +2137,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     // and typed refs (PR3), exception handling (PR4).
     const known_unsupported = [_]u8{
         0x06, 0x07, 0x08, 0x09, 0x0a, // try, catch, throw, rethrow, throw_ref
-        0x12, 0x13, 0x14, 0x15, // return_call, return_call_indirect, call_ref, return_call_ref
+        0x14, 0x15, // call_ref, return_call_ref
         0x18, 0x19, 0x1f, // delegate, catch_all, try_table
         0xd3, 0xd4, 0xd5, 0xd6, // ref.eq, ref.as_non_null, br_on_null, br_on_non_null
     };
@@ -2312,4 +2355,174 @@ test "relaxed SIMD opcodes above 0xff are type-checked" {
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
     try validate(&module, .{});
+}
+
+// ── Tail calls (issue #347) ─────────────────────────────────────────────
+
+/// Build a module with an enclosing function (whose body is `body`) and a
+/// callee at index 1, so tail-call targets can be given real signatures.
+fn testTailCallModule(
+    alloc: std.mem.Allocator,
+    caller_results: []const types.ValType,
+    callee_params: []const types.ValType,
+    callee_results: []const types.ValType,
+    body: []const u8,
+    with_table: bool,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    // Module.deinit frees params/results, so they must be owned copies.
+    try module.module_types.append(alloc, .{ .func_type = .{
+        .results = try alloc.dupe(types.ValType, caller_results),
+    } });
+    try module.module_types.append(alloc, .{ .func_type = .{
+        .params = try alloc.dupe(types.ValType, callee_params),
+        .results = try alloc.dupe(types.ValType, callee_results),
+    } });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    try module.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 1 } } });
+    if (with_table) try module.tables.append(alloc, .{});
+    return module;
+}
+
+test "return_call requires the callee's results to be the caller's" {
+    const alloc = std.testing.allocator;
+    const i32_1 = [_]types.ValType{.i32};
+
+    // caller [] -> [], callee [] -> []  : matching
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // caller [] -> [i32], callee [] -> [i32] : matching
+    {
+        var m = try testTailCallModule(alloc, &i32_1, &.{}, &i32_1, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // caller [] -> [i32], callee [] -> [] : the callee cannot supply the
+    // caller's result, and nothing runs after a tail call to fix that up.
+    {
+        var m = try testTailCallModule(alloc, &i32_1, &.{}, &.{}, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // caller [] -> [], callee [] -> [i32]
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &i32_1, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // caller [] -> [i32], callee [] -> [i64] : same arity, wrong type
+    {
+        const i64_1 = [_]types.ValType{.i64};
+        var m = try testTailCallModule(alloc, &i32_1, &.{}, &i64_1, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "return_call consumes the callee's parameters" {
+    const alloc = std.testing.allocator;
+    const i32_1 = [_]types.ValType{.i32};
+
+    // i32.const 0; return_call 1   where callee is [i32] -> []
+    {
+        var m = try testTailCallModule(alloc, &.{}, &i32_1, &.{}, &[_]u8{ 0x41, 0x00, 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // wrong operand type
+    {
+        const body = [_]u8{ 0x43, 0, 0, 0, 0, 0x12, 0x01, 0x0b }; // f32.const 0
+        var m = try testTailCallModule(alloc, &.{}, &i32_1, &.{}, &body, false);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // missing operand entirely
+    {
+        var m = try testTailCallModule(alloc, &.{}, &i32_1, &.{}, &[_]u8{ 0x12, 0x01, 0x0b }, false);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "return_call rejects an out-of-range function index" {
+    const alloc = std.testing.allocator;
+    var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x12, 0x07, 0x0b }, false);
+    defer m.deinit();
+    try std.testing.expectError(error.InvalidFuncIndex, validate(&m, .{}));
+}
+
+test "return_call makes the rest of the body unreachable" {
+    const alloc = std.testing.allocator;
+    // return_call 1; i64.add; drop; end -- i64.add is reached with nothing on
+    // the stack, which is only legal because a tail call makes the rest of
+    // the body stack-polymorphic. The drop is needed because polymorphism
+    // supplies i64.add's missing operands but not a home for its result,
+    // and the enclosing function returns nothing.
+    var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x12, 0x01, 0x7c, 0x1a, 0x0b }, false);
+    defer m.deinit();
+    try validate(&m, .{});
+
+    // Without the tail call the same body is a plain type error.
+    var m2 = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x7c, 0x1a, 0x0b }, false);
+    defer m2.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m2, .{}));
+}
+
+test "return_call_indirect type-checks like return_call" {
+    const alloc = std.testing.allocator;
+    const i32_1 = [_]types.ValType{.i32};
+
+    // i32.const 0 (table index); return_call_indirect type=1 table=0
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x41, 0x00, 0x13, 0x01, 0x00, 0x0b }, true);
+        defer m.deinit();
+        try validate(&m, .{});
+    }
+    // result mismatch against the enclosing function
+    {
+        var m = try testTailCallModule(alloc, &i32_1, &.{}, &.{}, &[_]u8{ 0x41, 0x00, 0x13, 0x01, 0x00, 0x0b }, true);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // no table declared
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x41, 0x00, 0x13, 0x01, 0x00, 0x0b }, false);
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidTableIndex, validate(&m, .{}));
+    }
+    // missing the i32 table operand
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x13, 0x01, 0x00, 0x0b }, true);
+        defer m.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+    // out-of-range type index
+    {
+        var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x41, 0x00, 0x13, 0x09, 0x00, 0x0b }, true);
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&m, .{}));
+    }
+}
+
+test "call_ref and return_call_ref stay rejected" {
+    // ValType carries no type index, so the operand of call_ref cannot be
+    // checked against the instruction's immediate. Accepting them would
+    // report success on something unverified, which is the fail-open this
+    // issue is about. They remain on the backlog.
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        &[_]u8{ 0x14, 0x00, 0x0b }, // call_ref 0
+        &[_]u8{ 0x15, 0x00, 0x0b }, // return_call_ref 0
+    }) |body| {
+        var m = try testModuleWithBody(alloc, body);
+        defer m.deinit();
+        try std.testing.expectError(error.UnsupportedOpcode, validate(&m, .{}));
+    }
 }
