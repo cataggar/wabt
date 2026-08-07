@@ -8,6 +8,7 @@ const types = @import("types.zig");
 const Mod = @import("Module.zig");
 const Feature = @import("Feature.zig");
 const leb128 = @import("leb128.zig");
+const Opcode = @import("Opcode.zig");
 
 pub const Error = error{
     InvalidTypeIndex,
@@ -31,6 +32,13 @@ pub const Error = error{
     TypeMismatch,
     ConstantExprRequired,
     InvalidAlignment,
+    /// The byte (or prefixed sub-opcode) does not encode any instruction
+    /// this build knows about, so the module is malformed.
+    UnknownOpcode,
+    /// A real instruction that this validator cannot type-check yet.
+    /// Reported rather than skipped: a validator that stops checking is
+    /// not entitled to report success. See issue #347.
+    UnsupportedOpcode,
     OutOfMemory,
 };
 
@@ -448,6 +456,30 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: ValTypeOrUn
 
     // Type must match expected
     if (!result_type.matches(expected)) return error.TypeMismatch;
+}
+
+// ── Unrecognised opcode classification ──────────────────────────────────
+
+/// Classify an opcode the instruction switch has no arm for.
+///
+/// Returns `UnsupportedOpcode` when `Opcode.Code` declares the instruction —
+/// it is real, this validator just cannot type-check it yet — and
+/// `UnknownOpcode` when the encoding is meaningless.
+///
+/// `Opcode.Code` is a non-exhaustive enum, so knownness is a test for a
+/// declared field rather than a successful int-to-enum cast.
+///
+/// Both are errors on purpose. The previous behaviour was to `break` out
+/// of the instruction loop, which abandoned validation for the rest of the
+/// body; because the function-level control frame was then never popped,
+/// the body was ultimately rejected as `TypeMismatch`. That made every
+/// SIMD module fail validation with an error naming a cause that did not
+/// exist. See issue #347.
+fn classifyOpcode(prefix: ?u8, code: u32) Error {
+    const disc: u32 = if (prefix) |p| (@as(u32, p) << 8) | code else code;
+    const tag: Opcode.Code = @enumFromInt(disc);
+    if (std.enums.tagName(Opcode.Code, tag) == null) return error.UnknownOpcode;
+    return error.UnsupportedOpcode;
 }
 
 // ── Memory alignment validation ─────────────────────────────────────────
@@ -1103,29 +1135,33 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         }
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                     },
-                    else => {},
+                    else => return classifyOpcode(Opcode.prefix_math, sub),
                 }
             },
             0xfe => {
-                // Atomic prefix — skip sub-opcode and memarg
+                // Atomic prefix (threads proposal). Not type-checked yet.
+                //
+                // This arm used to skip the sub-opcode and memarg and then
+                // carry on validating, without modelling the instruction's
+                // stack effects. Every later instruction was then checked
+                // against a value stack that no longer described the
+                // program, so invalid modules were accepted. Reject instead.
                 const sub = readU32(bytes, &pos);
-                if (sub >= 0x10) {
-                    // Atomic load/store/rmw have memarg
-                    _ = readU32(bytes, &pos); // align
-                    _ = readU32(bytes, &pos); // offset
-                }
-                // Don't type-check atomics for now
+                return classifyOpcode(Opcode.prefix_threads, sub);
             },
             0xfd => {
-                // SIMD prefix — skip
-                _ = readU32(bytes, &pos);
-                // SIMD ops have various immediates; skip conservatively
-                break;
+                // SIMD prefix. Not type-checked yet; see issue #347.
+                const sub = readU32(bytes, &pos);
+                return classifyOpcode(Opcode.prefix_simd, sub);
             },
-            else => {
-                // Unknown opcode — stop validation for this function to avoid misalignment
-                break;
+            0xfb => {
+                // GC prefix. `Opcode.Code` does not enumerate the GC
+                // proposal's sub-opcodes, so classification cannot tell a
+                // real one from a bogus one; report the prefix as known but
+                // unchecked, matching `component/adapter/gc.zig`.
+                return error.UnsupportedOpcode;
             },
+            else => return classifyOpcode(null, opcode),
         }
     }
 
@@ -1570,4 +1606,141 @@ test "local.set inside block does not escape (spec local_init.wast)" {
     );
     defer module.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+// ── Unrecognised opcodes (issue #347) ───────────────────────────────────
+
+/// Build a single-function module whose body is `body`, with one memory so
+/// that memory instructions resolve.
+fn testModuleWithBody(alloc: std.mem.Allocator, body: []const u8) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    try module.memories.append(alloc, .{});
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+test "atomics are not silently accepted without type checking" {
+    // Regression for issue #347. The 0xfe arm used to skip the sub-opcode
+    // and memarg and keep going without modelling stack effects, so every
+    // later instruction was checked against a stale value stack and invalid
+    // modules were accepted.
+    //
+    //   f64.const 0        ;; wrong operand type for the address
+    //   i32.atomic.load
+    //   drop
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x44, 0, 0, 0, 0, 0, 0, 0, 0, // f64.const 0
+        0xfe, 0x10, 0x02, 0x00, // i32.atomic.load align=2 offset=0
+        0x1a, // drop
+        0x0b, // end
+    };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+}
+
+test "unchecked 0xfc sub-opcodes are reported, not ignored" {
+    // i64.add128 (0xfc 0x13) has no arm; the inner `else` used to fall
+    // through silently, leaving the value stack wrong for what followed.
+    const alloc = std.testing.allocator;
+    const body = [_]u8{ 0xfc, 0x13, 0x0b };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+}
+
+test "SIMD reports UnsupportedOpcode rather than a bogus TypeMismatch" {
+    // A *valid* body: v128.const 0; drop. It cannot be type-checked yet, but
+    // the reported reason must not claim a type mismatch that does not exist.
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // v128.const 0
+        0x1a, // drop
+        0x0b, // end
+    };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+}
+
+test "tail-call opcodes are reported as unsupported" {
+    // return_call / return_call_indirect / return_call_ref — the opcodes
+    // behind GHSA-hv37-vjx6-rm9j. They have no validator arm.
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        &[_]u8{ 0x12, 0x00, 0x0b }, // return_call 0
+        &[_]u8{ 0x13, 0x00, 0x00, 0x0b }, // return_call_indirect 0 0
+        &[_]u8{ 0x15, 0x00, 0x0b }, // return_call_ref 0
+    }) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    }
+}
+
+test "meaningless opcodes are distinguished from unimplemented ones" {
+    // 0x27 is not assigned by any proposal this build knows about.
+    const alloc = std.testing.allocator;
+    const body = [_]u8{ 0x27, 0x0b };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.UnknownOpcode, validate(&module, .{}));
+}
+
+test "classifyOpcode separates declared opcodes from undeclared encodings" {
+    // Code is a non-exhaustive enum, so this must test for a declared field
+    // rather than a successful @enumFromInt.
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(null, 0x12)); // return_call
+    try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(null, 0x27)); // unassigned
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x0c)); // v128.const
+    try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_simd, 0xffff));
+}
+
+test "every declared single-byte opcode is handled or explicitly unsupported" {
+    // Drift guard for issue #347. Adding an opcode to Opcode.zig without
+    // giving the validator an arm must not silently reopen the gap, so this
+    // asserts both directions: opcodes on the backlog below must report
+    // UnsupportedOpcode, and every other declared opcode must reach a real
+    // arm (any other error is fine — a bare opcode byte is rarely a
+    // well-typed body — but it must not come back as un-handled).
+    //
+    // The backlog is in the order the issue plans to clear it: tail calls
+    // and typed refs (PR3), exception handling (PR4).
+    const known_unsupported = [_]u8{
+        0x06, 0x07, 0x08, 0x09, 0x0a, // try, catch, throw, rethrow, throw_ref
+        0x12, 0x13, 0x14, 0x15, // return_call, return_call_indirect, call_ref, return_call_ref
+        0x18, 0x19, 0x1f, // delegate, catch_all, try_table
+        0xd4, 0xd5, 0xd6, // ref.as_non_null, br_on_null, br_on_non_null
+    };
+    const alloc = std.testing.allocator;
+    var checked: usize = 0;
+    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
+        if (f.value <= 0xff) {
+            const op: u8 = @intCast(f.value);
+            const body = [_]u8{ op, 0x0b };
+            var module = try testModuleWithBody(alloc, &body);
+            defer module.deinit();
+            checked += 1;
+            if (std.mem.indexOfScalar(u8, &known_unsupported, op) != null) {
+                try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+            } else if (validate(&module, .{})) |_| {} else |err| switch (err) {
+                error.UnsupportedOpcode, error.UnknownOpcode => {
+                    std.debug.print(
+                        "opcode 0x{x:0>2} ({s}) has no validator arm; add one or list it above\n",
+                        .{ op, f.name },
+                    );
+                    return error.TestUnexpectedResult;
+                },
+                else => {},
+            }
+        }
+    }
+    // Guard against the loop silently stopping to exercise anything.
+    try std.testing.expect(checked > 150);
 }
