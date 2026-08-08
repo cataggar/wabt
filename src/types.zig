@@ -17,6 +17,139 @@ pub const invalid_address: Address = std.math.maxInt(Address);
 pub const invalid_offset: Offset = std.math.maxInt(Offset);
 pub const default_page_size: u32 = 0x10000; // 64 KiB
 
+// ── Reference types ───────────────────────────────────────────────────────
+
+pub const AbstractHeapType = enum(i32) {
+    noexn = -0x0c,
+    nofunc = -0x0d,
+    noextern = -0x0e,
+    none = -0x0f,
+    func = -0x10,
+    extern_ = -0x11,
+    any = -0x12,
+    eq = -0x13,
+    i31 = -0x14,
+    struct_ = -0x15,
+    array = -0x16,
+    exn = -0x17,
+
+    pub fn fromCode(code: i64) ?AbstractHeapType {
+        inline for (std.enums.values(AbstractHeapType)) |heap| {
+            if (code == @intFromEnum(heap)) return heap;
+        }
+        return null;
+    }
+
+    pub fn nullableValType(self: AbstractHeapType) ValType {
+        return switch (self) {
+            .func => .funcref,
+            .extern_ => .externref,
+            .any => .anyref,
+            .eq => .eqref,
+            .i31 => .i31ref,
+            .struct_ => .structref,
+            .array => .arrayref,
+            .exn => .exnref,
+            .none => .nullref,
+            .nofunc => .nullfuncref,
+            .noextern => .nullexternref,
+            .noexn => .nullexnref,
+        };
+    }
+
+    pub fn nonNullableValType(self: AbstractHeapType) ValType {
+        return switch (self) {
+            .func => .ref_func,
+            .extern_ => .ref_extern,
+            .any => .ref_any,
+            .eq => .ref_eq,
+            .i31 => .ref_i31,
+            .struct_ => .ref_struct,
+            .array => .ref_array,
+            .exn => .ref_exn,
+            .none => .ref_none,
+            .nofunc => .ref_nofunc,
+            .noextern => .ref_noextern,
+            .noexn => .ref_noexn,
+        };
+    }
+
+    pub fn fromValType(vt: ValType) ?struct { nullable: bool, heap: AbstractHeapType } {
+        return switch (vt) {
+            .funcref => .{ .nullable = true, .heap = .func },
+            .externref => .{ .nullable = true, .heap = .extern_ },
+            .anyref => .{ .nullable = true, .heap = .any },
+            .eqref => .{ .nullable = true, .heap = .eq },
+            .i31ref => .{ .nullable = true, .heap = .i31 },
+            .structref => .{ .nullable = true, .heap = .struct_ },
+            .arrayref => .{ .nullable = true, .heap = .array },
+            .exnref => .{ .nullable = true, .heap = .exn },
+            .nullref => .{ .nullable = true, .heap = .none },
+            .nullfuncref => .{ .nullable = true, .heap = .nofunc },
+            .nullexternref => .{ .nullable = true, .heap = .noextern },
+            .nullexnref => .{ .nullable = true, .heap = .noexn },
+            .ref_func => .{ .nullable = false, .heap = .func },
+            .ref_extern => .{ .nullable = false, .heap = .extern_ },
+            .ref_any => .{ .nullable = false, .heap = .any },
+            .ref_eq => .{ .nullable = false, .heap = .eq },
+            .ref_i31 => .{ .nullable = false, .heap = .i31 },
+            .ref_struct => .{ .nullable = false, .heap = .struct_ },
+            .ref_array => .{ .nullable = false, .heap = .array },
+            .ref_exn => .{ .nullable = false, .heap = .exn },
+            .ref_none => .{ .nullable = false, .heap = .none },
+            .ref_nofunc => .{ .nullable = false, .heap = .nofunc },
+            .ref_noextern => .{ .nullable = false, .heap = .noextern },
+            .ref_noexn => .{ .nullable = false, .heap = .noexn },
+            else => null,
+        };
+    }
+};
+
+pub const HeapType = union(enum) {
+    abstract: AbstractHeapType,
+    concrete: u32,
+};
+
+pub const RefType = struct {
+    nullable: bool,
+    heap: HeapType,
+
+    pub fn abstract(nullable: bool, heap: AbstractHeapType) RefType {
+        return .{ .nullable = nullable, .heap = .{ .abstract = heap } };
+    }
+
+    pub fn concrete(nullable: bool, type_index: u32) RefType {
+        return .{ .nullable = nullable, .heap = .{ .concrete = type_index } };
+    }
+
+    pub fn fromValType(vt: ValType) ?RefType {
+        const abs = AbstractHeapType.fromValType(vt) orelse return switch (vt) {
+            .concrete_ref => .concrete(false, invalid_index),
+            .concrete_ref_null => .concrete(true, invalid_index),
+            else => null,
+        };
+        return .abstract(abs.nullable, abs.heap);
+    }
+
+    pub fn fromValTypeAndIndex(vt: ValType, type_index: u32) ?RefType {
+        if (type_index != invalid_index) {
+            return switch (vt) {
+                .concrete_ref => .concrete(false, type_index),
+                .concrete_ref_null => .concrete(true, type_index),
+                else => fromValType(vt),
+            };
+        }
+        return fromValType(vt);
+    }
+
+    pub fn toValType(self: RefType) ValType {
+        return switch (self.heap) {
+            .abstract => |heap| if (self.nullable) heap.nullableValType() else heap.nonNullableValType(),
+            .concrete => if (self.nullable) .concrete_ref_null else .concrete_ref,
+        };
+    }
+};
+
 // ── Value types ───────────────────────────────────────────────────────────
 
 /// WebAssembly value types using the binary-format encoding (signed LEB128
@@ -44,10 +177,6 @@ pub const ValType = enum(i32) {
     arrayref = 0x6a,
     exnref = 0x69,
 
-    // Typed references (GC proposal)
-    ref = 0x64,
-    ref_null = 0x63,
-
     // Function signature marker
     func = 0x60,
 
@@ -56,36 +185,59 @@ pub const ValType = enum(i32) {
     array = 0x5e,
 
     // GC nullable bottom types (ref null <bottom>)
-    nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
+    nullfuncref = 0x73, // (ref null nofunc) — bottom of func hierarchy
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
-    nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
-    nullexnref = 0x74,    // (ref null noexn) — bottom of exn hierarchy
+    nullref = 0x71, // (ref null none) — bottom of internal hierarchy
+    nullexnref = 0x74, // (ref null noexn) — bottom of exn hierarchy
 
     // Non-nullable abstract heap types (internal-only, not binary encoded)
-    ref_func = -1,     // (ref func) — non-nullable func
-    ref_extern = -2,   // (ref extern) — non-nullable extern
-    ref_any = -3,      // (ref any) — non-nullable any
-    ref_none = -4,     // (ref none) — non-nullable none (bottom)
-    ref_nofunc = -5,   // (ref nofunc) — non-nullable nofunc (bottom)
+    ref_func = -1, // (ref func) — non-nullable func
+    ref_extern = -2, // (ref extern) — non-nullable extern
+    ref_any = -3, // (ref any) — non-nullable any
+    ref_none = -4, // (ref none) — non-nullable none (bottom)
+    ref_nofunc = -5, // (ref nofunc) — non-nullable nofunc (bottom)
     ref_noextern = -6, // (ref noextern) — non-nullable noextern (bottom)
-    ref_eq = -7,       // (ref eq) — non-nullable eq
-    ref_i31 = -8,      // (ref i31) — non-nullable i31
-    ref_struct = -9,   // (ref struct) — non-nullable struct
-    ref_array = -10,   // (ref array) — non-nullable array
-    ref_exn = -11,     // (ref exn) — non-nullable exn
-    ref_noexn = -12,   // (ref noexn) — non-nullable noexn (bottom)
+    ref_eq = -7, // (ref eq) — non-nullable eq
+    ref_i31 = -8, // (ref i31) — non-nullable i31
+    ref_struct = -9, // (ref struct) — non-nullable struct
+    ref_array = -10, // (ref array) — non-nullable array
+    ref_exn = -11, // (ref exn) — non-nullable exn
+    ref_noexn = -12, // (ref noexn) — non-nullable noexn (bottom)
+    concrete_ref = -13, // (ref <typeidx>) — type index stored out-of-line
+    concrete_ref_null = -14, // (ref null <typeidx>) — type index stored out-of-line
 
     // Block void type
     void_ = 0x40,
 
-    /// Returns `true` for reference types (funcref, externref, anyref,
-    /// exnref, ref, ref_null).
+    /// Returns `true` for reference types.
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .ref, .ref_null,
-            .nullfuncref, .nullexternref, .nullref, .nullexnref,
-            .ref_func, .ref_extern, .ref_any, .ref_eq, .ref_i31, .ref_struct, .ref_array,
-            .ref_none, .ref_nofunc, .ref_noextern, .ref_exn, .ref_noexn,
+            .funcref,
+            .externref,
+            .anyref,
+            .eqref,
+            .i31ref,
+            .structref,
+            .arrayref,
+            .exnref,
+            .nullfuncref,
+            .nullexternref,
+            .nullref,
+            .nullexnref,
+            .ref_func,
+            .ref_extern,
+            .ref_any,
+            .ref_eq,
+            .ref_i31,
+            .ref_struct,
+            .ref_array,
+            .ref_none,
+            .ref_nofunc,
+            .ref_noextern,
+            .ref_exn,
+            .ref_noexn,
+            .concrete_ref,
+            .concrete_ref_null,
             => true,
             else => false,
         };
@@ -117,8 +269,6 @@ pub const ValType = enum(i32) {
             .i31ref => "i31ref",
             .structref => "structref",
             .arrayref => "arrayref",
-            .ref => "ref",
-            .ref_null => "ref_null",
             .func => "func",
             .struct_ => "struct",
             .array => "array",
@@ -139,6 +289,8 @@ pub const ValType = enum(i32) {
             .ref_array => "(ref array)",
             .ref_exn => "(ref exn)",
             .ref_noexn => "(ref noexn)",
+            .concrete_ref => "(ref <typeidx>)",
+            .concrete_ref_null => "(ref null <typeidx>)",
         };
     }
 };
@@ -293,9 +445,6 @@ const spec_valtype_bytes = [_]struct { ValType, u8 }{
     .{ .structref, 0x6b }, // struct   = -0x15
     .{ .arrayref, 0x6a }, // array    = -0x16
     .{ .exnref, 0x69 }, // exn      = -0x17
-    // Typed-reference prefixes (followed by a heaptype; not types themselves)
-    .{ .ref, 0x64 },
-    .{ .ref_null, 0x63 },
     // Composite type forms
     .{ .func, 0x60 },
     .{ .struct_, 0x5f },
@@ -343,8 +492,8 @@ test "ValType.isRefType" {
     try std.testing.expect(ValType.externref.isRefType());
     try std.testing.expect(ValType.anyref.isRefType());
     try std.testing.expect(ValType.exnref.isRefType());
-    try std.testing.expect(ValType.ref.isRefType());
-    try std.testing.expect(ValType.ref_null.isRefType());
+    try std.testing.expect(ValType.concrete_ref.isRefType());
+    try std.testing.expect(ValType.concrete_ref_null.isRefType());
 
     try std.testing.expect(!ValType.i32.isRefType());
     try std.testing.expect(!ValType.f64.isRefType());
@@ -366,6 +515,19 @@ test "ValType.name" {
     try std.testing.expectEqualStrings("i32", ValType.i32.name());
     try std.testing.expectEqualStrings("funcref", ValType.funcref.name());
     try std.testing.expectEqualStrings("void", ValType.void_.name());
+}
+
+test "RefType carries abstract and concrete heap types" {
+    const nullable_func = RefType.abstract(true, .func);
+    try std.testing.expectEqual(ValType.funcref, nullable_func.toValType());
+
+    const concrete = RefType.concrete(true, 7);
+    try std.testing.expectEqual(ValType.concrete_ref_null, concrete.toValType());
+    try std.testing.expectEqual(@as(u32, 7), concrete.heap.concrete);
+    try std.testing.expectEqual(
+        @as(i32, -0x10),
+        @intFromEnum((RefType.fromValType(.ref_func) orelse unreachable).heap.abstract),
+    );
 }
 
 test "sentinel constants" {
