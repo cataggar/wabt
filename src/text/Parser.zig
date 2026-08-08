@@ -181,6 +181,29 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     return module;
 }
 
+/// Map a bare heaptype name (`any`, `nofunc`, …) to its abstract heap type.
+/// `func` is handled by its own keyword token before this is reached.
+fn abstractHeapTypeByName(name: []const u8) ?types.AbstractHeapType {
+    const table = .{
+        .{ "extern", types.AbstractHeapType.extern_ },
+        .{ "any", types.AbstractHeapType.any },
+        .{ "eq", types.AbstractHeapType.eq },
+        .{ "i31", types.AbstractHeapType.i31 },
+        .{ "struct", types.AbstractHeapType.struct_ },
+        .{ "array", types.AbstractHeapType.array },
+        .{ "exn", types.AbstractHeapType.exn },
+        .{ "none", types.AbstractHeapType.none },
+        .{ "nofunc", types.AbstractHeapType.nofunc },
+        .{ "noextern", types.AbstractHeapType.noextern },
+        .{ "noexn", types.AbstractHeapType.noexn },
+        .{ "func", types.AbstractHeapType.func },
+    };
+    inline for (table) |entry| {
+        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+    }
+    return null;
+}
+
 /// Skip an annotation and its content in prescan mode (no Parser struct available).
 fn skipPrescanAnnotation(lex: *Lexer) void {
     var depth: u32 = 1;
@@ -2654,29 +2677,22 @@ const Parser = struct {
                         }
                     }
                     // Parse heap type
-                    var heap_type_idx: i32 = -1;
+                    var heap_type: ?types.HeapType = null;
                     if (self.peek().kind == .identifier) {
                         const name = self.advance().text;
                         if (self.type_names.get(name)) |idx| {
-                            heap_type_idx = @intCast(idx);
+                            heap_type = .{ .concrete = idx };
                         }
                     } else if (self.peek().kind == .integer) {
-                        heap_type_idx = @intCast(self.parseU32() catch 0);
+                        heap_type = .{ .concrete = self.parseU32() catch 0 };
                     } else if (self.peek().kind == .kw_func) {
                         _ = self.advance();
-                        heap_type_idx = 0x70; // func abstract heap type
+                        heap_type = .{ .abstract = .func };
                     } else if (self.peek().kind != .r_paren) {
                         const ht_text = self.advance().text;
-                        if (std.mem.eql(u8, ht_text, "extern")) heap_type_idx = 0x6f
-                        else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e
-                        else if (std.mem.eql(u8, ht_text, "i31")) heap_type_idx = 0x6c
-                        else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d
-                        else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b
-                        else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a
-                        else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x71
-                        else if (std.mem.eql(u8, ht_text, "nofunc")) heap_type_idx = 0x73
-                        else if (std.mem.eql(u8, ht_text, "noextern")) heap_type_idx = 0x72
-                        else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x74;
+                        if (abstractHeapTypeByName(ht_text)) |abstract| {
+                            heap_type = .{ .abstract = abstract };
+                        }
                     }
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     // Emit sub-opcode
@@ -2685,12 +2701,7 @@ const Parser = struct {
                     else
                         (if (nullable) @as(u32, 0x17) else @as(u32, 0x16));
                     self.emitLeb128U32(code, sub_op);
-                    // Emit heap type as signed LEB128
-                    if (heap_type_idx >= 0) {
-                        var buf: [5]u8 = undefined;
-                        const n = leb128.writeS32Leb128(&buf, heap_type_idx);
-                        code.appendSlice(self.allocator, buf[0..n]) catch {};
-                    }
+                    if (heap_type) |ht| self.emitHeapType(code, ht);
                 } else if (self.peek().kind == .kw_i31ref or self.peek().kind == .kw_eqref or
                     self.peek().kind == .kw_structref or self.peek().kind == .kw_arrayref or
                     self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
@@ -2701,31 +2712,27 @@ const Parser = struct {
                     // Bare type keyword: ref.cast i31ref etc.
                     const vt = self.advance();
                     nullable = true; // bare ref types are nullable
-                    const heap_type_idx: i32 = switch (vt.kind) {
-                        .kw_i31ref => 0x6c,
-                        .kw_eqref => 0x6d,
-                        .kw_structref => 0x6b,
-                        .kw_arrayref => 0x6a,
-                        .kw_funcref => 0x70,
-                        .kw_anyref => 0x6e,
-                        .kw_externref => 0x6f,
-                        .kw_exnref => 0x69,
-                        .kw_nullref => 0x71,
-                        .kw_nullfuncref => 0x73,
-                        .kw_nullexternref => 0x72,
-                        .kw_nullexnref => 0x74,
-                        else => -1,
+                    const heap_type: ?types.AbstractHeapType = switch (vt.kind) {
+                        .kw_i31ref => .i31,
+                        .kw_eqref => .eq,
+                        .kw_structref => .struct_,
+                        .kw_arrayref => .array,
+                        .kw_funcref => .func,
+                        .kw_anyref => .any,
+                        .kw_externref => .extern_,
+                        .kw_exnref => .exn,
+                        .kw_nullref => .none,
+                        .kw_nullfuncref => .nofunc,
+                        .kw_nullexternref => .noextern,
+                        .kw_nullexnref => .noexn,
+                        else => null,
                     };
                     const sub_op: u32 = if (tok.kind == .kw_ref_test)
                         (if (nullable) @as(u32, 0x15) else @as(u32, 0x14))
                     else
                         (if (nullable) @as(u32, 0x17) else @as(u32, 0x16));
                     self.emitLeb128U32(code, sub_op);
-                    if (heap_type_idx >= 0) {
-                        var buf: [5]u8 = undefined;
-                        const n = leb128.writeS32Leb128(&buf, heap_type_idx);
-                        code.appendSlice(self.allocator, buf[0..n]) catch {};
-                    }
+                    if (heap_type) |abstract| self.emitHeapType(code, .{ .abstract = abstract });
                 }
             },
             .opcode => {
@@ -3103,6 +3110,16 @@ const Parser = struct {
         var buf: [10]u8 = undefined;
         const n = leb128.writeS64Leb128(&buf, val);
         code.appendSlice(self.allocator, buf[0..n]) catch {};
+    }
+
+    /// Emit a heaptype as the s33 LEB128 the binary format requires: abstract heap
+    /// types are the *negative* spec codes (func = -0x10 encodes to the single byte
+    /// 0x70), concrete heap types are the non-negative type index.
+    fn emitHeapType(self: *Parser, code: *std.ArrayListUnmanaged(u8), heap: types.HeapType) void {
+        switch (heap) {
+            .abstract => |abstract| self.emitLeb128S32(code, @intFromEnum(abstract)),
+            .concrete => |idx| self.emitLeb128S32(code, @bitCast(idx)),
+        }
     }
 
     fn emitGenericOpcode(self: *Parser, text: []const u8, code: *std.ArrayListUnmanaged(u8)) void {
@@ -6326,4 +6343,91 @@ fn normalizeIdentifier(allocator: std.mem.Allocator, text: []const u8) []const u
         }
     }
     return result.toOwnedSlice(allocator) catch text;
+}
+
+/// Expected `ref.test`/`ref.cast` heaptype operand bytes, captured from
+/// `wasm-tools parse` output. A heaptype is the s33 LEB128 of the *negative*
+/// spec heap code, so every abstract heap type is a single byte.
+const spec_heaptype_operand_bytes = [_]struct { types.AbstractHeapType, u8 }{
+    .{ .func, 0x70 },
+    .{ .extern_, 0x6f },
+    .{ .any, 0x6e },
+    .{ .eq, 0x6d },
+    .{ .i31, 0x6c },
+    .{ .struct_, 0x6b },
+    .{ .array, 0x6a },
+    .{ .exn, 0x69 },
+    .{ .none, 0x71 },
+    .{ .nofunc, 0x73 },
+    .{ .noextern, 0x72 },
+    .{ .noexn, 0x74 },
+};
+
+test "ref.test emits a single-byte heaptype for every abstract heap type" {
+    const allocator = std.testing.allocator;
+    inline for (spec_heaptype_operand_bytes) |entry| {
+        const name = switch (entry[0]) {
+            .extern_ => "extern",
+            .struct_ => "struct",
+            else => @tagName(entry[0]),
+        };
+        inline for (.{ .{ "", @as(u8, 0x14) }, .{ "null ", @as(u8, 0x15) } }) |form| {
+            const src = "(module (func (param anyref) local.get 0 ref.test (ref " ++
+                form[0] ++ name ++ ") drop))";
+            var module = try parseModule(allocator, src);
+            defer module.deinit();
+            const code = module.funcs.items[0].code_bytes;
+            // local.get 0 (20 00), then fb <sub_op> <heaptype>
+            try std.testing.expectEqualSlices(u8, &.{ 0xfb, form[1], entry[1] }, code[2..5]);
+        }
+    }
+}
+
+test "ref.cast emits a single-byte heaptype for bare reference keywords" {
+    const allocator = std.testing.allocator;
+    // Bare keywords are the nullable shorthand, so ref.cast uses sub-opcode 0x17.
+    inline for (.{
+        .{ "funcref", @as(u8, 0x70) },
+        .{ "externref", @as(u8, 0x6f) },
+        .{ "anyref", @as(u8, 0x6e) },
+        .{ "eqref", @as(u8, 0x6d) },
+        .{ "i31ref", @as(u8, 0x6c) },
+        .{ "structref", @as(u8, 0x6b) },
+        .{ "arrayref", @as(u8, 0x6a) },
+        .{ "exnref", @as(u8, 0x69) },
+        .{ "nullref", @as(u8, 0x71) },
+        .{ "nullfuncref", @as(u8, 0x73) },
+        .{ "nullexternref", @as(u8, 0x72) },
+        .{ "nullexnref", @as(u8, 0x74) },
+    }) |entry| {
+        const src = "(module (func (param anyref) local.get 0 ref.cast " ++ entry[0] ++ " drop))";
+        var module = try parseModule(allocator, src);
+        defer module.deinit();
+        const code = module.funcs.items[0].code_bytes;
+        try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x17, entry[1] }, code[2..5]);
+    }
+}
+
+test "ref.cast emits concrete type indices distinctly from abstract heap types" {
+    const allocator = std.testing.allocator;
+    // Concrete index 0 is a single 0x00 byte, not confusable with any abstract code.
+    var by_index = try parseModule(allocator,
+        \\(module (type $t (func)) (func (param funcref) local.get 0 ref.cast (ref 0) drop))
+    );
+    defer by_index.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x16, 0x00 }, by_index.funcs.items[0].code_bytes[2..5]);
+
+    var by_name = try parseModule(allocator,
+        \\(module (type $t (func)) (func (param funcref) local.get 0 ref.cast (ref $t) drop))
+    );
+    defer by_name.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x16, 0x00 }, by_name.funcs.items[0].code_bytes[2..5]);
+
+    // Index 112 shares the byte pattern that the abstract `func` code would have
+    // been double-encoded into; the two must not collide.
+    var big = try parseModule(allocator,
+        \\(module (type $t (func)) (func (param funcref) local.get 0 ref.cast (ref 112) drop))
+    );
+    defer big.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x16, 0xf0, 0x00 }, big.funcs.items[0].code_bytes[2..6]);
 }
