@@ -45,9 +45,6 @@ const stack_init = @import("stack_init.zig");
 
 pub const Error = error{
     UnsupportedOpcode,
-    /// Propagated from `binary.reader`: a `(ref $t)` naming a concrete
-    /// type index, which `ValType` cannot represent yet.
-    ConcreteRefTypeUnsupported,
     InvalidBody,
     MissingRequiredExport,
     InvalidIndex,

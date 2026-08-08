@@ -34,10 +34,6 @@ pub const ReadError = error{
     UnexpectedEof,
     InvalidSection,
     InvalidType,
-    /// A `(ref $t)` / `(ref null $t)` naming a concrete type index. `RefType`
-    /// can represent it, but the reader still rejects it until the module IR
-    /// stores reference types directly rather than via legacy side tables.
-    ConcreteRefTypeUnsupported,
     InvalidLimits,
     TooManyLocals,
     SectionTooLarge,
@@ -93,23 +89,31 @@ const abstract_heap_types = [_]types.AbstractHeapType{
     .func, .extern_, .any, .eq, .i31, .struct_, .array, .exn,
 };
 
-/// Resolve a decoded heaptype to the `ValType` for `(ref null <heap>)` when
-/// `nullable`, or `(ref <heap>)` otherwise.
-fn refTypeFromHeapType(heap_type: i64, nullable: bool) ReadError!types.ValType {
+/// Resolve a decoded heaptype to a `types.RefType`. Abstract heap types come
+/// from the exhaustive table above; a non-negative heaptype is a concrete type
+/// index, carried out-of-line because `ValType` has no room for it.
+fn refTypeFromHeapType(heap_type: i64, nullable: bool) ReadError!types.RefType {
     for (abstract_heap_types) |heap| {
         if (heap_type == @intFromEnum(heap)) {
-            return types.RefType.abstract(nullable, heap).toValType();
+            return types.RefType.abstract(nullable, heap);
         }
     }
-    // A non-negative heaptype is a concrete type index. The representation now
-    // exists (`types.RefType.concrete`), but the binary reader still rejects it
-    // here until the module IR stores typed references directly instead of via
-    // legacy side tables. Rejecting remains safer than widening to `funcref`.
-    if (heap_type >= 0) return error.ConcreteRefTypeUnsupported;
+    if (heap_type >= 0) {
+        if (heap_type > std.math.maxInt(u32)) return error.InvalidType;
+        return types.RefType.concrete(nullable, @intCast(heap_type));
+    }
     return error.InvalidType;
 }
 
 // ── Internal reader ─────────────────────────────────────────────────────
+
+/// A decoded value type together with its concrete type index, if any.
+/// `ValType` cannot carry the index itself, so the reader hands both back and
+/// each caller stores the index in the matching IR slot.
+const IndexedValType = struct {
+    vt: types.ValType,
+    type_idx: u32 = types.invalid_index,
+};
 
 const Reader = struct {
     data: []const u8,
@@ -181,26 +185,47 @@ const Reader = struct {
         return self.readBytes(len);
     }
 
-    fn readValType(self: *Reader) ReadError!types.ValType {
+    fn readValType(self: *Reader) ReadError!IndexedValType {
         const byte = try self.readByte();
         if (byte == ref_prefix or byte == ref_null_prefix) {
             // `0x63`/`0x64` are *prefixes*, not types: each is followed by a
             // heaptype LEB128 that must be consumed, or the stream desyncs and
             // the next byte is misread as this type.
             const heap_type = try self.readS64();
-            return refTypeFromHeapType(heap_type, byte == ref_null_prefix);
+            const ref = try refTypeFromHeapType(heap_type, byte == ref_null_prefix);
+            return .{
+                .vt = ref.toValType(),
+                .type_idx = switch (ref.heap) {
+                    .abstract => types.invalid_index,
+                    .concrete => |idx| idx,
+                },
+            };
         }
-        return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
+        const vt = enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
+        // The abbreviated forms never carry a concrete index; a bare
+        // `.concrete_ref` byte would be an internal marker leaking into the
+        // binary format, which is not a valid encoding.
+        if (vt == .concrete_ref or vt == .concrete_ref_null) return error.InvalidType;
+        return .{ .vt = vt };
     }
 
     /// Read a reference type encoding, handling both the abbreviated form
     /// (`0x70` funcref, `0x6f` externref, …) and the general
     /// `0x63`/`0x64` + heaptype form.
-    fn readRefType(self: *Reader) ReadError!types.ValType {
-        const vt = try self.readValType();
-        if (!vt.isRefType()) return error.InvalidType;
-        return vt;
+    fn readRefType(self: *Reader) ReadError!IndexedValType {
+        const indexed = try self.readValType();
+        if (!indexed.vt.isRefType()) return error.InvalidType;
+        return indexed;
+    }
+
+    /// Validate a concrete type index against the already-read type section.
+    /// Sections after the type section can be checked immediately.
+    fn checkTypeIndex(self: *Reader, indexed: IndexedValType) ReadError!IndexedValType {
+        if (indexed.type_idx != types.invalid_index and
+            indexed.type_idx >= self.module.module_types.items.len)
+            return error.InvalidType;
+        return indexed;
     }
 
     fn readLimits(self: *Reader) ReadError!types.Limits {
@@ -253,7 +278,11 @@ const Reader = struct {
                 0x43 => _ = try self.readBytes(4),
                 0x44 => _ = try self.readBytes(8),
                 0x23 => _ = try self.readU32(),
-                0xd0 => _ = try self.readValType(),
+                // `ref.null`'s operand is a heaptype LEB128, not a value type.
+                // The abbreviated abstract encodings coincide with the value
+                // type bytes, which hid this until concrete indices appeared:
+                // `ref.null 0` is `d0 00`, and an index >= 64 spans two bytes.
+                0xd0 => _ = try self.readS64(),
                 0xd2 => _ = try self.readU32(),
                 else => {},
             }
@@ -336,16 +365,55 @@ const Reader = struct {
             const num_params = try self.readU32();
             var params = try self.allocator.alloc(types.ValType, num_params);
             errdefer self.allocator.free(params);
-            for (0..num_params) |j| params[j] = try self.readValType();
+            var param_idxs = try self.allocator.alloc(u32, num_params);
+            errdefer self.allocator.free(param_idxs);
+            for (0..num_params) |j| {
+                const indexed = try self.readValType();
+                params[j] = indexed.vt;
+                param_idxs[j] = indexed.type_idx;
+            }
 
             const num_results = try self.readU32();
             var results = try self.allocator.alloc(types.ValType, num_results);
             errdefer self.allocator.free(results);
-            for (0..num_results) |j| results[j] = try self.readValType();
+            var result_idxs = try self.allocator.alloc(u32, num_results);
+            errdefer self.allocator.free(result_idxs);
+            for (0..num_results) |j| {
+                const indexed = try self.readValType();
+                results[j] = indexed.vt;
+                result_idxs[j] = indexed.type_idx;
+            }
 
             self.module.module_types.appendAssumeCapacity(.{
-                .func_type = .{ .params = params, .results = results },
+                .func_type = .{
+                    .params = params,
+                    .results = results,
+                    .param_type_idxs = param_idxs,
+                    .result_type_idxs = result_idxs,
+                },
             });
+        }
+        // Concrete heap types may refer forward within the type section, so
+        // indices can only be bounds-checked once the whole section is read.
+        try self.checkTypeSectionIndices();
+    }
+
+    /// Reject concrete heap types naming a type index the module does not have.
+    /// Left unchecked, an out-of-range index would reach the validator's type
+    /// table lookups, which fail closed but report a less specific error.
+    fn checkTypeSectionIndices(self: *Reader) ReadError!void {
+        const count = self.module.module_types.items.len;
+        for (self.module.module_types.items) |entry| {
+            const ft = switch (entry) {
+                .func_type => |ft| ft,
+                else => continue,
+            };
+            for (ft.param_type_idxs) |idx| {
+                if (idx != types.invalid_index and idx >= count) return error.InvalidType;
+            }
+            for (ft.result_type_idxs) |idx| {
+                if (idx != types.invalid_index and idx >= count) return error.InvalidType;
+            }
         }
     }
 
@@ -377,11 +445,14 @@ const Reader = struct {
                     self.module.num_func_imports += 1;
                 },
                 .table => {
-                    const elem_type = try self.readValType();
+                    const indexed = try self.checkTypeIndex(try self.readValType());
+                    const elem_type = indexed.vt;
                     const limits = try self.readLimits();
+                    import.table_type_idx = indexed.type_idx;
                     import.table = .{ .elem_type = elem_type, .limits = limits };
                     try self.module.tables.append(self.allocator, .{
                         .type = .{ .elem_type = elem_type, .limits = limits },
+                        .type_idx = indexed.type_idx,
                         .is_import = true,
                     });
                     self.module.num_table_imports += 1;
@@ -396,13 +467,16 @@ const Reader = struct {
                     self.module.num_memory_imports += 1;
                 },
                 .global => {
-                    const val_type = try self.readValType();
+                    const indexed = try self.checkTypeIndex(try self.readValType());
+                    const val_type = indexed.vt;
+                    import.global_type_idx = indexed.type_idx;
                     const mut_byte = try self.readByte();
                     if (mut_byte > 1) return error.InvalidType;
                     const mutability: types.Mutability = if (mut_byte != 0) .mutable else .immutable;
                     import.global = .{ .val_type = val_type, .mutability = mutability };
                     try self.module.globals.append(self.allocator, .{
                         .type = .{ .val_type = val_type, .mutability = mutability },
+                        .type_idx = indexed.type_idx,
                         .is_import = true,
                     });
                     self.module.num_global_imports += 1;
@@ -439,7 +513,8 @@ const Reader = struct {
                 const table_flags = try self.readByte(); // 0x00 = no table64
                 const is_table64 = (table_flags & 0x01) != 0;
                 const has_init = true; // 0x40 prefix indicates init expr
-                const elem_type = try self.readRefType();
+                const indexed = try self.checkTypeIndex(try self.readRefType());
+                const elem_type = indexed.vt;
                 const limits = try self.readLimits();
                 var init_bytes: []const u8 = &.{};
                 if (has_init) {
@@ -453,14 +528,16 @@ const Reader = struct {
                 }
                 try self.module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
+                    .type_idx = indexed.type_idx,
                     .is_table64 = is_table64,
                     .init_expr_bytes = init_bytes,
                 });
             } else {
-                const elem_type = try self.readValType();
+                const indexed = try self.checkTypeIndex(try self.readValType());
                 const limits = try self.readLimits();
                 try self.module.tables.append(self.allocator, .{
-                    .type = .{ .elem_type = elem_type, .limits = limits },
+                    .type = .{ .elem_type = indexed.vt, .limits = limits },
+                    .type_idx = indexed.type_idx,
                 });
             }
         }
@@ -479,7 +556,8 @@ const Reader = struct {
     fn readGlobalSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         for (0..count) |_| {
-            const val_type = try self.readValType();
+            const global_indexed = try self.checkTypeIndex(try self.readValType());
+            const val_type = global_indexed.vt;
             const mut_byte = try self.readByte();
             if (mut_byte > 1) return error.InvalidType;
             const mutability: types.Mutability = if (mut_byte != 0) .mutable else .immutable;
@@ -493,6 +571,7 @@ const Reader = struct {
                 expr_with_end;
             try self.module.globals.append(self.allocator, .{
                 .type = .{ .val_type = val_type, .mutability = mutability },
+                .type_idx = global_indexed.type_idx,
                 .init_expr_bytes = expr_body,
                 .owns_init_expr_bytes = false,
             });
@@ -548,7 +627,9 @@ const Reader = struct {
 
             if (is_passive or has_explicit_index) {
                 if (use_elem_exprs) {
-                    seg.elem_type = try self.readRefType();
+                    const seg_indexed = try self.checkTypeIndex(try self.readRefType());
+                    seg.elem_type = seg_indexed.vt;
+                    seg.elem_type_idx = seg_indexed.type_idx;
                     // Element segment type must be a reference type
                     if (!seg.elem_type.isRefType()) return error.InvalidType;
                 } else {
@@ -596,9 +677,10 @@ const Reader = struct {
                 const local_count = try self.readU32();
                 total_locals += local_count;
                 if (total_locals > 50000) return error.TooManyLocals;
-                const vt = try self.readValType();
+                const indexed = try self.checkTypeIndex(try self.readValType());
                 for (0..local_count) |_| {
-                    try self.module.funcs.items[func_idx].local_types.append(self.allocator, vt);
+                    try self.module.funcs.items[func_idx].local_types.append(self.allocator, indexed.vt);
+                    try self.module.funcs.items[func_idx].local_type_idxs.append(self.allocator, indexed.type_idx);
                 }
             }
             // Validate function body ends with 0x0b (end opcode)
@@ -860,8 +942,8 @@ test "abstract heap types map to distinct value types" {
         try std.testing.expect((try seen.getOrPut(non_nullable_form)).found_existing == false);
 
         // Resolution round-trips.
-        try std.testing.expectEqual(nullable_form, try refTypeFromHeapType(code, true));
-        try std.testing.expectEqual(non_nullable_form, try refTypeFromHeapType(code, false));
+        try std.testing.expectEqual(nullable_form, (try refTypeFromHeapType(code, true)).toValType());
+        try std.testing.expectEqual(non_nullable_form, (try refTypeFromHeapType(code, false)).toValType());
     }
 
     // Every non-nullable internal marker in `ValType` is reachable from the
@@ -948,25 +1030,68 @@ test "long-form reference types decode to the right type, not funcref" {
     }
 }
 
-test "concrete type indices are rejected, not widened to funcref" {
-    // `types.RefType` can now carry a concrete type index, but the module IR
-    // still stores value types and legacy side tables. Keep the binary reader
-    // fail-closed until that plumbing is converted too.
+test "concrete type indices are decoded and kept, not widened to funcref" {
+    // Bytes from `wasm-tools parse` v1.250.0 for:
+    //   (type $t (func))
+    //   (type $u (func (param (ref null $t)) (result (ref $t))))
+    //   (global (ref null $t) (ref.null $t))
+    //   (func (local (ref null $t)))
+    // `ValType` cannot carry the index, so every one of these must survive in
+    // the matching out-of-line slot. Widening any of them back to funcref, or
+    // dropping the index, loses the callee identity `call_ref` depends on.
     const allocator = std.testing.allocator;
-
     const src = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        // type section: count=2; type 0 = (func); type 1 = (func (param (ref null 0)))
-        0x01, 0x09, 0x02,
-        0x60, 0x00, 0x00,
-        0x60, 0x01, 0x63, 0x00, 0x00,
+        0x01, 0x0b, 0x02, 0x60, 0x00, 0x00, 0x60, 0x01, 0x63, 0x00, 0x01, 0x64, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x06, 0x07, 0x01, 0x63, 0x00, 0x00, 0xd0, 0x00, 0x0b,
+        0x0a, 0x07, 0x01, 0x05, 0x01, 0x01, 0x63, 0x00, 0x0b,
     };
-    try std.testing.expectError(
-        error.ConcreteRefTypeUnsupported,
-        readModule(allocator, &src),
-    );
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
 
-    // Unknown *abstract* heap types stay a plain type error.
+    const ft = module.module_types.items[1].func_type;
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, ft.params[0]);
+    try std.testing.expectEqual(@as(u32, 0), ft.param_type_idxs[0]);
+    try std.testing.expectEqual(types.ValType.concrete_ref, ft.results[0]);
+    try std.testing.expectEqual(@as(u32, 0), ft.result_type_idxs[0]);
+
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, module.globals.items[0].type.val_type);
+    try std.testing.expectEqual(@as(u32, 0), module.globals.items[0].type_idx);
+
+    const func = module.funcs.items[0];
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, func.local_types.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), func.local_type_idxs.items[0]);
+}
+
+test "a concrete type index past the end of the type section is rejected" {
+    // Fail closed: index 7 names a type the module does not define. Forward
+    // references inside the type section are legal, so this can only be
+    // detected once the section is fully read.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x63, 0x07, 0x00,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &src));
+}
+
+test "a forward concrete type reference inside the type section is accepted" {
+    // type 0 = (func (param (ref null 1))); type 1 = (func). Index 1 is not
+    // yet defined when type 0 is read, so a naive immediate bounds check
+    // would wrongly reject this.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x09, 0x02, 0x60, 0x01, 0x63, 0x01, 0x00, 0x60, 0x00, 0x00,
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(u32, 1), module.module_types.items[0].func_type.param_type_idxs[0]);
+}
+
+test "unknown abstract heap types stay a plain type error" {
+    const allocator = std.testing.allocator;
     const unknown = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         0x01, 0x06, 0x01, 0x60, 0x01, 0x63, 0x50, 0x00,
