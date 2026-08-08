@@ -96,7 +96,7 @@ const Writer = struct {
             try self.appendByte(0x6E); // any
         } else if (vt == .ref_none) {
             try self.appendByte(0x64); // ref
-            try self.appendByte(0x65); // none
+            try self.appendByte(0x71); // none
         } else if (vt == .ref_nofunc) {
             try self.appendByte(0x64); // ref
             try self.appendByte(0x73); // nofunc
@@ -120,7 +120,7 @@ const Writer = struct {
             try self.appendByte(0x69); // exn
         } else if (vt == .ref_noexn) {
             try self.appendByte(0x64); // ref
-            try self.appendByte(0x68); // noexn
+            try self.appendByte(0x74); // noexn
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
         }
@@ -908,4 +908,106 @@ test "binary read+write: defined table with init expression round-trips" {
     defer module2.deinit();
     try std.testing.expectEqual(@as(usize, 1), module2.tables.items.len);
     try std.testing.expectEqual(@as(usize, 2), module2.tables.items[0].init_expr_bytes.len);
+}
+
+test "text parse + binary write: reference types use the spec-assigned bytes" {
+    // Asserts the exact byte emitted for each abstract reference type, rather
+    // than round-tripping through this crate's own reader. A round-trip test
+    // passes even when the encoder and decoder share the same wrong constant,
+    // which is how `nullref`/`nullexnref` shipped as 0x65/0x68 (unassigned in
+    // the spec) and made wabt's output unreadable by every other engine.
+    //
+    // Expected bytes cross-checked against wasm-tools 1.250.0.
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    const cases = [_]struct { []const u8, u8 }{
+        .{ "funcref", 0x70 },
+        .{ "externref", 0x6f },
+        .{ "anyref", 0x6e },
+        .{ "eqref", 0x6d },
+        .{ "i31ref", 0x6c },
+        .{ "structref", 0x6b },
+        .{ "arrayref", 0x6a },
+        .{ "exnref", 0x69 },
+        .{ "nullref", 0x71 },
+        .{ "nullfuncref", 0x73 },
+        .{ "nullexternref", 0x72 },
+        .{ "nullexnref", 0x74 },
+    };
+
+    for (cases) |case| {
+        const type_name, const expected_byte = case;
+        const wat = try std.fmt.allocPrint(
+            allocator,
+            "(module (type (func (param {s}))))",
+            .{type_name},
+        );
+        defer allocator.free(wat);
+
+        var module = try Parser.parseModule(allocator, wat);
+        defer module.deinit();
+
+        const wasm = try writeModule(allocator, &module);
+        defer allocator.free(wasm);
+
+        // Type section body: count=1, 0x60 (func), param count=1, <valtype>.
+        const idx = std.mem.indexOfScalar(u8, wasm, 0x60) orelse {
+            std.debug.print("no func type marker for {s}\n", .{type_name});
+            return error.TestUnexpectedResult;
+        };
+        if (wasm[idx + 2] != expected_byte) {
+            std.debug.print(
+                "{s}: expected byte 0x{x:0>2}, got 0x{x:0>2}\n",
+                .{ type_name, expected_byte, wasm[idx + 2] },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "binary read: reference types decode from the spec-assigned bytes" {
+    // The inverse direction of the test above: a type section byte produced by
+    // any spec-conforming producer must decode to the matching `ValType`, and
+    // the unassigned bytes wabt used to emit must now be rejected.
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { u8, types.ValType }{
+        .{ 0x70, .funcref },
+        .{ 0x6f, .externref },
+        .{ 0x6e, .anyref },
+        .{ 0x6d, .eqref },
+        .{ 0x6c, .i31ref },
+        .{ 0x6b, .structref },
+        .{ 0x6a, .arrayref },
+        .{ 0x69, .exnref },
+        .{ 0x71, .nullref },
+        .{ 0x73, .nullfuncref },
+        .{ 0x72, .nullexternref },
+        .{ 0x74, .nullexnref },
+    };
+
+    for (cases) |case| {
+        const byte, const expected = case;
+        const src = [_]u8{
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            // type section: id=1, size=5, count=1, 0x60, params=1, <byte>, results=0
+            0x01, 0x05, 0x01, 0x60, 0x01, byte, 0x00,
+        };
+        var module = try reader.readModule(allocator, &src);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
+        const sig = module.module_types.items[0].func_type;
+        try std.testing.expectEqual(expected, sig.params[0]);
+    }
+
+    // 0x65 and 0x68 are unassigned as value types; wabt emitted them for
+    // nullref/nullexnref before this was fixed. They must not decode.
+    for ([_]u8{ 0x65, 0x68 }) |bad_byte| {
+        const src = [_]u8{
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            0x01, 0x05, 0x01, 0x60, 0x01, bad_byte, 0x00,
+        };
+        try std.testing.expectError(error.InvalidType, reader.readModule(allocator, &src));
+    }
 }
