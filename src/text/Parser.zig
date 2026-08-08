@@ -2066,7 +2066,7 @@ const Parser = struct {
                             else if (std.mem.eql(u8, ht_tok.text, "extern")) { target_heap = 0x6f; }
                             else if (std.mem.eql(u8, ht_tok.text, "struct")) { target_heap = 0x6b; }
                             else if (std.mem.eql(u8, ht_tok.text, "array")) { target_heap = 0x6a; }
-                            else if (std.mem.eql(u8, ht_tok.text, "none")) { target_heap = 0x65; }
+                            else if (std.mem.eql(u8, ht_tok.text, "none")) { target_heap = 0x71; }
                             else if (std.mem.eql(u8, ht_tok.text, "nofunc")) { target_heap = 0x73; }
                             else if (std.mem.eql(u8, ht_tok.text, "noextern")) { target_heap = 0x72; }
                             else if (ht_tok.kind == .identifier) {
@@ -2109,7 +2109,7 @@ const Parser = struct {
                     _ = self.advance();
                 } else if (self.peek().kind == .kw_nullref) {
                     cast_flags |= 2;
-                    target_heap = 0x65;
+                    target_heap = 0x71;
                     _ = self.advance();
                 } else if (self.peek().kind == .kw_nullfuncref) {
                     cast_flags |= 2;
@@ -2612,13 +2612,13 @@ const Parser = struct {
                         } else if (std.mem.eql(u8, ht.text, "array")) {
                             code.append(self.allocator, 0x6a) catch return;
                         } else if (std.mem.eql(u8, ht.text, "none")) {
-                            code.append(self.allocator, 0x65) catch return;
+                            code.append(self.allocator, 0x71) catch return;
                         } else if (std.mem.eql(u8, ht.text, "nofunc")) {
                             code.append(self.allocator, 0x73) catch return;
                         } else if (std.mem.eql(u8, ht.text, "noextern")) {
                             code.append(self.allocator, 0x72) catch return;
                         } else if (std.mem.eql(u8, ht.text, "noexn")) {
-                            code.append(self.allocator, 0x68) catch return;
+                            code.append(self.allocator, 0x74) catch return;
                         } else {
                             self.lexer.pos = save_pos;
                             self.peeked = save_peeked;
@@ -2673,10 +2673,10 @@ const Parser = struct {
                         else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d
                         else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b
                         else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a
-                        else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x65
+                        else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x71
                         else if (std.mem.eql(u8, ht_text, "nofunc")) heap_type_idx = 0x73
                         else if (std.mem.eql(u8, ht_text, "noextern")) heap_type_idx = 0x72
-                        else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x68;
+                        else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x74;
                     }
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     // Emit sub-opcode
@@ -2710,10 +2710,10 @@ const Parser = struct {
                         .kw_anyref => 0x6e,
                         .kw_externref => 0x6f,
                         .kw_exnref => 0x69,
-                        .kw_nullref => 0x65,
+                        .kw_nullref => 0x71,
                         .kw_nullfuncref => 0x73,
                         .kw_nullexternref => 0x72,
-                        .kw_nullexnref => 0x68,
+                        .kw_nullexnref => 0x74,
                         else => -1,
                     };
                     const sub_op: u32 = if (tok.kind == .kw_ref_test)

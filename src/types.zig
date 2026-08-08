@@ -58,8 +58,8 @@ pub const ValType = enum(i32) {
     // GC nullable bottom types (ref null <bottom>)
     nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
-    nullref = 0x65,       // (ref null none) — bottom of internal hierarchy
-    nullexnref = 0x68,    // (ref null noexn) — bottom of exn hierarchy
+    nullref = 0x71,       // (ref null none) — bottom of internal hierarchy
+    nullexnref = 0x74,    // (ref null noexn) — bottom of exn hierarchy
 
     // Non-nullable abstract heap types (internal-only, not binary encoded)
     ref_func = -1,     // (ref func) — non-nullable func
@@ -265,6 +265,69 @@ test "ValType encoding" {
     try std.testing.expectEqual(@as(i32, 0x69), @intFromEnum(ValType.exnref));
     try std.testing.expectEqual(@as(i32, 0x60), @intFromEnum(ValType.func));
     try std.testing.expectEqual(@as(i32, 0x40), @intFromEnum(ValType.void_));
+}
+
+/// Every `ValType` member with a binary encoding, paired with the byte the
+/// WebAssembly spec assigns to it. Each byte is the one-byte s33 LEB128 form
+/// of the type's negative code (e.g. `none` is `-0x0f`, encoded `0x71`).
+const spec_valtype_bytes = [_]struct { ValType, u8 }{
+    // Numeric types
+    .{ .i32, 0x7f },
+    .{ .i64, 0x7e },
+    .{ .f32, 0x7d },
+    .{ .f64, 0x7c },
+    .{ .v128, 0x7b },
+    // GC packed types
+    .{ .i8, 0x7a },
+    .{ .i16, 0x79 },
+    // Nullable abstract reference types (shorthands for `(ref null <heap>)`)
+    .{ .nullexnref, 0x74 }, // noexn    = -0x0c
+    .{ .nullfuncref, 0x73 }, // nofunc   = -0x0d
+    .{ .nullexternref, 0x72 }, // noextern = -0x0e
+    .{ .nullref, 0x71 }, // none     = -0x0f
+    .{ .funcref, 0x70 }, // func     = -0x10
+    .{ .externref, 0x6f }, // extern   = -0x11
+    .{ .anyref, 0x6e }, // any      = -0x12
+    .{ .eqref, 0x6d }, // eq       = -0x13
+    .{ .i31ref, 0x6c }, // i31      = -0x14
+    .{ .structref, 0x6b }, // struct   = -0x15
+    .{ .arrayref, 0x6a }, // array    = -0x16
+    .{ .exnref, 0x69 }, // exn      = -0x17
+    // Typed-reference prefixes (followed by a heaptype; not types themselves)
+    .{ .ref, 0x64 },
+    .{ .ref_null, 0x63 },
+    // Composite type forms
+    .{ .func, 0x60 },
+    .{ .struct_, 0x5f },
+    .{ .array, 0x5e },
+    // Empty block type
+    .{ .void_, 0x40 },
+};
+
+// Drift guard: locks every binary-encoded `ValType` to its spec byte, proves
+// the bytes are distinct, and proves the table is exhaustive over the members
+// that have a binary encoding. A type added to `ValType` without a spec byte
+// here fails this test instead of silently colliding with an unrelated type.
+test "ValType binary encodings match the spec" {
+    var seen_bytes = [_]bool{false} ** 256;
+    for (spec_valtype_bytes) |entry| {
+        const vt, const byte = entry;
+        try std.testing.expectEqual(@as(i32, byte), @intFromEnum(vt));
+        try std.testing.expect(!seen_bytes[byte]);
+        seen_bytes[byte] = true;
+    }
+
+    // Exhaustiveness: every member is either in the table above or is an
+    // internal-only marker, which must be negative so it can never be
+    // confused with a byte read from a binary.
+    inline for (@typeInfo(ValType).@"enum".fields) |field| {
+        const vt: ValType = @enumFromInt(field.value);
+        var in_table = false;
+        for (spec_valtype_bytes) |entry| {
+            if (entry[0] == vt) in_table = true;
+        }
+        if (!in_table) try std.testing.expect(field.value < 0);
+    }
 }
 
 test "Limits.indexType" {
