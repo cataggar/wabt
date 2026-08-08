@@ -3067,6 +3067,33 @@ test "call_ref rejects a callee reference of the wrong heap" {
     try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
 }
 
+test "call_ref rejects a concrete callee whose signature is not the expected type" {
+    // The wrong-heap test above uses externref, which any funcref-shaped check
+    // rejects. This one passes a *function* reference of a different concrete
+    // type: only comparing against (ref null $t) catches it. Widening the
+    // callee expectation to funcref makes wabt accept a module that
+    // wasm-tools v1.250.0 rejects with "func 0 failed to validate".
+    const alloc = std.testing.allocator;
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+    // type 0: (i32) -> (i32)   — what call_ref names
+    try appendFuncTypeForTest(&module, &[_]types.ValType{.i32}, &[_]types.ValType{.i32}, &.{}, &.{});
+    // type 1: () -> (i32)      — the caller
+    try appendFuncTypeForTest(&module, &.{}, &[_]types.ValType{.i32}, &.{}, &.{});
+    // type 2: (f64) -> (f64)   — the callee actually referenced
+    try appendFuncTypeForTest(&module, &[_]types.ValType{.f64}, &[_]types.ValType{.f64}, &.{}, &.{});
+    try module.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 2 } }, .is_import = true });
+    try module.exports.append(alloc, .{ .name = "callee", .kind = .func, .var_ = .{ .index = 0 } });
+    const body = [_]u8{
+        0x41, 0x04, // i32.const 4
+        0xd2, 0x00, // ref.func 0 -> (ref 2), not (ref 0)
+        0x14, 0x00, // call_ref 0
+        0x0b,
+    };
+    try module.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 1 } }, .code_bytes = &body });
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
 test "return_call_ref checks the callee and makes the frame unreachable" {
     const alloc = std.testing.allocator;
     const body = [_]u8{
