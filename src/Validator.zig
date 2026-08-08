@@ -600,8 +600,6 @@ const ValTypeOrUnknown = enum(i32) {
     funcref = @intFromEnum(types.ValType.funcref),
     externref = @intFromEnum(types.ValType.externref),
     anyref = @intFromEnum(types.ValType.anyref),
-    ref = @intFromEnum(types.ValType.ref),
-    ref_null = @intFromEnum(types.ValType.ref_null),
     nullfuncref = @intFromEnum(types.ValType.nullfuncref),
     nullexternref = @intFromEnum(types.ValType.nullexternref),
     nullref = @intFromEnum(types.ValType.nullref),
@@ -611,6 +609,8 @@ const ValTypeOrUnknown = enum(i32) {
     ref_none = @intFromEnum(types.ValType.ref_none),
     ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
     ref_noextern = @intFromEnum(types.ValType.ref_noextern),
+    concrete_ref = @intFromEnum(types.ValType.concrete_ref),
+    concrete_ref_null = @intFromEnum(types.ValType.concrete_ref_null),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -623,8 +623,6 @@ const ValTypeOrUnknown = enum(i32) {
             .funcref => .funcref,
             .externref => .externref,
             .anyref => .anyref,
-            .ref => .ref,
-            .ref_null => .ref_null,
             .nullfuncref => .nullfuncref,
             .nullexternref => .nullexternref,
             .nullref => .nullref,
@@ -634,13 +632,15 @@ const ValTypeOrUnknown = enum(i32) {
             .ref_none => .ref_none,
             .ref_nofunc => .ref_nofunc,
             .ref_noextern => .ref_noextern,
+            .concrete_ref => .concrete_ref,
+            .concrete_ref_null => .concrete_ref_null,
             else => .unknown,
         };
     }
 
     fn isRefType(self: ValTypeOrUnknown) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .ref, .ref_null,
+            .funcref, .externref, .anyref, .concrete_ref, .concrete_ref_null,
             .nullfuncref, .nullexternref, .nullref,
             .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
             => true,
@@ -650,7 +650,7 @@ const ValTypeOrUnknown = enum(i32) {
 
     fn isNonNullableRef(self: ValTypeOrUnknown) bool {
         return switch (self) {
-            .ref, .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern => true,
+            .concrete_ref, .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern => true,
             else => false,
         };
     }
@@ -1252,9 +1252,6 @@ const single_f64: [1]types.ValType = .{.f64};
 const single_funcref: [1]types.ValType = .{.funcref};
 const single_externref: [1]types.ValType = .{.externref};
 
-const single_ref_null: [1]types.ValType = .{.ref_null};
-const single_ref: [1]types.ValType = .{.ref};
-
 fn valTypeSlice(byte: u8) []const types.ValType {
     return switch (byte) {
         0x7f => &single_i32,
@@ -1263,8 +1260,6 @@ fn valTypeSlice(byte: u8) []const types.ValType {
         0x7c => &single_f64,
         0x70 => &single_funcref,
         0x6f => &single_externref,
-        0x63 => &single_ref_null,
-        0x64 => &single_ref,
         else => &.{},
     };
 }

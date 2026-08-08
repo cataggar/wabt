@@ -81,45 +81,45 @@ const Writer = struct {
     }
 
     fn writeValTypeWithTidx(self: *Writer, vt: types.ValType, tidx: u32) WriteError!void {
-        if ((vt == .ref_null or vt == .ref) and tidx != 0xFFFFFFFF) {
+        if ((vt == .concrete_ref_null or vt == .concrete_ref) and tidx != 0xFFFFFFFF) {
             // Concrete typed ref: write prefix + type index
-            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+            try self.appendByte(if (vt == .concrete_ref_null) reader.ref_null_prefix else reader.ref_prefix);
             try self.writeU32Leb(tidx);
         } else if (vt == .ref_func) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x70); // func
         } else if (vt == .ref_extern) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6F); // extern
         } else if (vt == .ref_any) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6E); // any
         } else if (vt == .ref_none) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x71); // none
         } else if (vt == .ref_nofunc) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x73); // nofunc
         } else if (vt == .ref_noextern) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x72); // noextern
         } else if (vt == .ref_eq) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6D); // eq
         } else if (vt == .ref_i31) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6C); // i31
         } else if (vt == .ref_struct) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6B); // struct
         } else if (vt == .ref_array) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x6A); // array
         } else if (vt == .ref_exn) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x69); // exn
         } else if (vt == .ref_noexn) {
-            try self.appendByte(0x64); // ref
+            try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x74); // noexn
         } else {
             try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
@@ -311,9 +311,9 @@ const Writer = struct {
                 try self.writeLimits(table.type.limits);
                 try self.appendSlice(table.init_expr_bytes);
                 try self.appendByte(0x0b);
-            } else if ((et == .ref_null or et == .ref) and table.type_idx != 0xFFFFFFFF) {
+            } else if ((et == .concrete_ref_null or et == .concrete_ref) and table.type_idx != 0xFFFFFFFF) {
                 // Typed reference: write prefix + concrete type index
-                try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(et)))));
+                try self.appendByte(if (et == .concrete_ref_null) reader.ref_null_prefix else reader.ref_prefix);
                 try self.writeU32Leb(table.type_idx);
                 try self.writeLimits(table.type.limits);
             } else {

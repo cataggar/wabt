@@ -34,10 +34,9 @@ pub const ReadError = error{
     UnexpectedEof,
     InvalidSection,
     InvalidType,
-    /// A `(ref $t)` / `(ref null $t)` naming a concrete type index. `ValType`
-    /// cannot yet carry a type index, so these are rejected explicitly rather
-    /// than being widened to `funcref`, which would let the validator reason
-    /// about a type the module never declared.
+    /// A `(ref $t)` / `(ref null $t)` naming a concrete type index. `RefType`
+    /// can represent it, but the reader still rejects it until the module IR
+    /// stores reference types directly rather than via legacy side tables.
     ConcreteRefTypeUnsupported,
     InvalidLimits,
     TooManyLocals,
@@ -79,9 +78,9 @@ fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E
 // ── Reference types ─────────────────────────────────────────────────────
 
 /// Binary prefix for a non-nullable typed reference, `(ref <heaptype>)`.
-const ref_prefix: u8 = 0x64;
+pub const ref_prefix: u8 = 0x64;
 /// Binary prefix for a nullable typed reference, `(ref null <heaptype>)`.
-const ref_null_prefix: u8 = 0x63;
+pub const ref_null_prefix: u8 = 0x63;
 
 /// The complete set of abstract heap types: the value each carries in a
 /// heaptype LEB128, and the `ValType` for its nullable and non-nullable forms.
@@ -89,31 +88,23 @@ const ref_null_prefix: u8 = 0x63;
 /// This is the single source of truth for heaptype decoding. It is deliberately
 /// exhaustive: a heaptype missing from this table is rejected, never silently
 /// widened to `funcref`.
-const abstract_heap_types = [_]struct { i64, types.ValType, types.ValType }{
-    // code,  (ref null <heap>),  (ref <heap>)
-    .{ -0x0c, .nullexnref, .ref_noexn },
-    .{ -0x0d, .nullfuncref, .ref_nofunc },
-    .{ -0x0e, .nullexternref, .ref_noextern },
-    .{ -0x0f, .nullref, .ref_none },
-    .{ -0x10, .funcref, .ref_func },
-    .{ -0x11, .externref, .ref_extern },
-    .{ -0x12, .anyref, .ref_any },
-    .{ -0x13, .eqref, .ref_eq },
-    .{ -0x14, .i31ref, .ref_i31 },
-    .{ -0x15, .structref, .ref_struct },
-    .{ -0x16, .arrayref, .ref_array },
-    .{ -0x17, .exnref, .ref_exn },
+const abstract_heap_types = [_]types.AbstractHeapType{
+    .noexn, .nofunc, .noextern, .none,
+    .func, .extern_, .any, .eq, .i31, .struct_, .array, .exn,
 };
 
 /// Resolve a decoded heaptype to the `ValType` for `(ref null <heap>)` when
 /// `nullable`, or `(ref <heap>)` otherwise.
 fn refTypeFromHeapType(heap_type: i64, nullable: bool) ReadError!types.ValType {
-    for (abstract_heap_types) |entry| {
-        const code, const nullable_form, const non_nullable_form = entry;
-        if (heap_type == code) return if (nullable) nullable_form else non_nullable_form;
+    for (abstract_heap_types) |heap| {
+        if (heap_type == @intFromEnum(heap)) {
+            return types.RefType.abstract(nullable, heap).toValType();
+        }
     }
-    // A non-negative heaptype is a concrete type index. `ValType` has no room
-    // for one, so reject it rather than pretending it is `funcref`.
+    // A non-negative heaptype is a concrete type index. The representation now
+    // exists (`types.RefType.concrete`), but the binary reader still rejects it
+    // here until the module IR stores typed references directly instead of via
+    // legacy side tables. Rejecting remains safer than widening to `funcref`.
     if (heap_type >= 0) return error.ConcreteRefTypeUnsupported;
     return error.InvalidType;
 }
@@ -842,8 +833,19 @@ test "abstract heap types map to distinct value types" {
     var seen_codes = std.AutoHashMap(i64, void).init(std.testing.allocator);
     defer seen_codes.deinit();
 
+    try std.testing.expectEqual(std.enums.values(types.AbstractHeapType).len, abstract_heap_types.len);
+    inline for (std.enums.values(types.AbstractHeapType)) |heap| {
+        var found = false;
+        for (abstract_heap_types) |entry| {
+            if (entry == heap) found = true;
+        }
+        try std.testing.expect(found);
+    }
+
     for (abstract_heap_types) |entry| {
-        const code, const nullable_form, const non_nullable_form = entry;
+        const code: i64 = @intFromEnum(entry);
+        const nullable_form = types.RefType.abstract(true, entry).toValType();
+        const non_nullable_form = types.RefType.abstract(false, entry).toValType();
 
         try std.testing.expect(code < 0); // heap type codes are negative
         try std.testing.expect((try seen_codes.getOrPut(code)).found_existing == false);
@@ -923,7 +925,9 @@ test "long-form reference types decode to the right type, not funcref" {
     const allocator = std.testing.allocator;
 
     for (abstract_heap_types) |entry| {
-        const code, const nullable_form, const non_nullable_form = entry;
+        const code: i64 = @intFromEnum(entry);
+        const nullable_form = types.RefType.abstract(true, entry).toValType();
+        const non_nullable_form = types.RefType.abstract(false, entry).toValType();
         // One-byte s33 LEB128 form of the (negative) heap type code.
         const heap_byte: u8 = @intCast(code & 0x7f);
 
@@ -945,9 +949,9 @@ test "long-form reference types decode to the right type, not funcref" {
 }
 
 test "concrete type indices are rejected, not widened to funcref" {
-    // `ValType` cannot carry a type index yet. Accepting `(ref null $t)` by
-    // silently treating it as `funcref` would leave the validator reasoning
-    // about a type the module never declared, so decoding fails instead.
+    // `types.RefType` can now carry a concrete type index, but the module IR
+    // still stores value types and legacy side tables. Keep the binary reader
+    // fail-closed until that plumbing is converted too.
     const allocator = std.testing.allocator;
 
     const src = [_]u8{

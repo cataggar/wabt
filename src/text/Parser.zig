@@ -557,7 +557,7 @@ const Parser = struct {
                         const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
                             self.malformed = true;
                             try self.expect(.r_paren);
-                            return if (nullable) .ref_null else .ref;
+                            return if (nullable) .concrete_ref_null else .concrete_ref;
                         };
                         resolved_type_idx = idx;
                         if (self.in_rec) {
@@ -627,7 +627,7 @@ const Parser = struct {
                 if (self.in_type_parse and resolved_type_idx != std.math.maxInt(u32)) {
                     self.collected_type_refs.append(self.allocator, resolved_type_idx) catch {};
                 }
-                return if (nullable) .ref_null else .ref;
+                return if (nullable) .concrete_ref_null else .concrete_ref;
             }
             // Not a ref type — restore state
             self.lexer.pos = save_pos;
@@ -831,7 +831,7 @@ const Parser = struct {
                                     fmut = true;
                                     const rb1 = self.collected_type_refs.items.len;
                                     const si1 = self.in_type_parse; self.in_type_parse = true;
-                                    const ftype = self.parseValType() catch .ref_null;
+                                    const ftype = self.parseValType() catch .concrete_ref_null;
                                     self.in_type_parse = si1;
                                     const ft1: u32 = if (self.collected_type_refs.items.len > rb1) self.collected_type_refs.items[rb1] else 0xFFFFFFFF;
                                     if (self.peek().kind == .r_paren) _ = self.advance();
@@ -841,7 +841,7 @@ const Parser = struct {
                                     self.peeked = spk2;
                                     const rb2 = self.collected_type_refs.items.len;
                                     const si2 = self.in_type_parse; self.in_type_parse = true;
-                                    const ftype = self.parseValType() catch .ref_null;
+                                    const ftype = self.parseValType() catch .concrete_ref_null;
                                     self.in_type_parse = si2;
                                     const ft2: u32 = if (self.collected_type_refs.items.len > rb2) self.collected_type_refs.items[rb2] else 0xFFFFFFFF;
                                     fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft2 }) catch {};
@@ -849,7 +849,7 @@ const Parser = struct {
                             } else {
                                 const rb3 = self.collected_type_refs.items.len;
                                 const si3 = self.in_type_parse; self.in_type_parse = true;
-                                const ftype = self.parseValType() catch .ref_null;
+                                const ftype = self.parseValType() catch .concrete_ref_null;
                                 self.in_type_parse = si3;
                                 const ft3: u32 = if (self.collected_type_refs.items.len > rb3) self.collected_type_refs.items[rb3] else 0xFFFFFFFF;
                                 fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft3 }) catch {};
@@ -901,7 +901,7 @@ const Parser = struct {
                         const prev_itp = self.in_type_parse;
                         self.in_type_parse = true;
                         defer self.in_type_parse = prev_itp;
-                        const elem_type = self.parseValType() catch .ref_null;
+                        const elem_type = self.parseValType() catch .concrete_ref_null;
                         const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                         if (self.peek().kind == .r_paren) _ = self.advance();
                         try self.expect(.r_paren); // close array
@@ -916,7 +916,7 @@ const Parser = struct {
                         const prev_itp = self.in_type_parse;
                         self.in_type_parse = true;
                         defer self.in_type_parse = prev_itp;
-                        const elem_type = self.parseValType() catch .ref_null;
+                        const elem_type = self.parseValType() catch .concrete_ref_null;
                         const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                         try self.expect(.r_paren); // close array
                         if (meta.is_sub) try self.expect(.r_paren);
@@ -929,7 +929,7 @@ const Parser = struct {
                     const prev_itp = self.in_type_parse;
                     self.in_type_parse = true;
                     defer self.in_type_parse = prev_itp;
-                    const elem_type = self.parseValType() catch .ref_null;
+                    const elem_type = self.parseValType() catch .concrete_ref_null;
                     const tidx: u32 = if (self.collected_type_refs.items.len > rb) self.collected_type_refs.items[rb] else 0xFFFFFFFF;
                     try self.expect(.r_paren); // close array
                     if (meta.is_sub) try self.expect(.r_paren);
@@ -1205,7 +1205,7 @@ const Parser = struct {
         }
     }
 
-    /// Append a canonicalized ValType to the key buffer. For concrete type refs (.ref/.ref_null),
+    /// Append a canonicalized ValType to the key buffer. For concrete type refs,
     /// uses the type_refs to resolve the index and canonicalize as internal/external reference.
     fn appendCanonicalValType(
         alloc: std.mem.Allocator,
@@ -1217,9 +1217,9 @@ const Parser = struct {
         group_start: u32,
         group_size: u32,
     ) usize {
-        if ((vt == .ref or vt == .ref_null) and ref_idx < type_refs.len) {
+        if ((vt == .concrete_ref or vt == .concrete_ref_null) and ref_idx < type_refs.len) {
             const target_idx = type_refs[ref_idx];
-            key.append(alloc, if (vt == .ref) @as(u8, 0xA0) else @as(u8, 0xA1)) catch {};
+            key.append(alloc, if (vt == .concrete_ref) @as(u8, 0xA0) else @as(u8, 0xA1)) catch {};
             if (target_idx >= group_start and target_idx < group_start + group_size) {
                 // Internal reference — encode by position within rec group
                 key.append(alloc, 0x01) catch {};
@@ -2852,16 +2852,16 @@ const Parser = struct {
             // Fall through to check for (type N) below
         } else if (param_count == 0 and result_count == 1 and @intFromEnum(result_types_buf[0]) > 0) {
             // Simple single-result block type: emit valtype byte
-            // BUT ref/ref_null need the multi-value path (type index) because
+            // BUT concrete refs need the multi-value path (type index) because
             // they require a heap type that can't be encoded in a single byte
             const rt = result_types_buf[0];
-            if (rt != .ref_null and rt != .ref and !force_type_index) {
+            if (rt != .concrete_ref_null and rt != .concrete_ref and !force_type_index) {
                 const raw: u32 = @bitCast(@intFromEnum(rt));
                 buf[0] = @truncate(raw);
                 return 1;
             }
         }
-        // Multi-value or ref/ref_null: create a func type entry and emit type index
+        // Multi-value or concrete ref: create a func type entry and emit type index
         if (param_count > 0 or result_count > 0) {
             if (self.module) |mod| {
                 const p = self.allocator.alloc(types.ValType, param_count) catch {
@@ -4936,7 +4936,7 @@ const Parser = struct {
                             } else if (type_tok.kind == .integer) {
                                 resolved_idx = std.fmt.parseInt(u32, type_tok.text, 0) catch 0xFFFFFFFF;
                             }
-                            seg.elem_type = .ref;
+                            seg.elem_type = .concrete_ref;
                             seg.elem_type_idx = resolved_idx;
                             if (self.peek().kind == .r_paren) _ = self.advance();
                             has_elem_type = true;
