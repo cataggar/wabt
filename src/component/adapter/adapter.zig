@@ -55,9 +55,6 @@ fn ResourceMap(comptime Value: type) type {
 
 pub const SpliceError = error{
     OutOfMemory,
-    /// Propagated from `binary.reader`: a `(ref $t)` naming a concrete
-    /// type index, which `ValType` cannot represent yet.
-    ConcreteRefTypeUnsupported,
     NotCoreWasm,
     InvalidAdapterCore,
     MissingEncodedWorld,
