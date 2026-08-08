@@ -34,6 +34,11 @@ pub const ReadError = error{
     UnexpectedEof,
     InvalidSection,
     InvalidType,
+    /// A `(ref $t)` / `(ref null $t)` naming a concrete type index. `ValType`
+    /// cannot yet carry a type index, so these are rejected explicitly rather
+    /// than being widened to `funcref`, which would let the validator reason
+    /// about a type the module never declared.
+    ConcreteRefTypeUnsupported,
     InvalidLimits,
     TooManyLocals,
     SectionTooLarge,
@@ -69,6 +74,48 @@ fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E
         if (value == @intFromEnum(field_value)) return field_value;
     }
     return null;
+}
+
+// ── Reference types ─────────────────────────────────────────────────────
+
+/// Binary prefix for a non-nullable typed reference, `(ref <heaptype>)`.
+const ref_prefix: u8 = 0x64;
+/// Binary prefix for a nullable typed reference, `(ref null <heaptype>)`.
+const ref_null_prefix: u8 = 0x63;
+
+/// The complete set of abstract heap types: the value each carries in a
+/// heaptype LEB128, and the `ValType` for its nullable and non-nullable forms.
+///
+/// This is the single source of truth for heaptype decoding. It is deliberately
+/// exhaustive: a heaptype missing from this table is rejected, never silently
+/// widened to `funcref`.
+const abstract_heap_types = [_]struct { i64, types.ValType, types.ValType }{
+    // code,  (ref null <heap>),  (ref <heap>)
+    .{ -0x0c, .nullexnref, .ref_noexn },
+    .{ -0x0d, .nullfuncref, .ref_nofunc },
+    .{ -0x0e, .nullexternref, .ref_noextern },
+    .{ -0x0f, .nullref, .ref_none },
+    .{ -0x10, .funcref, .ref_func },
+    .{ -0x11, .externref, .ref_extern },
+    .{ -0x12, .anyref, .ref_any },
+    .{ -0x13, .eqref, .ref_eq },
+    .{ -0x14, .i31ref, .ref_i31 },
+    .{ -0x15, .structref, .ref_struct },
+    .{ -0x16, .arrayref, .ref_array },
+    .{ -0x17, .exnref, .ref_exn },
+};
+
+/// Resolve a decoded heaptype to the `ValType` for `(ref null <heap>)` when
+/// `nullable`, or `(ref <heap>)` otherwise.
+fn refTypeFromHeapType(heap_type: i64, nullable: bool) ReadError!types.ValType {
+    for (abstract_heap_types) |entry| {
+        const code, const nullable_form, const non_nullable_form = entry;
+        if (heap_type == code) return if (nullable) nullable_form else non_nullable_form;
+    }
+    // A non-negative heaptype is a concrete type index. `ValType` has no room
+    // for one, so reject it rather than pretending it is `funcref`.
+    if (heap_type >= 0) return error.ConcreteRefTypeUnsupported;
+    return error.InvalidType;
 }
 
 // ── Internal reader ─────────────────────────────────────────────────────
@@ -145,29 +192,24 @@ const Reader = struct {
 
     fn readValType(self: *Reader) ReadError!types.ValType {
         const byte = try self.readByte();
+        if (byte == ref_prefix or byte == ref_null_prefix) {
+            // `0x63`/`0x64` are *prefixes*, not types: each is followed by a
+            // heaptype LEB128 that must be consumed, or the stream desyncs and
+            // the next byte is misread as this type.
+            const heap_type = try self.readS64();
+            return refTypeFromHeapType(heap_type, byte == ref_null_prefix);
+        }
         return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
             return error.InvalidType;
     }
 
-    /// Read a reference type encoding, handling both simple (0x70, 0x6f) and
-    /// GC-style (0x63/0x64 heaptype) encodings.
+    /// Read a reference type encoding, handling both the abbreviated form
+    /// (`0x70` funcref, `0x6f` externref, …) and the general
+    /// `0x63`/`0x64` + heaptype form.
     fn readRefType(self: *Reader) ReadError!types.ValType {
-        const byte = try self.readByte();
-        if (byte == 0x63 or byte == 0x64) {
-            // GC-style ref type: 0x63 = ref null, 0x64 = ref (non-nullable)
-            const nullable = (byte == 0x63);
-            const heap_type = try self.readS64();
-            const ht: i64 = heap_type;
-            if (ht == -0x10) return if (nullable) .funcref else .ref_func;
-            if (ht == -0x11) return if (nullable) .externref else .ref_extern;
-            if (ht == -0x0e) return if (nullable) .nullfuncref else .ref_nofunc;
-            if (ht == -0x0f) return if (nullable) .nullexternref else .ref_none;
-            if (ht == -0x12) return if (nullable) .anyref else .ref_any;
-            // Concrete type index or other abstract type
-            return if (nullable) .funcref else .ref_func;
-        }
-        return enumFromIntChecked(types.ValType, @as(i32, @intCast(@as(i8, @bitCast(byte))))) orelse
-            return error.InvalidType;
+        const vt = try self.readValType();
+        if (!vt.isRefType()) return error.InvalidType;
+        return vt;
     }
 
     fn readLimits(self: *Reader) ReadError!types.Limits {
@@ -786,4 +828,172 @@ test "accept element then data_count then code then data ordering" {
     try std.testing.expectEqual(@as(usize, 1), module.data_segments.items.len);
     try std.testing.expect(module.has_data_count);
     try std.testing.expectEqual(@as(u32, 1), module.data_count);
+}
+
+// Drift guard: every abstract heap type must resolve to a *distinct* `ValType`
+// in both its nullable and non-nullable form. The previous decoder collapsed
+// most heap types onto `funcref` via an unconditional fallback, so unhandled
+// types were indistinguishable from genuine `funcref`s and mismapped ones were
+// invisible. A heap type added to the table with a duplicate or copy-pasted
+// `ValType` now fails here instead of silently widening.
+test "abstract heap types map to distinct value types" {
+    var seen = std.AutoHashMap(types.ValType, void).init(std.testing.allocator);
+    defer seen.deinit();
+    var seen_codes = std.AutoHashMap(i64, void).init(std.testing.allocator);
+    defer seen_codes.deinit();
+
+    for (abstract_heap_types) |entry| {
+        const code, const nullable_form, const non_nullable_form = entry;
+
+        try std.testing.expect(code < 0); // heap type codes are negative
+        try std.testing.expect((try seen_codes.getOrPut(code)).found_existing == false);
+
+        // Nullable and non-nullable forms are different types.
+        try std.testing.expect(nullable_form != non_nullable_form);
+        try std.testing.expect(nullable_form.isRefType());
+        try std.testing.expect(non_nullable_form.isRefType());
+
+        // No two heap types share a ValType.
+        try std.testing.expect((try seen.getOrPut(nullable_form)).found_existing == false);
+        try std.testing.expect((try seen.getOrPut(non_nullable_form)).found_existing == false);
+
+        // Resolution round-trips.
+        try std.testing.expectEqual(nullable_form, try refTypeFromHeapType(code, true));
+        try std.testing.expectEqual(non_nullable_form, try refTypeFromHeapType(code, false));
+    }
+
+    // Every non-nullable internal marker in `ValType` is reachable from the
+    // table, so none can be orphaned by a missing heap type entry.
+    for ([_]types.ValType{
+        .ref_func,   .ref_extern, .ref_any,    .ref_none,
+        .ref_nofunc, .ref_noextern, .ref_eq,   .ref_i31,
+        .ref_struct, .ref_array,  .ref_exn,    .ref_noexn,
+    }) |vt| {
+        try std.testing.expect(seen.contains(vt));
+    }
+}
+
+test "readValType consumes the heaptype after a 0x63/0x64 prefix" {
+    // `(ref null func)` and `funcref` denote the same type, so a type section
+    // using the long form must decode identically to one using the shorthand.
+    // Before this was fixed the prefix byte was mapped straight to an enum
+    // member and the heaptype was left in the stream, desynchronising the
+    // reader so that the *next* byte was misread — which surfaced as a
+    // spurious `error.InvalidType` rather than as a decode failure.
+    const allocator = std.testing.allocator;
+
+    const long_form = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: count=1, func, params=1, 0x63 0x70 (ref null func), results=0
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x63, 0x70, 0x00,
+    };
+    const short_form = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x70, 0x00,
+    };
+
+    var m_long = try readModule(allocator, &long_form);
+    defer m_long.deinit();
+    var m_short = try readModule(allocator, &short_form);
+    defer m_short.deinit();
+
+    const long_sig = m_long.module_types.items[0].func_type;
+    const short_sig = m_short.module_types.items[0].func_type;
+    try std.testing.expectEqual(@as(usize, 1), long_sig.params.len);
+    try std.testing.expectEqual(types.ValType.funcref, long_sig.params[0]);
+    try std.testing.expectEqual(short_sig.params[0], long_sig.params[0]);
+
+    // The non-nullable form is a different type, not the same one widened.
+    const non_null_form = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x64, 0x70, 0x00,
+    };
+    var m_nn = try readModule(allocator, &non_null_form);
+    defer m_nn.deinit();
+    try std.testing.expectEqual(
+        types.ValType.ref_func,
+        m_nn.module_types.items[0].func_type.params[0],
+    );
+}
+
+test "long-form reference types decode to the right type, not funcref" {
+    // Each of these was previously either unhandled (falling through to
+    // `funcref`) or mismapped by one position: `noextern` decoded as
+    // `nullfuncref` and `none` as `nullexternref`.
+    const allocator = std.testing.allocator;
+
+    for (abstract_heap_types) |entry| {
+        const code, const nullable_form, const non_nullable_form = entry;
+        // One-byte s33 LEB128 form of the (negative) heap type code.
+        const heap_byte: u8 = @intCast(code & 0x7f);
+
+        inline for (.{ true, false }) |nullable| {
+            const prefix: u8 = if (nullable) ref_null_prefix else ref_prefix;
+            const src = [_]u8{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x01, 0x06, 0x01, 0x60, 0x01, prefix, heap_byte, 0x00,
+            };
+            var module = try readModule(allocator, &src);
+            defer module.deinit();
+            const expected = if (nullable) nullable_form else non_nullable_form;
+            try std.testing.expectEqual(
+                expected,
+                module.module_types.items[0].func_type.params[0],
+            );
+        }
+    }
+}
+
+test "concrete type indices are rejected, not widened to funcref" {
+    // `ValType` cannot carry a type index yet. Accepting `(ref null $t)` by
+    // silently treating it as `funcref` would leave the validator reasoning
+    // about a type the module never declared, so decoding fails instead.
+    const allocator = std.testing.allocator;
+
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // type section: count=2; type 0 = (func); type 1 = (func (param (ref null 0)))
+        0x01, 0x09, 0x02,
+        0x60, 0x00, 0x00,
+        0x60, 0x01, 0x63, 0x00, 0x00,
+    };
+    try std.testing.expectError(
+        error.ConcreteRefTypeUnsupported,
+        readModule(allocator, &src),
+    );
+
+    // Unknown *abstract* heap types stay a plain type error.
+    const unknown = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x60, 0x01, 0x63, 0x50, 0x00,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &unknown));
+}
+
+test "table element types use the full heap type table" {
+    // `readRefType` had its own, shorter heap type mapping ending in an
+    // unconditional widen to `funcref`, so a table declared
+    // `(ref null noextern)` was read as a table of `nullfuncref`.
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { u8, types.ValType }{
+        .{ 0x72, .nullexternref }, // noextern
+        .{ 0x71, .nullref }, // none
+        .{ 0x73, .nullfuncref }, // nofunc
+        .{ 0x6d, .eqref }, // eq
+        .{ 0x69, .exnref }, // exn
+    };
+
+    for (cases) |case| {
+        const heap_byte, const expected = case;
+        const src = [_]u8{
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            // table section: count=1, (ref null <heap>), limits min=1
+            0x04, 0x05, 0x01, ref_null_prefix, heap_byte, 0x00, 0x01,
+        };
+        var module = try readModule(allocator, &src);
+        defer module.deinit();
+        try std.testing.expectEqual(@as(usize, 1), module.tables.items.len);
+        try std.testing.expectEqual(expected, module.tables.items[0].@"type".elem_type);
+    }
 }
