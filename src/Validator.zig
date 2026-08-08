@@ -1118,6 +1118,29 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], funcParams(ft));
                 setUnreachable(&val_stack, &ctrl_stack);
             },
+            0x14 => { // call_ref
+                const type_idx = readU32(bytes, &pos);
+                if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+                const ft = switch (m.module_types.items[type_idx]) {
+                    .func_type => |ft| ft,
+                    else => return error.TypeMismatch,
+                };
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.fromRefType(types.RefType.concrete(true, type_idx)));
+                try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], funcParams(ft));
+                pushVals(&val_stack, funcResults(ft), gpa(m)) catch return error.OutOfMemory;
+            },
+            0x15 => { // return_call_ref
+                const type_idx = readU32(bytes, &pos);
+                if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+                const ft = switch (m.module_types.items[type_idx]) {
+                    .func_type => |ft| ft,
+                    else => return error.TypeMismatch,
+                };
+                try checkTailCallResults(&ctrl_stack, funcResults(ft));
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.fromRefType(types.RefType.concrete(true, type_idx)));
+                try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], funcParams(ft));
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
             0x1a => { // drop
                 _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
             },
@@ -1310,6 +1333,51 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 else
                     StackType.known(.ref_func);
                 val_stack.append(gpa(m), rt) catch return error.OutOfMemory;
+            },
+            0xd3 => { // ref.eq
+                const eqref = StackType.known(.eqref);
+                try popExpect(m, &val_stack, &ctrl_stack, eqref);
+                try popExpect(m, &val_stack, &ctrl_stack, eqref);
+                val_stack.append(gpa(m), StackType.known(.i32)) catch return error.OutOfMemory;
+            },
+            0xd4 => { // ref.as_non_null
+                const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                const result = if (actual.vt == .unknown) StackType.unknown() else blk: {
+                    const ref_type = actual.asRefType() orelse return error.TypeMismatch;
+                    break :blk StackType.fromRefType(.{ .nullable = false, .heap = ref_type.heap });
+                };
+                val_stack.append(gpa(m), result) catch return error.OutOfMemory;
+            },
+            0xd5 => { // br_on_null
+                const depth = readU32(bytes, &pos);
+                if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                const fallthrough = if (actual.vt == .unknown) StackType.unknown() else blk: {
+                    const ref_type = actual.asRefType() orelse return error.TypeMismatch;
+                    break :blk StackType.fromRefType(.{ .nullable = false, .heap = ref_type.heap });
+                };
+                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - depth];
+                const lt = labelTypes(&target);
+                try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+                pushVals(&val_stack, lt, gpa(m)) catch return error.OutOfMemory;
+                val_stack.append(gpa(m), fallthrough) catch return error.OutOfMemory;
+            },
+            0xd6 => { // br_on_non_null
+                const depth = readU32(bytes, &pos);
+                if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
+                const branch_value = if (actual.vt == .unknown) StackType.unknown() else blk: {
+                    const ref_type = actual.asRefType() orelse return error.TypeMismatch;
+                    break :blk StackType.fromRefType(.{ .nullable = false, .heap = ref_type.heap });
+                };
+                const target = ctrl_stack.items[ctrl_stack.items.len - 1 - depth];
+                const lt = labelTypes(&target);
+                if (lt.len() == 0) return error.TypeMismatch;
+                val_stack.append(gpa(m), branch_value) catch return error.OutOfMemory;
+                try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], lt);
+                for (0..lt.len() - 1) |i| {
+                    val_stack.append(gpa(m), lt.at(i)) catch return error.OutOfMemory;
+                }
             },
             // Prefixed opcodes
             0xfc => {
@@ -2707,21 +2775,6 @@ test "valid SIMD modules now validate (issue #347 D2)" {
     try validate(&module, .{});
 }
 
-test "reference-typed call opcodes are reported as unsupported" {
-    // return_call and return_call_indirect are type-checked as of the tail
-    // call work below. call_ref and return_call_ref are not: their operand
-    // is a typed reference and ValType carries no type index.
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        &[_]u8{ 0x14, 0x00, 0x0b }, // call_ref 0
-        &[_]u8{ 0x15, 0x00, 0x0b }, // return_call_ref 0
-    }) |body| {
-        var module = try testModuleWithBody(alloc, body);
-        defer module.deinit();
-        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
-    }
-}
-
 test "meaningless opcodes are distinguished from unimplemented ones" {
     // 0x27 is not assigned by any proposal this build knows about.
     const alloc = std.testing.allocator;
@@ -2757,9 +2810,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     // and typed refs (PR3), exception handling (PR4).
     const known_unsupported = [_]u8{
         0x06, 0x07, 0x08, 0x09, 0x0a, // try, catch, throw, rethrow, throw_ref
-        0x14, 0x15, // call_ref, return_call_ref
         0x18, 0x19, 0x1f, // delegate, catch_all, try_table
-        0xd3, 0xd4, 0xd5, 0xd6, // ref.eq, ref.as_non_null, br_on_null, br_on_non_null
     };
     const alloc = std.testing.allocator;
     var checked: usize = 0;
@@ -2799,9 +2850,247 @@ test "ref.eq is a declared opcode, not a malformed encoding (issue #350)" {
         const body = [_]u8{ op, 0x0b };
         var module = try testModuleWithBody(alloc, &body);
         defer module.deinit();
-        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
     }
     try std.testing.expectEqualStrings("ref.eq", Opcode.Code.ref_eq.name());
+}
+
+// ── Typed reference instructions (issue #355, PR5) ──────────────────────
+
+test "ref.eq accepts eqref-compatible operands" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0
+        0x20, 0x01, // local.get 1
+        0xd3, // ref.eq; wasm-tools v1.250.0 body bytes
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{ .eqref, .eqref },
+        &[_]types.ValType{.i32},
+        &body,
+    );
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "ref.eq rejects non-eq references" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : funcref
+        0x20, 0x01, // local.get 1 : eqref
+        0xd3, // ref.eq; wasm-tools v1.250.0 rejects funcref here
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{ .funcref, .eqref },
+        &[_]types.ValType{.i32},
+        &body,
+    );
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+}
+
+test "ref.as_non_null preserves a concrete type index" {
+    const alloc = std.testing.allocator;
+    var module = Mod.Module.init(alloc);
+    defer module.deinit();
+
+    try appendFuncTypeForTest(&module, &.{}, &.{}, &.{}, &.{});
+    try appendFuncTypeForTest(
+        &module,
+        &[_]types.ValType{.concrete_ref_null},
+        &[_]types.ValType{.concrete_ref},
+        &[_]u32{0},
+        &[_]u32{0},
+    );
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : (ref null 0)
+        0xd4, // ref.as_non_null; wasm-tools v1.250.0 body bytes
+        0x0b,
+    };
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 1 } },
+        .code_bytes = &body,
+    });
+
+    try validate(&module, .{});
+}
+
+test "ref.as_non_null rejects non-reference operands" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : i32
+        0xd4, // ref.as_non_null; wasm-tools v1.250.0 rejects i32 here
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.i32},
+        &[_]types.ValType{.ref_eq},
+        &body,
+    );
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+}
+
+test "br_on_null sharpens the fallthrough reference" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x02, 0x40, // block
+        0x20, 0x00, // local.get 0 : eqref
+        0xd5, 0x00, // br_on_null 0; wasm-tools v1.250.0 body bytes
+        0x1a, // drop the non-null fallthrough value
+        0x0b,
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.eqref},
+        &.{},
+        &body,
+    );
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "br_on_null rejects an unconsumed sharpened fallthrough value" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x02, 0x40, // block
+        0x20, 0x00, // local.get 0 : eqref
+        0xd5, 0x00, // br_on_null 0; wasm-tools v1.250.0 leaves (ref eq)
+        0x0b,
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.eqref},
+        &.{},
+        &body,
+    );
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+}
+
+test "br_on_non_null branches with the non-null reference" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : eqref
+        0xd6, 0x00, // br_on_non_null 0 to the function label
+        0xd0, 0x6d, // ref.null eq for the fallthrough path
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.eqref},
+        &[_]types.ValType{.eqref},
+        &body,
+    );
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "br_on_non_null rejects a target with no label type for its value" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : eqref
+        0xd6, 0x00, // br_on_non_null 0; wasm-tools v1.250.0 rejects this target
+        0x0b,
+    };
+    var m = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.eqref},
+        &.{},
+        &body,
+    );
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+}
+
+fn testCallRefModule(
+    alloc: std.mem.Allocator,
+    caller_results: []const types.ValType,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try appendFuncTypeForTest(
+        &module,
+        &[_]types.ValType{.i32},
+        &[_]types.ValType{.i32},
+        &.{},
+        &.{},
+    );
+    try appendFuncTypeForTest(&module, &.{}, caller_results, &.{}, &.{});
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .is_import = true,
+    });
+    try module.exports.append(alloc, .{
+        .name = "callee",
+        .kind = .func,
+        .var_ = .{ .index = 0 },
+    });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 1 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+test "call_ref checks the callee reference and function parameters" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x41, 0x04, // i32.const 4
+        0xd2, 0x00, // ref.func 0
+        0x14, 0x00, // call_ref 0; wasm-tools v1.250.0 body bytes
+        0x0b,
+    };
+    var m = try testCallRefModule(alloc, &[_]types.ValType{.i32}, &body);
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "call_ref rejects a callee reference of the wrong heap" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x41, 0x04, // i32.const 4
+        0xd0, 0x6f, // ref.null extern
+        0x14, 0x00, // call_ref 0; wasm-tools v1.250.0 rejects externref here
+        0x0b,
+    };
+    var m = try testCallRefModule(alloc, &[_]types.ValType{.i32}, &body);
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+}
+
+test "return_call_ref checks the callee and makes the frame unreachable" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x41, 0x04, // i32.const 4
+        0xd2, 0x00, // ref.func 0
+        0x15, 0x00, // return_call_ref 0; wasm-tools v1.250.0 body bytes
+        0x0b,
+    };
+    var m = try testCallRefModule(alloc, &[_]types.ValType{.i32}, &body);
+    defer m.deinit();
+    try validate(&m, .{});
+}
+
+test "return_call_ref rejects result mismatch with the enclosing function" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x41, 0x04, // i32.const 4
+        0xd2, 0x00, // ref.func 0
+        0x15, 0x00, // return_call_ref 0; wasm-tools v1.250.0 rejects i32 -> i64
+        0x0b,
+    };
+    var m = try testCallRefModule(alloc, &[_]types.ValType{.i64}, &body);
+    defer m.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
 }
 
 // ── SIMD type checking (issue #347, D2) ─────────────────────────────────
@@ -3128,22 +3417,6 @@ test "return_call_indirect type-checks like return_call" {
         var m = try testTailCallModule(alloc, &.{}, &.{}, &.{}, &[_]u8{ 0x41, 0x00, 0x13, 0x09, 0x00, 0x0b }, true);
         defer m.deinit();
         try std.testing.expectError(error.InvalidTypeIndex, validate(&m, .{}));
-    }
-}
-
-test "call_ref and return_call_ref stay rejected" {
-    // ValType carries no type index, so the operand of call_ref cannot be
-    // checked against the instruction's immediate. Accepting them would
-    // report success on something unverified, which is the fail-open this
-    // issue is about. They remain on the backlog.
-    const alloc = std.testing.allocator;
-    for ([_][]const u8{
-        &[_]u8{ 0x14, 0x00, 0x0b }, // call_ref 0
-        &[_]u8{ 0x15, 0x00, 0x0b }, // return_call_ref 0
-    }) |body| {
-        var m = try testModuleWithBody(alloc, body);
-        defer m.deinit();
-        try std.testing.expectError(error.UnsupportedOpcode, validate(&m, .{}));
     }
 }
 
