@@ -458,8 +458,8 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: ValTypeOrUn
     if (stack_depth == 0) return error.TypeMismatch;
     if (stack_depth > 1) return error.TypeMismatch;
 
-    // Type must match expected
-    if (!result_type.matches(expected)) return error.TypeMismatch;
+    // Constant expressions produce a value for a declared slot.
+    if (!result_type.isSubtypeOf(expected)) return error.TypeMismatch;
 }
 
 // ── Unrecognised opcode classification ──────────────────────────────────
@@ -600,15 +600,27 @@ const ValTypeOrUnknown = enum(i32) {
     funcref = @intFromEnum(types.ValType.funcref),
     externref = @intFromEnum(types.ValType.externref),
     anyref = @intFromEnum(types.ValType.anyref),
+    eqref = @intFromEnum(types.ValType.eqref),
+    i31ref = @intFromEnum(types.ValType.i31ref),
+    structref = @intFromEnum(types.ValType.structref),
+    arrayref = @intFromEnum(types.ValType.arrayref),
+    exnref = @intFromEnum(types.ValType.exnref),
     nullfuncref = @intFromEnum(types.ValType.nullfuncref),
     nullexternref = @intFromEnum(types.ValType.nullexternref),
     nullref = @intFromEnum(types.ValType.nullref),
+    nullexnref = @intFromEnum(types.ValType.nullexnref),
     ref_func = @intFromEnum(types.ValType.ref_func),
     ref_extern = @intFromEnum(types.ValType.ref_extern),
     ref_any = @intFromEnum(types.ValType.ref_any),
+    ref_eq = @intFromEnum(types.ValType.ref_eq),
+    ref_i31 = @intFromEnum(types.ValType.ref_i31),
+    ref_struct = @intFromEnum(types.ValType.ref_struct),
+    ref_array = @intFromEnum(types.ValType.ref_array),
     ref_none = @intFromEnum(types.ValType.ref_none),
     ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
     ref_noextern = @intFromEnum(types.ValType.ref_noextern),
+    ref_exn = @intFromEnum(types.ValType.ref_exn),
+    ref_noexn = @intFromEnum(types.ValType.ref_noexn),
     concrete_ref = @intFromEnum(types.ValType.concrete_ref),
     concrete_ref_null = @intFromEnum(types.ValType.concrete_ref_null),
     unknown = 0,
@@ -623,34 +635,65 @@ const ValTypeOrUnknown = enum(i32) {
             .funcref => .funcref,
             .externref => .externref,
             .anyref => .anyref,
+            .eqref => .eqref,
+            .i31ref => .i31ref,
+            .structref => .structref,
+            .arrayref => .arrayref,
+            .exnref => .exnref,
             .nullfuncref => .nullfuncref,
             .nullexternref => .nullexternref,
             .nullref => .nullref,
+            .nullexnref => .nullexnref,
             .ref_func => .ref_func,
             .ref_extern => .ref_extern,
             .ref_any => .ref_any,
+            .ref_eq => .ref_eq,
+            .ref_i31 => .ref_i31,
+            .ref_struct => .ref_struct,
+            .ref_array => .ref_array,
             .ref_none => .ref_none,
             .ref_nofunc => .ref_nofunc,
             .ref_noextern => .ref_noextern,
+            .ref_exn => .ref_exn,
+            .ref_noexn => .ref_noexn,
             .concrete_ref => .concrete_ref,
             .concrete_ref_null => .concrete_ref_null,
             else => .unknown,
         };
     }
 
+    fn toValType(self: ValTypeOrUnknown) ?types.ValType {
+        if (self == .unknown) return null;
+        return @enumFromInt(@intFromEnum(self));
+    }
+
+    fn asRefType(self: ValTypeOrUnknown) ?types.RefType {
+        const vt = self.toValType() orelse return null;
+        return types.RefType.fromValType(vt);
+    }
+
     fn isRefType(self: ValTypeOrUnknown) bool {
-        return switch (self) {
-            .funcref, .externref, .anyref, .concrete_ref, .concrete_ref_null,
-            .nullfuncref, .nullexternref, .nullref,
-            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
-            => true,
-            else => false,
-        };
+        const vt = self.toValType() orelse return false;
+        return vt.isRefType();
     }
 
     fn isNonNullableRef(self: ValTypeOrUnknown) bool {
+        const ref_type = self.asRefType() orelse return false;
+        return !ref_type.nullable;
+    }
+
+    fn heapSubtypeOf(self: types.AbstractHeapType, other: types.AbstractHeapType) bool {
+        if (self == other) return true;
         return switch (self) {
-            .concrete_ref, .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern => true,
+            .eq => other == .any,
+            .i31, .struct_, .array => other == .eq or other == .any,
+            .none => switch (other) {
+                .any, .eq, .i31, .struct_, .array => true,
+                else => false,
+            },
+            .nofunc => other == .func,
+            .noextern => other == .extern_,
+            .noexn => other == .exn,
             else => false,
         };
     }
@@ -659,26 +702,16 @@ const ValTypeOrUnknown = enum(i32) {
     fn isSubtypeOf(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
         if (self == other) return true;
         if (self == .unknown or other == .unknown) return true;
-        // GC type hierarchy (three SEPARATE hierarchies):
-        // Internal: any > eq > struct/array/i31 > none
-        // Function: func > nofunc (NOT under any)
-        // External: extern > noextern (NOT under any)
-        return switch (self) {
-            .nullfuncref => other == .funcref,
-            .nullexternref => other == .externref,
-            .nullref => other == .anyref,
-            .ref_nofunc => other == .ref_func,
-            .ref_noextern => other == .ref_extern,
-            .ref_none => other == .ref_any,
-            else => false,
+        const self_ref = self.asRefType() orelse return false;
+        const other_ref = other.asRefType() orelse return false;
+        if (self_ref.nullable and !other_ref.nullable) return false;
+        return switch (self_ref.heap) {
+            .abstract => |self_heap| switch (other_ref.heap) {
+                .abstract => |other_heap| heapSubtypeOf(self_heap, other_heap),
+                .concrete => false,
+            },
+            .concrete => false,
         };
-    }
-
-    fn matches(self: ValTypeOrUnknown, other: ValTypeOrUnknown) bool {
-        if (self == .unknown or other == .unknown) return true;
-        if (self == other) return true;
-        // Check subtyping in both directions
-        return self.isSubtypeOf(other) or other.isSubtypeOf(self);
     }
 };
 
@@ -1201,7 +1234,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
         // All blocks have been closed — check results on val_stack
         for (sig.results) |expected| {
             const actual = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
-            if (!actual.matches(ValTypeOrUnknown.fromValType(expected))) return error.TypeMismatch;
+            if (!actual.isSubtypeOf(ValTypeOrUnknown.fromValType(expected))) return error.TypeMismatch;
         }
     } else {
         // Function body ended with unclosed blocks — unexpected end
@@ -1315,7 +1348,7 @@ fn popVal(val_stack: *ValStack, ctrl_stack: *const std.ArrayListUnmanaged(CtrlFr
 
 fn popExpect(val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), expected: ValTypeOrUnknown) Error!void {
     const actual = popVal(val_stack, ctrl_stack) catch return error.TypeMismatch;
-    if (!actual.matches(expected)) return error.TypeMismatch;
+    if (!actual.isSubtypeOf(expected)) return error.TypeMismatch;
 }
 
 fn popVals(val_stack: *ValStack, frame: *const CtrlFrame, expected: []const types.ValType) Error!void {
@@ -1324,7 +1357,7 @@ fn popVals(val_stack: *ValStack, frame: *const CtrlFrame, expected: []const type
     while (i > 0) {
         i -= 1;
         const actual = popValFromFrame(val_stack, frame) catch return error.TypeMismatch;
-        if (!actual.matches(ValTypeOrUnknown.fromValType(expected[i]))) return error.TypeMismatch;
+        if (!actual.isSubtypeOf(ValTypeOrUnknown.fromValType(expected[i]))) return error.TypeMismatch;
     }
 }
 
@@ -2172,6 +2205,159 @@ fn testModuleWithBody(alloc: std.mem.Allocator, body: []const u8) !Mod.Module {
         .code_bytes = body,
     });
     return module;
+}
+
+fn testModuleWithSignatureAndBody(
+    alloc: std.mem.Allocator,
+    params: []const types.ValType,
+    results: []const types.ValType,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{
+        .params = try alloc.dupe(types.ValType, params),
+        .results = try alloc.dupe(types.ValType, results),
+    } });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+// ── Abstract reference subtyping (issue #355) ───────────────────────────
+
+const test_heap_types = [_]types.AbstractHeapType{
+    .func,
+    .nofunc,
+    .extern_,
+    .noextern,
+    .any,
+    .eq,
+    .i31,
+    .struct_,
+    .array,
+    .none,
+    .exn,
+    .noexn,
+};
+
+const test_nullabilities = [_]bool{ false, true };
+
+fn expectedHeapSubtype(actual: types.AbstractHeapType, expected: types.AbstractHeapType) bool {
+    if (actual == expected) return true;
+    return switch (actual) {
+        .eq => expected == .any,
+        .i31, .struct_, .array => expected == .eq or expected == .any,
+        .none => switch (expected) {
+            .any, .eq, .i31, .struct_, .array => true,
+            else => false,
+        },
+        .nofunc => expected == .func,
+        .noextern => expected == .extern_,
+        .noexn => expected == .exn,
+        else => false,
+    };
+}
+
+fn expectedRefSubtype(
+    actual_nullable: bool,
+    actual_heap: types.AbstractHeapType,
+    expected_nullable: bool,
+    expected_heap: types.AbstractHeapType,
+) bool {
+    if (actual_nullable and !expected_nullable) return false;
+    return expectedHeapSubtype(actual_heap, expected_heap);
+}
+
+fn abstractRefValType(nullable: bool, heap: types.AbstractHeapType) types.ValType {
+    return if (nullable) heap.nullableValType() else heap.nonNullableValType();
+}
+
+test "abstract reference subtyping lattice covers all pairs" {
+    for (test_nullabilities) |actual_nullable| {
+        for (test_heap_types) |actual_heap| {
+            const actual_vt = ValTypeOrUnknown.fromValType(abstractRefValType(actual_nullable, actual_heap));
+            for (test_nullabilities) |expected_nullable| {
+                for (test_heap_types) |expected_heap| {
+                    const expected_vt = ValTypeOrUnknown.fromValType(abstractRefValType(expected_nullable, expected_heap));
+                    try std.testing.expectEqual(
+                        expectedRefSubtype(actual_nullable, actual_heap, expected_nullable, expected_heap),
+                        actual_vt.isSubtypeOf(expected_vt),
+                    );
+                }
+            }
+        }
+    }
+
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.anyref).isSubtypeOf(ValTypeOrUnknown.fromValType(.nullref)));
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.funcref).isSubtypeOf(ValTypeOrUnknown.fromValType(.anyref)));
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.externref).isSubtypeOf(ValTypeOrUnknown.fromValType(.anyref)));
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.structref).isSubtypeOf(ValTypeOrUnknown.fromValType(.arrayref)));
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.arrayref).isSubtypeOf(ValTypeOrUnknown.fromValType(.structref)));
+    try std.testing.expect(!ValTypeOrUnknown.fromValType(.funcref).isSubtypeOf(ValTypeOrUnknown.fromValType(.ref_func)));
+}
+
+test "abstract reference subtyping lattice is reflexive and transitive" {
+    for (test_nullabilities) |nullable| {
+        for (test_heap_types) |heap| {
+            const vt = ValTypeOrUnknown.fromValType(abstractRefValType(nullable, heap));
+            try std.testing.expect(vt.isSubtypeOf(vt));
+        }
+    }
+
+    for (test_nullabilities) |a_nullable| {
+        for (test_heap_types) |a_heap| {
+            const av = ValTypeOrUnknown.fromValType(abstractRefValType(a_nullable, a_heap));
+            for (test_nullabilities) |b_nullable| {
+                for (test_heap_types) |b_heap| {
+                    const bv = ValTypeOrUnknown.fromValType(abstractRefValType(b_nullable, b_heap));
+                    if (!av.isSubtypeOf(bv)) continue;
+                    for (test_nullabilities) |c_nullable| {
+                        for (test_heap_types) |c_heap| {
+                            const cv = ValTypeOrUnknown.fromValType(abstractRefValType(c_nullable, c_heap));
+                            if (bv.isSubtypeOf(cv)) {
+                                try std.testing.expect(av.isSubtypeOf(cv));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "validator rejects a reference supertype where a subtype is required" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : anyref
+        0x0b, // end, expected nullref
+    };
+    var module = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.anyref},
+        &[_]types.ValType{.nullref},
+        &body,
+    );
+    defer module.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "validator accepts a non-null reference where nullable is expected" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{
+        0x20, 0x00, // local.get 0 : (ref func)
+        0x0b, // end, expected funcref
+    };
+    var module = try testModuleWithSignatureAndBody(
+        alloc,
+        &[_]types.ValType{.ref_func},
+        &[_]types.ValType{.funcref},
+        &body,
+    );
+    defer module.deinit();
+    try validate(&module, .{});
 }
 
 test "atomics are type-checked, not silently accepted" {
