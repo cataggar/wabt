@@ -163,9 +163,9 @@ pub const ValType = enum(i32) {
     f64 = 0x7c,
     v128 = 0x7b,
 
-    // GC packed types
-    i8 = 0x7a,
-    i16 = 0x79,
+    // GC packed types. Only valid as a struct field or array element type.
+    i8 = 0x78,
+    i16 = 0x77,
 
     // Reference types
     funcref = 0x70,
@@ -247,6 +247,16 @@ pub const ValType = enum(i32) {
     pub fn isNumType(self: ValType) bool {
         return switch (self) {
             .i32, .i64, .f32, .f64, .v128 => true,
+            else => false,
+        };
+    }
+
+    /// Returns `true` for the GC packed types. These are storage types, not
+    /// value types: they are legal only as a struct field or array element,
+    /// and widen to `i32` when read.
+    pub fn isPackedType(self: ValType) bool {
+        return switch (self) {
+            .i8, .i16 => true,
             else => false,
         };
     }
@@ -430,8 +440,8 @@ const spec_valtype_bytes = [_]struct { ValType, u8 }{
     .{ .f64, 0x7c },
     .{ .v128, 0x7b },
     // GC packed types
-    .{ .i8, 0x7a },
-    .{ .i16, 0x79 },
+    .{ .i8, 0x78 },
+    .{ .i16, 0x77 },
     // Nullable abstract reference types (shorthands for `(ref null <heap>)`)
     .{ .nullexnref, 0x74 }, // noexn    = -0x0c
     .{ .nullfuncref, 0x73 }, // nofunc   = -0x0d
