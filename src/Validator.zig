@@ -39,6 +39,13 @@ pub const Error = error{
     /// Reported rather than skipped: a validator that stops checking is
     /// not entitled to report success. See issue #347.
     UnsupportedOpcode,
+    /// A legacy exception-handling instruction (`try`, `catch`, `rethrow`,
+    /// `delegate`, `catch_all`). Distinct from `UnsupportedOpcode` because
+    /// this is a decision, not a backlog item: the legacy proposal was
+    /// superseded by `try_table`/`throw_ref` before exception handling was
+    /// standardised, and wabt implements only the standardised form.
+    /// See issue #356.
+    LegacyExceptionsUnsupported,
     /// A lane index immediate selects a lane the operand shape does not have.
     InvalidLaneIndex,
     /// An instruction's immediate operands run past the end of the body.
@@ -400,6 +407,37 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: StackType, 
 
 // ── Unrecognised opcode classification ──────────────────────────────────
 
+/// The legacy exception-handling instructions, in opcode order.
+///
+/// These are declared in `Opcode.Code` and are real instructions, but they
+/// belong to the *first* exception-handling proposal, which was replaced by
+/// `try_table`/`throw_ref` before exception handling was standardised. wabt
+/// implements only the standardised form, so these are rejected as a matter
+/// of policy rather than sitting on the backlog:
+///
+///   * The reference implementation agrees. `wasm-tools` gates them behind an
+///     explicit `legacy-exceptions` feature that is off by default and is not
+///     part of `wasm3`, the standardised feature set.
+///   * Nothing else in wabt speaks legacy EH. `text/Lexer.zig` has keywords
+///     for `try_table`, `throw`, `throw_ref` and the four catch clauses, but
+///     none for `try`, `delegate` or `rethrow`, so validating them would
+///     create a validate-only path for modules wabt can neither author nor
+///     print.
+///   * `delegate` and `rethrow` need frame-relative label rewriting and a
+///     handler stack that `try_table` does not, so supporting them costs
+///     permanent complexity in this file for a superseded design.
+///
+/// If a real need appears (old LLVM/Emscripten output is the only likely
+/// source), the natural home for an opt-in is a `legacy_exceptions` field on
+/// `Feature.Set`, mirroring `wasm-tools`. See issue #356.
+const legacy_eh_opcodes = [_]u8{
+    0x06, // try
+    0x07, // catch
+    0x09, // rethrow
+    0x18, // delegate
+    0x19, // catch_all
+};
+
 /// Classify an opcode the instruction switch has no arm for.
 ///
 /// Returns `UnsupportedOpcode` when `Opcode.Code` declares the instruction —
@@ -416,6 +454,15 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: StackType, 
 /// SIMD module fail validation with an error naming a cause that did not
 /// exist. See issue #347.
 fn classifyOpcode(prefix: ?u8, code: u32) Error {
+    // Legacy exception handling is declined, not pending, so it gets its own
+    // error rather than being lumped in with the backlog. Checked before the
+    // `Opcode.Code` lookup, which would answer `UnsupportedOpcode` for all
+    // five and lose the distinction.
+    if (prefix == null and code <= 0xff and
+        std.mem.indexOfScalar(u8, &legacy_eh_opcodes, @intCast(code)) != null)
+    {
+        return error.LegacyExceptionsUnsupported;
+    }
     // Opcode.Code packs prefixed opcodes at variable width: 0xPPCC for
     // sub-opcodes that fit in a byte, 0xPPCCC for the wider ones (relaxed
     // SIMD starts at 0xfd100). Mirror Opcode.getPrefix/getCode exactly --
@@ -2806,11 +2853,12 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     // arm (any other error is fine — a bare opcode byte is rarely a
     // well-typed body — but it must not come back as un-handled).
     //
-    // The backlog is in the order the issue plans to clear it: tail calls
-    // and typed refs (PR3), exception handling (PR4).
-    const known_unsupported = [_]u8{
-        0x06, 0x07, 0x08, 0x09, 0x0a, // try, catch, throw, rethrow, throw_ref
-        0x18, 0x19, 0x1f, // delegate, catch_all, try_table
+    // The two lists are deliberately separate. `modern_eh_todo` is a backlog
+    // that issue #356 empties; `legacy_eh_opcodes` is a decision that stays,
+    // so the work of clearing the first must never quietly erode the second.
+    const modern_eh_todo = [_]u8{
+        0x08, 0x0a, // throw, throw_ref
+        0x1f, // try_table
     };
     const alloc = std.testing.allocator;
     var checked: usize = 0;
@@ -2821,12 +2869,22 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
             var module = try testModuleWithBody(alloc, &body);
             defer module.deinit();
             checked += 1;
-            if (std.mem.indexOfScalar(u8, &known_unsupported, op) != null) {
+            if (std.mem.indexOfScalar(u8, &modern_eh_todo, op) != null) {
                 try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+            } else if (std.mem.indexOfScalar(u8, &legacy_eh_opcodes, op) != null) {
+                try std.testing.expectError(error.LegacyExceptionsUnsupported, validate(&module, .{}));
             } else if (validate(&module, .{})) |_| {} else |err| switch (err) {
                 error.UnsupportedOpcode, error.UnknownOpcode => {
                     std.debug.print(
                         "opcode 0x{x:0>2} ({s}) has no validator arm; add one or list it above\n",
+                        .{ op, f.name },
+                    );
+                    return error.TestUnexpectedResult;
+                },
+                error.LegacyExceptionsUnsupported => {
+                    std.debug.print(
+                        "opcode 0x{x:0>2} ({s}) reports LegacyExceptionsUnsupported but is not" ++
+                            " a legacy EH instruction\n",
                         .{ op, f.name },
                     );
                     return error.TestUnexpectedResult;
@@ -3595,4 +3653,60 @@ test "atomics require a memory to be declared" {
     const body = [_]u8{ 0x41, 0x00, 0xfe, 0x10, 0x02, 0x00, 0x1a, 0x0b };
     try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
     try std.testing.expectError(error.InvalidMemoryIndex, validate(&m, .{}));
+}
+
+test "legacy exception handling is declined with its own error (issue #356)" {
+    // The legacy proposal (`try`/`catch`/`rethrow`/`delegate`/`catch_all`)
+    // was superseded by `try_table`/`throw_ref` before exception handling was
+    // standardised. Rejecting it is a decision, so it must not be reported as
+    // `UnsupportedOpcode` -- that error means "on the backlog", and would tell
+    // a caller to wait for support that is never coming.
+    const alloc = std.testing.allocator;
+    for (legacy_eh_opcodes) |op| {
+        const body = [_]u8{ op, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.LegacyExceptionsUnsupported, validate(&module, .{}));
+    }
+}
+
+test "the legacy EH list names the legacy EH instructions and nothing else" {
+    // Without this, a typo'd byte in `legacy_eh_opcodes` would silently
+    // divert an unrelated instruction into the legacy error, and the drift
+    // guard above could not tell: it trusts the same list.
+    const expected = [_][]const u8{ "try", "catch", "rethrow", "delegate", "catch_all" };
+    try std.testing.expectEqual(expected.len, legacy_eh_opcodes.len);
+    // Indexed rather than a paired loop: a paired `for` over two arrays of
+    // comptime-known length turns a drifted list into a compile error, which
+    // reports the mismatch without naming the offending instruction.
+    for (legacy_eh_opcodes, 0..) |op, i| {
+        const tag: Opcode.Code = @enumFromInt(op);
+        try std.testing.expect(std.enums.tagName(Opcode.Code, tag) != null);
+        try std.testing.expectEqualStrings(expected[i % expected.len], tag.name());
+    }
+}
+
+test "the standardised EH instructions are still a backlog item, not declined" {
+    // `throw`, `throw_ref` and `try_table` are the form wabt intends to
+    // support, so they must keep reporting `UnsupportedOpcode` until their
+    // arms land. Conflating them with the legacy set would quietly convert
+    // the remaining work in issue #356 into a decision not to do it.
+    const alloc = std.testing.allocator;
+    for ([_]u8{ 0x08, 0x0a, 0x1f }) |op| {
+        const body = [_]u8{ op, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    }
+}
+
+test "classifyOpcode reports legacy EH separately from the backlog" {
+    try std.testing.expectEqual(error.LegacyExceptionsUnsupported, classifyOpcode(null, 0x06));
+    try std.testing.expectEqual(error.LegacyExceptionsUnsupported, classifyOpcode(null, 0x18));
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(null, 0x1f)); // try_table
+    // The legacy bytes are only legacy unprefixed: 0xfd 0x06 is a SIMD
+    // sub-opcode, and 0xfc 0x18 is unassigned. Neither may inherit the
+    // legacy error from a prefix-blind byte comparison.
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x06));
+    try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(0xfc, 0x18));
 }
