@@ -105,6 +105,32 @@ fn refTypeFromHeapType(heap_type: i64, nullable: bool) ReadError!types.RefType {
     return error.InvalidType;
 }
 
+/// Position of a non-custom section in the module's binary grammar.
+///
+/// Sections mostly appear in increasing ID order, but two do not, because
+/// both were added by later proposals and took the next free ID rather than
+/// one that sorts into place:
+///
+///   * the data-count section (id 12) sits between element (9) and code (10);
+///   * the tag section (id 13) sits between memory (5) and global (6).
+///
+/// Scaling every ID by 2 leaves an odd-numbered gap after each section, so
+/// both can occupy a half-step without colliding with their neighbours:
+/// tag becomes 5.5 (→ 11) and data-count 9.5 (→ 19). Mapping either onto its
+/// neighbour's number instead would make a legal `memory, tag` or
+/// `element, data_count` pair look like a duplicate section.
+///
+/// Verified against `wasm-tools` 1.250.0, which emits
+/// `1, 2, 3, 4, 5, 13, 6, 7, 8, 9, 10, 11` for a module using every section,
+/// and `1, 3, 5, 13, 12, 10, 11` for one that needs a data-count section.
+fn sectionOrder(id: u8) u8 {
+    return switch (id) {
+        13 => 11, // tag: between memory (5 → 10) and global (6 → 12)
+        12 => 19, // data count: between element (9 → 18) and code (10 → 20)
+        else => id *| 2,
+    };
+}
+
 // ── Internal reader ─────────────────────────────────────────────────────
 
 /// A decoded value type together with its concrete type index, if any.
@@ -304,15 +330,8 @@ const Reader = struct {
             // Validate section ordering and duplicates (custom sections exempt)
             if (id_byte != 0) {
                 if (id_byte > 13) return error.InvalidSection;
-                // Check ordering: non-custom sections appear in increasing ID
-                // order, with one exception — the data-count section (id 12)
-                // sits between the element (id 9) and code (id 10) sections
-                // (WebAssembly spec, "Module" binary grammar). Scale every ID
-                // by 2 so data-count can occupy the half-step 9.5 (→ 19)
-                // without colliding with the element section (9 → 18); a plain
-                // remap to 9 makes `element, data_count` look like a duplicate.
-                const order_id: u8 = if (id_byte == 12) 19 else id_byte *| 2;
-                const last_order: u8 = if (last_non_custom_id == 12) 19 else last_non_custom_id *| 2;
+                const order_id = sectionOrder(id_byte);
+                const last_order = sectionOrder(last_non_custom_id);
                 if (order_id <= last_order and last_non_custom_id != 0) return error.InvalidSection;
                 // Check for duplicate sections
                 const mask: u16 = @as(u16, 1) << @intCast(id_byte);
@@ -1124,5 +1143,112 @@ test "table element types use the full heap type table" {
         defer module.deinit();
         try std.testing.expectEqual(@as(usize, 1), module.tables.items.len);
         try std.testing.expectEqual(expected, module.tables.items[0].@"type".elem_type);
+    }
+}
+
+test "the tag section is accepted between the memory and global sections" {
+    // Bytes from `wasm-tools parse` v1.250.0 for:
+    //   (module (memory 1) (tag $a (param i32))
+    //           (global $g i32 (i32.const 0)) (func (export "f")))
+    // Sections come out as 1, 3, 5, 13, 6, 7, 10 -- the tag section has id 13
+    // but is ordered between memory (5) and global (6). Sorting it by its id
+    // instead put it after every other section, so wabt rejected every module
+    // with a tag as `InvalidSection`, including its own writer's output.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x01,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.tags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.memories.items.len);
+}
+
+test "the tag and data-count half-steps coexist in one module" {
+    // Bytes from `wasm-tools parse` v1.250.0 for a module with a memory, a
+    // tag, a passive data segment and a `memory.init`: sections 1, 3, 5, 13,
+    // 12, 10, 11. Both out-of-order sections appear at once, so getting
+    // either half-step wrong rejects this.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x01,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+        0x0c, 0x01, 0x01,
+        0x0a, 0x0e, 0x01, 0x0c, 0x00, 0x41, 0x00, 0x41, 0x00, 0x41, 0x01, 0xfc, 0x08, 0x00, 0x00, 0x0b,
+        0x0b, 0x04, 0x01, 0x01, 0x01, 0x78,
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.tags.items.len);
+    try std.testing.expectEqual(@as(usize, 1), module.data_segments.items.len);
+}
+
+test "a tag section after the global section is still rejected" {
+    // Accepting the tag section in its proper place must not turn the
+    // ordering check off for it: 6 then 13 is genuinely misordered.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
+        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x00, 0x0b,
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+    };
+    try std.testing.expectError(error.InvalidSection, readModule(allocator, &src));
+}
+
+test "a duplicate tag section is rejected" {
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x60, 0x01, 0x7f, 0x00,
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+        0x0d, 0x03, 0x01, 0x00, 0x00,
+    };
+    try std.testing.expectError(error.InvalidSection, readModule(allocator, &src));
+}
+
+test "section order positions are strictly increasing in binary-grammar order" {
+    // Drift guard. The two out-of-place sections (tag 13, data count 12) are
+    // easy to reintroduce as bugs by "simplifying" sectionOrder back to a
+    // plain id comparison, which reads as an obvious cleanup and silently
+    // rejects every module with a tag. Assert the grammar order directly.
+    const grammar_order = [_]u8{
+        1, // type
+        2, // import
+        3, // function
+        4, // table
+        5, // memory
+        13, // tag
+        6, // global
+        7, // export
+        8, // start
+        9, // element
+        12, // data count
+        10, // code
+        11, // data
+    };
+    var prev: u8 = 0;
+    for (grammar_order) |id| {
+        const pos = sectionOrder(id);
+        try std.testing.expect(pos > prev);
+        prev = pos;
+    }
+    // Every section must also land on its own position, or two distinct
+    // sections would look like a duplicate of one another.
+    for (grammar_order, 0..) |a, i| {
+        for (grammar_order[i + 1 ..]) |b| {
+            try std.testing.expect(sectionOrder(a) != sectionOrder(b));
+        }
     }
 }
