@@ -92,12 +92,14 @@ fn checkTypes(m: *const Mod.Module) Error!void {
                     if (!checkConcreteTypeIndex(m, r, typeIndexAt(ft.result_type_idxs, i))) return error.InvalidTypeIndex;
                 }
             },
+            // Fields and array elements are *storage* types, so the packed
+            // types are admissible here and nowhere else.
             .struct_type => |st| for (st.fields.items) |f| {
-                if (!f.@"type".isNumType() and !f.@"type".isRefType()) return error.InvalidTypeIndex;
+                if (!isStorageType(f.@"type")) return error.InvalidTypeIndex;
                 if (!checkConcreteTypeIndex(m, f.@"type", f.type_idx)) return error.InvalidTypeIndex;
             },
             .array_type => |at| {
-                if (!at.field.@"type".isNumType() and !at.field.@"type".isRefType()) return error.InvalidTypeIndex;
+                if (!isStorageType(at.field.@"type")) return error.InvalidTypeIndex;
                 if (!checkConcreteTypeIndex(m, at.field.@"type", at.field.type_idx)) return error.InvalidTypeIndex;
             },
         }
@@ -824,6 +826,12 @@ const CtrlFrame = struct {
 
 fn typeIndexAt(type_idxs: []const u32, idx: usize) u32 {
     return if (idx < type_idxs.len) type_idxs[idx] else types.invalid_index;
+}
+
+/// A struct field or array element type: any value type, plus the packed
+/// types, which are legal in this position only.
+fn isStorageType(vt: types.ValType) bool {
+    return vt.isNumType() or vt.isRefType() or vt.isPackedType();
 }
 
 fn checkConcreteTypeIndex(m: *const Mod.Module, vt: types.ValType, type_idx: u32) bool {
@@ -4152,4 +4160,33 @@ test "a block may return any single-byte value type" {
             return error.TestUnexpectedResult;
         } else |err| try std.testing.expectEqual(error.TypeMismatch, err);
     }
+}
+
+test "packed types are valid as storage types and nowhere else" {
+    const alloc = std.testing.allocator;
+
+    // An array of `(mut i8)` is well-formed: fields and array elements are
+    // storage types, so the packed types belong there.
+    var packed_array = Mod.Module.init(alloc);
+    defer packed_array.deinit();
+    try packed_array.module_types.append(alloc, .{
+        .array_type = .{ .field = .{ .@"type" = .i8, .mutable = true } },
+    });
+    try packed_array.type_meta.append(alloc, .{ .kind = .array });
+    try validate(&packed_array, .{});
+
+    // As is an `i16` struct field.
+    var packed_struct = Mod.Module.init(alloc);
+    defer packed_struct.deinit();
+    var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
+    try fields.append(alloc, .{ .@"type" = .i16 });
+    try packed_struct.module_types.append(alloc, .{ .struct_type = .{ .fields = fields } });
+    try packed_struct.type_meta.append(alloc, .{ .kind = .struct_ });
+    try validate(&packed_struct, .{});
+
+    // A packed type is not a value type, so it cannot be a parameter.
+    var packed_param = Mod.Module.init(alloc);
+    defer packed_param.deinit();
+    try appendFuncTypeForTest(&packed_param, &.{.i8}, &.{}, &.{}, &.{});
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&packed_param, .{}));
 }

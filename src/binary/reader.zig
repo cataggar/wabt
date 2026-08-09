@@ -378,43 +378,142 @@ const Reader = struct {
     fn readTypeSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         try self.module.module_types.ensureTotalCapacity(self.allocator, count);
+        // `count` counts *top-level* entries, and a rec group is one of them
+        // however many types it holds, so the number of types read can exceed
+        // it. This mirrors how the writer counts what it emits.
         for (0..count) |_| {
-            const form_byte = try self.readByte();
-            if (form_byte != 0x60) return error.InvalidType; // only func form for now
-            const num_params = try self.readU32();
-            var params = try self.allocator.alloc(types.ValType, num_params);
-            errdefer self.allocator.free(params);
-            var param_idxs = try self.allocator.alloc(u32, num_params);
-            errdefer self.allocator.free(param_idxs);
-            for (0..num_params) |j| {
-                const indexed = try self.readValType();
-                params[j] = indexed.vt;
-                param_idxs[j] = indexed.type_idx;
+            if (try self.peekByte() == rec_group_form) {
+                _ = try self.readByte();
+                const group_size = try self.readU32();
+                const group_id: u32 = @intCast(self.module.module_types.items.len);
+                for (0..group_size) |position| {
+                    try self.readOneType(.{
+                        .rec_group = group_id,
+                        .rec_group_size = group_size,
+                        .rec_position = @intCast(position),
+                    });
+                }
+            } else {
+                try self.readOneType(.{});
             }
-
-            const num_results = try self.readU32();
-            var results = try self.allocator.alloc(types.ValType, num_results);
-            errdefer self.allocator.free(results);
-            var result_idxs = try self.allocator.alloc(u32, num_results);
-            errdefer self.allocator.free(result_idxs);
-            for (0..num_results) |j| {
-                const indexed = try self.readValType();
-                results[j] = indexed.vt;
-                result_idxs[j] = indexed.type_idx;
-            }
-
-            self.module.module_types.appendAssumeCapacity(.{
-                .func_type = .{
-                    .params = params,
-                    .results = results,
-                    .param_type_idxs = param_idxs,
-                    .result_type_idxs = result_idxs,
-                },
-            });
         }
         // Concrete heap types may refer forward within the type section, so
         // indices can only be bounds-checked once the whole section is read.
         try self.checkTypeSectionIndices();
+    }
+
+    /// Recursion group marker, and the two forms that declare a supertype.
+    const rec_group_form: u8 = 0x4E;
+    const sub_form: u8 = 0x50;
+    const sub_final_form: u8 = 0x4F;
+    const func_form: u8 = 0x60;
+    const struct_form: u8 = 0x5F;
+    const array_form: u8 = 0x5E;
+
+    /// Position of a type within its recursion group, if any.
+    const RecPlacement = struct {
+        rec_group: u32 = types.invalid_index,
+        rec_group_size: u32 = 1,
+        rec_position: u32 = 0,
+    };
+
+    /// One type definition: an optional `sub`/`sub final` prefix naming a
+    /// supertype, then the structural form.
+    fn readOneType(self: *Reader, placement: RecPlacement) ReadError!void {
+        var meta = Mod.TypeMeta{
+            .rec_group = placement.rec_group,
+            .rec_group_size = placement.rec_group_size,
+            .rec_position = placement.rec_position,
+        };
+
+        const first = try self.peekByte();
+        if (first == sub_form or first == sub_final_form) {
+            _ = try self.readByte();
+            meta.is_sub = true;
+            meta.is_final = first == sub_final_form;
+            // The supertype list is a vector, but the GC proposal permits at
+            // most one entry.
+            const num_supertypes = try self.readU32();
+            if (num_supertypes > 1) return error.InvalidType;
+            if (num_supertypes == 1) meta.parent = try self.readU32();
+        }
+
+        const form_byte = try self.readByte();
+        const entry: Mod.TypeEntry = switch (form_byte) {
+            func_form => blk: {
+                meta.kind = .func;
+                break :blk .{ .func_type = try self.readFuncForm() };
+            },
+            struct_form => blk: {
+                meta.kind = .struct_;
+                break :blk .{ .struct_type = try self.readStructForm() };
+            },
+            array_form => blk: {
+                meta.kind = .array;
+                break :blk .{ .array_type = .{ .field = try self.readFieldType() } };
+            },
+            else => return error.InvalidType,
+        };
+
+        self.module.module_types.append(self.allocator, entry) catch return error.OutOfMemory;
+        // `type_meta` is indexed in lockstep with `module_types`, so it has to
+        // gain an entry per type even when there is nothing to record.
+        self.module.type_meta.append(self.allocator, meta) catch return error.OutOfMemory;
+    }
+
+    fn readFuncForm(self: *Reader) ReadError!Mod.FuncSignature {
+        const num_params = try self.readU32();
+        var params = try self.allocator.alloc(types.ValType, num_params);
+        errdefer self.allocator.free(params);
+        var param_idxs = try self.allocator.alloc(u32, num_params);
+        errdefer self.allocator.free(param_idxs);
+        for (0..num_params) |j| {
+            const indexed = try self.readValType();
+            params[j] = indexed.vt;
+            param_idxs[j] = indexed.type_idx;
+        }
+
+        const num_results = try self.readU32();
+        var results = try self.allocator.alloc(types.ValType, num_results);
+        errdefer self.allocator.free(results);
+        var result_idxs = try self.allocator.alloc(u32, num_results);
+        errdefer self.allocator.free(result_idxs);
+        for (0..num_results) |j| {
+            const indexed = try self.readValType();
+            results[j] = indexed.vt;
+            result_idxs[j] = indexed.type_idx;
+        }
+
+        return .{
+            .params = params,
+            .results = results,
+            .param_type_idxs = param_idxs,
+            .result_type_idxs = result_idxs,
+        };
+    }
+
+    fn readStructForm(self: *Reader) ReadError!Mod.TypeEntry.StructType {
+        const num_fields = try self.readU32();
+        var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
+        errdefer fields.deinit(self.allocator);
+        try fields.ensureTotalCapacity(self.allocator, num_fields);
+        for (0..num_fields) |_| {
+            fields.appendAssumeCapacity(try self.readFieldType());
+        }
+        return .{ .fields = fields };
+    }
+
+    /// A storage type and its mutability. `i8` and `i16` are only valid here,
+    /// which is why they are read through `readValType` like any other.
+    fn readFieldType(self: *Reader) ReadError!Mod.TypeEntry.StructType.Field {
+        const indexed = try self.readValType();
+        const mutable_byte = try self.readByte();
+        if (mutable_byte > 1) return error.InvalidType;
+        return .{
+            .@"type" = indexed.vt,
+            .mutable = mutable_byte == 1,
+            .type_idx = indexed.type_idx,
+        };
     }
 
     /// Reject concrete heap types naming a type index the module does not have.
@@ -422,17 +521,34 @@ const Reader = struct {
     /// table lookups, which fail closed but report a less specific error.
     fn checkTypeSectionIndices(self: *Reader) ReadError!void {
         const count = self.module.module_types.items.len;
+        const inRange = struct {
+            fn f(idx: u32, n: usize) bool {
+                return idx == types.invalid_index or idx < n;
+            }
+        }.f;
         for (self.module.module_types.items) |entry| {
-            const ft = switch (entry) {
-                .func_type => |ft| ft,
-                else => continue,
-            };
-            for (ft.param_type_idxs) |idx| {
-                if (idx != types.invalid_index and idx >= count) return error.InvalidType;
+            switch (entry) {
+                .func_type => |ft| {
+                    for (ft.param_type_idxs) |idx| {
+                        if (!inRange(idx, count)) return error.InvalidType;
+                    }
+                    for (ft.result_type_idxs) |idx| {
+                        if (!inRange(idx, count)) return error.InvalidType;
+                    }
+                },
+                .struct_type => |st| {
+                    for (st.fields.items) |f| {
+                        if (!inRange(f.type_idx, count)) return error.InvalidType;
+                    }
+                },
+                .array_type => |at| {
+                    if (!inRange(at.field.type_idx, count)) return error.InvalidType;
+                },
             }
-            for (ft.result_type_idxs) |idx| {
-                if (idx != types.invalid_index and idx >= count) return error.InvalidType;
-            }
+        }
+        // A declared supertype is an index into the same space.
+        for (self.module.type_meta.items) |meta| {
+            if (!inRange(meta.parent, count)) return error.InvalidType;
         }
     }
 
@@ -1359,4 +1475,126 @@ test "a tag with a non-zero attribute byte is rejected" {
         0x0d, 0x03, 0x01, 0x01, 0x00,
     };
     try std.testing.expectError(error.InvalidType, readModule(allocator, &src));
+}
+
+test "read a struct type" {
+    // (module (type (struct (field i32) (field (mut f64)))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x5f, 0x02, 0x7f, 0x00, 0x7c, 0x01,
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
+    const st = module.module_types.items[0].struct_type;
+    try std.testing.expectEqual(@as(usize, 2), st.fields.items.len);
+    try std.testing.expectEqual(types.ValType.i32, st.fields.items[0].@"type");
+    try std.testing.expect(!st.fields.items[0].mutable);
+    try std.testing.expectEqual(types.ValType.f64, st.fields.items[1].@"type");
+    try std.testing.expect(st.fields.items[1].mutable);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.struct_, module.type_meta.items[0].kind);
+}
+
+test "read an array type, including a packed element" {
+    // (module (type (array (mut i8))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x5e, 0x78, 0x01,
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+    const at = module.module_types.items[0].array_type;
+    try std.testing.expectEqual(types.ValType.i8, at.field.@"type");
+    try std.testing.expect(at.field.mutable);
+    try std.testing.expectEqual(Mod.TypeMeta.Kind.array, module.type_meta.items[0].kind);
+
+    // An immutable `i16` element, to pin the other packed byte down too.
+    const i16_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x5e, 0x77, 0x00,
+    };
+    var m16 = try readModule(std.testing.allocator, &i16_bytes);
+    defer m16.deinit();
+    try std.testing.expectEqual(types.ValType.i16, m16.module_types.items[0].array_type.field.@"type");
+    try std.testing.expect(!m16.module_types.items[0].array_type.field.mutable);
+}
+
+test "a recursion group is one entry in the type section count" {
+    // (module (rec (type $a (struct (field (ref null $b))))
+    //              (type $b (struct (field (ref null $a))))))
+    // The vector length is 1 -- a rec group counts once however many types it
+    // holds -- so reading it as a type count loses the second type and then
+    // desynchronises on whatever follows.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0d, 0x01, 0x4e, 0x02,
+        0x5f, 0x01, 0x63, 0x01, 0x00,
+        0x5f, 0x01, 0x63, 0x00, 0x00,
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.module_types.items.len);
+    try std.testing.expectEqual(@as(usize, 2), module.type_meta.items.len);
+    for (module.type_meta.items, 0..) |meta, i| {
+        try std.testing.expectEqual(@as(u32, 2), meta.rec_group_size);
+        try std.testing.expectEqual(@as(u32, 0), meta.rec_group);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), meta.rec_position);
+    }
+    // The two types refer to each other, which is only expressible inside a
+    // rec group and only resolvable once the whole section has been read.
+    try std.testing.expectEqual(@as(u32, 1), module.module_types.items[0].struct_type.fields.items[0].type_idx);
+    try std.testing.expectEqual(@as(u32, 0), module.module_types.items[1].struct_type.fields.items[0].type_idx);
+}
+
+test "read sub and sub final types" {
+    // (module (type $b (sub (struct (field i32))))
+    //         (type $d (sub $b (struct (field i32) (field f64)))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x10, 0x02,
+        0x50, 0x00, 0x5f, 0x01, 0x7f, 0x00,
+        0x50, 0x01, 0x00, 0x5f, 0x02, 0x7f, 0x00, 0x7c, 0x00,
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.module_types.items.len);
+    try std.testing.expect(module.type_meta.items[0].is_sub);
+    try std.testing.expect(!module.type_meta.items[0].is_final);
+    try std.testing.expectEqual(types.invalid_index, module.type_meta.items[0].parent);
+    try std.testing.expectEqual(@as(u32, 0), module.type_meta.items[1].parent);
+
+    // `sub final` is the same shape with a different marker byte.
+    const final_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x06, 0x01, 0x4f, 0x00, 0x60, 0x00, 0x00,
+    };
+    var fin = try readModule(std.testing.allocator, &final_bytes);
+    defer fin.deinit();
+    try std.testing.expect(fin.type_meta.items[0].is_sub);
+    try std.testing.expect(fin.type_meta.items[0].is_final);
+}
+
+test "malformed type definitions are rejected" {
+    const allocator = std.testing.allocator;
+    const header = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+
+    // An unassigned form byte. 0x5d sits just below the array form.
+    const bad_form = header ++ [_]u8{ 0x01, 0x03, 0x01, 0x5d, 0x00 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_form));
+
+    // The supertype list is a vector, but at most one entry is allowed.
+    const two_supers = header ++ [_]u8{ 0x01, 0x08, 0x01, 0x50, 0x02, 0x00, 0x00, 0x60, 0x00, 0x00 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &two_supers));
+
+    // A supertype index the module does not have.
+    const bad_parent = header ++ [_]u8{ 0x01, 0x06, 0x01, 0x50, 0x01, 0x09, 0x60, 0x00, 0x00 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_parent));
+
+    // Mutability is a single boolean byte.
+    const bad_mut = header ++ [_]u8{ 0x01, 0x04, 0x01, 0x5e, 0x7f, 0x02 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_mut));
+
+    // A field naming a type index past the end of the section.
+    const bad_field_idx = header ++ [_]u8{ 0x01, 0x06, 0x01, 0x5f, 0x01, 0x63, 0x09, 0x00 };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_field_idx));
 }
