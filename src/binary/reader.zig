@@ -388,6 +388,7 @@ const Reader = struct {
                 const group_id: u32 = @intCast(self.module.module_types.items.len);
                 for (0..group_size) |position| {
                     try self.readOneType(.{
+                        .in_rec_group = true,
                         .rec_group = group_id,
                         .rec_group_size = group_size,
                         .rec_position = @intCast(position),
@@ -412,6 +413,7 @@ const Reader = struct {
 
     /// Position of a type within its recursion group, if any.
     const RecPlacement = struct {
+        in_rec_group: bool = false,
         rec_group: u32 = types.invalid_index,
         rec_group_size: u32 = 1,
         rec_position: u32 = 0,
@@ -421,6 +423,7 @@ const Reader = struct {
     /// supertype, then the structural form.
     fn readOneType(self: *Reader, placement: RecPlacement) ReadError!void {
         var meta = Mod.TypeMeta{
+            .in_rec_group = placement.in_rec_group,
             .rec_group = placement.rec_group,
             .rec_group_size = placement.rec_group_size,
             .rec_position = placement.rec_position,

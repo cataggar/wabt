@@ -172,17 +172,16 @@ const Writer = struct {
     fn writeTypeSection(self: *Writer, module: *const Mod.Module) WriteError!void {
         if (module.module_types.items.len == 0) return;
         const ph = try self.beginSection(1);
-        // Count top-level entries: each rec group counts as 1, standalone types count as 1
+        // Count top-level entries: each rec group counts as 1 however many
+        // types it holds, and each standalone type counts as 1. A group of one
+        // is still a group, so the span is taken from `in_rec_group` rather
+        // than from the group size.
         var top_count: u32 = 0;
         {
             var i: usize = 0;
             while (i < module.module_types.items.len) {
-                const rgs = if (i < module.type_meta.items.len) module.type_meta.items[i].rec_group_size else 1;
-                if (rgs > 1) {
-                    i += rgs;
-                } else {
-                    i += 1;
-                }
+                const m = if (i < module.type_meta.items.len) module.type_meta.items[i] else Mod.TypeMeta{};
+                i += if (m.in_rec_group) m.rec_group_size else 1;
                 top_count += 1;
             }
         }
@@ -190,7 +189,7 @@ const Writer = struct {
         var idx: usize = 0;
         while (idx < module.module_types.items.len) {
             const meta = if (idx < module.type_meta.items.len) module.type_meta.items[idx] else Mod.TypeMeta{};
-            if (meta.rec_group_size > 1) {
+            if (meta.in_rec_group) {
                 try self.appendByte(0x4E); // rec group marker
                 try self.writeU32Leb(meta.rec_group_size);
                 var ri: u32 = 0;
@@ -1164,4 +1163,49 @@ test "text->binary: an imported tag with an inline signature emits a usable type
 
     try std.testing.expectEqual(@as(usize, 1), rt.tags.items.len);
     try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[0].@"type".sig.params);
+}
+
+test "a recursion group holding one type keeps its 0x4e marker" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator, "(module (rec (type $f (func (param i32)))))");
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    // Type section payload: one top-level entry, a rec group of one holding
+    // `(func (param i32))`. Dropping the wrapper would leave `01 60 01 7f 00`,
+    // which is a *different* type under iso-recursive typing.
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &[_]u8{ 0x01, 0x4e, 0x01, 0x60, 0x01, 0x7f, 0x00 }) != null);
+
+    // And it survives being read back.
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module2.type_meta.items.len);
+    try std.testing.expect(module2.type_meta.items[0].in_rec_group);
+    try std.testing.expectEqual(@as(u32, 1), module2.type_meta.items[0].rec_group_size);
+}
+
+test "a type declared outside a rec group gains no marker" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    // The text parser hands every standalone type its own rec group id for
+    // iso-recursive canonicalisation, so the group *id* cannot be used to
+    // decide this — only the explicit flag can.
+    var module = try Parser.parseModule(allocator, "(module (type $f (func (param i32))))");
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &[_]u8{ 0x01, 0x60, 0x01, 0x7f, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &[_]u8{0x4e}) == null);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module2.type_meta.items.len);
+    try std.testing.expect(!module2.type_meta.items[0].in_rec_group);
 }
