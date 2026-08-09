@@ -4285,6 +4285,8 @@ const Parser = struct {
                 if (self.peek().kind == .r_paren) _ = self.advance();
                 var imp_params: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer imp_params.deinit(self.allocator);
+                var imp_param_tidxs: std.ArrayListUnmanaged(u32) = .empty;
+                defer imp_param_tidxs.deinit(self.allocator);
                 var inline_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
@@ -4294,7 +4296,9 @@ const Parser = struct {
                         _ = self.advance();
                         if (self.peek().kind == .identifier) _ = self.advance();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const refs_before = self.collected_type_refs.items.len;
                             const vt = self.parseValType() catch break;
+                            imp_param_tidxs.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             imp_params.append(self.allocator, vt) catch {};
                         }
                         if (self.peek().kind == .r_paren) _ = self.advance();
@@ -4307,6 +4311,7 @@ const Parser = struct {
                                 switch (mod.module_types.items[tidx]) {
                                     .func_type => |ft| {
                                         for (ft.params) |p2| imp_params.append(self.allocator, p2) catch {};
+                                        for (ft.param_type_idxs) |ti| imp_param_tidxs.append(self.allocator, ti) catch {};
                                     },
                                     else => {},
                                 }
@@ -4320,6 +4325,15 @@ const Parser = struct {
                     }
                 }
                 const params = imp_params.toOwnedSlice(self.allocator) catch &.{};
+                const param_tidxs = imp_param_tidxs.toOwnedSlice(self.allocator) catch &.{};
+                defer if (param_tidxs.len > 0) self.allocator.free(param_tidxs);
+                // An imported tag needs a type section entry exactly as much
+                // as a defined one does -- the import section encodes a
+                // signature *index*, not a signature. Without this the
+                // written module referred to a type that was never emitted.
+                if (inline_tag_type_idx == std.math.maxInt(u32)) {
+                    inline_tag_type_idx = self.findOrAddFuncTypeWithTidxs(module, params, &.{}, param_tidxs, &.{});
+                }
                 module.imports.append(self.allocator, .{
                     .module_name = mod_name,
                     .field_name = field_name,
@@ -4701,6 +4715,10 @@ const Parser = struct {
                 defer params_list.deinit(self.allocator);
                 var results_list: std.ArrayListUnmanaged(types.ValType) = .empty;
                 defer results_list.deinit(self.allocator);
+                var param_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
+                defer param_tidxs_list.deinit(self.allocator);
+                var result_tidxs_list: std.ArrayListUnmanaged(u32) = .empty;
+                defer result_tidxs_list.deinit(self.allocator);
                 var imp_tag_type_idx: u32 = std.math.maxInt(u32);
                 while (self.peek().kind == .l_paren) {
                     const sp2 = self.lexer.pos;
@@ -4710,14 +4728,18 @@ const Parser = struct {
                         _ = self.advance();
                         if (self.peek().kind == .identifier) _ = self.advance();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const refs_before = self.collected_type_refs.items.len;
                             const vt = self.parseValType() catch break;
+                            param_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             params_list.append(self.allocator, vt) catch {};
                         }
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else if (self.peek().kind == .kw_result) {
                         _ = self.advance();
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const refs_before = self.collected_type_refs.items.len;
                             const vt = self.parseValType() catch break;
+                            result_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
                             results_list.append(self.allocator, vt) catch {};
                         }
                         if (self.peek().kind == .r_paren) _ = self.advance();
@@ -4730,6 +4752,9 @@ const Parser = struct {
                                 switch (mod.module_types.items[tidx]) {
                                     .func_type => |ft| {
                                         for (ft.params) |p2| params_list.append(self.allocator, p2) catch {};
+                                        for (ft.results) |r2| results_list.append(self.allocator, r2) catch {};
+                                        for (ft.param_type_idxs) |ti| param_tidxs_list.append(self.allocator, ti) catch {};
+                                        for (ft.result_type_idxs) |ti| result_tidxs_list.append(self.allocator, ti) catch {};
                                     },
                                     else => {},
                                 }
@@ -4744,6 +4769,15 @@ const Parser = struct {
                 }
                 const params = params_list.toOwnedSlice(self.allocator) catch &.{};
                 const results = results_list.toOwnedSlice(self.allocator) catch &.{};
+                const param_tidxs = param_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
+                const result_tidxs = result_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
+                defer if (param_tidxs.len > 0) self.allocator.free(param_tidxs);
+                defer if (result_tidxs.len > 0) self.allocator.free(result_tidxs);
+                // See the inline-import path: the import section encodes a
+                // signature index, so one has to exist in the type section.
+                if (imp_tag_type_idx == std.math.maxInt(u32)) {
+                    imp_tag_type_idx = self.findOrAddFuncTypeWithTidxs(module, params, results, param_tidxs, result_tidxs);
+                }
                 try module.tags.append(self.allocator, .{
                     .@"type" = .{ .sig = .{ .params = params, .results = results } },
                     .type_idx = imp_tag_type_idx,
@@ -6468,4 +6502,60 @@ test "parsing a tag frees the concrete type indices it collects" {
         &.{.f64},
         by_type.tags.items[0].@"type".sig.params,
     );
+}
+
+test "an imported tag with an inline signature registers a type" {
+    // The import section encodes a signature *index*, so a tag import needs
+    // an entry in the type section just as much as a defined tag does.
+    // Neither imported-tag path registered one, so `type_idx` stayed
+    // `maxInt` and the module referred to a type that was never emitted.
+    const allocator = std.testing.allocator;
+
+    var inline_form = try parseModule(allocator,
+        \\(module (tag $a (import "m" "t") (param i32 i64)))
+    );
+    defer inline_form.deinit();
+    try std.testing.expect(inline_form.tags.items[0].is_import);
+    try std.testing.expect(inline_form.tags.items[0].type_idx != std.math.maxInt(u32));
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .i32, .i64 },
+        inline_form.module_types.items[inline_form.tags.items[0].type_idx].func_type.params,
+    );
+
+    var desc_form = try parseModule(allocator,
+        \\(module (import "m" "t" (tag $a (param f32))))
+    );
+    defer desc_form.deinit();
+    try std.testing.expect(desc_form.tags.items[0].type_idx != std.math.maxInt(u32));
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{.f32},
+        desc_form.module_types.items[desc_form.tags.items[0].type_idx].func_type.params,
+    );
+}
+
+test "an imported tag reuses an existing matching type rather than adding one" {
+    const allocator = std.testing.allocator;
+    var mod = try parseModule(allocator,
+        \\(module (type $t (func (param i32))) (import "m" "t" (tag $a (param i32))))
+    );
+    defer mod.deinit();
+    try std.testing.expectEqual(@as(usize, 1), mod.module_types.items.len);
+    try std.testing.expectEqual(@as(u32, 0), mod.tags.items[0].type_idx);
+}
+
+test "imported and defined tags are distinguished by is_import, not by position" {
+    // The text parser appends tags in source order, so a defined tag written
+    // before an import lands *first* in `module.tags`. Anything that assumes
+    // the imports occupy the leading `num_tag_imports` entries pairs each tag
+    // with the other one's signature.
+    const allocator = std.testing.allocator;
+    var mod = try parseModule(allocator,
+        \\(module (tag $a (param i32)) (import "m" "t" (tag $b (param f32))))
+    );
+    defer mod.deinit();
+    try std.testing.expectEqual(@as(u32, 1), mod.num_tag_imports);
+    try std.testing.expect(!mod.tags.items[0].is_import);
+    try std.testing.expect(mod.tags.items[1].is_import);
 }

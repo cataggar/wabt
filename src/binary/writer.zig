@@ -279,17 +279,16 @@ const Writer = struct {
                 },
                 .tag => {
                     // The signature index lives on the `Tag`, not the
-                    // `Import`. Imported tags occupy the first
-                    // `num_tag_imports` entries of `module.tags` in import
-                    // order, which is how the tag section below finds the
-                    // defined ones, so walking a counter alongside pairs them
-                    // up. This used to write a hardcoded 0, silently
-                    // retyping every imported tag to whatever type 0 was.
+                    // `Import`, so the nth tag import has to be paired with
+                    // the nth imported entry of `module.tags`. Selecting it
+                    // by `is_import` rather than by position is what makes
+                    // that pairing hold: the text parser appends tags in
+                    // source order, so `(tag $a ...) (import ... (tag $b))`
+                    // leaves the import *second*, and slicing off the first
+                    // `num_tag_imports` entries would hand each tag the
+                    // other one's signature.
                     try self.appendByte(0); // attribute: 0 = exception
-                    const tag: ?Mod.Tag = if (tag_import_idx < module.num_tag_imports)
-                        module.tags.items[tag_import_idx]
-                    else
-                        null;
+                    const tag = nthImportedTag(module, tag_import_idx);
                     tag_import_idx += 1;
                     try self.writeU32Leb(if (tag) |t| tagTypeIndex(module, t) else 0);
                 },
@@ -357,12 +356,26 @@ const Writer = struct {
         return findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
     }
 
+    /// The `idx`th imported tag in import order. Imported and defined tags
+    /// share one list and the text parser interleaves them, so they can only
+    /// be told apart by `is_import`.
+    fn nthImportedTag(module: *const Mod.Module, idx: usize) ?Mod.Tag {
+        var seen: usize = 0;
+        for (module.tags.items) |tag| {
+            if (!tag.is_import) continue;
+            if (seen == idx) return tag;
+            seen += 1;
+        }
+        return null;
+    }
+
     fn writeTagSection(self: *Writer, module: *const Mod.Module) WriteError!void {
         const defined = module.tags.items.len - module.num_tag_imports;
         if (defined == 0) return;
         const ph = try self.beginSection(13); // tag section ID
         try self.writeU32Leb(@intCast(defined));
-        for (module.tags.items[module.num_tag_imports..]) |tag| {
+        for (module.tags.items) |tag| {
+            if (tag.is_import) continue;
             try self.appendByte(0); // attribute: 0 = exception
             try self.writeU32Leb(tagTypeIndex(module, tag));
         }
@@ -1096,4 +1109,50 @@ test "binary read+write: imported tag signatures round-trip" {
         &.{ .i32, .i64 },
         module2.tags.items[0].@"type".sig.params,
     );
+}
+
+test "text->binary: a defined tag written before an import keeps its own signature" {
+    // The text parser appends tags in source order, so here `$a` (defined)
+    // is `tags.items[0]` and `$b` (imported) is `tags.items[1]`. The import
+    // section used to take its signature from `tags.items[0..num_tag_imports]`
+    // -- i.e. from `$a` -- so the two tags swapped signatures, and both
+    // sections still produced a module that validated.
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+    var module = try Parser.parseModule(allocator,
+        \\(module (tag $a (param i32)) (import "m" "t" (tag $b (param f32))))
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var rt = try reader.readModule(allocator, wasm);
+    defer rt.deinit();
+
+    // Decoding puts imports first, so the imported `$b` leads here.
+    try std.testing.expectEqual(@as(usize, 2), rt.tags.items.len);
+    try std.testing.expect(rt.tags.items[0].is_import);
+    try std.testing.expectEqualSlices(types.ValType, &.{.f32}, rt.tags.items[0].@"type".sig.params);
+    try std.testing.expect(!rt.tags.items[1].is_import);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[1].@"type".sig.params);
+}
+
+test "text->binary: an imported tag with an inline signature emits a usable type index" {
+    // With no `(type ...)` spelled out, the parser left `type_idx` at
+    // `maxInt` and never added a type, so the writer emitted an index into
+    // an absent type section and produced an undecodable module.
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+    var module = try Parser.parseModule(allocator,
+        \\(module (import "m" "t" (tag $a (param i32))))
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var rt = try reader.readModule(allocator, wasm);
+    defer rt.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rt.tags.items.len);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[0].@"type".sig.params);
 }
