@@ -255,6 +255,7 @@ const Writer = struct {
         if (module.imports.items.len == 0) return;
         const ph = try self.beginSection(2);
         try self.writeU32Leb(@intCast(module.imports.items.len));
+        var tag_import_idx: usize = 0;
         for (module.imports.items) |imp| {
             try self.writeName(imp.module_name);
             try self.writeName(imp.field_name);
@@ -277,8 +278,20 @@ const Writer = struct {
                     }
                 },
                 .tag => {
-                    try self.appendByte(0); // attribute
-                    try self.writeU32Leb(0); // sig index placeholder
+                    // The signature index lives on the `Tag`, not the
+                    // `Import`. Imported tags occupy the first
+                    // `num_tag_imports` entries of `module.tags` in import
+                    // order, which is how the tag section below finds the
+                    // defined ones, so walking a counter alongside pairs them
+                    // up. This used to write a hardcoded 0, silently
+                    // retyping every imported tag to whatever type 0 was.
+                    try self.appendByte(0); // attribute: 0 = exception
+                    const tag: ?Mod.Tag = if (tag_import_idx < module.num_tag_imports)
+                        module.tags.items[tag_import_idx]
+                    else
+                        null;
+                    tag_import_idx += 1;
+                    try self.writeU32Leb(if (tag) |t| tagTypeIndex(module, t) else 0);
                 },
             }
         }
@@ -335,6 +348,15 @@ const Writer = struct {
         self.endSection(ph);
     }
 
+    /// Signature index to write for a tag: the one it was read or parsed
+    /// with, falling back to a structural match when the tag was built
+    /// without one. Shared by the import and tag sections so an imported and
+    /// a defined tag with the same signature cannot resolve differently.
+    fn tagTypeIndex(module: *const Mod.Module, tag: Mod.Tag) u32 {
+        if (tag.type_idx != std.math.maxInt(u32)) return tag.type_idx;
+        return findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
+    }
+
     fn writeTagSection(self: *Writer, module: *const Mod.Module) WriteError!void {
         const defined = module.tags.items.len - module.num_tag_imports;
         if (defined == 0) return;
@@ -342,12 +364,7 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(defined));
         for (module.tags.items[module.num_tag_imports..]) |tag| {
             try self.appendByte(0); // attribute: 0 = exception
-            // Resolve type index: if not set, find matching type by signature
-            var tidx = tag.type_idx;
-            if (tidx == std.math.maxInt(u32)) {
-                tidx = findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
-            }
-            try self.writeU32Leb(tidx);
+            try self.writeU32Leb(tagTypeIndex(module, tag));
         }
         self.endSection(ph);
     }
@@ -1010,4 +1027,73 @@ test "binary read: reference types decode from the spec-assigned bytes" {
         };
         try std.testing.expectError(error.InvalidType, reader.readModule(allocator, &src));
     }
+}
+
+test "binary read+write: tag signatures round-trip instead of collapsing to ()" {
+    // Two tags with different signatures, from `wasm-tools parse` v1.250.0:
+    //   (type (func (param f64 f64)))  ;; 0
+    //   (type (func (param i32 i64)))  ;; 1
+    //   (tag $a (param i32 i64))       ;; -> type 1
+    //   (tag $b (param f64 f64))       ;; -> type 0
+    //
+    // This was a silent miscompile. The reader dropped each tag's signature
+    // index and the writer then re-resolved it structurally, matching the
+    // empty signature both tags had been left with. Both came back out as
+    // `(type 2)` -- `()` -- and the result still validated, because `throw`
+    // marks the rest of the block unreachable, so nothing downstream noticed
+    // the parameters had vanished.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0e, 0x03, 0x60, 0x02, 0x7c, 0x7c, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x02,
+        0x0d, 0x05, 0x02, 0x00, 0x01, 0x00, 0x00,
+        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x01, 0x42, 0x02, 0x08, 0x00, 0x0b,
+    };
+
+    var module = try reader.readModule(allocator, &src);
+    defer module.deinit();
+    const wasm2 = try writeModule(allocator, &module);
+    defer allocator.free(wasm2);
+    var module2 = try reader.readModule(allocator, wasm2);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), module2.tags.items.len);
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .i32, .i64 },
+        module2.tags.items[0].@"type".sig.params,
+    );
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .f64, .f64 },
+        module2.tags.items[1].@"type".sig.params,
+    );
+}
+
+test "binary read+write: imported tag signatures round-trip" {
+    // The import section wrote a hardcoded 0 for every imported tag's
+    // signature index, so an imported tag was retyped to whatever type 0
+    // happened to be -- independently of the reader losing it as well.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x09, 0x02, 0x60, 0x00, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00,
+        0x02, 0x08, 0x01, 0x01, 0x6d, 0x01, 0x65, 0x04, 0x00, 0x01,
+    };
+
+    var module = try reader.readModule(allocator, &src);
+    defer module.deinit();
+    const wasm2 = try writeModule(allocator, &module);
+    defer allocator.free(wasm2);
+    var module2 = try reader.readModule(allocator, wasm2);
+    defer module2.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), module2.tags.items.len);
+    try std.testing.expectEqual(@as(u32, 1), module2.tags.items[0].type_idx);
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .i32, .i64 },
+        module2.tags.items[0].@"type".sig.params,
+    );
 }
