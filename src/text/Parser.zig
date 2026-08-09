@@ -159,7 +159,18 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
             .kw_elem => try p.parseElem(&module),
             .kw_data => try p.parseData(&module),
             .kw_definition => try p.skipSExpr(),
-            .kw_tag => try p.parseTag(&module),
+            .kw_tag => {
+                try p.parseTag(&module);
+                // A defined tag closes the import prologue exactly as a
+                // defined func/table/memory/global does. Without this a
+                // later `(import ... (tag ...))` was accepted and left the
+                // tag index space in source order, while the binary wabt
+                // writes puts every import first -- so `throw $t` in the
+                // text meant one tag and the same `throw` in the output
+                // meant another.
+                const last = module.tags.items[module.tags.items.len - 1];
+                if (!last.is_import) seen_non_import_def = true;
+            },
             .invalid => {
                 p.malformed = true;
                 try p.skipSExpr();
@@ -4438,6 +4449,13 @@ const Parser = struct {
         return self.findOrAddFuncTypeWithTidxs(module, params, results, &.{}, &.{});
     }
 
+        /// Concrete type index parallel to element `idx`. A shorter or absent
+    /// list means the remaining entries are abstract, which is how types
+    /// built without index tracking are represented.
+    fn concreteIdxAt(tidxs: []const u32, idx: usize) u32 {
+        return if (idx < tidxs.len) tidxs[idx] else 0xFFFFFFFF;
+    }
+
     fn findOrAddFuncTypeWithTidxs(self: *Parser, module: *Mod.Module, params: []const types.ValType, results: []const types.ValType, param_tidxs: []const u32, result_tidxs: []const u32) u32 {
         // Search existing types
         for (module.module_types.items, 0..) |entry, i| {
@@ -4445,12 +4463,23 @@ const Parser = struct {
                 .func_type => |ft| {
                     if (ft.params.len == params.len and ft.results.len == results.len) {
                         var match = true;
-                        for (ft.params, params) |a, b| {
-                            if (a != b) { match = false; break; }
+                        // The concrete type index has to take part in the
+                        // comparison: `(ref $a)` and `(ref $b)` are the same
+                        // `ValType`, so matching on value types alone folded
+                        // two distinct function types into one and handed
+                        // back an index describing the wrong signature.
+                        for (ft.params, params, 0..) |a, b, k| {
+                            if (a != b or concreteIdxAt(ft.param_type_idxs, k) != concreteIdxAt(param_tidxs, k)) {
+                                match = false;
+                                break;
+                            }
                         }
                         if (match) {
-                            for (ft.results, results) |a, b| {
-                                if (a != b) { match = false; break; }
+                            for (ft.results, results, 0..) |a, b, k| {
+                                if (a != b or concreteIdxAt(ft.result_type_idxs, k) != concreteIdxAt(result_tidxs, k)) {
+                                    match = false;
+                                    break;
+                                }
                             }
                         }
                         if (match) return @intCast(i);
@@ -6545,17 +6574,53 @@ test "an imported tag reuses an existing matching type rather than adding one" {
     try std.testing.expectEqual(@as(u32, 0), mod.tags.items[0].type_idx);
 }
 
-test "imported and defined tags are distinguished by is_import, not by position" {
-    // The text parser appends tags in source order, so a defined tag written
-    // before an import lands *first* in `module.tags`. Anything that assumes
-    // the imports occupy the leading `num_tag_imports` entries pairs each tag
-    // with the other one's signature.
+test "a tag import after a defined tag is rejected" {
+    // A defined tag closes the import prologue, exactly as a defined
+    // func/table/memory/global does. Accepting the interleaving left
+    // `module.tags` in source order while the binary writer emits every
+    // import first, so a `throw $t` in the text and the same `throw` in the
+    // output named different tags.
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator,
+        \\(module (tag $a (param i32)) (import "m" "t" (tag $b (param f32))))
+    ));
+
+    // The prologue itself is unaffected: imports before definitions are
+    // still fine, and the index space is imports-first.
+    var ok = try parseModule(allocator,
+        \\(module (import "m" "t" (tag $b (param f32))) (tag $a (param i32)))
+    );
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.num_tag_imports);
+    try std.testing.expect(ok.tags.items[0].is_import);
+    try std.testing.expect(!ok.tags.items[1].is_import);
+}
+
+test "function types differing only in a concrete type index are not folded together" {
+    // `(ref $a)` and `(ref $b)` are the same `ValType`, so a structural
+    // search that compared value types alone reported the first as a match
+    // for the second and handed back an index describing a different
+    // signature. Two tags is the shortest way to reach the search twice.
     const allocator = std.testing.allocator;
     var mod = try parseModule(allocator,
-        \\(module (tag $a (param i32)) (import "m" "t" (tag $b (param f32))))
+        \\(module (type $a (func)) (type $b (func (param i32)))
+        \\  (tag $e (param (ref $a))) (tag $f (param (ref $b))))
     );
     defer mod.deinit();
-    try std.testing.expectEqual(@as(u32, 1), mod.num_tag_imports);
-    try std.testing.expect(!mod.tags.items[0].is_import);
-    try std.testing.expect(mod.tags.items[1].is_import);
+    try std.testing.expect(mod.tags.items[0].type_idx != mod.tags.items[1].type_idx);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        mod.module_types.items[mod.tags.items[0].type_idx].func_type.param_type_idxs[0],
+    );
+    try std.testing.expectEqual(
+        @as(u32, 1),
+        mod.module_types.items[mod.tags.items[1].type_idx].func_type.param_type_idxs[0],
+    );
+
+    // Identical signatures must still share one entry.
+    var shared = try parseModule(allocator,
+        \\(module (tag $e (param i32)) (tag $f (param i32)))
+    );
+    defer shared.deinit();
+    try std.testing.expectEqual(shared.tags.items[0].type_idx, shared.tags.items[1].type_idx);
 }
