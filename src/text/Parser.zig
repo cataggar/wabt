@@ -1768,9 +1768,12 @@ const Parser = struct {
                 _ = self.advance();
                 code.append(self.allocator, 0x1f) catch return;
                 const label = self.consumeOptionalLabel();
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
-                // Parse catch clauses
+                // Parse catch clauses. `try_table`'s own label is deliberately
+                // not on the stack yet: a clause's label index is resolved in
+                // the context surrounding the instruction, so
+                // `(block $l (try_table (catch_all $l) ...))` is depth 0.
+                // Pushing first shifted every catch label by one.
                 var clause_count: u32 = 0;
                 var catch_bytes = std.ArrayListUnmanaged(u8).empty;
                 defer catch_bytes.deinit(self.allocator);
@@ -1811,6 +1814,8 @@ const Parser = struct {
                         break;
                     }
                 }
+                // The body *is* inside the new label scope, so push now.
+                self.label_stack.append(self.allocator, label) catch {};
                 var cnt_buf: [5]u8 = undefined;
                 const cn = leb128.writeU32Leb128(&cnt_buf, clause_count);
                 code.appendSlice(self.allocator, cnt_buf[0..cn]) catch {};
@@ -2195,10 +2200,11 @@ const Parser = struct {
                 code.append(self.allocator, 0x1f) catch return;
                 // Parse optional label
                 const label = if (self.peek().kind == .identifier) self.advance().text else null;
-                // Push label for depth resolution (try_table is a block-like construct)
-                self.label_stack.append(self.allocator, label) catch {};
                 self.emitBlockType(code);
-                // Parse catch clauses, building a byte buffer
+                // Parse catch clauses, building a byte buffer. `try_table`'s
+                // own label is pushed only afterwards -- see the folded form
+                // above; a clause's label is resolved in the enclosing
+                // context, so pushing first shifted every one of them by one.
                 var clause_count: u32 = 0;
                 var catch_bytes = std.ArrayListUnmanaged(u8).empty;
                 defer catch_bytes.deinit(self.allocator);
@@ -2249,6 +2255,8 @@ const Parser = struct {
                         break;
                     }
                 }
+                // The body *is* inside the new label scope, so push now.
+                self.label_stack.append(self.allocator, label) catch {};
                 // Emit: clause_count + catch clause bytes
                 var cnt_buf: [5]u8 = undefined;
                 const cn = leb128.writeU32Leb128(&cnt_buf, clause_count);
@@ -6623,4 +6631,41 @@ test "function types differing only in a concrete type index are not folded toge
     );
     defer shared.deinit();
     try std.testing.expectEqual(shared.tags.items[0].type_idx, shared.tags.items[1].type_idx);
+}
+
+test "a try_table catch label is resolved outside the try_table" {
+    // `try_table`'s own label belongs to its body, not to its catch clauses:
+    // a clause's label index counts from the enclosing context. Pushing the
+    // label before parsing the clauses shifted every one of them by one.
+    const allocator = std.testing.allocator;
+    var flat = try parseModule(allocator,
+        \\(module (tag $e) (func block $outer try_table (catch_all $outer) nop end end))
+    );
+    defer flat.deinit();
+    // 0x02 0x40 block, 0x1f 0x40 try_table, 0x01 one clause, 0x02 catch_all,
+    // then the label depth.
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x02, 0x40, 0x1f, 0x40, 0x01, 0x02, 0x00 },
+        flat.funcs.items[0].code_bytes[0..7],
+    );
+
+    var folded = try parseModule(allocator,
+        \\(module (tag $e) (func (block $outer (try_table (catch_all $outer) (nop)))))
+    );
+    defer folded.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x02, 0x40, 0x1f, 0x40, 0x01, 0x02, 0x00 },
+        folded.funcs.items[0].code_bytes[0..7],
+    );
+
+    // The body is still inside the new scope, so a `br` in it sees
+    // try_table at depth 0 and the block at depth 1.
+    var inner = try parseModule(allocator,
+        \\(module (tag $e) (func (block $outer (try_table (catch_all $outer) (br $outer)))))
+    );
+    defer inner.deinit();
+    const code = inner.funcs.items[0].code_bytes;
+    try std.testing.expectEqualSlices(u8, &.{ 0x0c, 0x01 }, code[7..9]);
 }
