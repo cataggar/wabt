@@ -501,10 +501,10 @@ const Reader = struct {
                     self.module.num_global_imports += 1;
                 },
                 .tag => {
-                    _ = try self.readByte(); // attribute
-                    const sig_index = try self.readU32();
-                    _ = sig_index;
-                    try self.module.tags.append(self.allocator, .{ .is_import = true });
+                    var tag = try self.readTagType();
+                    tag.is_import = true;
+                    import.tag = tag.@"type";
+                    try self.module.tags.append(self.allocator, tag);
                     self.module.num_tag_imports += 1;
                 },
             }
@@ -742,12 +742,40 @@ const Reader = struct {
         self.module.has_data_count = true;
     }
 
+    /// Resolve a tag's signature index against the type section.
+    ///
+    /// The index is the tag's whole type: dropping it left every
+    /// binary-decoded tag with an empty signature, so `throw` had no
+    /// parameters to check and the writer re-emitted the tag against
+    /// whichever type happened to match `()`. The tag section always follows
+    /// the type section, so this resolves immediately.
+    ///
+    /// The signature is copied because `Module.deinit` frees each tag's
+    /// params and results; aliasing the type section's slices here would
+    /// free them twice.
+    fn readTagType(self: *Reader) ReadError!Mod.Tag {
+        const attribute = try self.readByte();
+        if (attribute != 0) return error.InvalidType; // 0 = exception; nothing else is defined
+        const sig_index = try self.readU32();
+        if (sig_index >= self.module.module_types.items.len) return error.InvalidType;
+        const entry = self.module.module_types.items[sig_index];
+        const sig = switch (entry) {
+            .func_type => |ft| ft,
+            else => return error.InvalidType,
+        };
+        const params = try self.allocator.dupe(types.ValType, sig.params);
+        errdefer self.allocator.free(params);
+        const results = try self.allocator.dupe(types.ValType, sig.results);
+        return .{
+            .@"type" = .{ .sig = .{ .params = params, .results = results } },
+            .type_idx = sig_index,
+        };
+    }
+
     fn readTagSection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         for (0..count) |_| {
-            _ = try self.readByte(); // attribute
-            _ = try self.readU32(); // sig index
-            try self.module.tags.append(self.allocator, .{});
+            try self.module.tags.append(self.allocator, try self.readTagType());
         }
     }
 
@@ -1251,4 +1279,84 @@ test "section order positions are strictly increasing in binary-grammar order" {
             try std.testing.expect(sectionOrder(a) != sectionOrder(b));
         }
     }
+}
+
+test "tag signatures survive decoding" {
+    // Bytes from `wasm-tools parse` v1.250.0 for:
+    //   (type (func (param f64 f64)))   ;; 0
+    //   (type (func (param i32 i64)))   ;; 1
+    //   (tag $a (param i32 i64))        ;; -> type 1
+    //   (tag $b (param f64 f64))        ;; -> type 0
+    // The signature index used to be read and discarded, leaving every
+    // binary-decoded tag with an empty signature. Nothing downstream could
+    // tell the two tags apart afterwards, and the writer re-emitted both
+    // against whichever type matched `()`.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0e, 0x03, 0x60, 0x02, 0x7c, 0x7c, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x02,
+        0x0d, 0x05, 0x02, 0x00, 0x01, 0x00, 0x00,
+        0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00,
+        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x01, 0x42, 0x02, 0x08, 0x00, 0x0b,
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), module.tags.items.len);
+    const a = module.tags.items[0];
+    try std.testing.expectEqual(@as(u32, 1), a.type_idx);
+    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i64 }, a.@"type".sig.params);
+    const b = module.tags.items[1];
+    try std.testing.expectEqual(@as(u32, 0), b.type_idx);
+    try std.testing.expectEqualSlices(types.ValType, &.{ .f64, .f64 }, b.@"type".sig.params);
+}
+
+test "imported tag signatures survive decoding" {
+    // Bytes from `wasm-tools parse` v1.250.0 for
+    //   (type (func)) (type (func (param i32 i64)))
+    //   (import "m" "e" (tag (param i32 i64)))
+    // Imported tags took the same discard path as defined ones.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x09, 0x02, 0x60, 0x00, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00,
+        0x02, 0x08, 0x01, 0x01, 0x6d, 0x01, 0x65, 0x04, 0x00, 0x01,
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.tags.items.len);
+    try std.testing.expectEqual(@as(u32, 1), module.num_tag_imports);
+    const tag = module.tags.items[0];
+    try std.testing.expect(tag.is_import);
+    try std.testing.expectEqual(@as(u32, 1), tag.type_idx);
+    try std.testing.expectEqualSlices(types.ValType, &.{ .i32, .i64 }, tag.@"type".sig.params);
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .i32, .i64 },
+        module.imports.items[0].tag.?.sig.params,
+    );
+}
+
+test "a tag signature index past the end of the type section is rejected" {
+    // Fail closed rather than leaving the tag with a default signature.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x0d, 0x03, 0x01, 0x00, 0x07,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &src));
+}
+
+test "a tag with a non-zero attribute byte is rejected" {
+    // 0 (exception) is the only attribute the format defines. Skipping the
+    // byte unchecked would silently accept a future or corrupt encoding.
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x0d, 0x03, 0x01, 0x01, 0x00,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &src));
 }

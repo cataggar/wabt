@@ -4402,6 +4402,13 @@ const Parser = struct {
         const results = results_list.toOwnedSlice(self.allocator) catch &.{};
         const param_tidxs = param_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
         const result_tidxs = result_tidxs_list.toOwnedSlice(self.allocator) catch &.{};
+        // `Tag` has no slots for the concrete type indices, and
+        // `findOrAddFuncTypeWithTidxs` copies them into `module_types`, so
+        // nothing takes ownership of these two and they must be freed here.
+        // `params`/`results` are different: the tag keeps them, and
+        // `Module.deinit` frees them.
+        defer if (param_tidxs.len > 0) self.allocator.free(param_tidxs);
+        defer if (result_tidxs.len > 0) self.allocator.free(result_tidxs);
         // If no explicit type index, register a function type for this tag's signature
         if (tag_type_idx == std.math.maxInt(u32)) {
             tag_type_idx = self.findOrAddFuncTypeWithTidxs(module, params, results, param_tidxs, result_tidxs);
@@ -6430,4 +6437,35 @@ test "ref.cast emits concrete type indices distinctly from abstract heap types" 
     );
     defer big.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x16, 0xf0, 0x00 }, big.funcs.items[0].code_bytes[2..6]);
+}
+
+test "parsing a tag frees the concrete type indices it collects" {
+    // `Tag` has no slots for the per-parameter concrete type indices, and
+    // `findOrAddFuncTypeWithTidxs` copies them into `module_types`, so the
+    // originals are owned by nobody once the tag is appended. They were
+    // leaked, which `std.testing.allocator` fails on -- but only if a test
+    // actually parses a tag with parameters, which none did.
+    const allocator = std.testing.allocator;
+    var defined = try parseModule(allocator,
+        \\(module (tag $a (param i32 i64)))
+    );
+    defer defined.deinit();
+    try std.testing.expectEqual(@as(usize, 1), defined.tags.items.len);
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{ .i32, .i64 },
+        defined.tags.items[0].@"type".sig.params,
+    );
+
+    // The `(type $t)` form takes a different path to the same slices.
+    var by_type = try parseModule(allocator,
+        \\(module (type $t (func (param f64))) (tag $a (type $t)))
+    );
+    defer by_type.deinit();
+    try std.testing.expectEqual(@as(u32, 0), by_type.tags.items[0].type_idx);
+    try std.testing.expectEqualSlices(
+        types.ValType,
+        &.{.f64},
+        by_type.tags.items[0].@"type".sig.params,
+    );
 }

@@ -195,6 +195,16 @@ fn checkTags(m: *const Mod.Module) Error!void {
     for (m.tags.items) |tag| {
         // Tag types must have empty result types per spec.
         if (tag.@"type".sig.results.len > 0) return error.TypeMismatch;
+        // A tag's type index must name a function type in the module. The
+        // binary reader checks this as it decodes, but a tag can also arrive
+        // from the text parser, so re-check rather than trust the producer.
+        if (tag.type_idx != std.math.maxInt(u32)) {
+            if (tag.type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+            switch (m.module_types.items[tag.type_idx]) {
+                .func_type => {},
+                else => return error.InvalidTypeIndex,
+            }
+        }
     }
 }
 
