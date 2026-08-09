@@ -1531,11 +1531,19 @@ const Parser = struct {
                         if (ft.params.len != params_list.items.len or ft.results.len != results_list.items.len) {
                             self.malformed = true;
                         } else {
-                            for (ft.params, params_list.items) |a, b| {
+                            // The concrete type index is part of the type: an
+                            // inline `(ref $b)` does not match a referenced
+                            // `(ref $a)` even though both are the same
+                            // `ValType`.
+                            for (ft.params, params_list.items, 0..) |a, b, k| {
                                 if (a != b) self.malformed = true;
+                                if (Mod.FuncSignature.concreteIdxAt(ft.param_type_idxs, k) !=
+                                    Mod.FuncSignature.concreteIdxAt(param_tidxs_list.items, k)) self.malformed = true;
                             }
-                            for (ft.results, results_list.items) |a, b| {
+                            for (ft.results, results_list.items, 0..) |a, b, k| {
                                 if (a != b) self.malformed = true;
+                                if (Mod.FuncSignature.concreteIdxAt(ft.result_type_idxs, k) !=
+                                    Mod.FuncSignature.concreteIdxAt(result_tidxs_list.items, k)) self.malformed = true;
                             }
                         }
                     },
@@ -4461,7 +4469,7 @@ const Parser = struct {
     /// list means the remaining entries are abstract, which is how types
     /// built without index tracking are represented.
     fn concreteIdxAt(tidxs: []const u32, idx: usize) u32 {
-        return if (idx < tidxs.len) tidxs[idx] else 0xFFFFFFFF;
+        return Mod.FuncSignature.concreteIdxAt(tidxs, idx);
     }
 
     fn findOrAddFuncTypeWithTidxs(self: *Parser, module: *Mod.Module, params: []const types.ValType, results: []const types.ValType, param_tidxs: []const u32, result_tidxs: []const u32) u32 {
@@ -6668,4 +6676,85 @@ test "a try_table catch label is resolved outside the try_table" {
     defer inner.deinit();
     const code = inner.funcs.items[0].code_bytes;
     try std.testing.expectEqualSlices(u8, &.{ 0x0c, 0x01 }, code[7..9]);
+}
+
+test "two functions whose params differ only in the referenced type get different types" {
+    // `(ref $a)` and `(ref $b)` are the same `ValType`, so deduplicating a
+    // function declaration on value types alone gave the second function the
+    // first one's signature -- a module that still validates, with a
+    // different meaning than the source.
+    const allocator = std.testing.allocator;
+    var m = try parseModule(allocator,
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (type $b (func (param f64)))
+        \\  (func (param (ref $a)) (unreachable))
+        \\  (func (param (ref $b)) (unreachable))
+        \\)
+    );
+    defer m.deinit();
+    const f0 = m.funcs.items[0].decl.type_var.index;
+    const f1 = m.funcs.items[1].decl.type_var.index;
+    try std.testing.expect(f0 != f1);
+    try std.testing.expectEqual(@as(u32, 0), m.module_types.items[f0].func_type.param_type_idxs[0]);
+    try std.testing.expectEqual(@as(u32, 1), m.module_types.items[f1].func_type.param_type_idxs[0]);
+
+    // Results are matched the same way.
+    var r = try parseModule(allocator,
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (type $b (func (param f64)))
+        \\  (func (result (ref $a)) (unreachable))
+        \\  (func (result (ref $b)) (unreachable))
+        \\)
+    );
+    defer r.deinit();
+    try std.testing.expect(r.funcs.items[0].decl.type_var.index != r.funcs.items[1].decl.type_var.index);
+
+    // Two functions that really do share a signature must still share a type.
+    var same = try parseModule(allocator,
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (func (param (ref $a)) (unreachable))
+        \\  (func (param (ref $a)) (unreachable))
+        \\)
+    );
+    defer same.deinit();
+    try std.testing.expectEqual(same.funcs.items[0].decl.type_var.index, same.funcs.items[1].decl.type_var.index);
+}
+
+test "an inline signature must agree with its type reference about referenced types" {
+    // `(func (type $t) (param ...))` restates the signature; the restatement
+    // has to match, and the concrete type a reference points at is part of it.
+    const allocator = std.testing.allocator;
+    const mismatch =
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (type $b (func (param f64)))
+        \\  (type $t (func (param (ref $a))))
+        \\  (func (type $t) (param (ref $b)) (unreachable))
+        \\)
+    ;
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator, mismatch));
+
+    const result_mismatch =
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (type $b (func (param f64)))
+        \\  (type $t (func (result (ref $a))))
+        \\  (func (type $t) (result (ref $b)) (unreachable))
+        \\)
+    ;
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator, result_mismatch));
+
+    // The matching restatement is still accepted.
+    var ok = try parseModule(allocator,
+        \\(module
+        \\  (type $a (func (param i32)))
+        \\  (type $t (func (param (ref $a))))
+        \\  (func (type $t) (param (ref $a)) (unreachable))
+        \\)
+    );
+    defer ok.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ok.funcs.items[0].decl.type_var.index);
 }

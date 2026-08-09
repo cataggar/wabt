@@ -134,9 +134,26 @@ pub const FuncSignature = struct {
     param_type_idxs: []const u32 = &.{},
     result_type_idxs: []const u32 = &.{},
 
+    /// Concrete type index parallel to element `idx`. A shorter or absent
+    /// list means the remaining entries are abstract, which is how a
+    /// signature built without index tracking is represented.
+    pub fn concreteIdxAt(tidxs: []const u32, idx: usize) types.Index {
+        return if (idx < tidxs.len) tidxs[idx] else types.invalid_index;
+    }
+
     pub fn eql(a: FuncSignature, b: FuncSignature) bool {
-        return std.mem.eql(types.ValType, a.params, b.params) and
-            std.mem.eql(types.ValType, a.results, b.results);
+        if (!std.mem.eql(types.ValType, a.params, b.params)) return false;
+        if (!std.mem.eql(types.ValType, a.results, b.results)) return false;
+        // `(ref $a)` and `(ref $b)` are the same `ValType`, so comparing the
+        // value types alone reports two distinct signatures as equal and any
+        // caller deduplicating on that answer hands back the wrong one.
+        for (0..a.params.len) |i| {
+            if (concreteIdxAt(a.param_type_idxs, i) != concreteIdxAt(b.param_type_idxs, i)) return false;
+        }
+        for (0..a.results.len) |i| {
+            if (concreteIdxAt(a.result_type_idxs, i) != concreteIdxAt(b.result_type_idxs, i)) return false;
+        }
+        return true;
     }
 };
 
@@ -525,6 +542,28 @@ test "FuncSignature eql" {
     const c = FuncSignature{ .params = &.{.i32}, .results = &.{} };
     try std.testing.expect(!a.eql(b));
     try std.testing.expect(a.eql(c));
+}
+
+test "FuncSignature eql distinguishes the concrete type a reference points at" {
+    // `(ref $a)` and `(ref $b)` share a `ValType`; only the parallel index
+    // array tells them apart.
+    const ref_a = FuncSignature{ .params = &.{.concrete_ref}, .param_type_idxs = &.{0} };
+    const ref_b = FuncSignature{ .params = &.{.concrete_ref}, .param_type_idxs = &.{1} };
+    const ref_a2 = FuncSignature{ .params = &.{.concrete_ref}, .param_type_idxs = &.{0} };
+    try std.testing.expect(!ref_a.eql(ref_b));
+    try std.testing.expect(ref_a.eql(ref_a2));
+
+    const res_a = FuncSignature{ .results = &.{.concrete_ref}, .result_type_idxs = &.{0} };
+    const res_b = FuncSignature{ .results = &.{.concrete_ref}, .result_type_idxs = &.{1} };
+    try std.testing.expect(!res_a.eql(res_b));
+
+    // An absent index list means "abstract", so it must compare equal to an
+    // explicit list of sentinels rather than being treated as different.
+    const abstract = FuncSignature{ .params = &.{.i32}, .param_type_idxs = &.{} };
+    const sentinels = FuncSignature{ .params = &.{.i32}, .param_type_idxs = &.{types.invalid_index} };
+    try std.testing.expect(abstract.eql(sentinels));
+    // ...and a concrete index is still distinct from an absent one.
+    try std.testing.expect(!ref_a.eql(FuncSignature{ .params = &.{.concrete_ref} }));
 }
 
 test "Module import helpers" {
