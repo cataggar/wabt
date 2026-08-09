@@ -48,37 +48,104 @@ const WatWriter = struct {
     // ── Section writers ─────────────────────────────────────────────────
 
     fn writeTypes(self: *WatWriter, module: *const Mod.Module) WriteError!void {
-        for (module.module_types.items, 0..) |entry, i| {
-            try self.writeIndent();
-            try self.append("(type (;");
-            try self.writeU32(@intCast(i));
-            try self.append(";) ");
-            switch (entry) {
-                .func_type => |ft| {
-                    try self.append("(func");
-                    if (ft.params.len > 0) {
-                        try self.append(" (param");
-                        for (ft.params) |p| {
-                            try self.appendByte(' ');
-                            try self.writeValType(p);
-                        }
-                        try self.appendByte(')');
-                    }
-                    if (ft.results.len > 0) {
-                        try self.append(" (result");
-                        for (ft.results) |r| {
-                            try self.appendByte(' ');
-                            try self.writeValType(r);
-                        }
-                        try self.appendByte(')');
+        var i: usize = 0;
+        while (i < module.module_types.items.len) {
+            const meta = self.typeMeta(module, i);
+            // A recursion group is printed as one `(rec ...)` holding its
+            // members; the grouping is part of the type's identity, so it
+            // cannot be flattened away. A group of one is indistinguishable
+            // from a standalone type in the IR today -- the parser gives every
+            // type its own group id for canonicalisation -- so only real
+            // groups are wrapped, matching what the binary writer emits.
+            if (meta.rec_group_size > 1 and meta.rec_position == 0) {
+                try self.writeIndent();
+                try self.append("(rec");
+                try self.newline();
+                self.indent += 1;
+                for (0..meta.rec_group_size) |k| {
+                    try self.writeOneType(module, i + k);
+                }
+                self.indent -= 1;
+                try self.writeIndent();
+                try self.append(")");
+                try self.newline();
+                i += meta.rec_group_size;
+            } else {
+                try self.writeOneType(module, i);
+                i += 1;
+            }
+        }
+    }
+
+    fn typeMeta(_: *WatWriter, module: *const Mod.Module, idx: usize) Mod.TypeMeta {
+        return if (idx < module.type_meta.items.len) module.type_meta.items[idx] else .{};
+    }
+
+    fn writeOneType(self: *WatWriter, module: *const Mod.Module, idx: usize) WriteError!void {
+        const meta = self.typeMeta(module, idx);
+        try self.writeIndent();
+        try self.append("(type (;");
+        try self.writeU32(@intCast(idx));
+        try self.append(";) ");
+
+        // `sub` wraps the structural type and names any supertype. A final
+        // type with no supertype adds nothing, so it is left off.
+        const has_sub = meta.is_sub or !meta.is_final or meta.parent != types.invalid_index;
+        if (has_sub) {
+            try self.append("(sub ");
+            if (meta.is_final) try self.append("final ");
+            if (meta.parent != types.invalid_index) {
+                try self.writeU32(meta.parent);
+                try self.appendByte(' ');
+            }
+        }
+
+        switch (module.module_types.items[idx]) {
+            .func_type => |ft| {
+                try self.append("(func");
+                if (ft.params.len > 0) {
+                    try self.append(" (param");
+                    for (ft.params, 0..) |p, k| {
+                        try self.appendByte(' ');
+                        try self.writeValTypeWithTidx(p, Mod.FuncSignature.concreteIdxAt(ft.param_type_idxs, k));
                     }
                     try self.appendByte(')');
-                },
-                else => try self.append("(unknown)"),
-            }
-            try self.appendByte(')');
-            try self.newline();
+                }
+                if (ft.results.len > 0) {
+                    try self.append(" (result");
+                    for (ft.results, 0..) |r, k| {
+                        try self.appendByte(' ');
+                        try self.writeValTypeWithTidx(r, Mod.FuncSignature.concreteIdxAt(ft.result_type_idxs, k));
+                    }
+                    try self.appendByte(')');
+                }
+                try self.appendByte(')');
+            },
+            .struct_type => |st| {
+                try self.append("(struct");
+                for (st.fields.items) |f| {
+                    try self.append(" (field ");
+                    try self.writeFieldType(f);
+                    try self.appendByte(')');
+                }
+                try self.appendByte(')');
+            },
+            .array_type => |at| {
+                try self.append("(array ");
+                try self.writeFieldType(at.field);
+                try self.appendByte(')');
+            },
         }
+
+        if (has_sub) try self.appendByte(')');
+        try self.appendByte(')');
+        try self.newline();
+    }
+
+    fn writeFieldType(self: *WatWriter, field: Mod.TypeEntry.StructType.Field) WriteError!void {
+        if (field.mutable) try self.append("(mut ");
+        try self.writeValTypeWithTidx(field.@"type", field.type_idx);
+        if (field.mutable) try self.appendByte(')');
     }
 
     fn writeImports(self: *WatWriter, module: *const Mod.Module) WriteError!void {
@@ -104,16 +171,16 @@ const WatWriter = struct {
                     try self.appendByte(' ');
                     try self.writeLimits(t.limits);
                     try self.appendByte(' ');
-                    try self.writeValType(t.elem_type);
+                    try self.writeValTypeWithTidx(t.elem_type, imp.table_type_idx);
                 },
                 .global => if (imp.global) |g| {
                     try self.appendByte(' ');
                     if (g.mutability == .mutable) {
                         try self.append("(mut ");
-                        try self.writeValType(g.val_type);
+                        try self.writeValTypeWithTidx(g.val_type, imp.global_type_idx);
                         try self.appendByte(')');
                     } else {
-                        try self.writeValType(g.val_type);
+                        try self.writeValTypeWithTidx(g.val_type, imp.global_type_idx);
                     }
                 },
                 .tag => {},
@@ -141,10 +208,10 @@ const WatWriter = struct {
             if (func.local_types.items.len > 0) {
                 self.indent += 1;
                 try self.newline();
-                for (func.local_types.items) |lt| {
+                for (func.local_types.items, 0..) |lt, k| {
                     try self.writeIndent();
                     try self.append("(local ");
-                    try self.writeValType(lt);
+                    try self.writeValTypeWithTidx(lt, Mod.FuncSignature.concreteIdxAt(func.local_type_idxs.items, k));
                     try self.appendByte(')');
                 }
                 self.indent -= 1;
@@ -162,7 +229,7 @@ const WatWriter = struct {
             try self.append(";) ");
             try self.writeLimits(table.type.limits);
             try self.appendByte(' ');
-            try self.writeValType(table.type.elem_type);
+            try self.writeValTypeWithTidx(table.type.elem_type, table.type_idx);
             try self.appendByte(')');
             try self.newline();
         }
@@ -188,10 +255,10 @@ const WatWriter = struct {
             try self.append(";) ");
             if (global.type.mutability == .mutable) {
                 try self.append("(mut ");
-                try self.writeValType(global.type.val_type);
+                try self.writeValTypeWithTidx(global.type.val_type, global.type_idx);
                 try self.append(") ");
             } else {
-                try self.writeValType(global.type.val_type);
+                try self.writeValTypeWithTidx(global.type.val_type, global.type_idx);
                 try self.appendByte(' ');
             }
             try self.writeDefaultInitExpr(global.type.val_type);
@@ -285,8 +352,23 @@ const WatWriter = struct {
         }
     }
 
-    fn writeValType(self: *WatWriter, vt: types.ValType) WriteError!void {
-        try self.append(vt.name());
+    /// A value type together with the concrete type index it refers to, if it
+    /// has one. `ValType.name` cannot render `(ref $t)` on its own because the
+    /// index is held out-of-line, so it falls back to a `<typeidx>` placeholder
+    /// that is not valid wat.
+    fn writeValTypeWithTidx(self: *WatWriter, vt: types.ValType, type_idx: u32) WriteError!void {
+        switch (vt) {
+            .concrete_ref, .concrete_ref_null => {
+                if (type_idx == types.invalid_index) {
+                    try self.append(vt.name());
+                    return;
+                }
+                try self.append(if (vt == .concrete_ref_null) "(ref null " else "(ref ");
+                try self.writeU32(type_idx);
+                try self.appendByte(')');
+            },
+            else => try self.append(vt.name()),
+        }
     }
 
     fn writeLimits(self: *WatWriter, limits: types.Limits) WriteError!void {
@@ -408,4 +490,98 @@ test "write module with data" {
     const wat = try writeModule(alloc, &module);
     defer alloc.free(wat);
     try std.testing.expect(std.mem.indexOf(u8, wat, "(data") != null);
+}
+
+/// Round-trips a module through the binary reader and back out as text, which
+/// is the path `wabt text print` takes.
+fn printBinary(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var module = try @import("../binary/reader.zig").readModule(alloc, bytes);
+    defer module.deinit();
+    return writeModule(alloc, &module);
+}
+
+test "struct and array types print as themselves" {
+    const alloc = std.testing.allocator;
+
+    // (module (type (struct (field i32) (field (mut f64)))))
+    const struct_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x5f, 0x02, 0x7f, 0x00, 0x7c, 0x01,
+    };
+    const st = try printBinary(alloc, &struct_bytes);
+    defer alloc.free(st);
+    try std.testing.expect(std.mem.indexOf(u8, st, "(struct (field i32) (field (mut f64)))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, st, "unknown") == null);
+
+    // (module (type (array (mut i8))))
+    const array_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x5e, 0x78, 0x01,
+    };
+    const at = try printBinary(alloc, &array_bytes);
+    defer alloc.free(at);
+    try std.testing.expect(std.mem.indexOf(u8, at, "(array (mut i8))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, at, "unknown") == null);
+}
+
+test "a concrete reference prints the type index it names" {
+    const alloc = std.testing.allocator;
+    // (module (type (func)) (type (func (param (ref 0)) (result (ref null 0)))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0b, 0x02,
+        0x60, 0x00, 0x00,
+        0x60, 0x01, 0x64, 0x00, 0x01, 0x63, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    // The index lives out-of-line, so printing the value type alone yields a
+    // `<typeidx>` placeholder that is not valid wat.
+    try std.testing.expect(std.mem.indexOf(u8, wat, "typeidx") == null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(param (ref 0))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(result (ref null 0))") != null);
+}
+
+test "sub types print their finality and supertype" {
+    const alloc = std.testing.allocator;
+    // (module (type (sub (struct (field i32))))
+    //         (type (sub 0 (struct (field i32) (field f64)))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x10, 0x02,
+        0x50, 0x00, 0x5f, 0x01, 0x7f, 0x00,
+        0x50, 0x01, 0x00, 0x5f, 0x02, 0x7f, 0x00, 0x7c, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(sub (struct (field i32)))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(sub 0 (struct (field i32) (field f64)))") != null);
+
+    // A plain type carries no `sub` wrapper at all.
+    const plain = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+    };
+    const plain_wat = try printBinary(alloc, &plain);
+    defer alloc.free(plain_wat);
+    try std.testing.expect(std.mem.indexOf(u8, plain_wat, "sub") == null);
+}
+
+test "a recursion group prints as one rec holding its members" {
+    const alloc = std.testing.allocator;
+    // (module (rec (type (struct (field (ref null 1))))
+    //              (type (struct (field (ref null 0))))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x0d, 0x01, 0x4e, 0x02,
+        0x5f, 0x01, 0x63, 0x01, 0x00,
+        0x5f, 0x01, 0x63, 0x00, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(rec") != null);
+    // Both members sit inside the one group, and each names the other.
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(struct (field (ref null 1)))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(struct (field (ref null 0)))") != null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wat, "(rec"));
 }
