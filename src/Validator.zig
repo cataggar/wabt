@@ -17,6 +17,10 @@ pub const Error = error{
     InvalidMemoryIndex,
     InvalidGlobalIndex,
     InvalidTagIndex,
+    /// A `try_table` catch clause used a byte other than the four defined
+    /// clause kinds (0x00 catch, 0x01 catch_ref, 0x02 catch_all,
+    /// 0x03 catch_all_ref).
+    InvalidCatchKind,
     InvalidElemIndex,
     InvalidDataIndex,
     InvalidLimits,
@@ -1077,6 +1081,12 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 // the block in the polymorphic stack-typing regime.
                 setUnreachable(&val_stack, &ctrl_stack);
             },
+            0x0a => { // throw_ref
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.exnref));
+                // Rethrowing transfers control to a handler, so like `throw`
+                // nothing after it in this block is reached.
+                setUnreachable(&val_stack, &ctrl_stack);
+            },
             0x0b => { // end
                 if (ctrl_stack.items.len == 0) break;
                 const frame = ctrl_stack.items[ctrl_stack.items.len - 1];
@@ -1223,6 +1233,46 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.fromRefType(types.RefType.concrete(true, type_idx)));
                 try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], funcParams(ft));
                 setUnreachable(&val_stack, &ctrl_stack);
+            },
+            0x1f => { // try_table
+                const bt = readBlockType(m, bytes, &pos);
+                const clause_count = readU32(bytes, &pos);
+                // The catch clauses are checked against the *enclosing*
+                // label stack. `try_table`'s own frame is not pushed until
+                // afterwards, because a clause's label index is resolved in
+                // the context surrounding the instruction, not inside it --
+                // `(block $l (try_table (catch_all $l) ...))` encodes depth
+                // 0, not 1.
+                var ci: u32 = 0;
+                while (ci < clause_count) : (ci += 1) {
+                    if (pos >= bytes.len) return error.UnexpectedEnd;
+                    const kind = bytes[pos];
+                    pos += 1;
+                    // catch and catch_ref name a tag; catch_all and
+                    // catch_all_ref do not.
+                    const params: TypeSeq = switch (kind) {
+                        0x00, 0x01 => blk: {
+                            const tag_idx = readU32(bytes, &pos);
+                            if (tag_idx >= m.tags.items.len) return error.InvalidTagIndex;
+                            break :blk tagParams(m, m.tags.items[tag_idx]);
+                        },
+                        0x02, 0x03 => TypeSeq{},
+                        else => return error.InvalidCatchKind,
+                    };
+                    // The _ref variants additionally hand the label the
+                    // caught exception itself.
+                    const with_exnref = kind == 0x01 or kind == 0x03;
+                    const depth = readU32(bytes, &pos);
+                    if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+                    const target = ctrl_stack.items[ctrl_stack.items.len - 1 - depth];
+                    try checkCatchLabel(m, &target, params, with_exnref);
+                }
+                // From here on `try_table` behaves exactly like `block`.
+                if (bt.params.len() > 0)
+                    try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
+                pushCtrl(&ctrl_stack, &val_stack, 0x1f, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
+                ctrl_stack.items[ctrl_stack.items.len - 1].saved_init = packInitState(local_inited);
+                pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x1a => { // drop
                 _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
@@ -1620,24 +1670,36 @@ fn readBlockType(m: *const Mod.Module, bytes: []const u8, pos: *usize) BlockType
     return .{ .params = .{}, .results = .{} };
 }
 
-// Reusable single-element type slices for block types
-const single_i32: [1]types.ValType = .{.i32};
-const single_i64: [1]types.ValType = .{.i64};
-const single_f32: [1]types.ValType = .{.f32};
-const single_f64: [1]types.ValType = .{.f64};
-const single_funcref: [1]types.ValType = .{.funcref};
-const single_externref: [1]types.ValType = .{.externref};
+/// Reusable single-element type slices for block types, one per value type
+/// with a single-byte encoding.
+///
+/// Built from `types.ValType` rather than listed by hand: the hand-written
+/// list covered only i32/i64/f32/f64/funcref/externref, and every other
+/// single-byte block type -- `exnref`, `anyref`, `eqref`, `i31ref`,
+/// `structref`, `arrayref` and the four null bottoms -- fell through to the
+/// empty slice. A block declared to return one of those was validated as
+/// returning nothing at all.
+const single_val_types = blk: {
+    var table: [256]?[1]types.ValType = @splat(null);
+    for (@typeInfo(types.ValType).@"enum".fields) |f| {
+        // Negative discriminants are the internal non-nullable forms, which
+        // have no single-byte encoding. The composite markers (`func`,
+        // `struct`, `array`) and the GC packed types (`i8`, `i16`) do have
+        // one, but only inside a type section -- never as a block type.
+        if (f.value < 0 or f.value > 0xff) continue;
+        const vt: types.ValType = @enumFromInt(f.value);
+        switch (vt) {
+            .func, .struct_, .array, .i8, .i16 => continue,
+            else => {},
+        }
+        table[@as(usize, f.value)] = .{vt};
+    }
+    break :blk table;
+};
 
 fn valTypeSlice(byte: u8) []const types.ValType {
-    return switch (byte) {
-        0x7f => &single_i32,
-        0x7e => &single_i64,
-        0x7d => &single_f32,
-        0x7c => &single_f64,
-        0x70 => &single_funcref,
-        0x6f => &single_externref,
-        else => &.{},
-    };
+    if (single_val_types[byte]) |*one| return one;
+    return &.{};
 }
 
 fn readU32(bytes: []const u8, pos: *usize) u32 {
@@ -1751,6 +1813,27 @@ fn checkTailCallResults(
         const b = func_results.at(i);
         if (a.vt != b.vt or a.type_idx != b.type_idx) return error.TypeMismatch;
     }
+}
+
+/// A `try_table` catch clause hands its label a fixed list of values: the
+/// tag's parameters, plus the caught exception for the `_ref` variants. The
+/// label has to accept exactly that many, each a supertype of what arrives --
+/// the same rule `br` uses, which is why `(ref func)` may be delivered to a
+/// `funcref` label but not the reverse.
+fn checkCatchLabel(
+    m: *const Mod.Module,
+    target: *const CtrlFrame,
+    delivered: TypeSeq,
+    with_exnref: bool,
+) Error!void {
+    const lt = labelTypes(target);
+    const expected_len = delivered.len() + @intFromBool(with_exnref);
+    if (lt.len() != expected_len) return error.TypeMismatch;
+    for (0..delivered.len()) |i| {
+        if (!delivered.at(i).isSubtypeOf(m, lt.at(i))) return error.TypeMismatch;
+    }
+    if (with_exnref and !StackType.known(.exnref).isSubtypeOf(m, lt.at(expected_len - 1)))
+        return error.TypeMismatch;
 }
 
 fn labelTypes(frame: *const CtrlFrame) TypeSeq {
@@ -2892,10 +2975,10 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     // The two lists are deliberately separate. `modern_eh_todo` is a backlog
     // that issue #356 empties; `legacy_eh_opcodes` is a decision that stays,
     // so the work of clearing the first must never quietly erode the second.
-    const modern_eh_todo = [_]u8{
-        0x0a, // throw_ref
-        0x1f, // try_table
-    };
+    // Issue #356 emptied this. It stays as a named, documented anchor:
+    // a future EH-adjacent opcode that lands without a validator arm should
+    // be listed here deliberately rather than slipped past the guard.
+    const modern_eh_todo = [_]u8{};
     const alloc = std.testing.allocator;
     var checked: usize = 0;
     inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
@@ -3722,18 +3805,24 @@ test "the legacy EH list names the legacy EH instructions and nothing else" {
     }
 }
 
-test "the standardised EH instructions are still a backlog item, not declined" {
-    // `throw_ref` and `try_table` are the form wabt intends to support, so
-    // they must keep reporting `UnsupportedOpcode` until their arms land.
-    // Conflating them with the legacy set would quietly convert the
-    // remaining work in issue #356 into a decision not to do it. `throw`
-    // has landed and is deliberately absent.
+test "the standardised EH instructions all reach a real validator arm" {
+    // Issue #356 is done when none of `throw`, `throw_ref` or `try_table`
+    // comes back as UnsupportedOpcode. A bare opcode byte is not a
+    // well-typed body, so some other error is expected -- what matters is
+    // that the validator recognises the instruction. The legacy set must
+    // stay separately declined; clearing this backlog must not erode it.
     const alloc = std.testing.allocator;
-    for ([_]u8{ 0x0a, 0x1f }) |op| {
+    for ([_]u8{ 0x08, 0x0a, 0x1f }) |op| {
         const body = [_]u8{ op, 0x0b };
         var module = try testModuleWithBody(alloc, &body);
         defer module.deinit();
-        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+        if (validate(&module, .{})) |_| {} else |err| switch (err) {
+            error.UnsupportedOpcode, error.UnknownOpcode, error.LegacyExceptionsUnsupported => {
+                std.debug.print("EH opcode 0x{x:0>2} is still unhandled\n", .{op});
+                return error.TestUnexpectedResult;
+            },
+            else => {},
+        }
     }
 }
 
@@ -3867,4 +3956,200 @@ test "throw resolves a tag parameter's concrete type index" {
     );
     defer mismatched.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&mismatched, .{}));
+}
+
+test "throw_ref pops an exnref and makes the rest unreachable" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    // Nothing produces the i32; `throw_ref` has to leave the block
+    // polymorphic for this to type-check.
+    var ok = try Parser.parseModule(alloc,
+        \\(module (func (param exnref) (result i32) (local.get 0) (throw_ref)))
+    );
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    var wrong = try Parser.parseModule(alloc,
+        \\(module (func (param i32) (local.get 0) (throw_ref)))
+    );
+    defer wrong.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong, .{}));
+
+    var empty = try Parser.parseModule(alloc,
+        \\(module (func (throw_ref)))
+    );
+    defer empty.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&empty, .{}));
+}
+
+test "try_table catch delivers the tag's parameters to its label" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var ok = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32))
+        \\  (func (block $l (result i32)
+        \\    (try_table (result i32) (catch $e $l) (i32.const 0))) (drop)))
+    );
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    // Label takes an f32 where the tag delivers an i32. Both are one-element
+    // labels, so only a type-aware check rejects this.
+    var wrong_type = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32))
+        \\  (func (block $l (result f32)
+        \\    (try_table (result f32) (catch $e $l) (f32.const 0))) (drop)))
+    );
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong_type, .{}));
+
+    // catch_all delivers nothing, so a label expecting a value is wrong.
+    var all_with_results = try Parser.parseModule(alloc,
+        \\(module (tag $e)
+        \\  (func (block $l (result i32)
+        \\    (try_table (result i32) (catch_all $l) (i32.const 0))) (drop)))
+    );
+    defer all_with_results.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&all_with_results, .{}));
+}
+
+test "try_table _ref clauses append an exnref to what the label receives" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var catch_ref = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32))
+        \\  (func (block $l (result i32 exnref)
+        \\    (try_table (result i32 exnref) (catch_ref $e $l)
+        \\      (i32.const 0) (unreachable))) (drop) (drop)))
+    );
+    defer catch_ref.deinit();
+    try validate(&catch_ref, .{});
+
+    // Same clause, label missing the trailing exnref.
+    var missing = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32))
+        \\  (func (block $l (result i32)
+        \\    (try_table (result i32) (catch_ref $e $l) (i32.const 0))) (drop)))
+    );
+    defer missing.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&missing, .{}));
+
+    var catch_all_ref = try Parser.parseModule(alloc,
+        \\(module (tag $e)
+        \\  (func (block $l (result exnref)
+        \\    (try_table (result exnref) (catch_all_ref $l) (unreachable))) (drop)))
+    );
+    defer catch_all_ref.deinit();
+    try validate(&catch_all_ref, .{});
+
+    // catch_all_ref still delivers one value, so an empty label is wrong.
+    var all_ref_empty = try Parser.parseModule(alloc,
+        \\(module (tag $e) (func (block $l (try_table (catch_all_ref $l) (nop)))))
+    );
+    defer all_ref_empty.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&all_ref_empty, .{}));
+}
+
+test "a try_table catch label is resolved in the enclosing context" {
+    // The clause's label index counts from outside `try_table`, not inside
+    // it, so depth 0 here is the enclosing block. Off by one and depth 0
+    // would name `try_table` itself, whose label types are `(result i32)`
+    // rather than the block's `(result i64)` -- distinguishable only because
+    // the two differ.
+    const alloc = std.testing.allocator;
+    //  block(i64) { try_table(i32) catch_all -> depth 0 }
+    const body = [_]u8{
+        0x02, 0x7e, // block (result i64)
+        0x1f, 0x7f, 0x01, 0x02, 0x00, // try_table (result i32), 1 clause: catch_all depth 0
+        0x41, 0x00, // i32.const 0
+        0x0b, // end try_table
+        0x1a, // drop
+        0x42, 0x00, // i64.const 0
+        0x0b, // end block
+        0x1a, // drop
+        0x0b, // end function
+    };
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    // Depth 0 is the i64 block, which catch_all (delivering nothing) cannot
+    // branch to.
+    try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "try_table rejects a bad tag index, label depth and clause kind" {
+    const alloc = std.testing.allocator;
+
+    const bad_tag = [_]u8{ 0x1f, 0x40, 0x01, 0x00, 0x07, 0x00, 0x0b, 0x0b };
+    var m1 = try testModuleWithBody(alloc, &bad_tag);
+    defer m1.deinit();
+    try std.testing.expectError(error.InvalidTagIndex, validate(&m1, .{}));
+
+    const bad_depth = [_]u8{ 0x1f, 0x40, 0x01, 0x02, 0x7f, 0x0b, 0x0b };
+    var m2 = try testModuleWithBody(alloc, &bad_depth);
+    defer m2.deinit();
+    try std.testing.expectError(error.InvalidLabelIndex, validate(&m2, .{}));
+
+    const bad_kind = [_]u8{ 0x1f, 0x40, 0x01, 0x04, 0x00, 0x0b, 0x0b };
+    var m3 = try testModuleWithBody(alloc, &bad_kind);
+    defer m3.deinit();
+    try std.testing.expectError(error.InvalidCatchKind, validate(&m3, .{}));
+
+    const truncated = [_]u8{ 0x1f, 0x40, 0x01 };
+    var m4 = try testModuleWithBody(alloc, &truncated);
+    defer m4.deinit();
+    try std.testing.expectError(error.UnexpectedEnd, validate(&m4, .{}));
+}
+
+test "try_table is otherwise an ordinary block" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var ok = try Parser.parseModule(alloc,
+        \\(module (func (result i64)
+        \\  i32.const 1
+        \\  try_table (param i32) (result i64) drop i64.const 2 end))
+    );
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    // Body does not produce the declared result.
+    var bad = try Parser.parseModule(alloc,
+        \\(module (func (result i64) try_table (result i64) nop end))
+    );
+    defer bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&bad, .{}));
+}
+
+test "a block may return any single-byte value type" {
+    // The block-type table was a hand-written list of six; every other
+    // single-byte type -- exnref, anyref, eqref, i31ref, structref,
+    // arrayref and the four null bottoms -- silently became "no result", so
+    // a block declared to return one was validated as returning nothing.
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { byte: u8, name: []const u8 }{
+        .{ .byte = 0x69, .name = "exnref" },
+        .{ .byte = 0x6e, .name = "anyref" },
+        .{ .byte = 0x6d, .name = "eqref" },
+        .{ .byte = 0x6c, .name = "i31ref" },
+        .{ .byte = 0x6b, .name = "structref" },
+        .{ .byte = 0x6a, .name = "arrayref" },
+        .{ .byte = 0x71, .name = "nullref" },
+        .{ .byte = 0x73, .name = "nullfuncref" },
+        .{ .byte = 0x72, .name = "nullexternref" },
+        .{ .byte = 0x74, .name = "nullexnref" },
+    };
+    for (cases) |c| {
+        // block (result T) { } end -- the empty body cannot supply the
+        // declared result, so this must be rejected.
+        const body = [_]u8{ 0x02, c.byte, 0x0b, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        if (validate(&module, .{})) |_| {
+            std.debug.print("block (result {s}) was validated as returning nothing\n", .{c.name});
+            return error.TestUnexpectedResult;
+        } else |err| try std.testing.expectEqual(error.TypeMismatch, err);
+    }
 }
