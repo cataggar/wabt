@@ -1111,25 +1111,34 @@ test "binary read+write: imported tag signatures round-trip" {
     );
 }
 
-test "text->binary: a defined tag written before an import keeps its own signature" {
-    // The text parser appends tags in source order, so here `$a` (defined)
-    // is `tags.items[0]` and `$b` (imported) is `tags.items[1]`. The import
-    // section used to take its signature from `tags.items[0..num_tag_imports]`
-    // -- i.e. from `$a` -- so the two tags swapped signatures, and both
-    // sections still produced a module that validated.
+test "the writer pairs tag imports by is_import, not by list position" {
+    // Imported and defined tags share one list, so the import section has to
+    // pick out the imported ones. Slicing off the leading `num_tag_imports`
+    // entries only works if imports happen to come first; selecting by
+    // `is_import` holds whatever order the list is in. Built by hand,
+    // because the text parser now rejects the interleaving and the binary
+    // reader cannot produce it.
     const allocator = std.testing.allocator;
-    const Parser = @import("../text/Parser.zig");
-    var module = try Parser.parseModule(allocator,
-        \\(module (tag $a (param i32)) (import "m" "t" (tag $b (param f32))))
-    );
+    var module = Mod.Module{ .allocator = allocator };
     defer module.deinit();
+
+    const i32_params = try allocator.dupe(types.ValType, &.{.i32});
+    const f32_params = try allocator.dupe(types.ValType, &.{.f32});
+    try module.module_types.append(allocator, .{ .func_type = .{ .params = try allocator.dupe(types.ValType, &.{.i32}) } });
+    try module.module_types.append(allocator, .{ .func_type = .{ .params = try allocator.dupe(types.ValType, &.{.f32}) } });
+
+    // Defined tag first, imported tag second.
+    try module.tags.append(allocator, .{ .@"type" = .{ .sig = .{ .params = i32_params } }, .type_idx = 0 });
+    try module.tags.append(allocator, .{ .@"type" = .{ .sig = .{ .params = f32_params } }, .type_idx = 1, .is_import = true });
+    module.num_tag_imports = 1;
+    try module.imports.append(allocator, .{ .module_name = "m", .field_name = "t", .kind = .tag });
 
     const wasm = try writeModule(allocator, &module);
     defer allocator.free(wasm);
     var rt = try reader.readModule(allocator, wasm);
     defer rt.deinit();
 
-    // Decoding puts imports first, so the imported `$b` leads here.
+    // Decoding puts imports first, so the imported f32 tag leads.
     try std.testing.expectEqual(@as(usize, 2), rt.tags.items.len);
     try std.testing.expect(rt.tags.items[0].is_import);
     try std.testing.expectEqualSlices(types.ValType, &.{.f32}, rt.tags.items[0].@"type".sig.params);

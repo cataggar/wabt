@@ -576,6 +576,22 @@ fn funcResults(ft: Mod.FuncSignature) TypeSeq {
     return .{ .vts = ft.results, .type_idxs = ft.result_type_idxs };
 }
 
+/// The types a `throw` of this tag pops. The authoritative signature is the
+/// type section entry: `Tag.@"type".sig` carries the value types but neither
+/// the reader nor the parser fills in the concrete type indices beside them,
+/// so a tag taking a `(ref $t)` is only resolved correctly through
+/// `type_idx`. `checkTags` has already established that the index, when set,
+/// names a function type.
+fn tagParams(m: *const Mod.Module, tag: Mod.Tag) TypeSeq {
+    if (tag.type_idx != std.math.maxInt(u32) and tag.type_idx < m.module_types.items.len) {
+        switch (m.module_types.items[tag.type_idx]) {
+            .func_type => |ft| return funcParams(ft),
+            else => {},
+        }
+    }
+    return .{ .vts = tag.@"type".sig.params, .type_idxs = tag.@"type".sig.param_type_idxs };
+}
+
 fn typeSeqEql(a: TypeSeq, b: TypeSeq) bool {
     if (a.len() != b.len()) return false;
     for (a.vts, 0..) |_, i| {
@@ -1050,6 +1066,16 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 // Restore init state from if entry (else branch didn't execute then)
                 unpackInitState(frame.saved_init, local_inited);
                 pushVals(&val_stack, frame.start_types, gpa(m)) catch return error.OutOfMemory;
+            },
+            0x08 => { // throw
+                const tag_idx = readU32(bytes, &pos);
+                if (tag_idx >= m.tags.items.len) return error.InvalidTagIndex;
+                const params = tagParams(m, m.tags.items[tag_idx]);
+                try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], params);
+                // `throw` transfers control to a handler, so nothing after it
+                // in this block is reached. Like `br`, it leaves the rest of
+                // the block in the polymorphic stack-typing regime.
+                setUnreachable(&val_stack, &ctrl_stack);
             },
             0x0b => { // end
                 if (ctrl_stack.items.len == 0) break;
@@ -2867,7 +2893,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     // that issue #356 empties; `legacy_eh_opcodes` is a decision that stays,
     // so the work of clearing the first must never quietly erode the second.
     const modern_eh_todo = [_]u8{
-        0x08, 0x0a, // throw, throw_ref
+        0x0a, // throw_ref
         0x1f, // try_table
     };
     const alloc = std.testing.allocator;
@@ -3697,12 +3723,13 @@ test "the legacy EH list names the legacy EH instructions and nothing else" {
 }
 
 test "the standardised EH instructions are still a backlog item, not declined" {
-    // `throw`, `throw_ref` and `try_table` are the form wabt intends to
-    // support, so they must keep reporting `UnsupportedOpcode` until their
-    // arms land. Conflating them with the legacy set would quietly convert
-    // the remaining work in issue #356 into a decision not to do it.
+    // `throw_ref` and `try_table` are the form wabt intends to support, so
+    // they must keep reporting `UnsupportedOpcode` until their arms land.
+    // Conflating them with the legacy set would quietly convert the
+    // remaining work in issue #356 into a decision not to do it. `throw`
+    // has landed and is deliberately absent.
     const alloc = std.testing.allocator;
-    for ([_]u8{ 0x08, 0x0a, 0x1f }) |op| {
+    for ([_]u8{ 0x0a, 0x1f }) |op| {
         const body = [_]u8{ op, 0x0b };
         var module = try testModuleWithBody(alloc, &body);
         defer module.deinit();
@@ -3719,4 +3746,125 @@ test "classifyOpcode reports legacy EH separately from the backlog" {
     // legacy error from a prefix-blind byte comparison.
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x06));
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(0xfc, 0x18));
+}
+
+test "throw pops the tag's parameters, in reverse" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var ok = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32 i64))
+        \\  (func (i32.const 1) (i64.const 2) (throw $e)))
+    );
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    // Operands supplied in the wrong order. Both are on the stack and both
+    // are of a type the tag mentions, so only an order-sensitive check
+    // rejects this.
+    var swapped = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32 i64))
+        \\  (func (i64.const 2) (i32.const 1) (throw $e)))
+    );
+    defer swapped.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&swapped, .{}));
+
+    var too_few = try Parser.parseModule(alloc,
+        \\(module (tag $e (param i32 i64))
+        \\  (func (i32.const 1) (throw $e)))
+    );
+    defer too_few.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&too_few, .{}));
+}
+
+test "throw checks the tag it names, not merely some tag" {
+    // Two tags of the same arity whose parameter types differ. Throwing $b
+    // with $a's operand only fails if the tag index is actually resolved;
+    // a check that reached for the wrong tag, or for `tags.items[0]`, would
+    // accept it.
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var wrong = try Parser.parseModule(alloc,
+        \\(module (tag $a (param i32)) (tag $b (param f32))
+        \\  (func (i32.const 1) (throw $b)))
+    );
+    defer wrong.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong, .{}));
+
+    var right = try Parser.parseModule(alloc,
+        \\(module (tag $a (param i32)) (tag $b (param f32))
+        \\  (func (f32.const 1) (throw $b)))
+    );
+    defer right.deinit();
+    try validate(&right, .{});
+}
+
+test "throw resolves an imported tag's signature" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module (import "m" "t" (tag $e (param i64)))
+        \\  (func (i64.const 1) (throw $e)))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+
+    var bad = try Parser.parseModule(alloc,
+        \\(module (import "m" "t" (tag $e (param i64)))
+        \\  (func (i32.const 1) (throw $e)))
+    );
+    defer bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&bad, .{}));
+}
+
+test "throw with an out-of-range tag index is rejected" {
+    const alloc = std.testing.allocator;
+    const body = [_]u8{ 0x08, 0x00, 0x0b }; // throw 0, with no tags declared
+    var module = try testModuleWithBody(alloc, &body);
+    defer module.deinit();
+    try std.testing.expectError(error.InvalidTagIndex, validate(&module, .{}));
+}
+
+test "throw makes the rest of the block unreachable" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    // Nothing produces the i32 result: `throw` has to leave the block in the
+    // polymorphic regime for this to type-check, exactly as `br` does.
+    var module = try Parser.parseModule(alloc,
+        \\(module (tag $e)
+        \\  (func (result i32) (throw $e)))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+}
+
+test "throw resolves a tag parameter's concrete type index" {
+    // The value types alone say `(ref $a)` and `(ref $b)` are both a
+    // non-null concrete ref; only the type index beside them tells the two
+    // apart, and that index lives in the type section, not on the tag. Both
+    // signatures are spelled as explicit `(type ...)` declarations so that
+    // the function's own type is not folded together with the tag's.
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var ok = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $a (func)) (type $b (func (param i32)))
+        \\  (type $ta (func (param (ref $a)))) (type $tb (func (param (ref $b))))
+        \\  (tag $e (type $tb))
+        \\  (func (type $tb) (local.get 0) (throw $e)))
+    );
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    var mismatched = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $a (func)) (type $b (func (param i32)))
+        \\  (type $ta (func (param (ref $a)))) (type $tb (func (param (ref $b))))
+        \\  (tag $e (type $tb))
+        \\  (func (type $ta) (local.get 0) (throw $e)))
+    );
+    defer mismatched.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&mismatched, .{}));
 }
