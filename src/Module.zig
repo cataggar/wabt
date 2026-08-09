@@ -315,6 +315,13 @@ pub const TypeMeta = struct {
     is_sub: bool = false,
     is_final: bool = true,
     parent: u32 = std.math.maxInt(u32),
+    /// Whether this type was declared inside an explicit recursion group.
+    /// `rec_group` cannot answer that: the text parser assigns every
+    /// standalone type its own group id for iso-recursive canonicalisation,
+    /// and `rec_group_size` is 1 for both a lone type and a group of one.
+    /// Under iso-recursive typing those two are not interchangeable, so the
+    /// distinction has to be carried explicitly for the writers to preserve.
+    in_rec_group: bool = false,
     /// Rec group identifier (types in the same rec group share this).
     rec_group: u32 = std.math.maxInt(u32),
     /// Number of types in the rec group.

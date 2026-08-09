@@ -1097,6 +1097,7 @@ const Parser = struct {
                 // Stamp the last added type_meta with rec group info
                 if (module.type_meta.items.len > 0) {
                     var meta = &module.type_meta.items[module.type_meta.items.len - 1];
+                    meta.in_rec_group = true;
                     meta.rec_group = rec_start;
                     meta.rec_group_size = rec_count;
                     meta.rec_position = rec_pos;

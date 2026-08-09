@@ -52,12 +52,10 @@ const WatWriter = struct {
         while (i < module.module_types.items.len) {
             const meta = self.typeMeta(module, i);
             // A recursion group is printed as one `(rec ...)` holding its
-            // members; the grouping is part of the type's identity, so it
-            // cannot be flattened away. A group of one is indistinguishable
-            // from a standalone type in the IR today -- the parser gives every
-            // type its own group id for canonicalisation -- so only real
-            // groups are wrapped, matching what the binary writer emits.
-            if (meta.rec_group_size > 1 and meta.rec_position == 0) {
+            // members; the grouping is part of the type's identity under
+            // iso-recursive typing, so it cannot be flattened away even when
+            // the group holds a single type.
+            if (meta.in_rec_group and meta.rec_position == 0) {
                 try self.writeIndent();
                 try self.append("(rec");
                 try self.newline();
@@ -584,4 +582,29 @@ test "a recursion group prints as one rec holding its members" {
     try std.testing.expect(std.mem.indexOf(u8, wat, "(struct (field (ref null 1)))") != null);
     try std.testing.expect(std.mem.indexOf(u8, wat, "(struct (field (ref null 0)))") != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wat, "(rec"));
+}
+
+test "a group of one keeps its rec wrapper" {
+    const alloc = std.testing.allocator;
+    // (module (rec (type (array (mut (ref null 0))))))
+    // Self-referential, so the group is load-bearing: outside a `rec` the
+    // type could not name itself.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x07, 0x01, 0x4e, 0x01, 0x5e, 0x63, 0x00, 0x01,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, wat, "(rec"));
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(array (mut (ref null 0)))") != null);
+
+    // The same type declared outside a group has a different identity under
+    // iso-recursive typing, so it must not gain a wrapper.
+    const loose = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x01, 0x5e, 0x63, 0x00, 0x01,
+    };
+    const loose_wat = try printBinary(alloc, &loose);
+    defer alloc.free(loose_wat);
+    try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, loose_wat, "(rec"));
 }
