@@ -380,8 +380,14 @@ pub const Module = struct {
     // Count of explicitly declared types (from (type ...) definitions)
     num_declared_types: u32 = 0,
 
-    // Data count section
-    has_data_count: bool = false,
+    // Whether the binary form of this module carries a data count section.
+    // The writer emits one whenever there are data segments, so any module
+    // built in memory has one; only a binary can genuinely lack it, and only
+    // the reader can see that, so the reader is what clears this. It used to
+    // default to false, which meant the text parser -- which has no such
+    // section to parse -- produced modules that appeared to be missing it,
+    // and every `memory.init` and `data.drop` parsed from text was rejected.
+    has_data_count: bool = true,
     data_count: u32 = 0,
 
     // Heap-allocated name strings (e.g. decoded escape sequences in import/export names).

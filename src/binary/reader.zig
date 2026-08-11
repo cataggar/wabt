@@ -56,6 +56,9 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
     var module = Mod.Module.init(allocator);
     errdefer module.deinit();
 
+    // Nothing is known of a data count section until one is read.
+    module.has_data_count = false;
+
     var r = Reader{ .data = bytes, .pos = 8, .allocator = allocator, .module = &module };
     try r.readSections();
 

@@ -286,10 +286,17 @@ fn checkElemSegments(m: *const Mod.Module, options: Options) Error!void {
             const expected = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
             try checkElemExprs(m, seg.elem_expr_bytes, expected, seg.elem_expr_count, options.features);
         }
-        // Validate that func refs in funcref segments actually exist
-        for (seg.elem_var_indices.items) |v| {
-            if (v.index >= m.funcs.items.len)
-                return error.InvalidFuncIndex;
+        // A segment names its elements either as bare function indices or as
+        // expressions, never both. `elem_var_indices` shadows the expression
+        // form lossily -- an element that is `ref.null` has no index, and is
+        // recorded as `maxInt(u32)` -- so reading it as a function index
+        // rejected every segment holding a null. The expressions are the
+        // truth, and `checkElemExprs` above has already checked them.
+        if (seg.elem_expr_count == 0) {
+            for (seg.elem_var_indices.items) |v| {
+                if (v.index >= m.funcs.items.len)
+                    return error.InvalidFuncIndex;
+            }
         }
     }
 }
@@ -604,26 +611,28 @@ fn checkFunctionBodies(m: *const Mod.Module) Error!void {
     var declared = std.AutoHashMapUnmanaged(u32, void){};
     defer declared.deinit(gpa(m));
     for (m.elem_segments.items) |seg| {
-        for (seg.elem_var_indices.items) |v| {
-            declared.put(gpa(m), v.index, {}) catch {};
-        }
-        // Also scan elem_expr_bytes for ref.func instructions
         if (seg.elem_expr_count > 0) {
+            // Walk the expressions rather than the indices shadowing them:
+            // the shadow cannot represent `ref.null` and so records it as
+            // `maxInt(u32)`, which would declare a function that cannot exist.
             var epos: usize = 0;
             while (epos < seg.elem_expr_bytes.len) {
-                const op = seg.elem_expr_bytes[epos];
-                epos += 1;
-                if (op == 0xd2) { // ref.func
-                    const r = leb128.readU32Leb128(seg.elem_expr_bytes[epos..]) catch break;
-                    epos += r.bytes_read;
-                    declared.put(gpa(m), r.value, {}) catch {};
-                } else if (op == 0xd0) { // ref.null
-                    if (epos < seg.elem_expr_bytes.len) epos += 1;
-                } else if (op == 0x0b) { // end
+                if (seg.elem_expr_bytes[epos] == 0x0b) {
+                    epos += 1;
                     continue;
-                } else {
-                    break;
                 }
+                const before = epos;
+                const decoded = instr.decode(seg.elem_expr_bytes, &epos) catch break;
+                if (decoded.prefix == 0 and decoded.code == 0xd2) { // ref.func
+                    const r = leb128.readU32Leb128(seg.elem_expr_bytes[epos..]) catch break;
+                    declared.put(gpa(m), r.value, {}) catch {};
+                }
+                instr.skipImmediates(decoded.shape, seg.elem_expr_bytes, &epos) catch break;
+                if (epos == before) break;
+            }
+        } else {
+            for (seg.elem_var_indices.items) |v| {
+                declared.put(gpa(m), v.index, {}) catch {};
             }
         }
     }
@@ -4600,6 +4609,98 @@ test "a memory's index type is one fact, not two" {
         0x42, 0x00, 0xfe, 0x10, 0x02, 0x00, 0x1a, // i32.atomic.load, drop
         0x0b,
     };
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try validate(&m, .{});
+}
+
+// ── Element and data segment index tests ────────────────────────────────
+
+test "an element expressed as ref.null is not a function index" {
+    const alloc = std.testing.allocator;
+    // A segment naming its elements as expressions carries no function
+    // indices; `elem_var_indices` only shadows them, and cannot express
+    // `ref.null`, which it records as maxInt(u32). Reading that shadow as a
+    // function index rejected every segment holding a null.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    const exprs = [_]u8{ 0xd0, 0x6f, 0x0b }; // ref.null extern, end
+    try m.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .externref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 1,
+        .elem_var_indices = blk: {
+            var list: std.ArrayListUnmanaged(Mod.Var) = .empty;
+            try list.append(alloc, .{ .index = std.math.maxInt(u32) });
+            break :blk list;
+        },
+    });
+    try validate(&m, .{});
+}
+
+test "a function named by an element expression is still bounds checked" {
+    const alloc = std.testing.allocator;
+    // Ignoring the shadow must not mean ignoring the check: the expressions
+    // themselves name functions, and those names must exist.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    const exprs = [_]u8{ 0xd2, 0x07, 0x0b }; // ref.func 7, end
+    try m.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .funcref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 1,
+    });
+    try std.testing.expectError(error.InvalidFuncIndex, validate(&m, .{}));
+}
+
+test "a module built in memory has a data count section" {
+    const alloc = std.testing.allocator;
+    // memory.init and data.drop require the section. The writer emits one
+    // whenever there are data segments, so any module built in memory has
+    // it; the flag used to default to false, so every such instruction
+    // parsed from text was rejected as an invalid data index.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    try m.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 1 } } });
+    try m.data_segments.append(alloc, .{ .kind = .passive });
+    // i32.const 0 x3; memory.init 0; data.drop 0; end
+    const body = [_]u8{
+        0x41, 0x00, 0x41, 0x00, 0x41, 0x00, 0xfc, 0x08, 0x00, 0x00,
+        0xfc, 0x09, 0x00, 0x0b,
+    };
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try validate(&m, .{});
+
+    // A binary that genuinely lacks the section is still rejected, so the
+    // rule was relaxed for modules the reader never saw, not abandoned.
+    m.has_data_count = false;
+    try std.testing.expectError(error.InvalidDataIndex, validate(&m, .{}));
+}
+
+test "a function declared after an unfamiliar element expression is still declared" {
+    const alloc = std.testing.allocator;
+    // ref.func may only name a function some element segment has declared.
+    // Finding those declarations meant scanning the expression bytes for
+    // ref.func by hand, stopping at the first opcode the scan did not know.
+    // A segment beginning with global.get therefore hid every declaration
+    // after it, and a valid ref.func was rejected.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    try m.globals.append(alloc, .{
+        .type = .{ .val_type = .funcref, .mutability = .immutable },
+        .is_import = true,
+    });
+    const exprs = [_]u8{ 0x23, 0x00, 0x0b, 0xd2, 0x00, 0x0b }; // global.get 0; ref.func 0
+    try m.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .funcref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 2,
+    });
+    const body = [_]u8{ 0xd2, 0x00, 0x1a, 0x0b }; // ref.func 0; drop; end
     try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
     try validate(&m, .{});
 }
