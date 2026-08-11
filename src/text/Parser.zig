@@ -4163,7 +4163,6 @@ const Parser = struct {
                 const pages: u64 = if (data_len == 0) 0 else (data_len + page_size - 1) / page_size;
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true, .is_64 = is_memory64 } },
-                    .is_memory64 = is_memory64,
                 });
                 // Create active data segment at offset 0
                 var seg = Mod.DataSegment{};
@@ -4206,7 +4205,6 @@ const Parser = struct {
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
-                    .is_memory64 = is_memory64,
                 });
                 module.num_memory_imports += 1;
                 var import = Mod.Import{
@@ -4234,7 +4232,6 @@ const Parser = struct {
         const limits = try self.parseLimitsTail(is_memory64);
         try module.memories.append(self.allocator, .{
             .@"type" = .{ .limits = limits },
-            .is_memory64 = is_memory64,
         });
     }
 
@@ -4768,7 +4765,6 @@ const Parser = struct {
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
-                    .is_memory64 = is_memory64,
                 });
                 module.num_memory_imports += 1;
             },

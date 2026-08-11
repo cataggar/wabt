@@ -264,10 +264,18 @@ fn checkElemSegments(m: *const Mod.Module, options: Options) Error!void {
         if (seg.kind == .active) {
             if (m.tables.items.len == 0 or seg.table_var.index >= m.tables.items.len)
                 return error.InvalidTableIndex;
-            // Validate offset expression (even if empty — must produce i32)
-            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null, options.features);
-            // Validate elem type matches table type
             const table = m.tables.items[seg.table_var.index];
+            // The offset indexes the table, so it is of the table's index
+            // type. Requiring i32 of every table rejected each segment of a
+            // 64-bit one.
+            try checkConstExpr(
+                m,
+                seg.offset_expr_bytes,
+                StackType.fromValType(table.type.limits.indexType()),
+                null,
+                options.features,
+            );
+            // Validate elem type matches table type
             const elem_type = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
             const table_type = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
             if (!elem_type.isSubtypeOf(m, table_type))
@@ -319,8 +327,16 @@ fn checkDataSegments(m: *const Mod.Module, options: Options) Error!void {
         if (seg.kind == .active) {
             if (m.memories.items.len == 0 or seg.memory_var.index >= m.memories.items.len)
                 return error.InvalidMemoryIndex;
-            // Validate offset expression (even if empty — must produce i32)
-            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null, options.features);
+            // As for element segments, the offset is of the memory's index
+            // type rather than always i32.
+            const memory = m.memories.items[seg.memory_var.index];
+            try checkConstExpr(
+                m,
+                seg.offset_expr_bytes,
+                StackType.fromValType(memory.type.limits.indexType()),
+                null,
+                options.features,
+            );
         }
     }
 }
@@ -532,6 +548,23 @@ fn classifyOpcode(prefix: ?u8, code: u32) Error {
     const tag: Opcode.Code = @enumFromInt(disc);
     if (std.enums.tagName(Opcode.Code, tag) == null) return error.UnknownOpcode;
     return error.UnsupportedOpcode;
+}
+
+// ── Index types ─────────────────────────────────────────────────────────
+
+/// The type that indexes a memory: i64 under memory64, i32 otherwise.
+///
+/// Out-of-range indices answer i32; the caller reports the bad index itself,
+/// and answering here would report it as a type error instead.
+fn memIndexType(m: *const Mod.Module, idx: u32) ValTypeOrUnknown {
+    if (idx >= m.memories.items.len) return .i32;
+    return ValTypeOrUnknown.fromValType(m.memories.items[idx].type.limits.indexType());
+}
+
+/// The type that indexes a table: i64 under table64, i32 otherwise.
+fn tableIndexType(m: *const Mod.Module, idx: u32) ValTypeOrUnknown {
+    if (idx >= m.tables.items.len) return .i32;
+    return ValTypeOrUnknown.fromValType(m.tables.items[idx].type.limits.indexType());
 }
 
 // ── Memory alignment validation ─────────────────────────────────────────
@@ -1387,7 +1420,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             0x25 => { // table.get
                 const idx = readU32(bytes, &pos);
                 if (idx >= m.tables.items.len) return error.InvalidTableIndex;
-                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, idx)));
                 val_stack.append(gpa(m), StackType.fromValTypeAndIndex(m.tables.items[idx].type.elem_type, m.tables.items[idx].type_idx)) catch return error.OutOfMemory;
             },
             0x26 => { // table.set
@@ -1395,7 +1428,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (idx >= m.tables.items.len) return error.InvalidTableIndex;
                 const et = StackType.fromValTypeAndIndex(m.tables.items[idx].type.elem_type, m.tables.items[idx].type_idx);
                 try popExpect(m, &val_stack, &ctrl_stack, et);
-                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, idx)));
             },
             // Memory load instructions
             0x28 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x28); },
@@ -1426,14 +1459,15 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
-                val_stack.append(gpa(m), StackType.known(.i32)) catch return error.OutOfMemory;
+                val_stack.append(gpa(m), StackType.known(memIndexType(m, mem_idx))) catch return error.OutOfMemory;
             },
             0x40 => { // memory.grow
                 if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
-                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
-                val_stack.append(gpa(m), StackType.known(.i32)) catch return error.OutOfMemory;
+                const it = memIndexType(m, mem_idx);
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it));
+                val_stack.append(gpa(m), StackType.known(it)) catch return error.OutOfMemory;
             },
             0x41 => { // i32.const
                 _ = readS32(bytes, &pos);
@@ -1580,6 +1614,8 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         _ = readU32(bytes, &pos); // mem idx
                         if (data_idx >= m.data_segments.items.len) return error.InvalidDataIndex;
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
+                        // Length and source offset index the data segment and
+                        // stay i32; only the destination indexes the memory.
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
@@ -1593,19 +1629,16 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         const dst_mem = readU32(bytes, &pos);
                         const src_mem = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        const dst_m64 = dst_mem < m.memories.items.len and m.memories.items[dst_mem].is_memory64;
-                        const src_m64 = src_mem < m.memories.items.len and m.memories.items[src_mem].is_memory64;
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(if (dst_m64) .i64 else .i32)); // n
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(if (src_m64) .i64 else .i32)); // src
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(if (dst_m64) .i64 else .i32)); // dst
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, dst_mem))); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, src_mem))); // src
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, dst_mem))); // dst
                     },
                     0x0b => { // memory.fill
                         const mem_idx = readU32(bytes, &pos);
                         if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        const m64 = mem_idx < m.memories.items.len and m.memories.items[mem_idx].is_memory64;
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(if (m64) .i64 else .i32)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // n
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // val (always i32)
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(if (m64) .i64 else .i32)); // dst
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // dst
                     },
                     0x0c => { // table.init
                         _ = readU32(bytes, &pos);
@@ -1621,29 +1654,30 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     },
                     0x0f => { // table.grow
                         const tbl_idx = readU32(bytes, &pos);
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, tbl_idx)));
                         if (tbl_idx < m.tables.items.len) {
                             const elem_t = StackType.fromValTypeAndIndex(m.tables.items[tbl_idx].@"type".elem_type, m.tables.items[tbl_idx].type_idx);
                             try popExpect(m, &val_stack, &ctrl_stack, elem_t);
                         } else {
                             _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
                         }
-                        val_stack.append(gpa(m), StackType.known(.i32)) catch return error.OutOfMemory;
+                        val_stack.append(gpa(m), StackType.known(tableIndexType(m, tbl_idx))) catch return error.OutOfMemory;
                     },
                     0x10 => { // table.size
-                        _ = readU32(bytes, &pos);
-                        val_stack.append(gpa(m), StackType.known(.i32)) catch return error.OutOfMemory;
+                        const tbl_idx = readU32(bytes, &pos);
+                        val_stack.append(gpa(m), StackType.known(tableIndexType(m, tbl_idx))) catch return error.OutOfMemory;
                     },
                     0x11 => { // table.fill
                         const tbl_idx = readU32(bytes, &pos);
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                        const it = tableIndexType(m, tbl_idx);
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it));
                         if (tbl_idx < m.tables.items.len) {
                             const elem_t = StackType.fromValTypeAndIndex(m.tables.items[tbl_idx].@"type".elem_type, m.tables.items[tbl_idx].type_idx);
                             try popExpect(m, &val_stack, &ctrl_stack, elem_t);
                         } else {
                             _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
                         }
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it));
                     },
                     else => return classifyOpcode(Opcode.prefix_math, sub),
                 }
@@ -1919,7 +1953,7 @@ fn checkMemLoad(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack:
         if (memarg.align_val > max_align) return error.InvalidAlignment;
     }
     if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
-    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32));
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(memIndexType(m, memarg.mem_idx)));
     val_stack.append(alloc, StackType.known(result_type)) catch return error.OutOfMemory;
 }
 
@@ -1930,7 +1964,7 @@ fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack
     }
     if (m.memories.items.len == 0 or memarg.mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
     try popExpect(m, val_stack, ctrl_stack, StackType.known(value_type));
-    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32));
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(memIndexType(m, memarg.mem_idx)));
 }
 
 
@@ -2069,8 +2103,8 @@ fn checkAtomic(
         i -= 1;
         var expected = sig.params[i];
         // The address operand widens to i64 under memory64.
-        if (i == 0 and sig.imm == .memarg and m.memories.items[mem_idx].is_memory64) {
-            expected = .i64;
+        if (i == 0 and sig.imm == .memarg) {
+            expected = memIndexType(m, mem_idx);
         }
         try popExpect(m, val_stack, ctrl_stack, StackType.known(expected));
     }
@@ -2166,10 +2200,8 @@ fn checkSimd(
         var expected = sig.params[i];
         // The address operand of a memarg form widens to i64 under memory64.
         // It is always the bottom-most operand.
-        if (i == 0 and (sig.imm == .memarg or sig.imm == .memarg_lane) and
-            m.memories.items[mem_idx].is_memory64)
-        {
-            expected = .i64;
+        if (i == 0 and (sig.imm == .memarg or sig.imm == .memarg_lane)) {
+            expected = memIndexType(m, mem_idx);
         }
         try popExpect(m, val_stack, ctrl_stack, StackType.known(expected));
     }
@@ -4392,5 +4424,182 @@ test "an element expression ends where the instruction ends" {
         .elem_expr_count = 2,
         .uses_elem_exprs = true,
     });
+    try validate(&m, .{});
+}
+
+// ── Index type tests ────────────────────────────────────────────────────
+
+/// A module with one memory of the given index type and one function.
+fn testModuleWith64Memory(alloc: std.mem.Allocator, is_64: bool, body: []const u8) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    try module.memories.append(alloc, .{
+        .type = .{ .limits = .{ .initial = 1, .is_64 = is_64 } },
+    });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+/// A module with one table of the given index type and one function.
+fn testModuleWith64Table(alloc: std.mem.Allocator, is_64: bool, body: []const u8) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    try module.tables.append(alloc, .{
+        .type = .{ .elem_type = .funcref, .limits = .{ .initial = 4, .is_64 = is_64 } },
+    });
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+test "a memory address is of the memory's index type" {
+    const alloc = std.testing.allocator;
+    // i64.const 0; i32.load; drop; end
+    const with_i64_addr = [_]u8{ 0x42, 0x00, 0x28, 0x02, 0x00, 0x1a, 0x0b };
+    // i32.const 0; i32.load; drop; end
+    const with_i32_addr = [_]u8{ 0x41, 0x00, 0x28, 0x02, 0x00, 0x1a, 0x0b };
+
+    var m64 = try testModuleWith64Memory(alloc, true, &with_i64_addr);
+    defer m64.deinit();
+    try validate(&m64, .{});
+
+    // The address widens with the memory, so an i32 address no longer suits
+    // a 64-bit one...
+    var narrow = try testModuleWith64Memory(alloc, true, &with_i32_addr);
+    defer narrow.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&narrow, .{}));
+
+    // ...and an i64 address still does not suit a 32-bit one.
+    var m32 = try testModuleWith64Memory(alloc, false, &with_i64_addr);
+    defer m32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m32, .{}));
+
+    var ok32 = try testModuleWith64Memory(alloc, false, &with_i32_addr);
+    defer ok32.deinit();
+    try validate(&ok32, .{});
+
+    // Storing indexes the memory just as loading does.
+    // i64.const 0; i32.const 0; i32.store; end
+    const store_i64_addr = [_]u8{ 0x42, 0x00, 0x41, 0x00, 0x36, 0x02, 0x00, 0x0b };
+    var s64 = try testModuleWith64Memory(alloc, true, &store_i64_addr);
+    defer s64.deinit();
+    try validate(&s64, .{});
+
+    var s32 = try testModuleWith64Memory(alloc, false, &store_i64_addr);
+    defer s32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&s32, .{}));
+}
+
+test "memory.size and memory.grow speak the memory's index type" {
+    const alloc = std.testing.allocator;
+    // memory.size; i64.eqz; drop; end -- i64.eqz only accepts an i64, so it
+    // is what proves the result widened rather than merely being ignored.
+    const size64 = [_]u8{ 0x3f, 0x00, 0x50, 0x1a, 0x0b };
+    var m = try testModuleWith64Memory(alloc, true, &size64);
+    defer m.deinit();
+    try validate(&m, .{});
+
+    var m32 = try testModuleWith64Memory(alloc, false, &size64);
+    defer m32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&m32, .{}));
+
+    // i64.const 1; memory.grow; i64.eqz; drop; end -- grow takes and returns
+    // the index type.
+    const grow64 = [_]u8{ 0x42, 0x01, 0x40, 0x00, 0x50, 0x1a, 0x0b };
+    var g = try testModuleWith64Memory(alloc, true, &grow64);
+    defer g.deinit();
+    try validate(&g, .{});
+}
+
+test "a table index is of the table's index type" {
+    const alloc = std.testing.allocator;
+    // table.size; i64.eqz; drop; end
+    const size64 = [_]u8{ 0xfc, 0x10, 0x00, 0x50, 0x1a, 0x0b };
+    var t = try testModuleWith64Table(alloc, true, &size64);
+    defer t.deinit();
+    try validate(&t, .{});
+
+    var t32 = try testModuleWith64Table(alloc, false, &size64);
+    defer t32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&t32, .{}));
+
+    // i64.const 0; table.get 0; drop; end
+    const get64 = [_]u8{ 0x42, 0x00, 0x25, 0x00, 0x1a, 0x0b };
+    var g = try testModuleWith64Table(alloc, true, &get64);
+    defer g.deinit();
+    try validate(&g, .{});
+
+    var g32 = try testModuleWith64Table(alloc, false, &get64);
+    defer g32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&g32, .{}));
+}
+
+test "a segment offset is of the index type of what it indexes" {
+    const alloc = std.testing.allocator;
+    // The offset indexes the memory or table, so it widens with it. It was
+    // required to be i32 whatever the memory or table said, which rejected
+    // every active segment of a 64-bit one.
+    const off64 = [_]u8{ 0x42, 0x00, 0x0b }; // i64.const 0, end
+    const off32 = [_]u8{ 0x41, 0x00, 0x0b }; // i32.const 0, end
+
+    var mem = Mod.Module.init(alloc);
+    defer mem.deinit();
+    try mem.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 1, .is_64 = true } } });
+    try mem.data_segments.append(alloc, .{ .kind = .active, .offset_expr_bytes = &off64 });
+    try validate(&mem, .{});
+
+    var mem_narrow = Mod.Module.init(alloc);
+    defer mem_narrow.deinit();
+    try mem_narrow.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 1, .is_64 = true } } });
+    try mem_narrow.data_segments.append(alloc, .{ .kind = .active, .offset_expr_bytes = &off32 });
+    try std.testing.expectError(error.TypeMismatch, validate(&mem_narrow, .{}));
+
+    var tbl = Mod.Module.init(alloc);
+    defer tbl.deinit();
+    try tbl.tables.append(alloc, .{
+        .type = .{ .elem_type = .funcref, .limits = .{ .initial = 4, .is_64 = true } },
+    });
+    try tbl.elem_segments.append(alloc, .{ .kind = .active, .offset_expr_bytes = &off64 });
+    try validate(&tbl, .{});
+
+    // A 32-bit memory still wants an i32 offset, so the rule follows the
+    // memory rather than simply being dropped.
+    var mem32 = Mod.Module.init(alloc);
+    defer mem32.deinit();
+    try mem32.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 1 } } });
+    try mem32.data_segments.append(alloc, .{ .kind = .active, .offset_expr_bytes = &off64 });
+    try std.testing.expectError(error.TypeMismatch, validate(&mem32, .{}));
+}
+
+test "a memory's index type is one fact, not two" {
+    const alloc = std.testing.allocator;
+    // `Memory` carried both `is_memory64` and `type.limits.is_64`. The text
+    // parser set both, the binary reader only ever set the second, and the
+    // bulk and vector instructions read only the first -- so a valid module
+    // validated when parsed from text and was rejected when read from the
+    // binary it had just been written to.
+    //
+    // This module is built the way the reader builds one, setting only the
+    // limits. Every instruction below indexes the memory, so if any of them
+    // still consulted a separate flag this would fail.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    try m.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 1, .is_64 = true } } });
+    const body = [_]u8{
+        0x42, 0x00, 0x41, 0x00, 0x42, 0x00, 0xfc, 0x0b, 0x00, // memory.fill
+        0x42, 0x00, 0x42, 0x00, 0x42, 0x00, 0xfc, 0x0a, 0x00, 0x00, // memory.copy
+        0x42, 0x00, 0xfd, 0x00, 0x04, 0x00, 0x1a, // v128.load, drop
+        0x42, 0x00, 0xfe, 0x10, 0x02, 0x00, 0x1a, // i32.atomic.load, drop
+        0x0b,
+    };
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
     try validate(&m, .{});
 }
