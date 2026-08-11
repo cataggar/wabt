@@ -911,9 +911,9 @@ const WatWriter = struct {
             try self.append(";)");
             switch (seg.kind) {
                 .active => {
-                    // The table is only stated when it is not table 0, which
-                    // is what the shorthand form already means.
-                    if (seg.table_var.index != 0) {
+                    // Table 0 can be stated or left implicit, and the two
+                    // encode differently, so follow whichever was read.
+                    if (seg.has_explicit_table_index) {
                         try self.append(" (table ");
                         try self.writeU32(seg.table_var.index);
                         try self.appendByte(')');
@@ -924,7 +924,7 @@ const WatWriter = struct {
                 .declared => try self.append(" declare"),
                 .passive => {},
             }
-            if (seg.elem_expr_count > 0) {
+            if (seg.uses_elem_exprs) {
                 // Expression form: the element type is named, and each entry
                 // is a constant expression rather than a function index.
                 try self.appendByte(' ');
@@ -1657,4 +1657,62 @@ test "an imported tag prints its type and signature" {
     try std.testing.expect(std.mem.indexOf(u8, wat, "(import \"m\" \"f\" (tag (type 1) (param f64)))") != null);
     // An imported tag is not also a defined one.
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wat, "(tag "));
+}
+
+test "an empty element segment keeps its element type" {
+    const alloc = std.testing.allocator;
+    // (module (elem externref)) -- passive, expression form, no elements.
+    // With nothing to print between the parens the element type is the only
+    // thing that says what the segment holds, and an empty list of function
+    // indices is a different segment from an empty list of expressions.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x09, 0x04, 0x01, 0x05, 0x6f, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(elem (;0;) externref)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "func") == null);
+
+    // The same segment written as function indices prints `func`, and the
+    // two forms must not be confused for one another.
+    const idx = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x09, 0x04, 0x01, 0x01, 0x00, 0x00,
+    };
+    const iwat = try printBinary(alloc, &idx);
+    defer alloc.free(iwat);
+    try std.testing.expect(std.mem.indexOf(u8, iwat, "(elem (;0;) func)") != null);
+}
+
+test "an element segment states table 0 only when it was stated" {
+    const alloc = std.testing.allocator;
+    // (module (table 2 funcref) (func) (elem (table 0) (i32.const 0) func 0))
+    // Naming table 0 and leaving it implicit are encoded differently, so a
+    // segment that named it has to keep saying so.
+    const stated = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x02,
+        0x09, 0x09, 0x01, 0x02, 0x00, 0x41, 0x00, 0x0b, 0x00, 0x01, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const swat = try printBinary(alloc, &stated);
+    defer alloc.free(swat);
+    try std.testing.expect(std.mem.indexOf(u8, swat, "(elem (;0;) (table 0) (i32.const 0) func 0)") != null);
+
+    // The implicit form has no table index in it at all.
+    const implied = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x02,
+        0x09, 0x07, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const iwat = try printBinary(alloc, &implied);
+    defer alloc.free(iwat);
+    try std.testing.expect(std.mem.indexOf(u8, iwat, "(elem (;0;) (i32.const 0) func 0)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, iwat, "(elem (;0;) (table") == null);
 }
