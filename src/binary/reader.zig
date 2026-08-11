@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const leb128 = @import("../leb128.zig");
+const instr = @import("instr.zig");
 const types = @import("../types.zig");
 const Mod = @import("../Module.zig");
 
@@ -38,6 +39,9 @@ pub const ReadError = error{
     TooManyLocals,
     SectionTooLarge,
     FunctionCodeMismatch,
+    /// A constant expression holds an opcode whose immediates this crate
+    /// cannot size, so the run cannot be walked to its `end`.
+    UnsupportedOpcode,
     OutOfMemory,
 };
 
@@ -293,26 +297,23 @@ const Reader = struct {
         const start = self.pos;
         var depth: u32 = 0;
         while (true) {
-            const byte = try self.readByte();
-            switch (byte) {
-                0x0b => {
-                    if (depth == 0) return self.data[start..self.pos];
-                    depth -= 1;
-                },
-                0x02, 0x03, 0x04 => depth += 1,
-                0x41 => _ = try self.readS32(),
-                0x42 => _ = try self.readS64(),
-                0x43 => _ = try self.readBytes(4),
-                0x44 => _ = try self.readBytes(8),
-                0x23 => _ = try self.readU32(),
-                // `ref.null`'s operand is a heaptype LEB128, not a value type.
-                // The abbreviated abstract encodings coincide with the value
-                // type bytes, which hid this until concrete indices appeared:
-                // `ref.null 0` is `d0 00`, and an index >= 64 spans two bytes.
-                0xd0 => _ = try self.readS64(),
-                0xd2 => _ = try self.readU32(),
-                else => {},
+            if (self.pos >= self.data.len) return error.UnexpectedEof;
+            const op_start = self.pos;
+            const d = instr.decode(self.data, &self.pos) catch |err| switch (err) {
+                error.TruncatedBody => return error.UnexpectedEof,
+                error.UnsupportedOpcode => return error.UnsupportedOpcode,
+            };
+            if (d.prefix == 0 and d.code == 0x0b) {
+                if (depth == 0) return self.data[start..self.pos];
+                depth -= 1;
+                continue;
             }
+            if (d.prefix == 0 and (d.code == 0x02 or d.code == 0x03 or d.code == 0x04 or d.code == 0x1f)) depth += 1;
+            instr.skipImmediates(d.shape, self.data, &self.pos) catch |err| switch (err) {
+                error.TruncatedBody => return error.UnexpectedEof,
+                error.UnsupportedOpcode => return error.UnsupportedOpcode,
+            };
+            std.debug.assert(self.pos > op_start);
         }
     }
 
