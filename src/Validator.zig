@@ -494,8 +494,10 @@ fn classifyOpcode(prefix: ?u8, code: u32) Error {
 
 // ── Memory alignment validation ─────────────────────────────────────────
 
-/// Return the maximum allowed alignment (as log2) for a memory opcode.
-fn maxAlignmentForOpcode(opcode: u8) ?u32 {
+/// Return the natural alignment (as log2) of a plain memory opcode, which is
+/// both the largest alignment it may state and the one the text format means
+/// when it states none. Null for opcodes that take no memarg.
+pub fn maxAlignmentForOpcode(opcode: u8) ?u32 {
     return switch (opcode) {
         0x28 => 2, // i32.load: 4 bytes
         0x29 => 3, // i64.load: 8 bytes
@@ -1894,7 +1896,7 @@ fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack
 // ── Atomic (0xfe) instruction signatures ────────────────────────────────
 
 /// Shape of the immediate operands that follow an atomic opcode.
-const AtomicImm = enum {
+pub const AtomicImm = enum {
     /// align + optional memory index + offset.
     memarg,
     /// A single reserved byte, which must be zero (atomic.fence).
@@ -1902,7 +1904,7 @@ const AtomicImm = enum {
 };
 
 /// Static type signature of one atomic instruction.
-const AtomicSig = struct {
+pub const AtomicSig = struct {
     /// Operands in stack order, bottom first; popped in reverse.
     params: []const ValTypeOrUnknown,
     results: []const ValTypeOrUnknown,
@@ -1917,7 +1919,7 @@ const AtomicSig = struct {
 ///
 /// Generated from the opcode list in Opcode.zig; the drift-guard test below
 /// asserts the two stay in sync.
-fn atomicSig(sub: u32) ?AtomicSig {
+pub fn atomicSig(sub: u32) ?AtomicSig {
     return switch (sub) {
         0x00 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_notify
         0x01 => .{ .params = &.{.i32, .i32, .i64}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_wait32
@@ -2052,7 +2054,7 @@ const SimdImm = enum {
 };
 
 /// Static type signature of one SIMD instruction.
-const SimdSig = struct {
+pub const SimdSig = struct {
     /// Operands in stack order, bottom first; popped in reverse.
     params: []const ValTypeOrUnknown,
     results: []const ValTypeOrUnknown,
@@ -2132,7 +2134,7 @@ fn checkSimd(
     for (sig.results) |r| val_stack.append(alloc, StackType.known(r)) catch return error.OutOfMemory;
 }
 
-fn simdSig(sub: u32) ?SimdSig {
+pub fn simdSig(sub: u32) ?SimdSig {
     return switch (sub) {
         0x00 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 4 }, // v128_load
         0x01 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load8x8_s

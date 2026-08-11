@@ -11,6 +11,8 @@ const TokenKind = Lex.TokenKind;
 const types = @import("../types.zig");
 const Mod = @import("../Module.zig");
 const leb128 = @import("../leb128.zig");
+const Opcode = @import("../Opcode.zig");
+const Validator = @import("../Validator.zig");
 
 pub const ParseError = error{
     UnexpectedToken,
@@ -3238,20 +3240,27 @@ const Parser = struct {
                     self.emitU32Imm(code);
                 }
             } else {
-                // Prefixed opcode: high byte(s) = prefix, low bits = sub-opcode
-                const prefix: u8 = @truncate(op >> 16);
-                const sub: u32 = if (prefix != 0) op & 0xffff else blk: {
-                    // Legacy encoding: prefix in bits 8-15, sub in bits 0-7
-                    break :blk op & 0xff;
-                };
-                const actual_prefix: u8 = if (prefix != 0) prefix else @truncate(op >> 8);
+                const unpacked = unpackOpcode(op);
+                const sub = unpacked.sub;
+                const actual_prefix = unpacked.prefix;
                 code.append(self.allocator, actual_prefix) catch return;
                 var buf: [5]u8 = undefined;
                 const n = leb128.writeU32Leb128(&buf, sub);
                 code.appendSlice(self.allocator, buf[0..n]) catch return;
-                // Atomic/bulk memory instructions may have memarg or other immediates
-                if (actual_prefix == 0xfe and sub >= 0x10) {
-                    self.emitMemarg(code, 0);
+                if (actual_prefix == 0xfe) {
+                    // The validator already states what each threads opcode
+                    // carries and how it must be aligned, so read it from
+                    // there rather than keeping a second, driftable copy. The
+                    // condition here used to be `sub >= 0x10`, which is wrong
+                    // twice over: it gave `atomic.fence` a memarg instead of
+                    // its reserved byte, and gave notify and wait at 0x00 to
+                    // 0x02 no immediate at all.
+                    if (Validator.atomicSig(sub)) |sig| switch (sig.imm) {
+                        .fence => code.append(self.allocator, 0x00) catch return,
+                        // An atomic must be exactly naturally aligned, so that
+                        // is the alignment to assume when none is written.
+                        .memarg => self.emitMemargAligned(code, sig.align_log2),
+                    };
                 } else if (actual_prefix == 0xfc) {
                     self.emitBulkMemImm(sub, code);
                 } else if (actual_prefix == 0xfd) {
@@ -3343,8 +3352,11 @@ const Parser = struct {
     /// Emit immediates for SIMD (0xfd prefix) instructions.
     fn emitSimdImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
         if (sub <= 0x0b or (sub >= 0x5c and sub <= 0x5d)) {
-            // v128.load/store variants + load_zero: memarg only (no separate mem_idx)
-            self.emitMemarg(code, 0);
+            // v128.load/store variants + load_zero: memarg only (no separate
+            // mem_idx). As above, an omitted `align=` means the natural
+            // alignment, which the validator already records for each.
+            const natural: u8 = if (Validator.simdSig(sub)) |sig| sig.max_align else 0;
+            self.emitMemargAligned(code, natural);
         } else if (sub == 0x0d) {
             // i8x16.shuffle: 16 lane index bytes
             for (0..16) |_| {
@@ -3361,7 +3373,7 @@ const Parser = struct {
             // WAT format: optional "offset=N align=N" then lane_idx
             // Don't use emitMemarg (it may consume the lane integer as memory index).
             // Parse memarg keywords manually.
-            var alignment: u32 = 0;
+            var log2_align: u32 = if (Validator.simdSig(sub)) |sig| sig.max_align else 0;
             var offset: u64 = 0;
             for (0..2) |_| {
                 if (self.peek().kind == .nat_eq) {
@@ -3369,7 +3381,16 @@ const Parser = struct {
                     if (std.mem.startsWith(u8, tok.text, "offset=")) {
                         offset = std.fmt.parseInt(u64, tok.text[7..], 0) catch 0;
                     } else if (std.mem.startsWith(u8, tok.text, "align=")) {
-                        alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch 0;
+                        // `align=` states the alignment itself; what is
+                        // encoded is its log2. Emitting the stated number
+                        // made every naturally aligned lane op look
+                        // wildly over-aligned and be rejected.
+                        const stated = std.fmt.parseInt(u32, tok.text[6..], 0) catch 0;
+                        if (stated == 0 or (stated & (stated - 1)) != 0) {
+                            self.markMalformed(@src());
+                        } else {
+                            log2_align = @ctz(stated);
+                        }
                     }
                 }
             }
@@ -3377,7 +3398,7 @@ const Parser = struct {
             const lane_val = self.parseU32() catch 0;
             // Emit memarg: alignment LEB + offset LEB
             var abuf: [5]u8 = undefined;
-            const an = leb128.writeU32Leb128(&abuf, alignment);
+            const an = leb128.writeU32Leb128(&abuf, log2_align);
             code.appendSlice(self.allocator, abuf[0..an]) catch {};
             var obuf: [5]u8 = undefined;
             const on = leb128.writeU32Leb128(&obuf, @truncate(offset));
@@ -3492,7 +3513,17 @@ const Parser = struct {
     }
 
     fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
-        _ = opcode;
+        // Text that omits `align=` means the natural alignment, not no
+        // alignment. The validator already records the width of every plain
+        // memory instruction, so take it from there.
+        const natural = Validator.maxAlignmentForOpcode(opcode) orelse 0;
+        self.emitMemargAligned(code, @truncate(natural));
+    }
+
+    /// As `emitMemarg`, but with the alignment to assume when the text states
+    /// none, for instructions whose natural alignment is not keyed by a plain
+    /// opcode byte.
+    fn emitMemargAligned(self: *Parser, code: *std.ArrayListUnmanaged(u8), default_log2: u8) void {
         // Parse optional memory index: $name or integer before offset=/align=
         var mem_idx: u32 = 0;
         var has_mem_idx = false;
@@ -3548,7 +3579,7 @@ const Parser = struct {
             }
         }
         // Convert alignment to log2 and validate
-        var log2_align: u32 = 0;
+        var log2_align: u32 = default_log2;
         if (has_align) {
             if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
                 self.markMalformed(@src());
@@ -6239,8 +6270,51 @@ fn opcodeFromText(text: []const u8) ?u32 {
         .{ "i16x8.relaxed_dot_i8x16_i7x16_s", 0xfd_0112 },
         .{ "i32x4.relaxed_dot_i8x16_i7x16_add_s", 0xfd_0113 },
     });
-    return map.get(text);
+    return map.get(text) orelse generated_map.get(text);
 }
+
+/// The parser packs a prefixed opcode as `(prefix << 16) | sub`, while
+/// `Opcode.Code` packs it as the binary format writes it. Convert.
+/// Split a packed opcode into its prefix and sub-opcode.
+///
+/// Two packings are in use: the hand-written table above mostly writes
+/// `(prefix << 8) | sub`, while `packForParser` writes `(prefix << 16) | sub`
+/// so that sub-opcodes wider than a byte fit. Both are read here, so that
+/// whichever table an opcode came from it is taken apart the same way.
+fn unpackOpcode(op: u32) struct { prefix: u8, sub: u32 } {
+    const high: u8 = @truncate(op >> 16);
+    if (high != 0) return .{ .prefix = high, .sub = op & 0xffff };
+    return .{ .prefix = @truncate(op >> 8), .sub = op & 0xff };
+}
+
+fn packForParser(raw: u32) u32 {
+    if (raw <= 0xff) return raw;
+    const prefix: u32 = if (raw <= 0xffff) raw >> 8 else raw >> 12;
+    const sub: u32 = if (raw <= 0xffff) raw & 0xff else raw & 0xfff;
+    return (prefix << 16) | sub;
+}
+
+/// Every opcode `Opcode.Code` can name, keyed by that name.
+///
+/// The table above is kept by hand and had drifted: it was missing all of
+/// the threads atomics and the wide arithmetic, so the parser could not read
+/// back text the writer had just printed. Deriving the rest from the same
+/// enum the writer names instructions with means an opcode added there is
+/// readable as well as printable, rather than only printable.
+const generated_map = blk: {
+    @setEvalBranchQuota(200000);
+    const fields = @typeInfo(Opcode.Code).@"enum".fields;
+    var entries: [fields.len]struct { []const u8, u32 } = undefined;
+    var n: usize = 0;
+    for (fields) |f| {
+        const name = (@as(Opcode.Code, @enumFromInt(f.value))).name();
+        if (std.mem.eql(u8, name, "<unknown>")) continue;
+        entries[n] = .{ name, packForParser(f.value) };
+        n += 1;
+    }
+    const final = entries[0..n].*;
+    break :blk std.StaticStringMap(u32).initComptime(final);
+};
 
 // ── Tests ───────────────────────────────────────────────────────────────
 
@@ -6367,13 +6441,14 @@ test "memory load emits correct memarg without extra mem_idx byte" {
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.funcs.items.len);
     const code = module.funcs.items[0].code_bytes;
-    // Expected: i32.const 0 (41 00), i32.load align=0 offset=0 (28 00 00), end (0b)
+    // Expected: i32.const 0 (41 00), i32.load align=2 offset=0 (28 02 00), end (0b)
     // Total: 6 bytes
     try std.testing.expectEqual(@as(usize, 6), code.len);
     try std.testing.expectEqual(@as(u8, 0x41), code[0]); // i32.const
     try std.testing.expectEqual(@as(u8, 0x00), code[1]); // 0
     try std.testing.expectEqual(@as(u8, 0x28), code[2]); // i32.load
-    try std.testing.expectEqual(@as(u8, 0x00), code[3]); // align=0
+    // Omitting `align=` means the natural alignment, and i32.load is 4 wide.
+    try std.testing.expectEqual(@as(u8, 0x02), code[3]); // align=4
     try std.testing.expectEqual(@as(u8, 0x00), code[4]); // offset=0
     try std.testing.expectEqual(@as(u8, 0x0b), code[5]); // end
 }
@@ -6385,10 +6460,11 @@ test "memory store emits correct memarg" {
     );
     defer module.deinit();
     const code = module.funcs.items[0].code_bytes;
-    // i32.const 0 (41 00), i32.const 42 (41 2a), i32.store align=0 offset=0 (36 00 00), end (0b)
+    // i32.const 0 (41 00), i32.const 42 (41 2a), i32.store align=2 offset=0 (36 02 00), end (0b)
     try std.testing.expectEqual(@as(usize, 8), code.len);
     try std.testing.expectEqual(@as(u8, 0x36), code[4]); // i32.store
-    try std.testing.expectEqual(@as(u8, 0x00), code[5]); // align=0
+    // Omitting `align=` means the natural alignment, and i32.store is 4 wide.
+    try std.testing.expectEqual(@as(u8, 0x02), code[5]); // align=4
     try std.testing.expectEqual(@as(u8, 0x00), code[6]); // offset=0
     try std.testing.expectEqual(@as(u8, 0x0b), code[7]); // end
 }
@@ -6418,8 +6494,10 @@ test "v128.store has correct memarg encoding (no extra mem_idx)" {
     var found = false;
     for (0..code.len) |i| {
         if (i + 1 < code.len and code[i] == 0xfd and code[i + 1] == 0x0b) {
-            // Next two bytes should be memarg: align=0, offset=0
-            try std.testing.expectEqual(@as(u8, 0x00), code[i + 2]); // align
+            // Next two bytes should be memarg: align, offset=0. Omitting
+            // `align=` means the natural alignment, and v128.store is 16
+            // wide, so its align_log2 is 4.
+            try std.testing.expectEqual(@as(u8, 0x04), code[i + 2]); // align=16
             try std.testing.expectEqual(@as(u8, 0x00), code[i + 3]); // offset
             // Byte after offset should be end (0x0b) — NOT another 0x00
             try std.testing.expectEqual(@as(u8, 0x0b), code[i + 4]); // end
@@ -6962,4 +7040,139 @@ test "a position on the first line, and one past the end, still resolve" {
     const past = Diagnostic{ .offset = source.len + 10, .check = "x", .parser_line = 1 };
     try std.testing.expectEqual(@as(u32, 3), past.position(source).line);
     try std.testing.expectEqualStrings(")", past.sourceLine(source));
+}
+
+test "every mnemonic the writer can print, the parser can read back" {
+    // The parser's table of mnemonics was kept by hand while the writer named
+    // instructions from `Opcode.Code`, so the two drifted: 104 modules across
+    // the test corpora printed fine and were then rejected on reparse, every
+    // one of them for a name the writer knew and the parser did not. Deriving
+    // the parser's names from the same enum is what stops that recurring, and
+    // this is the test that holds the two together.
+    var missing: usize = 0;
+    var wrong: usize = 0;
+    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
+        const code: Opcode.Code = @enumFromInt(f.value);
+        const name = code.name();
+        if (!std.mem.eql(u8, name, "<unknown>")) {
+            if (opcodeFromText(name)) |got| {
+                // Resolving is not enough; it has to resolve to this opcode.
+                // `select` is the one name two members share, and the
+                // hand-written entry for it is the one that must win.
+                // Compare what the parser makes of the two, not the packed
+                // words: an opcode reached through the hand-written table is
+                // packed differently from one reached through the generated
+                // one, and both unpack to the same instruction.
+                const want = unpackOpcode(packForParser(f.value));
+                const have = unpackOpcode(got);
+                if ((have.prefix != want.prefix or have.sub != want.sub) and
+                    !std.mem.eql(u8, name, "select"))
+                {
+                    std.debug.print("{s}: got {x}/{x}, expected {x}/{x}\n", .{
+                        name, have.prefix, have.sub, want.prefix, want.sub,
+                    });
+                    wrong += 1;
+                }
+            } else {
+                std.debug.print("no mnemonic for {s}\n", .{name});
+                missing += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), missing);
+    try std.testing.expectEqual(@as(usize, 0), wrong);
+
+    // `select` resolves to the untyped form, not to `select_t`, which shares
+    // its name but takes a type immediate.
+    try std.testing.expectEqual(@as(u32, 0x1b), opcodeFromText("select").?);
+}
+
+test "a threads opcode carries the immediate the validator says it does" {
+    const allocator = std.testing.allocator;
+    // Which immediate a 0xfe opcode takes was decided here by `sub >= 0x10`,
+    // which is wrong twice over: it gave `atomic.fence` a memarg instead of
+    // its reserved byte, and it gave notify and wait no immediate at all.
+    var m = try parseModule(allocator,
+        \\(module
+        \\  (memory 1 1 shared)
+        \\  (func
+        \\    atomic.fence
+        \\    i32.const 0
+        \\    i32.atomic.load
+        \\    drop
+        \\    i32.const 0
+        \\    i64.atomic.load8_u
+        \\    drop))
+    );
+    defer m.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{
+        // atomic.fence takes a single reserved zero byte, not a memarg.
+        0xfe, 0x03, 0x00,
+        0x41, 0x00, // i32.const 0
+        // An atomic must be exactly naturally aligned, so text that omits the
+        // alignment means the natural one, not the unaligned 0 a plain load
+        // defaults to. i32.atomic.load is 4 wide, so its align_log2 is 2.
+        0xfe, 0x10, 0x02, 0x00,
+        0x1a, // drop
+        0x41, 0x00, // i32.const 0
+        // i64.atomic.load8_u reads one byte, so its natural alignment is 0.
+        0xfe, 0x14, 0x00, 0x00,
+        0x1a, // drop
+        0x0b, // end
+    }, m.funcs.items[0].code_bytes);
+}
+
+test "a stated alignment still beats the natural one" {
+    const allocator = std.testing.allocator;
+    // The natural alignment is only the assumption made when the text is
+    // silent. Text that states an alignment must still be taken at its word,
+    // or a module that says something unusual is silently rewritten.
+    var m = try parseModule(allocator,
+        \\(module
+        \\  (memory 1)
+        \\  (func (result i32) i32.const 0 i32.load align=1))
+    );
+    defer m.deinit();
+    const body = m.funcs.items[0].code_bytes;
+    try std.testing.expectEqualSlices(u8, &.{ 0x28, 0x00, 0x00 }, body[2..5]);
+}
+
+test "a lane memarg states its alignment the same way every other one does" {
+    const allocator = std.testing.allocator;
+    // The lane forms parse their memarg on a separate path, and that path
+    // emitted the stated alignment rather than its log2 -- so `align=4` was
+    // encoded as 4, which reads back as an alignment of 16 bytes and was
+    // rejected. It also defaulted to 0 rather than the natural alignment.
+    var m = try parseModule(allocator,
+        \\(module
+        \\  (memory 1)
+        \\  (func (param v128) (result v128)
+        \\    i32.const 0
+        \\    local.get 0
+        \\    v128.load32_lane align=4 0
+        \\    i32.const 0
+        \\    local.get 0
+        \\    v128.load32_lane 1))
+    );
+    defer m.deinit();
+    const body = m.funcs.items[0].code_bytes;
+
+    // align=4 is an alignment of 4 bytes, so log2 is 2 -- not the 4 that was
+    // emitted before.
+    const stated = std.mem.indexOf(u8, body, &.{ 0xfd, 0x56 }).?;
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xfd, 0x56, 0x02, 0x00, 0x00 },
+        body[stated .. stated + 5],
+    );
+
+    // The second one omits `align=`, so it means v128.load32_lane's natural
+    // alignment, which is 4 bytes, and its lane index is 1.
+    const implied = std.mem.indexOf(u8, body[stated + 5 ..], &.{ 0xfd, 0x56 }).? + stated + 5;
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xfd, 0x56, 0x02, 0x00, 0x01 },
+        body[implied .. implied + 5],
+    );
 }
