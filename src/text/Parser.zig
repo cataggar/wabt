@@ -21,8 +21,56 @@ pub const ParseError = error{
 };
 
 /// Parse a WebAssembly text format source into a Module.
+/// Why a module was rejected as malformed, and where.
+///
+/// `error.InvalidModule` is raised by any of several dozen checks and on its
+/// own says nothing about which, so a caller that wants to report something
+/// useful asks for one of these.
+pub const Diagnostic = struct {
+    /// Byte offset into the source of the token the check had just read.
+    offset: usize,
+    /// Name of the parser function that rejected the input.
+    check: []const u8,
+    /// Line in Parser.zig of the check that rejected it.
+    parser_line: u32,
+
+    /// One-based line and column of `offset` within `source`.
+    pub fn position(self: Diagnostic, source: []const u8) struct { line: u32, column: u32 } {
+        var line: u32 = 1;
+        var column: u32 = 1;
+        for (source[0..@min(self.offset, source.len)]) |c| {
+            if (c == '\n') {
+                line += 1;
+                column = 1;
+            } else column += 1;
+        }
+        return .{ .line = line, .column = column };
+    }
+
+    /// The source line `offset` falls on, without its line ending.
+    pub fn sourceLine(self: Diagnostic, source: []const u8) []const u8 {
+        const at = @min(self.offset, source.len);
+        const start = if (std.mem.lastIndexOfScalar(u8, source[0..at], '\n')) |i| i + 1 else 0;
+        const end = std.mem.indexOfScalarPos(u8, source, at, '\n') orelse source.len;
+        return source[start..end];
+    }
+};
+
 pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!Mod.Module {
+    return parseModuleDiag(allocator, source, null);
+}
+
+/// As `parseModule`, but writes to `diagnostic` when the module is rejected as
+/// malformed, so the caller can say where and why rather than only that it was.
+pub fn parseModuleDiag(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    diagnostic: ?*?Diagnostic,
+) ParseError!Mod.Module {
     var p = Parser{ .lexer = Lexer.init(source), .allocator = allocator };
+    errdefer if (diagnostic) |d| {
+        d.* = p.diagnostic;
+    };
     defer p.func_names.deinit(allocator);
     defer p.type_names.deinit(allocator);
     defer p.local_names.deinit(allocator);
@@ -75,7 +123,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         }
         if (p.peek().kind == .invalid) {
             _ = p.advance();
-            p.malformed = true;
+            p.markMalformed(@src());
             continue;
         }
         _ = p.advance(); // consume '('
@@ -116,7 +164,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
         }
         if (p.peek().kind == .invalid) {
             _ = p.advance();
-            p.malformed = true;
+            p.markMalformed(@src());
             continue;
         }
         _ = p.advance(); // consume '('
@@ -151,7 +199,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
                 if (!last.is_import) seen_non_import_def = true;
             },
             .kw_import => {
-                if (seen_non_import_def) p.malformed = true;
+                if (seen_non_import_def) p.markMalformed(@src());
                 try p.parseImport(&module);
             },
             .kw_export => try p.parseExport(&module),
@@ -172,7 +220,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
                 if (!last.is_import) seen_non_import_def = true;
             },
             .invalid => {
-                p.malformed = true;
+                p.markMalformed(@src());
                 try p.skipSExpr();
             },
             else => try p.skipSExpr(),
@@ -185,7 +233,7 @@ pub fn parseModule(allocator: std.mem.Allocator, source: []const u8) ParseError!
     p.skipAnnotations();
     try p.expect(.r_paren);
     // Check for unexpected trailing tokens
-    if (p.peek().kind != .eof) p.malformed = true;
+    if (p.peek().kind != .eof) p.markMalformed(@src());
     if (p.malformed or pass1_malformed) {
         return error.InvalidModule;
     }
@@ -412,6 +460,11 @@ const Parser = struct {
     module: ?*Mod.Module = null,
     /// Set when malformed input is detected (e.g. invalid alignment).
     malformed: bool = false,
+    /// Where the first malformed input was noticed, and by which check.
+    diagnostic: ?Diagnostic = null,
+    /// Offset of the most recently consumed token, which is what a check that
+    /// rejects the input has just looked at.
+    last_offset: usize = 0,
     /// True when parsing inside a (rec ...) group (forward type refs allowed).
     in_rec: bool = false,
     /// Upper bound type index for the current rec group.
@@ -448,11 +501,27 @@ const Parser = struct {
     }
 
     fn advance(self: *Parser) Lex.Token {
-        if (self.peeked) |t| {
+        const tok = if (self.peeked) |t| blk: {
             self.peeked = null;
-            return t;
+            break :blk t;
+        } else self.lexer.next();
+        self.last_offset = tok.offset;
+        return tok;
+    }
+
+    /// Record that the input is malformed, keeping where in the source it was
+    /// noticed and which check noticed it. Only the first is kept: later marks
+    /// are usually consequences of the first, and the earliest one is the one
+    /// worth reporting.
+    fn markMalformed(self: *Parser, src: std.builtin.SourceLocation) void {
+        self.malformed = true;
+        if (self.diagnostic == null) {
+            self.diagnostic = .{
+                .offset = self.last_offset,
+                .check = src.fn_name,
+                .parser_line = src.line,
+            };
         }
-        return self.lexer.next();
     }
 
     fn expect(self: *Parser, kind: TokenKind) ParseError!void {
@@ -564,7 +633,7 @@ const Parser = struct {
 
     /// Check if an identifier is empty (just "$" with no following chars)
     fn checkEmptyId(self: *Parser, text: []const u8) void {
-        if (text.len == 1 and text[0] == '$') self.malformed = true;
+        if (text.len == 1 and text[0] == '$') self.markMalformed(@src());
     }
 
     fn parseValType(self: *Parser) ParseError!types.ValType {
@@ -589,24 +658,24 @@ const Parser = struct {
                     // Validate type index if it's a number
                     if (ht.kind == .integer) {
                         const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
-                            self.malformed = true;
+                            self.markMalformed(@src());
                             try self.expect(.r_paren);
                             return if (nullable) .concrete_ref_null else .concrete_ref;
                         };
                         resolved_type_idx = idx;
                         if (self.in_rec) {
                             // Within rec group, allow refs within the group but not beyond
-                            if (idx >= self.rec_end) self.malformed = true;
+                            if (idx >= self.rec_end) self.markMalformed(@src());
                         } else if (self.in_type_parse) {
                             if (self.module) |mod| {
                                 // Allow self-reference: idx == items.len refers to the type currently being parsed
                                 const max = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len));
-                                if (idx >= max) self.malformed = true;
+                                if (idx >= max) self.markMalformed(@src());
                             }
                         } else {
                             if (self.module) |mod| {
                                 const max_types = if (mod.num_declared_types > 0) mod.num_declared_types else @as(u32, @intCast(mod.module_types.items.len));
-                                if (idx >= max_types) self.malformed = true;
+                                if (idx >= max_types) self.markMalformed(@src());
                             }
                         }
                     } else if (ht.kind == .identifier) {
@@ -614,14 +683,14 @@ const Parser = struct {
                         if (self.type_names.get(ht.text)) |idx| {
                             resolved_type_idx = idx;
                             if (self.in_rec) {
-                                if (idx >= self.rec_end) self.malformed = true;
+                                if (idx >= self.rec_end) self.markMalformed(@src());
                             } else if (self.in_type_parse) {
                                 if (self.module) |mod| {
-                                    if (idx > mod.module_types.items.len) self.malformed = true;
+                                    if (idx > mod.module_types.items.len) self.markMalformed(@src());
                                 }
                             } else {
                                 if (self.module) |mod| {
-                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                    if (idx >= mod.module_types.items.len) self.markMalformed(@src());
                                 }
                             }
                         }
@@ -846,7 +915,7 @@ const Parser = struct {
                             for (fields.items) |existing| {
                                 if (existing.name) |en| {
                                     if (fname) |fn2| {
-                                        if (std.mem.eql(u8, en, fn2)) self.malformed = true;
+                                        if (std.mem.eql(u8, en, fn2)) self.markMalformed(@src());
                                     }
                                 }
                             }
@@ -1008,23 +1077,23 @@ const Parser = struct {
                         const ht = self.advance();
                         if (ht.kind == .integer) {
                             const idx = std.fmt.parseInt(u32, ht.text, 0) catch {
-                                self.malformed = true;
+                                self.markMalformed(@src());
                                 continue;
                             };
                             if (self.in_rec) {
-                                if (idx >= self.rec_end) self.malformed = true;
+                                if (idx >= self.rec_end) self.markMalformed(@src());
                             } else {
                                 if (self.module) |mod| {
-                                    if (idx >= mod.module_types.items.len) self.malformed = true;
+                                    if (idx >= mod.module_types.items.len) self.markMalformed(@src());
                                 }
                             }
                         } else if (ht.kind == .identifier) {
                             if (self.type_names.get(ht.text)) |idx| {
                                 if (self.in_rec) {
-                                    if (idx >= self.rec_end) self.malformed = true;
+                                    if (idx >= self.rec_end) self.markMalformed(@src());
                                 } else {
                                     if (self.module) |mod| {
-                                        if (idx >= mod.module_types.items.len) self.malformed = true;
+                                        if (idx >= mod.module_types.items.len) self.markMalformed(@src());
                                     }
                                 }
                             }
@@ -1038,7 +1107,7 @@ const Parser = struct {
                         if (field_count < field_names.len) {
                             for (field_names[0..field_count]) |existing| {
                                 if (std.mem.eql(u8, fname, existing)) {
-                                    self.malformed = true;
+                                    self.markMalformed(@src());
                                     break;
                                 }
                             }
@@ -1289,7 +1358,7 @@ const Parser = struct {
             if (func.name) |n| {
                 const norm = normalizeIdentifier(self.allocator, n);
                 if (self.func_names.get(norm)) |existing| {
-                    if (existing != func_idx and existing < func_idx) self.malformed = true;
+                    if (existing != func_idx and existing < func_idx) self.markMalformed(@src());
                 }
                 self.func_names.put(self.allocator, norm, func_idx) catch {};
             }
@@ -1467,14 +1536,14 @@ const Parser = struct {
             self.skipAnnotations();
             const inner = self.peek().kind;
             if (inner == .kw_param) {
-                if (seen_results) self.malformed = true;
+                if (seen_results) self.markMalformed(@src());
                 _ = self.advance(); // consume 'param'
                 self.skipAnnotations();
                 if (self.peek().kind == .identifier) {
                     const name = self.advance().text;
                     const idx: u32 = @intCast(params_list.items.len);
                     if (self.local_names.get(name) != null) {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                     }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
@@ -1510,7 +1579,7 @@ const Parser = struct {
             } else if (inner == .kw_type) {
                 // (type ...) after (param/result ...) is malformed
                 if (params_list.items.len > 0 or results_list.items.len > 0) {
-                    self.malformed = true;
+                    self.markMalformed(@src());
                 }
                 try self.skipSExpr();
                 try self.expect(.r_paren);
@@ -1530,21 +1599,21 @@ const Parser = struct {
                 switch (module.module_types.items[tidx]) {
                     .func_type => |ft| {
                         if (ft.params.len != params_list.items.len or ft.results.len != results_list.items.len) {
-                            self.malformed = true;
+                            self.markMalformed(@src());
                         } else {
                             // The concrete type index is part of the type: an
                             // inline `(ref $b)` does not match a referenced
                             // `(ref $a)` even though both are the same
                             // `ValType`.
                             for (ft.params, params_list.items, 0..) |a, b, k| {
-                                if (a != b) self.malformed = true;
+                                if (a != b) self.markMalformed(@src());
                                 if (Mod.FuncSignature.concreteIdxAt(ft.param_type_idxs, k) !=
-                                    Mod.FuncSignature.concreteIdxAt(param_tidxs_list.items, k)) self.malformed = true;
+                                    Mod.FuncSignature.concreteIdxAt(param_tidxs_list.items, k)) self.markMalformed(@src());
                             }
                             for (ft.results, results_list.items, 0..) |a, b, k| {
-                                if (a != b) self.malformed = true;
+                                if (a != b) self.markMalformed(@src());
                                 if (Mod.FuncSignature.concreteIdxAt(ft.result_type_idxs, k) !=
-                                    Mod.FuncSignature.concreteIdxAt(result_tidxs_list.items, k)) self.malformed = true;
+                                    Mod.FuncSignature.concreteIdxAt(result_tidxs_list.items, k)) self.markMalformed(@src());
                             }
                         }
                     },
@@ -1634,7 +1703,7 @@ const Parser = struct {
                     const name = self.advance().text;
                     const idx: u32 = actual_param_count + @as(u32, @intCast(func.local_types.items.len));
                     if (self.local_names.get(name) != null) {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                     }
                     self.local_names.put(self.allocator, name, idx) catch {};
                 }
@@ -1680,10 +1749,10 @@ const Parser = struct {
                             const inner = scan.next();
                             if (inner.kind == .kw_param) {
                                 if (saw_instr or saw_local) {
-                                    if (!last_was_select) { self.malformed = true; break :scan_loop; }
+                                    if (!last_was_select) { self.markMalformed(@src()); break :scan_loop; }
                                 }
                             } else if (inner.kind == .kw_result) {
-                                if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
+                                if (saw_instr and !last_was_select) { self.markMalformed(@src()); break :scan_loop; }
                             } else if (inner.kind == .kw_local) {
                                 saw_local = true;
                                 last_was_select = false;
@@ -1910,7 +1979,7 @@ const Parser = struct {
                         has_operands = true;
                     } else {
                         // Could be additional immediates — skip them
-                        if (self.peek().kind == .invalid) self.malformed = true;
+                        if (self.peek().kind == .invalid) self.markMalformed(@src());
                         _ = self.advance();
                     }
                 }
@@ -1975,11 +2044,11 @@ const Parser = struct {
                     if (self.label_stack.items.len > 0) {
                         const opening = self.label_stack.items[self.label_stack.items.len - 1];
                         if (opening == null or !std.mem.eql(u8, opening.?, el_label)) {
-                            self.malformed = true;
+                            self.markMalformed(@src());
                             return;
                         }
                     } else {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                         return;
                     }
                 }
@@ -1993,11 +2062,11 @@ const Parser = struct {
                     if (self.label_stack.items.len > 0) {
                         const opening = self.label_stack.items[self.label_stack.items.len - 1];
                         if (opening == null or !std.mem.eql(u8, opening.?, en_label)) {
-                            self.malformed = true;
+                            self.markMalformed(@src());
                             return;
                         }
                     } else {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                         return;
                     }
                 }
@@ -2023,7 +2092,7 @@ const Parser = struct {
                     } else {
                         const label_tok = self.advance();
                         const depth = self.resolveLabelDepth(label_tok.text) orelse blk: {
-                            self.malformed = true;
+                            self.markMalformed(@src());
                             break :blk 0;
                         };
                         targets.append(self.allocator, depth) catch return;
@@ -2329,10 +2398,10 @@ const Parser = struct {
                         if (stok.kind != .l_paren) break;
                         const inner = scan.next();
                         if (inner.kind == .kw_type) {
-                            if (saw_param or saw_result) self.malformed = true;
+                            if (saw_param or saw_result) self.markMalformed(@src());
                             saw_type = true;
                         } else if (inner.kind == .kw_param) {
-                            if (saw_result) self.malformed = true;
+                            if (saw_result) self.markMalformed(@src());
                             saw_param = true;
                         } else if (inner.kind == .kw_result) {
                             saw_result = true;
@@ -2771,15 +2840,15 @@ const Parser = struct {
                 }
             },
             .invalid => {
-                self.malformed = true;
+                self.markMalformed(@src());
             },
             .kw_catch, .kw_catch_ref, .kw_catch_all, .kw_catch_all_ref => {
                 // catch/catch_ref/catch_all/catch_all_ref outside try_table is malformed
-                self.malformed = true;
+                self.markMalformed(@src());
             },
             .kw_local => {
                 // local in function body (after instructions) is an ordering error
-                self.malformed = true;
+                self.markMalformed(@src());
             },
             else => {},
         }
@@ -3053,17 +3122,17 @@ const Parser = struct {
         self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind != .integer) {
-            self.malformed = true;
+            self.markMalformed(@src());
             self.emitLeb128S32(code, 0);
             return;
         }
-        if (!isValidNumLiteral(tok.text)) self.malformed = true;
+        if (!isValidNumLiteral(tok.text)) self.markMalformed(@src());
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i32, text, 0) catch blk: {
             // Try parsing as unsigned and reinterpret
             const uval = std.fmt.parseInt(u32, text, 0) catch {
-                self.malformed = true;
+                self.markMalformed(@src());
                 break :blk 0;
             };
             break :blk @as(i32, @bitCast(uval));
@@ -3075,16 +3144,16 @@ const Parser = struct {
         self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind != .integer) {
-            self.malformed = true;
+            self.markMalformed(@src());
             self.emitLeb128S64(code, 0);
             return;
         }
-        if (!isValidNumLiteral(tok.text)) self.malformed = true;
+        if (!isValidNumLiteral(tok.text)) self.markMalformed(@src());
         const clean = stripUnderscores(tok.text);
         const text = clean.slice();
         const val = std.fmt.parseInt(i64, text, 0) catch blk: {
             const uval = std.fmt.parseInt(u64, text, 0) catch {
-                self.malformed = true;
+                self.markMalformed(@src());
                 break :blk 0;
             };
             break :blk @as(i64, @bitCast(uval));
@@ -3096,13 +3165,13 @@ const Parser = struct {
         self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
-            if (!isValidNumLiteral(tok.text)) self.malformed = true;
-            if (!isValidFloatLiteral(f32, tok.text)) self.malformed = true;
+            if (!isValidNumLiteral(tok.text)) self.markMalformed(@src());
+            if (!isValidFloatLiteral(f32, tok.text)) self.markMalformed(@src());
             const bits = parseF32Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
-            self.malformed = true;
+            self.markMalformed(@src());
             code.appendSlice(self.allocator, &[4]u8{ 0, 0, 0, 0 }) catch {};
         }
     }
@@ -3111,13 +3180,13 @@ const Parser = struct {
         self.skipAnnotations();
         const tok = self.advance();
         if (tok.kind == .integer or tok.kind == .float) {
-            if (!isValidNumLiteral(tok.text)) self.malformed = true;
-            if (!isValidFloatLiteral(f64, tok.text)) self.malformed = true;
+            if (!isValidNumLiteral(tok.text)) self.markMalformed(@src());
+            if (!isValidFloatLiteral(f64, tok.text)) self.markMalformed(@src());
             const bits = parseF64Bits(tok.text);
             const le = std.mem.toBytes(bits);
             code.appendSlice(self.allocator, &le) catch {};
         } else {
-            self.malformed = true;
+            self.markMalformed(@src());
             code.appendSlice(self.allocator, &[8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 }) catch {};
         }
     }
@@ -3193,7 +3262,7 @@ const Parser = struct {
             }
         } else {
             // Unrecognized opcode text — flag as malformed
-            self.malformed = true;
+            self.markMalformed(@src());
         }
     }
 
@@ -3466,12 +3535,12 @@ const Parser = struct {
                 if (std.mem.startsWith(u8, tok.text, "offset=")) {
                     const clean = stripUnderscores(tok.text[7..]);
                     offset = std.fmt.parseInt(u64, clean.slice(), 0) catch {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                         continue;
                     };
                 } else if (std.mem.startsWith(u8, tok.text, "align=")) {
                     alignment = std.fmt.parseInt(u32, tok.text[6..], 0) catch {
-                        self.malformed = true;
+                        self.markMalformed(@src());
                         continue;
                     };
                     has_align = true;
@@ -3482,7 +3551,7 @@ const Parser = struct {
         var log2_align: u32 = 0;
         if (has_align) {
             if (alignment == 0 or (alignment & (alignment - 1)) != 0) {
-                self.malformed = true;
+                self.markMalformed(@src());
             } else {
                 log2_align = @ctz(alignment);
             }
@@ -3688,7 +3757,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.table_names.get(name)) |existing| {
-                if (existing != table_idx and existing < table_idx) self.malformed = true;
+                if (existing != table_idx and existing < table_idx) self.markMalformed(@src());
             }
             self.table_names.put(self.allocator, name, table_idx) catch {};
         }
@@ -3952,7 +4021,7 @@ const Parser = struct {
                 init_code.appendSlice(self.allocator, sub_buf[0..sub_n]) catch {};
             } else {
                 // Unknown/invalid init expr — mark as malformed
-                self.malformed = true;
+                self.markMalformed(@src());
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
             }
             if (self.peek().kind == .r_paren) _ = self.advance();
@@ -4014,7 +4083,7 @@ const Parser = struct {
         if (self.peek().kind == .identifier) {
             const name = self.advance().text;
             if (self.memory_names.get(name)) |existing| {
-                if (existing != mem_idx and existing < mem_idx) self.malformed = true;
+                if (existing != mem_idx and existing < mem_idx) self.markMalformed(@src());
             }
             self.memory_names.put(self.allocator, name, mem_idx) catch {};
         }
@@ -4147,7 +4216,7 @@ const Parser = struct {
             // so if the existing index doesn't match ours AND it's a lower
             // index (already processed), it's a genuine duplicate.
             if (self.global_names.get(name)) |existing| {
-                if (existing != global_idx and existing < global_idx) self.malformed = true;
+                if (existing != global_idx and existing < global_idx) self.markMalformed(@src());
             }
             self.global_names.put(self.allocator, name, global_idx) catch {};
         }
@@ -4557,7 +4626,7 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) {
                     const fname = self.advance().text;
                     if (self.func_names.getOrPut(self.allocator, fname)) |gop| {
-                        if (gop.found_existing and gop.value_ptr.* != import_func_idx) self.malformed = true;
+                        if (gop.found_existing and gop.value_ptr.* != import_func_idx) self.markMalformed(@src());
                         gop.value_ptr.* = import_func_idx;
                     } else |_| {}
                 }
@@ -4651,7 +4720,7 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) {
                     const mname = self.advance().text;
                     if (self.memory_names.get(mname)) |existing| {
-                        if (existing != import_mem_idx and existing < import_mem_idx) self.malformed = true;
+                        if (existing != import_mem_idx and existing < import_mem_idx) self.markMalformed(@src());
                     }
                     self.memory_names.put(self.allocator, mname, import_mem_idx) catch {};
                 }
@@ -4679,7 +4748,7 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) {
                     const tname = self.advance().text;
                     if (self.table_names.get(tname)) |existing| {
-                        if (existing != import_table_idx and existing < import_table_idx) self.malformed = true;
+                        if (existing != import_table_idx and existing < import_table_idx) self.markMalformed(@src());
                     }
                     self.table_names.put(self.allocator, tname, import_table_idx) catch {};
                 }
@@ -4715,7 +4784,7 @@ const Parser = struct {
                 if (self.peek().kind == .identifier) {
                     const gname = self.advance().text;
                     if (self.global_names.get(gname)) |existing| {
-                        if (existing != import_global_idx and existing < import_global_idx) self.malformed = true;
+                        if (existing != import_global_idx and existing < import_global_idx) self.markMalformed(@src());
                     }
                     self.global_names.put(self.allocator, gname, import_global_idx) catch {};
                 }
@@ -5259,7 +5328,7 @@ const Parser = struct {
             const decoded = decodeWatString(self.allocator, raw);
             if (decoded.len > 0) {
                 if (!std.unicode.utf8ValidateSlice(decoded)) {
-                    self.malformed = true;
+                    self.markMalformed(@src());
                 }
                 if (self.module) |m| {
                     m.owned_strings.append(self.allocator, decoded) catch {};
@@ -5268,7 +5337,7 @@ const Parser = struct {
             }
         }
         if (!std.unicode.utf8ValidateSlice(raw)) {
-            self.malformed = true;
+            self.markMalformed(@src());
         }
         return raw;
     }
@@ -6830,4 +6899,67 @@ test "a page size survives being written back out" {
     defer dback.deinit();
     try std.testing.expectEqual(types.default_page_size, dback.memories.items[0].type.limits.page_size);
     try std.testing.expectEqual(bytes.len - 1, dbytes.len);
+}
+
+test "a rejected module says where it was rejected and by what" {
+    const allocator = std.testing.allocator;
+    // `error.InvalidModule` is raised by any of some seventy checks, so on its
+    // own it says only that something was wrong. Without a position, finding
+    // out which means deleting lines from the input one at a time.
+    const source =
+        \\(module
+        \\  (func $a)
+        \\  (func $a)
+        \\)
+    ;
+    var diagnostic: ?Diagnostic = null;
+    try std.testing.expectError(error.InvalidModule, parseModuleDiag(allocator, source, &diagnostic));
+
+    const d = diagnostic orelse return error.TestUnexpectedResult;
+    const pos = d.position(source);
+    try std.testing.expectEqual(@as(u32, 3), pos.line);
+    try std.testing.expectEqual(@as(u32, 9), pos.column);
+    try std.testing.expectEqualStrings("  (func $a)", d.sourceLine(source));
+    try std.testing.expectEqualStrings("parseFunc", d.check);
+    try std.testing.expect(d.parser_line > 0);
+
+    // The plain entry point still works and still rejects the same module.
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator, source));
+
+    // A module that is fine leaves the diagnostic alone.
+    var ok_diag: ?Diagnostic = null;
+    var m = try parseModuleDiag(allocator, "(module (func $a))", &ok_diag);
+    defer m.deinit();
+    try std.testing.expect(ok_diag == null);
+}
+
+test "the first thing noticed is the one reported" {
+    const allocator = std.testing.allocator;
+    // Later marks are usually consequences of the first, so a report that kept
+    // the last one would point past the actual problem.
+    const source =
+        \\(module
+        \\  (func $x)
+        \\  (func $x)
+        \\  (func $y)
+        \\  (func $y)
+        \\)
+    ;
+    var diagnostic: ?Diagnostic = null;
+    try std.testing.expectError(error.InvalidModule, parseModuleDiag(allocator, source, &diagnostic));
+    const d = diagnostic orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 3), d.position(source).line);
+}
+
+test "a position on the first line, and one past the end, still resolve" {
+    const source = "(module\n  (func)\n)";
+    const first = Diagnostic{ .offset = 0, .check = "x", .parser_line = 1 };
+    try std.testing.expectEqual(@as(u32, 1), first.position(source).line);
+    try std.testing.expectEqual(@as(u32, 1), first.position(source).column);
+    try std.testing.expectEqualStrings("(module", first.sourceLine(source));
+
+    // An offset at or past the end must not read out of bounds.
+    const past = Diagnostic{ .offset = source.len + 10, .check = "x", .parser_line = 1 };
+    try std.testing.expectEqual(@as(u32, 3), past.position(source).line);
+    try std.testing.expectEqualStrings(")", past.sourceLine(source));
 }

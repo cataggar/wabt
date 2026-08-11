@@ -14,7 +14,16 @@ pub const usage =
 /// Convert WAT text format to WASM binary.
 /// Parses the source, validates the module, then serializes to binary.
 pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
-    var module = try wabt.text.Parser.parseModule(allocator, wat_source);
+    return convertDiag(allocator, wat_source, null);
+}
+
+/// As `convert`, but reports where a malformed module was rejected.
+pub fn convertDiag(
+    allocator: std.mem.Allocator,
+    wat_source: []const u8,
+    diagnostic: ?*?wabt.text.Parser.Diagnostic,
+) ![]u8 {
+    var module = try wabt.text.Parser.parseModuleDiag(allocator, wat_source, diagnostic);
     defer module.deinit();
 
     try wabt.Validator.validate(&module, .{});
@@ -58,8 +67,15 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     };
     defer alloc.free(source);
 
-    const wasm = convert(alloc, source) catch |err| {
+    var diagnostic: ?wabt.text.Parser.Diagnostic = null;
+    const wasm = convertDiag(alloc, source, &diagnostic) catch |err| {
         std.debug.print("error: {any}\n", .{err});
+        if (diagnostic) |d| {
+            const pos = d.position(source);
+            std.debug.print("  {s}:{d}:{d}\n", .{ in_path, pos.line, pos.column });
+            std.debug.print("  {s}\n", .{d.sourceLine(source)});
+            std.debug.print("  rejected by {s} at Parser.zig:{d}\n", .{ d.check, d.parser_line });
+        }
         std.process.exit(1);
     };
     defer alloc.free(wasm);
