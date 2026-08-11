@@ -372,28 +372,44 @@ const WatWriter = struct {
         };
     }
 
+    /// An opcode and the shape of the immediates that follow it.
+    const Decoded = struct { prefix: u8, code: u32, shape: Imm };
+
+    /// Read the opcode at `pos`, advancing past it and its prefix.
+    fn decodeOpcode(bytes: []const u8, pos: *usize) WriteError!Decoded {
+        const byte = bytes[pos.*];
+        pos.* += 1;
+
+        var prefix: u8 = 0;
+        var code: u32 = byte;
+        if (byte == 0xfc or byte == 0xfd or byte == 0xfe or byte == 0xfb) {
+            prefix = byte;
+            code = try readU32At(bytes, pos);
+        }
+
+        return .{
+            .prefix = prefix,
+            .code = code,
+            .shape = immediateShape(prefix, code) orelse return error.UnsupportedOpcode,
+        };
+    }
+
     /// Print a function body in the flat form `wasm-tools print` emits, which
     /// this crate's own text parser accepts.
     fn writeBody(self: *WatWriter, code_bytes: []const u8) WriteError!void {
         var pos: usize = 0;
         while (pos < code_bytes.len) {
             const start = pos;
-            const byte = code_bytes[pos];
-            pos += 1;
-
-            var prefix: u8 = 0;
-            var code: u32 = byte;
-            if (byte == 0xfc or byte == 0xfd or byte == 0xfe or byte == 0xfb) {
-                prefix = byte;
-                code = try readU32At(code_bytes, &pos);
-            }
 
             // The body's trailing `end` closes the function itself and is
             // implied by the closing paren, so it is not printed. Anything
             // after it would be unreachable bytes, not instructions.
-            if (prefix == 0 and code == 0x0b and self.blockDepthAtBodyEnd(start, code_bytes)) break;
+            if (code_bytes[pos] == 0x0b and self.blockDepthAtBodyEnd(start, code_bytes)) break;
 
-            const shape = immediateShape(prefix, code) orelse return error.UnsupportedOpcode;
+            const d = try decodeOpcode(code_bytes, &pos);
+            const prefix = d.prefix;
+            const code = d.code;
+            const shape = d.shape;
 
             if (prefix == 0 and (code == 0x0b or code == 0x05 or code == 0x07 or code == 0x19)) {
                 if (self.indent > 0) self.indent -= 1;
@@ -408,6 +424,33 @@ const WatWriter = struct {
                 self.indent += 1;
             }
         }
+    }
+
+    /// Print a constant expression's instructions space-separated, the form
+    /// `wasm-tools print` uses for a global's initializer. The terminating
+    /// `end` is stripped when the expression is read, so every byte here is
+    /// an instruction. Returns how many were printed.
+    fn writeConstExprFlat(self: *WatWriter, bytes: []const u8) WriteError!u32 {
+        var pos: usize = 0;
+        var count: u32 = 0;
+        while (pos < bytes.len) {
+            const d = try decodeOpcode(bytes, &pos);
+            if (count > 0) try self.appendByte(' ');
+            try self.append(mnemonic(d.prefix, d.code) orelse return error.UnsupportedOpcode);
+            try self.writeImmediates(d.shape, bytes, &pos);
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Print a segment's offset expression. A single instruction takes the
+    /// folded shorthand `(i32.const 1)`; anything longer has no folded form
+    /// and must be spelled out as `(offset ...)`.
+    fn writeOffsetExpr(self: *WatWriter, bytes: []const u8) WriteError!void {
+        const mark = self.buf.items.len;
+        const count = try self.writeConstExprFlat(bytes);
+        try self.appendByte(')');
+        try self.buf.insertSlice(self.a(), mark, if (count == 1) "(" else "(offset ");
     }
 
     /// True when the `end` at `start` is the one closing the function body.
@@ -784,7 +827,13 @@ const WatWriter = struct {
                 try self.writeValTypeWithTidx(global.type.val_type, global.type_idx);
                 try self.appendByte(' ');
             }
-            try self.writeDefaultInitExpr(global.type.val_type);
+            if (global.init_expr_bytes.len > 0) {
+                _ = try self.writeConstExprFlat(global.init_expr_bytes);
+            } else {
+                // A global with no recorded initializer cannot be printed
+                // faithfully, so fall back to a well-typed zero.
+                try self.writeDefaultInitExpr(global.type.val_type);
+            }
             try self.appendByte(')');
             try self.newline();
         }
@@ -820,17 +869,58 @@ const WatWriter = struct {
             try self.writeU32(@intCast(i));
             try self.append(";)");
             switch (seg.kind) {
-                .active => try self.append(" (i32.const 0)"),
+                .active => {
+                    // The table is only stated when it is not table 0, which
+                    // is what the shorthand form already means.
+                    if (seg.table_var.index != 0) {
+                        try self.append(" (table ");
+                        try self.writeU32(seg.table_var.index);
+                        try self.appendByte(')');
+                    }
+                    try self.appendByte(' ');
+                    try self.writeOffsetExpr(seg.offset_expr_bytes);
+                },
                 .declared => try self.append(" declare"),
                 .passive => {},
             }
-            try self.append(" func");
-            for (seg.elem_var_indices.items) |v| {
+            if (seg.elem_expr_count > 0) {
+                // Expression form: the element type is named, and each entry
+                // is a constant expression rather than a function index.
                 try self.appendByte(' ');
-                try self.writeU32(v.index);
+                try self.writeValTypeWithTidx(seg.elem_type, seg.elem_type_idx);
+                try self.writeElemExprs(seg.elem_expr_bytes, seg.elem_expr_count);
+            } else {
+                try self.append(" func");
+                for (seg.elem_var_indices.items) |v| {
+                    try self.appendByte(' ');
+                    try self.writeU32(v.index);
+                }
             }
             try self.appendByte(')');
             try self.newline();
+        }
+    }
+
+    /// Print each of a segment's element expressions as its own parenthesised
+    /// group. They are laid out end to end, every one terminated by `end`.
+    fn writeElemExprs(self: *WatWriter, bytes: []const u8, count: u32) WriteError!void {
+        var pos: usize = 0;
+        var seen: u32 = 0;
+        while (seen < count) : (seen += 1) {
+            try self.append(" (");
+            var wrote: u32 = 0;
+            while (pos < bytes.len) {
+                if (bytes[pos] == 0x0b) {
+                    pos += 1;
+                    break;
+                }
+                const d = try decodeOpcode(bytes, &pos);
+                if (wrote > 0) try self.appendByte(' ');
+                try self.append(mnemonic(d.prefix, d.code) orelse return error.UnsupportedOpcode);
+                try self.writeImmediates(d.shape, bytes, &pos);
+                wrote += 1;
+            } else return error.TruncatedBody;
+            try self.appendByte(')');
         }
     }
 
@@ -841,7 +931,13 @@ const WatWriter = struct {
             try self.writeU32(@intCast(i));
             try self.append(";) ");
             if (seg.kind == .active) {
-                try self.append("(i32.const 0) ");
+                if (seg.memory_var.index != 0) {
+                    try self.append("(memory ");
+                    try self.writeU32(seg.memory_var.index);
+                    try self.append(") ");
+                }
+                try self.writeOffsetExpr(seg.offset_expr_bytes);
+                try self.appendByte(' ');
             }
             try self.appendByte('"');
             try self.writeEscapedString(seg.data);
@@ -1329,4 +1425,80 @@ test "a function restates its signature alongside its type index" {
     // whose types are renumbered, so the signature is restated too.
     try std.testing.expectEqualStrings("(func (;0;) (type 0) (param i32 f64) (result i32)", header orelse return error.NoFunc);
     try std.testing.expect(std.mem.indexOf(u8, wat, "local.get 0") != null);
+}
+
+test "a global prints the initializer it was given" {
+    const alloc = std.testing.allocator;
+    // (module (global i32 (i32.const 42)))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x06, 0x01, 0x7f, 0x00, 0x41, 0x2a, 0x0b,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(global (;0;) i32 i32.const 42)") != null);
+
+    // (module (global i32 (i32.add (i32.const 1) (i32.const 2))))
+    // A constant expression is a sequence, not a single instruction.
+    const folded = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x09, 0x01, 0x7f, 0x00, 0x41, 0x01, 0x41, 0x02, 0x6a, 0x0b,
+    };
+    const fwat = try printBinary(alloc, &folded);
+    defer alloc.free(fwat);
+    try std.testing.expect(std.mem.indexOf(u8, fwat, "(global (;0;) i32 i32.const 1 i32.const 2 i32.add)") != null);
+}
+
+test "a data segment prints the offset it was given" {
+    const alloc = std.testing.allocator;
+    // (module (memory 1) (data (i32.const 9) "hi"))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x0b, 0x08, 0x01, 0x00, 0x41, 0x09, 0x0b, 0x02, 0x68, 0x69,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(data (;0;) (i32.const 9) \"hi\")") != null);
+
+    // An offset of more than one instruction has no folded form, so it is
+    // spelled out as `(offset ...)` rather than wrapped in bare parens.
+    const multi = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+        0x0b, 0x0b, 0x01, 0x00, 0x41, 0x01, 0x41, 0x02, 0x6a, 0x0b, 0x02, 0x68, 0x69,
+    };
+    const mwat = try printBinary(alloc, &multi);
+    defer alloc.free(mwat);
+    try std.testing.expect(std.mem.indexOf(u8, mwat, "(data (;0;) (offset i32.const 1 i32.const 2 i32.add) \"hi\")") != null);
+}
+
+test "an element segment prints its offset, table and expressions" {
+    const alloc = std.testing.allocator;
+    // (module (table 2 funcref) (elem (i32.const 3) funcref (ref.null func)))
+    // `ref.null` names no function, so a segment kept as a list of function
+    // indices has nothing to record and prints a fabricated index instead.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x02,
+        0x09, 0x09, 0x01, 0x04, 0x41, 0x03, 0x0b, 0x01, 0xd0, 0x70, 0x0b,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(elem (;0;) (i32.const 3) funcref (ref.null func))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "4294967295") == null);
+
+    // An index-list segment on a table other than 0 must say so, or it
+    // silently moves to table 0.
+    const tbl = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x04, 0x07, 0x02, 0x70, 0x00, 0x02, 0x70, 0x00, 0x02,
+        0x09, 0x09, 0x01, 0x02, 0x01, 0x41, 0x00, 0x0b, 0x00, 0x01, 0x00,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const twat = try printBinary(alloc, &tbl);
+    defer alloc.free(twat);
+    try std.testing.expect(std.mem.indexOf(u8, twat, "(elem (;0;) (table 1) (i32.const 0) func 0)") != null);
 }

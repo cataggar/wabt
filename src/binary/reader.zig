@@ -778,6 +778,11 @@ const Reader = struct {
             const elem_count = try self.readU32();
             seg.elem_var_indices = .empty;
             try seg.elem_var_indices.ensureTotalCapacity(self.allocator, elem_count);
+            // Element expressions are laid out end to end, so the whole run
+            // is one slice of the source. `elem_var_indices` keeps only the
+            // function index each one happens to name, which is not enough to
+            // print the segment back: `ref.null` has no index to keep.
+            const elem_exprs_start = self.pos;
             for (0..elem_count) |_| {
                 if (use_elem_exprs) {
                     const expr = try self.readInitExprBytes();
@@ -791,6 +796,11 @@ const Reader = struct {
                 } else {
                     seg.elem_var_indices.appendAssumeCapacity(.{ .index = try self.readU32() });
                 }
+            }
+            if (use_elem_exprs) {
+                seg.elem_expr_bytes = self.data[elem_exprs_start..self.pos];
+                seg.owns_elem_expr_bytes = false;
+                seg.elem_expr_count = elem_count;
             }
 
             try self.module.elem_segments.append(self.allocator, seg);
