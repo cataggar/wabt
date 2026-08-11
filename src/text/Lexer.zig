@@ -42,6 +42,8 @@ pub const TokenKind = enum {
     kw_align,
     kw_declare,
     kw_item,
+    kw_shared,
+    kw_pagesize,
 
     // Value type keywords
     kw_i32,
@@ -552,6 +554,8 @@ fn matchKeyword(text: []const u8) TokenKind {
     if (eql(text, "align")) return .kw_align;
     if (eql(text, "declare")) return .kw_declare;
     if (eql(text, "item")) return .kw_item;
+    if (eql(text, "shared")) return .kw_shared;
+    if (eql(text, "pagesize")) return .kw_pagesize;
 
     // Value type keywords
     if (eql(text, "i32")) return .kw_i32;

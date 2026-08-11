@@ -3735,14 +3735,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_table64 = true;
                 }
-                self.skipAnnotations();
-                const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-                self.skipAnnotations();
-                var limits = types.Limits{ .initial = initial, .is_64 = is_table64 };
-                if (self.peek().kind == .integer) {
-                    limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-                    limits.has_max = true;
-                }
+                const limits = try self.parseLimitsTail(is_table64);
                 self.skipAnnotations();
                 const refs_before_it = self.collected_type_refs.items.len;
                 const saved_itp_it = self.in_type_parse;
@@ -3909,14 +3902,7 @@ const Parser = struct {
             return;
         }
 
-        self.skipAnnotations();
-        const initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-        self.skipAnnotations();
-        var limits = types.Limits{ .initial = initial, .is_64 = is_table64 };
-        if (self.peek().kind == .integer) {
-            limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-            limits.has_max = true;
-        }
+        const limits = try self.parseLimitsTail(is_table64);
         self.skipAnnotations();
         // Capture concrete type index if elem type is (ref null $t) / (ref $t)
         const saved_refs_len = self.collected_type_refs.items.len;
@@ -3978,6 +3964,48 @@ const Parser = struct {
             .type_idx = table_type_idx,
             .is_table64 = is_table64,
         });
+    }
+
+    /// Parse the bounds that follow a table's or memory's index type: an
+    /// initial size, an optional maximum, and the `shared` and `(pagesize N)`
+    /// markers. All six places that accept limits share this so that a form
+    /// the writer emits cannot be accepted in one position and rejected in
+    /// another.
+    fn parseLimitsTail(self: *Parser, is_64: bool) ParseError!types.Limits {
+        self.skipAnnotations();
+        const initial = if (is_64) try self.parseU64() else @as(u64, try self.parseU32());
+        var limits = types.Limits{ .initial = initial, .is_64 = is_64 };
+        self.skipAnnotations();
+        if (self.peek().kind == .integer) {
+            limits.max = if (is_64) try self.parseU64() else @as(u64, try self.parseU32());
+            limits.has_max = true;
+            self.skipAnnotations();
+        }
+        if (self.peek().kind == .kw_shared) {
+            _ = self.advance();
+            limits.is_shared = true;
+            self.skipAnnotations();
+        }
+        // `(pagesize N)` states the memory's page size, which is otherwise
+        // the default of 64 KiB.
+        if (self.peek().kind == .l_paren) {
+            const save_pos = self.lexer.pos;
+            const save_peek = self.peeked;
+            _ = self.advance();
+            self.skipAnnotations();
+            if (self.peek().kind == .kw_pagesize) {
+                _ = self.advance();
+                self.skipAnnotations();
+                limits.page_size = try self.parseU32();
+                self.skipAnnotations();
+                try self.expect(.r_paren);
+                self.skipAnnotations();
+            } else {
+                self.lexer.pos = save_pos;
+                self.peeked = save_peek;
+            }
+        }
+        return limits;
     }
 
     fn parseMemory(self: *Parser, module: *Mod.Module) ParseError!void {
@@ -4074,14 +4102,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_memory64 = true;
                 }
-                self.skipAnnotations();
-                const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-                self.skipAnnotations();
-                var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
-                if (self.peek().kind == .integer) {
-                    limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-                    limits.has_max = true;
-                }
+                const limits = try self.parseLimitsTail(is_memory64);
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
@@ -4110,14 +4131,7 @@ const Parser = struct {
             is_memory64 = true;
         }
 
-        self.skipAnnotations();
-        const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-        self.skipAnnotations();
-        var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
-        if (self.peek().kind == .integer) {
-            limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-            limits.has_max = true;
-        }
+        const limits = try self.parseLimitsTail(is_memory64);
         try module.memories.append(self.allocator, .{
             .@"type" = .{ .limits = limits },
             .is_memory64 = is_memory64,
@@ -4648,14 +4662,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_memory64 = true;
                 }
-                self.skipAnnotations();
-                const initial = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-                var limits = types.Limits{ .initial = initial, .is_64 = is_memory64 };
-                self.skipAnnotations();
-                if (self.peek().kind == .integer) {
-                    limits.max = if (is_memory64) try self.parseU64() else @as(u64, try self.parseU32());
-                    limits.has_max = true;
-                }
+                const limits = try self.parseLimitsTail(is_memory64);
                 self.skipAnnotations();
                 import.memory = .{ .limits = limits };
                 try module.memories.append(self.allocator, .{
@@ -4683,14 +4690,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_table64 = true;
                 }
-                self.skipAnnotations();
-                const t_initial = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-                var t_limits = types.Limits{ .initial = t_initial, .is_64 = is_table64 };
-                self.skipAnnotations();
-                if (self.peek().kind == .integer) {
-                    t_limits.max = if (is_table64) try self.parseU64() else @as(u64, try self.parseU32());
-                    t_limits.has_max = true;
-                }
+                const t_limits = try self.parseLimitsTail(is_table64);
                 self.skipAnnotations();
                 const refs_before_table = self.collected_type_refs.items.len;
                 const saved_itp_table = self.in_type_parse;
@@ -6758,4 +6758,76 @@ test "an inline signature must agree with its type reference about referenced ty
     );
     defer ok.deinit();
     try std.testing.expectEqual(@as(u32, 1), ok.funcs.items[0].decl.type_var.index);
+}
+
+test "a memory or table states shared and its page size in every position" {
+    const allocator = std.testing.allocator;
+    // Limits are accepted in six places -- a plain table or memory, either
+    // written with an inline `(import ...)` or listed under an `(import ...)`
+    // -- and a form the writer emits in one of them has to be accepted in all
+    // of them, or printing a module produces text this parser rejects.
+    var m = try parseModule(allocator,
+        \\(module
+        \\  (import "a" "b" (memory i64 1 2 shared))
+        \\  (import "c" "d" (table 3 4 funcref))
+        \\  (memory (import "e" "f") 5 6 shared)
+        \\  (table (import "g" "h") i64 7 8 funcref)
+        \\  (memory 9 10 shared)
+        \\  (table i64 11 12 funcref)
+        \\)
+    );
+    defer m.deinit();
+
+    try std.testing.expect(m.memories.items[0].type.limits.is_64);
+    try std.testing.expect(m.memories.items[0].type.limits.is_shared);
+    try std.testing.expectEqual(@as(u64, 2), m.memories.items[0].type.limits.max);
+    try std.testing.expect(m.memories.items[1].type.limits.is_shared);
+    try std.testing.expectEqual(@as(u64, 6), m.memories.items[1].type.limits.max);
+    try std.testing.expect(m.memories.items[2].type.limits.is_shared);
+    try std.testing.expectEqual(@as(u64, 10), m.memories.items[2].type.limits.max);
+
+    try std.testing.expectEqual(@as(u64, 4), m.tables.items[0].type.limits.max);
+    try std.testing.expect(m.tables.items[1].type.limits.is_64);
+    try std.testing.expectEqual(@as(u64, 8), m.tables.items[1].type.limits.max);
+    try std.testing.expect(m.tables.items[2].type.limits.is_64);
+    try std.testing.expectEqual(@as(u64, 12), m.tables.items[2].type.limits.max);
+
+    // A page size is stated as the size itself, not as its log2.
+    var ps = try parseModule(allocator,
+        \\(module
+        \\  (memory 1 (pagesize 1))
+        \\  (memory 2 (pagesize 0x10000))
+        \\)
+    );
+    defer ps.deinit();
+    try std.testing.expectEqual(@as(u32, 1), ps.memories.items[0].type.limits.page_size);
+    try std.testing.expectEqual(@as(u32, 0x10000), ps.memories.items[1].type.limits.page_size);
+    // The bounds are still the bounds, not the page size.
+    try std.testing.expectEqual(@as(u64, 1), ps.memories.items[0].type.limits.initial);
+    try std.testing.expectEqual(@as(u64, 2), ps.memories.items[1].type.limits.initial);
+}
+
+test "a page size survives being written back out" {
+    const allocator = std.testing.allocator;
+    // The binary writer never emitted the page size, so a memory read with
+    // one lost it on the way back out and became a 64 KiB memory.
+    var m = try parseModule(allocator, "(module (memory 1 (pagesize 1)))");
+    defer m.deinit();
+
+    const bytes = try @import("../binary/writer.zig").writeModule(allocator, &m);
+    defer allocator.free(bytes);
+
+    var back = try @import("../binary/reader.zig").readModule(allocator, bytes);
+    defer back.deinit();
+    try std.testing.expectEqual(@as(u32, 1), back.memories.items[0].type.limits.page_size);
+
+    // A memory that never stated one keeps the default and gains no flag.
+    var d = try parseModule(allocator, "(module (memory 1))");
+    defer d.deinit();
+    const dbytes = try @import("../binary/writer.zig").writeModule(allocator, &d);
+    defer allocator.free(dbytes);
+    var dback = try @import("../binary/reader.zig").readModule(allocator, dbytes);
+    defer dback.deinit();
+    try std.testing.expectEqual(types.default_page_size, dback.memories.items[0].type.limits.page_size);
+    try std.testing.expectEqual(bytes.len - 1, dbytes.len);
 }

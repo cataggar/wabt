@@ -134,6 +134,11 @@ const Writer = struct {
         const needs_64 = limits.is_64 or limits.initial > std.math.maxInt(u32) or
             (limits.has_max and limits.max > std.math.maxInt(u32));
         if (needs_64) flags |= 0x04;
+        // A page size other than the default is announced by 0x08 and written
+        // after the bounds, as a log2. Without this the size read from a
+        // module is silently dropped when it is written back out.
+        const custom_page_size = limits.page_size != types.default_page_size;
+        if (custom_page_size) flags |= 0x08;
         try self.appendByte(flags);
 
         if (needs_64) {
@@ -148,6 +153,8 @@ const Writer = struct {
             try self.writeU32Leb(@intCast(limits.initial));
             if (limits.has_max) try self.writeU32Leb(@intCast(limits.max));
         }
+
+        if (custom_page_size) try self.writeU32Leb(@ctz(limits.page_size));
     }
 
     // -- section helpers --
