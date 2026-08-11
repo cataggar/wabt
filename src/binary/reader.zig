@@ -256,9 +256,10 @@ const Reader = struct {
 
     fn readLimits(self: *Reader) ReadError!types.Limits {
         const flags = try self.readByte();
-        // Valid flags: 0x00 (min only), 0x01 (min+max), 0x03 (shared+max), 0x04 (memory64)
-        // Reject unknown flag combinations
-        if (flags & 0xF8 != 0) return error.InvalidLimits;
+        // Valid flags: 0x01 (max), 0x02 (shared), 0x04 (memory64) and 0x08
+        // (custom page size). Masking 0x08 away as unknown made the page-size
+        // branch below unreachable.
+        if (flags & 0xF0 != 0) return error.InvalidLimits;
         if (flags & 0x02 != 0 and flags & 0x01 == 0) return error.InvalidLimits; // shared requires max
         var limits = types.Limits{};
         limits.has_max = (flags & 0x01) != 0;

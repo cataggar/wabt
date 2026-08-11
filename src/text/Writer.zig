@@ -991,10 +991,23 @@ const WatWriter = struct {
     }
 
     fn writeLimits(self: *WatWriter, limits: types.Limits) WriteError!void {
+        // The index type precedes the bounds. Without it a 64-bit table or
+        // memory prints as a 32-bit one, which is a different type and
+        // rejects the very addresses the original accepted.
+        if (limits.is_64) try self.append("i64 ");
         try self.writeU64(limits.initial);
         if (limits.has_max) {
             try self.appendByte(' ');
             try self.writeU64(limits.max);
+        }
+        if (limits.is_shared) try self.append(" shared");
+        if (limits.page_size != types.default_page_size) {
+            // Stated as a power of two in hex, the way `wasm-tools print`
+            // does, since that is the only form the encoding can express.
+            try self.append(" (pagesize 0x");
+            var tmp: [20]u8 = undefined;
+            try self.append(std.fmt.bufPrint(&tmp, "{x}", .{limits.page_size}) catch unreachable);
+            try self.appendByte(')');
         }
     }
 
@@ -1501,4 +1514,70 @@ test "an element segment prints its offset, table and expressions" {
     const twat = try printBinary(alloc, &tbl);
     defer alloc.free(twat);
     try std.testing.expect(std.mem.indexOf(u8, twat, "(elem (;0;) (table 1) (i32.const 0) func 0)") != null);
+}
+
+test "a 64-bit table or memory states its index type" {
+    const alloc = std.testing.allocator;
+    // (module (memory i64 1))
+    const mem = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x04, 0x01,
+    };
+    const mwat = try printBinary(alloc, &mem);
+    defer alloc.free(mwat);
+    // Without `i64` this is a 32-bit memory, which rejects the very
+    // addresses the original accepted.
+    try std.testing.expect(std.mem.indexOf(u8, mwat, "(memory (;0;) i64 1)") != null);
+
+    // (module (table i64 8 funcref))
+    const tbl = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x04, 0x01, 0x70, 0x04, 0x08,
+    };
+    const twat = try printBinary(alloc, &tbl);
+    defer alloc.free(twat);
+    try std.testing.expect(std.mem.indexOf(u8, twat, "(table (;0;) i64 8 funcref)") != null);
+
+    // A 32-bit memory must not gain the marker.
+    const small = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+    };
+    const swat = try printBinary(alloc, &small);
+    defer alloc.free(swat);
+    try std.testing.expect(std.mem.indexOf(u8, swat, "(memory (;0;) 1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, swat, "i64") == null);
+}
+
+test "a shared memory stays shared" {
+    const alloc = std.testing.allocator;
+    // (module (memory 4 5 shared))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x04, 0x01, 0x03, 0x04, 0x05,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(memory (;0;) 4 5 shared)") != null);
+}
+
+test "a custom page size is read and printed" {
+    const alloc = std.testing.allocator;
+    // (module (memory 1 (pagesize 1))) — flag 0x08 carries a log2 page size.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x04, 0x01, 0x08, 0x01, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(memory (;0;) 1 (pagesize 0x1))") != null);
+
+    // The default page size is implied and must not be stated.
+    const plain = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x04, 0x01, 0x08, 0x01, 0x10,
+    };
+    const pwat = try printBinary(alloc, &plain);
+    defer alloc.free(pwat);
+    try std.testing.expect(std.mem.indexOf(u8, pwat, "pagesize") == null);
 }
