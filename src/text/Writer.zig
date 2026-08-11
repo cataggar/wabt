@@ -7,6 +7,7 @@ const types = @import("../types.zig");
 const Mod = @import("../Module.zig");
 const Opcode = @import("../Opcode.zig");
 const leb128 = @import("../leb128.zig");
+const instr = @import("../binary/instr.zig");
 
 pub const WriteError = error{
     OutOfMemory,
@@ -283,127 +284,6 @@ const WatWriter = struct {
 
     // ── Function bodies ─────────────────────────────────────────────────
 
-    /// The immediate operands that follow an opcode. Most opcodes take none;
-    /// the rest fall into these shapes, which is what makes decoding a body
-    /// tractable without a per-opcode table of 540 entries.
-    const Imm = enum {
-        none,
-        /// A block signature: `0x40`, a single value type, or a type index.
-        block_type,
-        /// One u32 index (label, function, local, global, table, ...).
-        index,
-        /// Two u32 indices, in the order the binary format writes them.
-        index_pair,
-        /// Two u32 indices that the text format states in the opposite order
-        /// from the binary one, as `memory.init` and `table.init` do.
-        index_pair_swapped,
-        /// An optional table index followed by `(type N)`. The binary form
-        /// writes the type first, so the two are also swapped here.
-        call_indirect,
-        /// A vector of label indices plus the default label.
-        br_table,
-        /// Alignment, an optional memory index, and an offset.
-        mem_arg,
-        /// A memarg followed by a lane index.
-        mem_arg_lane,
-        /// A single lane index byte.
-        lane,
-        /// Sixteen lane index bytes.
-        shuffle,
-        /// A sixteen byte vector constant.
-        v128,
-        s32,
-        s64,
-        f32,
-        f64,
-        /// A heap type, for `ref.null`.
-        heap_type,
-        /// A vector of value types, for the typed `select`.
-        select_types,
-        /// A block signature followed by a vector of catch clauses.
-        try_table,
-        /// The single reserved byte carried by `atomic.fence`.
-        reserved_byte,
-    };
-
-    /// Immediate shape for an opcode, or null when this writer has no way to
-    /// print it. Returning null is deliberate: emitting a mnemonic without its
-    /// operands, or skipping the instruction, would produce wat that no longer
-    /// means what the module said.
-    fn immediateShape(prefix: u8, code: u32) ?Imm {
-        return switch (prefix) {
-            0 => switch (code) {
-                0x02, 0x03, 0x04 => .block_type,
-                // Legacy exception handling is not supported (see #366), and
-                // the lexer has no keywords for it, so there is nothing valid
-                // to print.
-                0x06, 0x07, 0x09, 0x18, 0x19 => null,
-                0x00, 0x01, 0x05, 0x0a, 0x0b, 0x0f, 0x1a, 0x1b => .none,
-                0x08, 0x0c, 0x0d, 0x10, 0x12, 0x14, 0x15 => .index,
-                0x0e => .br_table,
-                0x11, 0x13 => .call_indirect,
-                0x1c => .select_types,
-                0x1f => .try_table,
-                0x20...0x26 => .index,
-                0x28...0x3e => .mem_arg,
-                0x3f, 0x40 => .index,
-                0x41 => .s32,
-                0x42 => .s64,
-                0x43 => .f32,
-                0x44 => .f64,
-                0x45...0xc4 => .none,
-                0xd0 => .heap_type,
-                0xd1, 0xd3, 0xd4 => .none,
-                0xd2, 0xd5, 0xd6 => .index,
-                else => null,
-            },
-            0xfc => switch (code) {
-                0x00...0x07 => .none,
-                0x08, 0x0c => .index_pair_swapped,
-                0x0a, 0x0e => .index_pair,
-                0x09, 0x0b, 0x0d, 0x0f, 0x10, 0x11 => .index,
-                0x13...0x16 => .none,
-                else => null,
-            },
-            0xfd => switch (code) {
-                0x00...0x0b => .mem_arg,
-                0x0c => .v128,
-                0x0d => .shuffle,
-                0x15...0x22 => .lane,
-                0x54...0x5b => .mem_arg_lane,
-                0x5c, 0x5d => .mem_arg,
-                else => .none,
-            },
-            0xfe => switch (code) {
-                0x03 => .reserved_byte,
-                else => .mem_arg,
-            },
-            else => null,
-        };
-    }
-
-    /// An opcode and the shape of the immediates that follow it.
-    const Decoded = struct { prefix: u8, code: u32, shape: Imm };
-
-    /// Read the opcode at `pos`, advancing past it and its prefix.
-    fn decodeOpcode(bytes: []const u8, pos: *usize) WriteError!Decoded {
-        const byte = bytes[pos.*];
-        pos.* += 1;
-
-        var prefix: u8 = 0;
-        var code: u32 = byte;
-        if (byte == 0xfc or byte == 0xfd or byte == 0xfe or byte == 0xfb) {
-            prefix = byte;
-            code = try readU32At(bytes, pos);
-        }
-
-        return .{
-            .prefix = prefix,
-            .code = code,
-            .shape = immediateShape(prefix, code) orelse return error.UnsupportedOpcode,
-        };
-    }
-
     /// Print a function body in the flat form `wasm-tools print` emits, which
     /// this crate's own text parser accepts.
     fn writeBody(self: *WatWriter, code_bytes: []const u8) WriteError!void {
@@ -416,7 +296,7 @@ const WatWriter = struct {
             // after it would be unreachable bytes, not instructions.
             if (code_bytes[pos] == 0x0b and self.blockDepthAtBodyEnd(start, code_bytes)) break;
 
-            const d = try decodeOpcode(code_bytes, &pos);
+            const d = try instr.decode(code_bytes, &pos);
             const prefix = d.prefix;
             const code = d.code;
             const shape = d.shape;
@@ -444,7 +324,7 @@ const WatWriter = struct {
         var pos: usize = 0;
         var count: u32 = 0;
         while (pos < bytes.len) {
-            const d = try decodeOpcode(bytes, &pos);
+            const d = try instr.decode(bytes, &pos);
             if (count > 0) try self.appendByte(' ');
             try self.append(mnemonic(d.prefix, d.code) orelse return error.UnsupportedOpcode);
             try self.writeImmediates(d.shape, bytes, &pos);
@@ -480,7 +360,7 @@ const WatWriter = struct {
         return name;
     }
 
-    fn writeImmediates(self: *WatWriter, shape: Imm, bytes: []const u8, pos: *usize) WriteError!void {
+    fn writeImmediates(self: *WatWriter, shape: instr.Imm, bytes: []const u8, pos: *usize) WriteError!void {
         switch (shape) {
             .none => {},
             .block_type => try self.writeBlockType(bytes, pos),
@@ -955,7 +835,7 @@ const WatWriter = struct {
                     pos += 1;
                     break;
                 }
-                const d = try decodeOpcode(bytes, &pos);
+                const d = try instr.decode(bytes, &pos);
                 if (wrote > 0) try self.appendByte(' ');
                 try self.append(mnemonic(d.prefix, d.code) orelse return error.UnsupportedOpcode);
                 try self.writeImmediates(d.shape, bytes, &pos);
@@ -1715,4 +1595,97 @@ test "an element segment states table 0 only when it was stated" {
     defer alloc.free(iwat);
     try std.testing.expect(std.mem.indexOf(u8, iwat, "(elem (;0;) (i32.const 0) func 0)") != null);
     try std.testing.expect(std.mem.indexOf(u8, iwat, "(elem (;0;) (table") == null);
+}
+
+test "a constant expression may hold an instruction with wide immediates" {
+    const alloc = std.testing.allocator;
+    // (module (global v128 v128.const i8x16 2 3 4 ...))
+    // A `v128.const` carries sixteen raw bytes. Read as opcodes those bytes
+    // are instructions: 0x02, 0x03 and 0x04 open a block, a loop and an `if`,
+    // so the expression's own `end` gets taken for theirs and the scan runs
+    // off the end of the module.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x16, 0x01, 0x7b, 0x00, 0xfd, 0x0c,
+        0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09,
+        0x0a, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12,
+        0x0b,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "v128.const i8x16 2 3 4 5 6 7 8 9 10 12 13 14 15 16 17 18") != null);
+
+    // The same hazard the other way round: an immediate byte that happens to
+    // be `end` closes the expression early and the rest is read as a module.
+    const ends = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x16, 0x01, 0x7b, 0x00, 0xfd, 0x0c,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b,
+    };
+    const ewat = try printBinary(alloc, &ends);
+    defer alloc.free(ewat);
+    try std.testing.expect(std.mem.indexOf(u8, ewat, "v128.const i8x16 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11") != null);
+}
+
+test "skipping an instruction's immediates lands where printing them does" {
+    // The reader walks constant expressions by stepping over immediates and
+    // the writer walks bodies by printing them. If the two ever disagree on
+    // how wide an immediate is, the reader silently mis-frames an expression,
+    // which is the failure this pairing exists to prevent. Every shape gets a
+    // sample encoding and both must consume exactly the same bytes.
+    const samples = [_][]const u8{
+        &.{0x01}, // nop -- none
+        &.{ 0x02, 0x40 }, // block -- block_type
+        &.{ 0x02, 0x7e }, // block (result i64) -- block_type as a value type
+        &.{ 0x02, 0x63, 0x70 }, // block (result (ref null func))
+        &.{ 0x0c, 0x03 }, // br -- index
+        &.{ 0xfc, 0x0a, 0x00, 0x01 }, // memory.copy -- index_pair
+        &.{ 0xfc, 0x08, 0x02, 0x00 }, // memory.init -- index_pair_swapped
+        &.{ 0x11, 0x01, 0x00 }, // call_indirect
+        &.{ 0x0e, 0x02, 0x00, 0x01, 0x02 }, // br_table
+        &.{ 0x28, 0x02, 0x10 }, // i32.load -- mem_arg
+        &.{ 0x28, 0x42, 0x01, 0x10 }, // i32.load with an explicit memory
+        &.{ 0x28, 0x02, 0x80, 0x01 }, // i32.load with a multi-byte offset
+        &.{ 0xfd, 0x54, 0x00, 0x00, 0x03 }, // v128.load8_lane -- mem_arg_lane
+        &.{ 0xfd, 0x15, 0x05 }, // i8x16.extract_lane_s -- lane
+        &.{ 0xfd, 0x0d, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 }, // shuffle
+        &.{ 0xfd, 0x0c, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }, // v128
+        &.{ 0x41, 0x80, 0x01 }, // i32.const -- s32
+        &.{ 0x42, 0xff, 0x7e }, // i64.const -- s64
+        &.{ 0x43, 0x00, 0x00, 0x80, 0x3f }, // f32.const
+        &.{ 0x44, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f }, // f64.const
+        &.{ 0xd0, 0x70 }, // ref.null func -- heap_type
+        &.{ 0xd0, 0x00 }, // ref.null 0 -- heap_type as a type index
+        &.{ 0x1c, 0x01, 0x7f }, // select (result i32) -- select_types
+        &.{ 0x1f, 0x40, 0x02, 0x00, 0x01, 0x00, 0x02, 0x01 }, // try_table
+        &.{ 0xfe, 0x03, 0x00 }, // atomic.fence -- reserved_byte
+    };
+
+    var seen = std.EnumSet(instr.Imm).initEmpty();
+    for (samples) |sample| {
+        var write_pos: usize = 0;
+        const d = try instr.decode(sample, &write_pos);
+        seen.insert(d.shape);
+        var skip_pos = write_pos;
+
+        var w = WatWriter{ .allocator = std.testing.allocator, .buf = .empty };
+        defer w.buf.deinit(std.testing.allocator);
+        try w.writeImmediates(d.shape, sample, &write_pos);
+        try instr.skipImmediates(d.shape, sample, &skip_pos);
+
+        try std.testing.expectEqual(write_pos, skip_pos);
+        // Both must also have used the whole sample, or the sample is wrong
+        // and the agreement above proves nothing.
+        try std.testing.expectEqual(sample.len, skip_pos);
+    }
+
+    // A shape with no sample would be silently untested.
+    for (std.enums.values(instr.Imm)) |shape| {
+        if (!seen.contains(shape)) {
+            std.debug.print("no sample for immediate shape {t}\n", .{shape});
+            return error.TestUnexpectedResult;
+        }
+    }
 }
