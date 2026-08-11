@@ -289,6 +289,13 @@ pub const ElemSegment = struct {
     owns_elem_expr_bytes: bool = false,
     /// Number of individual elem expressions encoded in elem_expr_bytes.
     elem_expr_count: u32 = 0,
+    /// Whether the segment holds expressions rather than function indices.
+    /// A segment with no elements at all still has one form or the other,
+    /// and they print differently, so the count cannot stand in for this.
+    uses_elem_exprs: bool = false,
+    /// Whether the segment named its table explicitly. Table 0 can be either
+    /// stated or left implicit, and the two are encoded differently.
+    has_explicit_table_index: bool = false,
 };
 
 /// Data segment.

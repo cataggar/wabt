@@ -755,7 +755,10 @@ const Reader = struct {
                 seg.kind = .active;
             }
 
+            seg.uses_elem_exprs = use_elem_exprs;
+
             if (!is_passive) {
+                seg.has_explicit_table_index = has_explicit_index;
                 if (has_explicit_index) seg.table_var = .{ .index = try self.readU32() };
                 const expr_with_end = try self.readInitExprBytes();
                 seg.offset_expr_bytes = if (expr_with_end.len > 0)
