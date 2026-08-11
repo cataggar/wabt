@@ -9,6 +9,7 @@ const Mod = @import("Module.zig");
 const Feature = @import("Feature.zig");
 const leb128 = @import("leb128.zig");
 const Opcode = @import("Opcode.zig");
+const instr = @import("binary/instr.zig");
 
 pub const Error = error{
     InvalidTypeIndex,
@@ -68,12 +69,12 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkFunctions(module);
     try checkTables(module, options);
     try checkMemories(module, options);
-    try checkGlobals(module);
+    try checkGlobals(module, options);
     try checkTags(module);
     try checkExports(module);
     try checkStart(module);
-    try checkElemSegments(module);
-    try checkDataSegments(module);
+    try checkElemSegments(module, options);
+    try checkDataSegments(module, options);
     try checkFunctionBodies(module);
 }
 
@@ -185,14 +186,14 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
     }
 }
 
-fn checkGlobals(m: *const Mod.Module) Error!void {
+fn checkGlobals(m: *const Mod.Module, options: Options) Error!void {
     for (m.globals.items, 0..) |global, i| {
         if (!global.type.val_type.isNumType() and !global.type.val_type.isRefType())
             return error.InvalidTypeIndex;
         // Validate init expression for non-imported globals
         if (!global.is_import) {
             const expected = StackType.fromValTypeAndIndex(global.type.val_type, global.type_idx);
-            try checkConstExpr(m, global.init_expr_bytes, expected, @intCast(i));
+            try checkConstExpr(m, global.init_expr_bytes, expected, @intCast(i), options.features);
         }
     }
 }
@@ -255,7 +256,7 @@ fn checkStart(m: *const Mod.Module) Error!void {
     }
 }
 
-fn checkElemSegments(m: *const Mod.Module) Error!void {
+fn checkElemSegments(m: *const Mod.Module, options: Options) Error!void {
     for (m.elem_segments.items) |seg| {
         // Validate elem type index references a valid type
         if (seg.elem_type_idx != 0xFFFFFFFF and seg.elem_type_idx >= m.module_types.items.len)
@@ -264,7 +265,7 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
             if (m.tables.items.len == 0 or seg.table_var.index >= m.tables.items.len)
                 return error.InvalidTableIndex;
             // Validate offset expression (even if empty — must produce i32)
-            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null);
+            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null, options.features);
             // Validate elem type matches table type
             const table = m.tables.items[seg.table_var.index];
             const elem_type = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
@@ -275,7 +276,7 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
         // Validate elem expressions
         if (seg.elem_expr_count > 0) {
             const expected = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
-            try checkElemExprs(m, seg.elem_expr_bytes, expected, seg.elem_expr_count);
+            try checkElemExprs(m, seg.elem_expr_bytes, expected, seg.elem_expr_count, options.features);
         }
         // Validate that func refs in funcref segments actually exist
         for (seg.elem_var_indices.items) |v| {
@@ -287,32 +288,39 @@ fn checkElemSegments(m: *const Mod.Module) Error!void {
 
 /// Validate elem expressions encoded as consecutive constant expressions
 /// separated by 0x0b terminators.
-fn checkElemExprs(m: *const Mod.Module, bytes: []const u8, expected: StackType, count: u32) Error!void {
+fn checkElemExprs(m: *const Mod.Module, bytes: []const u8, expected: StackType, count: u32, features: Feature.Set) Error!void {
     var pos: usize = 0;
     var remaining = count;
 
     while (remaining > 0 and pos < bytes.len) {
-        // Find the end of this expression (terminated by 0x0b)
-        var expr_end = pos;
-        while (expr_end < bytes.len and bytes[expr_end] != 0x0b) : (expr_end += 1) {}
-        const expr_bytes = bytes[pos..expr_end];
-
-        try checkConstExpr(m, expr_bytes, expected, null);
+        // Find the end of this expression. It is terminated by an `end`, but
+        // scanning for a 0x0b byte finds the first one that *looks* like an
+        // end, which may be part of an immediate: `ref.func 11` encodes as
+        // d2 0b, so an element segment referring to function 11 was cut in
+        // half. Step over whole instructions instead.
+        const start = pos;
+        while (pos < bytes.len) {
+            if (bytes[pos] == 0x0b) break;
+            var probe = pos;
+            const decoded = instr.decode(bytes, &probe) catch return error.UnsupportedOpcode;
+            instr.skipImmediates(decoded.shape, bytes, &probe) catch return error.UnexpectedEnd;
+            pos = probe;
+        }
+        try checkConstExpr(m, bytes[start..pos], expected, null, features);
 
         // Skip past the 0x0b terminator
-        if (expr_end < bytes.len) expr_end += 1;
-        pos = expr_end;
+        if (pos < bytes.len) pos += 1;
         remaining -= 1;
     }
 }
 
-fn checkDataSegments(m: *const Mod.Module) Error!void {
+fn checkDataSegments(m: *const Mod.Module, options: Options) Error!void {
     for (m.data_segments.items) |seg| {
         if (seg.kind == .active) {
             if (m.memories.items.len == 0 or seg.memory_var.index >= m.memories.items.len)
                 return error.InvalidMemoryIndex;
             // Validate offset expression (even if empty — must produce i32)
-            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null);
+            try checkConstExpr(m, seg.offset_expr_bytes, StackType.known(.i32), null, options.features);
         }
     }
 }
@@ -331,15 +339,30 @@ fn checkLimits(limits: types.Limits, absolute_max: u64) Error!void {
 // ── Constant expression validation ──────────────────────────────────────
 
 /// Validate a constant expression (used in global init, data/elem offsets).
-/// Only constant instructions are allowed: i32.const, i64.const, f32.const, f64.const,
-/// ref.null, ref.func, and global.get (of an immutable imported global).
-/// The expression must produce exactly one value of the expected type.
-/// `global_limit` restricts global.get to reference only imported globals with
-/// index < global_limit (for global init, this is the current global's index).
-fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: StackType, global_limit: ?u32) Error!void {
+///
+/// The constant instructions are the `*.const` forms, `ref.null`, `ref.func`
+/// and `global.get`; with the extended-const feature the integer `add`, `sub`
+/// and `mul` forms join them. The expression must leave exactly one value, of
+/// the expected type.
+///
+/// `global_limit` restricts global.get to globals with index < global_limit
+/// (for global init, this is the index of the global being defined).
+fn checkConstExpr(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    expected: StackType,
+    global_limit: ?u32,
+    features: Feature.Set,
+) Error!void {
     var pos: usize = 0;
-    var stack_depth: u32 = 0;
-    var result_type: StackType = StackType.unknown();
+
+    // A constant expression is type-checked like any other: an operand stack,
+    // not a count of pushes. Counting was enough while every constant
+    // instruction pushed one value and popped none, but extended-const adds
+    // instructions that pop two and push one, and their operand types have to
+    // be checked as well as their number.
+    var stack: std.ArrayListUnmanaged(StackType) = .empty;
+    defer stack.deinit(gpa(m));
 
     while (pos < bytes.len) {
         const opcode = bytes[pos];
@@ -348,62 +371,69 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: StackType, 
         switch (opcode) {
             0x41 => { // i32.const
                 _ = readS32(bytes, &pos);
-                stack_depth += 1;
-                result_type = StackType.known(.i32);
+                try push(m, &stack, StackType.known(.i32));
             },
             0x42 => { // i64.const
                 _ = readS64(bytes, &pos);
-                stack_depth += 1;
-                result_type = StackType.known(.i64);
+                try push(m, &stack, StackType.known(.i64));
             },
             0x43 => { // f32.const
                 pos += 4;
-                stack_depth += 1;
-                result_type = StackType.known(.f32);
+                try push(m, &stack, StackType.known(.f32));
             },
             0x44 => { // f64.const
                 pos += 8;
-                stack_depth += 1;
-                result_type = StackType.known(.f64);
+                try push(m, &stack, StackType.known(.f64));
+            },
+            // i32.add, i32.sub, i32.mul, i64.add, i64.sub, i64.mul. These are
+            // the whole of extended-const: the other integer operators, and
+            // every float one, stay non-constant.
+            0x6a, 0x6b, 0x6c, 0x7c, 0x7d, 0x7e => {
+                if (!features.extended_const) return error.ConstantExprRequired;
+                const vt: ValTypeOrUnknown = if (opcode <= 0x6c) .i32 else .i64;
+                try popExpecting(m, &stack, vt);
+                try popExpecting(m, &stack, vt);
+                try push(m, &stack, StackType.known(vt));
             },
             0xd0 => { // ref.null
-                result_type = readHeapStackType(bytes, &pos, true) orelse return error.InvalidTypeIndex;
-                stack_depth += 1;
+                const t = readHeapStackType(bytes, &pos, true) orelse return error.InvalidTypeIndex;
+                try push(m, &stack, t);
             },
             0xd2 => { // ref.func
                 const idx = readU32(bytes, &pos);
                 if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
-                stack_depth += 1;
                 const type_idx = m.funcs.items[idx].decl.type_var.index;
-                result_type = if (type_idx != types.invalid_index and type_idx < m.module_types.items.len)
+                try push(m, &stack, if (type_idx != types.invalid_index and type_idx < m.module_types.items.len)
                     StackType.fromRefType(types.RefType.concrete(false, type_idx))
                 else
-                    StackType.known(.ref_func);
+                    StackType.known(.ref_func));
             },
             0x23 => { // global.get
                 const idx = readU32(bytes, &pos);
-                // In a global init, can only reference imported immutable globals
-                // with index < the current global being defined
-                if (global_limit) |limit| {
-                    // For global init: only imported immutable globals with index < current
-                    if (idx >= limit or idx >= m.globals.items.len)
-                        return error.InvalidGlobalIndex;
-                    if (!m.globals.items[idx].is_import)
-                        return error.InvalidGlobalIndex;
-                    if (m.globals.items[idx].type.mutability == .mutable)
-                        return error.ConstantExprRequired;
-                } else {
-                    // For data/elem offsets: only imported immutable globals
-                    if (idx >= m.globals.items.len)
-                        return error.InvalidGlobalIndex;
-                    if (!m.globals.items[idx].is_import)
-                        return error.InvalidGlobalIndex;
-                    if (m.globals.items[idx].type.mutability == .mutable)
-                        return error.ConstantExprRequired;
-                }
-                const gt = StackType.fromValTypeAndIndex(m.globals.items[idx].type.val_type, m.globals.items[idx].type_idx);
-                stack_depth += 1;
-                result_type = gt;
+                // In a global init only globals before this one are in scope;
+                // elsewhere any global is.
+                const limit = global_limit orelse m.globals.items.len;
+                if (idx >= limit or idx >= m.globals.items.len)
+                    return error.InvalidGlobalIndex;
+                // A constant expression may only read an immutable global.
+                // Reading one that is defined here rather than imported is
+                // what the GC proposal relaxed; before it, only imports were
+                // in reach.
+                if (!m.globals.items[idx].is_import and !features.gc)
+                    return error.ConstantExprRequired;
+                if (m.globals.items[idx].type.mutability == .mutable)
+                    return error.ConstantExprRequired;
+                try push(m, &stack, StackType.fromValTypeAndIndex(
+                    m.globals.items[idx].type.val_type,
+                    m.globals.items[idx].type_idx,
+                ));
+            },
+            0xfd => { // SIMD prefix; v128.const is the only constant form
+                const sub = readU32(bytes, &pos);
+                if (sub != 0x0c) return error.ConstantExprRequired;
+                pos += 16;
+                if (pos > bytes.len) return error.UnexpectedEnd;
+                try push(m, &stack, StackType.known(.v128));
             },
             0x0b => break, // end
             else => {
@@ -413,12 +443,24 @@ fn checkConstExpr(m: *const Mod.Module, bytes: []const u8, expected: StackType, 
         }
     }
 
-    // Must produce exactly one value
-    if (stack_depth == 0) return error.TypeMismatch;
-    if (stack_depth > 1) return error.TypeMismatch;
+    // Must leave exactly one value, which must suit the slot it initialises.
+    if (stack.items.len != 1) return error.TypeMismatch;
+    if (!stack.items[0].isSubtypeOf(m, expected)) return error.TypeMismatch;
+}
 
-    // Constant expressions produce a value for a declared slot.
-    if (!result_type.isSubtypeOf(m, expected)) return error.TypeMismatch;
+fn push(m: *const Mod.Module, stack: *std.ArrayListUnmanaged(StackType), t: StackType) Error!void {
+    stack.append(gpa(m), t) catch return error.OutOfMemory;
+}
+
+/// Pop one operand off a constant expression's stack, requiring it to be of
+/// the given type.
+fn popExpecting(
+    m: *const Mod.Module,
+    stack: *std.ArrayListUnmanaged(StackType),
+    vt: ValTypeOrUnknown,
+) Error!void {
+    const got = stack.pop() orelse return error.TypeMismatch;
+    if (!got.isSubtypeOf(m, StackType.known(vt))) return error.TypeMismatch;
 }
 
 // ── Unrecognised opcode classification ──────────────────────────────────
@@ -4191,4 +4233,164 @@ test "packed types are valid as storage types and nowhere else" {
     defer packed_param.deinit();
     try appendFuncTypeForTest(&packed_param, &.{.i8}, &.{}, &.{}, &.{});
     try std.testing.expectError(error.InvalidTypeIndex, validate(&packed_param, .{}));
+}
+
+// ── Constant expression tests ───────────────────────────────────────────
+
+/// A module with one defined global of `vt`, initialised by `init`.
+fn testModuleWithGlobal(alloc: std.mem.Allocator, vt: types.ValType, init: []const u8) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.globals.append(alloc, .{
+        .type = .{ .val_type = vt, .mutability = .immutable },
+        .init_expr_bytes = init,
+    });
+    return module;
+}
+
+test "extended-const arithmetic initialises a global" {
+    const alloc = std.testing.allocator;
+    // `(global i32 (i32.add (i32.const 1) (i32.const 2)))`. Only the const
+    // instructions were accepted, so every module using extended-const was
+    // rejected -- 98 of them across the test corpora.
+    const init = [_]u8{ 0x41, 0x01, 0x41, 0x02, 0x6a, 0x0b };
+    var m = try testModuleWithGlobal(alloc, .i32, &init);
+    defer m.deinit();
+    try validate(&m, .{});
+
+    // It is a feature, and stating that the feature is off must bring the
+    // old answer back rather than being quietly ignored.
+    try std.testing.expectError(
+        error.ConstantExprRequired,
+        validate(&m, .{ .features = .{ .extended_const = false } }),
+    );
+}
+
+test "only add, sub and mul are constant" {
+    const alloc = std.testing.allocator;
+    // i32.mul is in extended-const...
+    const mul = [_]u8{ 0x41, 0x02, 0x41, 0x03, 0x6c, 0x0b };
+    var ok = try testModuleWithGlobal(alloc, .i32, &mul);
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    // ...but i32.div_u (0x6e) is not, and neither is anything else. Accepting
+    // the whole arithmetic range would be the easy mistake to make here.
+    const div = [_]u8{ 0x41, 0x02, 0x41, 0x03, 0x6e, 0x0b };
+    var bad = try testModuleWithGlobal(alloc, .i32, &div);
+    defer bad.deinit();
+    try std.testing.expectError(error.ConstantExprRequired, validate(&bad, .{}));
+}
+
+test "a constant expression type-checks its operands and its result" {
+    const alloc = std.testing.allocator;
+    // i64 operands under an i32.add. Counting pushes rather than tracking
+    // types would let this through.
+    const wrong_operands = [_]u8{ 0x42, 0x01, 0x42, 0x02, 0x6a, 0x0b };
+    var a = try testModuleWithGlobal(alloc, .i32, &wrong_operands);
+    defer a.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&a, .{}));
+
+    // Only one operand for an instruction that needs two.
+    const too_few = [_]u8{ 0x41, 0x01, 0x6a, 0x0b };
+    var b = try testModuleWithGlobal(alloc, .i32, &too_few);
+    defer b.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&b, .{}));
+
+    // An operand left over at the end.
+    const leftover = [_]u8{ 0x41, 0x01, 0x41, 0x02, 0x41, 0x03, 0x6a, 0x0b };
+    var c = try testModuleWithGlobal(alloc, .i32, &leftover);
+    defer c.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&c, .{}));
+
+    // The right shape, but the wrong type for the global it initialises.
+    const wrong_result = [_]u8{ 0x41, 0x01, 0x41, 0x02, 0x6a, 0x0b };
+    var d = try testModuleWithGlobal(alloc, .i64, &wrong_result);
+    defer d.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&d, .{}));
+}
+
+test "v128.const initialises a global" {
+    const alloc = std.testing.allocator;
+    // 0xfd 0x0c followed by sixteen bytes. The whole SIMD prefix was
+    // rejected, so a v128 global could be printed but never read back.
+    const init = [_]u8{0xfd} ++ [_]u8{0x0c} ++ [_]u8{0} ** 16 ++ [_]u8{0x0b};
+    var m = try testModuleWithGlobal(alloc, .v128, &init);
+    defer m.deinit();
+    try validate(&m, .{});
+
+    // v128.const is the only constant SIMD instruction; i8x16.splat (0x0f)
+    // is not one.
+    const splat = [_]u8{ 0xfd, 0x0f, 0x0b };
+    var bad = try testModuleWithGlobal(alloc, .v128, &splat);
+    defer bad.deinit();
+    try std.testing.expectError(error.ConstantExprRequired, validate(&bad, .{}));
+}
+
+test "a constant expression reads an immutable global, imported or not" {
+    const alloc = std.testing.allocator;
+    // Global 1 is initialised from global 0, which is defined here rather
+    // than imported. Reading a locally defined global is what the GC
+    // proposal relaxed; before it, only imports were in reach.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    const first = [_]u8{ 0x41, 0x07, 0x0b };
+    const second = [_]u8{ 0x23, 0x00, 0x0b };
+    try m.globals.append(alloc, .{
+        .type = .{ .val_type = .i32, .mutability = .immutable },
+        .init_expr_bytes = &first,
+    });
+    try m.globals.append(alloc, .{
+        .type = .{ .val_type = .i32, .mutability = .immutable },
+        .init_expr_bytes = &second,
+    });
+    try validate(&m, .{});
+    try std.testing.expectError(
+        error.ConstantExprRequired,
+        validate(&m, .{ .features = .{ .gc = false } }),
+    );
+
+    // A global may still only read one declared before it, whatever the
+    // feature says: global 0 cannot read global 1.
+    var fwd = Mod.Module.init(alloc);
+    defer fwd.deinit();
+    const reads_later = [_]u8{ 0x23, 0x01, 0x0b };
+    try fwd.globals.append(alloc, .{
+        .type = .{ .val_type = .i32, .mutability = .immutable },
+        .init_expr_bytes = &reads_later,
+    });
+    try fwd.globals.append(alloc, .{
+        .type = .{ .val_type = .i32, .mutability = .immutable },
+        .init_expr_bytes = &first,
+    });
+    try std.testing.expectError(error.InvalidGlobalIndex, validate(&fwd, .{}));
+}
+
+test "an element expression ends where the instruction ends" {
+    const alloc = std.testing.allocator;
+    // Expressions were split at the first 0x0b byte, which is not
+    // necessarily an `end`: `ref.func 11` encodes as d2 0b, so a segment
+    // referring to function 11 was cut in half and the halves type-checked
+    // as if they were whole expressions.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    for (0..13) |_| {
+        try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+    }
+    try m.tables.append(alloc, .{
+        .type = .{ .elem_type = .funcref, .limits = .{ .initial = 20 } },
+    });
+    const offset = [_]u8{ 0x41, 0x00, 0x0b };
+    // ref.func 11, end, ref.func 1, end
+    const exprs = [_]u8{ 0xd2, 0x0b, 0x0b, 0xd2, 0x01, 0x0b };
+    try m.elem_segments.append(alloc, .{
+        .kind = .active,
+        .elem_type = .funcref,
+        .offset_expr_bytes = &offset,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 2,
+        .uses_elem_exprs = true,
+    });
+    try validate(&m, .{});
 }
