@@ -258,7 +258,6 @@ pub const Memory = struct {
     @"type": types.MemoryType = .{},
     loc: Location = .{},
     is_import: bool = false,
-    is_memory64: bool = false,
 };
 
 /// A defined or imported tag (exception-handling proposal).
