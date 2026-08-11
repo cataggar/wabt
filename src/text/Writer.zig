@@ -45,6 +45,7 @@ const WatWriter = struct {
         try self.writeFuncs(module);
         try self.writeTables(module);
         try self.writeMemories(module);
+        try self.writeTags(module);
         try self.writeGlobals(module);
         try self.writeExports(module);
         try self.writeStart(module);
@@ -156,6 +157,10 @@ const WatWriter = struct {
     }
 
     fn writeImports(self: *WatWriter, module: *const Mod.Module) WriteError!void {
+        // An imported tag records its signature but not the type index that
+        // names it. Imported tags are appended to `tags` in import order, so
+        // the nth tag import is `tags[n]`.
+        var tag_import: u32 = 0;
         for (module.imports.items) |imp| {
             try self.writeIndent();
             try self.append("(import \"");
@@ -190,7 +195,12 @@ const WatWriter = struct {
                         try self.writeValTypeWithTidx(g.val_type, imp.global_type_idx);
                     }
                 },
-                .tag => {},
+                .tag => {
+                    if (tag_import < module.tags.items.len) {
+                        try self.writeTagType(module, module.tags.items[tag_import]);
+                    }
+                    tag_import += 1;
+                },
             }
             try self.append("))");
             try self.newline();
@@ -810,6 +820,37 @@ const WatWriter = struct {
             try self.writeLimits(mem.type.limits);
             try self.appendByte(')');
             try self.newline();
+        }
+    }
+
+    fn writeTags(self: *WatWriter, module: *const Mod.Module) WriteError!void {
+        for (module.tags.items[module.num_tag_imports..], 0..) |tag, i| {
+            try self.writeIndent();
+            try self.append("(tag (;");
+            try self.writeU32(module.num_tag_imports + @as(u32, @intCast(i)));
+            try self.append(";)");
+            if (tag.name) |n| {
+                try self.appendByte(' ');
+                try self.append(n);
+            }
+            try self.writeTagType(module, tag);
+            try self.appendByte(')');
+            try self.newline();
+        }
+    }
+
+    /// The `(type N)` a tag names, plus the signature it stands for. A tag
+    /// read from a binary holds a copy of the params without the concrete
+    /// type indices that go with them, so the signature is taken from the
+    /// type section whenever the tag names one.
+    fn writeTagType(self: *WatWriter, module: *const Mod.Module, tag: Mod.Tag) WriteError!void {
+        if (tag.type_idx != types.invalid_index) {
+            try self.append(" (type ");
+            try self.writeU32(tag.type_idx);
+            try self.appendByte(')');
+            try self.writeSignature(module, .{ .type_var = .{ .index = tag.type_idx } });
+        } else {
+            try self.writeSignature(module, .{ .sig = tag.@"type".sig });
         }
     }
 
@@ -1580,4 +1621,40 @@ test "a custom page size is read and printed" {
     const pwat = try printBinary(alloc, &plain);
     defer alloc.free(pwat);
     try std.testing.expect(std.mem.indexOf(u8, pwat, "pagesize") == null);
+}
+
+test "a tag prints the type it names and the signature it stands for" {
+    const alloc = std.testing.allocator;
+    // (module (type (func (param i32))) (type (func)) (tag (type 0)) (tag (type 1)))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x08, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x00, 0x00,
+        0x0d, 0x05, 0x02, 0x00, 0x00, 0x00, 0x01,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    // A dropped tag takes the module's ability to throw with it, and leaves
+    // every `throw` naming an index that no longer exists.
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(tag (;0;) (type 0) (param i32))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(tag (;1;) (type 1))") != null);
+}
+
+test "an imported tag prints its type and signature" {
+    const alloc = std.testing.allocator;
+    // (module (type (func (param i32))) (type (func (param f64)))
+    //         (import "m" "e" (tag (type 0))) (import "m" "f" (tag (type 1))))
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x09, 0x02, 0x60, 0x01, 0x7f, 0x00, 0x60, 0x01, 0x7c, 0x00,
+        0x02, 0x0f, 0x02, 0x01, 0x6d, 0x01, 0x65, 0x04, 0x00, 0x00,
+        0x01, 0x6d, 0x01, 0x66, 0x04, 0x00, 0x01,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+    // Each import takes its own tag, so a second one must not repeat the
+    // first one's signature.
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(import \"m\" \"e\" (tag (type 0) (param i32)))") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(import \"m\" \"f\" (tag (type 1) (param f64)))") != null);
+    // An imported tag is not also a defined one.
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, wat, "(tag "));
 }
