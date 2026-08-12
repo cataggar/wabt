@@ -1791,10 +1791,10 @@ fn readBlockType(
         return .{ .params = .{}, .results = .{ .vts = valTypeSlice(byte) } };
     }
 
-    // What is left is an s33 type index. Read it with the 64-bit decoder:
-    // the 33-bit range does not fit in an i32, and `readS32Leb128` reports
-    // the top of it as an overflow.
-    const result = leb128.readS64Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+    // What is left is an s33 type index. The 33-bit range does not fit in an
+    // i32, and reading it as an i64 would admit encodings up to ten bytes
+    // wide, so the width belongs to the reader.
+    const result = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
         error.UnexpectedEnd => error.UnexpectedEnd,
         error.Overflow => error.InvalidTypeIndex,
     };
@@ -1881,9 +1881,12 @@ fn readS64(bytes: []const u8, pos: *usize) i64 {
     return result.value;
 }
 
+/// Read a heap type: an s33 whose negative values name the abstract heap
+/// types and whose non-negative values are type indices. Same width rule as
+/// a block signature -- a heap type six bytes wide is malformed, not padded.
 fn readHeapStackType(m: *const Mod.Module, bytes: []const u8, pos: *usize, nullable: bool) ?StackType {
     if (pos.* >= bytes.len) return null;
-    const result = leb128.readS64Leb128(bytes[pos.*..]) catch return null;
+    const result = leb128.readS33Leb128(bytes[pos.*..]) catch return null;
     pos.* += result.bytes_read;
     if (types.AbstractHeapType.fromCode(result.value)) |heap| {
         return StackType.fromRefType(types.RefType.abstract(nullable, heap));
@@ -4472,6 +4475,75 @@ test "a malformed block signature is rejected, not read as an empty one" {
     // all.
     for ([_][]const u8{ &.{ 0x02, 0x63, 0x09, 0x0b, 0x0b }, &.{ 0x02, 0x64 } }) |body| {
         var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+}
+
+test "a block signature is an s33, and five bytes is as wide as one gets" {
+    // Padding is legal up to the width of the encoding and no further: 33
+    // bits do not reach a sixth byte, so a signature written in six is
+    // malformed. Reading the index as an s64 accepted up to ten -- wasm-tools
+    // 1.250.0 rejects every one of them.
+    const alloc = std.testing.allocator;
+
+    // block (type 0), padded to the full five bytes: valid.
+    {
+        const body = [_]u8{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    // The same index in six and in ten bytes, and a fifth byte that carries
+    // bits past the 33rd.
+    const malformed = [_][]const u8{
+        &.{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b, 0x0b },
+        &.{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b, 0x0b },
+        &.{ 0x02, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b, 0x0b },
+    };
+    for (malformed) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+}
+
+test "a heap type is an s33 too, and no wider" {
+    // The heap type after `0x63`/`0x64` and the operand of `ref.null` share
+    // one reader, so they share the width rule; both were reachable from
+    // this defect.
+    const alloc = std.testing.allocator;
+
+    // Padded to five bytes: `block (result (ref null 0))` and `ref.null 0`.
+    {
+        const body = [_]u8{
+            0x02, 0x63, 0x80, 0x80, 0x80, 0x80, 0x00,
+            0xd0, 0x80, 0x80, 0x80, 0x80, 0x00,
+            0x0b, 0x1a, 0x0b,
+        };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    // Six bytes for the heap type of a block signature, of a `ref.null` in a
+    // body, and of a `ref.null` in a global's initialiser.
+    {
+        const body = [_]u8{ 0x02, 0x63, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0xd0, 0x00, 0x0b, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+    {
+        const body = [_]u8{ 0xd0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+    {
+        const init = [_]u8{ 0xd0, 0xf0, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x0b };
+        var module = try testModuleWithGlobal(alloc, .funcref, &init);
         defer module.deinit();
         try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
     }
