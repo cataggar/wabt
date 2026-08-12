@@ -514,3 +514,151 @@ test "an element segment carries a concrete type index of any size" {
     try std.testing.expectEqual(@as(u32, 93), reread.elem_segments.items[0].elem_type_idx);
     try std.testing.expectEqual(@as(u32, 1), reread.elem_segments.items[0].elem_expr_count);
 }
+
+// ── 12. A table's initializer, all the way round ───────────────────────
+
+test "a table initializer survives binary → text → binary" {
+    const allocator = std.testing.allocator;
+
+    // Every one of these is a module wabt used to print less of than it
+    // read: the initializer was decoded, kept and re-encoded, and dropped
+    // by the text writer alone. The loop below is the one the printer
+    // fidelity metric runs -- read the binary, print it, read the text
+    // back, write it out again -- and it has to end where it started.
+    const cases = [_]struct { source: []const u8, printed: []const u8 }{
+        .{
+            .source = "(module (table 1 funcref ref.null func))",
+            .printed = "(table (;0;) 1 funcref ref.null func)",
+        },
+        .{
+            .source = "(module (table 1 arrayref ref.null array))",
+            .printed = "(table (;0;) 1 arrayref ref.null array)",
+        },
+        .{
+            .source = "(module (func) (table 3 funcref ref.func 0))",
+            .printed = "(table (;0;) 3 funcref ref.func 0)",
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global externref)) (table 4 externref global.get 0))",
+            .printed = "(table (;0;) 4 externref global.get 0)",
+        },
+        .{
+            .source = "(module (table i64 1 8 externref ref.null extern))",
+            .printed = "(table (;0;) i64 1 8 externref ref.null extern)",
+        },
+        .{
+            .source = "(module (type (func)) (table 1 (ref null 0) ref.null 0))",
+            .printed = "(table (;0;) 1 (ref null 0) ref.null 0)",
+        },
+    };
+
+    for (cases) |case| {
+        var built = try text_parser.parseModule(allocator, case.source);
+        defer built.deinit();
+        const wasm = try binary_writer.writeModule(allocator, &built);
+        defer allocator.free(wasm);
+
+        var decoded = try binary_reader.readModule(allocator, wasm);
+        defer decoded.deinit();
+        try Validator.validate(&decoded, .{});
+
+        const wat = try text_writer.writeModule(allocator, &decoded);
+        defer allocator.free(wat);
+        try std.testing.expect(containsSubstring(wat, case.printed));
+
+        var reparsed = try text_parser.parseModule(allocator, wat);
+        defer reparsed.deinit();
+        try Validator.validate(&reparsed, .{});
+
+        const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
+        defer allocator.free(rebuilt);
+        try std.testing.expectEqualSlices(u8, wasm, rebuilt);
+    }
+}
+
+test "a non-defaultable table prints a module that still validates" {
+    const allocator = std.testing.allocator;
+
+    // The severe case. A table whose element type has no null is only
+    // legal because of its initializer, so printing the table without it
+    // produced text that parses, and a module that does not validate.
+    const source =
+        \\(module
+        \\  (type $t (func))
+        \\  (func $f (type $t))
+        \\  (table 2 (ref func) ref.func $f)
+        \\  (table 2 (ref $t) ref.func $f)
+        \\)
+    ;
+
+    var module = try text_parser.parseModule(allocator, source);
+    defer module.deinit();
+    try Validator.validate(&module, .{});
+
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var decoded = try binary_reader.readModule(allocator, wasm);
+    defer decoded.deinit();
+    try Validator.validate(&decoded, .{});
+
+    const wat = try text_writer.writeModule(allocator, &decoded);
+    defer allocator.free(wat);
+    try std.testing.expect(containsSubstring(wat, "(table (;0;) 2 (ref func) ref.func 0)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;1;) 2 (ref 0) ref.func 0)"));
+
+    var reparsed = try text_parser.parseModule(allocator, wat);
+    defer reparsed.deinit();
+    // The printed text has to be a module in its own right: this is the
+    // assertion that fails if the initializer goes missing again.
+    try Validator.validate(&reparsed, .{});
+    try std.testing.expectEqual(types.ValType.ref_func, reparsed.tables.items[0].type.elem_type);
+    try std.testing.expectEqual(types.ValType.concrete_ref, reparsed.tables.items[1].type.elem_type);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x00 }, reparsed.tables.items[0].init_expr_bytes);
+
+    const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
+    defer allocator.free(rebuilt);
+    try std.testing.expectEqualSlices(u8, wasm, rebuilt);
+}
+
+test "a table with no initializer keeps printing without one" {
+    const allocator = std.testing.allocator;
+
+    // The other half of the rule: nothing may appear where a table never
+    // said anything, including the inline element abbreviation, which is a
+    // table plus a segment rather than a table with an initializer.
+    const source =
+        \\(module
+        \\  (func $f)
+        \\  (table 1 funcref)
+        \\  (table i64 2 4 externref)
+        \\  (table funcref (elem $f))
+        \\)
+    ;
+
+    var module = try text_parser.parseModule(allocator, source);
+    defer module.deinit();
+    try Validator.validate(&module, .{});
+    for (module.tables.items) |table| {
+        try std.testing.expectEqual(@as(usize, 0), table.init_expr_bytes.len);
+    }
+
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var decoded = try binary_reader.readModule(allocator, wasm);
+    defer decoded.deinit();
+
+    const wat = try text_writer.writeModule(allocator, &decoded);
+    defer allocator.free(wat);
+    try std.testing.expect(containsSubstring(wat, "(table (;0;) 1 funcref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;1;) i64 2 4 externref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;2;) 1 funcref)"));
+    // No table gained an initializer, so no `ref.null` was invented.
+    try std.testing.expect(!containsSubstring(wat, "funcref ref.null"));
+
+    var reparsed = try text_parser.parseModule(allocator, wat);
+    defer reparsed.deinit();
+    try Validator.validate(&reparsed, .{});
+    const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
+    defer allocator.free(rebuilt);
+    try std.testing.expectEqualSlices(u8, wasm, rebuilt);
+}

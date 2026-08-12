@@ -2737,7 +2737,7 @@ const Parser = struct {
             },
             .kw_ref_func => {
                 code.append(self.allocator, 0xd2) catch return;
-                self.emitU32Imm(code);
+                self.emitFuncIdx(code);
             },
             .kw_ref_test, .kw_ref_cast => {
                 // ref.test (ref [null] <ht>) / ref.cast (ref [null] <ht>)
@@ -3001,6 +3001,37 @@ const Parser = struct {
         }
         buf[0] = 0x40; // void
         return 1;
+    }
+
+    /// Emit the function index a `ref.func` names.
+    ///
+    /// `ref.func x` takes a funcidx and nothing else, so only the function
+    /// namespace is searched. The general immediate reader is no good here:
+    /// it tries labels and then locals first, for the sake of `br $label`
+    /// and `local.get $x`, and the local names of the function parsed most
+    /// recently are still in it when a table's or a global's initializer is
+    /// read. A module whose last function had a parameter `$y` and which
+    /// then wrote `ref.func $y` for the *function* `$y` silently got that
+    /// parameter's index instead. A name that no function has is malformed
+    /// rather than function 0.
+    fn emitFuncIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            if (self.lookupName(&self.func_names, tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+            } else {
+                self.markMalformed(@src());
+                self.emitLeb128U32(code, 0);
+            }
+            return;
+        }
+        if (self.peek().kind == .integer) {
+            self.emitLeb128U32(code, self.parseU32() catch 0);
+            return;
+        }
+        self.markMalformed(@src());
+        self.emitLeb128U32(code, 0);
     }
 
     fn emitGlobalIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
@@ -3773,6 +3804,7 @@ const Parser = struct {
                 // Extended constant expression in folded form (e.g. i32.add).
                 // Emit instruction, then operands, then reorder so operands precede instruction.
                 const instr_start = code.items.len;
+                if (self.takeInitExprTerminator()) return;
                 self.parsePlainInstr(code);
                 const instr_end = code.items.len;
                 const instr_len = instr_end - instr_start;
@@ -3807,7 +3839,26 @@ const Parser = struct {
 
     /// Parse a plain init expression instruction.
     fn parseInitExprPlain(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.takeInitExprTerminator()) return;
         self.parsePlainInstr(code);
+    }
+
+    /// Reject the `end` that terminates a constant expression in the binary
+    /// but has no spelling in the text.
+    ///
+    /// A constant expression is a sequence of instructions, not a block:
+    /// `expr ::= instr* end` puts the `end` in the *encoding*, and every
+    /// writer of one appends it. Reading `end` as an instruction let
+    /// `(global i32 i32.const 0 end)` through, and what it wrote was
+    /// `41 00 0b` plus the writer's own `0b` -- two terminators, and a
+    /// section whose declared size no longer matches its contents. The
+    /// validator could not catch it either, because it stops reading at the
+    /// first `end`.
+    fn takeInitExprTerminator(self: *Parser) bool {
+        if (self.peek().kind != .kw_end) return false;
+        self.markMalformed(@src());
+        _ = self.advance();
+        return true;
     }
 
     /// Parse an init expression that is wrapped in parens, e.g. (i32.const 0).
@@ -4147,50 +4198,24 @@ const Parser = struct {
             self.collected_type_refs.items[saved_refs_len]
         else
             0xFFFFFFFF;
-        // Parse optional table initializer expression: (ref.null func) etc.
+        // A table may state the value its slots start out holding. The
+        // initializer is an ordinary constant expression, written either
+        // folded — `(table 1 funcref (ref.null func))` — or unfolded, which
+        // is the spelling the text writer emits and the one `wasm-tools`
+        // prints: `(table 1 funcref ref.null func)`. Both go through the
+        // shared constant-expression parser, so a form accepted for a global
+        // is accepted here, with the same heap types, the same name
+        // resolution and the same errors.
+        self.skipAnnotations();
         var table_init_bytes: []const u8 = &.{};
         var owns_table_init_bytes = false;
-        if (self.peek().kind == .l_paren) {
-            _ = self.advance(); // consume '('
+        if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
             var init_code: std.ArrayListUnmanaged(u8) = .empty;
             defer init_code.deinit(self.allocator);
-            const inner = self.advance();
-            if (inner.kind == .kw_ref_null) {
-                init_code.append(self.allocator, 0xd0) catch {};
-                if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                    _ = self.advance(); // consume heaptype
-                }
-                init_code.append(self.allocator, 0x70) catch {};
-            } else if (inner.kind == .kw_ref_func) {
-                init_code.append(self.allocator, 0xd2) catch {};
-                if (self.peek().kind == .identifier) {
-                    const fidx = self.lookupName(&self.func_names, self.advance().text) orelse 0;
-                    self.emitLeb128U32(&init_code, fidx);
-                } else {
-                    self.emitLeb128U32(&init_code, self.parseU32() catch 0);
-                }
-            } else if (inner.kind == .kw_global_get) {
-                init_code.append(self.allocator, 0x23) catch {};
-                self.emitGlobalIdx(&init_code);
-            } else if (inner.kind == .opcode and std.mem.eql(u8, inner.text, "ref.i31")) {
-                // ref.i31 init expression: (ref.i31 (i32.const N))
-                // Operand first, then ref.i31 (stack order)
-                if (self.peek().kind == .l_paren) {
-                    _ = self.advance();
-                    self.parseInitExprFolded(&init_code);
-                } else {
-                    self.parseInitExprPlain(&init_code);
-                }
-                init_code.append(self.allocator, 0xfb) catch {};
-                var sub_buf: [5]u8 = undefined;
-                const sub_n = leb128.writeU32Leb128(&sub_buf, 0x1c);
-                init_code.appendSlice(self.allocator, sub_buf[0..sub_n]) catch {};
-            } else {
-                // Unknown/invalid init expr — mark as malformed
-                self.markMalformed(@src());
-                while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
-            }
-            if (self.peek().kind == .r_paren) _ = self.advance();
+            self.parseInitExpr(&init_code);
+            // Something followed the element type but produced no
+            // instruction, so it was not an initializer at all.
+            if (init_code.items.len == 0) self.markMalformed(@src());
             table_init_bytes = try init_code.toOwnedSlice(self.allocator);
             owns_table_init_bytes = true;
         }
@@ -6613,6 +6638,491 @@ test "ref.null rejects numeric indices in the abstract heap type alias window" {
         \\  (func ref.null 4294967280 drop)
         \\)
     ));
+}
+
+// ── Table initializers ──────────────────────────────────────────────────
+
+test "a table initializer is read folded or unfolded" {
+    // The text writer prints a constant expression unfolded, which is also
+    // what `wasm-tools` prints, and the folded spelling is what a
+    // hand-written module tends to use. Both name the same expression, so
+    // both must produce the same bytes.
+    const cases = [_]struct {
+        unfolded: []const u8,
+        folded: []const u8,
+        init: []const u8,
+    }{
+        .{
+            .unfolded = "(module (table 1 funcref ref.null func))",
+            .folded = "(module (table 1 funcref (ref.null func)))",
+            .init = &.{ 0xd0, 0x70 },
+        },
+        .{
+            .unfolded = "(module (table 1 externref ref.null extern))",
+            .folded = "(module (table 1 externref (ref.null extern)))",
+            .init = &.{ 0xd0, 0x6f },
+        },
+        .{
+            .unfolded = "(module (func) (table 3 funcref ref.func 0))",
+            .folded = "(module (func) (table 3 funcref (ref.func 0)))",
+            .init = &.{ 0xd2, 0x00 },
+        },
+        .{
+            .unfolded = "(module (func $f) (func $g) (table 3 funcref ref.func $g))",
+            .folded = "(module (func $f) (func $g) (table 3 funcref (ref.func $g)))",
+            .init = &.{ 0xd2, 0x01 },
+        },
+        .{
+            .unfolded = "(module (import \"m\" \"g\" (global externref)) (table 4 externref global.get 0))",
+            .folded = "(module (import \"m\" \"g\" (global externref)) (table 4 externref (global.get 0)))",
+            .init = &.{ 0x23, 0x00 },
+        },
+        .{
+            .unfolded = "(module (import \"m\" \"g\" (global $g externref)) (table 4 externref global.get $g))",
+            .folded = "(module (import \"m\" \"g\" (global $g externref)) (table 4 externref (global.get $g)))",
+            .init = &.{ 0x23, 0x00 },
+        },
+        .{
+            .unfolded = "(module (table $t 1 funcref ref.null func))",
+            .folded = "(module (table $t 1 funcref (ref.null func)))",
+            .init = &.{ 0xd0, 0x70 },
+        },
+        .{
+            .unfolded = "(module (table i64 1 8 externref ref.null extern))",
+            .folded = "(module (table i64 1 8 externref (ref.null extern)))",
+            .init = &.{ 0xd0, 0x6f },
+        },
+    };
+
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+
+        var unfolded = try parseModule(alloc, case.unfolded);
+        defer unfolded.deinit();
+        var folded = try parseModule(alloc, case.folded);
+        defer folded.deinit();
+
+        try std.testing.expectEqualSlices(u8, case.init, unfolded.tables.items[0].init_expr_bytes);
+        try std.testing.expectEqualSlices(u8, case.init, folded.tables.items[0].init_expr_bytes);
+        try Validator.validate(&unfolded, .{});
+        try Validator.validate(&folded, .{});
+
+        // Same module, so the same binary either way.
+        const a = try binary_writer.writeModule(alloc, &unfolded);
+        defer alloc.free(a);
+        const b = try binary_writer.writeModule(alloc, &folded);
+        defer alloc.free(b);
+        try std.testing.expectEqualSlices(u8, a, b);
+    }
+}
+
+test "a table's ref.null initializer keeps the heap type the source names" {
+    // The heap-type token was read and thrown away, and `funcref` written in
+    // its place, so `(table 1 externref (ref.null extern))` silently became a
+    // module that no longer validates.
+    const cases = [_]struct { source: []const u8, init: []const u8 }{
+        .{ .source = "(module (table 1 funcref ref.null func))", .init = &.{ 0xd0, 0x70 } },
+        .{ .source = "(module (table 1 externref ref.null extern))", .init = &.{ 0xd0, 0x6f } },
+        .{ .source = "(module (table 1 anyref ref.null any))", .init = &.{ 0xd0, 0x6e } },
+        .{ .source = "(module (table 1 eqref ref.null eq))", .init = &.{ 0xd0, 0x6d } },
+        .{ .source = "(module (table 1 i31ref ref.null i31))", .init = &.{ 0xd0, 0x6c } },
+        .{ .source = "(module (table 1 structref ref.null struct))", .init = &.{ 0xd0, 0x6b } },
+        .{ .source = "(module (table 1 arrayref ref.null array))", .init = &.{ 0xd0, 0x6a } },
+        .{ .source = "(module (table 1 exnref ref.null exn))", .init = &.{ 0xd0, 0x69 } },
+        .{ .source = "(module (table 1 nullref ref.null none))", .init = &.{ 0xd0, 0x71 } },
+        .{ .source = "(module (table 1 nullfuncref ref.null nofunc))", .init = &.{ 0xd0, 0x73 } },
+        .{ .source = "(module (table 1 nullexternref ref.null noextern))", .init = &.{ 0xd0, 0x72 } },
+        .{ .source = "(module (table 1 nullexnref ref.null noexn))", .init = &.{ 0xd0, 0x74 } },
+    };
+
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+
+        var module = try parseModule(alloc, case.source);
+        defer module.deinit();
+        try std.testing.expectEqualSlices(u8, case.init, module.tables.items[0].init_expr_bytes);
+        try Validator.validate(&module, .{});
+    }
+}
+
+test "a table initializer names a concrete heap type by name or index" {
+    const alloc = std.testing.allocator;
+
+    var named = try parseModule(alloc,
+        \\(module
+        \\  (type $t (func))
+        \\  (table 1 (ref null $t) ref.null $t)
+        \\)
+    );
+    defer named.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x00 }, named.tables.items[0].init_expr_bytes);
+    // The element type's own concrete index is not disturbed by the
+    // initializer that follows it.
+    try std.testing.expectEqual(@as(u32, 0), named.tables.items[0].type_idx);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, named.tables.items[0].type.elem_type);
+    try Validator.validate(&named, .{});
+
+    var numbered = try parseModule(alloc,
+        \\(module
+        \\  (type (func))
+        \\  (table 1 (ref null 0) ref.null 0)
+        \\)
+    );
+    defer numbered.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x00 }, numbered.tables.items[0].init_expr_bytes);
+    try std.testing.expectEqual(@as(u32, 0), numbered.tables.items[0].type_idx);
+    try Validator.validate(&numbered, .{});
+}
+
+test "a table initializer's concrete heap type is an s33, not a byte" {
+    const alloc = std.testing.allocator;
+
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(alloc);
+    try source.appendSlice(alloc, "(module\n");
+    for (0..65) |_| try source.appendSlice(alloc, "  (type (func))\n");
+    try source.appendSlice(alloc,
+        \\  (table 1 (ref null 64) ref.null 64)
+        \\)
+    );
+
+    var module = try parseModule(alloc, source.items);
+    defer module.deinit();
+    // 64 is the first concrete heap type index whose signed LEB needs two
+    // bytes; a one-byte write would spell `func` instead.
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0xc0, 0x00 }, module.tables.items[0].init_expr_bytes);
+    try std.testing.expectEqual(@as(u32, 64), module.tables.items[0].type_idx);
+    try Validator.validate(&module, .{});
+
+    const wasm = try binary_writer.writeModule(alloc, &module);
+    defer alloc.free(wasm);
+    var reread = try binary_reader.readModule(alloc, wasm);
+    defer reread.deinit();
+    try Validator.validate(&reread, .{});
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0xc0, 0x00 }, reread.tables.items[0].init_expr_bytes);
+    try std.testing.expectEqual(@as(u32, 64), reread.tables.items[0].type_idx);
+}
+
+test "a table whose element type has no null states what it holds" {
+    const alloc = std.testing.allocator;
+
+    // A non-defaultable element type is exactly the case where the
+    // initializer is not decoration: it is what makes the module legal.
+    var abstract = try parseModule(alloc, "(module (func $f) (table 2 (ref func) ref.func $f))");
+    defer abstract.deinit();
+    try std.testing.expectEqual(types.ValType.ref_func, abstract.tables.items[0].type.elem_type);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x00 }, abstract.tables.items[0].init_expr_bytes);
+    try Validator.validate(&abstract, .{});
+
+    var concrete = try parseModule(alloc,
+        \\(module
+        \\  (type $t (func))
+        \\  (func $f (type $t))
+        \\  (table 2 (ref $t) ref.func $f)
+        \\)
+    );
+    defer concrete.deinit();
+    try std.testing.expectEqual(types.ValType.concrete_ref, concrete.tables.items[0].type.elem_type);
+    try std.testing.expectEqual(@as(u32, 0), concrete.tables.items[0].type_idx);
+    try Validator.validate(&concrete, .{});
+
+    // Without one there is nothing to fill the table with.
+    var bare = try parseModule(alloc, "(module (func $f) (table 2 (ref func)))");
+    defer bare.deinit();
+    try std.testing.expectError(error.TypeMismatch, Validator.validate(&bare, .{}));
+
+    // An imported table needs no initializer: whoever supplies it has
+    // already filled it.
+    var imported = try parseModule(alloc, "(module (import \"m\" \"t\" (table 1 (ref func))))");
+    defer imported.deinit();
+    try Validator.validate(&imported, .{});
+}
+
+test "a table initializer that does not suit the table is rejected" {
+    // Each of these used to be accepted and quietly turned into something
+    // else, or rejected for the wrong reason. None of them may pass.
+    const cases = [_]struct { source: []const u8, err: anyerror }{
+        // The heap type does not match the element type.
+        .{ .source = "(module (table 1 funcref ref.null extern))", .err = error.TypeMismatch },
+        .{ .source = "(module (table 1 externref (ref.null func)))", .err = error.TypeMismatch },
+        // A number is not a reference.
+        .{ .source = "(module (table 1 funcref i32.const 0))", .err = error.TypeMismatch },
+        // Two values where one belongs.
+        .{ .source = "(module (func) (table 1 funcref ref.func 0 ref.null func))", .err = error.TypeMismatch },
+        // No function 0 to point at.
+        .{ .source = "(module (table 1 funcref ref.func 0))", .err = error.InvalidFuncIndex },
+        // Only an imported global is in scope: the table section comes
+        // before the global section.
+        .{
+            .source = "(module (global $g externref (ref.null extern)) (table 1 externref global.get $g))",
+            .err = error.InvalidGlobalIndex,
+        },
+        // A mutable global is not a constant.
+        .{
+            .source = "(module (import \"m\" \"g\" (global (mut externref))) (table 1 externref global.get 0))",
+            .err = error.ConstantExprRequired,
+        },
+        // A constant expression holds constant instructions only.
+        .{ .source = "(module (func) (table 1 funcref ref.func 0 drop))", .err = error.ConstantExprRequired },
+    };
+
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+
+        var module = try parseModule(alloc, case.source);
+        defer module.deinit();
+        try std.testing.expectError(case.err, Validator.validate(&module, .{}));
+    }
+}
+
+test "a table initializer that is not an expression at all is malformed" {
+    // Text that follows the element type but names no instruction is not an
+    // initializer, and must not be dropped as though the table had none.
+    try std.testing.expectError(
+        error.InvalidModule,
+        parseModule(std.testing.allocator, "(module (table 1 funcref bogus))"),
+    );
+}
+
+test "a table initializer is encoded like a global's" {
+    const alloc = std.testing.allocator;
+
+    // Both go through the same constant-expression parser, so a form spelled
+    // the same way in both places encodes the same way in both places --
+    // including the folded GC forms that the table branch used to special
+    // case for itself.
+    var module = try parseModule(alloc,
+        \\(module
+        \\  (global $a anyref (ref.i31 (i32.const 5)))
+        \\  (global $b anyref i32.const 5 ref.i31)
+        \\  (table 1 anyref (ref.i31 (i32.const 5)))
+        \\  (table 1 anyref i32.const 5 ref.i31)
+        \\)
+    );
+    defer module.deinit();
+    const expected = [_]u8{ 0x41, 0x05, 0xfb, 0x1c };
+    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[0].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[1].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[0].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[1].init_expr_bytes);
+}
+
+test "table initializers survive text, binary, text and binary again" {
+    // The whole loop: the text the writer prints for a module carries the
+    // initializer, parses back to the same bytes, and rebuilds the same
+    // binary the module started as.
+    const cases = [_]struct { source: []const u8, printed: []const u8 }{
+        .{
+            .source = "(module (table 1 funcref ref.null func))",
+            .printed = "(table (;0;) 1 funcref ref.null func)",
+        },
+        .{
+            .source = "(module (table 1 externref ref.null extern))",
+            .printed = "(table (;0;) 1 externref ref.null extern)",
+        },
+        .{
+            .source = "(module (table 1 arrayref ref.null array))",
+            .printed = "(table (;0;) 1 arrayref ref.null array)",
+        },
+        .{
+            .source = "(module (func) (table 3 funcref ref.func 0))",
+            .printed = "(table (;0;) 3 funcref ref.func 0)",
+        },
+        .{
+            .source = "(module (func $f) (table 2 (ref func) ref.func $f))",
+            .printed = "(table (;0;) 2 (ref func) ref.func 0)",
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global externref)) (table 4 externref global.get 0))",
+            .printed = "(table (;0;) 4 externref global.get 0)",
+        },
+        .{
+            .source = "(module (table i64 1 8 externref ref.null extern))",
+            .printed = "(table (;0;) i64 1 8 externref ref.null extern)",
+        },
+        .{
+            .source = "(module (type $t (func)) (table 1 (ref null $t) ref.null $t))",
+            .printed = "(table (;0;) 1 (ref null 0) ref.null 0)",
+        },
+        .{
+            .source = "(module (type $t (func)) (func $f (type $t)) (table 1 (ref $t) ref.func $f))",
+            .printed = "(table (;0;) 1 (ref 0) ref.func 0)",
+        },
+        .{
+            .source = "(module (table 1 funcref) (table 1 externref ref.null extern))",
+            .printed = "(table (;0;) 1 funcref)",
+        },
+    };
+
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+
+        var parsed = try parseModule(alloc, case.source);
+        defer parsed.deinit();
+        try Validator.validate(&parsed, .{});
+
+        const wasm = try binary_writer.writeModule(alloc, &parsed);
+        defer alloc.free(wasm);
+        var reread = try binary_reader.readModule(alloc, wasm);
+        defer reread.deinit();
+        try Validator.validate(&reread, .{});
+
+        const table = parsed.tables.items[0];
+        const round = reread.tables.items[0];
+        try std.testing.expectEqualSlices(u8, table.init_expr_bytes, round.init_expr_bytes);
+        try std.testing.expectEqual(table.type.elem_type, round.type.elem_type);
+        try std.testing.expectEqual(table.type_idx, round.type_idx);
+        try std.testing.expectEqual(table.type.limits.initial, round.type.limits.initial);
+        try std.testing.expectEqual(table.type.limits.is_64, round.type.limits.is_64);
+
+        // The binary the module came from is the binary it goes back to.
+        const again = try binary_writer.writeModule(alloc, &reread);
+        defer alloc.free(again);
+        try std.testing.expectEqualSlices(u8, wasm, again);
+
+        // The printed text says what the table holds...
+        const wat = try TextWriter.writeModule(alloc, &reread);
+        defer alloc.free(wat);
+        try std.testing.expect(std.mem.indexOf(u8, wat, case.printed) != null);
+
+        // ...and reads back as the module it was printed from.
+        var reparsed = try parseModule(alloc, wat);
+        defer reparsed.deinit();
+        try Validator.validate(&reparsed, .{});
+        const back = reparsed.tables.items[0];
+        try std.testing.expectEqualSlices(u8, table.init_expr_bytes, back.init_expr_bytes);
+        try std.testing.expectEqual(table.type.elem_type, back.type.elem_type);
+        try std.testing.expectEqual(table.type_idx, back.type_idx);
+        try std.testing.expectEqual(table.type.limits.initial, back.type.limits.initial);
+        try std.testing.expectEqual(table.type.limits.is_64, back.type.limits.is_64);
+
+        const from_text = try binary_writer.writeModule(alloc, &reparsed);
+        defer alloc.free(from_text);
+        try std.testing.expectEqualSlices(u8, wasm, from_text);
+    }
+}
+
+test "a constant expression's ref.func names a function, not a local" {
+    const alloc = std.testing.allocator;
+
+    // `ref.func x` takes a funcidx. It went through the general immediate
+    // reader, which tries labels and then locals first so that `br $l` and
+    // `local.get $x` work -- and the local names of the function parsed
+    // most recently are still in that map when a table's or a global's
+    // initializer is read. Here `$y` is function 2 and is also the name of
+    // the *parameter* of the function declared just before, so the
+    // initializer used to be `ref.func 0`: a different function, silently.
+    const cases = [_][]const u8{
+        // Table, unfolded and folded, shadowed by a parameter and by a local.
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (table 1 funcref ref.func $y))",
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (table 1 funcref (ref.func $y)))",
+        "(module (func $x) (func $z) (func $y) (func $a (local $y i32)) (table 1 funcref ref.func $y))",
+        // Global, the same two spellings.
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (global funcref ref.func $y))",
+        "(module (func $x) (func $z) (func $y) (func $a (local $y i32)) (global funcref (ref.func $y)))",
+        // A label of the last function is not a function either.
+        "(module (func $x) (func $z) (func $y) (func $a (block $y)) (table 1 funcref ref.func $y))",
+    };
+
+    for (cases) |source| {
+        var module = try parseModule(alloc, source);
+        defer module.deinit();
+        const init = if (module.tables.items.len > 0)
+            module.tables.items[0].init_expr_bytes
+        else
+            module.globals.items[0].init_expr_bytes;
+        try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x02 }, init);
+        try Validator.validate(&module, .{});
+    }
+
+    // A name no function has is malformed, not function 0.
+    const undefined_names = [_][]const u8{
+        "(module (func) (table 1 funcref ref.func $nope))",
+        "(module (func) (table 1 funcref (ref.func $nope)))",
+        "(module (func) (global funcref ref.func $nope))",
+        "(module (func) (global funcref (ref.func $nope)))",
+        "(module (func $a (param $y i32)) (table 1 funcref ref.func $y))",
+        "(module (func $a (local $y i32)) (global funcref (ref.func $y)))",
+    };
+    for (undefined_names) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(alloc, source));
+    }
+
+    // Numeric indices are unaffected, and so is the rest of a function
+    // body: a label is still a label and a local is still a local.
+    var body = try parseModule(alloc,
+        \\(module
+        \\  (func $x)
+        \\  (func $y)
+        \\  (elem declare func $y)
+        \\  (func $a (param $p i32) (result i32)
+        \\    (block $l (br $l))
+        \\    ref.func $y
+        \\    drop
+        \\    local.get $p)
+        \\  (table 1 funcref ref.func 1)
+        \\)
+    );
+    defer body.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x01 }, body.tables.items[0].init_expr_bytes);
+    try Validator.validate(&body, .{});
+}
+
+test "a constant expression has no `end` to write" {
+    // `expr ::= instr* end` puts the terminator in the encoding, not in the
+    // text. Reading one as an instruction wrote a second `0x0b` after the
+    // one every writer appends, and the module that came out had a section
+    // whose size no longer matched its contents -- which the validator
+    // could not see, because it stops reading at the first `end`.
+    const rejected = [_][]const u8{
+        "(module (global i32 i32.const 0 end))",
+        "(module (global i32 (i32.const 0) end))",
+        "(module (global i32 (i32.add (i32.const 1) end)))",
+        "(module (table 1 funcref ref.null func end))",
+        "(module (table 1 funcref (ref.null func) end))",
+        "(module (func) (table 1 funcref ref.func 0 end))",
+        "(module (memory 1) (data (offset i32.const 0 end) \"a\"))",
+        "(module (func) (table 1 funcref) (elem (offset i32.const 0 end) func 0))",
+    };
+    for (rejected) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+
+    // The same expressions without one are fine, and `end` keeps its
+    // meaning inside a function body, where it closes a block.
+    const accepted = [_][]const u8{
+        "(module (global i32 i32.const 0))",
+        "(module (table 1 funcref ref.null func))",
+        "(module (memory 1) (data (offset i32.const 0) \"a\"))",
+        "(module (func (result i32) block (result i32) i32.const 1 end))",
+    };
+    for (accepted) |source| {
+        var module = try parseModule(std.testing.allocator, source);
+        defer module.deinit();
+        try Validator.validate(&module, .{});
+    }
+}
+
+test "an inline element list is still an inline element list" {
+    const alloc = std.testing.allocator;
+
+    // `(table funcref (elem ...))` is an abbreviation for a table plus an
+    // active segment, not a table with an initializer.
+    var module = try parseModule(alloc,
+        \\(module
+        \\  (func $f)
+        \\  (func $g)
+        \\  (table funcref (elem $f $g))
+        \\  (table 1 funcref)
+        \\)
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.tables.items.len);
+    try std.testing.expectEqual(@as(u64, 2), module.tables.items[0].type.limits.initial);
+    try std.testing.expectEqual(@as(usize, 0), module.tables.items[0].init_expr_bytes.len);
+    try std.testing.expectEqual(@as(usize, 0), module.tables.items[1].init_expr_bytes.len);
+    try std.testing.expectEqual(@as(usize, 1), module.elem_segments.items.len);
+    try Validator.validate(&module, .{});
 }
 
 test "parse module with rec type group" {

@@ -153,25 +153,20 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
             return error.InvalidElemType;
         if (!checkConcreteTypeIndex(m, table.type.elem_type, table.type_idx))
             return error.InvalidTypeIndex;
-        // Non-nullable ref types require init expr (tables without init are invalid)
-        const vt = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
-        if (vt.isNonNullableRef())
-            return error.TypeMismatch;
         try checkLimits(table.@"type".limits, std.math.maxInt(u32));
-        // Validate table init expression type
+        const elem = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
         if (table.init_expr_bytes.len > 0) {
-            // Check init expr produces a ref type matching the table's elem type
-            const first_byte = table.init_expr_bytes[0];
-            if (first_byte == 0x41 or first_byte == 0x42 or first_byte == 0x43 or first_byte == 0x44) {
-                // Numeric const — invalid for ref table
-                return error.TypeMismatch;
-            }
-            // Check global.get references an imported global
-            if (first_byte == 0x23) {
-                const gidx = leb128.readU32Leb128(table.init_expr_bytes[1..]) catch return error.TypeMismatch;
-                if (gidx.value >= m.globals.items.len) return error.InvalidGlobalIndex;
-                if (!m.isGlobalImport(gidx.value)) return error.TypeMismatch;
-            }
+            // A table's initializer is a constant expression like any other,
+            // so it is type-checked like any other rather than by inspecting
+            // its first byte. The table section precedes the global section,
+            // so only an imported global is in scope here whatever the GC
+            // feature says about globals reading globals.
+            try checkConstExpr(m, table.init_expr_bytes, elem, m.num_global_imports, options.features);
+        } else if (!table.is_import and elem.isNonNullableRef()) {
+            // A defined table whose element type has no null needs an
+            // initializer to say what its slots hold. An imported one does
+            // not: whoever supplies it has already filled it.
+            return error.TypeMismatch;
         }
     }
 }
@@ -4773,6 +4768,167 @@ test "a constant expression reads an immutable global, imported or not" {
         .init_expr_bytes = &first,
     });
     try std.testing.expectError(error.InvalidGlobalIndex, validate(&fwd, .{}));
+}
+
+test "a table's initializer is a constant expression of its element type" {
+    const alloc = std.testing.allocator;
+
+    // The initializer used to be checked by looking at its first byte, which
+    // could only ever catch a numeric constant and a `global.get`. It is an
+    // ordinary constant expression, so it is checked like one: `ref.null`
+    // has to name a heap type the table accepts, and `ref.func` has to name
+    // a function.
+    const cases = [_]struct {
+        elem: types.ValType,
+        type_idx: u32 = 0xFFFFFFFF,
+        init: []const u8,
+        err: ?anyerror = null,
+    }{
+        .{ .elem = .funcref, .init = &.{ 0xd0, 0x70 } }, // ref.null func
+        .{ .elem = .externref, .init = &.{ 0xd0, 0x6f } }, // ref.null extern
+        .{ .elem = .anyref, .init = &.{ 0xd0, 0x71 } }, // ref.null none <: anyref
+        .{ .elem = .funcref, .init = &.{ 0xd0, 0x6f }, .err = error.TypeMismatch },
+        .{ .elem = .externref, .init = &.{ 0xd0, 0x70 }, .err = error.TypeMismatch },
+        .{ .elem = .funcref, .init = &.{ 0xd2, 0x00 } }, // ref.func 0
+        .{ .elem = .ref_func, .init = &.{ 0xd2, 0x00 } },
+        .{ .elem = .concrete_ref_null, .type_idx = 0, .init = &.{ 0xd2, 0x00 } },
+        .{ .elem = .concrete_ref, .type_idx = 0, .init = &.{ 0xd2, 0x00 } },
+        .{ .elem = .concrete_ref_null, .type_idx = 0, .init = &.{ 0xd0, 0x00 } }, // ref.null 0
+        .{ .elem = .funcref, .init = &.{ 0xd2, 0x07 }, .err = error.InvalidFuncIndex },
+        .{ .elem = .externref, .init = &.{ 0xd2, 0x00 }, .err = error.TypeMismatch },
+        .{ .elem = .funcref, .init = &.{ 0x41, 0x00 }, .err = error.TypeMismatch }, // i32.const 0
+        .{ .elem = .funcref, .init = &.{ 0x20, 0x00 }, .err = error.ConstantExprRequired }, // local.get 0
+        // Two values where the table wants one.
+        .{ .elem = .funcref, .init = &.{ 0xd2, 0x00, 0xd0, 0x70 }, .err = error.TypeMismatch },
+    };
+
+    for (cases) |case| {
+        var m = Mod.Module.init(alloc);
+        defer m.deinit();
+        try m.module_types.append(alloc, .{ .func_type = .{} });
+        try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+        try m.tables.append(alloc, .{
+            .type = .{ .elem_type = case.elem, .limits = .{ .initial = 1 } },
+            .type_idx = case.type_idx,
+            .init_expr_bytes = case.init,
+        });
+        if (case.err) |e| {
+            try std.testing.expectError(e, validate(&m, .{}));
+        } else {
+            try validate(&m, .{});
+        }
+    }
+}
+
+test "a table's initializer reads an imported global and no other" {
+    const alloc = std.testing.allocator;
+
+    // The table section precedes the global section, so a table initializer
+    // can only reach a global the module imports -- the GC relaxation that
+    // lets a global read a global defined before it does not reach here.
+    const get0 = [_]u8{ 0x23, 0x00 };
+
+    var imported = Mod.Module.init(alloc);
+    defer imported.deinit();
+    try imported.globals.append(alloc, .{
+        .type = .{ .val_type = .externref, .mutability = .immutable },
+        .is_import = true,
+    });
+    imported.num_global_imports = 1;
+    try imported.tables.append(alloc, .{
+        .type = .{ .elem_type = .externref, .limits = .{ .initial = 1 } },
+        .init_expr_bytes = &get0,
+    });
+    try validate(&imported, .{});
+
+    // Same module, mutable global: a mutable global is not a constant.
+    var mutable = Mod.Module.init(alloc);
+    defer mutable.deinit();
+    try mutable.globals.append(alloc, .{
+        .type = .{ .val_type = .externref, .mutability = .mutable },
+        .is_import = true,
+    });
+    mutable.num_global_imports = 1;
+    try mutable.tables.append(alloc, .{
+        .type = .{ .elem_type = .externref, .limits = .{ .initial = 1 } },
+        .init_expr_bytes = &get0,
+    });
+    try std.testing.expectError(error.ConstantExprRequired, validate(&mutable, .{}));
+
+    // Same module again, with the global defined here rather than imported:
+    // it is not in scope yet.
+    var defined = Mod.Module.init(alloc);
+    defer defined.deinit();
+    const null_extern = [_]u8{ 0xd0, 0x6f };
+    try defined.globals.append(alloc, .{
+        .type = .{ .val_type = .externref, .mutability = .immutable },
+        .init_expr_bytes = &null_extern,
+    });
+    try defined.tables.append(alloc, .{
+        .type = .{ .elem_type = .externref, .limits = .{ .initial = 1 } },
+        .init_expr_bytes = &get0,
+    });
+    try std.testing.expectError(error.InvalidGlobalIndex, validate(&defined, .{}));
+
+    // An imported global of the wrong type is still the wrong type.
+    var wrong = Mod.Module.init(alloc);
+    defer wrong.deinit();
+    try wrong.globals.append(alloc, .{
+        .type = .{ .val_type = .funcref, .mutability = .immutable },
+        .is_import = true,
+    });
+    wrong.num_global_imports = 1;
+    try wrong.tables.append(alloc, .{
+        .type = .{ .elem_type = .externref, .limits = .{ .initial = 1 } },
+        .init_expr_bytes = &get0,
+    });
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong, .{}));
+}
+
+test "a table whose element type has no null is initialised or imported" {
+    const alloc = std.testing.allocator;
+
+    // Every table with a non-nullable element type was rejected, initializer
+    // or not, so the modules the initializer exists for could not be
+    // expressed at all. What is invalid is a *defined* table that says
+    // nothing about what fills it.
+    const ref_func = [_]u8{ 0xd2, 0x00 };
+    const cases = [_]struct {
+        elem: types.ValType,
+        type_idx: u32 = 0xFFFFFFFF,
+        init: []const u8 = &.{},
+        is_import: bool = false,
+        err: ?anyerror = null,
+    }{
+        .{ .elem = .ref_func, .init = &ref_func },
+        .{ .elem = .concrete_ref, .type_idx = 0, .init = &ref_func },
+        .{ .elem = .ref_func, .err = error.TypeMismatch },
+        .{ .elem = .concrete_ref, .type_idx = 0, .err = error.TypeMismatch },
+        .{ .elem = .ref_func, .is_import = true },
+        .{ .elem = .concrete_ref, .type_idx = 0, .is_import = true },
+        // A nullable element type needs nothing said about it.
+        .{ .elem = .funcref },
+        .{ .elem = .concrete_ref_null, .type_idx = 0 },
+    };
+
+    for (cases) |case| {
+        var m = Mod.Module.init(alloc);
+        defer m.deinit();
+        try m.module_types.append(alloc, .{ .func_type = .{} });
+        try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+        try m.tables.append(alloc, .{
+            .type = .{ .elem_type = case.elem, .limits = .{ .initial = 1 } },
+            .type_idx = case.type_idx,
+            .init_expr_bytes = case.init,
+            .is_import = case.is_import,
+        });
+        if (case.is_import) m.num_table_imports = 1;
+        if (case.err) |e| {
+            try std.testing.expectError(e, validate(&m, .{}));
+        } else {
+            try validate(&m, .{});
+        }
+    }
 }
 
 test "an element expression ends where the instruction ends" {
