@@ -76,7 +76,7 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkStart(module);
     try checkElemSegments(module, options);
     try checkDataSegments(module, options);
-    try checkFunctionBodies(module);
+    try checkFunctionBodies(module, options.features);
 }
 
 // ── Validation passes ───────────────────────────────────────────────────
@@ -458,6 +458,22 @@ fn checkConstExpr(
                 if (pos > bytes.len) return error.UnexpectedEnd;
                 try push(m, &stack, StackType.known(.v128));
             },
+            0xfb => {
+                if (!features.gc) return error.ConstantExprRequired;
+                const sub = readU32(bytes, &pos);
+                if (sub == 0x1c) {
+                    try popExpecting(m, &stack, .i32);
+                    try push(m, &stack, StackType.known(.ref_i31));
+                    continue;
+                }
+                const heaps: struct { types.AbstractHeapType, types.AbstractHeapType } = switch (sub) {
+                    0x1a => .{ .extern_, .any },
+                    0x1b => .{ .any, .extern_ },
+                    else => return error.ConstantExprRequired,
+                };
+                const actual = stack.pop() orelse return error.TypeMismatch;
+                try push(m, &stack, try gcConvertedRef(m, actual, heaps[0], heaps[1]));
+            },
             0x0b => break, // end
             else => {
                 // Any other opcode is not allowed in constant expressions
@@ -724,7 +740,7 @@ fn declareFunc(m: *const Mod.Module, declared: *DeclaredFuncs, index: u32) Error
     declared.put(gpa(m), index, {}) catch return error.OutOfMemory;
 }
 
-fn checkFunctionBodies(m: *const Mod.Module) Error!void {
+fn checkFunctionBodies(m: *const Mod.Module, features: Feature.Set) Error!void {
     var declared: DeclaredFuncs = .{};
     defer declared.deinit(gpa(m));
     try collectDeclaredFuncs(m, &declared);
@@ -732,7 +748,7 @@ fn checkFunctionBodies(m: *const Mod.Module) Error!void {
     for (m.funcs.items) |func| {
         if (func.is_import) continue;
         if (func.code_bytes.len == 0) continue;
-        try checkOneBody(m, &func, &declared);
+        try checkOneBody(m, &func, &declared, features);
     }
 }
 
@@ -1164,7 +1180,12 @@ fn structuralConcreteSubtype(m: *const Mod.Module, actual_idx: u32, expected_idx
     };
 }
 
-fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const DeclaredFuncs) Error!void {
+fn checkOneBody(
+    m: *const Mod.Module,
+    func: *const Mod.Func,
+    declared_funcs: *const DeclaredFuncs,
+    features: Feature.Set,
+) Error!void {
     const sig = resolveSig(m, func.decl);
     const num_params: u32 = @intCast(sig.params.len());
     const num_locals: u32 = num_params + @as(u32, @intCast(func.local_types.items.len));
@@ -1869,11 +1890,30 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 try checkSimd(m, bytes, &pos, &val_stack, &ctrl_stack, simd_sig, gpa(m));
             },
             0xfb => {
-                // GC prefix. `Opcode.Code` does not enumerate the GC
-                // proposal's sub-opcodes, so classification cannot tell a
-                // real one from a bogus one; report the prefix as known but
-                // unchecked, matching `component/adapter/gc.zig`.
-                return error.UnsupportedOpcode;
+                if (!features.gc) return error.UnsupportedOpcode;
+                const sub = readU32(bytes, &pos);
+                switch (sub) {
+                    0x1a => try checkGcRefConversion(
+                        m,
+                        &val_stack,
+                        &ctrl_stack,
+                        .extern_,
+                        .any,
+                        gpa(m),
+                    ), // any.convert_extern
+                    0x1b => try checkGcRefConversion(
+                        m,
+                        &val_stack,
+                        &ctrl_stack,
+                        .any,
+                        .extern_,
+                        gpa(m),
+                    ), // extern.convert_any
+                    0x1c => try checkUnary(m, &val_stack, &ctrl_stack, .i32, .ref_i31, gpa(m)), // ref.i31
+                    0x1d, 0x1e => try checkUnary(m, &val_stack, &ctrl_stack, .i31ref, .i32, gpa(m)), // i31.get_s/u
+                    0x00...0x19 => return error.UnsupportedOpcode,
+                    else => return error.UnknownOpcode,
+                }
             },
             else => return classifyOpcode(null, opcode),
         }
@@ -2164,6 +2204,32 @@ fn labelTypes(frame: *const CtrlFrame) TypeSeq {
 fn checkUnary(m: *const Mod.Module, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), input: ValTypeOrUnknown, output: ValTypeOrUnknown, alloc: std.mem.Allocator) Error!void {
     try popExpect(m, val_stack, ctrl_stack, StackType.known(input));
     val_stack.append(alloc, StackType.known(output)) catch return error.OutOfMemory;
+}
+
+fn checkGcRefConversion(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    input_heap: types.AbstractHeapType,
+    output_heap: types.AbstractHeapType,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const actual = popVal(val_stack, ctrl_stack) catch return error.TypeMismatch;
+    val_stack.append(alloc, try gcConvertedRef(m, actual, input_heap, output_heap)) catch return error.OutOfMemory;
+}
+
+fn gcConvertedRef(
+    m: *const Mod.Module,
+    actual: StackType,
+    input_heap: types.AbstractHeapType,
+    output_heap: types.AbstractHeapType,
+) Error!StackType {
+    if (actual.vt == .unknown)
+        return StackType.fromRefType(types.RefType.abstract(false, output_heap));
+    const ref_type = actual.asRefType() orelse return error.TypeMismatch;
+    const expected = StackType.fromRefType(types.RefType.abstract(true, input_heap));
+    if (!actual.isSubtypeOf(m, expected)) return error.TypeMismatch;
+    return StackType.fromRefType(types.RefType.abstract(ref_type.nullable, output_heap));
 }
 
 fn checkBinary(m: *const Mod.Module, val_stack: *ValStack, ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), operand: ValTypeOrUnknown, result: ValTypeOrUnknown, alloc: std.mem.Allocator) Error!void {
@@ -3319,6 +3385,107 @@ test "valid SIMD modules now validate (issue #347 D2)" {
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
     try validate(&module, .{});
+}
+
+test "GC conversions preserve nullability and i31 instructions check operands" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (func (param externref) (result anyref) local.get 0 any.convert_extern))",
+        "(module (func (param (ref extern)) (result (ref any)) local.get 0 any.convert_extern))",
+        "(module (func (param anyref) (result externref) local.get 0 extern.convert_any))",
+        "(module (func (param (ref any)) (result (ref extern)) local.get 0 extern.convert_any))",
+        "(module (func (param i32) (result (ref i31)) local.get 0 ref.i31))",
+        "(module (func (param i31ref) (result i32) local.get 0 i31.get_s))",
+        "(module (func (param (ref i31)) (result i32) local.get 0 i31.get_u))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            validate(&module, .{ .features = .{ .gc = false } }),
+        );
+    }
+
+    const invalid = [_][]const u8{
+        "(module (func (param externref) (result (ref any)) local.get 0 any.convert_extern))",
+        "(module (func (param funcref) (result anyref) local.get 0 any.convert_extern))",
+        "(module (func (param externref) (result externref) local.get 0 extern.convert_any))",
+        "(module (func (param i64) (result (ref i31)) local.get 0 ref.i31))",
+        "(module (func (param eqref) (result i32) local.get 0 i31.get_s))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+
+    var unreachable_ok = try Parser.parseModule(alloc,
+        "(module (func (result (ref any)) unreachable any.convert_extern))",
+    );
+    defer unreachable_ok.deinit();
+    try validate(&unreachable_ok, .{});
+
+    var unreachable_bad = try Parser.parseModule(alloc,
+        "(module (func (result i32) unreachable any.convert_extern))",
+    );
+    defer unreachable_bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&unreachable_bad, .{}));
+}
+
+test "GC reference conversions type-check constant expressions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var globals = try Parser.parseModule(alloc,
+        \\(module
+        \\  (global anyref (any.convert_extern (ref.null extern)))
+        \\  (global externref (extern.convert_any (ref.null any)))
+        \\  (global (ref i31) (ref.i31 (i32.const 1))))
+    );
+    defer globals.deinit();
+    try validate(&globals, .{});
+    try std.testing.expectError(
+        error.ConstantExprRequired,
+        validate(&globals, .{ .features = .{ .gc = false } }),
+    );
+
+    var elem = Mod.Module.init(alloc);
+    defer elem.deinit();
+    const exprs = [_]u8{ 0xd0, 0x6e, 0xfb, 0x1b, 0x0b }; // extern.convert_any (ref.null any)
+    try elem.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .externref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 1,
+        .uses_elem_exprs = true,
+    });
+    const i31_expr = [_]u8{ 0x41, 0x01, 0xfb, 0x1c, 0x0b }; // ref.i31 (i32.const 1)
+    try elem.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .i31ref,
+        .elem_expr_bytes = &i31_expr,
+        .elem_expr_count = 1,
+        .uses_elem_exprs = true,
+    });
+    try validate(&elem, .{});
+}
+
+test "GC prefix distinguishes pending instructions from unknown subopcodes" {
+    const alloc = std.testing.allocator;
+
+    const pending = [_]u8{ 0xfb, 0x00, 0x00, 0x0b }; // struct.new 0
+    var known = try testModuleWithBody(alloc, &pending);
+    defer known.deinit();
+    try std.testing.expectError(error.UnsupportedOpcode, validate(&known, .{}));
+
+    const bogus = [_]u8{ 0xfb, 0x1f, 0x0b };
+    var unknown = try testModuleWithBody(alloc, &bogus);
+    defer unknown.deinit();
+    try std.testing.expectError(error.UnknownOpcode, validate(&unknown, .{}));
 }
 
 test "meaningless opcodes are distinguished from unimplemented ones" {

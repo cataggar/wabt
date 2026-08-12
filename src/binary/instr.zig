@@ -115,6 +115,10 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
             0x03 => .reserved_byte,
             else => .mem_arg,
         },
+        0xfb => switch (code) {
+            0x1a...0x1e => .none,
+            else => null,
+        },
         else => null,
     };
 }
