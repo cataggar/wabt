@@ -2737,7 +2737,7 @@ const Parser = struct {
             },
             .kw_ref_func => {
                 code.append(self.allocator, 0xd2) catch return;
-                self.emitU32Imm(code);
+                self.emitFuncIdx(code);
             },
             .kw_ref_test, .kw_ref_cast => {
                 // ref.test (ref [null] <ht>) / ref.cast (ref [null] <ht>)
@@ -3001,6 +3001,37 @@ const Parser = struct {
         }
         buf[0] = 0x40; // void
         return 1;
+    }
+
+    /// Emit the function index a `ref.func` names.
+    ///
+    /// `ref.func x` takes a funcidx and nothing else, so only the function
+    /// namespace is searched. The general immediate reader is no good here:
+    /// it tries labels and then locals first, for the sake of `br $label`
+    /// and `local.get $x`, and the local names of the function parsed most
+    /// recently are still in it when a table's or a global's initializer is
+    /// read. A module whose last function had a parameter `$y` and which
+    /// then wrote `ref.func $y` for the *function* `$y` silently got that
+    /// parameter's index instead. A name that no function has is malformed
+    /// rather than function 0.
+    fn emitFuncIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.skipAnnotations();
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            if (self.lookupName(&self.func_names, tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+            } else {
+                self.markMalformed(@src());
+                self.emitLeb128U32(code, 0);
+            }
+            return;
+        }
+        if (self.peek().kind == .integer) {
+            self.emitLeb128U32(code, self.parseU32() catch 0);
+            return;
+        }
+        self.markMalformed(@src());
+        self.emitLeb128U32(code, 0);
     }
 
     fn emitGlobalIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
@@ -6969,6 +7000,72 @@ test "table initializers survive text, binary, text and binary again" {
         defer alloc.free(from_text);
         try std.testing.expectEqualSlices(u8, wasm, from_text);
     }
+}
+
+test "a constant expression's ref.func names a function, not a local" {
+    const alloc = std.testing.allocator;
+
+    // `ref.func x` takes a funcidx. It went through the general immediate
+    // reader, which tries labels and then locals first so that `br $l` and
+    // `local.get $x` work -- and the local names of the function parsed
+    // most recently are still in that map when a table's or a global's
+    // initializer is read. Here `$y` is function 2 and is also the name of
+    // the *parameter* of the function declared just before, so the
+    // initializer used to be `ref.func 0`: a different function, silently.
+    const cases = [_][]const u8{
+        // Table, unfolded and folded, shadowed by a parameter and by a local.
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (table 1 funcref ref.func $y))",
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (table 1 funcref (ref.func $y)))",
+        "(module (func $x) (func $z) (func $y) (func $a (local $y i32)) (table 1 funcref ref.func $y))",
+        // Global, the same two spellings.
+        "(module (func $x) (func $z) (func $y) (func $a (param $y i32)) (global funcref ref.func $y))",
+        "(module (func $x) (func $z) (func $y) (func $a (local $y i32)) (global funcref (ref.func $y)))",
+        // A label of the last function is not a function either.
+        "(module (func $x) (func $z) (func $y) (func $a (block $y)) (table 1 funcref ref.func $y))",
+    };
+
+    for (cases) |source| {
+        var module = try parseModule(alloc, source);
+        defer module.deinit();
+        const init = if (module.tables.items.len > 0)
+            module.tables.items[0].init_expr_bytes
+        else
+            module.globals.items[0].init_expr_bytes;
+        try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x02 }, init);
+        try Validator.validate(&module, .{});
+    }
+
+    // A name no function has is malformed, not function 0.
+    const undefined_names = [_][]const u8{
+        "(module (func) (table 1 funcref ref.func $nope))",
+        "(module (func) (table 1 funcref (ref.func $nope)))",
+        "(module (func) (global funcref ref.func $nope))",
+        "(module (func) (global funcref (ref.func $nope)))",
+        "(module (func $a (param $y i32)) (table 1 funcref ref.func $y))",
+        "(module (func $a (local $y i32)) (global funcref (ref.func $y)))",
+    };
+    for (undefined_names) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(alloc, source));
+    }
+
+    // Numeric indices are unaffected, and so is the rest of a function
+    // body: a label is still a label and a local is still a local.
+    var body = try parseModule(alloc,
+        \\(module
+        \\  (func $x)
+        \\  (func $y)
+        \\  (elem declare func $y)
+        \\  (func $a (param $p i32) (result i32)
+        \\    (block $l (br $l))
+        \\    ref.func $y
+        \\    drop
+        \\    local.get $p)
+        \\  (table 1 funcref ref.func 1)
+        \\)
+    );
+    defer body.deinit();
+    try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x01 }, body.tables.items[0].init_expr_bytes);
+    try Validator.validate(&body, .{});
 }
 
 test "a constant expression has no `end` to write" {
