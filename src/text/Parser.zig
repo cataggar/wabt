@@ -13,6 +13,9 @@ const Mod = @import("../Module.zig");
 const leb128 = @import("../leb128.zig");
 const Opcode = @import("../Opcode.zig");
 const Validator = @import("../Validator.zig");
+const binary_reader = @import("../binary/reader.zig");
+const binary_writer = @import("../binary/writer.zig");
+const TextWriter = @import("Writer.zig");
 
 pub const ParseError = error{
     UnexpectedToken,
@@ -2694,67 +2697,7 @@ const Parser = struct {
             },
             .kw_ref_null => {
                 code.append(self.allocator, 0xd0) catch return;
-                const next = self.peek().kind;
-                if (next == .kw_funcref) {
-                    _ = self.advance();
-                    code.append(self.allocator, 0x70) catch return;
-                } else if (next == .kw_externref) {
-                    _ = self.advance();
-                    code.append(self.allocator, 0x6f) catch return;
-                } else if (next == .kw_exnref) {
-                    _ = self.advance();
-                    code.append(self.allocator, 0x69) catch return;
-                } else if (next == .kw_func) {
-                    _ = self.advance();
-                    code.append(self.allocator, 0x70) catch return;
-                } else if (next == .identifier) {
-                    // Type name reference: $type_name → type index
-                    const name = self.advance().text;
-                    const type_idx = self.type_names.get(name) orelse 0;
-                    self.emitLeb128S32(code, @bitCast(type_idx));
-                } else {
-                    const save_pos = self.lexer.pos;
-                    const save_peeked = self.peeked;
-                    if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                        const ht = self.advance();
-                        if (std.mem.eql(u8, ht.text, "extern")) {
-                            code.append(self.allocator, 0x6f) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "func")) {
-                            code.append(self.allocator, 0x70) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "any")) {
-                            code.append(self.allocator, 0x6e) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "exn")) {
-                            code.append(self.allocator, 0x69) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "i31")) {
-                            code.append(self.allocator, 0x6c) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "eq")) {
-                            code.append(self.allocator, 0x6d) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "struct")) {
-                            code.append(self.allocator, 0x6b) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "array")) {
-                            code.append(self.allocator, 0x6a) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "none")) {
-                            code.append(self.allocator, 0x71) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "nofunc")) {
-                            code.append(self.allocator, 0x73) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "noextern")) {
-                            code.append(self.allocator, 0x72) catch return;
-                        } else if (std.mem.eql(u8, ht.text, "noexn")) {
-                            code.append(self.allocator, 0x74) catch return;
-                        } else {
-                            self.lexer.pos = save_pos;
-                            self.peeked = save_peeked;
-                            if (self.parseValType()) |vt| {
-                                const raw: u32 = @bitCast(@intFromEnum(vt));
-                                code.append(self.allocator, @truncate(raw)) catch return;
-                            } else |_| {
-                                code.append(self.allocator, 0x70) catch return;
-                            }
-                        }
-                    } else {
-                        code.append(self.allocator, 0x70) catch return;
-                    }
-                }
+                self.emitRefNullHeapType(code);
             },
             .kw_ref_func => {
                 code.append(self.allocator, 0xd2) catch return;
@@ -3219,6 +3162,48 @@ const Parser = struct {
             .abstract => |abstract| self.emitLeb128S32(code, @intFromEnum(abstract)),
             .concrete => |idx| self.emitLeb128S32(code, @bitCast(idx)),
         }
+    }
+
+    fn emitRefNullHeapType(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        const heap: types.HeapType = switch (self.peek().kind) {
+            .identifier => .{ .concrete = self.parseTypeIdx() catch {
+                self.markMalformed(@src());
+                self.emitHeapType(code, .{ .abstract = .func });
+                return;
+            } },
+            .integer => .{ .concrete = self.parseU32() catch {
+                self.markMalformed(@src());
+                self.emitHeapType(code, .{ .abstract = .func });
+                return;
+            } },
+            .kw_funcref, .kw_func => blk: {
+                _ = self.advance();
+                break :blk .{ .abstract = .func };
+            },
+            .kw_externref => blk: {
+                _ = self.advance();
+                break :blk .{ .abstract = .extern_ };
+            },
+            .kw_exnref => blk: {
+                _ = self.advance();
+                break :blk .{ .abstract = .exn };
+            },
+            .r_paren, .eof => {
+                self.markMalformed(@src());
+                self.emitHeapType(code, .{ .abstract = .func });
+                return;
+            },
+            else => blk: {
+                const tok = self.advance();
+                const abstract = abstractHeapTypeByName(tok.text) orelse {
+                    self.markMalformed(@src());
+                    self.emitHeapType(code, .{ .abstract = .func });
+                    return;
+                };
+                break :blk .{ .abstract = abstract };
+            },
+        };
+        self.emitHeapType(code, heap);
     }
 
     fn emitGenericOpcode(self: *Parser, text: []const u8, code: *std.ArrayListUnmanaged(u8)) void {
@@ -6396,6 +6381,80 @@ test "parse (ref null func) as value type" {
     try std.testing.expectEqual(@as(usize, 1), module.globals.items.len);
     // (ref null func) is canonicalized to funcref (0x70)
     try std.testing.expectEqual(types.ValType.funcref, module.globals.items[0].type.val_type);
+}
+
+test "ref.null preserves named and abstract heap types" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (type $t (func))
+        \\  (global (ref null $t) (ref.null $t))
+        \\  (global funcref (ref.null func))
+        \\  (global externref (ref.null extern))
+        \\  (global anyref (ref.null any))
+        \\)
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x00 }, module.globals.items[0].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x70 }, module.globals.items[1].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x6f }, module.globals.items[2].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x6e }, module.globals.items[3].init_expr_bytes);
+    try Validator.validate(&module, .{});
+}
+
+test "ref.null numeric heap type emits s33 and round trips" {
+    const allocator = std.testing.allocator;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(allocator);
+
+    try source.appendSlice(allocator, "(module\n");
+    for (0..65) |_| try source.appendSlice(allocator, "  (type (func))\n");
+    try source.appendSlice(allocator,
+        \\  (global (ref null 64) (ref.null 64))
+        \\)
+    );
+
+    var module = try parseModule(allocator, source.items);
+    defer module.deinit();
+    // 64 is the first concrete heap type index whose signed LEB needs two
+    // bytes. It must not be flattened to the one-byte `func` heap type.
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0xc0, 0x00 }, module.globals.items[0].init_expr_bytes);
+    try Validator.validate(&module, .{});
+
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var reread = try binary_reader.readModule(allocator, wasm);
+    defer reread.deinit();
+    try Validator.validate(&reread, .{});
+
+    const wat = try TextWriter.writeModule(allocator, &reread);
+    defer allocator.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.null 64") != null);
+}
+
+test "ref.null numeric heap type works in a function body" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (type (func))
+        \\  (func (result (ref null 0)) ref.null 0)
+        \\)
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x00, 0x0b }, module.funcs.items[0].code_bytes);
+    try Validator.validate(&module, .{});
+}
+
+test "ref.null rejects an out-of-range numeric heap type" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (type (func))
+        \\  (func ref.null 1 drop)
+        \\)
+    );
+    defer module.deinit();
+
+    try std.testing.expectError(error.InvalidTypeIndex, Validator.validate(&module, .{}));
 }
 
 test "parse module with rec type group" {
