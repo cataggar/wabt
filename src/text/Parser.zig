@@ -4070,119 +4070,100 @@ const Parser = struct {
                 self.collected_type_refs.items[saved_refs_len2]
             else
                 0xFFFFFFFF;
-            // Parse (elem func_refs...)
-            var elem_indices: std.ArrayListUnmanaged(Mod.Var) = .empty;
+            // `(table <reftype> (elem <elemlist>))` abbreviates a table whose
+            // size is the length of the list, together with an active
+            // segment holding the list at offset zero. What follows `elem`
+            // is an ordinary elemlist, so it is read by the same code
+            // `(elem ...)` uses: the same folded and `(item ...)` spellings,
+            // the same heap types, the same name resolution.
+            var seg = Mod.ElemSegment{
+                .kind = .active,
+                .table_var = .{ .index = table_idx },
+                .elem_type = elem_type,
+                .elem_type_idx = inline_type_idx,
+                // The implicit form of a segment means table 0, so only a
+                // later table has to say which table its elements fill.
+                .has_explicit_table_index = table_idx != 0,
+            };
+            errdefer self.deinitElemSegment(&seg);
+            var elem_expr_code: std.ArrayListUnmanaged(u8) = .empty;
+            defer elem_expr_code.deinit(self.allocator);
+            var elem_expr_count: u32 = 0;
+            var func_index_count: u32 = 0;
+            var has_elem_list = false;
+            self.skipAnnotations();
             if (self.peek().kind == .l_paren) {
                 const sp2 = self.lexer.pos;
                 const spk2 = self.peeked;
                 _ = self.advance();
+                self.skipAnnotations();
                 if (self.peek().kind == .kw_elem) {
                     _ = self.advance();
+                    has_elem_list = true;
+                    self.skipAnnotations();
                     while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                         if (self.peek().kind == .l_paren) {
                             _ = self.advance();
-                            if (self.peek().kind == .kw_ref_func) {
-                                _ = self.advance();
-                                if (self.peek().kind == .identifier) {
-                                    const tok = self.advance();
-                                    const idx = self.lookupName(&self.func_names, tok.text) orelse 0;
-                                    elem_indices.append(self.allocator, .{ .index = idx }) catch {};
-                                } else if (self.peek().kind == .integer) {
-                                    const idx = self.parseU32() catch 0;
-                                    elem_indices.append(self.allocator, .{ .index = idx }) catch {};
-                                }
-                            } else if (self.peek().kind == .kw_ref_null) {
-                                _ = self.advance();
-                                if (self.peek().kind != .r_paren and self.peek().kind != .eof)
-                                    _ = self.advance();
-                                elem_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
-                            } else {
-                                try self.skipSExpr();
-                            }
-                            if (self.peek().kind == .r_paren) _ = self.advance();
-                        } else if (self.peek().kind == .identifier) {
-                            const tok = self.advance();
-                            if (self.lookupName(&self.func_names, tok.text)) |idx| {
-                                elem_indices.append(self.allocator, .{ .index = idx }) catch {};
-                            } else {
-                                elem_indices.append(self.allocator, .{ .index = 0 }) catch {};
-                            }
-                        } else if (self.peek().kind == .integer) {
-                            const idx = self.parseU32() catch 0;
-                            elem_indices.append(self.allocator, .{ .index = idx }) catch {};
+                            self.skipAnnotations();
+                            const inner_kind = self.peek().kind;
+                            try self.parseElemExprEntry(&seg, &elem_expr_code, inner_kind);
+                            elem_expr_count += 1;
+                        } else if (self.peek().kind == .integer or
+                            self.peek().kind == .identifier)
+                        {
+                            try self.parseElemFuncIdxEntry(&seg);
+                            func_index_count += 1;
                         } else {
+                            // Neither an expression nor a function index, so
+                            // it is not an element of any elemlist.
+                            self.markMalformed(@src());
                             _ = self.advance();
                         }
+                        self.skipAnnotations();
                     }
-                    if (self.peek().kind == .r_paren) _ = self.advance();
+                    try self.expect(.r_paren);
                 } else {
                     self.lexer.pos = sp2;
                     self.peeked = spk2;
                 }
             }
-            const initial: u64 = @intCast(elem_indices.items.len);
+            // The two elemlist forms are alternatives, not a mixture: a
+            // segment holds function indices or expressions, and only one of
+            // them can be encoded.
+            if (elem_expr_count > 0 and func_index_count > 0) self.markMalformed(@src());
+            const initial: u64 = elem_expr_count + func_index_count;
             try module.tables.append(self.allocator, .{
                 .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial, .is_64 = is_table64 } },
                 .type_idx = inline_type_idx,
                 .is_table64 = is_table64,
             });
-            // Create active element segment for the inline elements
-            if (elem_indices.items.len > 0) {
-                const ob = self.allocator.alloc(u8, 2) catch {
-                    elem_indices.deinit(self.allocator);
-                    return error.OutOfMemory;
-                };
-                if (is_table64) {
-                    ob[0] = 0x42; // i64.const
-                } else {
-                    ob[0] = 0x41; // i32.const
-                }
-                ob[1] = 0x00; // 0
-                // Check if any ref.null present — if so, use expression encoding
-                var has_null = false;
-                for (elem_indices.items) |v| {
-                    if (v.index == std.math.maxInt(u32)) { has_null = true; break; }
-                }
-                if (has_null) {
-                    // Generate expression bytes: ref.func $idx end | ref.null funcref end
-                    var expr_buf: std.ArrayListUnmanaged(u8) = .empty;
-                    var leb_buf: [5]u8 = undefined;
-                    const elem_count: u32 = @intCast(elem_indices.items.len);
-                    for (elem_indices.items) |v| {
-                        if (v.index == std.math.maxInt(u32)) {
-                            expr_buf.append(self.allocator, 0xD0) catch {}; // ref.null
-                            expr_buf.append(self.allocator, 0x70) catch {}; // funcref
-                            expr_buf.append(self.allocator, 0x0B) catch {}; // end
-                        } else {
-                            expr_buf.append(self.allocator, 0xD2) catch {}; // ref.func
-                            const n = leb128.writeU32Leb128(&leb_buf, v.index);
-                            expr_buf.appendSlice(self.allocator, leb_buf[0..n]) catch {};
-                            expr_buf.append(self.allocator, 0x0B) catch {}; // end
-                        }
-                    }
-                    elem_indices.deinit(self.allocator);
-                    try module.elem_segments.append(self.allocator, .{
-                        .kind = .active,
-                        .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
-                        .elem_type = elem_type,
-                        .offset_expr_bytes = ob,
-                        .owns_offset_expr_bytes = true,
-                        .elem_expr_bytes = expr_buf.toOwnedSlice(self.allocator) catch &.{},
-                        .elem_expr_count = elem_count,
-                    });
-                } else {
-                    try module.elem_segments.append(self.allocator, .{
-                        .kind = .active,
-                        .table_var = .{ .index = @intCast(module.tables.items.len - 1) },
-                        .elem_type = elem_type,
-                        .elem_var_indices = elem_indices,
-                        .offset_expr_bytes = ob,
-                        .owns_offset_expr_bytes = true,
-                    });
-                }
-            } else {
-                elem_indices.deinit(self.allocator);
+            if (!has_elem_list) return;
+
+            // An empty list is still a list, and it is written in whichever
+            // form can state the type: the index form only ever holds
+            // functions, so a table of any other reference type needs the
+            // expression form even with nothing in it.
+            const list_is_indices = func_index_count > 0 or
+                (elem_expr_count == 0 and (elem_type == .funcref or elem_type == .ref_func));
+            seg.uses_elem_exprs = !list_is_indices;
+            if (list_is_indices) {
+                // The function-index form infers `(ref func)`, not the
+                // table's own type, exactly as a written-out `(elem ...)`
+                // does.
+                seg.elem_type = .ref_func;
+                seg.elem_type_idx = types.invalid_index;
             }
+            const ob = try self.allocator.alloc(u8, 2);
+            ob[0] = if (is_table64) 0x42 else 0x41; // i64.const / i32.const
+            ob[1] = 0x00; // 0
+            seg.offset_expr_bytes = ob;
+            seg.owns_offset_expr_bytes = true;
+            if (elem_expr_count > 0) {
+                seg.elem_expr_bytes = try elem_expr_code.toOwnedSlice(self.allocator);
+                seg.owns_elem_expr_bytes = true;
+                seg.elem_expr_count = elem_expr_count;
+            }
+            try module.elem_segments.append(self.allocator, seg);
             return;
         }
 
@@ -5096,8 +5077,72 @@ const Parser = struct {
         module.start_var = .{ .index = index };
     }
 
+    /// Read one entry of an elemlist written as a constant expression. The
+    /// opening paren is already consumed and `inner_kind` is the token
+    /// behind it, so both `(item expr)` and a bare folded expression arrive
+    /// here. The `end` that terminates the expression in the binary is
+    /// appended, as every consumer of `elem_expr_bytes` expects.
+    ///
+    /// `(elem ...)` and the `(table <reftype> (elem ...))` abbreviation both
+    /// come through this, so the two spellings cannot drift apart: the same
+    /// folded and unfolded forms, the same heap types, the same name
+    /// resolution and the same errors.
+    fn parseElemExprEntry(
+        self: *Parser,
+        seg: *Mod.ElemSegment,
+        code: *std.ArrayListUnmanaged(u8),
+        inner_kind: TokenKind,
+    ) ParseError!void {
+        const expr_start = code.items.len;
+        if (inner_kind == .kw_item) {
+            _ = self.advance(); // consume 'item'
+            // item body: use parseInitExpr (flat form inside item)
+            self.parseInitExpr(code);
+        } else {
+            // Direct folded expression (outer ( already consumed)
+            // parseInitExprFolded consumes the closing )
+            self.parseInitExprFolded(code);
+        }
+        try code.append(self.allocator, 0x0b);
+        // `elem_var_indices` shadows the expressions with the function index
+        // each one happens to name, and records a `ref.null` as an index no
+        // function can have. It is lossy by construction, so it is kept only
+        // for the consumers that predate the expression form.
+        const expr_bytes = code.items[expr_start .. code.items.len - 1];
+        if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
+            if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
+                seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
+            } else |_| {}
+        } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
+            seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
+        }
+        if (inner_kind == .kw_item) try self.expect(.r_paren);
+    }
+
+    /// Read one entry of an elemlist written as a bare function index,
+    /// either numeric or a name.
+    fn parseElemFuncIdxEntry(self: *Parser, seg: *Mod.ElemSegment) ParseError!void {
+        const idx = if (self.peek().kind == .identifier) blk: {
+            const id_tok = self.advance();
+            break :blk self.lookupName(&self.func_names, id_tok.text) orelse 0;
+        } else try self.parseU32();
+        try seg.elem_var_indices.append(self.allocator, .{ .index = idx });
+    }
+
+    /// Release what a half-built element segment owns. A segment only
+    /// becomes the module's to free once it has been appended, so one
+    /// abandoned by a failing parse has to be freed here.
+    fn deinitElemSegment(self: *Parser, seg: *Mod.ElemSegment) void {
+        seg.elem_var_indices.deinit(self.allocator);
+        if (seg.owns_offset_expr_bytes and seg.offset_expr_bytes.len > 0)
+            self.allocator.free(seg.offset_expr_bytes);
+        if (seg.owns_elem_expr_bytes and seg.elem_expr_bytes.len > 0)
+            self.allocator.free(seg.elem_expr_bytes);
+    }
+
     fn parseElem(self: *Parser, module: *Mod.Module) ParseError!void {
         var seg = Mod.ElemSegment{};
+        errdefer self.deinitElemSegment(&seg);
         const elem_idx: u32 = @intCast(module.elem_segments.items.len);
         self.skipAnnotations();
         if (self.peek().kind == .identifier) {
@@ -5175,27 +5220,8 @@ const Parser = struct {
                     // Elements of a segment whose type has been named: each
                     // one is a constant expression, spelled `(item expr)` or
                     // as a bare folded expression.
-                    const expr_start = elem_expr_code.items.len;
-                    if (inner_kind == .kw_item) {
-                        _ = self.advance(); // consume 'item'
-                        // item body: use parseInitExpr (flat form inside item)
-                        self.parseInitExpr(&elem_expr_code);
-                    } else {
-                        // Direct folded expression (outer ( already consumed)
-                        // parseInitExprFolded consumes the closing )
-                        self.parseInitExprFolded(&elem_expr_code);
-                    }
-                    elem_expr_code.append(self.allocator, 0x0b) catch {};
+                    try self.parseElemExprEntry(&seg, &elem_expr_code, inner_kind);
                     elem_expr_count += 1;
-                    const expr_bytes = elem_expr_code.items[expr_start .. elem_expr_code.items.len - 1];
-                    if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd2) {
-                        if (leb128.readU32Leb128(expr_bytes[1..])) |r| {
-                            seg.elem_var_indices.append(self.allocator, .{ .index = r.value }) catch {};
-                        } else |_| {}
-                    } else if (expr_bytes.len >= 1 and expr_bytes[0] == 0xd0) {
-                        seg.elem_var_indices.append(self.allocator, .{ .index = std.math.maxInt(u32) }) catch {};
-                    }
-                    if (inner_kind == .kw_item) try self.expect(.r_paren);
                 } else if (!has_offset) {
                     // First folded expression is the offset expression
                     self.lexer.pos = save_pos;
@@ -5208,15 +5234,9 @@ const Parser = struct {
                     try self.skipSExpr();
                     try self.expect(.r_paren);
                 }
-            } else if (self.peek().kind == .integer) {
-                const idx = try self.parseU32();
+            } else if (self.peek().kind == .integer or self.peek().kind == .identifier) {
+                try self.parseElemFuncIdxEntry(&seg);
                 has_bare_index = true;
-                try seg.elem_var_indices.append(self.allocator, .{ .index = idx });
-            } else if (self.peek().kind == .identifier) {
-                const id_tok = self.advance();
-                const func_idx = self.lookupName(&self.func_names, id_tok.text) orelse 0;
-                has_bare_index = true;
-                try seg.elem_var_indices.append(self.allocator, .{ .index = func_idx });
             } else if (self.peek().kind == .kw_func) {
                 // The `func` short form: funcref elements written as plain
                 // function indices, which is already the default type.
@@ -8116,4 +8136,239 @@ test "the function-index forms of an element segment still read as before" {
     defer item.deinit();
     try std.testing.expectEqual(@as(u32, 1), item.elem_segments.items[0].elem_expr_count);
     try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x00, 0x0b }, item.elem_segments.items[0].elem_expr_bytes);
+}
+
+test "an inline table element list keeps its expressions" {
+    const allocator = std.testing.allocator;
+    // `(table <reftype> (elem <elemlist>))` abbreviates a table together
+    // with an active segment holding the list. The abbreviation used to
+    // build that segment by hand out of function indices, so it understood
+    // only `ref.func` and a `ref.null` it always spelled `func`, never said
+    // the segment held expressions -- which dropped every one of them on the
+    // way out -- and never owned the bytes it had written.
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (func $f)
+        \\  (global $g funcref (ref.null func))
+        \\  (table funcref (elem
+        \\    (ref.func $f)
+        \\    (ref.null func)
+        \\    (global.get $g)
+        \\    (item ref.func $f)
+        \\    (item (ref.func 0)))))
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 1), module.elem_segments.items.len);
+    const seg = module.elem_segments.items[0];
+    try std.testing.expectEqual(types.SegmentKind.active, seg.kind);
+    try std.testing.expect(seg.uses_elem_exprs);
+    try std.testing.expect(seg.owns_elem_expr_bytes);
+    try std.testing.expectEqual(@as(u32, 5), seg.elem_expr_count);
+    try std.testing.expectEqual(types.ValType.funcref, seg.elem_type);
+    try std.testing.expectEqual(types.invalid_index, seg.elem_type_idx);
+    try std.testing.expectEqualSlices(u8, &.{
+        0xd2, 0x00, 0x0b, // ref.func 0
+        0xd0, 0x70, 0x0b, // ref.null func
+        0x23, 0x00, 0x0b, // global.get 0
+        0xd2, 0x00, 0x0b, // (item ref.func 0)
+        0xd2, 0x00, 0x0b, // (item (ref.func 0))
+    }, seg.elem_expr_bytes);
+    // The segment fills the table the abbreviation defined, from zero.
+    try std.testing.expectEqual(@as(u32, 0), seg.table_var.index);
+    try std.testing.expectEqualSlices(u8, &.{ 0x41, 0x00 }, seg.offset_expr_bytes);
+    try std.testing.expect(seg.owns_offset_expr_bytes);
+    // A table written this way is as long as its list.
+    try std.testing.expectEqual(@as(u64, 5), module.tables.items[0].type.limits.initial);
+    try Validator.validate(&module, .{});
+}
+
+test "an inline table element list keeps every reference type" {
+    const allocator = std.testing.allocator;
+    // The elements are expressions of the table's own type, abstract or
+    // concrete, and the segment has to say which type that is: the encoding
+    // of an expression list has a reftype field, and a segment that leaves
+    // it at the default says `funcref` however it was written.
+    inline for (.{
+        .{ "externref", "(ref.null extern)", types.ValType.externref, @as([]const u8, &.{ 0xd0, 0x6f, 0x0b }) },
+        .{ "anyref", "(ref.null any)", types.ValType.anyref, @as([]const u8, &.{ 0xd0, 0x6e, 0x0b }) },
+        .{ "nullfuncref", "(ref.null nofunc)", types.ValType.nullfuncref, @as([]const u8, &.{ 0xd0, 0x73, 0x0b }) },
+        .{ "(ref null extern)", "(ref.null extern)", types.ValType.externref, @as([]const u8, &.{ 0xd0, 0x6f, 0x0b }) },
+    }) |entry| {
+        var module = try parseModule(allocator,
+            "(module (table " ++ entry[0] ++ " (elem " ++ entry[1] ++ ")))");
+        defer module.deinit();
+        const seg = module.elem_segments.items[0];
+        try std.testing.expect(seg.uses_elem_exprs);
+        try std.testing.expectEqual(entry[2], seg.elem_type);
+        try std.testing.expectEqual(types.invalid_index, seg.elem_type_idx);
+        try std.testing.expectEqual(@as(u32, 1), seg.elem_expr_count);
+        try std.testing.expectEqualSlices(u8, entry[3], seg.elem_expr_bytes);
+        try Validator.validate(&module, .{});
+    }
+
+    // A concrete element type is an index, and both the table and its
+    // segment have to keep it.
+    var concrete = try parseModule(allocator,
+        \\(module
+        \\  (type $t (func))
+        \\  (func $f (type $t))
+        \\  (table (ref null $t) (elem (ref.func $f) (ref.null $t))))
+    );
+    defer concrete.deinit();
+    const seg = concrete.elem_segments.items[0];
+    try std.testing.expect(seg.uses_elem_exprs);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, seg.elem_type);
+    try std.testing.expectEqual(@as(u32, 0), seg.elem_type_idx);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, concrete.tables.items[0].type.elem_type);
+    try std.testing.expectEqual(@as(u32, 0), concrete.tables.items[0].type_idx);
+    try std.testing.expectEqualSlices(u8, &.{ 0xd2, 0x00, 0x0b, 0xd0, 0x00, 0x0b }, seg.elem_expr_bytes);
+    try Validator.validate(&concrete, .{});
+}
+
+test "an inline table element list of function indices is still the index form" {
+    const allocator = std.testing.allocator;
+    // The other half of the elemlist rule: bare function indices, by number
+    // or by name, encode as indices rather than expressions and infer
+    // `(ref func)` as their type just as a written-out `(elem ...)` does.
+    inline for (.{
+        "(module (func) (func) (table funcref (elem 0 1)))",
+        "(module (func $a) (func $b) (table funcref (elem $a $b)))",
+    }) |src| {
+        var module = try parseModule(allocator, src);
+        defer module.deinit();
+        const seg = module.elem_segments.items[0];
+        try std.testing.expectEqual(types.SegmentKind.active, seg.kind);
+        try std.testing.expect(!seg.uses_elem_exprs);
+        try std.testing.expectEqual(@as(u32, 0), seg.elem_expr_count);
+        try std.testing.expectEqual(@as(usize, 0), seg.elem_expr_bytes.len);
+        try std.testing.expectEqual(types.ValType.ref_func, seg.elem_type);
+        try std.testing.expectEqual(@as(usize, 2), seg.elem_var_indices.items.len);
+        try std.testing.expectEqual(@as(u32, 0), seg.elem_var_indices.items[0].index);
+        try std.testing.expectEqual(@as(u32, 1), seg.elem_var_indices.items[1].index);
+        try std.testing.expectEqual(@as(u64, 2), module.tables.items[0].type.limits.initial);
+        try Validator.validate(&module, .{});
+    }
+}
+
+test "an empty inline table element list is still an element list" {
+    const allocator = std.testing.allocator;
+    // `(elem)` is an elemlist of no elements, and the abbreviation still
+    // stands for a segment. Which form of segment depends on the table: the
+    // index form only ever holds functions, so any other reference type
+    // needs the expression form to have somewhere to say so.
+    var funcs = try parseModule(allocator, "(module (table funcref (elem)))");
+    defer funcs.deinit();
+    try std.testing.expectEqual(@as(usize, 1), funcs.elem_segments.items.len);
+    try std.testing.expect(!funcs.elem_segments.items[0].uses_elem_exprs);
+    try std.testing.expectEqual(types.ValType.ref_func, funcs.elem_segments.items[0].elem_type);
+    try std.testing.expectEqual(@as(u32, 0), funcs.elem_segments.items[0].elem_expr_count);
+    try std.testing.expectEqual(@as(u64, 0), funcs.tables.items[0].type.limits.initial);
+    try Validator.validate(&funcs, .{});
+
+    var externs = try parseModule(allocator, "(module (table externref (elem)))");
+    defer externs.deinit();
+    try std.testing.expect(externs.elem_segments.items[0].uses_elem_exprs);
+    try std.testing.expectEqual(types.ValType.externref, externs.elem_segments.items[0].elem_type);
+    try std.testing.expectEqual(@as(u32, 0), externs.elem_segments.items[0].elem_expr_count);
+    try std.testing.expectEqual(@as(usize, 0), externs.elem_segments.items[0].elem_expr_bytes.len);
+    try Validator.validate(&externs, .{});
+
+    // A table with no element list at all is not a segment.
+    var none = try parseModule(allocator, "(module (table 1 funcref))");
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.elem_segments.items.len);
+}
+
+test "an inline table element list says which table it fills" {
+    const allocator = std.testing.allocator;
+    // The abbreviation names the table it defines, which is only table 0
+    // when it is the first one. A segment that leaves the index implicit
+    // means table 0 whatever table it was written under, so a later table's
+    // elements ended up in the first table's text.
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (func $f)
+        \\  (table 1 funcref)
+        \\  (table funcref (elem (ref.func $f)))
+        \\  (table funcref (elem $f)))
+    );
+    defer module.deinit();
+    try std.testing.expectEqual(@as(usize, 2), module.elem_segments.items.len);
+    try std.testing.expectEqual(@as(u32, 1), module.elem_segments.items[0].table_var.index);
+    try std.testing.expect(module.elem_segments.items[0].has_explicit_table_index);
+    try std.testing.expectEqual(@as(u32, 2), module.elem_segments.items[1].table_var.index);
+    try std.testing.expect(module.elem_segments.items[1].has_explicit_table_index);
+    try Validator.validate(&module, .{});
+
+    // Table 0 is what the implicit form means, so nothing has to be said.
+    var first = try parseModule(allocator, "(module (func $f) (table funcref (elem (ref.func $f))))");
+    defer first.deinit();
+    try std.testing.expectEqual(@as(u32, 0), first.elem_segments.items[0].table_var.index);
+    try std.testing.expect(!first.elem_segments.items[0].has_explicit_table_index);
+    try Validator.validate(&first, .{});
+}
+
+test "a 64-bit table's inline element list is offset by an i64" {
+    const allocator = std.testing.allocator;
+    // The offset the abbreviation invents indexes the table, so it has the
+    // table's index type.
+    var module = try parseModule(allocator,
+        \\(module (func $f) (table i64 funcref (elem (ref.func $f))))
+    );
+    defer module.deinit();
+    const seg = module.elem_segments.items[0];
+    try std.testing.expectEqualSlices(u8, &.{ 0x42, 0x00 }, seg.offset_expr_bytes);
+    try std.testing.expect(seg.uses_elem_exprs);
+    try std.testing.expect(module.tables.items[0].type.limits.is_64);
+    try Validator.validate(&module, .{});
+}
+
+test "an inline table element list rejects what is not an element" {
+    const allocator = std.testing.allocator;
+    // A word that is neither an index nor an expression used to be skipped
+    // silently, leaving a shorter table than was written.
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator,
+        \\(module (table funcref (elem garbage)))
+    ));
+    // The two forms of elemlist are alternatives, not a mixture: only one of
+    // them can be encoded, so the other's elements would be lost.
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator,
+        \\(module (func $f) (table funcref (elem 0 (ref.func $f))))
+    ));
+    // An expression of the wrong type, or one naming a function that does
+    // not exist, is caught where every other element expression is.
+    var wrong_type = try parseModule(allocator,
+        \\(module (table funcref (elem (i32.const 0))))
+    );
+    defer wrong_type.deinit();
+    try std.testing.expectError(error.TypeMismatch, Validator.validate(&wrong_type, .{}));
+
+    var no_such_func = try parseModule(allocator,
+        \\(module (table funcref (elem (ref.func 3))))
+    );
+    defer no_such_func.deinit();
+    try std.testing.expectError(error.InvalidFuncIndex, Validator.validate(&no_such_func, .{}));
+}
+
+test "an element list that fails part way frees what it had read" {
+    const allocator = std.testing.allocator;
+    // A segment belongs to the module only once it has been appended, so a
+    // parse that abandons one part way through has to free it itself. The
+    // testing allocator is what checks this: each of these fails on an index
+    // no `u32` can hold, after the segment has taken bytes and indices of
+    // its own.
+    inline for (.{
+        "(module (func) (table funcref (elem (ref.func 0) 99999999999999999999)))",
+        "(module (func $f) (table funcref (elem $f 99999999999999999999)))",
+        "(module (func) (table externref (elem (ref.null extern) 99999999999999999999)))",
+        "(module (func) (table 1 funcref) (elem (i32.const 0) func 0 99999999999999999999))",
+        "(module (func) (table 1 funcref) (elem (i32.const 0) funcref (ref.func 0) 99999999999999999999))",
+        "(module (func) (elem declare funcref (ref.func 0) 99999999999999999999))",
+    }) |src| {
+        if (parseModule(allocator, src)) |parsed| {
+            var module = parsed;
+            module.deinit();
+            return error.TestExpectedError;
+        } else |_| {}
+    }
 }
