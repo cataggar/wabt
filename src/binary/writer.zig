@@ -71,6 +71,12 @@ const Writer = struct {
         try self.appendSlice(tmp[0..n]);
     }
 
+    fn writeS64Leb(self: *Writer, v: i64) WriteError!void {
+        var tmp: [leb128.max_s64_bytes]u8 = undefined;
+        const n = leb128.writeS64Leb128(&tmp, v);
+        try self.appendSlice(tmp[0..n]);
+    }
+
     fn writeName(self: *Writer, name: []const u8) WriteError!void {
         try self.writeU32Leb(@intCast(name.len));
         try self.appendSlice(name);
@@ -84,7 +90,7 @@ const Writer = struct {
         if ((vt == .concrete_ref_null or vt == .concrete_ref) and tidx != 0xFFFFFFFF) {
             // Concrete typed ref: write prefix + type index
             try self.appendByte(if (vt == .concrete_ref_null) reader.ref_null_prefix else reader.ref_prefix);
-            try self.writeU32Leb(tidx);
+            try self.writeS64Leb(@intCast(tidx));
         } else if (vt == .ref_func) {
             try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x70); // func
@@ -332,7 +338,7 @@ const Writer = struct {
             } else if ((et == .concrete_ref_null or et == .concrete_ref) and table.type_idx != 0xFFFFFFFF) {
                 // Typed reference: write prefix + concrete type index
                 try self.appendByte(if (et == .concrete_ref_null) reader.ref_null_prefix else reader.ref_prefix);
-                try self.writeU32Leb(table.type_idx);
+                try self.writeS64Leb(@intCast(table.type_idx));
                 try self.writeLimits(table.type.limits);
             } else {
                 try self.writeValType(et);
@@ -1000,6 +1006,26 @@ test "text parse + binary write: reference types use the spec-assigned bytes" {
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "concrete heap types use signed s33 LEBs" {
+    const allocator = std.testing.allocator;
+    var module = Mod.Module.init(allocator);
+    defer module.deinit();
+
+    // This index is -16 when truncated to s32, which would encode as 0x70
+    // (`func`). Heap types are s33, so it must retain its positive value.
+    try module.globals.append(allocator, .{
+        .type = .{ .val_type = .concrete_ref_null },
+        .type_idx = 0xffff_fff0,
+        .init_expr_bytes = &.{ 0xd0, 0x70 },
+    });
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &.{
+        0x63, 0xf0, 0xff, 0xff, 0xff, 0x0f,
+    }) != null);
 }
 
 test "binary read: reference types decode from the spec-assigned bytes" {

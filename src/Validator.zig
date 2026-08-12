@@ -419,7 +419,7 @@ fn checkConstExpr(
                 try push(m, &stack, StackType.known(vt));
             },
             0xd0 => { // ref.null
-                const t = readHeapStackType(bytes, &pos, true) orelse return error.InvalidTypeIndex;
+                const t = readHeapStackType(m, bytes, &pos, true) orelse return error.InvalidTypeIndex;
                 try push(m, &stack, t);
             },
             0xd2 => { // ref.func
@@ -1544,7 +1544,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             0xc2...0xc4 => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
             // Reference types
             0xd0 => { // ref.null
-                const rt = readHeapStackType(bytes, &pos, true) orelse return error.InvalidTypeIndex;
+                const rt = readHeapStackType(m, bytes, &pos, true) orelse return error.InvalidTypeIndex;
                 val_stack.append(gpa(m), rt) catch return error.OutOfMemory;
             },
             0xd1 => { // ref.is_null
@@ -1818,7 +1818,7 @@ fn readS64(bytes: []const u8, pos: *usize) i64 {
     return result.value;
 }
 
-fn readHeapStackType(bytes: []const u8, pos: *usize, nullable: bool) ?StackType {
+fn readHeapStackType(m: *const Mod.Module, bytes: []const u8, pos: *usize, nullable: bool) ?StackType {
     if (pos.* >= bytes.len) return null;
     const result = leb128.readS64Leb128(bytes[pos.*..]) catch return null;
     pos.* += result.bytes_read;
@@ -1826,7 +1826,9 @@ fn readHeapStackType(bytes: []const u8, pos: *usize, nullable: bool) ?StackType 
         return StackType.fromRefType(types.RefType.abstract(nullable, heap));
     }
     if (result.value >= 0 and result.value <= std.math.maxInt(u32)) {
-        return StackType.fromRefType(types.RefType.concrete(nullable, @intCast(result.value)));
+        const idx: u32 = @intCast(result.value);
+        if (idx >= m.module_types.items.len) return null;
+        return StackType.fromRefType(types.RefType.concrete(nullable, idx));
     }
     return null;
 }
