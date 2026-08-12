@@ -1044,19 +1044,24 @@ test "element flags cover every segment form and survive text and binary round t
         defer allocator.free(rebuilt);
 
         pos = 8;
+        flag = null;
+        var found_rebuilt_element_section = false;
         while (pos < rebuilt.len) {
             const section_id = rebuilt[pos];
             pos += 1;
             const size = try leb128.readU32Leb128(rebuilt[pos..]);
             pos += size.bytes_read;
             if (section_id == 9) {
+                found_rebuilt_element_section = true;
                 const count = try leb128.readU32Leb128(rebuilt[pos..]);
+                try std.testing.expectEqual(@as(u32, 1), count.value);
                 pos += count.bytes_read;
                 flag = (try leb128.readU32Leb128(rebuilt[pos..])).value;
                 break;
             }
             pos += size.value;
         }
+        try std.testing.expect(found_rebuilt_element_section);
         try std.testing.expectEqual(@as(?u32, case.flag), flag);
     }
 }
