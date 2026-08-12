@@ -9,6 +9,7 @@ const testing = std.testing;
 pub const max_u32_bytes = 5;
 pub const max_u64_bytes = 10;
 pub const max_s32_bytes = 5;
+pub const max_s33_bytes = 5;
 pub const max_s64_bytes = 10;
 
 pub const ReadError = error{ Overflow, UnexpectedEnd };
@@ -16,6 +17,7 @@ pub const ReadError = error{ Overflow, UnexpectedEnd };
 pub const ReadU32Result = struct { value: u32, bytes_read: usize };
 pub const ReadU64Result = struct { value: u64, bytes_read: usize };
 pub const ReadS32Result = struct { value: i32, bytes_read: usize };
+pub const ReadS33Result = struct { value: i64, bytes_read: usize };
 pub const ReadS64Result = struct { value: i64, bytes_read: usize };
 
 // ---------------------------------------------------------------------------
@@ -84,6 +86,43 @@ pub fn readS32Leb128(bytes: []const u8) ReadError!ReadS32Result {
             if (shift < 31 and (last_byte & 0x40) != 0) {
                 result |= @as(u32, 0xffffffff) << (shift +| 7);
             }
+            return .{
+                .value = @bitCast(result),
+                .bytes_read = i + 1,
+            };
+        }
+        shift +|= 7;
+    }
+    return error.UnexpectedEnd;
+}
+
+/// Read an s33: the signed LEB128 the binary format uses for a block
+/// signature and for a heap type, where a non-negative value is a type index
+/// and a negative one names a value type or an abstract heap type.
+///
+/// 33 bits fit in five bytes, so a sixth is not padding but a malformed
+/// encoding, and the fifth byte carries only the 33rd bit: bits 34 and 35
+/// must repeat the sign in bit 33, which leaves the payload `0x00..0x0f` when
+/// non-negative and `0x70..0x7f` when negative. Reading these as an s64
+/// instead accepted encodings up to ten bytes wide, and `readS32Leb128`
+/// rejects the top of the range as an overflow, so neither is a substitute.
+pub fn readS33Leb128(bytes: []const u8) ReadError!ReadS33Result {
+    var result: u64 = 0;
+    var shift: u6 = 0;
+    for (bytes, 0..) |byte, i| {
+        if (i >= max_s33_bytes) return error.Overflow;
+
+        const payload: u64 = @as(u64, byte & 0x7f);
+
+        if (shift == 28) {
+            const top: u8 = byte & 0x7f;
+            if (top > 0x0f and top < 0x70) return error.Overflow;
+        }
+
+        result |= payload << shift;
+        if (byte & 0x80 == 0) {
+            // Sign-extend if the sign bit of the last byte is set.
+            if (byte & 0x40 != 0) result |= ~@as(u64, 0) << (shift +| 7);
             return .{
                 .value = @bitCast(result),
                 .bytes_read = i + 1,
@@ -318,6 +357,75 @@ test "readS32Leb128 max i32" {
     const r = try readS32Leb128(&.{ 0xff, 0xff, 0xff, 0xff, 0x07 });
     try testing.expectEqual(@as(i32, 2147483647), r.value);
     try testing.expectEqual(@as(usize, 5), r.bytes_read);
+}
+
+test "readS33Leb128 reads the values an s33 can hold" {
+    const cases = [_]struct { bytes: []const u8, value: i64, len: usize }{
+        .{ .bytes = &.{0x00}, .value = 0, .len = 1 },
+        .{ .bytes = &.{0x3f}, .value = 63, .len = 1 },
+        .{ .bytes = &.{0x40}, .value = -64, .len = 1 },
+        .{ .bytes = &.{0x7f}, .value = -1, .len = 1 },
+        // The abstract heap types: `func` is -0x10, `noexn` is -0x17.
+        .{ .bytes = &.{0x70}, .value = -0x10, .len = 1 },
+        .{ .bytes = &.{0x69}, .value = -0x17, .len = 1 },
+        .{ .bytes = &.{ 0xc0, 0x00 }, .value = 64, .len = 2 },
+        .{ .bytes = &.{ 0xcd, 0x00 }, .value = 77, .len = 2 },
+        // The ends of the range: -2^32 and 2^32-1.
+        .{ .bytes = &.{ 0x80, 0x80, 0x80, 0x80, 0x70 }, .value = -4294967296, .len = 5 },
+        .{ .bytes = &.{ 0xff, 0xff, 0xff, 0xff, 0x0f }, .value = 4294967295, .len = 5 },
+    };
+    for (cases) |c| {
+        const r = try readS33Leb128(c.bytes);
+        try testing.expectEqual(c.value, r.value);
+        try testing.expectEqual(c.len, r.bytes_read);
+    }
+}
+
+test "readS33Leb128 pads to five bytes but no further" {
+    // Padding within the width is legal, and wasm-tools accepts it.
+    const padded = try readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x00 });
+    try testing.expectEqual(@as(i64, 0), padded.value);
+    try testing.expectEqual(@as(usize, 5), padded.bytes_read);
+
+    // A sixth byte is not padding: 33 bits do not reach it. Reading an s33
+    // as an s64 accepted up to ten bytes, so a block signature or a heap
+    // type could be written in a form no other tool admits.
+    try testing.expectError(error.Overflow, readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }));
+    try testing.expectError(
+        error.Overflow,
+        readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }),
+    );
+}
+
+test "readS33Leb128 rejects a fifth byte that overflows 33 bits" {
+    // On the fifth byte only bit 33 is left, so bits 34 and 35 have to
+    // repeat its sign: the payload is 0x00..0x0f or 0x70..0x7f.
+    try testing.expectError(error.Overflow, readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x10 }));
+    try testing.expectError(error.Overflow, readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x20 }));
+    try testing.expectError(error.Overflow, readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x6f }));
+    _ = try readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x0f });
+    _ = try readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80, 0x70 });
+}
+
+test "readS33Leb128 reports a truncated encoding" {
+    try testing.expectError(error.UnexpectedEnd, readS33Leb128(&.{}));
+    try testing.expectError(error.UnexpectedEnd, readS33Leb128(&.{0x80}));
+    try testing.expectError(error.UnexpectedEnd, readS33Leb128(&.{ 0x80, 0x80, 0x80, 0x80 }));
+}
+
+test "readS33Leb128 agrees with readS64Leb128 wherever both are defined" {
+    // The two differ only in width; within five bytes the value must match,
+    // which is what makes the narrower reader a safe replacement.
+    var buf: [max_s64_bytes]u8 = undefined;
+    const values = [_]i64{ 0, 1, -1, 63, -64, 64, 77, 127, -128, 8191, -8192, 2147483647, -2147483648, 4294967295, -4294967296 };
+    for (values) |v| {
+        const n = writeS64Leb128(&buf, v);
+        if (n > max_s33_bytes) continue;
+        const wide = try readS64Leb128(buf[0..n]);
+        const narrow = try readS33Leb128(buf[0..n]);
+        try testing.expectEqual(wide.value, narrow.value);
+        try testing.expectEqual(wide.bytes_read, narrow.bytes_read);
+    }
 }
 
 test "readU64Leb128 max u64" {
