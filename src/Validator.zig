@@ -10,6 +10,7 @@ const Feature = @import("Feature.zig");
 const leb128 = @import("leb128.zig");
 const Opcode = @import("Opcode.zig");
 const instr = @import("binary/instr.zig");
+const reader = @import("binary/reader.zig");
 
 pub const Error = error{
     InvalidTypeIndex,
@@ -1103,6 +1104,13 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
     defer val_stack.deinit(gpa(m));
     var ctrl_stack: std.ArrayListUnmanaged(CtrlFrame) = .empty;
     defer ctrl_stack.deinit(gpa(m));
+    // Backing store for the block signatures that cannot borrow their type
+    // sequence from the type section -- `(ref null ht)` / `(ref ht)`. A
+    // control frame outlives the `readBlockType` call that filled it, so the
+    // slices must live as long as the body; nothing is allocated unless such
+    // a signature actually appears.
+    var block_types = std.heap.ArenaAllocator.init(gpa(m));
+    defer block_types.deinit();
 
     // Push the function frame
     ctrl_stack.append(gpa(m), .{
@@ -1128,7 +1136,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             },
             0x01 => {}, // nop
             0x02 => { // block
-                const bt = readBlockType(m, bytes, &pos);
+                const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x02, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
@@ -1136,7 +1144,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x03 => { // loop
-                const bt = readBlockType(m, bytes, &pos);
+                const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x03, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
@@ -1144,7 +1152,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 pushVals(&val_stack, bt.params, gpa(m)) catch return error.OutOfMemory;
             },
             0x04 => { // if
-                const bt = readBlockType(m, bytes, &pos);
+                const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
@@ -1329,7 +1337,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 setUnreachable(&val_stack, &ctrl_stack);
             },
             0x1f => { // try_table
-                const bt = readBlockType(m, bytes, &pos);
+                const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
                 const clause_count = readU32(bytes, &pos);
                 // The catch clauses are checked against the *enclosing*
                 // label stack. `try_table`'s own frame is not pushed until
@@ -1736,33 +1744,88 @@ const BlockType = struct {
     results: TypeSeq,
 };
 
-fn readBlockType(m: *const Mod.Module, bytes: []const u8, pos: *usize) BlockType {
-    if (pos.* >= bytes.len) return .{ .params = .{}, .results = .{} };
+/// Read a block signature: `blocktype ::= 0x40 | valtype | s33 typeidx`.
+///
+/// The three cases are told apart by the first byte, but not by its
+/// magnitude: as an s33 every one-byte value type is *negative* (`i32` is
+/// `0x7f`, that is -1) while a type index is non-negative and needs two
+/// bytes from 64 up (77 is `cd 00`), and `0x63`/`0x64` are prefixes that a
+/// heap type follows rather than complete types. Taking any byte >= 0x60 for
+/// a whole value type consumed half of both wide forms and left the rest of
+/// the body decoding at the wrong offset, which surfaced as a type mismatch
+/// or a bad label index somewhere further on (issue #384).
+///
+/// `scratch` owns the one-element sequence a `(ref null ht)` / `(ref ht)`
+/// signature needs; see `blockRefResult`.
+fn readBlockType(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    pos: *usize,
+    scratch: std.mem.Allocator,
+) Error!BlockType {
+    if (pos.* >= bytes.len) return error.UnexpectedEnd;
     const byte = bytes[pos.*];
+
+    // 0x40: no parameters and no results.
     if (byte == 0x40) {
         pos.* += 1;
         return .{ .params = .{}, .results = .{} };
     }
-    // Single value type (wasm type bytes: 0x7F=i32, 0x7E=i64, 0x7D=f32, 0x7C=f64,
-    // 0x70=funcref, 0x6F=externref). All are >= 0x60.
-    if (byte >= 0x60) {
+
+    // 0x63/0x64: a prefix plus a heap type, so the value type spans at least
+    // two bytes. The heap type may be abstract or a concrete type index;
+    // `readHeapStackType` bounds-checks the index.
+    if (byte == reader.ref_null_prefix or byte == reader.ref_prefix) {
+        pos.* += 1;
+        const nullable = byte == reader.ref_null_prefix;
+        const ref = readHeapStackType(m, bytes, pos, nullable) orelse return error.InvalidTypeIndex;
+        return .{ .params = .{}, .results = try blockRefResult(scratch, ref) };
+    }
+
+    // Every remaining value type encodes in one byte. `single_val_types`
+    // holds exactly those, so a byte it does not know is not a value type at
+    // all and falls through to the type-index reading below -- where, being
+    // negative as an s33, it is rejected.
+    if (single_val_types[byte] != null) {
         pos.* += 1;
         return .{ .params = .{}, .results = .{ .vts = valTypeSlice(byte) } };
     }
-    // Type index (s33 LEB128)
-    const result = leb128.readS32Leb128(bytes[pos.*..]) catch return .{ .params = .{}, .results = .{} };
+
+    // What is left is an s33 type index. Read it with the 64-bit decoder:
+    // the 33-bit range does not fit in an i32, and `readS32Leb128` reports
+    // the top of it as an overflow.
+    const result = leb128.readS64Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+        error.UnexpectedEnd => error.UnexpectedEnd,
+        error.Overflow => error.InvalidTypeIndex,
+    };
     pos.* += result.bytes_read;
-    const idx: u32 = @bitCast(result.value);
-    if (idx < m.module_types.items.len) {
-        return switch (m.module_types.items[idx]) {
-            .func_type => |ft| .{
-                .params = .{ .vts = ft.params, .type_idxs = ft.param_type_idxs },
-                .results = .{ .vts = ft.results, .type_idxs = ft.result_type_idxs },
-            },
-            else => .{ .params = .{}, .results = .{} },
-        };
-    }
-    return .{ .params = .{}, .results = .{} };
+    if (result.value < 0 or result.value > std.math.maxInt(u32)) return error.InvalidTypeIndex;
+    const idx: u32 = @intCast(result.value);
+    if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+    return switch (m.module_types.items[idx]) {
+        .func_type => |ft| .{ .params = funcParams(ft), .results = funcResults(ft) },
+        // A block signature names a function type; a struct or array type
+        // in that position is not a signature at all.
+        else => error.TypeMismatch,
+    };
+}
+
+/// The one-element result sequence of a `(ref null ht)` / `(ref ht)` block
+/// signature.
+///
+/// These value types have no single-byte encoding, so `single_val_types`
+/// cannot supply the slice, and a concrete index has to travel beside the
+/// type. `TypeSeq` holds slices and the control frame built from it outlives
+/// this call, so the storage comes from the caller's per-body arena rather
+/// than from a local.
+fn blockRefResult(scratch: std.mem.Allocator, ref: StackType) Error!TypeSeq {
+    const vt = ref.toValType() orelse return error.InvalidTypeIndex;
+    const vts = scratch.alloc(types.ValType, 1) catch return error.OutOfMemory;
+    vts[0] = vt;
+    if (ref.type_idx == types.invalid_index) return .{ .vts = vts };
+    const idxs = scratch.alloc(u32, 1) catch return error.OutOfMemory;
+    idxs[0] = ref.type_idx;
+    return .{ .vts = vts, .type_idxs = idxs };
 }
 
 /// Reusable single-element type slices for block types, one per value type
@@ -4246,6 +4309,171 @@ test "a block may return any single-byte value type" {
             std.debug.print("block (result {s}) was validated as returning nothing\n", .{c.name});
             return error.TestUnexpectedResult;
         } else |err| try std.testing.expectEqual(error.TypeMismatch, err);
+    }
+}
+
+// ── Block signatures wider than one byte (issue #384) ───────────────────
+
+/// A module with `empty_types` empty function types, then `(func (result
+/// i32))`, and one function of the first type whose body is `body`. The
+/// `(result i32)` type is the last one, so its index is `empty_types`.
+fn testModuleWithTypeCountAndBody(
+    alloc: std.mem.Allocator,
+    empty_types: usize,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    for (0..empty_types) |_| try appendFuncTypeForTest(&module, &.{}, &.{}, &.{}, &.{});
+    try appendFuncTypeForTest(&module, &.{}, &.{.i32}, &.{}, &.{});
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+test "a block signature may be a type index that needs more than one byte" {
+    // Type index 64 is `c0 00` as an s33. Reading only `c0` left `00` to be
+    // decoded as an instruction and the rest of the body at the wrong
+    // offset. `block`, `loop` and `if` share the reader, so all three are
+    // exercised.
+    const alloc = std.testing.allocator;
+    const bodies = [_][]const u8{
+        // block (type 64) (i32.const 1) end drop end
+        &.{ 0x02, 0xc0, 0x00, 0x41, 0x01, 0x0b, 0x1a, 0x0b },
+        // loop (type 64) (i32.const 1) end drop end
+        &.{ 0x03, 0xc0, 0x00, 0x41, 0x01, 0x0b, 0x1a, 0x0b },
+        // (i32.const 0) if (type 64) (i32.const 1) else (i32.const 2) end drop end
+        &.{ 0x41, 0x00, 0x04, 0xc0, 0x00, 0x41, 0x01, 0x05, 0x41, 0x02, 0x0b, 0x1a, 0x0b },
+    };
+    for (bodies) |body| {
+        var module = try testModuleWithTypeCountAndBody(alloc, 64, body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+}
+
+test "a try_table signature may be a type index that needs more than one byte" {
+    // e53 of the fixed wasm-smith corpus: `try_table (type 64)`, the only
+    // one of the 200 corpus binaries `wabt module validate` rejected.
+    const alloc = std.testing.allocator;
+    // try_table (type 64) 0-clauses (i32.const 1) end drop end
+    const body = [_]u8{ 0x1f, 0xc0, 0x00, 0x00, 0x41, 0x01, 0x0b, 0x1a, 0x0b };
+    var module = try testModuleWithTypeCountAndBody(alloc, 64, &body);
+    defer module.deinit();
+    try validate(&module, .{});
+}
+
+test "a block signature may be a two-byte 0x63/0x64 reference type" {
+    // `0x63`/`0x64` are prefixes, not types: the heap type after them is
+    // part of the value type. Consuming only the prefix desynchronised the
+    // body -- for `(ref null extern)` the `6f` left behind reads as
+    // `i32.rem_u`.
+    const alloc = std.testing.allocator;
+
+    // block (result (ref null extern)) (ref.null extern) end drop end
+    {
+        const body = [_]u8{ 0x02, 0x63, 0x6f, 0xd0, 0x6f, 0x0b, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    // block (result (ref null 0)) (ref.null 0) end drop end -- a concrete
+    // heap type, which has to travel beside the value type.
+    {
+        const body = [_]u8{ 0x02, 0x63, 0x00, 0xd0, 0x00, 0x0b, 0x1a, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    // (func (param (ref 0))) with
+    // block (result (ref 0)) (local.get 0) end drop end -- the non-nullable
+    // prefix, and a result the block really has to supply.
+    {
+        const body = [_]u8{ 0x02, 0x64, 0x00, 0x20, 0x00, 0x0b, 0x1a, 0x0b };
+        var module = Mod.Module.init(alloc);
+        defer module.deinit();
+        try appendFuncTypeForTest(&module, &.{}, &.{}, &.{}, &.{});
+        try appendFuncTypeForTest(&module, &.{.concrete_ref}, &.{}, &.{0}, &.{});
+        try module.funcs.append(alloc, .{
+            .decl = .{ .type_var = .{ .index = 1 } },
+            .code_bytes = &body,
+        });
+        try validate(&module, .{});
+    }
+
+    // The concrete index is kept, not flattened: a block declared to return
+    // `(ref null 1)` is not satisfied by a `(ref null 0)`.
+    {
+        const body = [_]u8{ 0x02, 0x63, 0x01, 0xd0, 0x00, 0x0b, 0x1a, 0x0b };
+        var module = Mod.Module.init(alloc);
+        defer module.deinit();
+        try appendFuncTypeForTest(&module, &.{}, &.{}, &.{}, &.{});
+        try appendFuncTypeForTest(&module, &.{.i32}, &.{}, &.{}, &.{});
+        try module.funcs.append(alloc, .{
+            .decl = .{ .type_var = .{ .index = 0 } },
+            .code_bytes = &body,
+        });
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "a malformed block signature is rejected, not read as an empty one" {
+    // Every one of these used to fall back to "no parameters, no results",
+    // which both accepted a module it should not have and hid the real
+    // shape of the body from everything after it.
+    const alloc = std.testing.allocator;
+
+    // A type index past the end of the type section.
+    {
+        // block (type 64) ... with only 2 types in the module
+        const body = [_]u8{ 0x02, 0xc0, 0x00, 0x41, 0x01, 0x0b, 0x1a, 0x0b };
+        var module = try testModuleWithTypeCountAndBody(alloc, 1, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+
+    // A type index that names a struct type. A block signature is a
+    // function type; nothing else is a signature.
+    {
+        const body = [_]u8{ 0x02, 0x01, 0x0b, 0x0b };
+        var module = Mod.Module.init(alloc);
+        defer module.deinit();
+        try appendFuncTypeForTest(&module, &.{}, &.{}, &.{}, &.{});
+        try module.module_types.append(alloc, .{ .struct_type = .{ .fields = .empty } });
+        try module.funcs.append(alloc, .{
+            .decl = .{ .type_var = .{ .index = 0 } },
+            .code_bytes = &body,
+        });
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+
+    // `0x60` is the function-type marker, not a value type, and as an s33 it
+    // is negative, so it is not a type index either.
+    {
+        const body = [_]u8{ 0x02, 0x60, 0x0b, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+    }
+
+    // A body that stops on the signature, and one that stops inside a
+    // multi-byte index.
+    for ([_][]const u8{ &.{0x02}, &.{ 0x02, 0xc0 } }) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+    }
+
+    // `0x63` with a heap type that names no type, and `0x64` with none at
+    // all.
+    for ([_][]const u8{ &.{ 0x02, 0x63, 0x09, 0x0b, 0x0b }, &.{ 0x02, 0x64 } }) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
     }
 }
 
