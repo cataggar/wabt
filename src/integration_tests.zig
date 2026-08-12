@@ -651,13 +651,128 @@ test "a table with no initializer keeps printing without one" {
     defer allocator.free(wat);
     try std.testing.expect(containsSubstring(wat, "(table (;0;) 1 funcref)"));
     try std.testing.expect(containsSubstring(wat, "(table (;1;) i64 2 4 externref)"));
-    try std.testing.expect(containsSubstring(wat, "(table (;2;) 1 funcref)"));
+    // The inline element abbreviation is `(table id' n n reftype)`: a table
+    // as long as its list, and no longer.
+    try std.testing.expect(containsSubstring(wat, "(table (;2;) 1 1 funcref)"));
     // No table gained an initializer, so no `ref.null` was invented.
     try std.testing.expect(!containsSubstring(wat, "funcref ref.null"));
 
     var reparsed = try text_parser.parseModule(allocator, wat);
     defer reparsed.deinit();
     try Validator.validate(&reparsed, .{});
+    const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
+    defer allocator.free(rebuilt);
+    try std.testing.expectEqualSlices(u8, wasm, rebuilt);
+}
+
+// ── 13. The inline table element abbreviation, all the way round ───────
+
+test "an inline table element list survives text → binary → text" {
+    const allocator = std.testing.allocator;
+
+    // `(table <reftype> (elem ...))` is a table plus an active segment. The
+    // segment the abbreviation built never said it held expressions, so the
+    // element section wrote a count of elements it then did not write, and
+    // printing the module back showed an empty list.
+    const source =
+        \\(module
+        \\  (type $t (func))
+        \\  (func $f (type $t))
+        \\  (global $g funcref (ref.null func))
+        \\  (table funcref (elem (ref.func $f) (ref.null func) (global.get $g)))
+        \\  (table externref (elem))
+        \\  (table (ref null $t) (elem (item ref.func $f) (ref.null $t)))
+        \\  (table funcref (elem $f))
+        \\)
+    ;
+
+    var module = try text_parser.parseModule(allocator, source);
+    defer module.deinit();
+    try Validator.validate(&module, .{});
+    try std.testing.expectEqual(@as(usize, 4), module.elem_segments.items.len);
+
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var decoded = try binary_reader.readModule(allocator, wasm);
+    defer decoded.deinit();
+    try Validator.validate(&decoded, .{});
+
+    // Every element the text named is in the binary, in the form it was
+    // written in: expressions where expressions were given, function
+    // indices where indices were.
+    const segs = decoded.elem_segments.items;
+    try std.testing.expectEqual(@as(usize, 4), segs.len);
+    try std.testing.expect(segs[0].uses_elem_exprs);
+    try std.testing.expectEqual(@as(u32, 3), segs[0].elem_expr_count);
+    try std.testing.expectEqual(types.ValType.funcref, segs[0].elem_type);
+    try std.testing.expect(segs[1].uses_elem_exprs);
+    try std.testing.expectEqual(@as(u32, 0), segs[1].elem_expr_count);
+    try std.testing.expectEqual(types.ValType.externref, segs[1].elem_type);
+    try std.testing.expect(segs[2].uses_elem_exprs);
+    try std.testing.expectEqual(@as(u32, 2), segs[2].elem_expr_count);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, segs[2].elem_type);
+    try std.testing.expectEqual(@as(u32, 0), segs[2].elem_type_idx);
+    try std.testing.expect(!segs[3].uses_elem_exprs);
+    try std.testing.expectEqual(@as(usize, 1), segs[3].elem_var_indices.items.len);
+
+    const wat = try text_writer.writeModule(allocator, &decoded);
+    defer allocator.free(wat);
+    try std.testing.expect(containsSubstring(
+        wat,
+        "(elem (;0;) (i32.const 0) funcref (ref.func 0) (ref.null func) (global.get 0))",
+    ));
+    try std.testing.expect(containsSubstring(wat, "(elem (;1;) (table 1) (i32.const 0) externref)"));
+    try std.testing.expect(containsSubstring(
+        wat,
+        "(elem (;2;) (table 2) (i32.const 0) (ref null 0) (ref.func 0) (ref.null 0))",
+    ));
+    try std.testing.expect(containsSubstring(wat, "(elem (;3;) (table 3) (i32.const 0) func 0)"));
+    // Each table is exactly as long as the list it was written with, in
+    // both bounds: the abbreviation is `(table id' n n reftype)`.
+    try std.testing.expect(containsSubstring(wat, "(table (;0;) 3 3 funcref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;1;) 0 0 externref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;2;) 2 2 (ref null 0))"));
+    try std.testing.expect(containsSubstring(wat, "(table (;3;) 1 1 funcref)"));
+
+    var reparsed = try text_parser.parseModule(allocator, wat);
+    defer reparsed.deinit();
+    try Validator.validate(&reparsed, .{});
+    const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
+    defer allocator.free(rebuilt);
+    try std.testing.expectEqualSlices(u8, wasm, rebuilt);
+}
+
+test "an inline element list fills the table it was written under" {
+    const allocator = std.testing.allocator;
+
+    // A segment that leaves its table index implicit means table 0, so a
+    // later table's elements were printed into the first table's.
+    const source =
+        \\(module
+        \\  (func $f)
+        \\  (table 1 funcref)
+        \\  (table funcref (elem (ref.func $f)))
+        \\)
+    ;
+
+    var module = try text_parser.parseModule(allocator, source);
+    defer module.deinit();
+    try Validator.validate(&module, .{});
+
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var decoded = try binary_reader.readModule(allocator, wasm);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), decoded.elem_segments.items[0].table_var.index);
+
+    const wat = try text_writer.writeModule(allocator, &decoded);
+    defer allocator.free(wat);
+    try std.testing.expect(containsSubstring(wat, "(elem (;0;) (table 1) (i32.const 0) funcref (ref.func 0))"));
+
+    var reparsed = try text_parser.parseModule(allocator, wat);
+    defer reparsed.deinit();
+    try Validator.validate(&reparsed, .{});
+    try std.testing.expectEqual(@as(u32, 1), reparsed.elem_segments.items[0].table_var.index);
     const rebuilt = try binary_writer.writeModule(allocator, &reparsed);
     defer allocator.free(rebuilt);
     try std.testing.expectEqualSlices(u8, wasm, rebuilt);
