@@ -574,6 +574,13 @@ fn tableIndexType(m: *const Mod.Module, idx: u32) ValTypeOrUnknown {
     return ValTypeOrUnknown.fromValType(m.tables.items[idx].type.limits.indexType());
 }
 
+/// The narrower of two index types, which is what a copy between two
+/// memories or two tables counts in: the length has to be a valid count in
+/// both, so it is i64 only when neither side is 32-bit.
+fn narrowerIndexType(a: ValTypeOrUnknown, b: ValTypeOrUnknown) ValTypeOrUnknown {
+    return if (a == .i64 and b == .i64) .i64 else .i32;
+}
+
 /// The type a table's elements have, concrete type index included. Callers
 /// bounds-check the index themselves; an absent table has no element type,
 /// and answering `unknown` here would accept anything in its place.
@@ -1634,16 +1641,27 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         try checkUnary(m, &val_stack, &ctrl_stack, input, output, gpa(m));
                     },
                     0x08 => { // memory.init
-                        if (!m.has_data_count) return error.InvalidDataIndex;
+                        // The binary states the data segment first and the
+                        // memory second; the text format states them the
+                        // other way round.
                         const data_idx = readU32(bytes, &pos);
-                        _ = readU32(bytes, &pos); // mem idx
+                        const mem_idx = readU32(bytes, &pos);
+                        // Bounds first: `memIndexType` answers i32 for a
+                        // memory that is not there, so checking it later
+                        // would report a bad memory index as a type error
+                        // instead. The memory is checked before the segment,
+                        // which is the order the reference implementation
+                        // reports the two in.
+                        if (mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+                        if (!m.has_data_count) return error.InvalidDataIndex;
                         if (data_idx >= m.data_segments.items.len) return error.InvalidDataIndex;
-                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        // Length and source offset index the data segment and
-                        // stay i32; only the destination indexes the memory.
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
+                        // Length and source offset index the data segment,
+                        // which is never 64-bit, and stay i32; only the
+                        // destination indexes the memory and so follows its
+                        // index type.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // src
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // dst
                     },
                     0x09 => { // data.drop
                         if (!m.has_data_count) return error.InvalidDataIndex;
@@ -1653,17 +1671,30 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     0x0a => { // memory.copy
                         const dst_mem = readU32(bytes, &pos);
                         const src_mem = readU32(bytes, &pos);
-                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, dst_mem))); // n
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, src_mem))); // src
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, dst_mem))); // dst
+                        if (dst_mem >= m.memories.items.len) return error.InvalidMemoryIndex;
+                        if (src_mem >= m.memories.items.len) return error.InvalidMemoryIndex;
+                        const dst_it = memIndexType(m, dst_mem);
+                        const src_it = memIndexType(m, src_mem);
+                        // Each offset follows the memory it indexes, while
+                        // the length is of the narrower of the two index
+                        // types -- it has to fit in both memories, so a copy
+                        // involving any 32-bit memory counts in i32. The
+                        // length used to follow the destination alone, which
+                        // rejected valid mixed-width copies.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(narrowerIndexType(dst_it, src_it))); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(src_it)); // src
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(dst_it)); // dst
                     },
                     0x0b => { // memory.fill
                         const mem_idx = readU32(bytes, &pos);
-                        if (m.memories.items.len == 0) return error.InvalidMemoryIndex;
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // n
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // val (always i32)
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // dst
+                        if (mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
+                        const it = memIndexType(m, mem_idx);
+                        // The destination and the length index the memory;
+                        // the byte written is a value, not an index, so it
+                        // stays i32 however wide the memory is.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // val
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // dst
                     },
                     0x0c => { // table.init
                         // The binary states the element segment first and the
@@ -1712,7 +1743,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         // length is of the narrower of the two index types --
                         // it has to fit in both tables, so a copy involving
                         // any 32-bit table counts in i32.
-                        const len_it: ValTypeOrUnknown = if (dst_it == .i64 and src_it == .i64) .i64 else .i32;
+                        const len_it = narrowerIndexType(dst_it, src_it);
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(len_it)); // n
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(src_it)); // src
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(dst_it)); // dst
@@ -5590,6 +5621,458 @@ test "table.init and table.copy validate the same whichever front end built the 
         var read_back = try binary_reader.readModule(alloc, bytes);
         defer read_back.deinit();
         if (c.ok) try validate(&read_back, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&read_back, .{}));
+    }
+}
+
+// ── memory.init, memory.copy and memory.fill tests ──────────────────────
+
+/// A module of one memory per entry of `memories` -- each says whether that
+/// memory is 64-bit -- plus `data_segs` passive data segments and one
+/// function. The data count section is present, as it is in every module
+/// that is not read from a binary lacking one.
+fn testMemoryModule(
+    alloc: std.mem.Allocator,
+    memories: []const bool,
+    data_segs: usize,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    for (memories) |is_64| {
+        try module.memories.append(alloc, .{
+            .type = .{ .limits = .{ .initial = 1, .is_64 = is_64 } },
+        });
+    }
+    for (0..data_segs) |_| {
+        try module.data_segments.append(alloc, .{ .kind = .passive, .data = "abc" });
+    }
+    module.data_count = @intCast(data_segs);
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+const mem32_only = [_]bool{false};
+const mem64_only = [_]bool{true};
+/// Memory 0 is 32-bit and memory 1 is 64-bit.
+const mem_mixed = [_]bool{ false, true };
+const mem_both64 = [_]bool{ true, true };
+
+const i32_zero = [_]u8{ 0x41, 0x00 };
+const i64_zero = [_]u8{ 0x42, 0x00 };
+const f32_zero = [_]u8{ 0x43, 0x00, 0x00, 0x00, 0x00 };
+
+test "memory.init pops three operands" {
+    const alloc = std.testing.allocator;
+    // memory.init data=0 mem=0; end
+    const init = [_]u8{ 0xfc, 0x08, 0x00, 0x00, 0x0b };
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &init, .ok = false },
+        .{ .body = &(i32_zero ++ init), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ init), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ init), .ok = true },
+        // A fourth operand is left behind, and the function returns nothing.
+        .{ .body = &(i32_zero ** 4 ++ init), .ok = false },
+        // f32.const 0 in each of the three positions: destination...
+        .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ init), .ok = false },
+        // ...source...
+        .{ .body = &(i32_zero ++ f32_zero ++ i32_zero ++ init), .ok = false },
+        // ...and length.
+        .{ .body = &(i32_zero ++ i32_zero ++ f32_zero ++ init), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testMemoryModule(alloc, &mem32_only, 1, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "memory.init checks the memory and the data segment it names" {
+    const alloc = std.testing.allocator;
+    const ops = i32_zero ++ i32_zero ++ i32_zero;
+
+    // memory.init data=0 mem=3 -- there is no memory 3. The immediate used
+    // to be read and thrown away, so any index at all was accepted.
+    var bad_mem = try testMemoryModule(alloc, &mem32_only, 1, &(ops ++ [_]u8{ 0xfc, 0x08, 0x00, 0x03, 0x0b }));
+    defer bad_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&bad_mem, .{}));
+
+    // memory.init data=3 mem=0 -- there is no segment 3.
+    var bad_data = try testMemoryModule(alloc, &mem32_only, 1, &(ops ++ [_]u8{ 0xfc, 0x08, 0x03, 0x00, 0x0b }));
+    defer bad_data.deinit();
+    try std.testing.expectError(error.InvalidDataIndex, validate(&bad_data, .{}));
+
+    // With both wrong the memory is the complaint, which is what the
+    // reference implementation reports.
+    var both_bad = try testMemoryModule(alloc, &mem32_only, 1, &(ops ++ [_]u8{ 0xfc, 0x08, 0x03, 0x03, 0x0b }));
+    defer both_bad.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&both_bad, .{}));
+
+    // With no memory at all the index is still the complaint. `memIndexType`
+    // answers i32 for a memory that is not there, so checking bounds after
+    // it would report a missing memory as a type error.
+    var no_mem = try testMemoryModule(alloc, &.{}, 1, &(ops ++ [_]u8{ 0xfc, 0x08, 0x00, 0x00, 0x0b }));
+    defer no_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&no_mem, .{}));
+
+    var no_data = try testMemoryModule(alloc, &mem32_only, 0, &(ops ++ [_]u8{ 0xfc, 0x08, 0x00, 0x00, 0x0b }));
+    defer no_data.deinit();
+    try std.testing.expectError(error.InvalidDataIndex, validate(&no_data, .{}));
+
+    // A binary without a data count section may not name a data segment at
+    // all, even one the data section defines.
+    var no_count = try testMemoryModule(alloc, &mem32_only, 1, &(ops ++ [_]u8{ 0xfc, 0x08, 0x00, 0x00, 0x0b }));
+    defer no_count.deinit();
+    no_count.has_data_count = false;
+    try std.testing.expectError(error.InvalidDataIndex, validate(&no_count, .{}));
+
+    // Bad indices are caught in unreachable code too, where no operand is
+    // popped that could have raised the alarm instead.
+    var unreachable_mem = try testMemoryModule(alloc, &mem32_only, 1, &[_]u8{ 0x00, 0xfc, 0x08, 0x00, 0x03, 0x0b });
+    defer unreachable_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&unreachable_mem, .{}));
+
+    var unreachable_data = try testMemoryModule(alloc, &mem32_only, 1, &[_]u8{ 0x00, 0xfc, 0x08, 0x03, 0x00, 0x0b });
+    defer unreachable_data.deinit();
+    try std.testing.expectError(error.InvalidDataIndex, validate(&unreachable_data, .{}));
+}
+
+test "memory.init's destination follows the memory's index type" {
+    const alloc = std.testing.allocator;
+    const init = [_]u8{ 0xfc, 0x08, 0x00, 0x00, 0x0b };
+
+    // The source offset and the length index the data segment, which is
+    // never 64-bit, so they stay i32 however wide the memory is. The
+    // destination was required to be i32 as well, which rejected every
+    // memory64 module that initialised its memory.
+    var ok = try testMemoryModule(alloc, &mem64_only, 1, &(i64_zero ++ i32_zero ++ i32_zero ++ init));
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    var narrow_dst = try testMemoryModule(alloc, &mem64_only, 1, &(i32_zero ++ i32_zero ++ i32_zero ++ init));
+    defer narrow_dst.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&narrow_dst, .{}));
+
+    var wide_src = try testMemoryModule(alloc, &mem64_only, 1, &(i64_zero ++ i64_zero ++ i32_zero ++ init));
+    defer wide_src.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_src, .{}));
+
+    var wide_len = try testMemoryModule(alloc, &mem64_only, 1, &(i64_zero ++ i32_zero ++ i64_zero ++ init));
+    defer wide_len.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_len, .{}));
+
+    // A 32-bit memory still wants an i32 destination.
+    var wide_dst_32 = try testMemoryModule(alloc, &mem32_only, 1, &(i64_zero ++ i32_zero ++ i32_zero ++ init));
+    defer wide_dst_32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_dst_32, .{}));
+
+    // The memory the immediate names is the one that decides, not memory 0:
+    // here memory 1 is the 64-bit one.
+    const init_mem1 = [_]u8{ 0xfc, 0x08, 0x00, 0x01, 0x0b };
+    var picks_named = try testMemoryModule(alloc, &mem_mixed, 1, &(i64_zero ++ i32_zero ++ i32_zero ++ init_mem1));
+    defer picks_named.deinit();
+    try validate(&picks_named, .{});
+
+    var picks_named_32 = try testMemoryModule(alloc, &mem_mixed, 1, &(i32_zero ++ i32_zero ++ i32_zero ++ init));
+    defer picks_named_32.deinit();
+    try validate(&picks_named_32, .{});
+
+    // Unreachable code supplies the missing operands but not their types:
+    // the i32 length is still the length of a 64-bit memory's initialisation.
+    var poly = try testMemoryModule(alloc, &mem64_only, 1, &([_]u8{0x00} ++ i32_zero ++ init));
+    defer poly.deinit();
+    try validate(&poly, .{});
+
+    var poly_bad = try testMemoryModule(alloc, &mem64_only, 1, &([_]u8{0x00} ++ i64_zero ++ init));
+    defer poly_bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly_bad, .{}));
+}
+
+test "memory.copy's offsets follow their memories and its length the narrower" {
+    const alloc = std.testing.allocator;
+    // memory.copy dst=1 src=0, then dst=0 src=1.
+    const copy_64_32 = [_]u8{ 0xfc, 0x0a, 0x01, 0x00, 0x0b };
+    const copy_32_64 = [_]u8{ 0xfc, 0x0a, 0x00, 0x01, 0x0b };
+    const copy_0_1 = [_]u8{ 0xfc, 0x0a, 0x00, 0x01, 0x0b };
+
+    // Each offset is of the index type of the memory it indexes, and the
+    // length is of the narrower of the two -- it has to be a valid count in
+    // both memories, so a copy touching any 32-bit memory counts in i32.
+    // The length used to follow the destination alone, which both rejected
+    // valid copies out of a 32-bit memory and accepted invalid ones into it.
+    var d64s32 = try testMemoryModule(alloc, &mem_mixed, 0, &(i64_zero ++ i32_zero ++ i32_zero ++ copy_64_32));
+    defer d64s32.deinit();
+    try validate(&d64s32, .{});
+
+    var d32s64 = try testMemoryModule(alloc, &mem_mixed, 0, &(i32_zero ++ i64_zero ++ i32_zero ++ copy_32_64));
+    defer d32s64.deinit();
+    try validate(&d32s64, .{});
+
+    // The length does not widen with either memory on its own.
+    var d64s32_len64 = try testMemoryModule(alloc, &mem_mixed, 0, &(i64_zero ++ i32_zero ++ i64_zero ++ copy_64_32));
+    defer d64s32_len64.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&d64s32_len64, .{}));
+
+    var d32s64_len64 = try testMemoryModule(alloc, &mem_mixed, 0, &(i32_zero ++ i64_zero ++ i64_zero ++ copy_32_64));
+    defer d32s64_len64.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&d32s64_len64, .{}));
+
+    // Nor does an offset take the other memory's index type.
+    var swapped = try testMemoryModule(alloc, &mem_mixed, 0, &(i64_zero ++ i32_zero ++ i32_zero ++ copy_32_64));
+    defer swapped.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&swapped, .{}));
+
+    // Only when both memories are 64-bit does the length widen.
+    var wide = try testMemoryModule(alloc, &mem_both64, 0, &(i64_zero ++ i64_zero ++ i64_zero ++ copy_0_1));
+    defer wide.deinit();
+    try validate(&wide, .{});
+
+    var wide_len32 = try testMemoryModule(alloc, &mem_both64, 0, &(i64_zero ++ i64_zero ++ i32_zero ++ copy_0_1));
+    defer wide_len32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_len32, .{}));
+
+    // Two 32-bit memories count in i32 throughout.
+    const both32 = [_]bool{ false, false };
+    var narrow = try testMemoryModule(alloc, &both32, 0, &(i32_zero ++ i32_zero ++ i32_zero ++ copy_0_1));
+    defer narrow.deinit();
+    try validate(&narrow, .{});
+
+    // A memory copied onto itself follows its own index type throughout.
+    const self_copy = [_]u8{ 0xfc, 0x0a, 0x00, 0x00, 0x0b };
+    var self64 = try testMemoryModule(alloc, &mem64_only, 0, &(i64_zero ++ i64_zero ++ i64_zero ++ self_copy));
+    defer self64.deinit();
+    try validate(&self64, .{});
+
+    var self64_len32 = try testMemoryModule(alloc, &mem64_only, 0, &(i64_zero ++ i64_zero ++ i32_zero ++ self_copy));
+    defer self64_len32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&self64_len32, .{}));
+
+    // Unreachable code still types what it is given: the length of a copy
+    // between a 64-bit and a 32-bit memory is i32.
+    var poly = try testMemoryModule(alloc, &mem_mixed, 0, &([_]u8{0x00} ++ i32_zero ++ copy_32_64));
+    defer poly.deinit();
+    try validate(&poly, .{});
+
+    var poly_bad = try testMemoryModule(alloc, &mem_mixed, 0, &([_]u8{0x00} ++ i64_zero ++ copy_32_64));
+    defer poly_bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly_bad, .{}));
+}
+
+test "memory.copy pops three operands and checks both memories" {
+    const alloc = std.testing.allocator;
+    const copy = [_]u8{ 0xfc, 0x0a, 0x00, 0x00, 0x0b };
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &copy, .ok = false },
+        .{ .body = &(i32_zero ++ copy), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ copy), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ copy), .ok = true },
+        .{ .body = &(i32_zero ** 4 ++ copy), .ok = false },
+        .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ copy), .ok = false },
+        .{ .body = &(i32_zero ++ f32_zero ++ i32_zero ++ copy), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ f32_zero ++ copy), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testMemoryModule(alloc, &mem32_only, 0, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+
+    const ops = i32_zero ++ i32_zero ++ i32_zero;
+    // Neither index was bounds-checked: only a module with no memory at all
+    // was rejected, so `memory.copy 3 4` passed in a module with one memory.
+    var bad_dst = try testMemoryModule(alloc, &mem32_only, 0, &(ops ++ [_]u8{ 0xfc, 0x0a, 0x03, 0x00, 0x0b }));
+    defer bad_dst.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&bad_dst, .{}));
+
+    var bad_src = try testMemoryModule(alloc, &mem32_only, 0, &(ops ++ [_]u8{ 0xfc, 0x0a, 0x00, 0x03, 0x0b }));
+    defer bad_src.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&bad_src, .{}));
+
+    var both_bad = try testMemoryModule(alloc, &mem32_only, 0, &(ops ++ [_]u8{ 0xfc, 0x0a, 0x03, 0x04, 0x0b }));
+    defer both_bad.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&both_bad, .{}));
+
+    var no_mem = try testMemoryModule(alloc, &.{}, 0, &(ops ++ copy));
+    defer no_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&no_mem, .{}));
+
+    var unreachable_bad = try testMemoryModule(alloc, &mem32_only, 0, &[_]u8{ 0x00, 0xfc, 0x0a, 0x03, 0x04, 0x0b });
+    defer unreachable_bad.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&unreachable_bad, .{}));
+}
+
+test "memory.fill's destination and length follow the memory, its value does not" {
+    const alloc = std.testing.allocator;
+    const fill = [_]u8{ 0xfc, 0x0b, 0x00, 0x0b };
+
+    // The byte written is a value, not an index, so it stays i32 however
+    // wide the memory is; the destination and the count index the memory.
+    var ok64 = try testMemoryModule(alloc, &mem64_only, 0, &(i64_zero ++ i32_zero ++ i64_zero ++ fill));
+    defer ok64.deinit();
+    try validate(&ok64, .{});
+
+    var narrow_len = try testMemoryModule(alloc, &mem64_only, 0, &(i64_zero ++ i32_zero ++ i32_zero ++ fill));
+    defer narrow_len.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&narrow_len, .{}));
+
+    var narrow_dst = try testMemoryModule(alloc, &mem64_only, 0, &(i32_zero ++ i32_zero ++ i64_zero ++ fill));
+    defer narrow_dst.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&narrow_dst, .{}));
+
+    var wide_val = try testMemoryModule(alloc, &mem64_only, 0, &(i64_zero ++ i64_zero ++ i64_zero ++ fill));
+    defer wide_val.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_val, .{}));
+
+    var ok32 = try testMemoryModule(alloc, &mem32_only, 0, &(i32_zero ++ i32_zero ++ i32_zero ++ fill));
+    defer ok32.deinit();
+    try validate(&ok32, .{});
+
+    var wide_dst_32 = try testMemoryModule(alloc, &mem32_only, 0, &(i64_zero ++ i32_zero ++ i32_zero ++ fill));
+    defer wide_dst_32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_dst_32, .{}));
+
+    // The memory the immediate names decides, not memory 0.
+    const fill_mem1 = [_]u8{ 0xfc, 0x0b, 0x01, 0x0b };
+    var picks_named = try testMemoryModule(alloc, &mem_mixed, 0, &(i64_zero ++ i32_zero ++ i64_zero ++ fill_mem1));
+    defer picks_named.deinit();
+    try validate(&picks_named, .{});
+
+    var poly = try testMemoryModule(alloc, &mem64_only, 0, &([_]u8{0x00} ++ i64_zero ++ fill));
+    defer poly.deinit();
+    try validate(&poly, .{});
+
+    var poly_bad = try testMemoryModule(alloc, &mem64_only, 0, &([_]u8{0x00} ++ i32_zero ++ fill));
+    defer poly_bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly_bad, .{}));
+}
+
+test "memory.fill pops three operands and checks the memory it names" {
+    const alloc = std.testing.allocator;
+    const fill = [_]u8{ 0xfc, 0x0b, 0x00, 0x0b };
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &fill, .ok = false },
+        .{ .body = &(i32_zero ++ fill), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ fill), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ fill), .ok = true },
+        .{ .body = &(i32_zero ** 4 ++ fill), .ok = false },
+        .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ fill), .ok = false },
+        .{ .body = &(i32_zero ++ f32_zero ++ i32_zero ++ fill), .ok = false },
+        .{ .body = &(i32_zero ++ i32_zero ++ f32_zero ++ fill), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testMemoryModule(alloc, &mem32_only, 0, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+
+    const ops = i32_zero ++ i32_zero ++ i32_zero;
+    // The index was not bounds-checked: `memory.fill 3` passed in a module
+    // with one memory.
+    var bad_mem = try testMemoryModule(alloc, &mem32_only, 0, &(ops ++ [_]u8{ 0xfc, 0x0b, 0x03, 0x0b }));
+    defer bad_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&bad_mem, .{}));
+
+    var no_mem = try testMemoryModule(alloc, &.{}, 0, &(ops ++ fill));
+    defer no_mem.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&no_mem, .{}));
+
+    var unreachable_bad = try testMemoryModule(alloc, &mem32_only, 0, &[_]u8{ 0x00, 0xfc, 0x0b, 0x03, 0x0b });
+    defer unreachable_bad.deinit();
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&unreachable_bad, .{}));
+}
+
+test "the bulk memory instructions validate the same whichever front end built the module" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const writer = @import("binary/writer.zig");
+
+    // Every verdict below was checked against wasm-tools 1.250.0.
+    const cases = [_]struct { wat: []const u8, err: ?Error = null }{
+        // memory.init: the destination follows the memory, the source
+        // offset and the length index the data segment and stay i32.
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 memory.init 0 0))" },
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.init 0 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func i64.const 0 i64.const 0 i32.const 0 memory.init 0 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func i64.const 0 i32.const 0 i64.const 0 memory.init 0 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1) (data \"abc\")" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.init 0 0))" },
+        .{ .wat = "(module (memory 1) (data \"abc\") (func memory.init 0 0))", .err = error.TypeMismatch },
+        // `memory.init $mem $data` in the text is data-then-memory in the
+        // binary, so a front end that swapped them would name the wrong one:
+        // memory 1 is the 64-bit one here.
+        .{ .wat = "(module (memory 1) (memory i64 1) (data \"abc\")" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 memory.init 1 0))" },
+        .{ .wat = "(module (memory 1) (memory i64 1) (data \"abc\")" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.init 1 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1) (data \"abc\")" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.init 0 1))", .err = error.InvalidDataIndex },
+        .{ .wat = "(module (memory 1) (data \"abc\")" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.init 1 0))", .err = error.InvalidMemoryIndex },
+        // memory.copy: each offset follows its own memory, the length the
+        // narrower of the two.
+        .{ .wat = "(module (memory i64 1)" ++
+            " (func i64.const 0 i64.const 0 i64.const 0 memory.copy 0 0))" },
+        .{ .wat = "(module (memory i64 1)" ++
+            " (func i64.const 0 i64.const 0 i32.const 0 memory.copy 0 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory i64 1) (memory 1)" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 memory.copy 0 1))" },
+        .{ .wat = "(module (memory i64 1) (memory 1)" ++
+            " (func i64.const 0 i32.const 0 i64.const 0 memory.copy 0 1))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1) (memory i64 1)" ++
+            " (func i32.const 0 i64.const 0 i32.const 0 memory.copy 0 1))" },
+        .{ .wat = "(module (memory 1) (memory i64 1)" ++
+            " (func i32.const 0 i64.const 0 i64.const 0 memory.copy 0 1))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.copy 1 0))", .err = error.InvalidMemoryIndex },
+        .{ .wat = "(module (memory 1)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.copy 0 1))", .err = error.InvalidMemoryIndex },
+        // memory.fill: destination and length follow the memory, the byte
+        // written stays i32.
+        .{ .wat = "(module (memory i64 1)" ++
+            " (func i64.const 0 i32.const 0 i64.const 0 memory.fill 0))" },
+        .{ .wat = "(module (memory i64 1)" ++
+            " (func i64.const 0 i64.const 0 i64.const 0 memory.fill 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory i64 1)" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 memory.fill 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.fill 0))" },
+        .{ .wat = "(module (memory 1) (memory i64 1)" ++
+            " (func i64.const 0 i32.const 0 i64.const 0 memory.fill 1))" },
+        .{ .wat = "(module (memory 1)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 memory.fill 1))", .err = error.InvalidMemoryIndex },
+        // Unreachable code supplies operands but not their types.
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func unreachable i32.const 0 memory.init 0 0))" },
+        .{ .wat = "(module (memory i64 1) (data \"abc\")" ++
+            " (func unreachable i64.const 0 memory.init 0 0))", .err = error.TypeMismatch },
+        .{ .wat = "(module (memory 1) (func unreachable memory.fill 1))", .err = error.InvalidMemoryIndex },
+    };
+
+    for (cases) |c| {
+        var parsed = Parser.parseModule(alloc, c.wat) catch |err| {
+            if (c.err == null) return err;
+            continue;
+        };
+        defer parsed.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&parsed, .{})) else try validate(&parsed, .{});
+
+        // The same module written out and read back must reach the same
+        // verdict: the two front ends fill in memories and segments
+        // differently, and memory.init's immediates are ordered differently
+        // in the two formats.
+        const bytes = try writer.writeModule(alloc, &parsed);
+        defer alloc.free(bytes);
+        var read_back = try binary_reader.readModule(alloc, bytes);
+        defer read_back.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&read_back, .{})) else try validate(&read_back, .{});
     }
 }
 
