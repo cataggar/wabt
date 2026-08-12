@@ -651,7 +651,9 @@ test "a table with no initializer keeps printing without one" {
     defer allocator.free(wat);
     try std.testing.expect(containsSubstring(wat, "(table (;0;) 1 funcref)"));
     try std.testing.expect(containsSubstring(wat, "(table (;1;) i64 2 4 externref)"));
-    try std.testing.expect(containsSubstring(wat, "(table (;2;) 1 funcref)"));
+    // The inline element abbreviation is `(table id' n n reftype)`: a table
+    // as long as its list, and no longer.
+    try std.testing.expect(containsSubstring(wat, "(table (;2;) 1 1 funcref)"));
     // No table gained an initializer, so no `ref.null` was invented.
     try std.testing.expect(!containsSubstring(wat, "funcref ref.null"));
 
@@ -725,11 +727,12 @@ test "an inline table element list survives text → binary → text" {
         "(elem (;2;) (table 2) (i32.const 0) (ref null 0) (ref.func 0) (ref.null 0))",
     ));
     try std.testing.expect(containsSubstring(wat, "(elem (;3;) (table 3) (i32.const 0) func 0)"));
-    // Each table is as long as the list it was written with.
-    try std.testing.expect(containsSubstring(wat, "(table (;0;) 3 funcref)"));
-    try std.testing.expect(containsSubstring(wat, "(table (;1;) 0 externref)"));
-    try std.testing.expect(containsSubstring(wat, "(table (;2;) 2 (ref null 0))"));
-    try std.testing.expect(containsSubstring(wat, "(table (;3;) 1 funcref)"));
+    // Each table is exactly as long as the list it was written with, in
+    // both bounds: the abbreviation is `(table id' n n reftype)`.
+    try std.testing.expect(containsSubstring(wat, "(table (;0;) 3 3 funcref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;1;) 0 0 externref)"));
+    try std.testing.expect(containsSubstring(wat, "(table (;2;) 2 2 (ref null 0))"));
+    try std.testing.expect(containsSubstring(wat, "(table (;3;) 1 1 funcref)"));
 
     var reparsed = try text_parser.parseModule(allocator, wat);
     defer reparsed.deinit();

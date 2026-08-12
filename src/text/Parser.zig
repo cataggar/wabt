@@ -4131,9 +4131,19 @@ const Parser = struct {
             // segment holds function indices or expressions, and only one of
             // them can be encoded.
             if (elem_expr_count > 0 and func_index_count > 0) self.markMalformed(@src());
+            // The abbreviation stands for `(table id' n n reftype)`: a table
+            // exactly as long as the list that fills it, both bounds. A
+            // minimum on its own leaves room the elements do not reach, and
+            // lets the table grow past what was written -- the sibling
+            // `(memory (data ...))` abbreviation has always fixed both.
             const initial: u64 = elem_expr_count + func_index_count;
             try module.tables.append(self.allocator, .{
-                .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial, .is_64 = is_table64 } },
+                .@"type" = .{ .elem_type = elem_type, .limits = .{
+                    .initial = initial,
+                    .max = if (has_elem_list) initial else 0,
+                    .has_max = has_elem_list,
+                    .is_64 = is_table64,
+                } },
                 .type_idx = inline_type_idx,
                 .is_table64 = is_table64,
             });
@@ -8371,4 +8381,68 @@ test "an element list that fails part way frees what it had read" {
             return error.TestExpectedError;
         } else |_| {}
     }
+}
+
+test "an inline table element list fixes the table's size" {
+    const allocator = std.testing.allocator;
+    // `(table <reftype> (elem <elemlist>))` abbreviates `(table id' n n
+    // <reftype>)`: the table is exactly as long as the list, both bounds.
+    // A minimum on its own leaves room no element reaches and lets the
+    // table grow past what was written.
+    inline for (.{
+        .{ "(module (func $f) (table funcref (elem $f)))", 1 },
+        .{ "(module (func) (func) (table funcref (elem 0 1)))", 2 },
+        .{ "(module (func $f) (table funcref (elem (ref.func $f) (ref.null func))))", 2 },
+        .{ "(module (table funcref (elem)))", 0 },
+        .{ "(module (table externref (elem)))", 0 },
+        .{ "(module (table externref (elem (ref.null extern))))", 1 },
+        .{ "(module (table anyref (elem (ref.null any) (ref.null none))))", 2 },
+        .{ "(module (func $f) (table i64 funcref (elem $f)))", 1 },
+        .{ "(module (func $f) (table i64 funcref (elem (ref.func $f))))", 1 },
+        .{ "(module (type $t (func)) (func $f (type $t)) (table (ref null $t) (elem (ref.func $f))))", 1 },
+    }) |entry| {
+        var module = try parseModule(allocator, entry[0]);
+        defer module.deinit();
+        const limits = module.tables.items[module.tables.items.len - 1].type.limits;
+        try std.testing.expectEqual(@as(u64, entry[1]), limits.initial);
+        try std.testing.expect(limits.has_max);
+        try std.testing.expectEqual(@as(u64, entry[1]), limits.max);
+        try Validator.validate(&module, .{});
+    }
+
+    // A table with no element list is not the abbreviation, and states
+    // whichever bounds it was written with.
+    var explicit = try parseModule(allocator, "(module (table 1 funcref) (table 2 5 funcref))");
+    defer explicit.deinit();
+    try std.testing.expect(!explicit.tables.items[0].type.limits.has_max);
+    try std.testing.expect(explicit.tables.items[1].type.limits.has_max);
+    try std.testing.expectEqual(@as(u64, 5), explicit.tables.items[1].type.limits.max);
+}
+
+test "an inline table element list writes both bounds into the binary" {
+    const allocator = std.testing.allocator;
+    // The bound has to reach the encoding, where it is a flag byte before
+    // the numbers: without `has_max` the table entry is `70 00 01` and the
+    // maximum is not written at all.
+    var module = try parseModule(allocator, "(module (func $f) (table funcref (elem $f)))");
+    defer module.deinit();
+    const wasm = try binary_writer.writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    // funcref, limits flags 0x01 (has max), minimum 1, maximum 1.
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &[_]u8{ 0x70, 0x01, 0x01, 0x01 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &[_]u8{ 0x70, 0x00, 0x01 }) == null);
+
+    // A 64-bit table says so in the same byte: 0x04 for the index type and
+    // 0x01 for the maximum.
+    var wide = try parseModule(allocator, "(module (func $f) (table i64 funcref (elem $f $f)))");
+    defer wide.deinit();
+    const wide_wasm = try binary_writer.writeModule(allocator, &wide);
+    defer allocator.free(wide_wasm);
+    try std.testing.expect(std.mem.indexOf(u8, wide_wasm, &[_]u8{ 0x70, 0x05, 0x02, 0x02 }) != null);
+
+    // Reading the module back finds the bound the writer put there.
+    var reread = try binary_reader.readModule(allocator, wasm);
+    defer reread.deinit();
+    try std.testing.expect(reread.tables.items[0].type.limits.has_max);
+    try std.testing.expectEqual(@as(u64, 1), reread.tables.items[0].type.limits.max);
 }
