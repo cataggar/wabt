@@ -462,7 +462,11 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(module.elem_segments.items.len));
         for (module.elem_segments.items) |seg| {
             const has_table_idx = seg.kind == .active and seg.table_var.index != 0;
-            const has_exprs = seg.elem_expr_bytes.len > 0;
+            // A segment that names a reference type holds expressions even
+            // when it holds none of them: an empty segment of some other
+            // type still has to say which type, and only the expression
+            // form has anywhere to say it.
+            const has_exprs = seg.elem_expr_bytes.len > 0 or seg.uses_elem_exprs;
 
             // Compute flags per the wasm binary format:
             // bit 0: passive/declared (non-active)
