@@ -574,7 +574,13 @@ const WatWriter = struct {
         }
         const r = leb128.readS64Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
         pos.* += r.bytes_read;
-        if (r.value < 0) return error.UnsupportedOpcode;
+        // A concrete heap type is a type index, so it has to fit in one.
+        // A negative value that is not one of the abstract codes has no
+        // spelling, and neither has a positive one past the end of the
+        // index space -- both are reported, not asserted: this used to
+        // reach `@intCast` and abort the process on a module that a fuzzer
+        // or a truncated file can produce.
+        if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
         try self.writeU32(@intCast(r.value));
     }
 
@@ -1482,6 +1488,50 @@ test "a table prints the initializer it was given" {
         defer alloc.free(wat);
         try std.testing.expect(std.mem.indexOf(u8, wat, case.expect) != null);
     }
+}
+
+test "a heap type past the type index space is reported, not asserted" {
+    const alloc = std.testing.allocator;
+
+    // A concrete heap type is an s33, so its encoding has room for values
+    // that are not type indices. `ref.null 4294967296` is one past the
+    // widest index there can be. Nothing well-formed writes it, but a
+    // fuzzer or a damaged file does, and printing it used to reach an
+    // `@intCast` and abort the process instead of failing the command.
+
+    // (global funcref (ref.null 4294967296))
+    const global_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0a, 0x01, 0x70, 0x00, 0xd0, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &global_bytes));
+
+    // (table 1 funcref ref.null 4294967296)
+    const table_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x0d, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
+        0xd0, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &table_bytes));
+
+    // The check is at the boundary, not short of it: the widest index that
+    // does fit still prints as itself.
+    const widest_global = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0a, 0x01, 0x70, 0x00, 0xd0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b,
+    };
+    const gwat = try printBinary(alloc, &widest_global);
+    defer alloc.free(gwat);
+    try std.testing.expect(std.mem.indexOf(u8, gwat, "ref.null 4294967295") != null);
+
+    const widest_table = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x0d, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
+        0xd0, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b,
+    };
+    const twat = try printBinary(alloc, &widest_table);
+    defer alloc.free(twat);
+    try std.testing.expect(std.mem.indexOf(u8, twat, "(table (;0;) 1 funcref ref.null 4294967295)") != null);
 }
 
 test "a table initializer's concrete heap type prints as the index it names" {
