@@ -3576,10 +3576,29 @@ const Parser = struct {
         self.emitLeb128U32(code, 0);
     }
 
-    /// Emit memory index immediate for memory.size/memory.grow.
-    /// Same as emitMemIdx — resolves $name or emits 0.
+    /// Emit the optional memory index for memory.size/memory.grow.
     fn emitMemIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
-        self.emitMemIdx(code);
+        self.skipAnnotations();
+        if (self.peek().kind == .identifier) {
+            const tok = self.advance();
+            if (self.lookupName(&self.memory_names, tok.text)) |idx| {
+                self.emitLeb128U32(code, idx);
+            } else {
+                self.markMalformed(@src());
+                self.emitLeb128U32(code, 0);
+            }
+            return;
+        }
+        if (self.peek().kind == .integer) {
+            const idx = self.parseU32() catch {
+                self.markMalformed(@src());
+                self.emitLeb128U32(code, 0);
+                return;
+            };
+            self.emitLeb128U32(code, idx);
+            return;
+        }
+        self.emitLeb128U32(code, 0);
     }
 
     fn emitMemarg(self: *Parser, code: *std.ArrayListUnmanaged(u8), opcode: u8) void {
@@ -6371,6 +6390,26 @@ test "parse module with memory" {
     try std.testing.expectEqual(@as(usize, 1), module.memories.items.len);
     try std.testing.expectEqual(@as(u64, 1), module.memories.items[0].type.limits.initial);
     try std.testing.expectEqual(@as(u64, 256), module.memories.items[0].type.limits.max);
+}
+
+test "memory.size and memory.grow preserve numeric and named memory indices" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (memory $narrow 1)
+        \\  (memory $wide i64 1)
+        \\  (func (result i64) memory.size 1)
+        \\  (func (result i64) i64.const 1 memory.grow $wide))
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x3f, 0x01, 0x0b }, module.funcs.items[0].code_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0x42, 0x01, 0x40, 0x01, 0x0b }, module.funcs.items[1].code_bytes);
+    try Validator.validate(&module, .{});
+
+    try std.testing.expectError(error.InvalidModule, parseModule(allocator,
+        \\(module (memory $known 1) (func memory.size $missing drop))
+    ));
 }
 
 test "parse module with export" {

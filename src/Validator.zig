@@ -1561,13 +1561,11 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
             0x3d => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d); },
             0x3e => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e); },
             0x3f => { // memory.size
-                if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
                 val_stack.append(gpa(m), StackType.known(memIndexType(m, mem_idx))) catch return error.OutOfMemory;
             },
             0x40 => { // memory.grow
-                if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
                 const it = memIndexType(m, mem_idx);
@@ -5209,6 +5207,32 @@ test "memory.size and memory.grow speak the memory's index type" {
     var g = try testModuleWith64Memory(alloc, true, &grow64);
     defer g.deinit();
     try validate(&g, .{});
+
+    // Explicit non-zero indices select that memory rather than being rejected
+    // as a legacy reserved zero byte.
+    const size_second = [_]u8{ 0x3f, 0x01, 0x50, 0x1a, 0x0b };
+    var second = try testModuleWith64Memory(alloc, false, &size_second);
+    defer second.deinit();
+    try second.memories.append(alloc, .{
+        .type = .{ .limits = .{ .initial = 1, .is_64 = true } },
+    });
+    try validate(&second, .{});
+
+    const grow_second = [_]u8{ 0x42, 0x01, 0x40, 0x01, 0x50, 0x1a, 0x0b };
+    var grow = try testModuleWith64Memory(alloc, false, &grow_second);
+    defer grow.deinit();
+    try grow.memories.append(alloc, .{
+        .type = .{ .limits = .{ .initial = 1, .is_64 = true } },
+    });
+    try validate(&grow, .{});
+
+    const invalid = [_]u8{ 0x3f, 0x02, 0x1a, 0x0b };
+    var bad = try testModuleWith64Memory(alloc, false, &invalid);
+    defer bad.deinit();
+    try bad.memories.append(alloc, .{
+        .type = .{ .limits = .{ .initial = 1, .is_64 = true } },
+    });
+    try std.testing.expectError(error.InvalidMemoryIndex, validate(&bad, .{}));
 }
 
 test "a table index is of the table's index type" {
