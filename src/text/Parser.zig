@@ -91,8 +91,19 @@ pub fn parseModuleDiag(
     errdefer module.deinit();
     p.module = &module;
 
-    // Pre-scan: collect function, type, global, table, memory, and data names for forward references.
-    prescanNames(source, &p.func_names, &p.type_names, &p.global_names, &p.table_names, &p.memory_names, &p.data_names, allocator);
+    // Pre-scan names for forward references.
+    prescanNames(
+        source,
+        &p.func_names,
+        &p.type_names,
+        &p.global_names,
+        &p.table_names,
+        &p.tag_names,
+        &p.memory_names,
+        &p.data_names,
+        &p.elem_names,
+        allocator,
+    );
 
     try p.expect(.l_paren);
     // Skip any annotations between '(' and 'module'
@@ -287,16 +298,18 @@ fn skipPrescanAnnotation(lex: *Lexer) void {
     }
 }
 
-/// Fast pre-scan of source text to collect function, type, and global names
-/// for forward reference resolution. Uses a separate lexer pass.
+/// Fast pre-scan of source text to collect names for forward reference
+/// resolution. Uses a separate lexer pass.
 fn prescanNames(
     source: []const u8,
     func_names: *std.StringArrayHashMapUnmanaged(u32),
     type_names: *std.StringArrayHashMapUnmanaged(u32),
     global_names: *std.StringArrayHashMapUnmanaged(u32),
     table_names: *std.StringArrayHashMapUnmanaged(u32),
+    tag_names: *std.StringArrayHashMapUnmanaged(u32),
     memory_names: *std.StringArrayHashMapUnmanaged(u32),
     data_names: *std.StringArrayHashMapUnmanaged(u32),
+    elem_names: *std.StringArrayHashMapUnmanaged(u32),
     allocator: std.mem.Allocator,
 ) void {
     var lex = Lexer.init(source);
@@ -304,8 +317,10 @@ fn prescanNames(
     var type_idx: u32 = 0;
     var global_idx: u32 = 0;
     var table_idx: u32 = 0;
+    var tag_idx: u32 = 0;
     var memory_idx: u32 = 0;
     var data_idx: u32 = 0;
+    var elem_idx: u32 = 0;
 
     // Skip (module and optional name
     var tok = lex.next();
@@ -344,6 +359,7 @@ fn prescanNames(
             skipPrescanAnnotation(&lex);
             tok = lex.next();
         }
+        const field_kind = tok.kind;
         if (tok.kind == .kw_func) {
             tok = lex.next();
             while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
@@ -372,6 +388,13 @@ fn prescanNames(
                 table_names.put(allocator, normalizeIdentifier(allocator, tok.text), table_idx) catch {};
             }
             table_idx += 1;
+        } else if (tok.kind == .kw_tag) {
+            tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            if (tok.kind == .identifier) {
+                tag_names.put(allocator, tok.text, tag_idx) catch {};
+            }
+            tag_idx += 1;
         } else if (tok.kind == .kw_memory) {
             tok = lex.next();
             while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
@@ -386,6 +409,13 @@ fn prescanNames(
                 data_names.put(allocator, normalizeIdentifier(allocator, tok.text), data_idx) catch {};
             }
             data_idx += 1;
+        } else if (tok.kind == .kw_elem) {
+            tok = lex.next();
+            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            if (tok.kind == .identifier) {
+                elem_names.put(allocator, tok.text, elem_idx) catch {};
+            }
+            elem_idx += 1;
         } else if (tok.kind == .kw_import) {
             // Imports define indices for their kind. We need to find
             // (import "mod" "name" (func $name ...)) to count import funcs.
@@ -429,6 +459,13 @@ fn prescanNames(
                         memory_names.put(allocator, normalizeIdentifier(allocator, tok.text), memory_idx) catch {};
                     }
                     memory_idx += 1;
+                } else if (tok.kind == .kw_tag) {
+                    tok = lex.next();
+                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                    if (tok.kind == .identifier) {
+                        tag_names.put(allocator, tok.text, tag_idx) catch {};
+                    }
+                    tag_idx += 1;
                 }
                 // Skip remaining tokens in kind desc '(func/global/... ...)' 
                 var inner_depth: u32 = 1;
@@ -444,10 +481,28 @@ fn prescanNames(
         }
         // Skip to matching ')'
         var depth: u32 = 1;
-        if (tok.kind == .l_paren or tok.kind == .annotation) depth += 1;
+        var direct_table_child = false;
+        if (tok.kind == .l_paren) {
+            depth += 1;
+            direct_table_child = field_kind == .kw_table and depth == 2;
+        } else if (tok.kind == .annotation) {
+            skipPrescanAnnotation(&lex);
+        }
         while (depth > 0) {
             tok = lex.next();
-            if (tok.kind == .l_paren or tok.kind == .annotation) depth += 1;
+            if (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                continue;
+            }
+            if (tok.kind == .l_paren) {
+                depth += 1;
+                direct_table_child = field_kind == .kw_table and depth == 2;
+                continue;
+            }
+            if (direct_table_child) {
+                if (tok.kind == .kw_elem) elem_idx += 1;
+                direct_table_child = false;
+            }
             if (tok.kind == .r_paren) depth -= 1;
             if (tok.kind == .eof) return;
             if (tok.kind == .invalid and tok.text.len >= 2 and tok.text[0] == '(' and tok.text[1] == '@') depth += 1;
@@ -633,7 +688,19 @@ const Parser = struct {
             defer self.allocator.free(norm);
             if (names.get(norm)) |idx| return idx;
         }
+        for (names.keys(), names.values()) |name, idx| {
+            if (self.identifiersEqual(name, text)) return idx;
+        }
         return null;
+    }
+
+    fn identifiersEqual(self: *Parser, a: []const u8, b: []const u8) bool {
+        if (std.mem.eql(u8, a, b)) return true;
+        const norm_a = normalizeIdentifier(self.allocator, a);
+        defer if (norm_a.ptr != a.ptr) self.allocator.free(norm_a);
+        const norm_b = normalizeIdentifier(self.allocator, b);
+        defer if (norm_b.ptr != b.ptr) self.allocator.free(norm_b);
+        return std.mem.eql(u8, norm_a, norm_b);
     }
 
     /// Check if an identifier is empty (just "$" with no following chars)
@@ -1910,18 +1977,12 @@ const Parser = struct {
                         };
                         catch_bytes.append(self.allocator, cc) catch {};
                         if (cc <= 0x01) {
-                            var tag_idx: u32 = 0;
-                            if (self.peek().kind == .identifier) {
-                                tag_idx = self.tag_names.get(self.advance().text) orelse 0;
-                            } else { tag_idx = self.parseU32() catch 0; }
+                            const tag_idx = self.readIndexImm(&self.tag_names);
                             var buf: [5]u8 = undefined;
                             const n = leb128.writeU32Leb128(&buf, tag_idx);
                             catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
                         }
-                        var depth: u32 = 0;
-                        if (self.peek().kind == .identifier) {
-                            depth = self.resolveLabelDepth(self.advance().text) orelse 0;
-                        } else { depth = self.parseU32() catch 0; }
+                        const depth = self.readLabelIdxImm();
                         var buf: [5]u8 = undefined;
                         const n = leb128.writeU32Leb128(&buf, depth);
                         catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
@@ -2115,11 +2176,11 @@ const Parser = struct {
             },
             .kw_br => {
                 code.append(self.allocator, 0x0c) catch return;
-                self.emitU32Imm(code);
+                self.emitLabelIdxImm(code);
             },
             .kw_br_if => {
                 code.append(self.allocator, 0x0d) catch return;
-                self.emitU32Imm(code);
+                self.emitLabelIdxImm(code);
             },
             .kw_br_table => {
                 code.append(self.allocator, 0x0e) catch return;
@@ -2152,11 +2213,11 @@ const Parser = struct {
             .kw_return => code.append(self.allocator, 0x0f) catch return,
             .kw_br_on_null => {
                 code.append(self.allocator, 0xd5) catch return;
-                self.emitU32Imm(code);
+                self.emitLabelIdxImm(code);
             },
             .kw_br_on_non_null => {
                 code.append(self.allocator, 0xd6) catch return;
-                self.emitU32Imm(code);
+                self.emitLabelIdxImm(code);
             },
             .kw_br_on_cast, .kw_br_on_cast_fail => {
                 code.append(self.allocator, 0xfb) catch return;
@@ -2169,7 +2230,7 @@ const Parser = struct {
                 var cast_flags: u8 = 0;
                 // Parse (ref [null] ht1) (ref [null] ht2) label
                 // Actually format is: label (ref [null] ht1) (ref [null] ht2)
-                self.emitU32Imm(code); // label depth
+                self.emitLabelIdxImm(code);
                 // Parse source ref type
                 if (self.peek().kind == .l_paren) {
                     _ = self.advance();
@@ -2179,8 +2240,14 @@ const Parser = struct {
                             _ = self.advance();
                             cast_flags |= 1;
                         }
-                        if (self.peek().kind != .r_paren and self.peek().kind != .eof)
-                            _ = self.advance(); // heap type
+                        if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+                            const source_heap = self.advance();
+                            if (source_heap.kind == .identifier and
+                                self.lookupName(&self.type_names, source_heap.text) == null)
+                            {
+                                self.markMalformed(@src());
+                            }
+                        }
                         if (self.peek().kind == .r_paren) _ = self.advance();
                     } else {
                         // bare type keyword
@@ -2228,7 +2295,7 @@ const Parser = struct {
                             else if (std.mem.eql(u8, ht_tok.text, "nofunc")) { target_heap = 0x73; }
                             else if (std.mem.eql(u8, ht_tok.text, "noextern")) { target_heap = 0x72; }
                             else if (ht_tok.kind == .identifier) {
-                                target_heap = @intCast(self.type_names.get(ht_tok.text) orelse 0);
+                                target_heap = @intCast(self.resolveIndexToken(&self.type_names, ht_tok));
                             } else if (ht_tok.kind == .integer) {
                                 target_heap = @intCast(std.fmt.parseInt(u32, ht_tok.text, 0) catch 0);
                             }
@@ -2284,36 +2351,16 @@ const Parser = struct {
             },
             .kw_throw => {
                 code.append(self.allocator, 0x08) catch return;
-                // throw $tag_idx
-                if (self.peek().kind == .identifier) {
-                    const tag_tok = self.advance();
-                    const idx = self.tag_names.get(tag_tok.text) orelse 0;
-                    self.emitLeb128U32(code, idx);
-                } else {
-                    self.emitU32Imm(code);
-                }
+                self.emitTagIdxImm(code);
             },
             .kw_throw_ref => code.append(self.allocator, 0x0a) catch return,
             .kw_call_ref => {
                 code.append(self.allocator, 0x14) catch return;
-                // call_ref $type — type index
-                if (self.peek().kind == .identifier) {
-                    const type_tok = self.advance();
-                    const idx = self.type_names.get(type_tok.text) orelse 0;
-                    self.emitLeb128U32(code, idx);
-                } else {
-                    self.emitU32Imm(code);
-                }
+                self.emitTypeIdxImm(code);
             },
             .kw_return_call_ref => {
                 code.append(self.allocator, 0x15) catch return;
-                if (self.peek().kind == .identifier) {
-                    const type_tok = self.advance();
-                    const idx = self.type_names.get(type_tok.text) orelse 0;
-                    self.emitLeb128U32(code, idx);
-                } else {
-                    self.emitU32Imm(code);
-                }
+                self.emitTypeIdxImm(code);
             },
             .kw_try_table => {
                 code.append(self.allocator, 0x1f) catch return;
@@ -2344,25 +2391,13 @@ const Parser = struct {
                         catch_bytes.append(self.allocator, catch_code) catch {};
                         // catch/catch_ref have a tag index
                         if (catch_code <= 0x01) {
-                            var tag_idx: u32 = 0;
-                            if (self.peek().kind == .identifier) {
-                                const tag_tok = self.advance();
-                                tag_idx = self.tag_names.get(tag_tok.text) orelse 0;
-                            } else {
-                                tag_idx = self.parseU32() catch 0;
-                            }
+                            const tag_idx = self.readIndexImm(&self.tag_names);
                             var buf: [5]u8 = undefined;
                             const n = leb128.writeU32Leb128(&buf, tag_idx);
                             catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
                         }
                         // Label (branch depth)
-                        var depth: u32 = 0;
-                        if (self.peek().kind == .identifier) {
-                            const lbl = self.advance();
-                            depth = self.resolveLabelDepth(lbl.text) orelse 0;
-                        } else {
-                            depth = self.parseU32() catch 0;
-                        }
+                        const depth = self.readLabelIdxImm();
                         var buf: [5]u8 = undefined;
                         const n = leb128.writeU32Leb128(&buf, depth);
                         catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
@@ -2385,11 +2420,11 @@ const Parser = struct {
             },
             .kw_call => {
                 code.append(self.allocator, 0x10) catch return;
-                self.emitU32Imm(code);
+                self.emitFuncIdx(code);
             },
             .kw_return_call => {
                 code.append(self.allocator, 0x12) catch return;
-                self.emitU32Imm(code);
+                self.emitFuncIdx(code);
             },
             .kw_call_indirect => {
                 code.append(self.allocator, 0x11) catch return;
@@ -2398,8 +2433,7 @@ const Parser = struct {
                 var ci_table_idx: u32 = 0;
                 // Check for $table identifier before the type use
                 if (self.peek().kind == .identifier) {
-                    const ci_tok = self.advance();
-                    ci_table_idx = self.table_names.get(ci_tok.text) orelse 0;
+                    ci_table_idx = self.readIndexImm(&self.table_names);
                 } else if (self.peek().kind == .integer) {
                     // Lookahead: if integer followed by (type ...), it's a table index
                     const sp_ci = self.lexer.pos;
@@ -2462,13 +2496,8 @@ const Parser = struct {
                     _ = self.advance(); // '('
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance(); // 'type'
-                        // Resolve type name via type_names, not emitU32Imm
-                        // (emitU32Imm checks func_names first, which can
-                        // shadow type names when a function has the same $name)
                         if (self.peek().kind == .identifier) {
-                            const type_tok = self.advance();
-                            const idx = self.type_names.get(type_tok.text) orelse 0;
-                            self.emitLeb128U32(code, idx);
+                            self.emitTypeIdxImm(code);
                         } else {
                             self.emitU32Imm(code); // numeric type index
                         }
@@ -2527,8 +2556,7 @@ const Parser = struct {
                 code.append(self.allocator, 0x13) catch return;
                 var rci_table_idx: u32 = 0;
                 if (self.peek().kind == .identifier) {
-                    const rci_tok = self.advance();
-                    rci_table_idx = self.table_names.get(rci_tok.text) orelse 0;
+                    rci_table_idx = self.readIndexImm(&self.table_names);
                 } else if (self.peek().kind == .integer) {
                     // Lookahead: if integer followed by (type/param/result ...), it's a table index
                     const sp_ti = self.lexer.pos;
@@ -2558,9 +2586,7 @@ const Parser = struct {
                     if (self.peek().kind == .kw_type) {
                         _ = self.advance();
                         if (self.peek().kind == .identifier) {
-                            const type_tok = self.advance();
-                            const idx = self.type_names.get(type_tok.text) orelse 0;
-                            self.emitLeb128U32(code, idx);
+                            self.emitTypeIdxImm(code);
                         } else {
                             self.emitU32Imm(code);
                         }
@@ -2689,15 +2715,15 @@ const Parser = struct {
             },
             .kw_local_get => {
                 code.append(self.allocator, 0x20) catch return;
-                self.emitU32Imm(code);
+                self.emitLocalIdxImm(code);
             },
             .kw_local_set => {
                 code.append(self.allocator, 0x21) catch return;
-                self.emitU32Imm(code);
+                self.emitLocalIdxImm(code);
             },
             .kw_local_tee => {
                 code.append(self.allocator, 0x22) catch return;
-                self.emitU32Imm(code);
+                self.emitLocalIdxImm(code);
             },
             .kw_global_get => {
                 code.append(self.allocator, 0x23) catch return;
@@ -2758,8 +2784,11 @@ const Parser = struct {
                     var heap_type: ?types.HeapType = null;
                     if (self.peek().kind == .identifier) {
                         const name = self.advance().text;
-                        if (self.type_names.get(name)) |idx| {
+                        if (self.lookupName(&self.type_names, name)) |idx| {
                             heap_type = .{ .concrete = idx };
+                        } else {
+                            self.markMalformed(@src());
+                            heap_type = .{ .abstract = .func };
                         }
                     } else if (self.peek().kind == .integer) {
                         heap_type = .{ .concrete = self.parseU32() catch 0 };
@@ -2992,7 +3021,9 @@ const Parser = struct {
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     const n = leb128.writeS32Leb128(buf, @bitCast(idx));
                     return n;
-                } else |_| {}
+                } else |_| {
+                    self.markMalformed(@src());
+                }
                 if (self.peek().kind == .r_paren) _ = self.advance();
             } else {
                 self.lexer.pos = sp;
@@ -3016,84 +3047,99 @@ const Parser = struct {
     /// rather than function 0.
     fn emitFuncIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         self.skipAnnotations();
-        if (self.peek().kind == .identifier) {
-            const tok = self.advance();
-            if (self.lookupName(&self.func_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-            } else {
-                self.markMalformed(@src());
-                self.emitLeb128U32(code, 0);
-            }
+        if (self.peek().kind != .identifier and self.peek().kind != .integer) {
+            self.markMalformed(@src());
+            self.emitLeb128U32(code, 0);
             return;
         }
-        if (self.peek().kind == .integer) {
-            self.emitLeb128U32(code, self.parseU32() catch 0);
-            return;
-        }
-        self.markMalformed(@src());
-        self.emitLeb128U32(code, 0);
+        self.emitIndexImm(code, &self.func_names);
     }
 
     fn emitGlobalIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.global_names);
+    }
+
+    fn emitLocalIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.local_names);
+    }
+
+    fn emitTypeIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.type_names);
+    }
+
+    fn emitTableIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.table_names);
+    }
+
+    fn emitTagIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.tag_names);
+    }
+
+    fn emitDataIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.data_names);
+    }
+
+    fn emitElemIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitIndexImm(code, &self.elem_names);
+    }
+
+    fn resolveIndexToken(
+        self: *Parser,
+        names: *const std.StringArrayHashMapUnmanaged(u32),
+        tok: Lex.Token,
+    ) u32 {
+        if (tok.kind == .identifier) {
+            return self.lookupName(names, tok.text) orelse {
+                self.markMalformed(@src());
+                return 0;
+            };
+        }
+        if (tok.kind == .integer) {
+            const clean = stripUnderscores(tok.text);
+            return std.fmt.parseInt(u32, clean.slice(), 0) catch 0;
+        }
+        return 0;
+    }
+
+    fn readIndexImm(
+        self: *Parser,
+        names: *const std.StringArrayHashMapUnmanaged(u32),
+    ) u32 {
+        self.skipAnnotations();
+        if (self.peek().kind != .identifier and self.peek().kind != .integer) return 0;
+        return self.resolveIndexToken(names, self.advance());
+    }
+
+    fn emitIndexImm(
+        self: *Parser,
+        code: *std.ArrayListUnmanaged(u8),
+        names: *const std.StringArrayHashMapUnmanaged(u32),
+    ) void {
+        self.emitLeb128U32(code, self.readIndexImm(names));
+    }
+
+    fn readLabelIdxImm(self: *Parser) u32 {
+        self.skipAnnotations();
         if (self.peek().kind == .identifier) {
             const tok = self.advance();
-            if (self.lookupName(&self.global_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            self.emitLeb128U32(code, 0);
-            return;
+            return self.resolveLabelDepth(tok.text) orelse {
+                self.markMalformed(@src());
+                return 0;
+            };
         }
-        const tok = self.advance();
-        if (tok.kind == .integer) {
-            const val = std.fmt.parseInt(u32, tok.text, 0) catch 0;
-            self.emitLeb128U32(code, val);
-        } else {
-            self.emitLeb128U32(code, 0);
-        }
+        if (self.peek().kind == .integer) return self.parseU32() catch 0;
+        return 0;
+    }
+
+    fn emitLabelIdxImm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        self.emitLeb128U32(code, self.readLabelIdxImm());
     }
 
     fn emitU32Imm(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         self.skipAnnotations();
         if (self.peek().kind == .identifier) {
-            const tok = self.advance();
-            // Check label stack first (for br/br_if $label)
-            if (self.resolveLabelDepth(tok.text)) |depth| {
-                self.emitLeb128U32(code, depth);
-                return;
-            }
-            if (self.lookupName(&self.local_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.func_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.type_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.global_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.table_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.memory_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.data_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
-            if (self.lookupName(&self.elem_names, tok.text)) |idx| {
-                self.emitLeb128U32(code, idx);
-                return;
-            }
+            _ = self.advance();
+            self.markMalformed(@src());
             self.emitLeb128U32(code, 0);
             return;
         }
@@ -3303,11 +3349,11 @@ const Parser = struct {
                 }
                 // table.get / table.set need a table index immediate
                 if (op == 0x25 or op == 0x26) {
-                    self.emitU32Imm(code);
+                    self.emitTableIdxImm(code);
                 }
                 // br_on_null / br_on_non_null need a label depth immediate
                 if (op == 0xd5 or op == 0xd6) {
-                    self.emitU32Imm(code);
+                    self.emitLabelIdxImm(code);
                 }
             } else {
                 const unpacked = unpackOpcode(op);
@@ -3348,33 +3394,25 @@ const Parser = struct {
     /// Emit immediates for GC (0xfb prefix) instructions.
     fn emitGcImm(self: *Parser, sub: u32, code: *std.ArrayListUnmanaged(u8)) void {
         switch (sub) {
-            0x00, 0x01 => self.emitU32Imm(code), // struct.new, struct.new_default: typeidx
+            0x00, 0x01 => self.emitTypeIdxImm(code), // struct.new, struct.new_default: typeidx
             0x02, 0x03, 0x04, 0x05 => { // struct.get/get_s/get_u/set: typeidx, fieldidx
-                // First: type index
-                var type_idx: u32 = 0;
-                if (self.peek().kind == .identifier) {
-                    const tok = self.advance();
-                    type_idx = self.type_names.get(tok.text) orelse 0;
-                    self.emitLeb128U32(code, type_idx);
-                } else if (self.peek().kind == .integer) {
-                    type_idx = self.parseU32() catch 0;
-                    self.emitLeb128U32(code, type_idx);
-                } else {
-                    self.emitLeb128U32(code, 0);
-                }
+                const type_idx = self.readIndexImm(&self.type_names);
+                self.emitLeb128U32(code, type_idx);
                 // Second: field index (may be $name or numeric)
                 if (self.peek().kind == .identifier) {
                     const field_tok = self.advance();
                     // Look up field name in the struct type
                     var field_idx: u32 = 0;
+                    var found = false;
                     if (self.module) |mod| {
                         if (type_idx < mod.module_types.items.len) {
                             switch (mod.module_types.items[type_idx]) {
                                 .struct_type => |st| {
                                     for (st.fields.items, 0..) |field, fi| {
                                         if (field.name) |name| {
-                                            if (std.mem.eql(u8, name, field_tok.text)) {
+                                            if (self.identifiersEqual(name, field_tok.text)) {
                                                 field_idx = @intCast(fi);
+                                                found = true;
                                                 break;
                                             }
                                         }
@@ -3384,34 +3422,39 @@ const Parser = struct {
                             }
                         }
                     }
+                    if (!found) self.markMalformed(@src());
                     self.emitLeb128U32(code, field_idx);
                 } else {
                     self.emitU32Imm(code);
                 }
             },
-            0x06, 0x07 => self.emitU32Imm(code), // array.new, array.new_default: typeidx
+            0x06, 0x07 => self.emitTypeIdxImm(code), // array.new, array.new_default: typeidx
             0x08 => { // array.new_fixed: typeidx, count
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
-            },
-            0x09, 0x0a => { // array.new_data, array.new_elem: typeidx, dataidx/elemidx
-                self.emitU32Imm(code);
+                self.emitTypeIdxImm(code);
                 self.emitU32Imm(code);
             },
-            0x0b, 0x0c, 0x0d, 0x0e => self.emitU32Imm(code), // array.get/get_s/get_u/set: typeidx
+            0x09 => { // array.new_data: typeidx, dataidx
+                self.emitTypeIdxImm(code);
+                self.emitDataIdxImm(code);
+            },
+            0x0a => { // array.new_elem: typeidx, elemidx
+                self.emitTypeIdxImm(code);
+                self.emitElemIdxImm(code);
+            },
+            0x0b, 0x0c, 0x0d, 0x0e => self.emitTypeIdxImm(code), // array.get/get_s/get_u/set: typeidx
             0x0f => {}, // array.len: no immediates
-            0x10 => self.emitU32Imm(code), // array.fill: typeidx
+            0x10 => self.emitTypeIdxImm(code), // array.fill: typeidx
             0x11 => { // array.copy: typeidx, typeidx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                self.emitTypeIdxImm(code);
+                self.emitTypeIdxImm(code);
             },
             0x12 => { // array.init_data: typeidx, dataidx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                self.emitTypeIdxImm(code);
+                self.emitDataIdxImm(code);
             },
             0x13 => { // array.init_elem: typeidx, elemidx
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                self.emitTypeIdxImm(code);
+                self.emitElemIdxImm(code);
             },
             0x1a, 0x1b => {}, // any.convert_extern, extern.convert_any: no immediates
             0x1c, 0x1d, 0x1e => {}, // ref.i31, i31.get_s, i31.get_u: no immediates
@@ -3567,7 +3610,7 @@ const Parser = struct {
     /// Checks if the next token is a $name matching a known memory.
     fn emitMemIdx(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         if (self.peek().kind == .identifier) {
-            if (self.memory_names.get(self.peek().text)) |idx| {
+            if (self.lookupName(&self.memory_names, self.peek().text)) |idx| {
                 _ = self.advance();
                 self.emitLeb128U32(code, idx);
                 return;
@@ -3617,17 +3660,12 @@ const Parser = struct {
         var mem_idx: u32 = 0;
         var has_mem_idx = false;
         if (self.peek().kind == .identifier) {
-            const save_pos = self.lexer.pos;
-            const save_peeked = self.peeked;
             const tok = self.advance();
-            // Check if this is a memory name (not a local/etc)
-            if (self.memory_names.get(tok.text)) |idx| {
+            if (self.lookupName(&self.memory_names, tok.text)) |idx| {
                 mem_idx = idx;
                 has_mem_idx = true;
             } else {
-                // Not a memory name — rewind
-                self.lexer.pos = save_pos;
-                self.peeked = save_peeked;
+                self.markMalformed(@src());
             }
         } else if (self.peek().kind == .integer and self.peek().text.len > 0 and self.peek().text[0] != '-') {
             // Check if next token is a bare integer (memory index) before offset=/align=
@@ -3695,71 +3733,63 @@ const Parser = struct {
                 // Binary format expects: data_idx, mem_idx
                 const first_kind = self.peek().kind;
                 if (first_kind == .identifier or first_kind == .integer) {
-                    var first_code = std.ArrayListUnmanaged(u8).empty;
-                    self.emitU32Imm(&first_code);
+                    const first_tok = self.advance();
                     const second_kind = self.peek().kind;
                     if (second_kind == .identifier or second_kind == .integer) {
                         // Two immediates: first is mem_idx, second is data_idx
                         // Binary order: data_idx, mem_idx
-                        var second_code = std.ArrayListUnmanaged(u8).empty;
-                        self.emitU32Imm(&second_code);
-                        code.appendSlice(self.allocator, second_code.items) catch {};
-                        code.appendSlice(self.allocator, first_code.items) catch {};
-                        second_code.deinit(self.allocator);
+                        const second_tok = self.advance();
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.data_names, second_tok));
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.memory_names, first_tok));
                     } else {
                         // One immediate: it's data_idx, mem defaults to 0
-                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.data_names, first_tok));
                         self.emitLeb128U32(code, 0); // mem_idx = 0
                     }
-                    first_code.deinit(self.allocator);
                 } else {
                     self.emitLeb128U32(code, 0); // data_idx = 0
                     self.emitLeb128U32(code, 0); // mem_idx = 0
                 }
             },
-            0x09 => self.emitU32Imm(code), // data.drop
+            0x09 => self.emitDataIdxImm(code), // data.drop
             0x0a => {
                 // memory.copy: dst_mem, src_mem
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                self.emitIndexImm(code, &self.memory_names);
+                self.emitIndexImm(code, &self.memory_names);
             },
-            0x0b => self.emitU32Imm(code), // memory.fill
+            0x0b => self.emitIndexImm(code, &self.memory_names), // memory.fill
             0x0c => {
                 // table.init: WAT syntax is `table.init $table $elem` or `table.init $elem`
                 // Binary format expects: elem_idx, table_idx
                 const first_kind = self.peek().kind;
                 if (first_kind == .identifier or first_kind == .integer) {
-                    var first_code = std.ArrayListUnmanaged(u8).empty;
-                    self.emitU32Imm(&first_code);
+                    const first_tok = self.advance();
                     const second_kind = self.peek().kind;
                     if (second_kind == .identifier or second_kind == .integer) {
                         // Two immediates: first is table_idx, second is elem_idx
                         // Binary order: elem_idx, table_idx
-                        var second_code = std.ArrayListUnmanaged(u8).empty;
-                        self.emitU32Imm(&second_code);
-                        code.appendSlice(self.allocator, second_code.items) catch {};
-                        code.appendSlice(self.allocator, first_code.items) catch {};
-                        second_code.deinit(self.allocator);
+                        const second_tok = self.advance();
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.elem_names, second_tok));
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.table_names, first_tok));
                     } else {
                         // One immediate: it's elem_idx, table defaults to 0
-                        code.appendSlice(self.allocator, first_code.items) catch {};
+                        self.emitLeb128U32(code, self.resolveIndexToken(&self.elem_names, first_tok));
                         self.emitLeb128U32(code, 0); // table_idx = 0
                     }
-                    first_code.deinit(self.allocator);
                 } else {
                     self.emitLeb128U32(code, 0); // elem_idx = 0
                     self.emitLeb128U32(code, 0); // table_idx = 0
                 }
             },
-            0x0d => self.emitU32Imm(code), // elem.drop
+            0x0d => self.emitElemIdxImm(code), // elem.drop
             0x0e => {
                 // table.copy: dst_table, src_table
-                self.emitU32Imm(code);
-                self.emitU32Imm(code);
+                self.emitTableIdxImm(code);
+                self.emitTableIdxImm(code);
             },
-            0x0f => self.emitU32Imm(code), // table.grow
-            0x10 => self.emitU32Imm(code), // table.size
-            0x11 => self.emitU32Imm(code), // table.fill
+            0x0f => self.emitTableIdxImm(code), // table.grow
+            0x10 => self.emitTableIdxImm(code), // table.size
+            0x11 => self.emitTableIdxImm(code), // table.fill
             else => {},
         }
     }
@@ -6410,6 +6440,135 @@ test "memory.size and memory.grow preserve numeric and named memory indices" {
     try std.testing.expectError(error.InvalidModule, parseModule(allocator,
         \\(module (memory $known 1) (func memory.size $missing drop))
     ));
+}
+
+test "unknown named instruction immediates are malformed in their own namespace" {
+    const allocator = std.testing.allocator;
+    const sources = [_][]const u8{
+        "(module (func call $missing))",
+        "(module (func local.get $missing drop))",
+        "(module (func global.get $missing drop))",
+        "(module (func table.get $missing drop))",
+        "(module (func call_ref $missing))",
+        "(module (type $t (func)) (func call_indirect $missing (type $t)))",
+        "(module (table 1 funcref) (func call_indirect (type $missing)))",
+        "(module (func throw $missing))",
+        "(module (func block try_table (catch $missing 0) end end))",
+        "(module (func block try_table (catch_all $missing) end end))",
+        "(module (func data.drop $missing))",
+        "(module (func elem.drop $missing))",
+        "(module (func block br $missing end))",
+        "(module (func ref.cast (ref $missing) drop))",
+        "(module (type $s (struct)) (func block br_on_cast 0 (ref $s) (ref $missing) end))",
+        "(module (type $s (struct (field $known i32))) (func struct.get $s $missing drop))",
+        "(module (global i32 global.get $missing))",
+    };
+    for (sources) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(allocator, source));
+    }
+}
+
+test "instruction immediates do not resolve a same-spelling wrong namespace name" {
+    const allocator = std.testing.allocator;
+    const sources = [_][]const u8{
+        "(module (global $same i32 (i32.const 0)) (func call $same))",
+        "(module (func $same) (func local.get $same drop))",
+        "(module (func $same) (func global.get $same drop))",
+        "(module (func $same) (func table.get $same drop))",
+        "(module (func $same) (func call_ref $same))",
+        "(module (type $t (func)) (func $same) (func call_indirect $same (type $t)))",
+        "(module (func $same) (func throw $same))",
+        "(module (elem $same declare func) (func data.drop $same))",
+        "(module (data $same \"\") (func elem.drop $same))",
+        "(module (func $same) (func block br $same end))",
+        "(module (type $s (struct (field $known i32))) (global $same i32 (i32.const 0)) (func struct.get $s $same drop))",
+        "(module (func $same) (global i32 global.get $same))",
+    };
+    for (sources) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(allocator, source));
+    }
+}
+
+test "named instruction immediates preserve forward and quoted references" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (type $ty (func))
+        \\  (type $s (struct (field $field i32)))
+        \\  (func
+        \\    (local $local i32)
+        \\    block $label
+        \\      local.get $"local"
+        \\      drop
+        \\      call $"fun"
+        \\      global.get $"global"
+        \\      drop
+        \\      table.size $"table"
+        \\      drop
+        \\      call_ref $"ty"
+        \\      throw $"tag"
+        \\      data.drop $"data"
+        \\      elem.drop $"elem"
+        \\      struct.get $"s" $"field"
+        \\      drop
+        \\      br $"label"
+        \\    end)
+        \\  (func $fun)
+        \\  (global $global i32 (i32.const 0))
+        \\  (table $table 1 funcref)
+        \\  (tag $tag)
+        \\  (data $data "")
+        \\  (elem $elem declare func))
+    );
+    defer module.deinit();
+
+    const code = module.funcs.items[0].code_bytes;
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0x10, 0x01 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0xfc, 0x09, 0x00 }) != null);
+    try std.testing.expect(std.mem.indexOf(u8, code, &.{ 0xfc, 0x0d, 0x00 }) != null);
+}
+
+test "forward element indices include inline table element lists" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (func $f)
+        \\  (table funcref (elem $f))
+        \\  (func elem.drop $later)
+        \\  (elem $"later" declare func))
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xfc, 0x0d, 0x01, 0x0b }, module.funcs.items[1].code_bytes);
+}
+
+test "annotation contents do not count as inline element lists" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (func $f)
+        \\  (func elem.drop $later)
+        \\  (table funcref (@x elem) (elem $f))
+        \\  (elem $later declare func))
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0xfc, 0x0d, 0x01, 0x0b }, module.funcs.items[1].code_bytes);
+}
+
+test "quoted forward tag and element names use non-owning prescan keys" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(allocator,
+        \\(module
+        \\  (func throw $tag)
+        \\  (func elem.drop $elem)
+        \\  (tag $"tag")
+        \\  (elem $"elem" declare func))
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ 0x08, 0x00, 0x0b }, module.funcs.items[0].code_bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xfc, 0x0d, 0x00, 0x0b }, module.funcs.items[1].code_bytes);
 }
 
 test "parse module with export" {
