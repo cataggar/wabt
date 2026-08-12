@@ -804,6 +804,12 @@ fn emitLive(
     for (src.tables.items, 0..) |t, i| {
         if (!live.tables.isSet(i)) continue;
         try out.tables.append(gpa, t);
+        const clone = &out.tables.items[out.tables.items.len - 1];
+        clone.owns_init_expr_bytes = false;
+        if (t.init_expr_bytes.len > 0) {
+            clone.init_expr_bytes = try gpa.dupe(u8, t.init_expr_bytes);
+            clone.owns_init_expr_bytes = true;
+        }
     }
     for (src.memories.items, 0..) |mem, i| {
         if (!live.memories.isSet(i)) continue;
@@ -1055,6 +1061,32 @@ test "gc.run: preserves custom sections verbatim" {
         }
     }
     try testing.expect(saw_custom);
+}
+
+test "emitLive gives table initializer bytes independent ownership" {
+    const allocator = testing.allocator;
+    var src = Mod.Module.init(allocator);
+    defer src.deinit();
+    const init = try allocator.dupe(u8, &.{ 0xd0, 0x70 });
+    try src.tables.append(allocator, .{
+        .init_expr_bytes = init,
+        .owns_init_expr_bytes = true,
+    });
+
+    var live = try LiveSets.init(allocator, &src);
+    defer live.deinit(allocator);
+    live.tables.set(0);
+    var remaps = try Remaps.compute(allocator, &live, &src);
+    defer remaps.deinit(allocator);
+
+    var out = Mod.Module.init(allocator);
+    defer out.deinit();
+    try emitLive(allocator, &out, &src, &live, &remaps);
+
+    const cloned = out.tables.items[0];
+    try testing.expect(cloned.owns_init_expr_bytes);
+    try testing.expectEqualSlices(u8, init, cloned.init_expr_bytes);
+    try testing.expect(cloned.init_expr_bytes.ptr != init.ptr);
 }
 
 // ── Test fixtures ───────────────────────────────────────────────────────

@@ -677,6 +677,7 @@ const Reader = struct {
                     .type_idx = indexed.type_idx,
                     .is_table64 = is_table64,
                     .init_expr_bytes = init_bytes,
+                    .owns_init_expr_bytes = false,
                 });
             } else {
                 const indexed = try self.checkTypeIndex(try self.readValType());
@@ -1312,6 +1313,27 @@ test "table element types use the full heap type table" {
         try std.testing.expectEqual(@as(usize, 1), module.tables.items.len);
         try std.testing.expectEqual(expected, module.tables.items[0].@"type".elem_type);
     }
+}
+
+test "a binary table initializer remains borrowed from the input" {
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x09, 0x01,
+        0x40, 0x00, 0x70, 0x00, 0x01,
+        0xd0, 0x70, 0x0b,
+    };
+
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+
+    const table = module.tables.items[0];
+    try std.testing.expectEqualSlices(u8, &.{ 0xd0, 0x70 }, table.init_expr_bytes);
+    try std.testing.expect(!table.owns_init_expr_bytes);
+    const init_addr = @intFromPtr(table.init_expr_bytes.ptr);
+    const src_addr = @intFromPtr(src[0..].ptr);
+    try std.testing.expect(init_addr >= src_addr);
+    try std.testing.expect(init_addr < src_addr + src.len);
 }
 
 test "the tag section is accepted between the memory and global sections" {
