@@ -5134,7 +5134,15 @@ const Parser = struct {
     fn parseElemFuncIdxEntry(self: *Parser, seg: *Mod.ElemSegment) ParseError!void {
         const idx = if (self.peek().kind == .identifier) blk: {
             const id_tok = self.advance();
-            break :blk self.lookupName(&self.func_names, id_tok.text) orelse 0;
+            // Every function name in the module is known before the fields
+            // are read, so a name still unresolved here is a name no
+            // function has. Reading it as function 0 put a function in the
+            // table that the module never named, exactly as `emitFuncIdx`
+            // used to before it was made to reject the same mistake.
+            break :blk self.lookupName(&self.func_names, id_tok.text) orelse {
+                self.markMalformed(@src());
+                break :blk 0;
+            };
         } else try self.parseU32();
         try seg.elem_var_indices.append(self.allocator, .{ .index = idx });
     }
@@ -8445,4 +8453,36 @@ test "an inline table element list writes both bounds into the binary" {
     defer reread.deinit();
     try std.testing.expect(reread.tables.items[0].type.limits.has_max);
     try std.testing.expectEqual(@as(u64, 1), reread.tables.items[0].type.limits.max);
+}
+
+test "an element segment rejects a function name no function has" {
+    const allocator = std.testing.allocator;
+    // Every function name is known before the fields are read, so a name
+    // still unresolved in an elemlist is a name no function has. Reading it
+    // as function 0 put a function in the table the module never named.
+    inline for (.{
+        "(module (func $f) (table funcref (elem $nope)))",
+        "(module (func $f) (table funcref (elem $f $nope)))",
+        "(module (func $f) (table 1 funcref) (elem (i32.const 0) func $nope))",
+        "(module (func $f) (table 1 funcref) (elem (i32.const 0) $nope))",
+        "(module (func $f) (elem func $nope))",
+        "(module (func $f) (elem declare func $nope))",
+    }) |src| {
+        try std.testing.expectError(error.InvalidModule, parseModule(allocator, src));
+    }
+
+    // The same lists with a name some function does have are accepted, and
+    // resolve to that function.
+    inline for (.{
+        .{ "(module (func) (func $f) (table funcref (elem $f)))", 1 },
+        .{ "(module (func) (func $f) (table 1 2 funcref) (elem (i32.const 0) func $f))", 1 },
+        .{ "(module (func) (func $f) (elem func $f))", 1 },
+    }) |entry| {
+        var module = try parseModule(allocator, entry[0]);
+        defer module.deinit();
+        const seg = module.elem_segments.items[0];
+        try std.testing.expectEqual(@as(usize, 1), seg.elem_var_indices.items.len);
+        try std.testing.expectEqual(@as(u32, entry[1]), seg.elem_var_indices.items[0].index);
+        try Validator.validate(&module, .{});
+    }
 }
