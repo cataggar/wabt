@@ -3773,6 +3773,7 @@ const Parser = struct {
                 // Extended constant expression in folded form (e.g. i32.add).
                 // Emit instruction, then operands, then reorder so operands precede instruction.
                 const instr_start = code.items.len;
+                if (self.takeInitExprTerminator()) return;
                 self.parsePlainInstr(code);
                 const instr_end = code.items.len;
                 const instr_len = instr_end - instr_start;
@@ -3807,7 +3808,26 @@ const Parser = struct {
 
     /// Parse a plain init expression instruction.
     fn parseInitExprPlain(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
+        if (self.takeInitExprTerminator()) return;
         self.parsePlainInstr(code);
+    }
+
+    /// Reject the `end` that terminates a constant expression in the binary
+    /// but has no spelling in the text.
+    ///
+    /// A constant expression is a sequence of instructions, not a block:
+    /// `expr ::= instr* end` puts the `end` in the *encoding*, and every
+    /// writer of one appends it. Reading `end` as an instruction let
+    /// `(global i32 i32.const 0 end)` through, and what it wrote was
+    /// `41 00 0b` plus the writer's own `0b` -- two terminators, and a
+    /// section whose declared size no longer matches its contents. The
+    /// validator could not catch it either, because it stops reading at the
+    /// first `end`.
+    fn takeInitExprTerminator(self: *Parser) bool {
+        if (self.peek().kind != .kw_end) return false;
+        self.markMalformed(@src());
+        _ = self.advance();
+        return true;
     }
 
     /// Parse an init expression that is wrapped in parens, e.g. (i32.const 0).
@@ -6845,6 +6865,41 @@ test "a table initializer that is not an expression at all is malformed" {
         error.InvalidModule,
         parseModule(arena.allocator(), "(module (table 1 funcref bogus))"),
     );
+}
+
+test "a constant expression has no `end` to write" {
+    // `expr ::= instr* end` puts the terminator in the encoding, not in the
+    // text. Reading one as an instruction wrote a second `0x0b` after the
+    // one every writer appends, and the module that came out had a section
+    // whose size no longer matched its contents -- which the validator
+    // could not see, because it stops reading at the first `end`.
+    const rejected = [_][]const u8{
+        "(module (global i32 i32.const 0 end))",
+        "(module (global i32 (i32.const 0) end))",
+        "(module (global i32 (i32.add (i32.const 1) end)))",
+        "(module (table 1 funcref ref.null func end))",
+        "(module (table 1 funcref (ref.null func) end))",
+        "(module (func) (table 1 funcref ref.func 0 end))",
+        "(module (memory 1) (data (offset i32.const 0 end) \"a\"))",
+        "(module (func) (table 1 funcref) (elem (offset i32.const 0 end) func 0))",
+    };
+    for (rejected) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+
+    // The same expressions without one are fine, and `end` keeps its
+    // meaning inside a function body, where it closes a block.
+    const accepted = [_][]const u8{
+        "(module (global i32 i32.const 0))",
+        "(module (table 1 funcref ref.null func))",
+        "(module (memory 1) (data (offset i32.const 0) \"a\"))",
+        "(module (func (result i32) block (result i32) i32.const 1 end))",
+    };
+    for (accepted) |source| {
+        var module = try parseModule(std.testing.allocator, source);
+        defer module.deinit();
+        try Validator.validate(&module, .{});
+    }
 }
 
 test "a table initializer is encoded like a global's" {
