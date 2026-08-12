@@ -354,6 +354,10 @@ pub const Module = struct {
     module_types: std.ArrayListUnmanaged(TypeEntry) = .empty,
     /// Per-type metadata for GC subtyping validation.
     type_meta: std.ArrayListUnmanaged(TypeMeta) = .empty,
+    /// Type-index positions of explicit empty recursion groups. Each value is
+    /// the number of type definitions preceding that group; repeated values
+    /// preserve consecutive empty groups.
+    empty_rec_group_positions: std.ArrayListUnmanaged(u32) = .empty,
 
     // Entity lists
     funcs: std.ArrayListUnmanaged(Func) = .empty,
@@ -418,6 +422,7 @@ pub const Module = struct {
             if (tm.type_refs.len > 0) self.allocator.free(tm.type_refs);
         }
         self.type_meta.deinit(self.allocator);
+        self.empty_rec_group_positions.deinit(self.allocator);
         for (self.funcs.items) |*func| {
             func.local_types.deinit(self.allocator);
             func.local_type_idxs.deinit(self.allocator);

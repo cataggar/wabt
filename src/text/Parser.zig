@@ -1185,6 +1185,10 @@ const Parser = struct {
         self.lexer.pos = save_pos;
         self.peeked = save_peeked;
 
+        if (rec_count == 0) {
+            try module.empty_rec_group_positions.append(self.allocator, rec_start);
+        }
+
         self.in_rec = true;
         self.rec_end = rec_start + rec_count;
         defer {
@@ -1207,6 +1211,9 @@ const Parser = struct {
                 }
                 rec_pos += 1;
             } else {
+                // A recursion group may be empty, but every member it has
+                // must be a type declaration.
+                self.markMalformed(@src());
                 try self.skipSExpr();
             }
             try self.expect(.r_paren);
@@ -6610,6 +6617,34 @@ test "parse module with rec type group" {
     );
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 2), module.module_types.items.len);
+}
+
+test "parse empty recursion groups keeps their ordering" {
+    var module = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (rec)
+        \\  (rec)
+        \\  (type (func))
+        \\  (rec)
+        \\  (rec (type (func)))
+        \\  (rec)
+        \\  (rec)
+        \\  (type (func))
+        \\  (rec)
+        \\)
+    );
+    defer module.deinit();
+
+    const expected_positions = [_]u32{ 0, 0, 1, 2, 2, 3 };
+    try std.testing.expectEqualSlices(u32, &expected_positions, module.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(usize, 3), module.module_types.items.len);
+    try std.testing.expect(module.type_meta.items[1].in_rec_group);
+}
+
+test "recursion groups reject non-type members" {
+    try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator,
+        \\(module (rec (func)))
+    ));
 }
 
 test "parse module with anyref global" {

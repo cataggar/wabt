@@ -89,3 +89,18 @@ test "module with custom section is stripped" {
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 0), module.customs.items.len);
 }
+
+test "strip preserves empty recursion groups" {
+    const input = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x05, 0x02, 0x4e, 0x00, 0x4e, 0x00,
+    };
+    const output = try strip(std.testing.allocator, &input);
+    defer std.testing.allocator.free(output);
+
+    var module = try wabt.binary.reader.readModule(std.testing.allocator, output);
+    defer module.deinit();
+    const expected_positions = [_]u32{ 0, 0 };
+    try std.testing.expectEqualSlices(u32, &expected_positions, module.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(usize, 0), module.module_types.items.len);
+}
