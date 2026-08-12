@@ -574,6 +574,15 @@ fn tableIndexType(m: *const Mod.Module, idx: u32) ValTypeOrUnknown {
     return ValTypeOrUnknown.fromValType(m.tables.items[idx].type.limits.indexType());
 }
 
+/// The type a table's elements have, concrete type index included. Callers
+/// bounds-check the index themselves; an absent table has no element type,
+/// and answering `unknown` here would accept anything in its place.
+fn tableElemStackType(m: *const Mod.Module, idx: u32) StackType {
+    if (idx >= m.tables.items.len) return StackType.unknown();
+    const table = m.tables.items[idx];
+    return StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
+}
+
 // ── Memory alignment validation ─────────────────────────────────────────
 
 /// Return the natural alignment (as log2) of a plain memory opcode, which is
@@ -1657,16 +1666,56 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(memIndexType(m, mem_idx))); // dst
                     },
                     0x0c => { // table.init
-                        _ = readU32(bytes, &pos);
-                        _ = readU32(bytes, &pos);
+                        // The binary states the element segment first and the
+                        // table second; the text format states them the other
+                        // way round.
+                        const elem_idx = readU32(bytes, &pos);
+                        const tbl_idx = readU32(bytes, &pos);
+                        // Bounds first: `tableIndexType` answers i32 for a
+                        // table that is not there, so checking it later would
+                        // report a bad table index as a type error instead.
+                        if (elem_idx >= m.elem_segments.items.len) return error.InvalidElemIndex;
+                        if (tbl_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                        const seg = m.elem_segments.items[elem_idx];
+                        // The elements are written into the table, so the
+                        // segment's type must be a subtype of the table's.
+                        // Any segment may be named, active ones included:
+                        // instantiation drops them, which is a trap at run
+                        // time rather than a validation error.
+                        const seg_type = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
+                        if (!seg_type.isSubtypeOf(m, tableElemStackType(m, tbl_idx)))
+                            return error.TypeMismatch;
+                        // Length and source offset index the element segment
+                        // and stay i32; only the destination indexes the
+                        // table and so follows its index type.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // src
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, tbl_idx))); // dst
                     },
                     0x0d => { // elem.drop
                         const idx = readU32(bytes, &pos);
                         if (idx >= m.elem_segments.items.len) return error.InvalidElemIndex;
                     },
                     0x0e => { // table.copy
-                        _ = readU32(bytes, &pos);
-                        _ = readU32(bytes, &pos);
+                        const dst_idx = readU32(bytes, &pos);
+                        const src_idx = readU32(bytes, &pos);
+                        if (dst_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                        if (src_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                        // Elements move from the source table to the
+                        // destination, so the source's type must be a subtype
+                        // of the destination's, not merely equal to it.
+                        if (!tableElemStackType(m, src_idx).isSubtypeOf(m, tableElemStackType(m, dst_idx)))
+                            return error.TypeMismatch;
+                        const dst_it = tableIndexType(m, dst_idx);
+                        const src_it = tableIndexType(m, src_idx);
+                        // Each offset follows the table it indexes, while the
+                        // length is of the narrower of the two index types --
+                        // it has to fit in both tables, so a copy involving
+                        // any 32-bit table counts in i32.
+                        const len_it: ValTypeOrUnknown = if (dst_it == .i64 and src_it == .i64) .i64 else .i32;
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(len_it)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(src_it)); // src
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(dst_it)); // dst
                     },
                     0x0f => { // table.grow
                         const tbl_idx = readU32(bytes, &pos);
@@ -5135,6 +5184,397 @@ test "a memory's index type is one fact, not two" {
     };
     try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
     try validate(&m, .{});
+}
+
+// ── table.init and table.copy tests ─────────────────────────────────────
+
+/// One table of a `testTableModule`: its element type, the concrete type
+/// index that element type may name, and its index type.
+const TestTable = struct {
+    elem: types.ValType = .funcref,
+    type_idx: u32 = types.invalid_index,
+    is_64: bool = false,
+    /// A table whose element type has no null needs an initializer.
+    init_expr_bytes: []const u8 = &.{},
+};
+
+/// One element segment of a `testTableModule`.
+const TestElemSeg = struct {
+    elem: types.ValType = .funcref,
+    type_idx: u32 = types.invalid_index,
+    kind: types.SegmentKind = .passive,
+    /// Only read for an active segment, which needs an offset that
+    /// type-checks against the table it is written into.
+    offset_expr_bytes: []const u8 = &.{},
+};
+
+/// A module of the given tables and element segments plus one function.
+/// Type 0 is `(func)`, so a table or segment naming type index 0 has a
+/// concrete function reference as its element type.
+fn testTableModule(
+    alloc: std.mem.Allocator,
+    tables: []const TestTable,
+    segs: []const TestElemSeg,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    for (tables) |t| {
+        try module.tables.append(alloc, .{
+            .type = .{ .elem_type = t.elem, .limits = .{ .initial = 4, .is_64 = t.is_64 } },
+            .type_idx = t.type_idx,
+            .init_expr_bytes = t.init_expr_bytes,
+        });
+    }
+    for (segs) |s| {
+        try module.elem_segments.append(alloc, .{
+            .kind = s.kind,
+            .elem_type = s.elem,
+            .elem_type_idx = s.type_idx,
+            .offset_expr_bytes = s.offset_expr_bytes,
+            .uses_elem_exprs = true,
+        });
+    }
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+const funcref_table = [_]TestTable{.{}};
+const funcref_seg = [_]TestElemSeg{.{}};
+
+test "table.init pops three operands" {
+    const alloc = std.testing.allocator;
+    // The arm read its two immediates and returned, so any stack at all --
+    // an empty one included -- was accepted.
+    const i32_0 = [_]u8{ 0x41, 0x00 };
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        // table.init 0 0; end -- nothing to pop
+        .{ .body = &[_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }, .ok = false },
+        .{ .body = &(i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        .{ .body = &(i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        .{ .body = &(i32_0 ++ i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = true },
+        // A fourth operand is left behind, and the function returns nothing.
+        .{ .body = &(i32_0 ** 4 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        // f32.const 0 in each of the three positions: destination...
+        .{ .body = &([_]u8{ 0x43, 0, 0, 0, 0 } ++ i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        // ...source...
+        .{ .body = &(i32_0 ++ [_]u8{ 0x43, 0, 0, 0, 0 } ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        // ...and length.
+        .{ .body = &(i32_0 ++ i32_0 ++ [_]u8{ 0x43, 0, 0, 0, 0 } ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, &funcref_table, &funcref_seg, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.init checks the table and the element segment it names" {
+    const alloc = std.testing.allocator;
+    const ops = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x41, 0x00 };
+    // table.init elem=0 table=1 -- there is no table 1.
+    var bad_table = try testTableModule(alloc, &funcref_table, &funcref_seg, &(ops ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x01, 0x0b }));
+    defer bad_table.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&bad_table, .{}));
+
+    // table.init elem=1 table=0 -- there is no segment 1.
+    var bad_elem = try testTableModule(alloc, &funcref_table, &funcref_seg, &(ops ++ [_]u8{ 0xfc, 0x0c, 0x01, 0x00, 0x0b }));
+    defer bad_elem.deinit();
+    try std.testing.expectError(error.InvalidElemIndex, validate(&bad_elem, .{}));
+
+    // With no table at all the index is still the complaint. `tableIndexType`
+    // answers i32 for a table that is not there, so checking bounds after it
+    // would report a missing table as a type error.
+    var no_table = try testTableModule(alloc, &.{}, &funcref_seg, &(ops ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }));
+    defer no_table.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&no_table, .{}));
+
+    // A bad index is caught in unreachable code too, where no operand is
+    // popped that could have raised the alarm instead.
+    var unreachable_bad = try testTableModule(alloc, &funcref_table, &funcref_seg, &[_]u8{ 0x00, 0xfc, 0x0c, 0x01, 0x00, 0x0b });
+    defer unreachable_bad.deinit();
+    try std.testing.expectError(error.InvalidElemIndex, validate(&unreachable_bad, .{}));
+}
+
+test "table.init's destination follows the table's index type" {
+    const alloc = std.testing.allocator;
+    const table64 = [_]TestTable{.{ .is_64 = true }};
+    const i32_0 = [_]u8{ 0x41, 0x00 };
+    const i64_0 = [_]u8{ 0x42, 0x00 };
+    const init = [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b };
+
+    // The source offset and the length index the element segment, which is
+    // never 64-bit, so they stay i32 however wide the table is.
+    var ok = try testTableModule(alloc, &table64, &funcref_seg, &(i64_0 ++ i32_0 ++ i32_0 ++ init));
+    defer ok.deinit();
+    try validate(&ok, .{});
+
+    var narrow_dst = try testTableModule(alloc, &table64, &funcref_seg, &(i32_0 ++ i32_0 ++ i32_0 ++ init));
+    defer narrow_dst.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&narrow_dst, .{}));
+
+    var wide_src = try testTableModule(alloc, &table64, &funcref_seg, &(i64_0 ++ i64_0 ++ i32_0 ++ init));
+    defer wide_src.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_src, .{}));
+
+    var wide_len = try testTableModule(alloc, &table64, &funcref_seg, &(i64_0 ++ i32_0 ++ i64_0 ++ init));
+    defer wide_len.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_len, .{}));
+
+    // A 32-bit table still wants an i32 destination.
+    var wide_dst_32 = try testTableModule(alloc, &funcref_table, &funcref_seg, &(i64_0 ++ i32_0 ++ i32_0 ++ init));
+    defer wide_dst_32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_dst_32, .{}));
+
+    // Unreachable code supplies the missing operands but not their types: the
+    // i32 length is still the length of a 64-bit table's initialisation.
+    var poly = try testTableModule(alloc, &table64, &funcref_seg, &([_]u8{0x00} ++ i32_0 ++ init));
+    defer poly.deinit();
+    try validate(&poly, .{});
+
+    var poly_bad = try testTableModule(alloc, &table64, &funcref_seg, &([_]u8{0x00} ++ i64_0 ++ init));
+    defer poly_bad.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly_bad, .{}));
+}
+
+test "table.init requires the segment's elements to suit the table" {
+    const alloc = std.testing.allocator;
+    const ops = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x41, 0x00 };
+    const body = ops ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b };
+    const externref_table = [_]TestTable{.{ .elem = .externref }};
+    const externref_seg = [_]TestElemSeg{.{ .elem = .externref }};
+    // Type 0 is `(func)`, so `(ref null 0)` is a subtype of funcref.
+    const concrete_table = [_]TestTable{.{ .elem = .concrete_ref_null, .type_idx = 0 }};
+    const concrete_seg = [_]TestElemSeg{.{ .elem = .concrete_ref_null, .type_idx = 0 }};
+
+    var mismatched = try testTableModule(alloc, &externref_table, &funcref_seg, &body);
+    defer mismatched.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&mismatched, .{}));
+
+    var matched = try testTableModule(alloc, &externref_table, &externref_seg, &body);
+    defer matched.deinit();
+    try validate(&matched, .{});
+
+    // The elements are written into the table, so a segment of a subtype
+    // suits it...
+    var subtype = try testTableModule(alloc, &funcref_table, &concrete_seg, &body);
+    defer subtype.deinit();
+    try validate(&subtype, .{});
+
+    // ...and a segment of a supertype does not.
+    var supertype = try testTableModule(alloc, &concrete_table, &funcref_seg, &body);
+    defer supertype.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&supertype, .{}));
+
+    // Type compatibility is checked without popping anything, so unreachable
+    // code does not excuse it.
+    var poly = try testTableModule(alloc, &externref_table, &funcref_seg, &[_]u8{ 0x00, 0xfc, 0x0c, 0x00, 0x00, 0x0b });
+    defer poly.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly, .{}));
+
+    // Any segment may be named, whatever its kind: an active segment is
+    // dropped at instantiation, which traps at run time rather than failing
+    // validation. i32.const 0, end.
+    const offset = [_]u8{ 0x41, 0x00, 0x0b };
+    const active = [_]TestElemSeg{.{ .kind = .active, .offset_expr_bytes = &offset }};
+    var active_m = try testTableModule(alloc, &funcref_table, &active, &body);
+    defer active_m.deinit();
+    try validate(&active_m, .{});
+
+    const declared = [_]TestElemSeg{.{ .kind = .declared }};
+    var declared_m = try testTableModule(alloc, &funcref_table, &declared, &body);
+    defer declared_m.deinit();
+    try validate(&declared_m, .{});
+}
+
+test "table.copy pops three operands" {
+    const alloc = std.testing.allocator;
+    const i32_0 = [_]u8{ 0x41, 0x00 };
+    const copy = [_]u8{ 0xfc, 0x0e, 0x00, 0x00, 0x0b }; // table.copy 0 0
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &copy, .ok = false },
+        .{ .body = &(i32_0 ++ copy), .ok = false },
+        .{ .body = &(i32_0 ++ i32_0 ++ copy), .ok = false },
+        .{ .body = &(i32_0 ++ i32_0 ++ i32_0 ++ copy), .ok = true },
+        .{ .body = &([_]u8{ 0x43, 0, 0, 0, 0 } ++ i32_0 ++ i32_0 ++ copy), .ok = false },
+        .{ .body = &(i32_0 ++ [_]u8{ 0x43, 0, 0, 0, 0 } ++ i32_0 ++ copy), .ok = false },
+        .{ .body = &(i32_0 ++ i32_0 ++ [_]u8{ 0x43, 0, 0, 0, 0 } ++ copy), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, &funcref_table, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.copy checks both of the tables it names" {
+    const alloc = std.testing.allocator;
+    const ops = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x41, 0x00 };
+
+    var bad_dst = try testTableModule(alloc, &funcref_table, &.{}, &(ops ++ [_]u8{ 0xfc, 0x0e, 0x01, 0x00, 0x0b }));
+    defer bad_dst.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&bad_dst, .{}));
+
+    var bad_src = try testTableModule(alloc, &funcref_table, &.{}, &(ops ++ [_]u8{ 0xfc, 0x0e, 0x00, 0x01, 0x0b }));
+    defer bad_src.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&bad_src, .{}));
+
+    var no_tables = try testTableModule(alloc, &.{}, &.{}, &(ops ++ [_]u8{ 0xfc, 0x0e, 0x00, 0x00, 0x0b }));
+    defer no_tables.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&no_tables, .{}));
+
+    var poly = try testTableModule(alloc, &funcref_table, &.{}, &[_]u8{ 0x00, 0xfc, 0x0e, 0x00, 0x01, 0x0b });
+    defer poly.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&poly, .{}));
+}
+
+test "table.copy's offsets follow their tables and its length the narrower" {
+    const alloc = std.testing.allocator;
+    const i32_0 = [_]u8{ 0x41, 0x00 };
+    const i64_0 = [_]u8{ 0x42, 0x00 };
+    const mixed = [_]TestTable{ .{}, .{ .is_64 = true } }; // table 0 is 32-bit, table 1 is 64
+    const both64 = [_]TestTable{ .{ .is_64 = true }, .{ .is_64 = true } };
+    // table.copy dst=0 src=1, then dst=1 src=0.
+    const copy_32_64 = [_]u8{ 0xfc, 0x0e, 0x00, 0x01, 0x0b };
+    const copy_64_32 = [_]u8{ 0xfc, 0x0e, 0x01, 0x00, 0x0b };
+    const copy_64_64 = [_]u8{ 0xfc, 0x0e, 0x00, 0x01, 0x0b };
+
+    // Each offset is of the index type of the table it indexes, and the
+    // length is of the narrower of the two -- it has to be a valid count in
+    // both tables, so a copy touching any 32-bit table counts in i32.
+    var d32s64 = try testTableModule(alloc, &mixed, &.{}, &(i32_0 ++ i64_0 ++ i32_0 ++ copy_32_64));
+    defer d32s64.deinit();
+    try validate(&d32s64, .{});
+
+    var d64s32 = try testTableModule(alloc, &mixed, &.{}, &(i64_0 ++ i32_0 ++ i32_0 ++ copy_64_32));
+    defer d64s32.deinit();
+    try validate(&d64s32, .{});
+
+    // The length does not widen with either table on its own.
+    var d32s64_len64 = try testTableModule(alloc, &mixed, &.{}, &(i32_0 ++ i64_0 ++ i64_0 ++ copy_32_64));
+    defer d32s64_len64.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&d32s64_len64, .{}));
+
+    var d64s32_len64 = try testTableModule(alloc, &mixed, &.{}, &(i64_0 ++ i32_0 ++ i64_0 ++ copy_64_32));
+    defer d64s32_len64.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&d64s32_len64, .{}));
+
+    // Nor does an offset take the other table's index type.
+    var swapped = try testTableModule(alloc, &mixed, &.{}, &(i64_0 ++ i32_0 ++ i32_0 ++ copy_32_64));
+    defer swapped.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&swapped, .{}));
+
+    // Only when both tables are 64-bit does the length widen.
+    var wide = try testTableModule(alloc, &both64, &.{}, &(i64_0 ++ i64_0 ++ i64_0 ++ copy_64_64));
+    defer wide.deinit();
+    try validate(&wide, .{});
+
+    var wide_len32 = try testTableModule(alloc, &both64, &.{}, &(i64_0 ++ i64_0 ++ i32_0 ++ copy_64_64));
+    defer wide_len32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wide_len32, .{}));
+}
+
+test "table.copy requires the source elements to suit the destination" {
+    const alloc = std.testing.allocator;
+    const ops = [_]u8{ 0x41, 0x00, 0x41, 0x00, 0x41, 0x00 };
+    const copy_0_1 = ops ++ [_]u8{ 0xfc, 0x0e, 0x00, 0x01, 0x0b };
+    const copy_1_0 = ops ++ [_]u8{ 0xfc, 0x0e, 0x01, 0x00, 0x0b };
+    const func_extern = [_]TestTable{ .{}, .{ .elem = .externref } };
+    // Type 0 is `(func)`, so table 1's `(ref null 0)` is a subtype of the
+    // funcref of table 0.
+    const func_concrete = [_]TestTable{ .{}, .{ .elem = .concrete_ref_null, .type_idx = 0 } };
+    // A non-null reference is a subtype of the nullable one, not the reverse.
+    // The non-null table needs an initializer: ref.func 0, end.
+    const ref_func_init = [_]u8{ 0xd2, 0x00, 0x0b };
+    const null_nonnull = [_]TestTable{
+        .{ .elem = .funcref },
+        .{ .elem = .ref_func, .init_expr_bytes = &ref_func_init },
+    };
+
+    var unrelated = try testTableModule(alloc, &func_extern, &.{}, &copy_0_1);
+    defer unrelated.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&unrelated, .{}));
+
+    var subtype = try testTableModule(alloc, &func_concrete, &.{}, &copy_0_1);
+    defer subtype.deinit();
+    try validate(&subtype, .{});
+
+    var supertype = try testTableModule(alloc, &func_concrete, &.{}, &copy_1_0);
+    defer supertype.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&supertype, .{}));
+
+    var nonnull_into_null = try testTableModule(alloc, &null_nonnull, &.{}, &copy_0_1);
+    defer nonnull_into_null.deinit();
+    try validate(&nonnull_into_null, .{});
+
+    var null_into_nonnull = try testTableModule(alloc, &null_nonnull, &.{}, &copy_1_0);
+    defer null_into_nonnull.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&null_into_nonnull, .{}));
+
+    // A table is trivially compatible with itself, whatever it holds.
+    const externref_table = [_]TestTable{.{ .elem = .externref }};
+    var self_copy = try testTableModule(alloc, &externref_table, &.{}, &(ops ++ [_]u8{ 0xfc, 0x0e, 0x00, 0x00, 0x0b }));
+    defer self_copy.deinit();
+    try validate(&self_copy, .{});
+
+    var poly = try testTableModule(alloc, &func_extern, &.{}, &[_]u8{ 0x00, 0xfc, 0x0e, 0x00, 0x01, 0x0b });
+    defer poly.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&poly, .{}));
+}
+
+test "table.init and table.copy validate the same whichever front end built the module" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const writer = @import("binary/writer.zig");
+
+    const cases = [_]struct { wat: []const u8, ok: bool }{
+        .{ .wat = "(module (table 4 funcref) (elem funcref) (func table.init 0 0))", .ok = false },
+        .{ .wat = "(module (table 4 funcref) (elem funcref)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = true },
+        // `table.init $table $elem` in the text is elem-then-table in the
+        // binary, so a front end that swapped them would name the wrong one.
+        .{ .wat = "(module (table 4 funcref) (elem funcref) (elem externref)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.init 0 1))", .ok = false },
+        .{ .wat = "(module (table i64 4 funcref) (elem funcref)" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = true },
+        .{ .wat = "(module (table i64 4 funcref) (elem funcref)" ++
+            " (func i64.const 0 i64.const 0 i64.const 0 table.init 0 0))", .ok = false },
+        .{ .wat = "(module (table 4 funcref) (func table.copy 0 0))", .ok = false },
+        .{ .wat = "(module (table 4 funcref)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.copy 0 0))", .ok = true },
+        .{ .wat = "(module (table 4 funcref) (table i64 4 funcref)" ++
+            " (func i32.const 0 i64.const 0 i32.const 0 table.copy 0 1))", .ok = true },
+        .{ .wat = "(module (table 4 funcref) (table i64 4 funcref)" ++
+            " (func i64.const 0 i32.const 0 i32.const 0 table.copy 1 0))", .ok = true },
+        .{ .wat = "(module (table 4 funcref) (table i64 4 funcref)" ++
+            " (func i64.const 0 i32.const 0 i64.const 0 table.copy 1 0))", .ok = false },
+        .{ .wat = "(module (table 4 funcref) (table 4 externref)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.copy 0 1))", .ok = false },
+    };
+
+    for (cases) |c| {
+        var parsed = Parser.parseModule(alloc, c.wat) catch |err| {
+            if (c.ok) return err;
+            continue;
+        };
+        defer parsed.deinit();
+        if (c.ok) try validate(&parsed, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&parsed, .{}));
+
+        // The same module written out and read back must reach the same
+        // verdict: the text and binary front ends fill in tables and
+        // segments differently, and the immediates are ordered differently
+        // in the two formats.
+        const bytes = try writer.writeModule(alloc, &parsed);
+        defer alloc.free(bytes);
+        var read_back = try binary_reader.readModule(alloc, bytes);
+        defer read_back.deinit();
+        if (c.ok) try validate(&read_back, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&read_back, .{}));
+    }
 }
 
 // ── Element and data segment index tests ────────────────────────────────
