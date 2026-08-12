@@ -531,11 +531,9 @@ const WatWriter = struct {
             return;
         }
         if (byte >= 0x80) {
-            const r = leb128.readS64Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
-            pos.* += r.bytes_read;
-            if (r.value < 0) return error.UnsupportedOpcode;
+            const type_idx = try readTypeIndexS33(bytes, pos);
             try self.append(" (type ");
-            try self.writeU32(@intCast(r.value));
+            try self.writeU32(type_idx);
             try self.appendByte(')');
             return;
         }
@@ -572,16 +570,7 @@ const WatWriter = struct {
             try self.append(heapTypeName(heap));
             return;
         }
-        const r = leb128.readS64Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
-        pos.* += r.bytes_read;
-        // A concrete heap type is a type index, so it has to fit in one.
-        // A negative value that is not one of the abstract codes has no
-        // spelling, and neither has a positive one past the end of the
-        // index space -- both are reported, not asserted: this used to
-        // reach `@intCast` and abort the process on a module that a fuzzer
-        // or a truncated file can produce.
-        if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
-        try self.writeU32(@intCast(r.value));
+        try self.writeU32(try readTypeIndexS33(bytes, pos));
     }
 
     /// `align=` is always printed, as the encoded value rather than a value
@@ -646,6 +635,21 @@ const WatWriter = struct {
         const r = leb128.readU32Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
         pos.* += r.bytes_read;
         return r.value;
+    }
+
+    /// The type index a block signature or a concrete heap type names.
+    ///
+    /// Both are encoded as an s33, which has room for values that are not
+    /// type indices at all: a negative one that names no abstract type, and
+    /// a positive one past the widest index there can be. Neither has a
+    /// spelling, so both are reported. Handing the value straight to
+    /// `@intCast` aborted the process instead, on input a fuzzer or a
+    /// truncated file produces and the binary reader passes through.
+    fn readTypeIndexS33(bytes: []const u8, pos: *usize) WriteError!u32 {
+        const r = leb128.readS64Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
+        pos.* += r.bytes_read;
+        if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
+        return @intCast(r.value);
     }
 
     fn readU64At(bytes: []const u8, pos: *usize) WriteError!u64 {
@@ -1532,6 +1536,73 @@ test "a heap type past the type index space is reported, not asserted" {
     const twat = try printBinary(alloc, &widest_table);
     defer alloc.free(twat);
     try std.testing.expect(std.mem.indexOf(u8, twat, "(table (;0;) 1 funcref ref.null 4294967295)") != null);
+}
+
+test "a block signature past the type index space is reported, not asserted" {
+    const alloc = std.testing.allocator;
+
+    // A block signature's positive form is an s33 type index, and shares
+    // the defect its heap-type sibling had: `readS64` and then `@intCast`
+    // to a `u32`, which aborts the process rather than failing the command.
+    // Every path that prints instructions can reach it -- a function body,
+    // a global's initializer, and now a table's.
+
+    // (module (func (block <type 4294967296> end)))
+    const func_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x0a, 0x0b, 0x01, 0x09, 0x00, 0x02, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &func_bytes));
+
+    // (module (global i32 block <type 4294967296> end))
+    const global_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0b, 0x01, 0x7f, 0x00, 0x02, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &global_bytes));
+
+    // (module (table 1 funcref block <type 4294967296> end))
+    const table_bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x04, 0x0e, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
+        0x02, 0x80, 0x80, 0x80, 0x80, 0x10, 0x0b, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &table_bytes));
+
+    // The widest index that does fit still prints as itself, on all three.
+    const widest = [_]struct { bytes: []const u8, expect: []const u8 }{
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+                0x03, 0x02, 0x01, 0x00,
+                0x0a, 0x0b, 0x01, 0x09, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b, 0x0b,
+            },
+            .expect = "block (type 4294967295)",
+        },
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x06, 0x0b, 0x01, 0x7f, 0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b, 0x0b,
+            },
+            .expect = "(global (;0;) i32 block (type 4294967295) end)",
+        },
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x04, 0x0e, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
+                0x02, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x0b, 0x0b,
+            },
+            .expect = "(table (;0;) 1 funcref block (type 4294967295) end)",
+        },
+    };
+    for (widest) |case| {
+        const wat = try printBinary(alloc, case.bytes);
+        defer alloc.free(wat);
+        try std.testing.expect(std.mem.indexOf(u8, wat, case.expect) != null);
+    }
 }
 
 test "a table initializer's concrete heap type prints as the index it names" {
