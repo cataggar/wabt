@@ -685,7 +685,7 @@ const Parser = struct {
                         }
                     } else if (ht.kind == .identifier) {
                         // Validate named type references
-                        if (self.type_names.get(ht.text)) |idx| {
+                        if (self.lookupName(&self.type_names, ht.text)) |idx| {
                             resolved_type_idx = idx;
                             if (self.in_rec) {
                                 if (idx >= self.rec_end) self.markMalformed(@src());
@@ -698,6 +698,8 @@ const Parser = struct {
                                     if (idx >= mod.module_types.items.len) self.markMalformed(@src());
                                 }
                             }
+                        } else {
+                            self.markMalformed(@src());
                         }
                     }
                 }
@@ -730,6 +732,7 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
+                    if (std.mem.eql(u8, heap_text, "noexn")) return .ref_noexn;
                 }
                 // Record type index for concrete type references (only during type section parsing)
                 if (self.in_type_parse and resolved_type_idx != std.math.maxInt(u32)) {
@@ -3785,6 +3788,107 @@ const Parser = struct {
         }
     }
 
+    const IndexedValType = struct {
+        val_type: types.ValType,
+        type_idx: u32 = types.invalid_index,
+    };
+
+    fn parseIndexedValType(self: *Parser) ParseError!IndexedValType {
+        const refs_before = self.collected_type_refs.items.len;
+        const saved_in_type_parse = self.in_type_parse;
+        self.in_type_parse = true;
+        const val_type_result = self.parseValType();
+        self.in_type_parse = saved_in_type_parse;
+        const val_type = val_type_result catch |err| {
+            self.collected_type_refs.shrinkRetainingCapacity(refs_before);
+            return err;
+        };
+        const type_idx = if (self.collected_type_refs.items.len > refs_before)
+            self.collected_type_refs.items[refs_before]
+        else
+            types.invalid_index;
+        self.collected_type_refs.shrinkRetainingCapacity(refs_before);
+        if ((val_type == .concrete_ref or val_type == .concrete_ref_null) and
+            type_idx == types.invalid_index)
+        {
+            self.markMalformed(@src());
+        }
+        return .{
+            .val_type = val_type,
+            .type_idx = type_idx,
+        };
+    }
+
+    const IndexedGlobalType = struct {
+        global_type: types.GlobalType,
+        type_idx: u32 = types.invalid_index,
+    };
+
+    fn parseIndexedGlobalType(self: *Parser) ParseError!IndexedGlobalType {
+        self.skipAnnotations();
+        if (self.peek().kind == .l_paren) {
+            const save_pos = self.lexer.pos;
+            const save_peeked = self.peeked;
+            _ = self.advance();
+            self.skipAnnotations();
+            if (self.peek().kind == .kw_mut) {
+                _ = self.advance();
+                self.skipAnnotations();
+                const indexed = try self.parseIndexedValType();
+                self.skipAnnotations();
+                try self.expect(.r_paren);
+                return .{
+                    .global_type = .{ .val_type = indexed.val_type, .mutability = .mutable },
+                    .type_idx = indexed.type_idx,
+                };
+            }
+            self.lexer.pos = save_pos;
+            self.peeked = save_peeked;
+        }
+
+        const indexed = try self.parseIndexedValType();
+        return .{
+            .global_type = .{ .val_type = indexed.val_type, .mutability = .immutable },
+            .type_idx = indexed.type_idx,
+        };
+    }
+
+    fn recordTableImport(
+        self: *Parser,
+        module: *Mod.Module,
+        import: *Mod.Import,
+        table_type: types.TableType,
+        type_idx: u32,
+        is_table64: bool,
+    ) ParseError!void {
+        import.table = table_type;
+        import.table_type_idx = type_idx;
+        try module.tables.append(self.allocator, .{
+            .@"type" = table_type,
+            .type_idx = type_idx,
+            .is_import = true,
+            .is_table64 = is_table64,
+        });
+        module.num_table_imports += 1;
+    }
+
+    fn recordGlobalImport(
+        self: *Parser,
+        module: *Mod.Module,
+        import: *Mod.Import,
+        global_type: types.GlobalType,
+        type_idx: u32,
+    ) ParseError!void {
+        import.global = global_type;
+        import.global_type_idx = type_idx;
+        try module.globals.append(self.allocator, .{
+            .@"type" = global_type,
+            .type_idx = type_idx,
+            .is_import = true,
+        });
+        module.num_global_imports += 1;
+    }
+
     fn parseTable(self: *Parser, module: *Mod.Module) ParseError!void {
         const table_idx: u32 = @intCast(module.tables.items.len);
         self.skipAnnotations();
@@ -3840,26 +3944,19 @@ const Parser = struct {
                 }
                 const limits = try self.parseLimitsTail(is_table64);
                 self.skipAnnotations();
-                const refs_before_it = self.collected_type_refs.items.len;
-                const saved_itp_it = self.in_type_parse;
-                self.in_type_parse = true;
-                const elem_type = try self.parseValType();
-                self.in_type_parse = saved_itp_it;
-                const import_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_it) self.collected_type_refs.items[refs_before_it] else 0xFFFFFFFF;
-                try module.tables.append(self.allocator, .{
-                    .@"type" = .{ .elem_type = elem_type, .limits = limits },
-                    .is_import = true,
-                    .is_table64 = is_table64,
-                    .type_idx = import_tidx,
-                });
-                module.num_table_imports += 1;
+                const indexed = try self.parseIndexedValType();
                 var import = Mod.Import{
                     .module_name = mod_name,
                     .field_name = field_name,
                     .kind = .table,
                 };
-                import.table = .{ .elem_type = elem_type, .limits = limits };
-                import.table_type_idx = import_tidx;
+                try self.recordTableImport(
+                    module,
+                    &import,
+                    .{ .elem_type = indexed.val_type, .limits = limits },
+                    indexed.type_idx,
+                    is_table64,
+                );
                 try module.imports.append(self.allocator, import);
                 return;
             } else {
@@ -4281,57 +4378,18 @@ const Parser = struct {
                 self.skipAnnotations();
                 try self.expect(.r_paren); // close (import ...)
 
-                // Parse type after import
-                self.skipAnnotations();
-                var mutability: types.Mutability = .immutable;
-                var val_type: types.ValType = undefined;
-                var imp_global_tidx: u32 = 0xFFFFFFFF;
-                if (self.peek().kind == .l_paren) {
-                    const sp2 = self.lexer.pos;
-                    const spk2 = self.peeked;
-                    _ = self.advance();
-                    if (self.peek().kind == .kw_mut) {
-                        _ = self.advance();
-                        mutability = .mutable;
-                        const rb = self.collected_type_refs.items.len;
-                        const si = self.in_type_parse;
-                        self.in_type_parse = true;
-                        val_type = try self.parseValType();
-                        self.in_type_parse = si;
-                        if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
-                        self.skipAnnotations();
-                        try self.expect(.r_paren);
-                    } else {
-                        self.lexer.pos = sp2;
-                        self.peeked = spk2;
-                        const rb = self.collected_type_refs.items.len;
-                        const si = self.in_type_parse;
-                        self.in_type_parse = true;
-                        val_type = try self.parseValType();
-                        self.in_type_parse = si;
-                        if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
-                    }
-                } else {
-                    const rb = self.collected_type_refs.items.len;
-                    const si = self.in_type_parse;
-                    self.in_type_parse = true;
-                    val_type = try self.parseValType();
-                    self.in_type_parse = si;
-                    if (self.collected_type_refs.items.len > rb) imp_global_tidx = self.collected_type_refs.items[rb];
-                }
-                try module.globals.append(self.allocator, .{
-                    .type = .{ .val_type = val_type, .mutability = mutability },
-                    .type_idx = imp_global_tidx,
-                    .is_import = true,
-                });
-                module.num_global_imports += 1;
+                const indexed = try self.parseIndexedGlobalType();
                 var import = Mod.Import{
                     .module_name = mod_name,
                     .field_name = field_name,
                     .kind = .global,
                 };
-                import.global = .{ .val_type = val_type, .mutability = mutability };
-                import.global_type_idx = imp_global_tidx;
+                try self.recordGlobalImport(
+                    module,
+                    &import,
+                    indexed.global_type,
+                    indexed.type_idx,
+                );
                 try module.imports.append(self.allocator, import);
                 return;
             } else {
@@ -4791,21 +4849,15 @@ const Parser = struct {
                 }
                 const t_limits = try self.parseLimitsTail(is_table64);
                 self.skipAnnotations();
-                const refs_before_table = self.collected_type_refs.items.len;
-                const saved_itp_table = self.in_type_parse;
-                self.in_type_parse = true;
-                const elem_type = try self.parseValType();
-                self.in_type_parse = saved_itp_table;
-                const import_table_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_table) self.collected_type_refs.items[refs_before_table] else 0xFFFFFFFF;
+                const indexed = try self.parseIndexedValType();
                 self.skipAnnotations();
-                import.table = .{ .elem_type = elem_type, .limits = t_limits };
-                import.table_type_idx = import_table_tidx;
-                try module.tables.append(self.allocator, .{
-                    .type = .{ .elem_type = elem_type, .limits = t_limits },
-                    .is_import = true,
-                    .is_table64 = is_table64,
-                });
-                module.num_table_imports += 1;
+                try self.recordTableImport(
+                    module,
+                    &import,
+                    .{ .elem_type = indexed.val_type, .limits = t_limits },
+                    indexed.type_idx,
+                    is_table64,
+                );
             },
             .kw_global => {
                 import.kind = .global;
@@ -4819,35 +4871,14 @@ const Parser = struct {
                     self.global_names.put(self.allocator, gname, import_global_idx) catch {};
                 }
                 self.skipAnnotations();
-                var mutability: types.Mutability = .immutable;
-                var val_type: types.ValType = undefined;
-                if (self.peek().kind == .l_paren) {
-                    const save_pos = self.lexer.pos;
-                    const save_peeked = self.peeked;
-                    _ = self.advance();
-                    self.skipAnnotations();
-                    if (self.peek().kind == .kw_mut) {
-                        _ = self.advance();
-                        self.skipAnnotations();
-                        mutability = .mutable;
-                        val_type = try self.parseValType();
-                        self.skipAnnotations();
-                        try self.expect(.r_paren);
-                    } else {
-                        self.lexer.pos = save_pos;
-                        self.peeked = save_peeked;
-                        val_type = try self.parseValType();
-                    }
-                } else {
-                    val_type = try self.parseValType();
-                }
+                const indexed = try self.parseIndexedGlobalType();
                 self.skipAnnotations();
-                import.global = .{ .val_type = val_type, .mutability = mutability };
-                try module.globals.append(self.allocator, .{
-                    .type = .{ .val_type = val_type, .mutability = mutability },
-                    .is_import = true,
-                });
-                module.num_global_imports += 1;
+                try self.recordGlobalImport(
+                    module,
+                    &import,
+                    indexed.global_type,
+                    indexed.type_idx,
+                );
             },
             .kw_tag => {
                 import.kind = .tag;
@@ -6365,6 +6396,171 @@ test "parse module with import" {
     defer module.deinit();
     try std.testing.expectEqual(@as(usize, 1), module.imports.items.len);
     try std.testing.expectEqual(@as(types.Index, 1), module.num_func_imports);
+}
+
+test "table and global import spellings preserve concrete reference indices" {
+    const cases = [_]struct {
+        source: []const u8,
+        kind: types.ExternalKind,
+    }{
+        .{ .source = "(module (type $t (func)) (import \"m\" \"t\" (table 1 (ref null $t))))", .kind = .table },
+        .{ .source = "(module (type $t (func)) (table (import \"m\" \"t\") 1 (ref null $t)))", .kind = .table },
+        .{ .source = "(module (type (func)) (import \"m\" \"t\" (table 1 (ref null 0))))", .kind = .table },
+        .{ .source = "(module (type (func)) (table (import \"m\" \"t\") 1 (ref null 0)))", .kind = .table },
+        .{ .source = "(module (type $t (func)) (import \"m\" \"g\" (global (ref null $t))))", .kind = .global },
+        .{ .source = "(module (type $t (func)) (global (import \"m\" \"g\") (ref null $t)))", .kind = .global },
+        .{ .source = "(module (type (func)) (import \"m\" \"g\" (global (mut (ref null 0)))))", .kind = .global },
+        .{ .source = "(module (type (func)) (global (import \"m\" \"g\") (mut (ref null 0))))", .kind = .global },
+    };
+
+    for (cases) |case| {
+        var module = try parseModule(std.testing.allocator, case.source);
+        defer module.deinit();
+        const import = module.imports.items[0];
+        try std.testing.expectEqual(case.kind, import.kind);
+        switch (case.kind) {
+            .table => {
+                try std.testing.expectEqual(@as(u32, 0), import.table_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.tables.items[0].type_idx);
+            },
+            .global => {
+                try std.testing.expectEqual(@as(u32, 0), import.global_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.globals.items[0].type_idx);
+            },
+            else => unreachable,
+        }
+    }
+}
+
+test "quoted type names resolve in imports and function signatures" {
+    const import_cases = [_]struct {
+        source: []const u8,
+        kind: types.ExternalKind,
+    }{
+        .{
+            .source = "(module (type $t (func)) (import \"m\" \"t\" (table 1 (ref null $\"t\"))))",
+            .kind = .table,
+        },
+        .{
+            .source = "(module (type $t (func)) (table (import \"m\" \"t\") 1 (ref null $\"t\")))",
+            .kind = .table,
+        },
+        .{
+            .source = "(module (type $t (func)) (import \"m\" \"g\" (global (mut (ref null $\"t\")))))",
+            .kind = .global,
+        },
+        .{
+            .source = "(module (type $t (func)) (global (import \"m\" \"g\") (ref null $\"t\")))",
+            .kind = .global,
+        },
+    };
+
+    for (import_cases) |case| {
+        var module = try parseModule(std.testing.allocator, case.source);
+        defer module.deinit();
+        switch (case.kind) {
+            .table => {
+                try std.testing.expectEqual(@as(u32, 0), module.imports.items[0].table_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.tables.items[0].type_idx);
+            },
+            .global => {
+                try std.testing.expectEqual(@as(u32, 0), module.imports.items[0].global_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.globals.items[0].type_idx);
+            },
+            else => unreachable,
+        }
+        try Validator.validate(&module, .{});
+    }
+
+    var function = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (type $t (func))
+        \\  (func (param (ref null $"t")) local.get 0 drop)
+        \\)
+    );
+    defer function.deinit();
+    const func_type_idx = function.funcs.items[0].decl.type_var.index;
+    const func_type = function.module_types.items[func_type_idx].func_type;
+    try std.testing.expectEqual(@as(u32, 0), func_type.param_type_idxs[0]);
+    try Validator.validate(&function, .{});
+}
+
+test "undefined quoted concrete type names remain invalid" {
+    const cases = [_][]const u8{
+        "(module (import \"m\" \"t\" (table 1 (ref null $\"missing\"))))",
+        "(module (import \"m\" \"g\" (global (ref null $\"missing\"))))",
+        "(module (func (param (ref null $\"missing\"))))",
+    };
+    for (cases) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+}
+
+test "table and global import spellings reject invalid concrete reference indices" {
+    const cases = [_][]const u8{
+        "(module (type (func)) (import \"m\" \"t\" (table 1 (ref null 1))))",
+        "(module (type (func)) (table (import \"m\" \"t\") 1 (ref null 1)))",
+        "(module (type (func)) (import \"m\" \"g\" (global (ref null 1))))",
+        "(module (type (func)) (global (import \"m\" \"g\") (ref null 1)))",
+        "(module (import \"m\" \"t\" (table 1 (ref null $missing))))",
+        "(module (table (import \"m\" \"t\") 1 (ref null $missing)))",
+        "(module (import \"m\" \"g\" (global (ref null $missing))))",
+        "(module (global (import \"m\" \"g\") (ref null $missing)))",
+    };
+    for (cases) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+}
+
+test "noexn global imports preserve nullability and mutability" {
+    const cases = [_]struct {
+        source: []const u8,
+        val_type: types.ValType,
+        mutability: types.Mutability,
+    }{
+        .{
+            .source = "(module (import \"m\" \"g\" (global (ref noexn))))",
+            .val_type = .ref_noexn,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (ref noexn)))",
+            .val_type = .ref_noexn,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global (mut (ref noexn)))))",
+            .val_type = .ref_noexn,
+            .mutability = .mutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (mut (ref noexn))))",
+            .val_type = .ref_noexn,
+            .mutability = .mutable,
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global (ref null noexn))))",
+            .val_type = .nullexnref,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (mut (ref null noexn))))",
+            .val_type = .nullexnref,
+            .mutability = .mutable,
+        },
+    };
+
+    for (cases) |case| {
+        var module = try parseModule(std.testing.allocator, case.source);
+        defer module.deinit();
+        const global = module.globals.items[0];
+        const import = module.imports.items[0];
+        try std.testing.expectEqual(case.val_type, global.@"type".val_type);
+        try std.testing.expectEqual(case.mutability, global.@"type".mutability);
+        try std.testing.expectEqual(types.invalid_index, global.type_idx);
+        try std.testing.expectEqual(types.invalid_index, import.global_type_idx);
+        try Validator.validate(&module, .{});
+    }
 }
 
 test "parse module with global" {
