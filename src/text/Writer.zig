@@ -59,8 +59,18 @@ const WatWriter = struct {
     // ── Section writers ─────────────────────────────────────────────────
 
     fn writeTypes(self: *WatWriter, module: *const Mod.Module) WriteError!void {
+        const empty_rec_group_positions = module.empty_rec_group_positions.items;
         var i: usize = 0;
+        var empty_rec_group_index: usize = 0;
         while (i < module.module_types.items.len) {
+            while (empty_rec_group_index < empty_rec_group_positions.len and
+                @as(usize, @intCast(empty_rec_group_positions[empty_rec_group_index])) <= i)
+            {
+                try self.writeIndent();
+                try self.append("(rec)");
+                try self.newline();
+                empty_rec_group_index += 1;
+            }
             const meta = self.typeMeta(module, i);
             // A recursion group is printed as one `(rec ...)` holding its
             // members; the grouping is part of the type's identity under
@@ -83,6 +93,11 @@ const WatWriter = struct {
                 try self.writeOneType(module, i);
                 i += 1;
             }
+        }
+        while (empty_rec_group_index < empty_rec_group_positions.len) : (empty_rec_group_index += 1) {
+            try self.writeIndent();
+            try self.append("(rec)");
+            try self.newline();
         }
     }
 
@@ -1162,6 +1177,42 @@ test "a group of one keeps its rec wrapper" {
     const loose_wat = try printBinary(alloc, &loose);
     defer alloc.free(loose_wat);
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, loose_wat, "(rec"));
+}
+
+test "empty recursion groups print in type-section order" {
+    const alloc = std.testing.allocator;
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x18, 0x09,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x01, 0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+    };
+    const wat = try printBinary(alloc, &bytes);
+    defer alloc.free(wat);
+
+    try std.testing.expectEqualStrings(
+        \\(module
+        \\  (rec)
+        \\  (rec)
+        \\  (type (;0;) (func))
+        \\  (rec)
+        \\  (rec
+        \\    (type (;1;) (func))
+        \\  )
+        \\  (rec)
+        \\  (rec)
+        \\  (type (;2;) (func))
+        \\  (rec)
+        \\)
+        \\
+    , wat);
 }
 
 /// Wraps `body` (instructions plus the trailing `end`) in the smallest module

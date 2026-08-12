@@ -128,6 +128,52 @@ test "binary read → validate → write → re-read" {
     try std.testing.expectEqualStrings("main", module2.exports.items[0].name);
 }
 
+test "empty recursion groups survive binary-text-binary round-trip" {
+    const allocator = std.testing.allocator;
+    const wasm = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x18, 0x09,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x01, 0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x03, 0x02, 0x01, 0x02,
+        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+    };
+    const expected_positions = [_]u32{ 0, 0, 1, 2, 2, 3 };
+
+    var decoded = try binary_reader.readModule(allocator, &wasm);
+    defer decoded.deinit();
+    try Validator.validate(&decoded, .{});
+    try std.testing.expectEqualSlices(u32, &expected_positions, decoded.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(u32, 2), decoded.funcs.items[0].decl.type_var.index);
+
+    const wat = try text_writer.writeModule(allocator, &decoded);
+    defer allocator.free(wat);
+    try std.testing.expectEqual(@as(usize, 7), std.mem.count(u8, wat, "(rec"));
+
+    var parsed = try text_parser.parseModule(allocator, wat);
+    defer parsed.deinit();
+    try Validator.validate(&parsed, .{});
+    try std.testing.expectEqualSlices(u32, &expected_positions, parsed.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(u32, 2), parsed.funcs.items[0].decl.type_var.index);
+
+    const rebuilt = try binary_writer.writeModule(allocator, &parsed);
+    defer allocator.free(rebuilt);
+    var reread = try binary_reader.readModule(allocator, rebuilt);
+    defer reread.deinit();
+    try Validator.validate(&reread, .{});
+    try std.testing.expectEqualSlices(u32, &expected_positions, reread.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(usize, 3), reread.module_types.items.len);
+    try std.testing.expect(reread.type_meta.items[1].in_rec_group);
+    try std.testing.expectEqual(@as(u32, 2), reread.funcs.items[0].decl.type_var.index);
+}
+
 // ── 3. Text parse → binary write → binary read ─────────────────────────
 
 test "text parse → binary write → binary read" {

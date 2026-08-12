@@ -391,6 +391,9 @@ const Reader = struct {
                 _ = try self.readByte();
                 const group_size = try self.readU32();
                 const group_id: u32 = @intCast(self.module.module_types.items.len);
+                if (group_size == 0) {
+                    try self.module.empty_rec_group_positions.append(self.allocator, group_id);
+                }
                 for (0..group_size) |position| {
                     try self.readOneType(.{
                         .in_rec_group = true,
@@ -1565,6 +1568,42 @@ test "a recursion group is one entry in the type section count" {
     // rec group and only resolvable once the whole section has been read.
     try std.testing.expectEqual(@as(u32, 1), module.module_types.items[0].struct_type.fields.items[0].type_idx);
     try std.testing.expectEqual(@as(u32, 0), module.module_types.items[1].struct_type.fields.items[0].type_idx);
+}
+
+test "empty recursion groups retain their type-section positions" {
+    // Two leading empty groups, one between a singleton type and a group,
+    // two after that group, and one trailing group.
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x18, 0x09,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x01, 0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+    };
+    var module = try readModule(std.testing.allocator, &bytes);
+    defer module.deinit();
+
+    const expected_positions = [_]u32{ 0, 0, 1, 2, 2, 3 };
+    try std.testing.expectEqualSlices(u32, &expected_positions, module.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(usize, 3), module.module_types.items.len);
+    try std.testing.expect(!module.type_meta.items[0].in_rec_group);
+    try std.testing.expect(module.type_meta.items[1].in_rec_group);
+    try std.testing.expectEqual(@as(u32, 1), module.type_meta.items[1].rec_group_size);
+    try std.testing.expect(!module.type_meta.items[2].in_rec_group);
+}
+
+test "an empty recursion group does not hide an invalid following type" {
+    const bytes = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x02, 0x4e, 0x00, 0x5d,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(std.testing.allocator, &bytes));
 }
 
 test "read sub and sub final types" {

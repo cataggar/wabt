@@ -183,7 +183,8 @@ const Writer = struct {
     // -- sections --
 
     fn writeTypeSection(self: *Writer, module: *const Mod.Module) WriteError!void {
-        if (module.module_types.items.len == 0) return;
+        const empty_rec_group_positions = module.empty_rec_group_positions.items;
+        if (module.module_types.items.len == 0 and empty_rec_group_positions.len == 0) return;
         const ph = try self.beginSection(1);
         // Count top-level entries: each rec group counts as 1 however many
         // types it holds, and each standalone type counts as 1. A group of one
@@ -198,9 +199,18 @@ const Writer = struct {
                 top_count += 1;
             }
         }
+        top_count += @intCast(empty_rec_group_positions.len);
         try self.writeU32Leb(top_count);
         var idx: usize = 0;
+        var empty_rec_group_index: usize = 0;
         while (idx < module.module_types.items.len) {
+            while (empty_rec_group_index < empty_rec_group_positions.len and
+                @as(usize, @intCast(empty_rec_group_positions[empty_rec_group_index])) <= idx)
+            {
+                try self.appendByte(0x4E); // empty rec group marker
+                try self.writeU32Leb(0);
+                empty_rec_group_index += 1;
+            }
             const meta = if (idx < module.type_meta.items.len) module.type_meta.items[idx] else Mod.TypeMeta{};
             if (meta.in_rec_group) {
                 try self.appendByte(0x4E); // rec group marker
@@ -216,6 +226,10 @@ const Writer = struct {
                 try self.writeOneType(module, idx, meta);
                 idx += 1;
             }
+        }
+        while (empty_rec_group_index < empty_rec_group_positions.len) : (empty_rec_group_index += 1) {
+            try self.appendByte(0x4E); // empty rec group marker
+            try self.writeU32Leb(0);
         }
         self.endSection(ph);
     }
@@ -1299,6 +1313,70 @@ test "a recursion group holding one type keeps its 0x4e marker" {
     try std.testing.expectEqual(@as(usize, 1), module2.type_meta.items.len);
     try std.testing.expect(module2.type_meta.items[0].in_rec_group);
     try std.testing.expectEqual(@as(u32, 1), module2.type_meta.items[0].rec_group_size);
+}
+
+test "only empty recursion groups emit a type section" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator, "(module (rec) (rec))");
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    const expected_payload = [_]u8{ 0x02, 0x4e, 0x00, 0x4e, 0x00 };
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &expected_payload) != null);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+    const expected_positions = [_]u32{ 0, 0 };
+    try std.testing.expectEqualSlices(u32, &expected_positions, module2.empty_rec_group_positions.items);
+    try std.testing.expectEqual(@as(usize, 0), module2.module_types.items.len);
+}
+
+test "empty recursion groups retain binary type-section ordering" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+
+    var module = try Parser.parseModule(allocator,
+        \\(module
+        \\  (rec)
+        \\  (rec)
+        \\  (type (func))
+        \\  (rec)
+        \\  (rec (type (func)))
+        \\  (rec)
+        \\  (rec)
+        \\  (type (func))
+        \\  (rec)
+        \\)
+    );
+    defer module.deinit();
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+
+    const expected_payload = [_]u8{
+        0x09,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x01, 0x60, 0x00, 0x00,
+        0x4e, 0x00,
+        0x4e, 0x00,
+        0x60, 0x00, 0x00,
+        0x4e, 0x00,
+    };
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &expected_payload) != null);
+
+    var module2 = try reader.readModule(allocator, wasm);
+    defer module2.deinit();
+    const expected_positions = [_]u32{ 0, 0, 1, 2, 2, 3 };
+    try std.testing.expectEqualSlices(u32, &expected_positions, module2.empty_rec_group_positions.items);
+    try std.testing.expect(module2.type_meta.items[1].in_rec_group);
+    try std.testing.expectEqual(@as(u32, 1), module2.type_meta.items[1].rec_group_size);
 }
 
 test "a type declared outside a rec group gains no marker" {
