@@ -621,40 +621,113 @@ pub fn maxAlignmentForOpcode(opcode: u8) ?u32 {
 
 // ── Function body validation ────────────────────────────────────────────
 
-fn checkFunctionBodies(m: *const Mod.Module) Error!void {
-    // Build set of "declared" function indices for ref.func validation.
-    // A function is declared if it appears in an element segment or is exported.
-    var declared = std.AutoHashMapUnmanaged(u32, void){};
-    defer declared.deinit(gpa(m));
+/// The function indices a module declares, which is what `ref.func` in a
+/// function body is measured against.
+const DeclaredFuncs = std.AutoHashMapUnmanaged(u32, void);
+
+/// Collect the function indices the module declares.
+///
+/// The rule is stated exactly by the module validation judgement, which
+/// builds the context's `refs` field as
+///
+///     x* = funcidx(global* mem* table* elem* export*)
+///
+/// -- the function indices occurring syntactically in the *defined* globals,
+/// memories, tables, element segments and exports. So the declaration sites
+/// are:
+///
+///   * every defined global's initializer (`ref.func` in a constant
+///     expression),
+///   * every defined table's initializer, which the function-references
+///     proposal added and which is what issue #418 was about,
+///   * every element segment: its offset expression, its element
+///     expressions, and, in the other form, its plain function indices,
+///   * every export of a function.
+///
+/// Memories carry no expressions, so they contribute nothing. Everything
+/// else is deliberately *not* a declaration site: data segments and the
+/// start function are absent from the list above, so `(start $f)` alone
+/// leaves `$f` undeclared -- wasm-tools 1.250.0 agrees -- and so are
+/// imports, tags, types and the code of other functions.
+fn collectDeclaredFuncs(m: *const Mod.Module, declared: *DeclaredFuncs) Error!void {
+    // An imported global or table has no initializer of its own, and the
+    // rule reads the defined ones; skipping the imports says so rather than
+    // relying on their byte slices being empty.
+    for (m.globals.items) |global| {
+        if (global.is_import) continue;
+        try declareFuncsInExprs(m, global.init_expr_bytes, declared);
+    }
+    for (m.tables.items) |table| {
+        if (table.is_import) continue;
+        try declareFuncsInExprs(m, table.init_expr_bytes, declared);
+    }
     for (m.elem_segments.items) |seg| {
-        if (seg.elem_expr_count > 0) {
+        try declareFuncsInExprs(m, seg.offset_expr_bytes, declared);
+        if (seg.elem_expr_count > 0 or seg.elem_expr_bytes.len > 0) {
             // Walk the expressions rather than the indices shadowing them:
             // the shadow cannot represent `ref.null` and so records it as
-            // `maxInt(u32)`, which would declare a function that cannot exist.
-            var epos: usize = 0;
-            while (epos < seg.elem_expr_bytes.len) {
-                if (seg.elem_expr_bytes[epos] == 0x0b) {
-                    epos += 1;
-                    continue;
-                }
-                const before = epos;
-                const decoded = instr.decode(seg.elem_expr_bytes, &epos) catch break;
-                if (decoded.prefix == 0 and decoded.code == 0xd2) { // ref.func
-                    const r = leb128.readU32Leb128(seg.elem_expr_bytes[epos..]) catch break;
-                    declared.put(gpa(m), r.value, {}) catch {};
-                }
-                instr.skipImmediates(decoded.shape, seg.elem_expr_bytes, &epos) catch break;
-                if (epos == before) break;
-            }
+            // `maxInt(u32)`, which would declare a function that cannot
+            // exist. `checkElemSegments` picks the same form the same way.
+            try declareFuncsInExprs(m, seg.elem_expr_bytes, declared);
         } else {
-            for (seg.elem_var_indices.items) |v| {
-                declared.put(gpa(m), v.index, {}) catch {};
-            }
+            for (seg.elem_var_indices.items) |v| try declareFunc(m, declared, v.index);
         }
     }
     for (m.exports.items) |exp| {
-        if (exp.kind == .func) declared.put(gpa(m), exp.var_.index, {}) catch {};
+        if (exp.kind == .func) try declareFunc(m, declared, exp.var_.index);
     }
+}
+
+/// Record every function index `ref.func` names in a run of constant
+/// expressions.
+///
+/// One buffer holds either a single expression -- a global or table
+/// initializer, an element segment's offset -- or several laid end to end,
+/// as a segment's element expressions are. Both are read the same way: an
+/// `end` is just another instruction, separating the expressions of a run
+/// and terminating the last, and the walk steps over whole instructions so
+/// that an index encoded as `0x0b` is not mistaken for one.
+///
+/// The walk is total. Every byte is decoded, and a buffer that does not
+/// decode is reported rather than abandoned part-read: a scan that gives up
+/// silently would drop the declarations after the byte it stopped on, which
+/// is the shape of bug this collection has had twice.
+fn declareFuncsInExprs(m: *const Mod.Module, bytes: []const u8, declared: *DeclaredFuncs) Error!void {
+    var pos: usize = 0;
+    while (pos < bytes.len) {
+        const before = pos;
+        const decoded = instr.decode(bytes, &pos) catch |err| return switch (err) {
+            error.TruncatedBody => error.UnexpectedEnd,
+            error.UnsupportedOpcode => error.UnsupportedOpcode,
+        };
+        if (decoded.prefix == 0 and decoded.code == 0xd2) { // ref.func
+            const r = leb128.readU32Leb128(bytes[pos..]) catch return error.UnexpectedEnd;
+            try declareFunc(m, declared, r.value);
+        }
+        instr.skipImmediates(decoded.shape, bytes, &pos) catch |err| return switch (err) {
+            error.TruncatedBody => error.UnexpectedEnd,
+            error.UnsupportedOpcode => error.UnsupportedOpcode,
+        };
+        std.debug.assert(pos > before);
+    }
+}
+
+/// Add one function index to the declaration set.
+///
+/// The index is recorded as it was written, without a bounds check: the set
+/// is the syntactic one the spec describes, and each site that names a
+/// function -- an element segment, an export, a constant expression -- has
+/// its own check that the name exists, as does `ref.func` in a body. A
+/// failure to record is a real failure and is reported: quietly dropping an
+/// entry would reject a valid `ref.func` later.
+fn declareFunc(m: *const Mod.Module, declared: *DeclaredFuncs, index: u32) Error!void {
+    declared.put(gpa(m), index, {}) catch return error.OutOfMemory;
+}
+
+fn checkFunctionBodies(m: *const Mod.Module) Error!void {
+    var declared: DeclaredFuncs = .{};
+    defer declared.deinit(gpa(m));
+    try collectDeclaredFuncs(m, &declared);
 
     for (m.funcs.items) |func| {
         if (func.is_import) continue;
@@ -1091,7 +1164,7 @@ fn structuralConcreteSubtype(m: *const Mod.Module, actual_idx: u32, expected_idx
     };
 }
 
-fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const std.AutoHashMapUnmanaged(u32, void)) Error!void {
+fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *const DeclaredFuncs) Error!void {
     const sig = resolveSig(m, func.decl);
     const num_params: u32 = @intCast(sig.params.len());
     const num_locals: u32 = num_params + @as(u32, @intCast(func.local_types.items.len));
@@ -6493,4 +6566,342 @@ test "a function declared after an unfamiliar element expression is still declar
     const body = [_]u8{ 0xd2, 0x00, 0x1a, 0x0b }; // ref.func 0; drop; end
     try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
     try validate(&m, .{});
+}
+
+test "every part of a module outside its bodies declares the functions it names" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const writer = @import("binary/writer.zig");
+
+    // `ref.func x` in a body is valid only where x is declared, and the set
+    // of declarations is `funcidx(global* mem* table* elem* export*)`: the
+    // function indices written in the module's defined globals, tables,
+    // element segments and exports. Table initializers used to be left out,
+    // which rejected the modules issue #418 reported, and so were global
+    // initializers.
+    const cases = [_]struct { wat: []const u8, err: ?Error = null }{
+        // Element segments, in each of their forms.
+        .{ .wat = "(module (type (func)) (func) (elem declare func 0) (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (elem declare funcref (item ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 funcref) (elem (i32.const 0) 0)" ++
+            " (func ref.func 0 drop))" },
+        // An export.
+        .{ .wat = "(module (type (func)) (func) (export \"f\" (func 0)) (func ref.func 0 drop))" },
+        // A global initializer, whatever the global's type or mutability.
+        .{ .wat = "(module (type (func)) (func) (global funcref (ref.func 0)) (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (global (ref func) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (global (ref 0) (ref.func 0)) (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (global (mut funcref) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (global funcref (ref.null func))" ++
+            " (global funcref (ref.func 0)) (func ref.func 0 drop))" },
+        // A table initializer, which is what issue #418 was about.
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 funcref (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref 0) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table i64 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 funcref) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 drop))" },
+        // The declaration set is the whole module's, so it does not matter
+        // whether the declaration is written before the body or after it,
+        // nor whether the body's `ref.func` is reachable.
+        .{ .wat = "(module (type (func)) (func) (func ref.func 0 drop) (global funcref (ref.func 0)))" },
+        .{ .wat = "(module (type (func)) (func) (func ref.func 0 drop) (table 1 (ref func) (ref.func 0)))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func unreachable ref.func 0 drop))" },
+        // An imported function is declared the same way as a defined one.
+        .{ .wat = "(module (type (func)) (import \"m\" \"f\" (func (type 0)))" ++
+            " (table 1 (ref func) (ref.func 0)) (func ref.func 0 drop))" },
+
+        // Nothing else declares. A function that no global, table, element
+        // segment or export names cannot be referred to, however else it is
+        // mentioned.
+        .{ .wat = "(module (type (func)) (func) (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (func) (start 0) (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (func) (memory 1) (data (i32.const 0) \"x\")" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        // A mention in another body is not a declaration either.
+        .{ .wat = "(module (type (func)) (func) (func) (elem declare func 1)" ++
+            " (func ref.func 1 drop) (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        // An initializer that names no function declares no function.
+        .{ .wat = "(module (type (func)) (func) (table 1 funcref (ref.null func))" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (func) (global funcref (ref.null func))" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (import \"m\" \"g\" (global funcref)) (func)" ++
+            " (table 1 funcref (global.get 0)) (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        // An imported table brings no initializer with it.
+        .{ .wat = "(module (type (func)) (import \"m\" \"t\" (table 1 funcref)) (func)" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        // A declaration is of the function it names and of no other.
+        .{ .wat = "(module (type (func)) (func) (func) (table 1 (ref func) (ref.func 1))" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (func) (func) (global funcref (ref.func 1))" ++
+            " (func ref.func 0 drop))", .err = error.InvalidFuncIndex },
+    };
+
+    for (cases) |c| {
+        var parsed = try Parser.parseModule(alloc, c.wat);
+        defer parsed.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&parsed, .{})) else try validate(&parsed, .{});
+
+        // The verdict must not depend on the front end: the reader and the
+        // parser fill in initializers and segments by different routes.
+        const bytes = try writer.writeModule(alloc, &parsed);
+        defer alloc.free(bytes);
+        var read_back = try binary_reader.readModule(alloc, bytes);
+        defer read_back.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&read_back, .{})) else try validate(&read_back, .{});
+    }
+}
+
+test "a non-nullable table's initializer declares the element table.grow and table.fill write" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const writer = @import("binary/writer.zig");
+
+    // The four modules issue #418 was found from: a `(ref func)` table has
+    // to be initialised, its initializer is the only mention of the
+    // function, and growing or filling the table needs that same function as
+    // a value. wasm-tools 1.250.0 accepts all four.
+    const cases = [_]struct { wat: []const u8, err: ?Error = null }{
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 i32.const 1 table.grow 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table i64 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 i64.const 1 table.grow 0 drop))" },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func i32.const 0 ref.func 0 i32.const 1 table.fill 0))" },
+        .{ .wat = "(module (type (func)) (func) (table i64 1 (ref func) (ref.func 0))" ++
+            " (func i64.const 0 ref.func 0 i64.const 1 table.fill 0))" },
+        // The other function the module defines is still undeclared.
+        .{ .wat = "(module (type (func)) (func) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 1 i32.const 1 table.grow 0 drop))", .err = error.InvalidFuncIndex },
+        .{ .wat = "(module (type (func)) (func) (func) (table i64 1 (ref func) (ref.func 0))" ++
+            " (func i64.const 0 ref.func 1 i64.const 1 table.fill 0))", .err = error.InvalidFuncIndex },
+    };
+
+    for (cases) |c| {
+        var parsed = try Parser.parseModule(alloc, c.wat);
+        defer parsed.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&parsed, .{})) else try validate(&parsed, .{});
+
+        const bytes = try writer.writeModule(alloc, &parsed);
+        defer alloc.free(bytes);
+        var read_back = try binary_reader.readModule(alloc, bytes);
+        defer read_back.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&read_back, .{})) else try validate(&read_back, .{});
+    }
+}
+
+/// A module of `func_count` functions of type `(func)`, one table of the
+/// given element type initialised by `table_init`, one global of type
+/// `funcref` initialised by `global_init`, and one function whose body is
+/// `body`. Empty initializers are left out, so a case says only what it is
+/// about.
+fn testDeclarationModule(
+    alloc: std.mem.Allocator,
+    func_count: usize,
+    table_init: []const u8,
+    global_init: []const u8,
+    body: []const u8,
+) !Mod.Module {
+    var module = Mod.Module.init(alloc);
+    errdefer module.deinit();
+    try module.module_types.append(alloc, .{ .func_type = .{} });
+    for (0..func_count) |_| {
+        try module.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+    }
+    if (table_init.len > 0) {
+        try module.tables.append(alloc, .{
+            .type = .{ .elem_type = .funcref, .limits = .{ .initial = 1 } },
+            .init_expr_bytes = table_init,
+        });
+    }
+    if (global_init.len > 0) {
+        try module.globals.append(alloc, .{
+            .type = .{ .val_type = .funcref, .mutability = .immutable },
+            .init_expr_bytes = global_init,
+        });
+    }
+    try module.funcs.append(alloc, .{
+        .decl = .{ .type_var = .{ .index = 0 } },
+        .code_bytes = body,
+    });
+    return module;
+}
+
+test "an initializer's function index is decoded rather than searched for" {
+    const alloc = std.testing.allocator;
+
+    // `ref.func 11` encodes as d2 0b, and 0x0b is also `end`: an index read
+    // by looking at bytes rather than by decoding the instruction that
+    // carries it splits the instruction in half. The index is also read
+    // exactly as written, so a padded LEB names the same function as a
+    // short one.
+    const ref_func_11 = [_]u8{ 0xd2, 0x0b }; // ref.func 11
+    const ref_func_0_padded = [_]u8{ 0xd2, 0x80, 0x80, 0x00 }; // ref.func 0
+    const body_11 = [_]u8{ 0xd2, 0x0b, 0x1a, 0x0b }; // ref.func 11; drop; end
+    const body_0 = [_]u8{ 0xd2, 0x00, 0x1a, 0x0b }; // ref.func 0; drop; end
+
+    var from_table = try testDeclarationModule(alloc, 12, &ref_func_11, &.{}, &body_11);
+    defer from_table.deinit();
+    try validate(&from_table, .{});
+
+    var from_global = try testDeclarationModule(alloc, 12, &.{}, &ref_func_11, &body_11);
+    defer from_global.deinit();
+    try validate(&from_global, .{});
+
+    var padded = try testDeclarationModule(alloc, 1, &ref_func_0_padded, &.{}, &body_0);
+    defer padded.deinit();
+    try validate(&padded, .{});
+
+    // The function next to the one declared is still not declared.
+    var neighbour = try testDeclarationModule(alloc, 12, &ref_func_11, &.{}, &body_0);
+    defer neighbour.deinit();
+    try std.testing.expectError(error.InvalidFuncIndex, validate(&neighbour, .{}));
+}
+
+test "a declaration after the expressions before it in a run is still found" {
+    const alloc = std.testing.allocator;
+
+    // A segment's element expressions are laid end to end, and a global or
+    // table initializer may be several instructions long. Reading the run
+    // has to step over whole instructions, all the way to its end: a scan
+    // that gave up at the first opcode it did not recognise hid every
+    // declaration after it.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    for (0..13) |_| try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+    try m.globals.append(alloc, .{
+        .type = .{ .val_type = .funcref, .mutability = .immutable },
+        .is_import = true,
+    });
+    // global.get 0; end; ref.null func; end; ref.func 11; end; ref.func 1; end
+    const exprs = [_]u8{
+        0x23, 0x00, 0x0b, 0xd0, 0x70, 0x0b, 0xd2, 0x0b, 0x0b, 0xd2, 0x01, 0x0b,
+    };
+    try m.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .funcref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 4,
+        .uses_elem_exprs = true,
+    });
+    // ref.func 11; drop; ref.func 1; drop; end
+    const body = [_]u8{ 0xd2, 0x0b, 0x1a, 0xd2, 0x01, 0x1a, 0x0b };
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try validate(&m, .{});
+}
+
+test "an initializer that runs off its end is reported, not read half way" {
+    const alloc = std.testing.allocator;
+
+    // Collecting declarations reads bytes the type-checkers ahead of it have
+    // already accepted, but it reads more of them: a truncated immediate is
+    // a malformed module, and abandoning the scan there would silently drop
+    // the declarations that follow. So it is reported.
+    const truncated = [_]u8{0xd2}; // ref.func, with no index
+    const body = [_]u8{ 0xd2, 0x00, 0x1a, 0x0b }; // ref.func 0; drop; end
+
+    var table = try testDeclarationModule(alloc, 1, &truncated, &.{}, &body);
+    defer table.deinit();
+    try std.testing.expectError(error.UnexpectedEnd, validate(&table, .{}));
+
+    var global = try testDeclarationModule(alloc, 1, &.{}, &truncated, &body);
+    defer global.deinit();
+    try std.testing.expectError(error.UnexpectedEnd, validate(&global, .{}));
+
+    // The same for a run of element expressions, whose tail is read even
+    // where it is longer than the count says.
+    var seg = Mod.Module.init(alloc);
+    defer seg.deinit();
+    try seg.module_types.append(alloc, .{ .func_type = .{} });
+    try seg.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+    const exprs = [_]u8{ 0xd2, 0x00, 0x0b, 0xd2 }; // ref.func 0; end; ref.func …
+    try seg.elem_segments.append(alloc, .{
+        .kind = .declared,
+        .elem_type = .funcref,
+        .elem_expr_bytes = &exprs,
+        .elem_expr_count = 1,
+        .uses_elem_exprs = true,
+    });
+    try seg.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try std.testing.expectError(error.UnexpectedEnd, validate(&seg, .{}));
+}
+
+/// An allocator that fails exactly one allocation -- the first -- and serves
+/// every other from the allocator behind it.
+///
+/// `std.testing.FailingAllocator` cannot express this: once it has induced
+/// its failure every later allocation fails too, so a validator that
+/// swallowed the failure and carried on would still end up reporting
+/// `OutOfMemory` from the next allocation, and the test would pass either
+/// way.
+const FailFirstAllocator = struct {
+    backing: std.mem.Allocator,
+    failed: bool = false,
+
+    fn allocator(self: *FailFirstAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.failed) {
+            self.failed = true;
+            return null;
+        }
+        return self.backing.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *FailFirstAllocator = @ptrCast(@alignCast(ctx));
+        self.backing.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+test "a declaration that cannot be recorded is reported rather than dropped" {
+    const alloc = std.testing.allocator;
+
+    // The declaration set is a hash map, and a failure to grow it used to be
+    // swallowed. That turns an allocation failure into a wrong answer: the
+    // module is reported invalid, naming a function that is in fact
+    // declared. This module declares function 0 by exporting it, and that
+    // record is the first thing validating it allocates.
+    var m = Mod.Module.init(alloc);
+    defer m.deinit();
+    try m.module_types.append(alloc, .{ .func_type = .{} });
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } } });
+    try m.exports.append(alloc, .{ .name = "f", .kind = .func, .var_ = .{ .index = 0 } });
+    const body = [_]u8{ 0xd2, 0x00, 0x1a, 0x0b }; // ref.func 0; drop; end
+    try m.funcs.append(alloc, .{ .decl = .{ .type_var = .{ .index = 0 } }, .code_bytes = &body });
+    try validate(&m, .{});
+
+    var failing = FailFirstAllocator{ .backing = alloc };
+    m.allocator = failing.allocator();
+    defer m.allocator = alloc;
+    try std.testing.expectError(error.OutOfMemory, validate(&m, .{}));
+    try std.testing.expect(failing.failed);
 }
