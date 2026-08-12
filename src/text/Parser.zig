@@ -6611,10 +6611,6 @@ test "ref.null rejects numeric indices in the abstract heap type alias window" {
 
 // ── Table initializers ──────────────────────────────────────────────────
 
-// These parse through an arena rather than the testing allocator directly:
-// the bytes a table initializer allocates are handed back either way, so
-// what is asserted here is what the parser produces, not who frees it.
-
 test "a table initializer is read folded or unfolded" {
     // The text writer prints a constant expression unfolded, which is also
     // what `wasm-tools` prints, and the folded spelling is what a
@@ -6668,9 +6664,7 @@ test "a table initializer is read folded or unfolded" {
     };
 
     for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
+        const alloc = std.testing.allocator;
 
         var unfolded = try parseModule(alloc, case.unfolded);
         defer unfolded.deinit();
@@ -6684,7 +6678,9 @@ test "a table initializer is read folded or unfolded" {
 
         // Same module, so the same binary either way.
         const a = try binary_writer.writeModule(alloc, &unfolded);
+        defer alloc.free(a);
         const b = try binary_writer.writeModule(alloc, &folded);
+        defer alloc.free(b);
         try std.testing.expectEqualSlices(u8, a, b);
     }
 }
@@ -6709,9 +6705,7 @@ test "a table's ref.null initializer keeps the heap type the source names" {
     };
 
     for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
+        const alloc = std.testing.allocator;
 
         var module = try parseModule(alloc, case.source);
         defer module.deinit();
@@ -6721,9 +6715,7 @@ test "a table's ref.null initializer keeps the heap type the source names" {
 }
 
 test "a table initializer names a concrete heap type by name or index" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     var named = try parseModule(alloc,
         \\(module
@@ -6752,11 +6744,10 @@ test "a table initializer names a concrete heap type by name or index" {
 }
 
 test "a table initializer's concrete heap type is an s33, not a byte" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(alloc);
     try source.appendSlice(alloc, "(module\n");
     for (0..65) |_| try source.appendSlice(alloc, "  (type (func))\n");
     try source.appendSlice(alloc,
@@ -6773,6 +6764,7 @@ test "a table initializer's concrete heap type is an s33, not a byte" {
     try Validator.validate(&module, .{});
 
     const wasm = try binary_writer.writeModule(alloc, &module);
+    defer alloc.free(wasm);
     var reread = try binary_reader.readModule(alloc, wasm);
     defer reread.deinit();
     try Validator.validate(&reread, .{});
@@ -6781,9 +6773,7 @@ test "a table initializer's concrete heap type is an s33, not a byte" {
 }
 
 test "a table whose element type has no null states what it holds" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     // A non-defaultable element type is exactly the case where the
     // initializer is not decoration: it is what makes the module legal.
@@ -6846,9 +6836,7 @@ test "a table initializer that does not suit the table is rejected" {
     };
 
     for (cases) |case| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
+        const alloc = std.testing.allocator;
 
         var module = try parseModule(alloc, case.source);
         defer module.deinit();
@@ -6857,14 +6845,130 @@ test "a table initializer that does not suit the table is rejected" {
 }
 
 test "a table initializer that is not an expression at all is malformed" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     // Text that follows the element type but names no instruction is not an
     // initializer, and must not be dropped as though the table had none.
     try std.testing.expectError(
         error.InvalidModule,
-        parseModule(arena.allocator(), "(module (table 1 funcref bogus))"),
+        parseModule(std.testing.allocator, "(module (table 1 funcref bogus))"),
     );
+}
+
+test "a table initializer is encoded like a global's" {
+    const alloc = std.testing.allocator;
+
+    // Both go through the same constant-expression parser, so a form spelled
+    // the same way in both places encodes the same way in both places --
+    // including the folded GC forms that the table branch used to special
+    // case for itself.
+    var module = try parseModule(alloc,
+        \\(module
+        \\  (global $a anyref (ref.i31 (i32.const 5)))
+        \\  (global $b anyref i32.const 5 ref.i31)
+        \\  (table 1 anyref (ref.i31 (i32.const 5)))
+        \\  (table 1 anyref i32.const 5 ref.i31)
+        \\)
+    );
+    defer module.deinit();
+    const expected = [_]u8{ 0x41, 0x05, 0xfb, 0x1c };
+    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[0].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[1].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[0].init_expr_bytes);
+    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[1].init_expr_bytes);
+}
+
+test "table initializers survive text, binary, text and binary again" {
+    // The whole loop: the text the writer prints for a module carries the
+    // initializer, parses back to the same bytes, and rebuilds the same
+    // binary the module started as.
+    const cases = [_]struct { source: []const u8, printed: []const u8 }{
+        .{
+            .source = "(module (table 1 funcref ref.null func))",
+            .printed = "(table (;0;) 1 funcref ref.null func)",
+        },
+        .{
+            .source = "(module (table 1 externref ref.null extern))",
+            .printed = "(table (;0;) 1 externref ref.null extern)",
+        },
+        .{
+            .source = "(module (table 1 arrayref ref.null array))",
+            .printed = "(table (;0;) 1 arrayref ref.null array)",
+        },
+        .{
+            .source = "(module (func) (table 3 funcref ref.func 0))",
+            .printed = "(table (;0;) 3 funcref ref.func 0)",
+        },
+        .{
+            .source = "(module (func $f) (table 2 (ref func) ref.func $f))",
+            .printed = "(table (;0;) 2 (ref func) ref.func 0)",
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global externref)) (table 4 externref global.get 0))",
+            .printed = "(table (;0;) 4 externref global.get 0)",
+        },
+        .{
+            .source = "(module (table i64 1 8 externref ref.null extern))",
+            .printed = "(table (;0;) i64 1 8 externref ref.null extern)",
+        },
+        .{
+            .source = "(module (type $t (func)) (table 1 (ref null $t) ref.null $t))",
+            .printed = "(table (;0;) 1 (ref null 0) ref.null 0)",
+        },
+        .{
+            .source = "(module (type $t (func)) (func $f (type $t)) (table 1 (ref $t) ref.func $f))",
+            .printed = "(table (;0;) 1 (ref 0) ref.func 0)",
+        },
+        .{
+            .source = "(module (table 1 funcref) (table 1 externref ref.null extern))",
+            .printed = "(table (;0;) 1 funcref)",
+        },
+    };
+
+    for (cases) |case| {
+        const alloc = std.testing.allocator;
+
+        var parsed = try parseModule(alloc, case.source);
+        defer parsed.deinit();
+        try Validator.validate(&parsed, .{});
+
+        const wasm = try binary_writer.writeModule(alloc, &parsed);
+        defer alloc.free(wasm);
+        var reread = try binary_reader.readModule(alloc, wasm);
+        defer reread.deinit();
+        try Validator.validate(&reread, .{});
+
+        const table = parsed.tables.items[0];
+        const round = reread.tables.items[0];
+        try std.testing.expectEqualSlices(u8, table.init_expr_bytes, round.init_expr_bytes);
+        try std.testing.expectEqual(table.type.elem_type, round.type.elem_type);
+        try std.testing.expectEqual(table.type_idx, round.type_idx);
+        try std.testing.expectEqual(table.type.limits.initial, round.type.limits.initial);
+        try std.testing.expectEqual(table.type.limits.is_64, round.type.limits.is_64);
+
+        // The binary the module came from is the binary it goes back to.
+        const again = try binary_writer.writeModule(alloc, &reread);
+        defer alloc.free(again);
+        try std.testing.expectEqualSlices(u8, wasm, again);
+
+        // The printed text says what the table holds...
+        const wat = try TextWriter.writeModule(alloc, &reread);
+        defer alloc.free(wat);
+        try std.testing.expect(std.mem.indexOf(u8, wat, case.printed) != null);
+
+        // ...and reads back as the module it was printed from.
+        var reparsed = try parseModule(alloc, wat);
+        defer reparsed.deinit();
+        try Validator.validate(&reparsed, .{});
+        const back = reparsed.tables.items[0];
+        try std.testing.expectEqualSlices(u8, table.init_expr_bytes, back.init_expr_bytes);
+        try std.testing.expectEqual(table.type.elem_type, back.type.elem_type);
+        try std.testing.expectEqual(table.type_idx, back.type_idx);
+        try std.testing.expectEqual(table.type.limits.initial, back.type.limits.initial);
+        try std.testing.expectEqual(table.type.limits.is_64, back.type.limits.is_64);
+
+        const from_text = try binary_writer.writeModule(alloc, &reparsed);
+        defer alloc.free(from_text);
+        try std.testing.expectEqualSlices(u8, wasm, from_text);
+    }
 }
 
 test "a constant expression has no `end` to write" {
@@ -6902,85 +7006,8 @@ test "a constant expression has no `end` to write" {
     }
 }
 
-test "a table initializer is encoded like a global's" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Both go through the same constant-expression parser, so a form spelled
-    // the same way in both places encodes the same way in both places --
-    // including the folded GC forms that the table branch used to special
-    // case for itself.
-    var module = try parseModule(alloc,
-        \\(module
-        \\  (global $a anyref (ref.i31 (i32.const 5)))
-        \\  (global $b anyref i32.const 5 ref.i31)
-        \\  (table 1 anyref (ref.i31 (i32.const 5)))
-        \\  (table 1 anyref i32.const 5 ref.i31)
-        \\)
-    );
-    defer module.deinit();
-    const expected = [_]u8{ 0x41, 0x05, 0xfb, 0x1c };
-    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[0].init_expr_bytes);
-    try std.testing.expectEqualSlices(u8, &expected, module.globals.items[1].init_expr_bytes);
-    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[0].init_expr_bytes);
-    try std.testing.expectEqualSlices(u8, &expected, module.tables.items[1].init_expr_bytes);
-}
-
-test "table initializers survive text, binary and text again" {
-    const sources = [_][]const u8{
-        "(module (table 1 funcref ref.null func))",
-        "(module (table 1 externref ref.null extern))",
-        "(module (table 1 arrayref ref.null array))",
-        "(module (func) (table 3 funcref ref.func 0))",
-        "(module (func) (table 2 (ref func) ref.func 0))",
-        "(module (import \"m\" \"g\" (global externref)) (table 4 externref global.get 0))",
-        "(module (table i64 1 8 externref ref.null extern))",
-        "(module (type $t (func)) (table 1 (ref null $t) ref.null $t))",
-    };
-
-    for (sources) |source| {
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        const alloc = arena.allocator();
-
-        var parsed = try parseModule(alloc, source);
-        defer parsed.deinit();
-        try Validator.validate(&parsed, .{});
-
-        const wasm = try binary_writer.writeModule(alloc, &parsed);
-        var reread = try binary_reader.readModule(alloc, wasm);
-        defer reread.deinit();
-        try Validator.validate(&reread, .{});
-
-        const table = parsed.tables.items[0];
-        const round = reread.tables.items[0];
-        try std.testing.expectEqualSlices(u8, table.init_expr_bytes, round.init_expr_bytes);
-        try std.testing.expectEqual(table.type.elem_type, round.type.elem_type);
-        try std.testing.expectEqual(table.type_idx, round.type_idx);
-        try std.testing.expectEqual(table.type.limits.initial, round.type.limits.initial);
-        try std.testing.expectEqual(table.type.limits.is_64, round.type.limits.is_64);
-
-        // The binary the module came from is the binary it goes back to.
-        const again = try binary_writer.writeModule(alloc, &reread);
-        try std.testing.expectEqualSlices(u8, wasm, again);
-
-        // And the text the writer prints for it parses back to the same
-        // module. The initializer itself is not printed yet, so what is
-        // checked here is that nothing else about the table moved.
-        const wat = try TextWriter.writeModule(alloc, &reread);
-        var reparsed = try parseModule(alloc, wat);
-        defer reparsed.deinit();
-        try std.testing.expectEqual(table.type.elem_type, reparsed.tables.items[0].type.elem_type);
-        try std.testing.expectEqual(table.type_idx, reparsed.tables.items[0].type_idx);
-        try std.testing.expectEqual(table.type.limits.initial, reparsed.tables.items[0].type.limits.initial);
-    }
-}
-
 test "an inline element list is still an inline element list" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+    const alloc = std.testing.allocator;
 
     // `(table funcref (elem ...))` is an abbreviation for a table plus an
     // active segment, not a table with an initializer.

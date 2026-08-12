@@ -701,6 +701,15 @@ const WatWriter = struct {
             try self.writeLimits(table.type.limits);
             try self.appendByte(' ');
             try self.writeValTypeWithTidx(table.type.elem_type, table.type_idx);
+            // A table may say what its slots start out holding, and the
+            // element type does not say it: `funcref` is filled with nulls
+            // either way, but `ref.func 0` is not, and an element type with
+            // no null is only legal because the initializer is there. It is
+            // a constant expression like a global's, so it prints like one.
+            if (table.init_expr_bytes.len > 0) {
+                try self.appendByte(' ');
+                _ = try self.writeConstExprFlat(table.init_expr_bytes);
+            }
             try self.appendByte(')');
             try self.newline();
         }
@@ -1410,6 +1419,87 @@ test "a function restates its signature alongside its type index" {
     // whose types are renumbered, so the signature is restated too.
     try std.testing.expectEqualStrings("(func (;0;) (type 0) (param i32 f64) (result i32)", header orelse return error.NoFunc);
     try std.testing.expect(std.mem.indexOf(u8, wat, "local.get 0") != null);
+}
+
+test "a table prints the initializer it was given" {
+    const alloc = std.testing.allocator;
+
+    // Every one of these is `wasm-tools parse` v1.250.0 output, and every
+    // expected line is what `wasm-tools print` says about it. A table's
+    // initializer was decoded and re-encoded but never printed, so the
+    // text wabt wrote said less than the module it came from -- and for a
+    // non-defaultable element type, said something that no longer
+    // validates.
+    const cases = [_]struct { bytes: []const u8, expect: []const u8 }{
+        // (module (table 1 funcref ref.null func))
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x04, 0x09, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01, 0xd0, 0x70, 0x0b,
+            },
+            .expect = "(table (;0;) 1 funcref ref.null func)",
+        },
+        // (module (table i64 1 8 externref ref.null extern))
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x04, 0x0a, 0x01, 0x40, 0x00, 0x6f, 0x05, 0x01, 0x08, 0xd0, 0x6f, 0x0b,
+            },
+            .expect = "(table (;0;) i64 1 8 externref ref.null extern)",
+        },
+        // (module (func) (table 2 (ref func) ref.func 0))
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+                0x03, 0x02, 0x01, 0x00,
+                0x04, 0x0a, 0x01, 0x40, 0x00, 0x64, 0x70, 0x00, 0x02, 0xd2, 0x00, 0x0b,
+                0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+            },
+            .expect = "(table (;0;) 2 (ref func) ref.func 0)",
+        },
+        // (module (import "m" "g" (global externref)) (table 4 externref global.get 0))
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x02, 0x08, 0x01, 0x01, 0x6d, 0x01, 0x67, 0x03, 0x6f, 0x00,
+                0x04, 0x09, 0x01, 0x40, 0x00, 0x6f, 0x00, 0x04, 0x23, 0x00, 0x0b,
+            },
+            .expect = "(table (;0;) 4 externref global.get 0)",
+        },
+        // (module (table 1 funcref)) -- no initializer, nothing added.
+        .{
+            .bytes = &.{
+                0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+                0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
+            },
+            .expect = "(table (;0;) 1 funcref)",
+        },
+    };
+
+    for (cases) |case| {
+        const wat = try printBinary(alloc, case.bytes);
+        defer alloc.free(wat);
+        try std.testing.expect(std.mem.indexOf(u8, wat, case.expect) != null);
+    }
+}
+
+test "a table initializer's concrete heap type prints as the index it names" {
+    const alloc = std.testing.allocator;
+    // 65 empty function types, then
+    //   (table 1 (ref null 64) ref.null 64)
+    // Index 64 is the first whose signed LEB needs two bytes; printing it
+    // from one byte would say `func`.
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try bytes.appendSlice(alloc, &.{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 });
+    try bytes.appendSlice(alloc, &.{ 0x01, 0xc4, 0x01, 0x41 });
+    for (0..65) |_| try bytes.appendSlice(alloc, &.{ 0x60, 0x00, 0x00 });
+    try bytes.appendSlice(alloc, &.{ 0x04, 0x0c, 0x01, 0x40, 0x00, 0x63, 0xc0, 0x00, 0x00, 0x01, 0xd0, 0xc0, 0x00, 0x0b });
+
+    const wat = try printBinary(alloc, bytes.items);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "(table (;0;) 1 (ref null 64) ref.null 64)") != null);
 }
 
 test "a global prints the initializer it was given" {
