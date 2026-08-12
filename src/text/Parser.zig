@@ -3159,23 +3159,41 @@ const Parser = struct {
     /// 0x70), concrete heap types are the non-negative type index.
     fn emitHeapType(self: *Parser, code: *std.ArrayListUnmanaged(u8), heap: types.HeapType) void {
         switch (heap) {
-            .abstract => |abstract| self.emitLeb128S32(code, @intFromEnum(abstract)),
-            .concrete => |idx| self.emitLeb128S32(code, @bitCast(idx)),
+            .abstract => |abstract| self.emitLeb128S64(code, @intFromEnum(abstract)),
+            .concrete => |idx| self.emitLeb128S64(code, @intCast(idx)),
+        }
+    }
+
+    fn validateRefNullTypeIndex(self: *Parser, idx: u32) void {
+        if (self.module) |mod| {
+            const max = if (mod.num_declared_types > 0)
+                mod.num_declared_types
+            else
+                @as(u32, @intCast(mod.module_types.items.len));
+            if (idx >= max) self.markMalformed(@src());
         }
     }
 
     fn emitRefNullHeapType(self: *Parser, code: *std.ArrayListUnmanaged(u8)) void {
         const heap: types.HeapType = switch (self.peek().kind) {
-            .identifier => .{ .concrete = self.parseTypeIdx() catch {
-                self.markMalformed(@src());
-                self.emitHeapType(code, .{ .abstract = .func });
-                return;
-            } },
-            .integer => .{ .concrete = self.parseU32() catch {
-                self.markMalformed(@src());
-                self.emitHeapType(code, .{ .abstract = .func });
-                return;
-            } },
+            .identifier => blk: {
+                const idx = self.parseTypeIdx() catch {
+                    self.markMalformed(@src());
+                    self.emitHeapType(code, .{ .abstract = .func });
+                    return;
+                };
+                self.validateRefNullTypeIndex(idx);
+                break :blk .{ .concrete = idx };
+            },
+            .integer => blk: {
+                const idx = self.parseU32() catch {
+                    self.markMalformed(@src());
+                    self.emitHeapType(code, .{ .abstract = .func });
+                    return;
+                };
+                self.validateRefNullTypeIndex(idx);
+                break :blk .{ .concrete = idx };
+            },
             .kw_funcref, .kw_func => blk: {
                 _ = self.advance();
                 break :blk .{ .abstract = .func };
@@ -6446,15 +6464,21 @@ test "ref.null numeric heap type works in a function body" {
 }
 
 test "ref.null rejects an out-of-range numeric heap type" {
-    var module = try parseModule(std.testing.allocator,
+    try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator,
         \\(module
         \\  (type (func))
         \\  (func ref.null 1 drop)
         \\)
-    );
-    defer module.deinit();
+    ));
+}
 
-    try std.testing.expectError(error.InvalidTypeIndex, Validator.validate(&module, .{}));
+test "ref.null rejects numeric indices in the abstract heap type alias window" {
+    try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator,
+        \\(module
+        \\  (type (func))
+        \\  (func ref.null 4294967280 drop)
+        \\)
+    ));
 }
 
 test "parse module with rec type group" {
