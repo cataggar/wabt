@@ -730,6 +730,7 @@ const Parser = struct {
                     if (std.mem.eql(u8, heap_text, "none")) return .ref_none;
                     if (std.mem.eql(u8, heap_text, "nofunc")) return .ref_nofunc;
                     if (std.mem.eql(u8, heap_text, "noextern")) return .ref_noextern;
+                    if (std.mem.eql(u8, heap_text, "noexn")) return .ref_noexn;
                 }
                 // Record type index for concrete type references (only during type section parsing)
                 if (self.in_type_parse and resolved_type_idx != std.math.maxInt(u32)) {
@@ -6442,6 +6443,57 @@ test "table and global import spellings reject invalid concrete reference indice
     };
     for (cases) |source| {
         try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+}
+
+test "noexn global imports preserve nullability and mutability" {
+    const cases = [_]struct {
+        source: []const u8,
+        val_type: types.ValType,
+        mutability: types.Mutability,
+    }{
+        .{
+            .source = "(module (import \"m\" \"g\" (global (ref noexn))))",
+            .val_type = .ref_noexn,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (ref noexn)))",
+            .val_type = .ref_noexn,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global (mut (ref noexn)))))",
+            .val_type = .ref_noexn,
+            .mutability = .mutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (mut (ref noexn))))",
+            .val_type = .ref_noexn,
+            .mutability = .mutable,
+        },
+        .{
+            .source = "(module (import \"m\" \"g\" (global (ref null noexn))))",
+            .val_type = .nullexnref,
+            .mutability = .immutable,
+        },
+        .{
+            .source = "(module (global (import \"m\" \"g\") (mut (ref null noexn))))",
+            .val_type = .nullexnref,
+            .mutability = .mutable,
+        },
+    };
+
+    for (cases) |case| {
+        var module = try parseModule(std.testing.allocator, case.source);
+        defer module.deinit();
+        const global = module.globals.items[0];
+        const import = module.imports.items[0];
+        try std.testing.expectEqual(case.val_type, global.@"type".val_type);
+        try std.testing.expectEqual(case.mutability, global.@"type".mutability);
+        try std.testing.expectEqual(types.invalid_index, global.type_idx);
+        try std.testing.expectEqual(types.invalid_index, import.global_type_idx);
+        try Validator.validate(&module, .{});
     }
 }
 

@@ -693,6 +693,35 @@ test "concrete table and global import indices survive text and binary round tri
     }
 }
 
+test "imported concrete heap type index 112 survives a binary round trip" {
+    const Parser = @import("../text/Parser.zig");
+    const allocator = std.testing.allocator;
+    var source: std.ArrayListUnmanaged(u8) = .empty;
+    defer source.deinit(allocator);
+
+    try source.appendSlice(allocator, "(module\n");
+    for (0..113) |_| try source.appendSlice(allocator, "  (type (func))\n");
+    try source.appendSlice(allocator,
+        \\  (import "m" "t" (table 1 (ref null 112)))
+        \\  (import "m" "g" (global (ref null 112)))
+        \\)
+    );
+
+    var module = try Parser.parseModule(allocator, source.items);
+    defer module.deinit();
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var round_trip = try reader.readModule(allocator, wasm);
+    defer round_trip.deinit();
+
+    try std.testing.expectEqual(@as(u32, 112), round_trip.imports.items[0].table_type_idx);
+    try std.testing.expectEqual(@as(u32, 112), round_trip.tables.items[0].type_idx);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.tables.items[0].@"type".elem_type);
+    try std.testing.expectEqual(@as(u32, 112), round_trip.imports.items[1].global_type_idx);
+    try std.testing.expectEqual(@as(u32, 112), round_trip.globals.items[0].type_idx);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.globals.items[0].@"type".val_type);
+}
+
 test "round-trip memory section" {
     const allocator = std.testing.allocator;
     const input = [_]u8{
