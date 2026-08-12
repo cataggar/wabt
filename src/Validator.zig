@@ -1369,7 +1369,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
                 // call_indirect requires a funcref table
                 if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
-                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // table index operand
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, table_idx)));
                 const ft = switch (m.module_types.items[type_idx]) {
                     .func_type => |ft| ft,
                     else => Mod.FuncSignature{},
@@ -1397,7 +1397,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     else => Mod.FuncSignature{},
                 };
                 try checkTailCallResults(&ctrl_stack, funcResults(ft));
-                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32)); // table index operand
+                try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, table_idx)));
                 try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], funcParams(ft));
                 setUnreachable(&val_stack, &ctrl_stack);
             },
@@ -5256,6 +5256,30 @@ test "a table index is of the table's index type" {
     var g32 = try testModuleWith64Table(alloc, false, &get64);
     defer g32.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&g32, .{}));
+}
+
+test "indirect calls select a function with the table's index type" {
+    const alloc = std.testing.allocator;
+
+    // i64.const 0; call_indirect type=0 table=0; end
+    const call64 = [_]u8{ 0x42, 0x00, 0x11, 0x00, 0x00, 0x0b };
+    var call = try testModuleWith64Table(alloc, true, &call64);
+    defer call.deinit();
+    try validate(&call, .{});
+
+    var call32 = try testModuleWith64Table(alloc, false, &call64);
+    defer call32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&call32, .{}));
+
+    // i64.const 0; return_call_indirect type=0 table=0; end
+    const return64 = [_]u8{ 0x42, 0x00, 0x13, 0x00, 0x00, 0x0b };
+    var tail = try testModuleWith64Table(alloc, true, &return64);
+    defer tail.deinit();
+    try validate(&tail, .{});
+
+    var tail32 = try testModuleWith64Table(alloc, false, &return64);
+    defer tail32.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&tail32, .{}));
 }
 
 test "a segment offset is of the index type of what it indexes" {
