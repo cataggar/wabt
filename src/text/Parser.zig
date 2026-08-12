@@ -685,7 +685,7 @@ const Parser = struct {
                         }
                     } else if (ht.kind == .identifier) {
                         // Validate named type references
-                        if (self.type_names.get(ht.text)) |idx| {
+                        if (self.lookupName(&self.type_names, ht.text)) |idx| {
                             resolved_type_idx = idx;
                             if (self.in_rec) {
                                 if (idx >= self.rec_end) self.markMalformed(@src());
@@ -698,6 +698,8 @@ const Parser = struct {
                                     if (idx >= mod.module_types.items.len) self.markMalformed(@src());
                                 }
                             }
+                        } else {
+                            self.markMalformed(@src());
                         }
                     }
                 }
@@ -6427,6 +6429,70 @@ test "table and global import spellings preserve concrete reference indices" {
             },
             else => unreachable,
         }
+    }
+}
+
+test "quoted type names resolve in imports and function signatures" {
+    const import_cases = [_]struct {
+        source: []const u8,
+        kind: types.ExternalKind,
+    }{
+        .{
+            .source = "(module (type $t (func)) (import \"m\" \"t\" (table 1 (ref null $\"t\"))))",
+            .kind = .table,
+        },
+        .{
+            .source = "(module (type $t (func)) (table (import \"m\" \"t\") 1 (ref null $\"t\")))",
+            .kind = .table,
+        },
+        .{
+            .source = "(module (type $t (func)) (import \"m\" \"g\" (global (mut (ref null $\"t\")))))",
+            .kind = .global,
+        },
+        .{
+            .source = "(module (type $t (func)) (global (import \"m\" \"g\") (ref null $\"t\")))",
+            .kind = .global,
+        },
+    };
+
+    for (import_cases) |case| {
+        var module = try parseModule(std.testing.allocator, case.source);
+        defer module.deinit();
+        switch (case.kind) {
+            .table => {
+                try std.testing.expectEqual(@as(u32, 0), module.imports.items[0].table_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.tables.items[0].type_idx);
+            },
+            .global => {
+                try std.testing.expectEqual(@as(u32, 0), module.imports.items[0].global_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), module.globals.items[0].type_idx);
+            },
+            else => unreachable,
+        }
+        try Validator.validate(&module, .{});
+    }
+
+    var function = try parseModule(std.testing.allocator,
+        \\(module
+        \\  (type $t (func))
+        \\  (func (param (ref null $"t")) local.get 0 drop)
+        \\)
+    );
+    defer function.deinit();
+    const func_type_idx = function.funcs.items[0].decl.type_var.index;
+    const func_type = function.module_types.items[func_type_idx].func_type;
+    try std.testing.expectEqual(@as(u32, 0), func_type.param_type_idxs[0]);
+    try Validator.validate(&function, .{});
+}
+
+test "undefined quoted concrete type names remain invalid" {
+    const cases = [_][]const u8{
+        "(module (import \"m\" \"t\" (table 1 (ref null $\"missing\"))))",
+        "(module (import \"m\" \"g\" (global (ref null $\"missing\"))))",
+        "(module (func (param (ref null $\"missing\"))))",
+    };
+    for (cases) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
     }
 }
 
