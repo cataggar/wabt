@@ -4149,9 +4149,11 @@ const Parser = struct {
             0xFFFFFFFF;
         // Parse optional table initializer expression: (ref.null func) etc.
         var table_init_bytes: []const u8 = &.{};
+        var owns_table_init_bytes = false;
         if (self.peek().kind == .l_paren) {
             _ = self.advance(); // consume '('
             var init_code: std.ArrayListUnmanaged(u8) = .empty;
+            defer init_code.deinit(self.allocator);
             const inner = self.advance();
             if (inner.kind == .kw_ref_null) {
                 init_code.append(self.allocator, 0xd0) catch {};
@@ -4189,11 +4191,15 @@ const Parser = struct {
                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
             }
             if (self.peek().kind == .r_paren) _ = self.advance();
-            table_init_bytes = init_code.toOwnedSlice(self.allocator) catch &.{};
+            table_init_bytes = try init_code.toOwnedSlice(self.allocator);
+            owns_table_init_bytes = true;
         }
+        errdefer if (owns_table_init_bytes and table_init_bytes.len > 0)
+            self.allocator.free(table_init_bytes);
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
             .init_expr_bytes = table_init_bytes,
+            .owns_init_expr_bytes = owns_table_init_bytes,
             .type_idx = table_type_idx,
             .is_table64 = is_table64,
         });
@@ -7187,6 +7193,22 @@ test "a memory or table states shared and its page size in every position" {
     // The bounds are still the bounds, not the page size.
     try std.testing.expectEqual(@as(u64, 1), ps.memories.items[0].type.limits.initial);
     try std.testing.expectEqual(@as(u64, 2), ps.memories.items[1].type.limits.initial);
+}
+
+test "a parsed table initializer is released with its module" {
+    const allocator = std.testing.allocator;
+    var module = try parseModule(
+        allocator,
+        \\(module (table 1 funcref (ref.null func)))
+    );
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xd0, 0x70 },
+        module.tables.items[0].init_expr_bytes,
+    );
+    try std.testing.expect(module.tables.items[0].owns_init_expr_bytes);
 }
 
 test "a page size survives being written back out" {

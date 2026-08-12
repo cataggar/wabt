@@ -245,7 +245,11 @@ pub const Global = struct {
 pub const Table = struct {
     name: ?[]const u8 = null,
     @"type": types.TableType = .{},
+    /// Raw bytecode for the init expression (constant expr).
+    /// Points into the original wasm bytes (binary path) or an owned buffer (text path).
     init_expr_bytes: []const u8 = &.{},
+    /// True when init_expr_bytes is an owned allocation that must be freed.
+    owns_init_expr_bytes: bool = false,
     type_idx: u32 = 0xFFFFFFFF,
     loc: Location = .{},
     is_import: bool = false,
@@ -431,6 +435,11 @@ pub const Module = struct {
             }
         }
         self.funcs.deinit(self.allocator);
+        for (self.tables.items) |*table| {
+            if (table.owns_init_expr_bytes and table.init_expr_bytes.len > 0) {
+                self.allocator.free(table.init_expr_bytes);
+            }
+        }
         self.tables.deinit(self.allocator);
         self.memories.deinit(self.allocator);
         for (self.globals.items) |*g| {
