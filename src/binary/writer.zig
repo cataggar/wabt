@@ -646,6 +646,53 @@ test "round-trip type section" {
     try std.testing.expectEqual(@as(usize, 1), module.module_types.items.len);
 }
 
+test "concrete table and global import indices survive text and binary round trips" {
+    const Parser = @import("../text/Parser.zig");
+    const TextWriter = @import("../text/Writer.zig");
+    const Validator = @import("../Validator.zig");
+    const cases = [_][]const u8{
+        "(module (type $t (func)) (import \"m\" \"t\" (table 1 (ref null $t))))",
+        "(module (type $t (func)) (table (import \"m\" \"t\") 1 (ref null $t)))",
+        "(module (type (func)) (import \"m\" \"t\" (table 1 (ref null 0))))",
+        "(module (type (func)) (table (import \"m\" \"t\") 1 (ref null 0)))",
+        "(module (type $t (func)) (import \"m\" \"g\" (global (ref null $t))))",
+        "(module (type $t (func)) (global (import \"m\" \"g\") (ref null $t)))",
+        "(module (type (func)) (import \"m\" \"g\" (global (mut (ref null 0)))))",
+        "(module (type (func)) (global (import \"m\" \"g\") (mut (ref null 0))))",
+    };
+
+    for (cases) |source| {
+        var module = try Parser.parseModule(std.testing.allocator, source);
+        defer module.deinit();
+        try Validator.validate(&module, .{});
+
+        const wasm = try writeModule(std.testing.allocator, &module);
+        defer std.testing.allocator.free(wasm);
+        var binary_round_trip = try reader.readModule(std.testing.allocator, wasm);
+        defer binary_round_trip.deinit();
+        try Validator.validate(&binary_round_trip, .{});
+
+        const wat = try TextWriter.writeModule(std.testing.allocator, &binary_round_trip);
+        defer std.testing.allocator.free(wat);
+        var text_round_trip = try Parser.parseModule(std.testing.allocator, wat);
+        defer text_round_trip.deinit();
+        try Validator.validate(&text_round_trip, .{});
+
+        const import = text_round_trip.imports.items[0];
+        switch (import.kind) {
+            .table => {
+                try std.testing.expectEqual(@as(u32, 0), import.table_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), text_round_trip.tables.items[0].type_idx);
+            },
+            .global => {
+                try std.testing.expectEqual(@as(u32, 0), import.global_type_idx);
+                try std.testing.expectEqual(@as(u32, 0), text_round_trip.globals.items[0].type_idx);
+            },
+            else => unreachable,
+        }
+    }
+}
+
 test "round-trip memory section" {
     const allocator = std.testing.allocator;
     const input = [_]u8{

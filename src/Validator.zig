@@ -151,6 +151,8 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
     for (m.tables.items) |table| {
         if (!table.type.elem_type.isRefType())
             return error.InvalidElemType;
+        if (!checkConcreteTypeIndex(m, table.type.elem_type, table.type_idx))
+            return error.InvalidTypeIndex;
         // Non-nullable ref types require init expr (tables without init are invalid)
         const vt = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
         if (vt.isNonNullableRef())
@@ -190,6 +192,8 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
 fn checkGlobals(m: *const Mod.Module, options: Options) Error!void {
     for (m.globals.items, 0..) |global, i| {
         if (!global.type.val_type.isNumType() and !global.type.val_type.isRefType())
+            return error.InvalidTypeIndex;
+        if (!checkConcreteTypeIndex(m, global.type.val_type, global.type_idx))
             return error.InvalidTypeIndex;
         // Validate init expression for non-imported globals
         if (!global.is_import) {
@@ -2662,6 +2666,68 @@ test "validate type mismatch via text parser" {
     var module = try Parser.parseModule(alloc, "(module (func (result i32)))");
     defer module.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+}
+
+test "concrete table and global imports validate in both text spellings" {
+    const Parser = @import("text/Parser.zig");
+    const cases = [_][]const u8{
+        \\(module (type $t (func))
+        \\  (import "m" "t" (table $tab 1 (ref null $t)))
+        \\  (func (result (ref null $t)) i32.const 0 table.get $tab))
+        ,
+        \\(module (type $t (func))
+        \\  (table $tab (import "m" "t") 1 (ref null $t))
+        \\  (func (result (ref null $t)) i32.const 0 table.get $tab))
+        ,
+        \\(module (type (func))
+        \\  (import "m" "t" (table $tab 1 (ref null 0)))
+        \\  (func (result (ref null 0)) i32.const 0 table.get $tab))
+        ,
+        \\(module (type (func))
+        \\  (table $tab (import "m" "t") 1 (ref null 0))
+        \\  (func (result (ref null 0)) i32.const 0 table.get $tab))
+        ,
+        \\(module (type $t (func))
+        \\  (import "m" "g" (global $g (ref null $t)))
+        \\  (func (result (ref null $t)) global.get $g))
+        ,
+        \\(module (type $t (func))
+        \\  (global $g (import "m" "g") (ref null $t))
+        \\  (func (result (ref null $t)) global.get $g))
+        ,
+        \\(module (type (func))
+        \\  (import "m" "g" (global $g (mut (ref null 0))))
+        \\  (func (result (ref null 0)) global.get $g))
+        ,
+        \\(module (type (func))
+        \\  (global $g (import "m" "g") (mut (ref null 0)))
+        \\  (func (result (ref null 0)) global.get $g))
+        ,
+    };
+
+    for (cases) |source| {
+        var module = try Parser.parseModule(std.testing.allocator, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+}
+
+test "concrete table and global imports reject invalid type indices" {
+    const Parser = @import("text/Parser.zig");
+
+    var table_module = try Parser.parseModule(std.testing.allocator,
+        "(module (type (func)) (import \"m\" \"t\" (table 1 (ref null 0))))",
+    );
+    defer table_module.deinit();
+    table_module.tables.items[0].type_idx = 1;
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&table_module, .{}));
+
+    var global_module = try Parser.parseModule(std.testing.allocator,
+        "(module (type (func)) (import \"m\" \"g\" (global (ref null 0))))",
+    );
+    defer global_module.deinit();
+    global_module.globals.items[0].type_idx = 1;
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&global_module, .{}));
 }
 
 test "return with empty operand in store should fail" {
