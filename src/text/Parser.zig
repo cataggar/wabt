@@ -5242,6 +5242,13 @@ const Parser = struct {
         // rather than function indices, whether or not there are any: an
         // empty segment still has to carry its type through to the binary.
         seg.uses_elem_exprs = has_elem_type and !has_bare_index;
+        // The function-index forms infer `(ref func)`, not `funcref`.
+        // Their encoding has no reftype field, so retain that inferred type
+        // explicitly for validation and other IR consumers.
+        if (!seg.uses_elem_exprs) {
+            seg.elem_type = .ref_func;
+            seg.elem_type_idx = types.invalid_index;
+        }
 
         if (elem_expr_count > 0) {
             seg.elem_expr_bytes = elem_expr_code.toOwnedSlice(self.allocator) catch &.{};
@@ -8077,7 +8084,7 @@ test "the function-index forms of an element segment still read as before" {
         defer module.deinit();
         const seg = module.elem_segments.items[0];
         try std.testing.expectEqual(types.SegmentKind.active, seg.kind);
-        try std.testing.expectEqual(types.ValType.funcref, seg.elem_type);
+        try std.testing.expectEqual(types.ValType.ref_func, seg.elem_type);
         try std.testing.expectEqual(@as(u32, 0), seg.elem_expr_count);
         try std.testing.expect(!seg.uses_elem_exprs);
         try std.testing.expectEqual(@as(usize, 2), seg.elem_var_indices.items.len);
@@ -8085,13 +8092,21 @@ test "the function-index forms of an element segment still read as before" {
         try std.testing.expectEqual(@as(u32, 1), seg.elem_var_indices.items[1].index);
     }
 
-    // A declarative segment of function indices keeps funcref and its kind.
+    // Passive and declarative function-index segments infer `(ref func)`.
+    var passive = try parseModule(allocator,
+        \\(module (func $f) (elem func $f))
+    );
+    defer passive.deinit();
+    try std.testing.expectEqual(types.SegmentKind.passive, passive.elem_segments.items[0].kind);
+    try std.testing.expectEqual(types.ValType.ref_func, passive.elem_segments.items[0].elem_type);
+    try std.testing.expect(!passive.elem_segments.items[0].uses_elem_exprs);
+
     var declared = try parseModule(allocator,
         \\(module (func $f) (elem declare func $f))
     );
     defer declared.deinit();
     try std.testing.expectEqual(types.SegmentKind.declared, declared.elem_segments.items[0].kind);
-    try std.testing.expectEqual(types.ValType.funcref, declared.elem_segments.items[0].elem_type);
+    try std.testing.expectEqual(types.ValType.ref_func, declared.elem_segments.items[0].elem_type);
     try std.testing.expect(!declared.elem_segments.items[0].uses_elem_exprs);
 
     // `(item expr)` is the long spelling of an element expression.

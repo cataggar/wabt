@@ -5544,6 +5544,22 @@ test "table.init and table.copy validate the same whichever front end built the 
             " (func i64.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = true },
         .{ .wat = "(module (table i64 4 funcref) (elem funcref)" ++
             " (func i64.const 0 i64.const 0 i64.const 0 table.init 0 0))", .ok = false },
+        // Function-index segments infer non-nullable `(ref func)`. They
+        // initialise a matching table, both as passive and declarative
+        // segments, and an active segment also suits the table at module
+        // validation time.
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (elem (i32.const 0) func 0))", .ok = true },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0)) (elem func 0)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = true },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0)) (elem declare func 0)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = true },
+        // `(ref func)` is not a subtype of nullable bottom `(ref null
+        // nofunc)`: this covers table.init and active segment validation.
+        .{ .wat = "(module (type (func)) (func) (table 1 nullfuncref) (elem func 0)" ++
+            " (func i32.const 0 i32.const 0 i32.const 0 table.init 0 0))", .ok = false },
+        .{ .wat = "(module (type (func)) (func) (table 1 nullfuncref)" ++
+            " (elem (i32.const 0) func 0))", .ok = false },
         .{ .wat = "(module (table 4 funcref) (func table.copy 0 0))", .ok = false },
         .{ .wat = "(module (table 4 funcref)" ++
             " (func i32.const 0 i32.const 0 i32.const 0 table.copy 0 0))", .ok = true },
