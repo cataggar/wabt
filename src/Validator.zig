@@ -1750,30 +1750,37 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                     },
                     0x0f => { // table.grow
                         const tbl_idx = readU32(bytes, &pos);
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, tbl_idx)));
-                        if (tbl_idx < m.tables.items.len) {
-                            const elem_t = StackType.fromValTypeAndIndex(m.tables.items[tbl_idx].@"type".elem_type, m.tables.items[tbl_idx].type_idx);
-                            try popExpect(m, &val_stack, &ctrl_stack, elem_t);
-                        } else {
-                            _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
-                        }
-                        val_stack.append(gpa(m), StackType.known(tableIndexType(m, tbl_idx))) catch return error.OutOfMemory;
+                        // Bounds first: `tableIndexType` answers i32 for a
+                        // table that is not there, so checking it later would
+                        // report a bad table index as a type error instead --
+                        // and a missing table has no element type to check
+                        // the value against at all.
+                        if (tbl_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                        const it = tableIndexType(m, tbl_idx);
+                        // The delta and the old size the instruction answers
+                        // with both count the table's entries, so both follow
+                        // its index type; between them is the value the new
+                        // entries take, which is one of the table's elements.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, tableElemStackType(m, tbl_idx)); // init
+                        val_stack.append(gpa(m), StackType.known(it)) catch return error.OutOfMemory;
                     },
                     0x10 => { // table.size
                         const tbl_idx = readU32(bytes, &pos);
+                        if (tbl_idx >= m.tables.items.len) return error.InvalidTableIndex;
+                        // The size counts the table's entries, so it is of
+                        // the table's index type.
                         val_stack.append(gpa(m), StackType.known(tableIndexType(m, tbl_idx))) catch return error.OutOfMemory;
                     },
                     0x11 => { // table.fill
                         const tbl_idx = readU32(bytes, &pos);
+                        if (tbl_idx >= m.tables.items.len) return error.InvalidTableIndex;
                         const it = tableIndexType(m, tbl_idx);
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it));
-                        if (tbl_idx < m.tables.items.len) {
-                            const elem_t = StackType.fromValTypeAndIndex(m.tables.items[tbl_idx].@"type".elem_type, m.tables.items[tbl_idx].type_idx);
-                            try popExpect(m, &val_stack, &ctrl_stack, elem_t);
-                        } else {
-                            _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
-                        }
-                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it));
+                        // The destination and the length index the table; the
+                        // value written between them is one of its elements.
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // n
+                        try popExpect(m, &val_stack, &ctrl_stack, tableElemStackType(m, tbl_idx)); // val
+                        try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // dst
                     },
                     else => return classifyOpcode(Opcode.prefix_math, sub),
                 }
@@ -5621,6 +5628,326 @@ test "table.init and table.copy validate the same whichever front end built the 
         var read_back = try binary_reader.readModule(alloc, bytes);
         defer read_back.deinit();
         if (c.ok) try validate(&read_back, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&read_back, .{}));
+    }
+}
+
+// ── table.grow, table.size and table.fill tests ─────────────────────────
+
+/// `ref.null func`, `ref.null extern` and `ref.null nofunc`: one null of an
+/// abstract heap type each, for the value `table.grow` and `table.fill`
+/// write into a table.
+const ref_null_func = [_]u8{ 0xd0, 0x70 };
+const ref_null_extern = [_]u8{ 0xd0, 0x6f };
+const ref_null_nofunc = [_]u8{ 0xd0, 0x73 };
+
+/// `table.grow 0`, `table.size 0` and `table.fill 0`.
+const grow_0 = [_]u8{ 0xfc, 0x0f, 0x00 };
+const size_0 = [_]u8{ 0xfc, 0x10, 0x00 };
+const fill_0 = [_]u8{ 0xfc, 0x11, 0x00 };
+const drop_end = [_]u8{ 0x1a, 0x0b };
+const end_only = [_]u8{0x0b};
+
+test "table.grow pops a delta and a value and answers the old size" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        // Nothing to pop at all.
+        .{ .body = &(grow_0 ++ drop_end), .ok = false },
+        // The delta alone, then the value alone.
+        .{ .body = &(i32_zero ++ grow_0 ++ drop_end), .ok = false },
+        .{ .body = &(ref_null_func ++ grow_0 ++ drop_end), .ok = false },
+        // The value is pushed first and the delta second.
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .ok = true },
+        .{ .body = &(i32_zero ++ ref_null_func ++ grow_0 ++ drop_end), .ok = false },
+        // A wrong delta...
+        .{ .body = &(ref_null_func ++ f32_zero ++ grow_0 ++ drop_end), .ok = false },
+        // ...and a wrong value: a funcref table takes no externref.
+        .{ .body = &(ref_null_extern ++ i32_zero ++ grow_0 ++ drop_end), .ok = false },
+        // The old size is pushed, so leaving it behind is a leftover value
+        // in a function that returns nothing.
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ end_only), .ok = false },
+        // Exactly two operands are popped, so a third is left behind.
+        .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, &funcref_table, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.size answers one value and pops nothing" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &(size_0 ++ drop_end), .ok = true },
+        // The size is pushed, so it has to go somewhere.
+        .{ .body = &(size_0 ++ end_only), .ok = false },
+        // Exactly one value is pushed, so a second drop empties too much.
+        .{ .body = &(size_0 ++ [_]u8{0x1a} ++ drop_end), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, &funcref_table, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.fill pops a destination, a value and a length" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, ok: bool }{
+        .{ .body = &(fill_0 ++ end_only), .ok = false },
+        .{ .body = &(i32_zero ++ fill_0 ++ end_only), .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_func ++ fill_0 ++ end_only), .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = true },
+        // A fourth operand is left behind.
+        .{ .body = &(i32_zero ** 2 ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
+        // A wrong destination, value and length in turn.
+        .{ .body = &(f32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_extern ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_func ++ f32_zero ++ fill_0 ++ end_only), .ok = false },
+        // The value sits between the two indices, not beside them.
+        .{ .body = &(ref_null_func ++ i32_zero ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, &funcref_table, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.grow, table.size and table.fill check the table they name" {
+    const alloc = std.testing.allocator;
+    // Each of the three read their immediate and never bounds-checked it.
+    // `tableIndexType` answers i32 for a table that is not there, so the
+    // index type it stands in for made the instruction validate: in a module
+    // with no table at all, `table.size 0` pushed an i32 and passed.
+    const grow_3 = [_]u8{ 0xfc, 0x0f, 0x03 };
+    const size_3 = [_]u8{ 0xfc, 0x10, 0x03 };
+    const fill_3 = [_]u8{ 0xfc, 0x11, 0x03 };
+    const grow_ops = ref_null_func ++ i32_zero;
+    const fill_ops = i32_zero ++ ref_null_func ++ i32_zero;
+
+    const cases = [_]struct { body: []const u8, tables: []const TestTable }{
+        // A table the module does not have, with the operands the
+        // instruction wants...
+        .{ .body = &(grow_ops ++ grow_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &(size_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &(fill_ops ++ fill_3 ++ end_only), .tables = &funcref_table },
+        // ...and with no operands at all, where the bad index is the only
+        // thing wrong that could be reported first.
+        .{ .body = &(grow_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &(fill_3 ++ end_only), .tables = &funcref_table },
+        // A module with no tables whatsoever.
+        .{ .body = &(grow_ops ++ grow_0 ++ drop_end), .tables = &.{} },
+        .{ .body = &(size_0 ++ drop_end), .tables = &.{} },
+        .{ .body = &(fill_ops ++ fill_0 ++ end_only), .tables = &.{} },
+        // Unreachable code excuses the missing operands but not the index.
+        .{ .body = &([_]u8{0x00} ++ grow_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &([_]u8{0x00} ++ size_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &([_]u8{0x00} ++ fill_3 ++ end_only), .tables = &funcref_table },
+        // A bad index outranks a bad operand, which is the order the
+        // reference implementation reports the two in.
+        .{ .body = &(f32_zero ++ f32_zero ++ grow_3 ++ drop_end), .tables = &funcref_table },
+        .{ .body = &(f32_zero ** 3 ++ fill_3 ++ end_only), .tables = &funcref_table },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, c.tables, &.{}, c.body);
+        defer m.deinit();
+        try std.testing.expectError(error.InvalidTableIndex, validate(&m, .{}));
+    }
+}
+
+test "table.grow, table.size and table.fill speak the named table's index type" {
+    const alloc = std.testing.allocator;
+    const table64 = [_]TestTable{.{ .is_64 = true }};
+    // Table 0 is 32-bit and table 1 is 64-bit.
+    const mixed = [_]TestTable{ .{}, .{ .is_64 = true } };
+    const i32_eqz = [_]u8{0x45};
+    const i64_eqz = [_]u8{0x50};
+    const grow_1 = [_]u8{ 0xfc, 0x0f, 0x01 };
+    const size_1 = [_]u8{ 0xfc, 0x10, 0x01 };
+    const fill_1 = [_]u8{ 0xfc, 0x11, 0x01 };
+
+    const cases = [_]struct { body: []const u8, tables: []const TestTable, ok: bool }{
+        // The delta and the old size both count entries, so both follow the
+        // table's index type. `i64.eqz` accepts only an i64, so it is what
+        // proves the result widened rather than merely being ignored.
+        .{ .body = &(ref_null_func ++ i64_zero ++ grow_0 ++ i64_eqz ++ drop_end), .tables = &table64, .ok = true },
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .tables = &table64, .ok = false },
+        .{ .body = &(ref_null_func ++ i64_zero ++ grow_0 ++ i32_eqz ++ drop_end), .tables = &table64, .ok = false },
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ i32_eqz ++ drop_end), .tables = &funcref_table, .ok = true },
+        .{ .body = &(ref_null_func ++ i64_zero ++ grow_0 ++ drop_end), .tables = &funcref_table, .ok = false },
+        // The size answers in the index type too.
+        .{ .body = &(size_0 ++ i64_eqz ++ drop_end), .tables = &table64, .ok = true },
+        .{ .body = &(size_0 ++ i32_eqz ++ drop_end), .tables = &table64, .ok = false },
+        .{ .body = &(size_0 ++ i32_eqz ++ drop_end), .tables = &funcref_table, .ok = true },
+        // The destination and the length index the table; the value between
+        // them is an element and has no width to widen.
+        .{ .body = &(i64_zero ++ ref_null_func ++ i64_zero ++ fill_0 ++ end_only), .tables = &table64, .ok = true },
+        .{ .body = &(i32_zero ++ ref_null_func ++ i64_zero ++ fill_0 ++ end_only), .tables = &table64, .ok = false },
+        .{ .body = &(i64_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .tables = &table64, .ok = false },
+        .{ .body = &(i64_zero ++ ref_null_func ++ i64_zero ++ fill_0 ++ end_only), .tables = &funcref_table, .ok = false },
+        // The table the immediate names is the one that decides, not table 0.
+        .{ .body = &(ref_null_func ++ i64_zero ++ grow_1 ++ i64_eqz ++ drop_end), .tables = &mixed, .ok = true },
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_1 ++ drop_end), .tables = &mixed, .ok = false },
+        .{ .body = &(size_1 ++ i64_eqz ++ drop_end), .tables = &mixed, .ok = true },
+        .{ .body = &(size_0 ++ i64_eqz ++ drop_end), .tables = &mixed, .ok = false },
+        .{ .body = &(i64_zero ++ ref_null_func ++ i64_zero ++ fill_1 ++ end_only), .tables = &mixed, .ok = true },
+        .{ .body = &(i64_zero ++ ref_null_func ++ i64_zero ++ fill_0 ++ end_only), .tables = &mixed, .ok = false },
+        // Unreachable code supplies the missing operands but not their
+        // types: a 64-bit table still counts in i64.
+        .{ .body = &([_]u8{0x00} ++ i64_zero ++ fill_0 ++ end_only), .tables = &table64, .ok = true },
+        .{ .body = &([_]u8{0x00} ++ i32_zero ++ fill_0 ++ end_only), .tables = &table64, .ok = false },
+        .{ .body = &([_]u8{0x00} ++ i64_zero ++ grow_0 ++ drop_end), .tables = &table64, .ok = true },
+        .{ .body = &([_]u8{0x00} ++ i32_zero ++ grow_0 ++ drop_end), .tables = &table64, .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, c.tables, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "table.grow and table.fill write a value the table's elements accept" {
+    const alloc = std.testing.allocator;
+    const externref_table = [_]TestTable{.{ .elem = .externref }};
+    // Type 0 is `(func)`, so this table holds `(ref null 0)`.
+    const concrete_table = [_]TestTable{.{ .elem = .concrete_ref_null, .type_idx = 0 }};
+    // A table whose element type has no null needs an initializer:
+    // ref.func 0, end.
+    const ref_func_init = [_]u8{ 0xd2, 0x00, 0x0b };
+    const nonnull_table = [_]TestTable{.{ .elem = .ref_func, .init_expr_bytes = &ref_func_init }};
+
+    const cases = [_]struct { body: []const u8, tables: []const TestTable, ok: bool }{
+        .{ .body = &(ref_null_extern ++ i32_zero ++ grow_0 ++ drop_end), .tables = &externref_table, .ok = true },
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .tables = &externref_table, .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_extern ++ i32_zero ++ fill_0 ++ end_only), .tables = &externref_table, .ok = true },
+        .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .tables = &externref_table, .ok = false },
+        // A subtype of the element type is written; a supertype is not.
+        // `nullfuncref` is below every function reference, `funcref` above
+        // the concrete one.
+        .{ .body = &(ref_null_nofunc ++ i32_zero ++ grow_0 ++ drop_end), .tables = &concrete_table, .ok = true },
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .tables = &concrete_table, .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_nofunc ++ i32_zero ++ fill_0 ++ end_only), .tables = &concrete_table, .ok = true },
+        .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .tables = &concrete_table, .ok = false },
+        // A table whose elements have no null takes no null.
+        .{ .body = &(ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .tables = &nonnull_table, .ok = false },
+        .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .tables = &nonnull_table, .ok = false },
+        // The element type is checked in unreachable code as well, where the
+        // value is not popped from anything.
+        .{ .body = &([_]u8{0x00} ++ ref_null_func ++ i32_zero ++ grow_0 ++ drop_end), .tables = &externref_table, .ok = false },
+        .{ .body = &([_]u8{0x00} ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .tables = &nonnull_table, .ok = false },
+    };
+    for (cases) |c| {
+        var m = try testTableModule(alloc, c.tables, &.{}, c.body);
+        defer m.deinit();
+        if (c.ok) try validate(&m, .{}) else try std.testing.expectError(error.TypeMismatch, validate(&m, .{}));
+    }
+}
+
+test "a truncated table immediate is not taken for a table that exists" {
+    const alloc = std.testing.allocator;
+    // A body that stops in the middle of an instruction reads a zero for the
+    // immediate that is not there, so the bounds check is what stands
+    // between a truncated `table.size` and the module's first table.
+    var no_tables = try testTableModule(alloc, &.{}, &.{}, &[_]u8{ 0xfc, 0x10 });
+    defer no_tables.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&no_tables, .{}));
+
+    // With a table present the instruction reads as `table.size 0`, but the
+    // body still ends without its `end`.
+    var truncated = try testTableModule(alloc, &funcref_table, &.{}, &[_]u8{ 0xfc, 0x10 });
+    defer truncated.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&truncated, .{}));
+
+    // The `end` of a body whose immediate is missing is read as the
+    // immediate -- 0x0b is 11 -- and 11 is not a table this module has.
+    var eats_end = try testTableModule(alloc, &funcref_table, &.{}, &[_]u8{ 0xfc, 0x10, 0x0b });
+    defer eats_end.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&eats_end, .{}));
+
+    // An immediate whose LEB128 never ends is not a table index either.
+    var unfinished = try testTableModule(alloc, &funcref_table, &.{}, &[_]u8{ 0xfc, 0x10, 0x80 });
+    defer unfinished.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&unfinished, .{}));
+
+    var grow_cut = try testTableModule(alloc, &.{}, &.{}, &(ref_null_func ++ i32_zero ++ [_]u8{ 0xfc, 0x0f }));
+    defer grow_cut.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&grow_cut, .{}));
+
+    var fill_cut = try testTableModule(alloc, &.{}, &.{}, &(i32_zero ++ ref_null_func ++ i32_zero ++ [_]u8{ 0xfc, 0x11 }));
+    defer fill_cut.deinit();
+    try std.testing.expectError(error.InvalidTableIndex, validate(&fill_cut, .{}));
+
+    // A binary whose code section stops mid-instruction does not reach the
+    // validator at all: the reader rejects the section.
+    const binary_reader = @import("binary/reader.zig");
+    const truncated_module = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, // magic, version
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type: (func)
+        0x03, 0x02, 0x01, 0x00, // function: one func of type 0
+        0x04, 0x04, 0x01, 0x70, 0x00, 0x01, // table: one funcref table
+        0x0a, 0x05, 0x01, 0x03, 0x00, 0xfc, 0x10, // code: table.size, no immediate
+    };
+    try std.testing.expectError(error.InvalidSection, binary_reader.readModule(alloc, &truncated_module));
+}
+
+test "table.grow, table.size and table.fill validate the same whichever front end built the module" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const writer = @import("binary/writer.zig");
+
+    const cases = [_]struct { wat: []const u8, err: ?Error }{
+        .{ .wat = "(module (table 1 funcref) (func ref.null func i32.const 1 table.grow drop))", .err = null },
+        // The table index may be omitted, and it means table 0 either way.
+        .{ .wat = "(module (table 1 funcref) (func ref.null func i32.const 1 table.grow 0 drop))", .err = null },
+        .{ .wat = "(module (table 1 funcref) (func ref.null func i32.const 1 table.grow 3 drop))", .err = error.InvalidTableIndex },
+        .{ .wat = "(module (table 1 funcref) (func table.size drop))", .err = null },
+        .{ .wat = "(module (table 1 funcref) (func table.size 3 drop))", .err = error.InvalidTableIndex },
+        // A module with no table at all: `table.size 0` used to push the i32
+        // that stands in for a missing table's index type and pass.
+        .{ .wat = "(module (func table.size 0 drop))", .err = error.InvalidTableIndex },
+        .{ .wat = "(module (func ref.null func i32.const 1 table.grow 0 drop))", .err = error.InvalidTableIndex },
+        .{ .wat = "(module (func i32.const 0 ref.null func i32.const 0 table.fill 0))", .err = error.InvalidTableIndex },
+        .{ .wat = "(module (table 1 funcref) (func i32.const 0 ref.null func i32.const 0 table.fill))", .err = null },
+        .{ .wat = "(module (table 1 funcref) (func i32.const 0 ref.null func i32.const 0 table.fill 3))", .err = error.InvalidTableIndex },
+        // A bad index is reported from unreachable code too.
+        .{ .wat = "(module (table 1 funcref) (func unreachable table.size 3 drop))", .err = error.InvalidTableIndex },
+        // table64: the delta, the size and the fill's two indices are i64.
+        .{ .wat = "(module (table i64 1 funcref) (func ref.null func i64.const 1 table.grow drop))", .err = null },
+        .{ .wat = "(module (table i64 1 funcref) (func ref.null func i32.const 1 table.grow drop))", .err = error.TypeMismatch },
+        .{ .wat = "(module (table i64 1 funcref) (func table.size i64.eqz drop))", .err = null },
+        .{ .wat = "(module (table i64 1 funcref) (func i64.const 0 ref.null func i64.const 0 table.fill))", .err = null },
+        .{ .wat = "(module (table i64 1 funcref) (func i64.const 0 ref.null func i32.const 0 table.fill))", .err = error.TypeMismatch },
+        // The table named decides, not table 0.
+        .{ .wat = "(module (table 1 funcref) (table i64 1 funcref) (func table.size 1 i64.eqz drop))", .err = null },
+        .{ .wat = "(module (table 1 funcref) (table i64 1 funcref) (func table.size 0 i64.eqz drop))", .err = error.TypeMismatch },
+        // The value written has to suit the table's elements.
+        .{ .wat = "(module (table 1 externref) (func ref.null func i32.const 1 table.grow drop))", .err = error.TypeMismatch },
+        .{ .wat = "(module (table 1 externref) (func ref.null extern i32.const 1 table.grow drop))", .err = null },
+        .{ .wat = "(module (type (func)) (table 1 (ref null 0))" ++
+            " (func i32.const 0 ref.null nofunc i32.const 0 table.fill))", .err = null },
+        .{ .wat = "(module (type (func)) (table 1 (ref null 0))" ++
+            " (func i32.const 0 ref.null func i32.const 0 table.fill))", .err = error.TypeMismatch },
+        .{ .wat = "(module (type (func)) (func) (elem declare func 0) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.func 0 i32.const 1 table.grow drop))", .err = null },
+        .{ .wat = "(module (type (func)) (func) (table 1 (ref func) (ref.func 0))" ++
+            " (func ref.null func i32.const 1 table.grow drop))", .err = error.TypeMismatch },
+    };
+
+    for (cases) |c| {
+        var parsed = try Parser.parseModule(alloc, c.wat);
+        defer parsed.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&parsed, .{})) else try validate(&parsed, .{});
+
+        // The same module written out and read back must reach the same
+        // verdict: the two front ends fill in tables differently, and a
+        // table index that no table answers to must survive the trip.
+        const bytes = try writer.writeModule(alloc, &parsed);
+        defer alloc.free(bytes);
+        var read_back = try binary_reader.readModule(alloc, bytes);
+        defer read_back.deinit();
+        if (c.err) |e| try std.testing.expectError(e, validate(&read_back, .{})) else try validate(&read_back, .{});
     }
 }
 
