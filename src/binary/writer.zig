@@ -475,33 +475,34 @@ const Writer = struct {
         const ph = try self.beginSection(9);
         try self.writeU32Leb(@intCast(module.elem_segments.items.len));
         for (module.elem_segments.items) |seg| {
-            const has_table_idx = seg.kind == .active and seg.table_var.index != 0;
+            // `table 0` can be explicit too. Preserve that distinction after
+            // text or binary round trips, while still accepting callers that
+            // only populated the non-default table index in the legacy IR.
+            const has_table_idx = seg.kind == .active and
+                (seg.has_explicit_table_index or seg.table_var.index != 0);
             // A segment that names a reference type holds expressions even
             // when it holds none of them: an empty segment of some other
             // type still has to say which type, and only the expression
             // form has anywhere to say it.
             const has_exprs = seg.elem_expr_bytes.len > 0 or seg.uses_elem_exprs;
 
-            // Compute flags per the wasm binary format:
-            // bit 0: passive/declared (non-active)
-            // bit 1: explicit table index (or elemkind/reftype for non-active)
-            // bit 2: elem expressions instead of function indices
-            var flags: u32 = 0;
-            if (seg.kind == .passive) flags |= 1;
-            if (seg.kind == .declared) flags |= 3;
-            if (has_table_idx) flags |= 2;
-            if (has_exprs) flags |= 4;
-            // For passive/declared with func indices, bit 1 is set to indicate elemkind
-            if (seg.kind != .active and !has_exprs) flags |= 2;
-            // Active expr segments with non-default reftype need explicit table idx (flags=6)
-            // so the reftype byte is included in the encoding
-            const needs_explicit_reftype = has_exprs and seg.kind == .active and
-                seg.elem_type != .funcref and (flags & 2 == 0);
-            if (needs_explicit_reftype) flags |= 2;
+            // The eight element flags are distinct encodings, not independent
+            // bits: a passive function-index segment is flag 1, while flag 3
+            // is declarative. Expression segments whose active table is
+            // implicit only use flag 4 for funcref; every other reference type
+            // needs flag 6 so its reftype has a place in the binary.
+            const needs_explicit_reftype = has_exprs and seg.elem_type != .funcref;
+            const flags: u32 = switch (seg.kind) {
+                .active => if (has_exprs)
+                    if (has_table_idx or needs_explicit_reftype) 6 else 4
+                else if (has_table_idx) 2 else 0,
+                .passive => if (has_exprs) 5 else 1,
+                .declared => if (has_exprs) 7 else 3,
+            };
             try self.writeU32Leb(flags);
 
             // Table index (for active with explicit table — bit 1 set)
-            if (has_table_idx or needs_explicit_reftype) {
+            if (seg.kind == .active and (flags & 2) != 0) {
                 try self.writeU32Leb(seg.table_var.index);
             }
 
@@ -957,6 +958,151 @@ test "text parse + binary write: passive elem segment" {
     try std.testing.expectEqual(@as(usize, 1), module2.elem_segments.items.len);
     // Passive segment with elem expressions
     try std.testing.expect(module2.elem_segments.items[0].kind == .passive);
+}
+
+test "element flags cover every segment form and survive text and binary round trips" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+    const TextWriter = @import("../text/Writer.zig");
+    const Validator = @import("../Validator.zig");
+
+    // The first eight cases are the function-index encodings and the last
+    // eight use element expressions. Each covers active table 0, active
+    // explicit table, passive, and declared segments, both empty and
+    // non-empty. The expected flags are the exact bytes wasm-tools 1.250.0
+    // emits for these forms.
+    const cases = [_]struct {
+        source: []const u8,
+        flag: u8,
+        kind: types.SegmentKind,
+        uses_exprs: bool,
+        explicit_table: bool,
+        count: usize,
+    }{
+        .{ .source = "(module (table 1 funcref) (func) (elem (i32.const 0) func 0))", .flag = 0, .kind = .active, .uses_exprs = false, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (table 1 funcref) (elem (i32.const 0) func))", .flag = 0, .kind = .active, .uses_exprs = false, .explicit_table = false, .count = 0 },
+        .{ .source = "(module (table 1 funcref) (func) (elem (table 0) (i32.const 0) func 0))", .flag = 2, .kind = .active, .uses_exprs = false, .explicit_table = true, .count = 1 },
+        .{ .source = "(module (table 1 funcref) (elem (table 0) (i32.const 0) func))", .flag = 2, .kind = .active, .uses_exprs = false, .explicit_table = true, .count = 0 },
+        .{ .source = "(module (func) (elem func 0))", .flag = 1, .kind = .passive, .uses_exprs = false, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (elem func))", .flag = 1, .kind = .passive, .uses_exprs = false, .explicit_table = false, .count = 0 },
+        .{ .source = "(module (func) (elem declare func 0))", .flag = 3, .kind = .declared, .uses_exprs = false, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (elem declare func))", .flag = 3, .kind = .declared, .uses_exprs = false, .explicit_table = false, .count = 0 },
+        .{ .source = "(module (table 1 funcref) (func) (elem (i32.const 0) funcref (ref.func 0)))", .flag = 4, .kind = .active, .uses_exprs = true, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (table 1 funcref) (elem (i32.const 0) funcref))", .flag = 4, .kind = .active, .uses_exprs = true, .explicit_table = false, .count = 0 },
+        .{ .source = "(module (table 1 funcref) (func) (elem (table 0) (i32.const 0) funcref (ref.func 0)))", .flag = 6, .kind = .active, .uses_exprs = true, .explicit_table = true, .count = 1 },
+        .{ .source = "(module (table 1 funcref) (elem (table 0) (i32.const 0) funcref))", .flag = 6, .kind = .active, .uses_exprs = true, .explicit_table = true, .count = 0 },
+        .{ .source = "(module (func) (elem funcref (ref.func 0)))", .flag = 5, .kind = .passive, .uses_exprs = true, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (elem funcref))", .flag = 5, .kind = .passive, .uses_exprs = true, .explicit_table = false, .count = 0 },
+        .{ .source = "(module (func) (elem declare funcref (ref.func 0)))", .flag = 7, .kind = .declared, .uses_exprs = true, .explicit_table = false, .count = 1 },
+        .{ .source = "(module (elem declare funcref))", .flag = 7, .kind = .declared, .uses_exprs = true, .explicit_table = false, .count = 0 },
+    };
+
+    for (cases) |case| {
+        var module = try Parser.parseModule(allocator, case.source);
+        defer module.deinit();
+        try Validator.validate(&module, .{});
+
+        const wasm = try writeModule(allocator, &module);
+        defer allocator.free(wasm);
+        var pos: usize = 8;
+        var flag: ?u32 = null;
+        while (pos < wasm.len) {
+            const section_id = wasm[pos];
+            pos += 1;
+            const size = try leb128.readU32Leb128(wasm[pos..]);
+            pos += size.bytes_read;
+            if (section_id == 9) {
+                const count = try leb128.readU32Leb128(wasm[pos..]);
+                try std.testing.expectEqual(@as(u32, 1), count.value);
+                pos += count.bytes_read;
+                flag = (try leb128.readU32Leb128(wasm[pos..])).value;
+                break;
+            }
+            pos += size.value;
+        }
+        try std.testing.expectEqual(@as(?u32, case.flag), flag);
+
+        var reread = try reader.readModule(allocator, wasm);
+        defer reread.deinit();
+        try Validator.validate(&reread, .{});
+        const seg = reread.elem_segments.items[0];
+        try std.testing.expectEqual(case.kind, seg.kind);
+        try std.testing.expectEqual(case.uses_exprs, seg.uses_elem_exprs);
+        try std.testing.expectEqual(case.explicit_table, seg.has_explicit_table_index);
+        try std.testing.expectEqual(case.count, seg.elem_var_indices.items.len);
+        try std.testing.expectEqual(
+            if (case.uses_exprs) types.ValType.funcref else types.ValType.ref_func,
+            seg.elem_type,
+        );
+
+        const wat = try TextWriter.writeModule(allocator, &reread);
+        defer allocator.free(wat);
+        var reparsed = try Parser.parseModule(allocator, wat);
+        defer reparsed.deinit();
+        try Validator.validate(&reparsed, .{});
+        const rebuilt = try writeModule(allocator, &reparsed);
+        defer allocator.free(rebuilt);
+
+        pos = 8;
+        flag = null;
+        var found_rebuilt_element_section = false;
+        while (pos < rebuilt.len) {
+            const section_id = rebuilt[pos];
+            pos += 1;
+            const size = try leb128.readU32Leb128(rebuilt[pos..]);
+            pos += size.bytes_read;
+            if (section_id == 9) {
+                found_rebuilt_element_section = true;
+                const count = try leb128.readU32Leb128(rebuilt[pos..]);
+                try std.testing.expectEqual(@as(u32, 1), count.value);
+                pos += count.bytes_read;
+                flag = (try leb128.readU32Leb128(rebuilt[pos..])).value;
+                break;
+            }
+            pos += size.value;
+        }
+        try std.testing.expect(found_rebuilt_element_section);
+        try std.testing.expectEqual(@as(?u32, case.flag), flag);
+    }
+}
+
+test "a passive function-index segment remains usable by table.init after binary round trip" {
+    const allocator = std.testing.allocator;
+    const Parser = @import("../text/Parser.zig");
+    const Validator = @import("../Validator.zig");
+
+    // A declarative segment is unavailable to table.init at instantiation.
+    // This deliberately uses the short function-index form: encoding it as
+    // flag 3 instead of flag 1 therefore changes the program's behavior.
+    var module = try Parser.parseModule(allocator,
+        \\(module
+        \\  (type $result (func (result i32)))
+        \\  (func $f (result i32) i32.const 42)
+        \\  (table (export "table") 1 funcref)
+        \\  (elem func $f)
+        \\  (func (export "init-and-call") (result i32)
+        \\    i32.const 0
+        \\    i32.const 0
+        \\    i32.const 1
+        \\    table.init 0 0
+        \\    i32.const 0
+        \\    call_indirect (type $result))
+        \\)
+    );
+    defer module.deinit();
+    try Validator.validate(&module, .{});
+
+    const wasm = try writeModule(allocator, &module);
+    defer allocator.free(wasm);
+    var reread = try reader.readModule(allocator, wasm);
+    defer reread.deinit();
+    try Validator.validate(&reread, .{});
+
+    const seg = reread.elem_segments.items[0];
+    try std.testing.expectEqual(types.SegmentKind.passive, seg.kind);
+    try std.testing.expectEqual(types.ValType.ref_func, seg.elem_type);
+    try std.testing.expect(!seg.uses_elem_exprs);
+    try std.testing.expectEqual(@as(u32, 0), seg.elem_var_indices.items[0].index);
 }
 
 test "text parse + binary write: active elem segment offset preserved without trailing 0x0b" {
