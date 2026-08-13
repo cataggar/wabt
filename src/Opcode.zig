@@ -13,6 +13,7 @@ const Feature = @import("Feature.zig");
 pub const prefix_math: u8 = 0xfc;
 pub const prefix_simd: u8 = 0xfd;
 pub const prefix_threads: u8 = 0xfe;
+pub const prefix_gc: u8 = 0xfb;
 
 // ── Opcode enum ──────────────────────────────────────────────────────────
 
@@ -247,6 +248,13 @@ pub const Code = enum(u32) {
     ref_as_non_null = 0xd4,
     br_on_null = 0xd5,
     br_on_non_null = 0xd6,
+
+    // -- GC prefix (0xfb << 8 | code) --
+
+    ref_test = 0xfb14,
+    ref_test_null = 0xfb15,
+    ref_cast = 0xfb16,
+    ref_cast_null = 0xfb17,
 
     // -- Math prefix (0xfc << 8 | code) --
 
@@ -801,7 +809,12 @@ pub const Code = enum(u32) {
             => features.reference_types,
 
             // Garbage collection
-            .ref_eq => features.gc,
+            .ref_eq,
+            .ref_test,
+            .ref_test_null,
+            .ref_cast,
+            .ref_cast_null,
+            => features.gc,
 
             // Multi-value (select_t enabled by default)
             .select_t => features.multi_value,
@@ -1527,6 +1540,8 @@ pub const Code = enum(u32) {
             .ref_eq => "ref.eq",
             .br_on_null => "br_on_null",
             .br_on_non_null => "br_on_non_null",
+            .ref_test, .ref_test_null => "ref.test",
+            .ref_cast, .ref_cast_null => "ref.cast",
             .i32_trunc_sat_f32_s => "i32.trunc_sat_f32_s",
             .i32_trunc_sat_f32_u => "i32.trunc_sat_f32_u",
             .i32_trunc_sat_f64_s => "i32.trunc_sat_f64_s",
@@ -1887,6 +1902,7 @@ test "opcode encoding — single-byte values" {
 }
 
 test "opcode encoding — prefixed values" {
+    try std.testing.expectEqual(@as(u32, 0xfb14), @intFromEnum(Code.ref_test));
     try std.testing.expectEqual(@as(u32, 0xfc00), @intFromEnum(Code.i32_trunc_sat_f32_s));
     try std.testing.expectEqual(@as(u32, 0xfd0c), @intFromEnum(Code.v128_const));
     try std.testing.expectEqual(@as(u32, 0xfe00), @intFromEnum(Code.memory_atomic_notify));
@@ -1907,6 +1923,7 @@ test "getPrefix" {
     try std.testing.expectEqual(prefix_math, Code.i32_trunc_sat_f32_s.getPrefix());
     try std.testing.expectEqual(prefix_simd, Code.v128_const.getPrefix());
     try std.testing.expectEqual(prefix_threads, Code.memory_atomic_notify.getPrefix());
+    try std.testing.expectEqual(prefix_gc, Code.ref_cast_null.getPrefix());
 }
 
 test "getCode" {
@@ -1916,6 +1933,7 @@ test "getCode" {
     try std.testing.expectEqual(@as(u32, 0x07), Code.i64_trunc_sat_f64_u.getCode());
     try std.testing.expectEqual(@as(u32, 0x0c), Code.v128_const.getCode());
     try std.testing.expectEqual(@as(u32, 0x00), Code.memory_atomic_notify.getCode());
+    try std.testing.expectEqual(@as(u32, 0x17), Code.ref_cast_null.getCode());
 }
 
 test "getBytes — single-byte opcode" {
@@ -2026,6 +2044,12 @@ test "isEnabled — feature-gated opcodes respect flags" {
     with_funcref.function_references = true;
     try std.testing.expect(Code.call_ref.isEnabled(with_funcref));
 
+    // Garbage collection
+    try std.testing.expect(!Code.ref_cast.isEnabled(none));
+    var with_gc = none;
+    with_gc.gc = true;
+    try std.testing.expect(Code.ref_cast.isEnabled(with_gc));
+
     // Multi-value (select_t)
     try std.testing.expect(!Code.select_t.isEnabled(none));
     var with_mv = none;
@@ -2058,6 +2082,7 @@ test "isEnabled — default features enable expected proposals" {
     try std.testing.expect(Code.return_call.isEnabled(defaults));
     try std.testing.expect(Code.memory_atomic_notify.isEnabled(defaults));
     try std.testing.expect(Code.call_ref.isEnabled(defaults));
+    try std.testing.expect(Code.ref_test.isEnabled(defaults));
     // These should NOT be enabled by default
     try std.testing.expect(!Code.i8x16_relaxed_swizzle.isEnabled(defaults));
     try std.testing.expect(!Code.i64_add128.isEnabled(defaults));
@@ -2068,6 +2093,8 @@ test "name — spot checks" {
     try std.testing.expectEqualStrings("i32.const", Code.i32_const.name());
     try std.testing.expectEqualStrings("memory.size", Code.memory_size.name());
     try std.testing.expectEqualStrings("i32.trunc_sat_f32_s", Code.i32_trunc_sat_f32_s.name());
+    try std.testing.expectEqualStrings("ref.test", Code.ref_test_null.name());
+    try std.testing.expectEqualStrings("ref.cast", Code.ref_cast.name());
     try std.testing.expectEqualStrings("v128.const", Code.v128_const.name());
     try std.testing.expectEqualStrings("memory.atomic.notify", Code.memory_atomic_notify.name());
     try std.testing.expectEqualStrings("<unknown>", (@as(Code, @enumFromInt(0xFFFF))).name());
