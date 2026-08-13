@@ -470,6 +470,12 @@ const WatWriter = struct {
                 try self.appendByte(' ');
                 try self.writeHeapType(bytes, pos);
             },
+            .ref_type, .ref_null_type => {
+                try self.append(" (ref ");
+                if (shape == .ref_null_type) try self.append("null ");
+                try self.writeHeapType(bytes, pos);
+                try self.appendByte(')');
+            },
             .select_types => {
                 const count = try readU32At(bytes, pos);
                 for (0..count) |_| {
@@ -552,25 +558,22 @@ const WatWriter = struct {
         try self.appendByte(')');
     }
 
-    /// The operand of `ref.null`: an abstract heap type or a type index. As
-    /// with a block signature the encoding is an s33, so the sign lives in
+    /// A reference instruction's heap type: an abstract type or a type index.
+    /// As with a block signature the encoding is an s33, so the sign lives in
     /// bit `0x40` -- `extern` is `0x6f`, which is negative as an s33 even
     /// though the byte on its own looks positive.
     fn writeHeapType(self: *WatWriter, bytes: []const u8, pos: *usize) WriteError!void {
-        if (pos.* >= bytes.len) return error.TruncatedBody;
-        const byte = bytes[pos.*];
-        if (byte < 0x80) {
-            pos.* += 1;
-            if ((byte & 0x40) == 0) {
-                try self.writeU32(byte);
-                return;
-            }
-            const code = @as(i64, byte) - 0x80;
-            const heap = types.AbstractHeapType.fromCode(code) orelse return error.UnsupportedOpcode;
+        const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.TruncatedBody,
+            error.Overflow => error.UnsupportedOpcode,
+        };
+        pos.* += r.bytes_read;
+        if (types.AbstractHeapType.fromCode(r.value)) |heap| {
             try self.append(heapTypeName(heap));
             return;
         }
-        try self.writeU32(try readTypeIndexS33(bytes, pos));
+        if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
+        try self.writeU32(@intCast(r.value));
     }
 
     /// `align=` is always printed, as the encoded value rather than a value
@@ -637,16 +640,14 @@ const WatWriter = struct {
         return r.value;
     }
 
-    /// The type index a block signature or a concrete heap type names.
-    ///
-    /// Both are encoded as an s33, which has room for values that are not
-    /// type indices at all: a negative one that names no abstract type, and
-    /// a positive one past the widest index there can be. Neither has a
-    /// spelling, so both are reported. Handing the value straight to
-    /// `@intCast` aborted the process instead, on input a fuzzer or a
-    /// truncated file produces and the binary reader passes through.
+    /// The type index a block signature names. It is encoded as an s33, but a
+    /// negative value is not a type index and an encoding wider than five
+    /// bytes is not an s33. Both are reported rather than cast or accepted.
     fn readTypeIndexS33(bytes: []const u8, pos: *usize) WriteError!u32 {
-        const r = leb128.readS64Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
+        const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.TruncatedBody,
+            error.Overflow => error.UnsupportedOpcode,
+        };
         pos.* += r.bytes_read;
         if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
         return @intCast(r.value);
@@ -1891,6 +1892,60 @@ test "a constant expression may hold an instruction with wide immediates" {
     try std.testing.expect(std.mem.indexOf(u8, ewat, "v128.const i8x16 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11") != null);
 }
 
+test "ref test and cast print and reparse their target reference types" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (func (param anyref)
+        \\    local.get 0 ref.test (ref i31) drop
+        \\    local.get 0 ref.test (ref null struct) drop
+        \\    local.get 0 ref.cast (ref array) drop
+        \\    local.get 0 ref.cast (ref null eq) drop))
+    );
+    defer module.deinit();
+
+    const wat = try writeModule(alloc, &module);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.test (ref i31)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.test (ref null struct)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.cast (ref array)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.cast (ref null eq)") != null);
+
+    var reparsed = try Parser.parseModule(alloc, wat);
+    defer reparsed.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        module.funcs.items[0].code_bytes,
+        reparsed.funcs.items[0].code_bytes,
+    );
+}
+
+test "heap type printing accepts padded s33 and rejects six-byte encodings" {
+    const alloc = std.testing.allocator;
+
+    // `any` is -18. This valid padded s33 encoding must stay abstract rather
+    // than being interpreted as the unsigned concrete index 16366.
+    const padded = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x0a, 0x09, 0x01, 0x07, 0x00, 0xfb, 0x14, 0xee, 0x7f, 0x1a, 0x0b,
+    };
+    const wat = try printBinary(alloc, &padded);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(u8, wat, "ref.test (ref any)") != null);
+
+    const overlong = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x00,
+        0x0a, 0x0d, 0x01, 0x0b, 0x00, 0xfb, 0x14,
+        0xee, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x1a, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, printBinary(alloc, &overlong));
+}
+
 test "skipping an instruction's immediates lands where printing them does" {
     // The reader walks constant expressions by stepping over immediates and
     // the writer walks bodies by printing them. If the two ever disagree on
@@ -1924,6 +1979,8 @@ test "skipping an instruction's immediates lands where printing them does" {
         &.{ 0x44, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f }, // f64.const
         &.{ 0xd0, 0x70 }, // ref.null func -- heap_type
         &.{ 0xd0, 0x00 }, // ref.null 0 -- heap_type as a type index
+        &.{ 0xfb, 0x14, 0x0b }, // ref.test (ref 11) -- ref_type; 0x0b is not end
+        &.{ 0xfb, 0x15, 0x0b }, // ref.test (ref null 11) -- ref_null_type
         &.{ 0x1c, 0x01, 0x7f }, // select (result i32) -- select_types
         &.{ 0x1f, 0x40, 0x02, 0x00, 0x01, 0x00, 0x02, 0x01 }, // try_table
         &.{ 0xfe, 0x03, 0x00 }, // atomic.fence -- reserved_byte

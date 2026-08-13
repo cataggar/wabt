@@ -55,6 +55,12 @@ pub const Imm = enum {
     f64,
     /// A heap type, for `ref.null`.
     heap_type,
+    /// A non-null reference type encoded as just its heap type, for
+    /// `ref.test` and `ref.cast`.
+    ref_type,
+    /// A nullable reference type encoded as just its heap type, for the
+    /// nullable `ref.test` and `ref.cast` variants.
+    ref_null_type,
     /// A vector of value types, for the typed `select`.
     select_types,
     /// A block signature followed by a vector of catch clauses.
@@ -119,6 +125,8 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
             0x00, 0x01, 0x06, 0x07, 0x0b...0x0e, 0x10 => .index,
             0x02...0x05, 0x08...0x0a, 0x11...0x13 => .index_pair,
             0x0f => .none,
+            0x14, 0x16 => .ref_type,
+            0x15, 0x17 => .ref_null_type,
             0x1a...0x1e => .none,
             else => null,
         },
@@ -167,6 +175,15 @@ fn readS64At(bytes: []const u8, pos: *usize) Error!i64 {
     return r.value;
 }
 
+fn readS33At(bytes: []const u8, pos: *usize) Error!i64 {
+    const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+        error.UnexpectedEnd => error.TruncatedBody,
+        error.Overflow => error.UnsupportedOpcode,
+    };
+    pos.* += r.bytes_read;
+    return r.value;
+}
+
 fn skipBytes(n: usize, bytes: []const u8, pos: *usize) Error!void {
     if (pos.* + n > bytes.len) return error.TruncatedBody;
     pos.* += n;
@@ -185,17 +202,12 @@ fn skipBlockType(bytes: []const u8, pos: *usize) Error!void {
         pos.* += 1;
         return;
     }
-    _ = try readS64At(bytes, pos);
+    _ = try readS33At(bytes, pos);
 }
 
 /// Step over a heap type, which is an s33 and so may span several bytes.
 fn skipHeapType(bytes: []const u8, pos: *usize) Error!void {
-    if (pos.* >= bytes.len) return error.TruncatedBody;
-    if (bytes[pos.*] < 0x80) {
-        pos.* += 1;
-        return;
-    }
-    _ = try readS64At(bytes, pos);
+    _ = try readS33At(bytes, pos);
 }
 
 /// A memarg is an alignment, an optional memory index that bit `0x40` of the
@@ -232,7 +244,7 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
         .s32, .s64 => _ = try readS64At(bytes, pos),
         .f32 => try skipBytes(4, bytes, pos),
         .f64 => try skipBytes(8, bytes, pos),
-        .heap_type => try skipHeapType(bytes, pos),
+        .heap_type, .ref_type, .ref_null_type => try skipHeapType(bytes, pos),
         .select_types => {
             const count = try readU32At(bytes, pos);
             try skipBytes(count, bytes, pos);

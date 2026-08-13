@@ -2158,6 +2158,22 @@ fn checkOneBody(
                             elem_idx,
                         );
                     },
+                    0x14...0x17 => {
+                        const target = try readHeapStackTypeImmediate(
+                            m,
+                            bytes,
+                            &pos,
+                            sub == 0x15 or sub == 0x17,
+                        );
+                        try checkRefTestOrCast(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            target,
+                            sub == 0x14 or sub == 0x15,
+                            gpa(m),
+                        );
+                    },
                     0x1a => try checkGcRefConversion(
                         m,
                         &val_stack,
@@ -2176,7 +2192,7 @@ fn checkOneBody(
                     ), // extern.convert_any
                     0x1c => try checkUnary(m, &val_stack, &ctrl_stack, .i32, .ref_i31, gpa(m)), // ref.i31
                     0x1d, 0x1e => try checkUnary(m, &val_stack, &ctrl_stack, .i31ref, .i32, gpa(m)), // i31.get_s/u
-                    0x14...0x19 => return error.UnsupportedOpcode,
+                    0x18, 0x19 => return error.UnsupportedOpcode,
                     else => return error.UnknownOpcode,
                 }
             },
@@ -2368,6 +2384,28 @@ fn readHeapStackType(m: *const Mod.Module, bytes: []const u8, pos: *usize, nulla
     return null;
 }
 
+fn readHeapStackTypeImmediate(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    pos: *usize,
+    nullable: bool,
+) Error!StackType {
+    if (pos.* >= bytes.len) return error.UnexpectedEnd;
+    const result = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+        error.UnexpectedEnd => error.UnexpectedEnd,
+        error.Overflow => error.InvalidTypeIndex,
+    };
+    pos.* += result.bytes_read;
+    if (types.AbstractHeapType.fromCode(result.value)) |heap| {
+        return StackType.fromRefType(types.RefType.abstract(nullable, heap));
+    }
+    if (result.value < 0 or result.value > std.math.maxInt(u32))
+        return error.InvalidTypeIndex;
+    const idx: u32 = @intCast(result.value);
+    if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+    return StackType.fromRefType(types.RefType.concrete(nullable, idx));
+}
+
 fn pushCtrl(ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), val_stack: *ValStack, opcode: u8, start: TypeSeq, end: TypeSeq, alloc: std.mem.Allocator) !void {
     try ctrl_stack.append(alloc, .{
         .opcode = opcode,
@@ -2488,6 +2526,42 @@ fn checkGcRefConversion(
 ) Error!void {
     const actual = popVal(val_stack, ctrl_stack) catch return error.TypeMismatch;
     val_stack.append(alloc, try gcConvertedRef(m, actual, input_heap, output_heap)) catch return error.OutOfMemory;
+}
+
+fn checkRefTestOrCast(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    target: StackType,
+    is_test: bool,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const expected_heap: types.AbstractHeapType = switch ((target.asRefType() orelse
+        return error.InvalidTypeIndex).heap)
+    {
+        .abstract => |heap| switch (heap) {
+            .func, .nofunc => .func,
+            .extern_, .noextern => .extern_,
+            .exn, .noexn => .exn,
+            .any, .eq, .i31, .struct_, .array, .none => .any,
+        },
+        .concrete => |idx| switch (concreteKind(m, idx) orelse
+            return error.InvalidTypeIndex)
+        {
+            .func => .func,
+            .struct_, .array => .any,
+        },
+    };
+    try popExpect(
+        m,
+        val_stack,
+        ctrl_stack,
+        StackType.fromRefType(types.RefType.abstract(true, expected_heap)),
+    );
+    val_stack.append(
+        alloc,
+        if (is_test) StackType.known(.i32) else target,
+    ) catch return error.OutOfMemory;
 }
 
 fn checkStructNew(
@@ -3982,6 +4056,161 @@ test "GC conversions preserve nullability and i31 instructions check operands" {
     try std.testing.expectError(error.TypeMismatch, validate(&unreachable_bad, .{}));
 }
 
+test "GC ref tests and casts enforce heap families and exact results" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (func (param structref) (result i32) local.get 0 ref.test (ref array)))",
+        "(module (func (param arrayref) (result i32) local.get 0 ref.test (ref null i31)))",
+        "(module (func (param nullref) (result i32) local.get 0 ref.test (ref null struct)))",
+        "(module (func (param funcref) (result i32) local.get 0 ref.test (ref nofunc)))",
+        "(module (func (param externref) (result i32) local.get 0 ref.test (ref null noextern)))",
+        "(module (func (param exnref) (result i32) local.get 0 ref.test (ref noexn)))",
+        "(module (func (param anyref) (result (ref struct)) local.get 0 ref.cast (ref struct)))",
+        "(module (func (param (ref any)) (result structref) local.get 0 ref.cast (ref null struct)))",
+        "(module (func (param funcref) (result (ref nofunc)) local.get 0 ref.cast (ref nofunc)))",
+        "(module (type $f (func)) (func (param funcref) (result (ref $f)) local.get 0 ref.cast (ref $f)))",
+        "(module (type $s (struct)) (func (param anyref) (result (ref null $s)) local.get 0 ref.cast (ref null $s)))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (func (param i32) (result i32) local.get 0 ref.test (ref any)))",
+        "(module (func (param anyref) (result i32) local.get 0 ref.test (ref func)))",
+        "(module (func (param funcref) (result i32) local.get 0 ref.test (ref any)))",
+        "(module (func (param nullref) (result i32) local.get 0 ref.test (ref null func)))",
+        "(module (func (param externref) (result i32) local.get 0 ref.test (ref eq)))",
+        "(module (func (param exnref) (result i32) local.get 0 ref.test (ref extern)))",
+        "(module (func (param anyref) (result (ref struct)) local.get 0 ref.cast (ref null struct)))",
+        "(module (type $f (func)) (func (param anyref) (result (ref $f)) local.get 0 ref.cast (ref $f)))",
+        "(module (type $s (struct)) (func (param funcref) (result (ref $s)) local.get 0 ref.cast (ref $s)))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC ref casts accept recursive types and declared subtype directions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        \\(module
+        \\  (rec (type $node (sub (struct (field (ref null $node))))))
+        \\  (func (param anyref) (result (ref $node))
+        \\    local.get 0 ref.cast (ref $node)))
+        ,
+        \\(module
+        \\  (type $parent (sub (struct)))
+        \\  (type $child (sub $parent (struct)))
+        \\  (func (param (ref null $parent)) (result (ref $child))
+        \\    local.get 0 ref.cast (ref $child))
+        \\  (func (param (ref $child)) (result (ref null $parent))
+        \\    local.get 0 ref.cast (ref null $parent)))
+        ,
+        \\(module
+        \\  (type $parent (sub (struct)))
+        \\  (type $left (sub $parent (struct)))
+        \\  (type $right (sub $parent (struct)))
+        \\  (func (param (ref $left)) (result i32)
+        \\    local.get 0 ref.test (ref $right)))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+}
+
+test "GC ref cast immediates gate features and reject malformed heap types" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var gated = try Parser.parseModule(alloc,
+        \\(module
+        \\  (func (param anyref)
+        \\    local.get 0 ref.test (ref any) drop
+        \\    local.get 0 ref.cast (ref any) drop))
+    );
+    defer gated.deinit();
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validate(&gated, .{ .features = .{ .gc = false } }),
+    );
+
+    const invalid_index = [_]u8{ 0xfb, 0x14, 0x01 };
+    var bad_index = try testModuleWithBody(alloc, &invalid_index);
+    defer bad_index.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_index, .{}));
+
+    const invalid_abstract = [_]u8{ 0xfb, 0x16, 0x7f };
+    var bad_abstract = try testModuleWithBody(alloc, &invalid_abstract);
+    defer bad_abstract.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_abstract, .{}));
+
+    const truncated = [_][]const u8{
+        &.{ 0xfb, 0x14 },
+        &.{ 0xfb, 0x15, 0x80 },
+        &.{ 0xfb, 0x16 },
+        &.{ 0xfb, 0x17, 0x80 },
+    };
+    for (truncated) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+    }
+}
+
+test "GC ref cast results stay constrained in unreachable code" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (func (result i32) unreachable ref.test (ref array)))",
+        "(module (func (result (ref struct)) unreachable ref.cast (ref struct)))",
+        "(module (func (result structref) unreachable ref.cast (ref null struct)))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (func (result anyref) unreachable ref.test (ref array)))",
+        "(module (func (result i32) unreachable ref.cast (ref struct)))",
+        "(module (func (result (ref struct)) unreachable ref.cast (ref null struct)))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC ref tests and casts are not constant instructions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const invalid = [_][]const u8{
+        "(module (global i32 (ref.test (ref any) (ref.null any))))",
+        "(module (global (ref any) (ref.cast (ref any) (ref.null any))))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.ConstantExprRequired, validate(&module, .{}));
+    }
+}
+
 test "GC struct constructors check field order, storage types, and result type" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
@@ -4732,7 +4961,7 @@ test "GC reference conversions type-check constant expressions" {
 test "GC prefix distinguishes pending instructions from unknown subopcodes" {
     const alloc = std.testing.allocator;
 
-    const pending = [_]u8{ 0xfb, 0x14, 0x0b }; // ref.test (still pending)
+    const pending = [_]u8{ 0xfb, 0x18, 0x0b }; // br_on_cast (still pending)
     var known = try testModuleWithBody(alloc, &pending);
     defer known.deinit();
     try std.testing.expectError(error.UnsupportedOpcode, validate(&known, .{}));

@@ -196,9 +196,12 @@ const Reader = struct {
         return result.value;
     }
 
-    fn readS64(self: *Reader) ReadError!i64 {
+    fn readS33(self: *Reader) ReadError!i64 {
         if (self.pos >= self.data.len) return error.UnexpectedEof;
-        const result = leb128.readS64Leb128(self.data[self.pos..]) catch return error.UnexpectedEof;
+        const result = leb128.readS33Leb128(self.data[self.pos..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.UnexpectedEof,
+            error.Overflow => error.InvalidType,
+        };
         self.pos += result.bytes_read;
         return result.value;
     }
@@ -224,7 +227,7 @@ const Reader = struct {
             // `0x63`/`0x64` are *prefixes*, not types: each is followed by a
             // heaptype LEB128 that must be consumed, or the stream desyncs and
             // the next byte is misread as this type.
-            const heap_type = try self.readS64();
+            const heap_type = try self.readS33();
             const ref = try refTypeFromHeapType(heap_type, byte == ref_null_prefix);
             return .{
                 .vt = ref.toValType(),
@@ -1371,6 +1374,56 @@ test "a binary table initializer remains borrowed from the input" {
     const src_addr = @intFromPtr(src[0..].ptr);
     try std.testing.expect(init_addr >= src_addr);
     try std.testing.expect(init_addr < src_addr + src.len);
+}
+
+test "a ref test heap type byte does not end an initializer scan" {
+    const allocator = std.testing.allocator;
+    // The first 0x0b after ref.test is concrete heap type index 11; only the
+    // second is the expression's end. A custom section follows to prove the
+    // scanner left the module positioned at the next section.
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x09, 0x01, 0x7f, 0x00,
+        0xd0, 0x6e, 0xfb, 0x14, 0x0b, 0x0b,
+        0x00, 0x02, 0x01, 'x',
+    };
+
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xd0, 0x6e, 0xfb, 0x14, 0x0b },
+        module.globals.items[0].init_expr_bytes,
+    );
+    try std.testing.expectEqual(@as(usize, 1), module.customs.items.len);
+    try std.testing.expectEqualStrings("x", module.customs.items[0].name);
+}
+
+test "heap types use s33 width in reference types and initializer scans" {
+    const allocator = std.testing.allocator;
+
+    const padded = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x09, 0x01, 0x63, 0xee, 0x7f, 0x00, 0xd0, 0xee, 0x7f, 0x0b,
+    };
+    var module = try readModule(allocator, &padded);
+    defer module.deinit();
+    try std.testing.expectEqual(types.ValType.anyref, module.globals.items[0].type.val_type);
+
+    const overlong_type = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0c, 0x01, 0x63, 0xee, 0xff, 0xff, 0xff, 0xff, 0x7f,
+        0x00, 0xd0, 0x6e, 0x0b,
+    };
+    try std.testing.expectError(error.InvalidType, readModule(allocator, &overlong_type));
+
+    const overlong_immediate = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0c, 0x01, 0x7f, 0x00, 0xfb, 0x14,
+        0xee, 0xff, 0xff, 0xff, 0xff, 0x7f, 0x0b,
+    };
+    try std.testing.expectError(error.UnsupportedOpcode, readModule(allocator, &overlong_immediate));
 }
 
 test "the tag section is accepted between the memory and global sections" {
