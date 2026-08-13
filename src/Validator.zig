@@ -460,7 +460,12 @@ fn checkConstExpr(
             },
             0xfb => {
                 if (!features.gc) return error.ConstantExprRequired;
-                const sub = readU32(bytes, &pos);
+                const sub = try readU32Immediate(bytes, &pos);
+                if (sub == 0x00 or sub == 0x01) {
+                    const type_idx = try readU32Immediate(bytes, &pos);
+                    try checkConstStructNew(m, &stack, type_idx, sub == 0x01);
+                    continue;
+                }
                 if (sub == 0x1c) {
                     try popExpecting(m, &stack, .i32);
                     try push(m, &stack, StackType.known(.ref_i31));
@@ -500,6 +505,29 @@ fn popExpecting(
 ) Error!void {
     const got = stack.pop() orelse return error.TypeMismatch;
     if (!got.isSubtypeOf(m, StackType.known(vt))) return error.TypeMismatch;
+}
+
+fn checkConstStructNew(
+    m: *const Mod.Module,
+    stack: *std.ArrayListUnmanaged(StackType),
+    type_idx: u32,
+    use_default: bool,
+) Error!void {
+    const st = try structTypeAt(m, type_idx);
+    if (use_default) {
+        for (st.fields.items) |field| {
+            if (!isDefaultableField(field)) return error.TypeMismatch;
+        }
+    } else {
+        var i = st.fields.items.len;
+        while (i > 0) {
+            i -= 1;
+            const actual = stack.pop() orelse return error.TypeMismatch;
+            if (!actual.isSubtypeOf(m, storageStackType(st.fields.items[i])))
+                return error.TypeMismatch;
+        }
+    }
+    try push(m, stack, concreteStructRef(type_idx, false));
 }
 
 // ── Unrecognised opcode classification ──────────────────────────────────
@@ -1110,6 +1138,41 @@ fn refSubtypeOf(maybe_m: ?*const Mod.Module, actual: types.RefType, expected: ty
 
 fn fieldStackType(field: Mod.TypeEntry.StructType.Field) StackType {
     return StackType.fromValTypeAndIndex(field.@"type", field.type_idx);
+}
+
+fn storageStackType(field: Mod.TypeEntry.StructType.Field) StackType {
+    return if (field.@"type".isPackedType())
+        StackType.known(.i32)
+    else
+        fieldStackType(field);
+}
+
+fn structTypeAt(m: *const Mod.Module, type_idx: u32) Error!Mod.TypeEntry.StructType {
+    if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+    return switch (m.module_types.items[type_idx]) {
+        .struct_type => |st| st,
+        else => error.TypeMismatch,
+    };
+}
+
+fn structFieldAt(
+    m: *const Mod.Module,
+    type_idx: u32,
+    field_idx: u32,
+) Error!Mod.TypeEntry.StructType.Field {
+    const st = try structTypeAt(m, type_idx);
+    if (field_idx >= st.fields.items.len) return error.TypeMismatch;
+    return st.fields.items[field_idx];
+}
+
+fn isDefaultableField(field: Mod.TypeEntry.StructType.Field) bool {
+    if (field.@"type".isNumType() or field.@"type".isPackedType()) return true;
+    const ref_type = fieldStackType(field).asRefType() orelse return false;
+    return ref_type.nullable;
+}
+
+fn concreteStructRef(type_idx: u32, nullable: bool) StackType {
+    return StackType.fromRefType(types.RefType.concrete(nullable, type_idx));
 }
 
 fn stackSubtype(m: *const Mod.Module, actual: StackType, expected: StackType, depth: usize) bool {
@@ -1891,8 +1954,43 @@ fn checkOneBody(
             },
             0xfb => {
                 if (!features.gc) return error.UnsupportedOpcode;
-                const sub = readU32(bytes, &pos);
+                const sub = try readU32Immediate(bytes, &pos);
                 switch (sub) {
+                    0x00, 0x01 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        try checkStructNew(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            sub == 0x01,
+                            gpa(m),
+                        );
+                    },
+                    0x02...0x04 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const field_idx = try readU32Immediate(bytes, &pos);
+                        try checkStructGet(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            field_idx,
+                            sub,
+                            gpa(m),
+                        );
+                    },
+                    0x05 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const field_idx = try readU32Immediate(bytes, &pos);
+                        try checkStructSet(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            field_idx,
+                        );
+                    },
                     0x1a => try checkGcRefConversion(
                         m,
                         &val_stack,
@@ -1911,7 +2009,7 @@ fn checkOneBody(
                     ), // extern.convert_any
                     0x1c => try checkUnary(m, &val_stack, &ctrl_stack, .i32, .ref_i31, gpa(m)), // ref.i31
                     0x1d, 0x1e => try checkUnary(m, &val_stack, &ctrl_stack, .i31ref, .i32, gpa(m)), // i31.get_s/u
-                    0x00...0x19 => return error.UnsupportedOpcode,
+                    0x06...0x19 => return error.UnsupportedOpcode,
                     else => return error.UnknownOpcode,
                 }
             },
@@ -2060,6 +2158,13 @@ fn valTypeSlice(byte: u8) []const types.ValType {
 fn readU32(bytes: []const u8, pos: *usize) u32 {
     if (pos.* >= bytes.len) return 0;
     const result = leb128.readU32Leb128(bytes[pos.*..]) catch return 0;
+    pos.* += result.bytes_read;
+    return result.value;
+}
+
+fn readU32Immediate(bytes: []const u8, pos: *usize) Error!u32 {
+    if (pos.* >= bytes.len) return error.UnexpectedEnd;
+    const result = leb128.readU32Leb128(bytes[pos.*..]) catch return error.UnexpectedEnd;
     pos.* += result.bytes_read;
     return result.value;
 }
@@ -2216,6 +2321,68 @@ fn checkGcRefConversion(
 ) Error!void {
     const actual = popVal(val_stack, ctrl_stack) catch return error.TypeMismatch;
     val_stack.append(alloc, try gcConvertedRef(m, actual, input_heap, output_heap)) catch return error.OutOfMemory;
+}
+
+fn checkStructNew(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    use_default: bool,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const st = try structTypeAt(m, type_idx);
+    if (use_default) {
+        for (st.fields.items) |field| {
+            if (!isDefaultableField(field)) return error.TypeMismatch;
+        }
+    } else {
+        var i = st.fields.items.len;
+        while (i > 0) {
+            i -= 1;
+            try popExpect(m, val_stack, ctrl_stack, storageStackType(st.fields.items[i]));
+        }
+    }
+    val_stack.append(alloc, concreteStructRef(type_idx, false)) catch return error.OutOfMemory;
+}
+
+fn checkStructGet(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    field_idx: u32,
+    sub: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const field = try structFieldAt(m, type_idx, field_idx);
+    const is_packed = field.@"type".isPackedType();
+    const result = switch (sub) {
+        0x02 => blk: {
+            if (is_packed) return error.TypeMismatch;
+            break :blk fieldStackType(field);
+        },
+        0x03, 0x04 => blk: {
+            if (!is_packed) return error.TypeMismatch;
+            break :blk StackType.known(.i32);
+        },
+        else => unreachable,
+    };
+    try popExpect(m, val_stack, ctrl_stack, concreteStructRef(type_idx, true));
+    val_stack.append(alloc, result) catch return error.OutOfMemory;
+}
+
+fn checkStructSet(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    field_idx: u32,
+) Error!void {
+    const field = try structFieldAt(m, type_idx, field_idx);
+    if (!field.mutable) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, storageStackType(field));
+    try popExpect(m, val_stack, ctrl_stack, concreteStructRef(type_idx, true));
 }
 
 fn gcConvertedRef(
@@ -3436,6 +3603,312 @@ test "GC conversions preserve nullability and i31 instructions check operands" {
     try std.testing.expectError(error.TypeMismatch, validate(&unreachable_bad, .{}));
 }
 
+test "GC struct constructors check field order, storage types, and result type" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        \\(module
+        \\  (type $s (struct (field i32) (field f64)))
+        \\  (func (result (ref $s))
+        \\    i32.const 1 f64.const 2 struct.new $s))
+        ,
+        \\(module
+        \\  (type $s (struct (field i8) (field i16)))
+        \\  (func (result (ref $s))
+        \\    i32.const 1 i32.const 2 struct.new $s))
+        ,
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $box (struct (field (ref null $p))))
+        \\  (func (param (ref $c)) (result (ref $box))
+        \\    local.get 0 struct.new $box))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        \\(module
+        \\  (type $s (struct (field i32) (field f64)))
+        \\  (func (result (ref $s))
+        \\    f64.const 2 i32.const 1 struct.new $s))
+        ,
+        \\(module
+        \\  (type $s (struct (field i8)))
+        \\  (func (result (ref $s)) i64.const 1 struct.new $s))
+        ,
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $box (struct (field (ref null $c))))
+        \\  (func (param (ref $p)) (result (ref $box))
+        \\    local.get 0 struct.new $box))
+        ,
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC struct.new_default accepts exactly defaultable fields" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var valid = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $p (struct))
+        \\  (type $s (struct
+        \\    (field i32) (field f64) (field v128)
+        \\    (field i8) (field i16)
+        \\    (field funcref) (field (ref null $p))))
+        \\  (func (result (ref $s)) struct.new_default $s))
+    );
+    defer valid.deinit();
+    try validate(&valid, .{});
+
+    const invalid = [_][]const u8{
+        \\(module
+        \\  (type $s (struct (field (ref func))))
+        \\  (func (result (ref $s)) struct.new_default $s))
+        ,
+        \\(module
+        \\  (type $p (struct))
+        \\  (type $s (struct (field (ref $p))))
+        \\  (func (result (ref $s)) struct.new_default $s))
+        ,
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC struct gets enforce receiver and packed-field forms" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $s (struct (field i64)))" ++
+            " (func (param (ref null $s)) (result i64) local.get 0 struct.get $s 0))",
+        "(module (type $s (struct (field i8)))" ++
+            " (func (param (ref null $s)) (result i32) local.get 0 struct.get_s $s 0))",
+        "(module (type $s (struct (field i16)))" ++
+            " (func (param (ref $s)) (result i32) local.get 0 struct.get_u $s 0))",
+        \\(module
+        \\  (type $p (sub (struct (field i32))))
+        \\  (type $c (sub $p (struct (field i32) (field f64))))
+        \\  (func (param (ref null $c)) (result i32)
+        \\    local.get 0 struct.get $p 0))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $s (struct (field i8)))" ++
+            " (func (param (ref null $s)) (result i32) local.get 0 struct.get $s 0))",
+        "(module (type $s (struct (field i32)))" ++
+            " (func (param (ref null $s)) (result i32) local.get 0 struct.get_s $s 0))",
+        "(module (type $s (struct (field i16)))" ++
+            " (func (param (ref null $s)) (result i32) local.get 0 struct.get_u $s 1))",
+        "(module (type $s (struct (field i32)))" ++
+            " (func (param structref) (result i32) local.get 0 struct.get $s 0))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC struct.set checks mutability, operand order, and value subtyping" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $s (struct (field (mut i8))))" ++
+            " (func (param (ref null $s)) local.get 0 i32.const 1 struct.set $s 0))",
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $box (struct (field (mut (ref null $p)))))
+        \\  (func (param (ref null $box)) (param (ref $c))
+        \\    local.get 0 local.get 1 struct.set $box 0))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $s (struct (field i32)))" ++
+            " (func (param (ref null $s)) local.get 0 i32.const 1 struct.set $s 0))",
+        "(module (type $s (struct (field (mut i32))))" ++
+            " (func (param (ref null $s)) i32.const 1 local.get 0 struct.set $s 0))",
+        "(module (type $s (struct (field (mut i16))))" ++
+            " (func (param (ref null $s)) local.get 0 i64.const 1 struct.set $s 0))",
+        \\(module
+        \\  (type $p (sub (struct)))
+            \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $box (struct (field (mut (ref null $c)))))
+        \\  (func (param (ref null $box)) (param (ref $p))
+        \\    local.get 0 local.get 1 struct.set $box 0))
+        ,
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC struct immediates check type and field bounds and feature gating" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var bad_type = try Parser.parseModule(alloc,
+        "(module (func struct.new_default 10 drop))",
+    );
+    defer bad_type.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_type, .{}));
+
+    var wrong_kind = try Parser.parseModule(alloc,
+        "(module (type $f (func)) (func struct.new_default $f drop))",
+    );
+    defer wrong_kind.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong_kind, .{}));
+
+    var bad_field = try Parser.parseModule(alloc,
+        "(module (type $s (struct (field i32)))" ++
+            " (func (param (ref null $s)) local.get 0 struct.get $s 1 drop))",
+    );
+    defer bad_field.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&bad_field, .{}));
+
+    const gated = [_][]const u8{
+        "(module (type $s (struct)) (func struct.new $s drop))",
+        "(module (type $s (struct)) (func struct.new_default $s drop))",
+        "(module (type $s (struct (field i32)))" ++
+            " (func (param (ref null $s)) local.get 0 struct.get $s 0 drop))",
+        "(module (type $s (struct (field i8)))" ++
+            " (func (param (ref null $s)) local.get 0 struct.get_s $s 0 drop))",
+        "(module (type $s (struct (field i16)))" ++
+            " (func (param (ref null $s)) local.get 0 struct.get_u $s 0 drop))",
+        "(module (type $s (struct (field (mut i32))))" ++
+            " (func (param (ref null $s)) local.get 0 i32.const 0 struct.set $s 0))",
+    };
+    for (gated) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            validate(&module, .{ .features = .{ .gc = false } }),
+        );
+    }
+
+    const truncated = [_][]const u8{
+        &.{ 0xfb, 0x00 },
+        &.{ 0xfb, 0x02, 0x00 },
+        &.{ 0xfb, 0x05, 0x00 },
+    };
+    for (truncated) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+    }
+}
+
+test "GC struct instructions preserve known results in unreachable code" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $s (struct (field i32)))" ++
+            " (func (result (ref $s)) unreachable struct.new $s))",
+        "(module (type $s (struct (field i32)))" ++
+            " (func (result i32) unreachable struct.get $s 0))",
+        "(module (type $s (struct (field i8)))" ++
+            " (func (result i32) unreachable struct.get_s $s 0))",
+        "(module (type $s (struct (field (mut i32))))" ++
+            " (func unreachable struct.set $s 0))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $s (struct (field i32)))" ++
+            " (func (result i32) unreachable struct.new $s))",
+        "(module (type $s (struct (field i32)))" ++
+            " (func (result i64) unreachable struct.get $s 0))",
+        "(module (type $s (struct (field i8)))" ++
+            " (func (result i64) unreachable struct.get_u $s 0))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC struct constructors are valid constant expressions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const binary_writer = @import("binary/writer.zig");
+
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $s (struct (field i32) (field i8)))
+        \\  (global (ref $s) (struct.new $s (i32.const 1) (i32.const 2)))
+        \\  (global (ref $s) (struct.new_default $s)))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+    try std.testing.expectError(
+        error.ConstantExprRequired,
+        validate(&module, .{ .features = .{ .gc = false } }),
+    );
+
+    const bytes = try binary_writer.writeModule(alloc, &module);
+    defer alloc.free(bytes);
+    var round_trip = try binary_reader.readModule(alloc, bytes);
+    defer round_trip.deinit();
+    try validate(&round_trip, .{});
+
+    var nondefaultable = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $s (struct (field (ref func))))
+        \\  (global (ref $s) (struct.new_default $s)))
+    );
+    defer nondefaultable.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&nondefaultable, .{}));
+
+    var get = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $s (struct (field i32)))
+        \\  (global i32
+        \\    (struct.get $s 0 (struct.new $s (i32.const 1)))))
+    );
+    defer get.deinit();
+    try std.testing.expectError(error.ConstantExprRequired, validate(&get, .{}));
+}
+
 test "GC reference conversions type-check constant expressions" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
@@ -3477,7 +3950,7 @@ test "GC reference conversions type-check constant expressions" {
 test "GC prefix distinguishes pending instructions from unknown subopcodes" {
     const alloc = std.testing.allocator;
 
-    const pending = [_]u8{ 0xfb, 0x00, 0x00, 0x0b }; // struct.new 0
+    const pending = [_]u8{ 0xfb, 0x06, 0x00, 0x0b }; // array.new 0
     var known = try testModuleWithBody(alloc, &pending);
     defer known.deinit();
     try std.testing.expectError(error.UnsupportedOpcode, validate(&known, .{}));
