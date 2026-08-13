@@ -116,6 +116,8 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
             else => .mem_arg,
         },
         0xfb => switch (code) {
+            0x00, 0x01 => .index,
+            0x02...0x05 => .index_pair,
             0x1a...0x1e => .none,
             else => null,
         },
