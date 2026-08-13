@@ -1400,6 +1400,34 @@ test "a ref test heap type byte does not end an initializer scan" {
     try std.testing.expectEqualStrings("x", module.customs.items[0].name);
 }
 
+test "cast branch immediates are scanned through both heap types" {
+    const allocator = std.testing.allocator;
+    const src = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x0c, 0x01, 0x6e, 0x00, 0xd0, 0x6e, 0xfb,
+        0x18, 0x03, 0x00, 0x6e, 0x6b, 0x0b, 0x00, 0x02,
+        0x01, 'x',
+    };
+    var module = try readModule(allocator, &src);
+    defer module.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xd0, 0x6e, 0xfb, 0x18, 0x03, 0x00, 0x6e, 0x6b },
+        module.globals.items[0].init_expr_bytes,
+    );
+    try std.testing.expectEqualStrings("x", module.customs.items[0].name);
+
+    const invalid_flags = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x06, 0x07, 0x01, 0x6e, 0x00, 0xfb, 0x18, 0x04,
+        0x0b,
+    };
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        readModule(allocator, &invalid_flags),
+    );
+}
+
 test "heap types use s33 width in reference types and initializer scans" {
     const allocator = std.testing.allocator;
 

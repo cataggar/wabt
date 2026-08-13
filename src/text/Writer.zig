@@ -476,6 +476,16 @@ const WatWriter = struct {
                 try self.writeHeapType(bytes, pos);
                 try self.appendByte(')');
             },
+            .cast_branch => {
+                const flags = try readByteAt(bytes, pos);
+                if (flags > 0x03) return error.UnsupportedOpcode;
+                try self.appendByte(' ');
+                try self.writeU32(try readU32At(bytes, pos));
+                try self.appendByte(' ');
+                try self.writeCastRefType(bytes, pos, (flags & 0x01) != 0);
+                try self.appendByte(' ');
+                try self.writeCastRefType(bytes, pos, (flags & 0x02) != 0);
+            },
             .select_types => {
                 const count = try readU32At(bytes, pos);
                 for (0..count) |_| {
@@ -574,6 +584,34 @@ const WatWriter = struct {
         }
         if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
         try self.writeU32(@intCast(r.value));
+    }
+
+    fn writeCastRefType(
+        self: *WatWriter,
+        bytes: []const u8,
+        pos: *usize,
+        nullable: bool,
+    ) WriteError!void {
+        const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.TruncatedBody,
+            error.Overflow => error.UnsupportedOpcode,
+        };
+        pos.* += r.bytes_read;
+        if (types.AbstractHeapType.fromCode(r.value)) |heap| {
+            if (nullable) {
+                try self.append(heap.nullableValType().name());
+            } else {
+                try self.append("(ref ");
+                try self.append(heapTypeName(heap));
+                try self.appendByte(')');
+            }
+            return;
+        }
+        if (r.value < 0 or r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
+        try self.append("(ref ");
+        if (nullable) try self.append("null ");
+        try self.writeU32(@intCast(r.value));
+        try self.appendByte(')');
     }
 
     /// `align=` is always printed, as the encoded value rather than a value
@@ -1921,6 +1959,43 @@ test "ref test and cast print and reparse their target reference types" {
     );
 }
 
+test "cast branches print and reparse both reference types" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("Parser.zig");
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $source (struct))
+        \\  (type $target (sub $source (struct)))
+        \\  (func
+        \\    block
+        \\      br_on_cast 0 anyref (ref $target) drop
+        \\      br_on_cast_fail 0 (ref null $source) (ref null $target) drop
+        \\    end))
+    );
+    defer module.deinit();
+
+    const wat = try writeModule(alloc, &module);
+    defer alloc.free(wat);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        wat,
+        "br_on_cast 0 anyref (ref 1)",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        wat,
+        "br_on_cast_fail 0 (ref null 0) (ref null 1)",
+    ) != null);
+
+    var reparsed = try Parser.parseModule(alloc, wat);
+    defer reparsed.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        module.funcs.items[0].code_bytes,
+        reparsed.funcs.items[0].code_bytes,
+    );
+}
+
 test "heap type printing accepts padded s33 and rejects six-byte encodings" {
     const alloc = std.testing.allocator;
 
@@ -1981,6 +2056,7 @@ test "skipping an instruction's immediates lands where printing them does" {
         &.{ 0xd0, 0x00 }, // ref.null 0 -- heap_type as a type index
         &.{ 0xfb, 0x14, 0x0b }, // ref.test (ref 11) -- ref_type; 0x0b is not end
         &.{ 0xfb, 0x15, 0x0b }, // ref.test (ref null 11) -- ref_null_type
+        &.{ 0xfb, 0x18, 0x01, 0x00, 0x6e, 0x6b }, // br_on_cast -- cast_branch
         &.{ 0x1c, 0x01, 0x7f }, // select (result i32) -- select_types
         &.{ 0x1f, 0x40, 0x02, 0x00, 0x01, 0x00, 0x02, 0x01 }, // try_table
         &.{ 0xfe, 0x03, 0x00 }, // atomic.fence -- reserved_byte

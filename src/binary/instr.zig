@@ -61,6 +61,9 @@ pub const Imm = enum {
     /// A nullable reference type encoded as just its heap type, for the
     /// nullable `ref.test` and `ref.cast` variants.
     ref_null_type,
+    /// Cast flags, a label index, a source heap type, and a target heap type,
+    /// for `br_on_cast` and `br_on_cast_fail`.
+    cast_branch,
     /// A vector of value types, for the typed `select`.
     select_types,
     /// A block signature followed by a vector of catch clauses.
@@ -127,6 +130,7 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
             0x0f => .none,
             0x14, 0x16 => .ref_type,
             0x15, 0x17 => .ref_null_type,
+            0x18, 0x19 => .cast_branch,
             0x1a...0x1e => .none,
             else => null,
         },
@@ -245,6 +249,15 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
         .f32 => try skipBytes(4, bytes, pos),
         .f64 => try skipBytes(8, bytes, pos),
         .heap_type, .ref_type, .ref_null_type => try skipHeapType(bytes, pos),
+        .cast_branch => {
+            if (pos.* >= bytes.len) return error.TruncatedBody;
+            const flags = bytes[pos.*];
+            pos.* += 1;
+            if (flags > 0x03) return error.UnsupportedOpcode;
+            _ = try readU32At(bytes, pos);
+            try skipHeapType(bytes, pos);
+            try skipHeapType(bytes, pos);
+        },
         .select_types => {
             const count = try readU32At(bytes, pos);
             try skipBytes(count, bytes, pos);
