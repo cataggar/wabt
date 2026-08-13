@@ -251,12 +251,37 @@ pub const Code = enum(u32) {
 
     // -- GC prefix (0xfb << 8 | code) --
 
+    struct_new = 0xfb00,
+    struct_new_default = 0xfb01,
+    struct_get = 0xfb02,
+    struct_get_s = 0xfb03,
+    struct_get_u = 0xfb04,
+    struct_set = 0xfb05,
+    array_new = 0xfb06,
+    array_new_default = 0xfb07,
+    array_new_fixed = 0xfb08,
+    array_new_data = 0xfb09,
+    array_new_elem = 0xfb0a,
+    array_get = 0xfb0b,
+    array_get_s = 0xfb0c,
+    array_get_u = 0xfb0d,
+    array_set = 0xfb0e,
+    array_len = 0xfb0f,
+    array_fill = 0xfb10,
+    array_copy = 0xfb11,
+    array_init_data = 0xfb12,
+    array_init_elem = 0xfb13,
     ref_test = 0xfb14,
     ref_test_null = 0xfb15,
     ref_cast = 0xfb16,
     ref_cast_null = 0xfb17,
     br_on_cast = 0xfb18,
     br_on_cast_fail = 0xfb19,
+    any_convert_extern = 0xfb1a,
+    extern_convert_any = 0xfb1b,
+    ref_i31 = 0xfb1c,
+    i31_get_s = 0xfb1d,
+    i31_get_u = 0xfb1e,
 
     // -- Math prefix (0xfc << 8 | code) --
 
@@ -812,12 +837,37 @@ pub const Code = enum(u32) {
 
             // Garbage collection
             .ref_eq,
+            .struct_new,
+            .struct_new_default,
+            .struct_get,
+            .struct_get_s,
+            .struct_get_u,
+            .struct_set,
+            .array_new,
+            .array_new_default,
+            .array_new_fixed,
+            .array_new_data,
+            .array_new_elem,
+            .array_get,
+            .array_get_s,
+            .array_get_u,
+            .array_set,
+            .array_len,
+            .array_fill,
+            .array_copy,
+            .array_init_data,
+            .array_init_elem,
             .ref_test,
             .ref_test_null,
             .ref_cast,
             .ref_cast_null,
             .br_on_cast,
             .br_on_cast_fail,
+            .any_convert_extern,
+            .extern_convert_any,
+            .ref_i31,
+            .i31_get_s,
+            .i31_get_u,
             => features.gc,
 
             // Multi-value (select_t enabled by default)
@@ -1544,10 +1594,35 @@ pub const Code = enum(u32) {
             .ref_eq => "ref.eq",
             .br_on_null => "br_on_null",
             .br_on_non_null => "br_on_non_null",
+            .struct_new => "struct.new",
+            .struct_new_default => "struct.new_default",
+            .struct_get => "struct.get",
+            .struct_get_s => "struct.get_s",
+            .struct_get_u => "struct.get_u",
+            .struct_set => "struct.set",
+            .array_new => "array.new",
+            .array_new_default => "array.new_default",
+            .array_new_fixed => "array.new_fixed",
+            .array_new_data => "array.new_data",
+            .array_new_elem => "array.new_elem",
+            .array_get => "array.get",
+            .array_get_s => "array.get_s",
+            .array_get_u => "array.get_u",
+            .array_set => "array.set",
+            .array_len => "array.len",
+            .array_fill => "array.fill",
+            .array_copy => "array.copy",
+            .array_init_data => "array.init_data",
+            .array_init_elem => "array.init_elem",
             .ref_test, .ref_test_null => "ref.test",
             .ref_cast, .ref_cast_null => "ref.cast",
             .br_on_cast => "br_on_cast",
             .br_on_cast_fail => "br_on_cast_fail",
+            .any_convert_extern => "any.convert_extern",
+            .extern_convert_any => "extern.convert_any",
+            .ref_i31 => "ref.i31",
+            .i31_get_s => "i31.get_s",
+            .i31_get_u => "i31.get_u",
             .i32_trunc_sat_f32_s => "i32.trunc_sat_f32_s",
             .i32_trunc_sat_f32_u => "i32.trunc_sat_f32_u",
             .i32_trunc_sat_f64_s => "i32.trunc_sat_f64_s",
@@ -1908,9 +1983,11 @@ test "opcode encoding — single-byte values" {
 }
 
 test "opcode encoding — prefixed values" {
+    try std.testing.expectEqual(@as(u32, 0xfb00), @intFromEnum(Code.struct_new));
     try std.testing.expectEqual(@as(u32, 0xfb14), @intFromEnum(Code.ref_test));
     try std.testing.expectEqual(@as(u32, 0xfb18), @intFromEnum(Code.br_on_cast));
     try std.testing.expectEqual(@as(u32, 0xfb19), @intFromEnum(Code.br_on_cast_fail));
+    try std.testing.expectEqual(@as(u32, 0xfb1e), @intFromEnum(Code.i31_get_u));
     try std.testing.expectEqual(@as(u32, 0xfc00), @intFromEnum(Code.i32_trunc_sat_f32_s));
     try std.testing.expectEqual(@as(u32, 0xfd0c), @intFromEnum(Code.v128_const));
     try std.testing.expectEqual(@as(u32, 0xfe00), @intFromEnum(Code.memory_atomic_notify));
@@ -2057,8 +2134,10 @@ test "isEnabled — feature-gated opcodes respect flags" {
     try std.testing.expect(!Code.ref_cast.isEnabled(none));
     var with_gc = none;
     with_gc.gc = true;
+    try std.testing.expect(Code.struct_new.isEnabled(with_gc));
     try std.testing.expect(Code.ref_cast.isEnabled(with_gc));
     try std.testing.expect(Code.br_on_cast.isEnabled(with_gc));
+    try std.testing.expect(Code.i31_get_u.isEnabled(with_gc));
 
     // Multi-value (select_t)
     try std.testing.expect(!Code.select_t.isEnabled(none));
@@ -2104,10 +2183,14 @@ test "name — spot checks" {
     try std.testing.expectEqualStrings("i32.const", Code.i32_const.name());
     try std.testing.expectEqualStrings("memory.size", Code.memory_size.name());
     try std.testing.expectEqualStrings("i32.trunc_sat_f32_s", Code.i32_trunc_sat_f32_s.name());
+    try std.testing.expectEqualStrings("struct.new", Code.struct_new.name());
+    try std.testing.expectEqualStrings("array.init_elem", Code.array_init_elem.name());
     try std.testing.expectEqualStrings("ref.test", Code.ref_test_null.name());
     try std.testing.expectEqualStrings("ref.cast", Code.ref_cast.name());
     try std.testing.expectEqualStrings("br_on_cast", Code.br_on_cast.name());
     try std.testing.expectEqualStrings("br_on_cast_fail", Code.br_on_cast_fail.name());
+    try std.testing.expectEqualStrings("extern.convert_any", Code.extern_convert_any.name());
+    try std.testing.expectEqualStrings("i31.get_u", Code.i31_get_u.name());
     try std.testing.expectEqualStrings("v128.const", Code.v128_const.name());
     try std.testing.expectEqualStrings("memory.atomic.notify", Code.memory_atomic_notify.name());
     try std.testing.expectEqualStrings("<unknown>", (@as(Code, @enumFromInt(0xFFFF))).name());
