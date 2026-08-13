@@ -1904,8 +1904,10 @@ test "skipping an instruction's immediates lands where printing them does" {
         &.{ 0x02, 0x63, 0x70 }, // block (result (ref null func))
         &.{ 0x0c, 0x03 }, // br -- index
         &.{ 0xfb, 0x00, 0x0b }, // struct.new -- index (the byte also spells end)
+        &.{ 0xfb, 0x07, 0x0b }, // array.new_default -- index
         &.{ 0xfc, 0x0a, 0x00, 0x01 }, // memory.copy -- index_pair
         &.{ 0xfb, 0x02, 0x0b, 0x01 }, // struct.get -- index_pair
+        &.{ 0xfb, 0x08, 0x0b, 0x0b }, // array.new_fixed -- index_pair
         &.{ 0xfc, 0x08, 0x02, 0x00 }, // memory.init -- index_pair_swapped
         &.{ 0x11, 0x01, 0x00 }, // call_indirect
         &.{ 0x0e, 0x02, 0x00, 0x01, 0x02 }, // br_table

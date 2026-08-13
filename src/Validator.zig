@@ -466,6 +466,17 @@ fn checkConstExpr(
                     try checkConstStructNew(m, &stack, type_idx, sub == 0x01);
                     continue;
                 }
+                if (sub == 0x06 or sub == 0x07) {
+                    const type_idx = try readU32Immediate(bytes, &pos);
+                    try checkConstArrayNew(m, &stack, type_idx, sub == 0x07);
+                    continue;
+                }
+                if (sub == 0x08) {
+                    const type_idx = try readU32Immediate(bytes, &pos);
+                    const count = try readU32Immediate(bytes, &pos);
+                    try checkConstArrayNewFixed(m, &stack, type_idx, count);
+                    continue;
+                }
                 if (sub == 0x1c) {
                     try popExpecting(m, &stack, .i32);
                     try push(m, &stack, StackType.known(.ref_i31));
@@ -528,6 +539,36 @@ fn checkConstStructNew(
         }
     }
     try push(m, stack, concreteStructRef(type_idx, false));
+}
+
+fn checkConstArrayNew(
+    m: *const Mod.Module,
+    stack: *std.ArrayListUnmanaged(StackType),
+    type_idx: u32,
+    use_default: bool,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (use_default and !isDefaultableField(field)) return error.TypeMismatch;
+    try popExpecting(m, stack, .i32);
+    if (!use_default) {
+        const actual = stack.pop() orelse return error.TypeMismatch;
+        if (!actual.isSubtypeOf(m, storageStackType(field))) return error.TypeMismatch;
+    }
+    try push(m, stack, concreteArrayRef(type_idx, false));
+}
+
+fn checkConstArrayNewFixed(
+    m: *const Mod.Module,
+    stack: *std.ArrayListUnmanaged(StackType),
+    type_idx: u32,
+    count: u32,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    for (0..count) |_| {
+        const actual = stack.pop() orelse return error.TypeMismatch;
+        if (!actual.isSubtypeOf(m, storageStackType(field))) return error.TypeMismatch;
+    }
+    try push(m, stack, concreteArrayRef(type_idx, false));
 }
 
 // ── Unrecognised opcode classification ──────────────────────────────────
@@ -1165,6 +1206,14 @@ fn structFieldAt(
     return st.fields.items[field_idx];
 }
 
+fn arrayTypeAt(m: *const Mod.Module, type_idx: u32) Error!Mod.TypeEntry.ArrayType {
+    if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+    return switch (m.module_types.items[type_idx]) {
+        .array_type => |at| at,
+        else => error.TypeMismatch,
+    };
+}
+
 fn isDefaultableField(field: Mod.TypeEntry.StructType.Field) bool {
     if (field.@"type".isNumType() or field.@"type".isPackedType()) return true;
     const ref_type = fieldStackType(field).asRefType() orelse return false;
@@ -1173,6 +1222,24 @@ fn isDefaultableField(field: Mod.TypeEntry.StructType.Field) bool {
 
 fn concreteStructRef(type_idx: u32, nullable: bool) StackType {
     return StackType.fromRefType(types.RefType.concrete(nullable, type_idx));
+}
+
+fn concreteArrayRef(type_idx: u32, nullable: bool) StackType {
+    return StackType.fromRefType(types.RefType.concrete(nullable, type_idx));
+}
+
+fn isDataArrayField(field: Mod.TypeEntry.StructType.Field) bool {
+    return field.@"type".isNumType() or field.@"type".isPackedType();
+}
+
+fn arrayFieldsMatch(
+    m: *const Mod.Module,
+    source: Mod.TypeEntry.StructType.Field,
+    destination: Mod.TypeEntry.StructType.Field,
+) bool {
+    if (source.@"type".isPackedType() or destination.@"type".isPackedType())
+        return source.@"type" == destination.@"type";
+    return fieldStackType(source).isSubtypeOf(m, fieldStackType(destination));
 }
 
 fn stackSubtype(m: *const Mod.Module, actual: StackType, expected: StackType, depth: usize) bool {
@@ -1991,6 +2058,106 @@ fn checkOneBody(
                             field_idx,
                         );
                     },
+                    0x06, 0x07 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayNew(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            sub == 0x07,
+                            gpa(m),
+                        );
+                    },
+                    0x08 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const count = try readU32Immediate(bytes, &pos);
+                        try checkArrayNewFixed(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            count,
+                            gpa(m),
+                        );
+                    },
+                    0x09 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const data_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayNewData(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            data_idx,
+                            gpa(m),
+                        );
+                    },
+                    0x0a => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const elem_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayNewElem(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            elem_idx,
+                            gpa(m),
+                        );
+                    },
+                    0x0b...0x0d => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayGet(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            sub,
+                            gpa(m),
+                        );
+                    },
+                    0x0e => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        try checkArraySet(m, &val_stack, &ctrl_stack, type_idx);
+                    },
+                    0x0f => try checkArrayLen(m, &val_stack, &ctrl_stack, gpa(m)),
+                    0x10 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayFill(m, &val_stack, &ctrl_stack, type_idx);
+                    },
+                    0x11 => {
+                        const destination_idx = try readU32Immediate(bytes, &pos);
+                        const source_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayCopy(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            destination_idx,
+                            source_idx,
+                        );
+                    },
+                    0x12 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const data_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayInitData(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            data_idx,
+                        );
+                    },
+                    0x13 => {
+                        const type_idx = try readU32Immediate(bytes, &pos);
+                        const elem_idx = try readU32Immediate(bytes, &pos);
+                        try checkArrayInitElem(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            type_idx,
+                            elem_idx,
+                        );
+                    },
                     0x1a => try checkGcRefConversion(
                         m,
                         &val_stack,
@@ -2009,7 +2176,7 @@ fn checkOneBody(
                     ), // extern.convert_any
                     0x1c => try checkUnary(m, &val_stack, &ctrl_stack, .i32, .ref_i31, gpa(m)), // ref.i31
                     0x1d, 0x1e => try checkUnary(m, &val_stack, &ctrl_stack, .i31ref, .i32, gpa(m)), // i31.get_s/u
-                    0x06...0x19 => return error.UnsupportedOpcode,
+                    0x14...0x19 => return error.UnsupportedOpcode,
                     else => return error.UnknownOpcode,
                 }
             },
@@ -2383,6 +2550,218 @@ fn checkStructSet(
     if (!field.mutable) return error.TypeMismatch;
     try popExpect(m, val_stack, ctrl_stack, storageStackType(field));
     try popExpect(m, val_stack, ctrl_stack, concreteStructRef(type_idx, true));
+}
+
+fn checkArrayNew(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    use_default: bool,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (use_default and !isDefaultableField(field)) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    if (!use_default)
+        try popExpect(m, val_stack, ctrl_stack, storageStackType(field)); // init
+    val_stack.append(alloc, concreteArrayRef(type_idx, false)) catch return error.OutOfMemory;
+}
+
+fn popExpectRepeated(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    expected: StackType,
+    count: u32,
+) Error!void {
+    var remaining = count;
+    while (remaining > 0) : (remaining -= 1) {
+        if (ctrl_stack.items.len == 0) return error.TypeMismatch;
+        const frame = ctrl_stack.items[ctrl_stack.items.len - 1];
+        // The unreachable stack supplies any number of unknown operands.
+        // Stop here rather than iterating a u32-sized fixed-array count.
+        if (frame.unreachable_flag and val_stack.items.len == frame.height) return;
+        try popExpect(m, val_stack, ctrl_stack, expected);
+    }
+}
+
+fn checkArrayNewFixed(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    count: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    try popExpectRepeated(m, val_stack, ctrl_stack, storageStackType(field), count);
+    val_stack.append(alloc, concreteArrayRef(type_idx, false)) catch return error.OutOfMemory;
+}
+
+fn checkDataArray(
+    m: *const Mod.Module,
+    type_idx: u32,
+    data_idx: u32,
+    require_mutable: bool,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (require_mutable and !field.mutable) return error.TypeMismatch;
+    if (!isDataArrayField(field)) return error.TypeMismatch;
+    if (!m.has_data_count or data_idx >= m.data_segments.items.len)
+        return error.InvalidDataIndex;
+}
+
+fn checkElemArray(
+    m: *const Mod.Module,
+    type_idx: u32,
+    elem_idx: u32,
+    require_mutable: bool,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (require_mutable and !field.mutable) return error.TypeMismatch;
+    if (!field.@"type".isRefType()) return error.TypeMismatch;
+    if (elem_idx >= m.elem_segments.items.len) return error.InvalidElemIndex;
+    const seg = m.elem_segments.items[elem_idx];
+    const seg_type = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
+    if (!seg_type.isSubtypeOf(m, fieldStackType(field))) return error.TypeMismatch;
+}
+
+fn checkArrayNewData(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    data_idx: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    try checkDataArray(m, type_idx, data_idx, false);
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // src
+    val_stack.append(alloc, concreteArrayRef(type_idx, false)) catch return error.OutOfMemory;
+}
+
+fn checkArrayNewElem(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    elem_idx: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    try checkElemArray(m, type_idx, elem_idx, false);
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // src
+    val_stack.append(alloc, concreteArrayRef(type_idx, false)) catch return error.OutOfMemory;
+}
+
+fn checkArrayGet(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    sub: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    const is_packed = field.@"type".isPackedType();
+    const result = switch (sub) {
+        0x0b => blk: {
+            if (is_packed) return error.TypeMismatch;
+            break :blk fieldStackType(field);
+        },
+        0x0c, 0x0d => blk: {
+            if (!is_packed) return error.TypeMismatch;
+            break :blk StackType.known(.i32);
+        },
+        else => unreachable,
+    };
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // i
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(type_idx, true));
+    val_stack.append(alloc, result) catch return error.OutOfMemory;
+}
+
+fn checkArraySet(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (!field.mutable) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, storageStackType(field)); // val
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // i
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(type_idx, true));
+}
+
+fn checkArrayLen(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    alloc: std.mem.Allocator,
+) Error!void {
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.arrayref));
+    val_stack.append(alloc, StackType.known(.i32)) catch return error.OutOfMemory;
+}
+
+fn checkArrayFill(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+) Error!void {
+    const field = (try arrayTypeAt(m, type_idx)).field;
+    if (!field.mutable) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, storageStackType(field)); // val
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // d
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(type_idx, true));
+}
+
+fn checkArrayCopy(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    destination_idx: u32,
+    source_idx: u32,
+) Error!void {
+    const destination = (try arrayTypeAt(m, destination_idx)).field;
+    const source = (try arrayTypeAt(m, source_idx)).field;
+    if (!destination.mutable) return error.TypeMismatch;
+    if (!arrayFieldsMatch(m, source, destination)) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // src
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(source_idx, true));
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // dst
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(destination_idx, true));
+}
+
+fn checkArrayInitData(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    data_idx: u32,
+) Error!void {
+    try checkDataArray(m, type_idx, data_idx, true);
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // src
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // dst
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(type_idx, true));
+}
+
+fn checkArrayInitElem(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    type_idx: u32,
+    elem_idx: u32,
+) Error!void {
+    try checkElemArray(m, type_idx, elem_idx, true);
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // n
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // src
+    try popExpect(m, val_stack, ctrl_stack, StackType.known(.i32)); // dst
+    try popExpect(m, val_stack, ctrl_stack, concreteArrayRef(type_idx, true));
 }
 
 fn gcConvertedRef(
@@ -3909,6 +4288,409 @@ test "GC struct constructors are valid constant expressions" {
     try std.testing.expectError(error.ConstantExprRequired, validate(&get, .{}));
 }
 
+test "GC array constructors check storage types, arity, and defaultability" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) i32.const 7 i32.const 3 array.new $a))",
+        "(module (type $a (array i8))" ++
+            " (func (result (ref $a)) i32.const 7 i32.const 3 array.new $a))",
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $a (array (ref null $p)))
+        \\  (func (param (ref $c)) (result (ref $a))
+        \\    local.get 0 i32.const 3 array.new $a))
+        ,
+        \\(module
+        \\  (type $s (struct))
+        \\  (type $a (array (ref null $s)))
+        \\  (func (result (ref $a)) i32.const 3 array.new_default $a))
+        ,
+        "(module (type $a (array i16))" ++
+            " (func (result (ref $a)) i32.const 1 i32.const 2 array.new_fixed $a 2))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) i32.const 7 i64.const 3 array.new $a))",
+        "(module (type $a (array i8))" ++
+            " (func (result (ref $a)) i64.const 7 i32.const 3 array.new $a))",
+        \\(module
+        \\  (type $s (struct))
+        \\  (type $a (array (ref $s)))
+        \\  (func (result (ref $a)) i32.const 3 array.new_default $a))
+        ,
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) i32.const 1 array.new_fixed $a 2))",
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) i32.const 1 i64.const 2 array.new_fixed $a 2))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC array data and element constructors check segment and element types" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $a (array v128)) (data \"abcdefghijklmnop\")" ++
+            " (func (result (ref $a)) i32.const 0 i32.const 1 array.new_data $a 0))",
+        "(module (type $a (array i8)) (data \"abc\")" ++
+            " (func (result (ref $a)) i32.const 0 i32.const 3 array.new_data $a 0))",
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $a (array (ref null $p)))
+        \\  (elem (ref null $c) (ref.null $c))
+        \\  (func (result (ref $a))
+        \\    i32.const 0 i32.const 1 array.new_elem $a 0))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $a (array funcref)) (data \"abcd\")" ++
+            " (func (result (ref $a)) i32.const 0 i32.const 1 array.new_data $a 0))",
+        "(module (type $a (array i32)) (func $f)" ++
+            " (elem funcref (ref.func $f))" ++
+            " (func (result (ref $a)) i32.const 0 i32.const 1 array.new_elem $a 0))",
+        "(module (type $a (array externref)) (func $f)" ++
+            " (elem funcref (ref.func $f))" ++
+            " (func (result (ref $a)) i32.const 0 i32.const 1 array.new_elem $a 0))",
+        "(module (type $a (array i32)) (data \"abcd\")" ++
+            " (func (result (ref $a)) i64.const 0 i32.const 1 array.new_data $a 0))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC array access checks receivers, packed forms, mutability, and subtyping" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $a (array i64))" ++
+            " (func (param (ref null $a)) (result i64)" ++
+            " local.get 0 i32.const 0 array.get $a))",
+        "(module (type $a (array i8))" ++
+            " (func (param (ref null $a)) (result i32)" ++
+            " local.get 0 i32.const 0 array.get_s $a))",
+        "(module (type $a (array i16))" ++
+            " (func (param (ref $a)) (result i32)" ++
+            " local.get 0 i32.const 0 array.get_u $a))",
+        "(module (type $a (array (mut i8)))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 7 array.set $a))",
+        "(module (func (param arrayref) (result i32) local.get 0 array.len))",
+        \\(module
+        \\  (type $p (sub (array (ref null any))))
+        \\  (type $c (sub $p (array (ref null eq))))
+        \\  (func (param (ref null $c)) (result anyref)
+        \\    local.get 0 i32.const 0 array.get $p))
+        ,
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $a (array (mut (ref null $p))))
+        \\  (func (param (ref null $a)) (param (ref $c))
+        \\    local.get 0 i32.const 0 local.get 1 array.set $a))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $a (array i8))" ++
+            " (func (param (ref null $a)) (result i32)" ++
+            " local.get 0 i32.const 0 array.get $a))",
+        "(module (type $a (array i32))" ++
+            " (func (param (ref null $a)) (result i32)" ++
+            " local.get 0 i32.const 0 array.get_s $a))",
+        "(module (type $a (array i32))" ++
+            " (func (param arrayref) (result i32)" ++
+            " local.get 0 i32.const 0 array.get $a))",
+        "(module (type $a (array i32))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 7 array.set $a))",
+        "(module (type $a (array (mut i32)))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i64.const 7 array.set $a))",
+        "(module (func (param eqref) (result i32) local.get 0 array.len))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC array bulk operations check operands, mutability, and source compatibility" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $a (array (mut i8)))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 7 i32.const 2 array.fill $a))",
+        \\(module
+        \\  (type $p (sub (struct)))
+        \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $a (array (mut (ref null $p))))
+        \\  (func (param (ref null $a)) (param (ref $c))
+        \\    local.get 0 i32.const 0 local.get 1 i32.const 2 array.fill $a))
+        ,
+        \\(module
+        \\  (type $d (array (mut (ref null any))))
+        \\  (type $s (array (ref null eq)))
+        \\  (func (param (ref null $d)) (param (ref null $s))
+        \\    local.get 0 i32.const 0 local.get 1 i32.const 0 i32.const 2
+        \\    array.copy $d $s))
+        ,
+        "(module (type $d (array (mut i8))) (type $s (array i8))" ++
+            " (func (param (ref null $d)) (param (ref null $s))" ++
+            " local.get 0 i32.const 0 local.get 1 i32.const 0 i32.const 2" ++
+            " array.copy $d $s))",
+        "(module (type $a (array (mut i32))) (data \"abcd\")" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_data $a 0))",
+        "(module (type $a (array (mut funcref))) (func $f)" ++
+            " (elem funcref (ref.func $f))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_elem $a 0))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $a (array i32))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 7 i32.const 2 array.fill $a))",
+        "(module (type $d (array i32)) (type $s (array i32))" ++
+            " (func (param (ref null $d)) (param (ref null $s))" ++
+            " local.get 0 i32.const 0 local.get 1 i32.const 0 i32.const 2" ++
+            " array.copy $d $s))",
+        "(module (type $d (array (mut i16))) (type $s (array i8))" ++
+            " (func (param (ref null $d)) (param (ref null $s))" ++
+            " local.get 0 i32.const 0 local.get 1 i32.const 0 i32.const 2" ++
+            " array.copy $d $s))",
+        "(module (type $a (array i32)) (data \"abcd\")" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_data $a 0))",
+        "(module (type $a (array (mut funcref))) (data \"abcd\")" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_data $a 0))",
+        "(module (type $a (array (mut i32))) (func $f)" ++
+            " (elem funcref (ref.func $f))" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_elem $a 0))",
+        "(module (type $a (array (mut i32))) (data \"abcd\")" ++
+            " (func (param (ref null $a))" ++
+            " local.get 0 i32.const 0 i64.const 0 i32.const 1 array.init_data $a 0))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC array immediates check bounds, kinds, feature gating, and truncation" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var bad_type = try Parser.parseModule(alloc,
+        "(module (func unreachable array.new_default 10 drop))",
+    );
+    defer bad_type.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_type, .{}));
+
+    var wrong_kind = try Parser.parseModule(alloc,
+        "(module (type $f (func)) (func unreachable array.new_default $f drop))",
+    );
+    defer wrong_kind.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&wrong_kind, .{}));
+
+    var bad_data = try Parser.parseModule(alloc,
+        "(module (type $a (array i32))" ++
+            " (func unreachable array.new_data $a 0 drop))",
+    );
+    defer bad_data.deinit();
+    try std.testing.expectError(error.InvalidDataIndex, validate(&bad_data, .{}));
+
+    var no_data_count = try Parser.parseModule(alloc,
+        "(module (type $a (array i32)) (data \"x\")" ++
+            " (func unreachable array.new_data $a 0 drop))",
+    );
+    defer no_data_count.deinit();
+    no_data_count.has_data_count = false;
+    try std.testing.expectError(error.InvalidDataIndex, validate(&no_data_count, .{}));
+
+    var bad_elem = try Parser.parseModule(alloc,
+        "(module (type $a (array funcref))" ++
+            " (func unreachable array.new_elem $a 0 drop))",
+    );
+    defer bad_elem.deinit();
+    try std.testing.expectError(error.InvalidElemIndex, validate(&bad_elem, .{}));
+
+    const gated_instructions = [_][]const u8{
+        "array.new $i drop",
+        "array.new_default $i drop",
+        "array.new_fixed $i 2 drop",
+        "array.new_data $i 0 drop",
+        "array.new_elem $r 0 drop",
+        "array.get $i drop",
+        "array.get_s $p drop",
+        "array.get_u $p drop",
+        "array.set $i",
+        "array.len drop",
+        "array.fill $i",
+        "array.copy $i $i",
+        "array.init_data $i 0",
+        "array.init_elem $r 0",
+    };
+    for (gated_instructions) |instruction| {
+        const source = try std.fmt.allocPrint(alloc,
+            \\(module
+            \\  (type $i (array (mut i32)))
+            \\  (type $p (array (mut i8)))
+            \\  (type $r (array (mut funcref)))
+            \\  (func $f)
+            \\  (elem funcref (ref.func $f))
+            \\  (data "x")
+            \\  (func unreachable {s}))
+        , .{instruction});
+        defer alloc.free(source);
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+        try std.testing.expectError(
+            error.UnsupportedOpcode,
+            validate(&module, .{ .features = .{ .gc = false } }),
+        );
+    }
+
+    const truncated = [_][]const u8{
+        &.{ 0xfb, 0x06 },
+        &.{ 0xfb, 0x08, 0x00 },
+        &.{ 0xfb, 0x0b },
+        &.{ 0xfb, 0x10 },
+        &.{ 0xfb, 0x13, 0x00 },
+    };
+    for (truncated) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+    }
+}
+
+test "GC array instructions preserve constrained results in unreachable code" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) unreachable array.new $a))",
+        "(module (type $a (array i32))" ++
+            " (func (result (ref $a)) unreachable array.new_fixed $a 4294967295))",
+        "(module (type $a (array i64))" ++
+            " (func (result i64) unreachable array.get $a))",
+        "(module (type $a (array i8))" ++
+            " (func (result i32) unreachable array.get_u $a))",
+        "(module (func (result i32) unreachable array.len))",
+        "(module (type $a (array (mut i32)))" ++
+            " (func unreachable array.set $a array.fill $a array.copy $a $a))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (type $a (array i32))" ++
+            " (func (result i32) unreachable array.new $a))",
+        "(module (type $a (array i64))" ++
+            " (func (result i32) unreachable array.get $a))",
+        "(module (func (result i64) unreachable array.len))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC array constructors are valid constant expressions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const binary_reader = @import("binary/reader.zig");
+    const binary_writer = @import("binary/writer.zig");
+
+    var module = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $a (array i32))
+        \\  (global (ref $a) (array.new $a (i32.const 1) (i32.const 2)))
+        \\  (global (ref $a) (array.new_default $a (i32.const 2)))
+        \\  (global (ref $a)
+        \\    (array.new_fixed $a 2 (i32.const 1) (i32.const 2))))
+    );
+    defer module.deinit();
+    try validate(&module, .{});
+    try std.testing.expectError(
+        error.ConstantExprRequired,
+        validate(&module, .{ .features = .{ .gc = false } }),
+    );
+
+    const bytes = try binary_writer.writeModule(alloc, &module);
+    defer alloc.free(bytes);
+    var round_trip = try binary_reader.readModule(alloc, bytes);
+    defer round_trip.deinit();
+    try validate(&round_trip, .{});
+
+    var nondefaultable = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $s (struct))
+        \\  (type $a (array (ref $s)))
+        \\  (global (ref $a) (array.new_default $a (i32.const 1))))
+    );
+    defer nondefaultable.deinit();
+    try std.testing.expectError(error.TypeMismatch, validate(&nondefaultable, .{}));
+
+    var nonconstant = try Parser.parseModule(alloc,
+        \\(module
+        \\  (type $a (array i32))
+        \\  (global i32
+        \\    (array.len (array.new_fixed $a 1 (i32.const 1)))))
+    );
+    defer nonconstant.deinit();
+    try std.testing.expectError(error.ConstantExprRequired, validate(&nonconstant, .{}));
+}
+
 test "GC reference conversions type-check constant expressions" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
@@ -3950,7 +4732,7 @@ test "GC reference conversions type-check constant expressions" {
 test "GC prefix distinguishes pending instructions from unknown subopcodes" {
     const alloc = std.testing.allocator;
 
-    const pending = [_]u8{ 0xfb, 0x06, 0x00, 0x0b }; // array.new 0
+    const pending = [_]u8{ 0xfb, 0x14, 0x0b }; // ref.test (still pending)
     var known = try testModuleWithBody(alloc, &pending);
     defer known.deinit();
     try std.testing.expectError(error.UnsupportedOpcode, validate(&known, .{}));
