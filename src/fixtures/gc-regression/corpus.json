@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "valid": [
+    {
+      "name": "struct-opcodes",
+      "family": "struct",
+      "subopcodes": [0, 1, 2, 3, 4, 5],
+      "wat": "(module\n  (type $plain (struct (field i64)))\n  (type $packed8 (struct (field i8)))\n  (type $packed16 (struct (field i16)))\n  (type $mutable (struct (field (mut i32))))\n  (type $default (struct (field i32)))\n  (func i64.const 1 struct.new $plain drop)\n  (func struct.new_default $default drop)\n  (func (param (ref null $plain)) local.get 0 struct.get $plain 0 drop)\n  (func (param (ref null $packed8)) local.get 0 struct.get_s $packed8 0 drop)\n  (func (param (ref $packed16)) local.get 0 struct.get_u $packed16 0 drop)\n  (func (param (ref null $mutable)) local.get 0 i32.const 1 struct.set $mutable 0)\n)"
+    },
+    {
+      "name": "array-opcodes",
+      "family": "array",
+      "subopcodes": [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+      "wat": "(module\n  (type $ints (array (mut i32)))\n  (type $packed8 (array (mut i8)))\n  (type $packed16 (array (mut i16)))\n  (type $bytes (array (mut i8)))\n  (type $refs (array (mut funcref)))\n  (func $target)\n  (elem $elements funcref (ref.func $target))\n  (data $bytes-data \"abcd\")\n  (func i32.const 7 i32.const 3 array.new $ints drop)\n  (func i32.const 3 array.new_default $ints drop)\n  (func i32.const 1 i32.const 2 array.new_fixed $ints 2 drop)\n  (func i32.const 0 i32.const 4 array.new_data $bytes $bytes-data drop)\n  (func i32.const 0 i32.const 1 array.new_elem $refs $elements drop)\n  (func (param (ref null $ints)) local.get 0 i32.const 0 array.get $ints drop)\n  (func (param (ref null $packed8)) local.get 0 i32.const 0 array.get_s $packed8 drop)\n  (func (param (ref $packed16)) local.get 0 i32.const 0 array.get_u $packed16 drop)\n  (func (param (ref null $ints)) local.get 0 i32.const 0 i32.const 9 array.set $ints)\n  (func (param arrayref) local.get 0 array.len drop)\n  (func (param (ref null $ints)) local.get 0 i32.const 0 i32.const 9 i32.const 2 array.fill $ints)\n  (func (param (ref null $ints)) (param (ref null $ints)) local.get 0 i32.const 0 local.get 1 i32.const 0 i32.const 2 array.copy $ints $ints)\n  (func (param (ref null $bytes)) local.get 0 i32.const 0 i32.const 0 i32.const 4 array.init_data $bytes $bytes-data)\n  (func (param (ref null $refs)) local.get 0 i32.const 0 i32.const 0 i32.const 1 array.init_elem $refs $elements)\n)"
+    },
+    {
+      "name": "cast-opcodes",
+      "family": "casts",
+      "subopcodes": [20, 21, 22, 23, 24, 25],
+      "wat": "(module\n  (rec (type $node (sub (struct (field (ref null $node))))))\n  (type $parent (sub (struct)))\n  (type $child (sub $parent (struct (field i32))))\n  (func (param anyref) (result i32) local.get 0 ref.test (ref $node))\n  (func (param anyref) (result i32) local.get 0 ref.test (ref null $child))\n  (func (param anyref) (result (ref $child)) local.get 0 ref.cast (ref $child))\n  (func (param (ref null $parent)) (result (ref null $child)) local.get 0 ref.cast (ref null $child))\n  (func (param anyref)\n    block (result (ref $node))\n      local.get 0 br_on_cast 0 anyref (ref $node)\n      drop ref.null $node ref.as_non_null\n    end\n    drop)\n  (func (param anyref)\n    block (result anyref)\n      local.get 0 br_on_cast_fail 0 anyref (ref struct)\n      drop ref.null any\n    end\n    drop)\n)"
+    },
+    {
+      "name": "conversion-opcodes",
+      "family": "conversions",
+      "subopcodes": [26, 27],
+      "wat": "(module\n  (func (param externref) (result anyref) local.get 0 any.convert_extern)\n  (func (param anyref) (result externref) local.get 0 extern.convert_any)\n)"
+    },
+    {
+      "name": "i31-opcodes",
+      "family": "i31",
+      "subopcodes": [28, 29, 30],
+      "wat": "(module\n  (func (param i32) (result (ref i31)) local.get 0 ref.i31)\n  (func (param i31ref) (result i32) local.get 0 i31.get_s)\n  (func (param (ref i31)) (result i32) local.get 0 i31.get_u)\n)"
+    }
+  ],
+  "invalid_wat": [
+    {
+      "name": "struct-wrong-operand",
+      "family": "operands-results",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $s (struct (field i32))) (func i64.const 1 struct.new $s drop))"
+    },
+    {
+      "name": "ref-test-wrong-result",
+      "family": "operands-results",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (param anyref) (result anyref) local.get 0 ref.test (ref array)))"
+    },
+    {
+      "name": "invalid-type-index",
+      "family": "indices",
+      "wabt_error": "InvalidTypeIndex",
+      "wat": "(module (func struct.new_default 9 drop))"
+    },
+    {
+      "name": "invalid-field-index",
+      "family": "indices",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $s (struct (field i32))) (func (param (ref null $s)) local.get 0 struct.get $s 1 drop))"
+    },
+    {
+      "name": "invalid-data-index",
+      "family": "indices",
+      "wabt_error": "InvalidDataIndex",
+      "wat": "(module (type $a (array i8)) (data \"x\") (func i32.const 0 i32.const 1 array.new_data $a 1 drop))"
+    },
+    {
+      "name": "invalid-element-index",
+      "family": "indices",
+      "wabt_error": "InvalidElemIndex",
+      "wat": "(module (type $a (array funcref)) (func $f) (elem funcref (ref.func $f)) (func i32.const 0 i32.const 1 array.new_elem $a 1 drop))"
+    },
+    {
+      "name": "invalid-label-index",
+      "family": "indices",
+      "wabt_error": "InvalidLabelIndex",
+      "wat": "(module (func (param anyref) local.get 0 br_on_cast 2 anyref (ref struct) drop))"
+    },
+    {
+      "name": "packed-get-form",
+      "family": "packed-default-mutability",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $s (struct (field i8))) (func (param (ref null $s)) local.get 0 struct.get $s 0 drop))"
+    },
+    {
+      "name": "nondefaultable-array",
+      "family": "packed-default-mutability",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $s (struct)) (type $a (array (ref $s))) (func i32.const 1 array.new_default $a drop))"
+    },
+    {
+      "name": "immutable-array-set",
+      "family": "packed-default-mutability",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $a (array i32)) (func (param (ref null $a)) local.get 0 i32.const 0 i32.const 1 array.set $a))"
+    },
+    {
+      "name": "nullable-cast-result",
+      "family": "nullability",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (param anyref) (result (ref struct)) local.get 0 ref.cast (ref null struct)))"
+    },
+    {
+      "name": "recursive-sibling-branch-cast",
+      "family": "recursive-subtyping",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (rec (type $node (sub (struct (field (ref null $node)))))) (type $other (sub (struct))) (func (param (ref null $node)) block (result (ref null $other)) local.get 0 br_on_cast 0 (ref null $node) (ref null $other) drop ref.null $other end drop))"
+    }
+  ],
+  "invalid_binary": [
+    {
+      "name": "truncated-struct-type-index",
+      "family": "malformed-immediates",
+      "wabt_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "body_hex": "fb00"
+    },
+    {
+      "name": "truncated-array-index-pair",
+      "family": "malformed-immediates",
+      "wabt_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "body_hex": "fb1300"
+    },
+    {
+      "name": "truncated-nullable-cast-heap-type",
+      "family": "malformed-immediates",
+      "wabt_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "body_hex": "fb1580"
+    },
+    {
+      "name": "truncated-branch-cast-target",
+      "family": "malformed-immediates",
+      "wabt_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "body_hex": "fb1801006e"
+    },
+    {
+      "name": "invalid-branch-cast-flags",
+      "family": "malformed-immediates",
+      "wabt_error": "InvalidCastFlags",
+      "binary_error": "InvalidCastFlags",
+      "body_hex": "fb18040b"
+    },
+    {
+      "name": "overflowing-gc-subopcode-leb",
+      "family": "malformed-immediates",
+      "wabt_error": "UnexpectedEnd",
+      "binary_error": "UnexpectedEnd",
+      "body_hex": "fb8080808080000b"
+    },
+    {
+      "name": "unknown-gc-subopcode",
+      "family": "malformed-immediates",
+      "wabt_error": "UnknownOpcode",
+      "binary_error": "UnknownOpcode",
+      "body_hex": "fb1f0b"
+    }
+  ]
+}

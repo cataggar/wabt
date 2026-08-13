@@ -97,4 +97,5 @@ test {
     _ = @import("component/adapter/world_gc.zig");
     _ = @import("component/adapter/test_fixtures.zig");
     _ = @import("integration_tests.zig");
+    _ = @import("gc_regression.zig");
 }
