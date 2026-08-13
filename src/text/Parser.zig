@@ -2220,134 +2220,28 @@ const Parser = struct {
                 self.emitLabelIdxImm(code);
             },
             .kw_br_on_cast, .kw_br_on_cast_fail => {
+                self.skipAnnotations();
+                if (self.peek().kind != .identifier and self.peek().kind != .integer) {
+                    self.markMalformed(@src());
+                    return;
+                }
+                const label_idx = self.readLabelIdxImm();
+                self.skipAnnotations();
+                const source = self.parseRefTestCastImmediate() orelse return;
+                self.skipAnnotations();
+                const target = self.parseRefTestCastImmediate() orelse return;
+
                 code.append(self.allocator, 0xfb) catch return;
                 const sub: u32 = if (tok.kind == .kw_br_on_cast) 0x18 else 0x19;
-                var buf_sub: [5]u8 = undefined;
-                const n_sub = leb128.writeU32Leb128(&buf_sub, sub);
-                code.appendSlice(self.allocator, buf_sub[0..n_sub]) catch return;
-                // br_on_cast/br_on_cast_fail: castflags label rt1 rt2
-                // castflags: 1 byte (bit 0 = src nullable, bit 1 = dst nullable)
-                var cast_flags: u8 = 0;
-                // Parse (ref [null] ht1) (ref [null] ht2) label
-                // Actually format is: label (ref [null] ht1) (ref [null] ht2)
-                self.emitLabelIdxImm(code);
-                // Parse source ref type
-                if (self.peek().kind == .l_paren) {
-                    _ = self.advance();
-                    if (self.peek().kind == .kw_ref) {
-                        _ = self.advance();
-                        if (self.peek().kind == .kw_null) {
-                            _ = self.advance();
-                            cast_flags |= 1;
-                        }
-                        if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                            const source_heap = self.advance();
-                            if (source_heap.kind == .identifier and
-                                self.lookupName(&self.type_names, source_heap.text) == null)
-                            {
-                                self.markMalformed(@src());
-                            }
-                        }
-                        if (self.peek().kind == .r_paren) _ = self.advance();
-                    } else {
-                        // bare type keyword
-                        const vt = self.peek();
-                        if (vt.kind == .kw_funcref or vt.kind == .kw_anyref or
-                            vt.kind == .kw_externref or vt.kind == .kw_eqref or
-                            vt.kind == .kw_i31ref or vt.kind == .kw_structref or
-                            vt.kind == .kw_arrayref or vt.kind == .kw_exnref)
-                        {
-                            cast_flags |= 1; // bare ref types are nullable
-                            _ = self.advance();
-                        }
-                        if (self.peek().kind == .r_paren) _ = self.advance();
-                    }
-                } else if (self.peek().kind == .kw_funcref or self.peek().kind == .kw_anyref or
-                    self.peek().kind == .kw_externref or self.peek().kind == .kw_eqref or
-                    self.peek().kind == .kw_i31ref or self.peek().kind == .kw_exnref or
-                    self.peek().kind == .kw_structref or self.peek().kind == .kw_arrayref or
-                    self.peek().kind == .kw_nullref or self.peek().kind == .kw_nullfuncref or
-                    self.peek().kind == .kw_nullexternref or self.peek().kind == .kw_nullexnref)
-                {
-                    cast_flags |= 1;
-                    _ = self.advance();
-                }
-                // Parse target ref type
-                var target_heap: i32 = -0x10; // default: func
-                if (self.peek().kind == .l_paren) {
-                    _ = self.advance();
-                    if (self.peek().kind == .kw_ref) {
-                        _ = self.advance();
-                        if (self.peek().kind == .kw_null) {
-                            _ = self.advance();
-                            cast_flags |= 2;
-                        }
-                        if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                            const ht_tok = self.advance();
-                            if (std.mem.eql(u8, ht_tok.text, "i31")) { target_heap = 0x6c; }
-                            else if (std.mem.eql(u8, ht_tok.text, "eq")) { target_heap = 0x6d; }
-                            else if (std.mem.eql(u8, ht_tok.text, "any")) { target_heap = 0x6e; }
-                            else if (std.mem.eql(u8, ht_tok.text, "func")) { target_heap = 0x70; }
-                            else if (std.mem.eql(u8, ht_tok.text, "extern")) { target_heap = 0x6f; }
-                            else if (std.mem.eql(u8, ht_tok.text, "struct")) { target_heap = 0x6b; }
-                            else if (std.mem.eql(u8, ht_tok.text, "array")) { target_heap = 0x6a; }
-                            else if (std.mem.eql(u8, ht_tok.text, "none")) { target_heap = 0x71; }
-                            else if (std.mem.eql(u8, ht_tok.text, "nofunc")) { target_heap = 0x73; }
-                            else if (std.mem.eql(u8, ht_tok.text, "noextern")) { target_heap = 0x72; }
-                            else if (ht_tok.kind == .identifier) {
-                                target_heap = @intCast(self.resolveIndexToken(&self.type_names, ht_tok));
-                            } else if (ht_tok.kind == .integer) {
-                                target_heap = @intCast(std.fmt.parseInt(u32, ht_tok.text, 0) catch 0);
-                            }
-                        }
-                        if (self.peek().kind == .r_paren) _ = self.advance();
-                    } else {
-                        if (self.peek().kind == .r_paren) _ = self.advance();
-                    }
-                } else if (self.peek().kind == .kw_i31ref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6c;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_eqref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6d;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_structref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6b;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_arrayref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6a;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_funcref) {
-                    cast_flags |= 2;
-                    target_heap = 0x70;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_anyref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6e;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_externref) {
-                    cast_flags |= 2;
-                    target_heap = 0x6f;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_nullref) {
-                    cast_flags |= 2;
-                    target_heap = 0x71;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_nullfuncref) {
-                    cast_flags |= 2;
-                    target_heap = 0x73;
-                    _ = self.advance();
-                } else if (self.peek().kind == .kw_nullexternref) {
-                    cast_flags |= 2;
-                    target_heap = 0x72;
-                    _ = self.advance();
-                }
-                // Emit: castflags (1 byte), then encode source/target heap types
-                code.append(self.allocator, cast_flags) catch return;
-                self.emitLeb128S32(code, target_heap);
+                self.emitLeb128U32(code, sub);
+                code.append(
+                    self.allocator,
+                    @as(u8, @intFromBool(source.nullable)) |
+                        (@as(u8, @intFromBool(target.nullable)) << 1),
+                ) catch return;
+                self.emitLeb128U32(code, label_idx);
+                self.emitHeapType(code, source.heap_type);
+                self.emitHeapType(code, target.heap_type);
             },
             .kw_throw => {
                 code.append(self.allocator, 0x08) catch return;
@@ -3060,7 +2954,12 @@ const Parser = struct {
                 return 0;
             };
         }
-        if (self.peek().kind == .integer) return self.parseU32() catch 0;
+        if (self.peek().kind == .integer) {
+            return self.parseU32() catch {
+                self.markMalformed(@src());
+                return 0;
+            };
+        }
         return 0;
     }
 
@@ -7694,6 +7593,79 @@ test "ref.cast emits concrete type indices distinctly from abstract heap types" 
     var big = try parseModule(allocator, source.items);
     defer big.deinit();
     try std.testing.expectEqualSlices(u8, &.{ 0xfb, 0x16, 0xf0, 0x00 }, big.funcs.items[0].code_bytes[2..6]);
+}
+
+test "cast branches emit flags, label, source heap, and target heap" {
+    const allocator = std.testing.allocator;
+    inline for (.{
+        .{ "br_on_cast", "(ref any)", "(ref struct)", @as(u8, 0x18), @as(u8, 0x00) },
+        .{ "br_on_cast", "anyref", "(ref struct)", @as(u8, 0x18), @as(u8, 0x01) },
+        .{ "br_on_cast", "(ref any)", "structref", @as(u8, 0x18), @as(u8, 0x02) },
+        .{ "br_on_cast_fail", "anyref", "structref", @as(u8, 0x19), @as(u8, 0x03) },
+    }) |entry| {
+        const source = "(module (func block " ++ entry[0] ++ " 0 " ++
+            entry[1] ++ " " ++ entry[2] ++ " drop end))";
+        var module = try parseModule(allocator, source);
+        defer module.deinit();
+        try std.testing.expectEqualSlices(
+            u8,
+            &.{ 0xfb, entry[3], entry[4], 0x00, 0x6e, 0x6b },
+            module.funcs.items[0].code_bytes[2..8],
+        );
+    }
+
+    var concrete = try parseModule(allocator,
+        \\(module
+        \\  (type $source (struct))
+        \\  (type $target (struct))
+        \\  (func block br_on_cast 0 (ref null $source) (ref $target) drop end))
+    );
+    defer concrete.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xfb, 0x18, 0x01, 0x00, 0x00, 0x01 },
+        concrete.funcs.items[0].code_bytes[2..8],
+    );
+
+    var named = try parseModule(allocator,
+        \\(module (func block $target
+        \\  br_on_cast $target (ref any) (ref struct) drop
+        \\end))
+    );
+    defer named.deinit();
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xfb, 0x18, 0x00, 0x00, 0x6e, 0x6b },
+        named.funcs.items[0].code_bytes[2..8],
+    );
+}
+
+test "cast branches reject malformed labels and reference immediates" {
+    const sources = [_][]const u8{
+        "(module (func block br_on_cast end))",
+        "(module (func block br_on_cast 0 end))",
+        "(module (func block br_on_cast 0 anyref end))",
+        "(module (func block br_on_cast $missing anyref structref end))",
+        "(module (func block br_on_cast 0 (ref) structref end))",
+        "(module (func block br_on_cast_fail 0 anyref (ref null) end))",
+        "(module (func block br_on_cast 0 anyref (ref $missing) end))",
+    };
+    for (sources) |source| {
+        try std.testing.expectError(error.InvalidModule, parseModule(std.testing.allocator, source));
+    }
+}
+
+test "cast branches reject overflow and negative numeric labels" {
+    inline for (.{ "br_on_cast", "br_on_cast_fail" }) |instruction| {
+        inline for (.{ "4294967296", "-1" }) |label| {
+            const source = "(module (func block " ++ instruction ++ " " ++ label ++
+                " anyref structref drop end))";
+            try std.testing.expectError(
+                error.InvalidModule,
+                parseModule(std.testing.allocator, source),
+            );
+        }
+    }
 }
 
 test "ref.test and ref.cast reject malformed heap type immediates" {

@@ -255,6 +255,8 @@ pub const Code = enum(u32) {
     ref_test_null = 0xfb15,
     ref_cast = 0xfb16,
     ref_cast_null = 0xfb17,
+    br_on_cast = 0xfb18,
+    br_on_cast_fail = 0xfb19,
 
     // -- Math prefix (0xfc << 8 | code) --
 
@@ -814,6 +816,8 @@ pub const Code = enum(u32) {
             .ref_test_null,
             .ref_cast,
             .ref_cast_null,
+            .br_on_cast,
+            .br_on_cast_fail,
             => features.gc,
 
             // Multi-value (select_t enabled by default)
@@ -1542,6 +1546,8 @@ pub const Code = enum(u32) {
             .br_on_non_null => "br_on_non_null",
             .ref_test, .ref_test_null => "ref.test",
             .ref_cast, .ref_cast_null => "ref.cast",
+            .br_on_cast => "br_on_cast",
+            .br_on_cast_fail => "br_on_cast_fail",
             .i32_trunc_sat_f32_s => "i32.trunc_sat_f32_s",
             .i32_trunc_sat_f32_u => "i32.trunc_sat_f32_u",
             .i32_trunc_sat_f64_s => "i32.trunc_sat_f64_s",
@@ -1903,6 +1909,8 @@ test "opcode encoding — single-byte values" {
 
 test "opcode encoding — prefixed values" {
     try std.testing.expectEqual(@as(u32, 0xfb14), @intFromEnum(Code.ref_test));
+    try std.testing.expectEqual(@as(u32, 0xfb18), @intFromEnum(Code.br_on_cast));
+    try std.testing.expectEqual(@as(u32, 0xfb19), @intFromEnum(Code.br_on_cast_fail));
     try std.testing.expectEqual(@as(u32, 0xfc00), @intFromEnum(Code.i32_trunc_sat_f32_s));
     try std.testing.expectEqual(@as(u32, 0xfd0c), @intFromEnum(Code.v128_const));
     try std.testing.expectEqual(@as(u32, 0xfe00), @intFromEnum(Code.memory_atomic_notify));
@@ -1934,6 +1942,7 @@ test "getCode" {
     try std.testing.expectEqual(@as(u32, 0x0c), Code.v128_const.getCode());
     try std.testing.expectEqual(@as(u32, 0x00), Code.memory_atomic_notify.getCode());
     try std.testing.expectEqual(@as(u32, 0x17), Code.ref_cast_null.getCode());
+    try std.testing.expectEqual(@as(u32, 0x18), Code.br_on_cast.getCode());
 }
 
 test "getBytes — single-byte opcode" {
@@ -2049,6 +2058,7 @@ test "isEnabled — feature-gated opcodes respect flags" {
     var with_gc = none;
     with_gc.gc = true;
     try std.testing.expect(Code.ref_cast.isEnabled(with_gc));
+    try std.testing.expect(Code.br_on_cast.isEnabled(with_gc));
 
     // Multi-value (select_t)
     try std.testing.expect(!Code.select_t.isEnabled(none));
@@ -2083,6 +2093,7 @@ test "isEnabled — default features enable expected proposals" {
     try std.testing.expect(Code.memory_atomic_notify.isEnabled(defaults));
     try std.testing.expect(Code.call_ref.isEnabled(defaults));
     try std.testing.expect(Code.ref_test.isEnabled(defaults));
+    try std.testing.expect(Code.br_on_cast.isEnabled(defaults));
     // These should NOT be enabled by default
     try std.testing.expect(!Code.i8x16_relaxed_swizzle.isEnabled(defaults));
     try std.testing.expect(!Code.i64_add128.isEnabled(defaults));
@@ -2095,6 +2106,8 @@ test "name — spot checks" {
     try std.testing.expectEqualStrings("i32.trunc_sat_f32_s", Code.i32_trunc_sat_f32_s.name());
     try std.testing.expectEqualStrings("ref.test", Code.ref_test_null.name());
     try std.testing.expectEqualStrings("ref.cast", Code.ref_cast.name());
+    try std.testing.expectEqualStrings("br_on_cast", Code.br_on_cast.name());
+    try std.testing.expectEqualStrings("br_on_cast_fail", Code.br_on_cast_fail.name());
     try std.testing.expectEqualStrings("v128.const", Code.v128_const.name());
     try std.testing.expectEqualStrings("memory.atomic.notify", Code.memory_atomic_notify.name());
     try std.testing.expectEqualStrings("<unknown>", (@as(Code, @enumFromInt(0xFFFF))).name());

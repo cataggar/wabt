@@ -23,6 +23,9 @@ pub const Error = error{
     /// clause kinds (0x00 catch, 0x01 catch_ref, 0x02 catch_all,
     /// 0x03 catch_all_ref).
     InvalidCatchKind,
+    /// `br_on_cast` and `br_on_cast_fail` reserve every cast-flags value
+    /// except 0 through 3.
+    InvalidCastFlags,
     InvalidElemIndex,
     InvalidDataIndex,
     InvalidLimits,
@@ -2192,7 +2195,35 @@ fn checkOneBody(
                     ), // extern.convert_any
                     0x1c => try checkUnary(m, &val_stack, &ctrl_stack, .i32, .ref_i31, gpa(m)), // ref.i31
                     0x1d, 0x1e => try checkUnary(m, &val_stack, &ctrl_stack, .i31ref, .i32, gpa(m)), // i31.get_s/u
-                    0x18, 0x19 => return error.UnsupportedOpcode,
+                    0x18, 0x19 => {
+                        if (pos >= bytes.len) return error.UnexpectedEnd;
+                        const flags = bytes[pos];
+                        pos += 1;
+                        if (flags > 0x03) return error.InvalidCastFlags;
+                        const depth = try readU32Immediate(bytes, &pos);
+                        const source = try readHeapStackTypeImmediate(
+                            m,
+                            bytes,
+                            &pos,
+                            (flags & 0x01) != 0,
+                        );
+                        const target = try readHeapStackTypeImmediate(
+                            m,
+                            bytes,
+                            &pos,
+                            (flags & 0x02) != 0,
+                        );
+                        try checkBrOnCast(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            depth,
+                            source,
+                            target,
+                            sub == 0x19,
+                            gpa(m),
+                        );
+                    },
                     else => return error.UnknownOpcode,
                 }
             },
@@ -2562,6 +2593,43 @@ fn checkRefTestOrCast(
         alloc,
         if (is_test) StackType.known(.i32) else target,
     ) catch return error.OutOfMemory;
+}
+
+fn checkBrOnCast(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    depth: u32,
+    source: StackType,
+    target: StackType,
+    branch_on_failure: bool,
+    alloc: std.mem.Allocator,
+) Error!void {
+    if (depth >= ctrl_stack.items.len) return error.InvalidLabelIndex;
+    if (!target.isSubtypeOf(m, source)) return error.TypeMismatch;
+    try popExpect(m, val_stack, ctrl_stack, source);
+
+    const difference = try refTypeDifference(source, target);
+    const branch_value = if (branch_on_failure) difference else target;
+    const fallthrough = if (branch_on_failure) target else difference;
+    const label_types = labelTypes(&ctrl_stack.items[ctrl_stack.items.len - 1 - depth]);
+    if (label_types.len() == 0) return error.TypeMismatch;
+
+    val_stack.append(alloc, branch_value) catch return error.OutOfMemory;
+    try popVals(m, val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], label_types);
+    for (0..label_types.len() - 1) |i| {
+        val_stack.append(alloc, label_types.at(i)) catch return error.OutOfMemory;
+    }
+    val_stack.append(alloc, fallthrough) catch return error.OutOfMemory;
+}
+
+fn refTypeDifference(source: StackType, target: StackType) Error!StackType {
+    const source_ref = source.asRefType() orelse return error.TypeMismatch;
+    const target_ref = target.asRefType() orelse return error.TypeMismatch;
+    return StackType.fromRefType(.{
+        .nullable = source_ref.nullable and !target_ref.nullable,
+        .heap = source_ref.heap,
+    });
 }
 
 fn checkStructNew(
@@ -4211,6 +4279,219 @@ test "GC ref tests and casts are not constant instructions" {
     }
 }
 
+test "GC cast branches refine branch and fallthrough reference types" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (func (param anyref) block (result structref) local.get 0 br_on_cast 0 anyref structref drop ref.null struct end drop))",
+        "(module (func (param anyref) block (result anyref) local.get 0 br_on_cast_fail 0 anyref (ref struct) drop ref.null any end drop))",
+        "(module (func (param anyref) block (result (ref any)) local.get 0 br_on_cast_fail 0 anyref structref drop ref.null any ref.as_non_null end drop))",
+        "(module (func (param (ref any)) block (result (ref struct)) local.get 0 br_on_cast 0 (ref any) (ref struct) drop ref.null struct ref.as_non_null end drop))",
+        "(module (func (param anyref) block (result (ref struct)) local.get 0 br_on_cast 0 anyref (ref struct) drop ref.null struct ref.as_non_null end drop))",
+        \\(module
+        \\  (type $bt (func (result i32 structref)))
+        \\  (func (param anyref)
+        \\    block (type $bt)
+        \\      i32.const 7
+        \\      local.get 0
+        \\      br_on_cast 0 anyref structref
+        \\      drop drop
+        \\      i32.const 0 ref.null struct
+        \\    end
+        \\    drop drop))
+        ,
+        \\(module
+        \\  (func (param anyref)
+        \\    block (result structref)
+        \\      block
+        \\        local.get 0 br_on_cast 1 anyref structref
+        \\        drop
+        \\      end
+        \\      ref.null struct
+        \\    end
+        \\    drop))
+        ,
+        \\(module
+        \\  (type $loop (func (param structref)))
+        \\  (func (param anyref)
+        \\    ref.null struct
+        \\    loop (type $loop)
+        \\      drop
+        \\      local.get 0 br_on_cast 0 anyref structref
+        \\      drop
+        \\    end))
+        ,
+        \\(module
+        \\  (rec (type $node (sub (struct (field (ref null $node))))))
+        \\  (func (param anyref)
+        \\    block (result (ref $node))
+        \\      local.get 0 br_on_cast 0 anyref (ref $node)
+        \\      drop ref.null $node ref.as_non_null
+        \\    end
+        \\    drop))
+        ,
+        \\(module
+        \\  (type $parent (sub (struct)))
+        \\  (type $child (sub $parent (struct)))
+        \\  (func (param (ref null $parent))
+        \\    block (result (ref $child))
+        \\      local.get 0 br_on_cast 0 (ref null $parent) (ref $child)
+        \\      drop ref.null $child ref.as_non_null
+        \\    end
+        \\    drop))
+        ,
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (func (param (ref any)) block (result structref) local.get 0 br_on_cast 0 (ref any) structref drop ref.null struct end drop))",
+        "(module (func (param structref) block (result anyref) local.get 0 br_on_cast 0 structref anyref drop ref.null any end drop))",
+        "(module (func (param structref) block (result arrayref) local.get 0 br_on_cast 0 structref arrayref drop ref.null array end drop))",
+        "(module (func (param anyref) block (result funcref) local.get 0 br_on_cast 0 anyref funcref drop ref.null func end drop))",
+        "(module (func (param anyref) block (result i32) local.get 0 br_on_cast 0 anyref (ref struct) drop i32.const 0 end drop))",
+        "(module (func (param anyref) block local.get 0 br_on_cast 0 anyref (ref struct) drop end))",
+        "(module (func (param i32) block (result structref) local.get 0 br_on_cast 0 anyref structref drop ref.null struct end drop))",
+        \\(module
+        \\  (type $parent (sub (struct)))
+        \\  (type $left (sub $parent (struct (field i32))))
+        \\  (type $right (sub $parent (struct (field i64))))
+        \\  (func (param (ref null $left))
+        \\    block (result (ref null $right))
+        \\      local.get 0 br_on_cast 0 (ref null $left) (ref null $right)
+        \\      drop ref.null $right
+        \\    end
+        \\    drop))
+        ,
+        \\(module
+        \\  (type $bt (func (result i32 structref)))
+        \\  (func (param anyref)
+        \\    block (type $bt)
+        \\      f32.const 0
+        \\      local.get 0 br_on_cast 0 anyref structref
+        \\      drop drop
+        \\      i32.const 0 ref.null struct
+        \\    end
+        \\    drop drop))
+        ,
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+
+    var invalid_depth = try Parser.parseModule(
+        alloc,
+        "(module (func (param anyref) local.get 0 br_on_cast 2 anyref (ref struct) drop))",
+    );
+    defer invalid_depth.deinit();
+    try std.testing.expectError(error.InvalidLabelIndex, validate(&invalid_depth, .{}));
+}
+
+test "GC cast branch results stay constrained in unreachable code" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    const valid = [_][]const u8{
+        "(module (func (result (ref any)) block (result anyref) unreachable br_on_cast 0 anyref structref return end unreachable))",
+        "(module (func (result (ref struct)) block (result anyref) unreachable br_on_cast_fail 0 anyref (ref struct) return end unreachable))",
+    };
+    for (valid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try validate(&module, .{});
+    }
+
+    const invalid = [_][]const u8{
+        "(module (func (result (ref any)) block (result anyref) unreachable br_on_cast 0 anyref (ref struct) return end unreachable))",
+        "(module (func (result (ref array)) block (result anyref) unreachable br_on_cast_fail 0 anyref (ref struct) return end unreachable))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
+    }
+}
+
+test "GC cast branch immediates gate features and reject malformed binaries" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+
+    var gated = try Parser.parseModule(
+        alloc,
+        "(module (func (param anyref) block (result structref) local.get 0 br_on_cast 0 anyref structref drop ref.null struct end drop))",
+    );
+    defer gated.deinit();
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validate(&gated, .{ .features = .{ .gc = false } }),
+    );
+
+    const truncated = [_][]const u8{
+        &.{ 0xfb, 0x18 },
+        &.{ 0xfb, 0x18, 0x01 },
+        &.{ 0xfb, 0x18, 0x01, 0x00 },
+        &.{ 0xfb, 0x18, 0x01, 0x00, 0x6e },
+        &.{ 0xfb, 0x19, 0x01, 0x80 },
+        &.{ 0xfb, 0x19, 0x01, 0x00, 0x80 },
+        &.{ 0xfb, 0x19, 0x01, 0x00, 0x6e, 0x80 },
+    };
+    for (truncated) |body| {
+        var module = try testModuleWithBody(alloc, body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnexpectedEnd, validate(&module, .{}));
+    }
+
+    const invalid_flags = [_]u8{ 0xfb, 0x18, 0x04 };
+    var flags = try testModuleWithBody(alloc, &invalid_flags);
+    defer flags.deinit();
+    try std.testing.expectError(error.InvalidCastFlags, validate(&flags, .{}));
+
+    const invalid_source = [_]u8{ 0xfb, 0x18, 0x01, 0x00, 0x01, 0x6b };
+    var source = try testModuleWithBody(alloc, &invalid_source);
+    defer source.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&source, .{}));
+
+    const invalid_target = [_]u8{ 0xfb, 0x18, 0x01, 0x00, 0x6e, 0x01 };
+    var target = try testModuleWithBody(alloc, &invalid_target);
+    defer target.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&target, .{}));
+
+    const invalid_source_heap = [_]u8{ 0xfb, 0x18, 0x01, 0x00, 0x7f, 0x6b };
+    var source_heap = try testModuleWithBody(alloc, &invalid_source_heap);
+    defer source_heap.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&source_heap, .{}));
+
+    const invalid_target_heap = [_]u8{ 0xfb, 0x19, 0x01, 0x00, 0x6e, 0x7f };
+    var target_heap = try testModuleWithBody(alloc, &invalid_target_heap);
+    defer target_heap.deinit();
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&target_heap, .{}));
+
+    const invalid_depth = [_]u8{ 0xfb, 0x18, 0x01, 0x01, 0x6e, 0x6b };
+    var depth = try testModuleWithBody(alloc, &invalid_depth);
+    defer depth.deinit();
+    try std.testing.expectError(error.InvalidLabelIndex, validate(&depth, .{}));
+}
+
+test "GC cast branches are not constant instructions" {
+    const alloc = std.testing.allocator;
+    const Parser = @import("text/Parser.zig");
+    const invalid = [_][]const u8{
+        "(module (global anyref (br_on_cast 0 anyref structref (ref.null any))))",
+        "(module (global anyref (br_on_cast_fail 0 anyref (ref struct) (ref.null any))))",
+    };
+    for (invalid) |source| {
+        var module = try Parser.parseModule(alloc, source);
+        defer module.deinit();
+        try std.testing.expectError(error.ConstantExprRequired, validate(&module, .{}));
+    }
+}
+
 test "GC struct constructors check field order, storage types, and result type" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
@@ -4958,13 +5239,13 @@ test "GC reference conversions type-check constant expressions" {
     try validate(&elem, .{});
 }
 
-test "GC prefix distinguishes pending instructions from unknown subopcodes" {
+test "GC prefix distinguishes cast branches from unknown subopcodes" {
     const alloc = std.testing.allocator;
 
-    const pending = [_]u8{ 0xfb, 0x18, 0x0b }; // br_on_cast (still pending)
-    var known = try testModuleWithBody(alloc, &pending);
+    const truncated = [_]u8{ 0xfb, 0x18 };
+    var known = try testModuleWithBody(alloc, &truncated);
     defer known.deinit();
-    try std.testing.expectError(error.UnsupportedOpcode, validate(&known, .{}));
+    try std.testing.expectError(error.UnexpectedEnd, validate(&known, .{}));
 
     const bogus = [_]u8{ 0xfb, 0x1f, 0x0b };
     var unknown = try testModuleWithBody(alloc, &bogus);
@@ -4993,6 +5274,8 @@ test "classifyOpcode separates declared opcodes from undeclared encodings" {
     // wrong question.
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x100));
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_simd, 0x1fe));
+    try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_gc, 0x18));
+    try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_gc, 0x1f));
 }
 
 test "every declared single-byte opcode is handled or explicitly unsupported" {
