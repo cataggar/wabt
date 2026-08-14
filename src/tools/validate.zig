@@ -9,6 +9,8 @@ pub const usage =
     \\(preamble \0asm 0d 00 01 00) are accepted.
     \\
     \\Options:
+    \\  --enable-wide-arithmetic
+    \\                       Enable i64.add128/sub128/mul_wide_{s,u}
     \\
 ;
 
@@ -25,6 +27,14 @@ pub const ValidateError = error{ UnexpectedEof, InvalidMagic };
 /// malformed binaries.  This matches the `wasm-tools validate`
 /// behaviour exercised by `wamr/build.zig`'s `installAndValidate`.
 pub fn validateBytes(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void {
+    return validateBytesWithOptions(allocator, wasm_bytes, .{});
+}
+
+pub fn validateBytesWithOptions(
+    allocator: std.mem.Allocator,
+    wasm_bytes: []const u8,
+    options: wabt.Validator.Options,
+) !void {
     if (wasm_bytes.len < 8) return error.UnexpectedEof;
     if (!std.mem.eql(u8, wasm_bytes[0..4], &[_]u8{ 0x00, 0x61, 0x73, 0x6d })) {
         return error.InvalidMagic;
@@ -39,7 +49,7 @@ pub fn validateBytes(allocator: std.mem.Allocator, wasm_bytes: []const u8) !void
 
     var module = try wabt.binary.reader.readModule(allocator, wasm_bytes);
     defer module.deinit();
-    try wabt.Validator.validate(&module, .{});
+    try wabt.Validator.validate(&module, options);
 }
 
 pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
@@ -50,11 +60,14 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     const alloc = init.gpa;
 
     var input_file: ?[]const u8 = null;
+    var validator_options: wabt.Validator.Options = .{};
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        {
+        if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
+            validator_options.features.wide_arithmetic = true;
+        } else {
             input_file = arg;
         }
     }
@@ -70,7 +83,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     };
     defer alloc.free(source);
 
-    validateBytes(alloc, source) catch |err| {
+    validateBytesWithOptions(alloc, source, validator_options) catch |err| {
         std.debug.print("{s}: validation error: {any}\n", .{ in_path, err });
         std.process.exit(1);
     };
@@ -133,4 +146,26 @@ test "validate rejects unknown layer/version" {
     // (0x000d0001) — should bubble up the loader's InvalidVersion.
     const bad = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x99, 0x00, 0x01, 0x00 };
     try std.testing.expectError(error.InvalidVersion, validateBytes(std.testing.allocator, &bad));
+}
+
+test "validate wide arithmetic only when enabled" {
+    const Parser = wabt.text.Parser;
+    var module = try Parser.parseModule(
+        std.testing.allocator,
+        "(module (func (param i64 i64) (result i64 i64) " ++
+            "local.get 0 local.get 1 i64.mul_wide_s))",
+    );
+    defer module.deinit();
+    const wasm = try wabt.binary.writer.writeModule(std.testing.allocator, &module);
+    defer std.testing.allocator.free(wasm);
+
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validateBytes(std.testing.allocator, wasm),
+    );
+    try validateBytesWithOptions(
+        std.testing.allocator,
+        wasm,
+        .{ .features = .{ .wide_arithmetic = true } },
+    );
 }
