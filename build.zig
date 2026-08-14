@@ -308,6 +308,38 @@ pub fn build(b: *std.Build) void {
         wabt_help_run.expectExitCode(0);
         test_step.dependOn(&wabt_help_run.step);
 
+        const wabt_text_help_run = b.addRunArtifact(wabt_exe);
+        wabt_text_help_run.addArgs(&.{ "help", "text" });
+        wabt_text_help_run.expectExitCode(0);
+        wabt_text_help_run.expectStdOutMatch("Usage: wabt text <verb> [args...]");
+        test_step.dependOn(&wabt_text_help_run.step);
+
+        const global_nested_help_cases = [_][3][]const u8{
+            .{ "text", "parse", "Usage: wabt text parse [options] <file.wat>" },
+            .{ "module", "validate", "Usage: wabt module validate [options] <file.wasm>" },
+        };
+        inline for (global_nested_help_cases) |c| {
+            const nested_help = b.addRunArtifact(wabt_exe);
+            nested_help.addArgs(&.{ "help", c[0], c[1] });
+            nested_help.expectExitCode(0);
+            nested_help.expectStdOutMatch(c[2]);
+            nested_help.expectStdOutMatch("--enable-wide-arithmetic");
+            test_step.dependOn(&nested_help.step);
+
+            const invalid_nested_help = b.addRunArtifact(wabt_exe);
+            invalid_nested_help.addArgs(&.{ "help", c[0], "not-a-real-verb" });
+            invalid_nested_help.expectExitCode(1);
+            invalid_nested_help.expectStdErrMatch(b.fmt("error: unknown {s} verb 'not-a-real-verb'", .{c[0]}));
+            test_step.dependOn(&invalid_nested_help.step);
+        }
+
+        const subject_local_nested_help = b.addRunArtifact(wabt_exe);
+        subject_local_nested_help.addArgs(&.{ "text", "help", "parse" });
+        subject_local_nested_help.expectExitCode(0);
+        subject_local_nested_help.expectStdOutMatch("Usage: wabt text parse [options] <file.wat>");
+        subject_local_nested_help.expectStdOutMatch("--enable-wide-arithmetic");
+        test_step.dependOn(&subject_local_nested_help.step);
+
         const wabt_no_subcmd = b.addRunArtifact(wabt_exe);
         wabt_no_subcmd.expectExitCode(1);
         test_step.dependOn(&wabt_no_subcmd.step);
