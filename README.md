@@ -7,7 +7,7 @@ A rewrite of [WebAssembly/wabt](https://github.com/WebAssembly/wabt) in Zig, mai
 Install pre-built binaries from GitHub Releases with [ghr](https://github.com/cataggar/ghr):
 
 ```console
-$ ghr install cataggar/wabt@v3.0.0-dev.4
+$ ghr install cataggar/wabt
 ```
 
 See [INSTALL.md](INSTALL.md) for alternative installation methods (uv, pip) and detailed instructions.
