@@ -50,6 +50,28 @@ mismatch, and removes materialized files after a successful run unless
 its GC-disabled check remains in the embedded Zig suite; the external runner
 checks the wasm-tools `-gc` verdict.
 
+## Wide arithmetic differential matrix
+
+`src/wide_arithmetic_regression.zig` covers the four `0xfc13..0xfc16`
+instructions in-process, including exact operands/results, feature gating,
+unreachable-stack typing, malformed neighboring encodings, and
+WAT/binary/WAT round trips.
+
+The focused wasm-tools 1.250.0 matrix also exercises the CLI's
+`--enable-wide-arithmetic` option:
+
+```console
+$ zig build
+$ scripts/wide_arithmetic_regression.py \
+    zig-out/bin/wabt \
+    /path/to/wasm-tools-1.250.0
+```
+
+It compares enabled and disabled WAT and binary verdicts, malformed binaries,
+and validates wabt-produced binary and text output with wasm-tools. Temporary
+files stay below `zig-out/wide-arithmetic-matrix` and are removed after a
+successful run.
+
 ## Legacy C++-era test corpus
 
 The `parse/`, `regress/`, `spec-new/`, and `typecheck/` directories

@@ -1857,7 +1857,7 @@ fn checkOneBody(
             },
             // Prefixed opcodes
             0xfc => {
-                const sub = readU32(bytes, &pos);
+                const sub = try readU32Immediate(bytes, &pos);
                 switch (sub) {
                     0x00...0x07 => {
                         // Saturating float-to-int: 0-1 f32→i32, 2-3 f64→i32, 4-5 f32→i64, 6-7 f64→i64
@@ -2006,6 +2006,26 @@ fn checkOneBody(
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // n
                         try popExpect(m, &val_stack, &ctrl_stack, tableElemStackType(m, tbl_idx)); // val
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // dst
+                    },
+                    0x13, 0x14 => { // i64.add128, i64.sub128
+                        if (!features.wide_arithmetic) return error.UnsupportedOpcode;
+                        try checkWideArithmetic(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            4,
+                            gpa(m),
+                        );
+                    },
+                    0x15, 0x16 => { // i64.mul_wide_s, i64.mul_wide_u
+                        if (!features.wide_arithmetic) return error.UnsupportedOpcode;
+                        try checkWideArithmetic(
+                            m,
+                            &val_stack,
+                            &ctrl_stack,
+                            2,
+                            gpa(m),
+                        );
                     },
                     else => return classifyOpcode(Opcode.prefix_math, sub),
                 }
@@ -2726,6 +2746,24 @@ fn popExpectRepeated(
         if (frame.unreachable_flag and val_stack.items.len == frame.height) return;
         try popExpect(m, val_stack, ctrl_stack, expected);
     }
+}
+
+fn checkWideArithmetic(
+    m: *const Mod.Module,
+    val_stack: *ValStack,
+    ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame),
+    operand_count: u32,
+    alloc: std.mem.Allocator,
+) Error!void {
+    try popExpectRepeated(
+        m,
+        val_stack,
+        ctrl_stack,
+        StackType.known(.i64),
+        operand_count,
+    );
+    val_stack.append(alloc, StackType.known(.i64)) catch return error.OutOfMemory;
+    val_stack.append(alloc, StackType.known(.i64)) catch return error.OutOfMemory;
 }
 
 fn checkArrayNewFixed(
@@ -4050,14 +4088,24 @@ test "atomics are type-checked, not silently accepted" {
     try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
 }
 
-test "unchecked 0xfc sub-opcodes are reported, not ignored" {
-    // i64.add128 (0xfc 0x13) has no arm; the inner `else` used to fall
-    // through silently, leaving the value stack wrong for what followed.
+test "wide arithmetic 0xfc sub-opcodes reach real validator arms" {
+    // Positive drift guard for issue #438. Each instruction consumes its
+    // operands from the polymorphic unreachable stack, produces two concrete
+    // i64 results, and is then balanced by two drops. A newly lost switch arm
+    // would regress to UnsupportedOpcode here instead of silently drifting.
     const alloc = std.testing.allocator;
-    const body = [_]u8{ 0xfc, 0x13, 0x0b };
-    var module = try testModuleWithBody(alloc, &body);
-    defer module.deinit();
-    try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    for ([_]u8{ 0x13, 0x14, 0x15, 0x16 }) |sub| {
+        const body = [_]u8{
+            0x00, // unreachable
+            0xfc, sub,
+            0x1a, 0x1a, // drop both concrete i64 results
+            0x0b,
+        };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try validate(&module, .{ .features = .{ .wide_arithmetic = true } });
+        try std.testing.expectError(error.UnsupportedOpcode, validate(&module, .{}));
+    }
 }
 
 test "valid SIMD modules now validate (issue #347 D2)" {

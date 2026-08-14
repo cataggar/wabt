@@ -8,6 +8,8 @@ pub const usage =
     \\
     \\Options:
     \\  -o, --output <file>   Output file (default: <input>.wasm)
+    \\  --enable-wide-arithmetic
+    \\                       Enable i64.add128/sub128/mul_wide_{s,u}
     \\
 ;
 
@@ -17,16 +19,33 @@ pub fn convert(allocator: std.mem.Allocator, wat_source: []const u8) ![]u8 {
     return convertDiag(allocator, wat_source, null);
 }
 
+pub fn convertWithOptions(
+    allocator: std.mem.Allocator,
+    wat_source: []const u8,
+    options: wabt.Validator.Options,
+) ![]u8 {
+    return convertDiagWithOptions(allocator, wat_source, null, options);
+}
+
 /// As `convert`, but reports where a malformed module was rejected.
 pub fn convertDiag(
     allocator: std.mem.Allocator,
     wat_source: []const u8,
     diagnostic: ?*?wabt.text.Parser.Diagnostic,
 ) ![]u8 {
+    return convertDiagWithOptions(allocator, wat_source, diagnostic, .{});
+}
+
+pub fn convertDiagWithOptions(
+    allocator: std.mem.Allocator,
+    wat_source: []const u8,
+    diagnostic: ?*?wabt.text.Parser.Diagnostic,
+    options: wabt.Validator.Options,
+) ![]u8 {
     var module = try wabt.text.Parser.parseModuleDiag(allocator, wat_source, diagnostic);
     defer module.deinit();
 
-    try wabt.Validator.validate(&module, .{});
+    try wabt.Validator.validate(&module, options);
 
     return wabt.binary.writer.writeModule(allocator, &module);
 }
@@ -40,6 +59,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
 
     var input_file: ?[]const u8 = null;
     var output_file: ?[]const u8 = null;
+    var validator_options: wabt.Validator.Options = .{};
 
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
@@ -51,6 +71,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 std.process.exit(1);
             }
             output_file = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
+            validator_options.features.wide_arithmetic = true;
         } else {
             input_file = arg;
         }
@@ -68,7 +90,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     defer alloc.free(source);
 
     var diagnostic: ?wabt.text.Parser.Diagnostic = null;
-    const wasm = convertDiag(alloc, source, &diagnostic) catch |err| {
+    const wasm = convertDiagWithOptions(alloc, source, &diagnostic, validator_options) catch |err| {
         std.debug.print("error: {any}\n", .{err});
         if (diagnostic) |d| {
             const pos = d.position(source);
@@ -113,4 +135,19 @@ test "convert module round-trips through binary" {
     try std.testing.expect(wasm.len >= 8);
     try std.testing.expectEqualSlices(u8, &wabt.binary.reader.magic, wasm[0..4]);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, wasm[4..8], .little));
+}
+
+test "convert wide arithmetic only when enabled" {
+    const source =
+        "(module (func (param i64 i64) (result i64 i64) " ++
+        "local.get 0 local.get 1 i64.mul_wide_u))";
+    try std.testing.expectError(error.UnsupportedOpcode, convert(std.testing.allocator, source));
+
+    const wasm = try convertWithOptions(
+        std.testing.allocator,
+        source,
+        .{ .features = .{ .wide_arithmetic = true } },
+    );
+    defer std.testing.allocator.free(wasm);
+    try std.testing.expect(std.mem.indexOf(u8, wasm, &.{ 0xfc, 0x16 }) != null);
 }

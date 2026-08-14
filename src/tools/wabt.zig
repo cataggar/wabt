@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
             writeStdout(init.io, "wabt " ++ wabt.version ++ "\n");
             return;
         },
-        .help => runHelp(init.io, sub_args),
+        .help => try runHelp(init, sub_args),
         .text => try text_cmd.run(init, sub_args),
         .module => try module_cmd.run(init, sub_args),
         .component => try component_cmd.run(init, sub_args),
@@ -120,24 +120,40 @@ const help_usage =
     \\
 ;
 
-fn runHelp(io: std.Io, args: []const []const u8) void {
+fn runHelp(init: std.process.Init, args: []const []const u8) !void {
     if (args.len == 0) {
-        writeStdout(io, top_usage);
+        writeStdout(init.io, top_usage);
         return;
     }
     const sub = parseSubcommand(args[0]) orelse {
         std.debug.print("error: unknown topic '{s}' — try `wabt help`\n", .{args[0]});
         std.process.exit(1);
     };
+
+    if (args.len > 1) {
+        const forwarded_args = try init.arena.allocator().alloc([]const u8, args.len);
+        forwarded_args[0] = "help";
+        @memcpy(forwarded_args[1..], args[1..]);
+        switch (sub) {
+            .text => return text_cmd.run(init, forwarded_args),
+            .module => return module_cmd.run(init, forwarded_args),
+            .component => return component_cmd.run(init, forwarded_args),
+            .interface => return interface_cmd.run(init, forwarded_args),
+            .compose => return compose_cmd.run(init, forwarded_args),
+            .spec => return spec_cmd.run(init, forwarded_args),
+            .version, .help => {},
+        }
+    }
+
     switch (sub) {
-        .text => writeStdout(io, text_cmd.usage),
-        .module => writeStdout(io, module_cmd.usage),
-        .component => writeStdout(io, component_cmd.usage),
-        .interface => writeStdout(io, interface_cmd.usage),
-        .compose => writeStdout(io, compose_cmd.usage),
-        .spec => writeStdout(io, spec_cmd.usage),
-        .version => writeStdout(io, version_usage),
-        .help => writeStdout(io, help_usage),
+        .text => writeStdout(init.io, text_cmd.usage),
+        .module => writeStdout(init.io, module_cmd.usage),
+        .component => writeStdout(init.io, component_cmd.usage),
+        .interface => writeStdout(init.io, interface_cmd.usage),
+        .compose => writeStdout(init.io, compose_cmd.usage),
+        .spec => writeStdout(init.io, spec_cmd.usage),
+        .version => writeStdout(init.io, version_usage),
+        .help => writeStdout(init.io, help_usage),
     }
 }
 

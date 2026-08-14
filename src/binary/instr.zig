@@ -276,3 +276,29 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
         },
     }
 }
+
+test "wide arithmetic opcodes have no immediates" {
+    try std.testing.expectEqual(@as(?Imm, .none), immediateShape(0xfc, 0x13));
+    try std.testing.expectEqual(@as(?Imm, .none), immediateShape(0xfc, 0x14));
+    try std.testing.expectEqual(@as(?Imm, .none), immediateShape(0xfc, 0x15));
+    try std.testing.expectEqual(@as(?Imm, .none), immediateShape(0xfc, 0x16));
+    try std.testing.expectEqual(@as(?Imm, null), immediateShape(0xfc, 0x12));
+    try std.testing.expectEqual(@as(?Imm, null), immediateShape(0xfc, 0x17));
+
+    for ([_]u8{ 0x13, 0x14, 0x15, 0x16 }) |sub| {
+        const bytes = [_]u8{ 0xfc, sub, 0x0b };
+        var pos: usize = 0;
+        const decoded = try decode(&bytes, &pos);
+        try std.testing.expectEqual(@as(u8, 0xfc), decoded.prefix);
+        try std.testing.expectEqual(@as(u32, sub), decoded.code);
+        try std.testing.expectEqual(Imm.none, decoded.shape);
+        try std.testing.expectEqual(@as(usize, 2), pos);
+        try skipImmediates(decoded.shape, &bytes, &pos);
+        try std.testing.expectEqual(@as(usize, 2), pos);
+        const end = try decode(&bytes, &pos);
+        try std.testing.expectEqual(@as(u32, 0x0b), end.code);
+    }
+
+    var truncated_pos: usize = 0;
+    try std.testing.expectError(error.TruncatedBody, decode(&.{0xfc}, &truncated_pos));
+}

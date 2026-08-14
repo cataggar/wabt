@@ -98,4 +98,5 @@ test {
     _ = @import("component/adapter/test_fixtures.zig");
     _ = @import("integration_tests.zig");
     _ = @import("gc_regression.zig");
+    _ = @import("wide_arithmetic_regression.zig");
 }

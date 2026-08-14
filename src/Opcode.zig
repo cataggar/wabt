@@ -1989,6 +1989,10 @@ test "opcode encoding — prefixed values" {
     try std.testing.expectEqual(@as(u32, 0xfb19), @intFromEnum(Code.br_on_cast_fail));
     try std.testing.expectEqual(@as(u32, 0xfb1e), @intFromEnum(Code.i31_get_u));
     try std.testing.expectEqual(@as(u32, 0xfc00), @intFromEnum(Code.i32_trunc_sat_f32_s));
+    try std.testing.expectEqual(@as(u32, 0xfc13), @intFromEnum(Code.i64_add128));
+    try std.testing.expectEqual(@as(u32, 0xfc14), @intFromEnum(Code.i64_sub128));
+    try std.testing.expectEqual(@as(u32, 0xfc15), @intFromEnum(Code.i64_mul_wide_s));
+    try std.testing.expectEqual(@as(u32, 0xfc16), @intFromEnum(Code.i64_mul_wide_u));
     try std.testing.expectEqual(@as(u32, 0xfd0c), @intFromEnum(Code.v128_const));
     try std.testing.expectEqual(@as(u32, 0xfe00), @intFromEnum(Code.memory_atomic_notify));
     try std.testing.expectEqual(@as(u32, 0xfe4e), @intFromEnum(Code.i64_atomic_rmw32_cmpxchg_u));
@@ -2035,6 +2039,21 @@ test "getBytes — prefixed opcode (small code)" {
     try std.testing.expectEqual(@as(u8, 2), len);
     try std.testing.expectEqual(prefix_math, buf[0]);
     try std.testing.expectEqual(@as(u8, 0x00), buf[1]);
+}
+
+test "getBytes — wide arithmetic opcodes" {
+    const cases = [_]struct { opcode: Code, sub: u8 }{
+        .{ .opcode = .i64_add128, .sub = 0x13 },
+        .{ .opcode = .i64_sub128, .sub = 0x14 },
+        .{ .opcode = .i64_mul_wide_s, .sub = 0x15 },
+        .{ .opcode = .i64_mul_wide_u, .sub = 0x16 },
+    };
+    for (cases) |case| {
+        var buf: [6]u8 = undefined;
+        const len = case.opcode.getBytes(&buf);
+        try std.testing.expectEqual(@as(u8, 2), len);
+        try std.testing.expectEqualSlices(u8, &.{ prefix_math, case.sub }, buf[0..len]);
+    }
 }
 
 test "getBytes — SIMD opcode" {
