@@ -8,6 +8,8 @@ pub const usage =
     \\
     \\Options:
     \\  -o, --output <file>   Output file (default: <input>.wasm)
+    \\  --enable-custom-page-sizes
+    \\                       Enable 1-byte and explicit 64-KiB memory pages
     \\  --enable-wide-arithmetic
     \\                       Enable i64.add128/sub128/mul_wide_{s,u}
     \\
@@ -71,6 +73,8 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 std.process.exit(1);
             }
             output_file = sub_args[i];
+        } else if (std.mem.eql(u8, arg, "--enable-custom-page-sizes")) {
+            validator_options.features.custom_page_sizes = true;
         } else if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
             validator_options.features.wide_arithmetic = true;
         } else {

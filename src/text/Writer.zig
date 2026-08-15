@@ -11,6 +11,8 @@ const instr = @import("../binary/instr.zig");
 
 pub const WriteError = error{
     OutOfMemory,
+    /// A memory or table has limits that cannot be represented by valid wat.
+    InvalidLimits,
     /// A function body holds an opcode this writer cannot name, so printing
     /// it would silently drop or corrupt code. Reported rather than skipped.
     UnsupportedOpcode,
@@ -193,11 +195,11 @@ const WatWriter = struct {
                 },
                 .memory => if (imp.memory) |mem| {
                     try self.appendByte(' ');
-                    try self.writeLimits(mem.limits);
+                    try self.writeLimits(mem.limits, .memory);
                 },
                 .table => if (imp.table) |t| {
                     try self.appendByte(' ');
-                    try self.writeLimits(t.limits);
+                    try self.writeLimits(t.limits, .table);
                     try self.appendByte(' ');
                     try self.writeValTypeWithTidx(t.elem_type, imp.table_type_idx);
                 },
@@ -747,7 +749,7 @@ const WatWriter = struct {
             try self.append("(table (;");
             try self.writeU32(module.num_table_imports + @as(u32, @intCast(i)));
             try self.append(";) ");
-            try self.writeLimits(table.type.limits);
+            try self.writeLimits(table.type.limits, .table);
             try self.appendByte(' ');
             try self.writeValTypeWithTidx(table.type.elem_type, table.type_idx);
             // A table may say what its slots start out holding, and the
@@ -770,7 +772,7 @@ const WatWriter = struct {
             try self.append("(memory (;");
             try self.writeU32(module.num_memory_imports + @as(u32, @intCast(i)));
             try self.append(";) ");
-            try self.writeLimits(mem.type.limits);
+            try self.writeLimits(mem.type.limits, .memory);
             try self.appendByte(')');
             try self.newline();
         }
@@ -984,7 +986,31 @@ const WatWriter = struct {
         }
     }
 
-    fn writeLimits(self: *WatWriter, limits: types.Limits) WriteError!void {
+    const LimitsKind = enum { table, memory };
+
+    fn validateLimits(limits: types.Limits, kind: LimitsKind) WriteError!void {
+        if (kind == .table and limits.is_shared) return error.InvalidLimits;
+        if (limits.is_shared and !limits.has_max) return error.InvalidLimits;
+
+        const absolute_max = switch (kind) {
+            .table => @as(u64, std.math.maxInt(u32)),
+            .memory => types.memoryMaxPages(limits.is_64, limits.page_size) orelse
+                return error.InvalidLimits,
+        };
+        if (kind == .table and limits.usesCustomPageSize())
+            return error.InvalidLimits;
+        if (limits.initial > absolute_max) return error.InvalidLimits;
+        if (limits.has_max and
+            (limits.max > absolute_max or limits.max < limits.initial))
+            return error.InvalidLimits;
+    }
+
+    fn writeLimits(
+        self: *WatWriter,
+        limits: types.Limits,
+        kind: LimitsKind,
+    ) WriteError!void {
+        try validateLimits(limits, kind);
         // The index type precedes the bounds. Without it a 64-bit table or
         // memory prints as a 32-bit one, which is a different type and
         // rejects the very addresses the original accepted.
@@ -995,7 +1021,7 @@ const WatWriter = struct {
             try self.writeU64(limits.max);
         }
         if (limits.is_shared) try self.append(" shared");
-        if (limits.page_size != types.default_page_size) {
+        if (limits.usesCustomPageSize()) {
             // Stated as a power of two in hex, the way `wasm-tools print`
             // does, since that is the only form the encoding can express.
             try self.append(" (pagesize 0x");
@@ -1794,14 +1820,23 @@ test "a custom page size is read and printed" {
     defer alloc.free(wat);
     try std.testing.expect(std.mem.indexOf(u8, wat, "(memory (;0;) 1 (pagesize 0x1))") != null);
 
-    // The default page size is implied and must not be stated.
-    const plain = [_]u8{
+    // An explicitly stated default remains observable.
+    const explicit_default = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         0x05, 0x04, 0x01, 0x08, 0x01, 0x10,
     };
-    const pwat = try printBinary(alloc, &plain);
-    defer alloc.free(pwat);
-    try std.testing.expect(std.mem.indexOf(u8, pwat, "pagesize") == null);
+    const ewat = try printBinary(alloc, &explicit_default);
+    defer alloc.free(ewat);
+    try std.testing.expect(std.mem.indexOf(u8, ewat, "(pagesize 0x10000)") != null);
+
+    // Without flag 0x08 the same value is implied and must not be stated.
+    const implicit_default = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x01, 0x00, 0x01,
+    };
+    const iwat = try printBinary(alloc, &implicit_default);
+    defer alloc.free(iwat);
+    try std.testing.expect(std.mem.indexOf(u8, iwat, "pagesize") == null);
 }
 
 test "a tag prints the type it names and the signature it stands for" {

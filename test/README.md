@@ -72,6 +72,26 @@ and validates wabt-produced binary and text output with wasm-tools. Temporary
 files stay below `zig-out/wide-arithmetic-matrix` and are removed after a
 successful run.
 
+## Custom page-size differential matrix
+
+`src/custom_page_sizes_regression.zig` checks text, binary, validation, and
+round-trip behavior for 1-byte and 64-KiB memory pages. Run its standalone
+wasm-tools 1.250.0 matrix with:
+
+```console
+$ zig build
+$ scripts/custom_page_sizes.py \
+    zig-out/bin/wabt \
+    /path/to/wasm-tools-1.250.0
+```
+
+Shared memories remain part of the threads feature. Shared tables are
+intentionally rejected at every WABT boundary because they require the
+separate shared-everything-threads type system, which WABT does not yet model.
+wasm-tools 1.250.0 rejects them with its default features and accepts a
+well-typed shared-table binary with `--features all`; WABT will continue to
+reject them until a dedicated feature and shared types are implemented.
+
 ## Legacy C++-era test corpus
 
 The `parse/`, `regress/`, `spec-new/`, and `typecheck/` directories

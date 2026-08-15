@@ -8,7 +8,7 @@ const types = @import("../types.zig");
 const Mod = @import("../Module.zig");
 const reader = @import("reader.zig");
 
-pub const WriteError = error{OutOfMemory};
+pub const WriteError = error{ OutOfMemory, InvalidLimits };
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -132,7 +132,30 @@ const Writer = struct {
         }
     }
 
-    fn writeLimits(self: *Writer, limits: types.Limits) WriteError!void {
+    const LimitsKind = enum { table, memory };
+
+    fn validateMemoryLimits(limits: types.Limits) WriteError!void {
+        const max_pages = types.memoryMaxPages(limits.is_64, limits.page_size) orelse
+            return error.InvalidLimits;
+        if (limits.initial > max_pages) return error.InvalidLimits;
+        if (limits.has_max and
+            (limits.max > max_pages or limits.max < limits.initial))
+            return error.InvalidLimits;
+    }
+
+    fn writeLimits(
+        self: *Writer,
+        limits: types.Limits,
+        kind: LimitsKind,
+    ) WriteError!void {
+        if (kind == .table and limits.is_shared) return error.InvalidLimits;
+        if (limits.is_shared and !limits.has_max) return error.InvalidLimits;
+        if (kind == .memory) {
+            try validateMemoryLimits(limits);
+        } else if (limits.usesCustomPageSize()) {
+            return error.InvalidLimits;
+        }
+
         var flags: u8 = 0;
         if (limits.has_max) flags |= 0x01;
         if (limits.is_shared) flags |= 0x02;
@@ -140,10 +163,12 @@ const Writer = struct {
         const needs_64 = limits.is_64 or limits.initial > std.math.maxInt(u32) or
             (limits.has_max and limits.max > std.math.maxInt(u32));
         if (needs_64) flags |= 0x04;
-        // A page size other than the default is announced by 0x08 and written
-        // after the bounds, as a log2. Without this the size read from a
-        // module is silently dropped when it is written back out.
-        const custom_page_size = limits.page_size != types.default_page_size;
+        const custom_page_size = kind == .memory and limits.usesCustomPageSize();
+        const page_size_log2 = if (custom_page_size)
+            types.memoryPageSizeLog2(limits.page_size) orelse
+                return error.InvalidLimits
+        else
+            0;
         if (custom_page_size) flags |= 0x08;
         try self.appendByte(flags);
 
@@ -160,7 +185,7 @@ const Writer = struct {
             if (limits.has_max) try self.writeU32Leb(@intCast(limits.max));
         }
 
-        if (custom_page_size) try self.writeU32Leb(@ctz(limits.page_size));
+        if (custom_page_size) try self.writeU32Leb(page_size_log2);
     }
 
     // -- section helpers --
@@ -291,11 +316,11 @@ const Writer = struct {
                 .table => {
                     if (imp.table) |t| {
                         try self.writeValTypeWithTidx(t.elem_type, imp.table_type_idx);
-                        try self.writeLimits(t.limits);
+                        try self.writeLimits(t.limits, .table);
                     }
                 },
                 .memory => {
-                    if (imp.memory) |m| try self.writeLimits(m.limits);
+                    if (imp.memory) |m| try self.writeLimits(m.limits, .memory);
                 },
                 .global => {
                     if (imp.global) |g| {
@@ -346,17 +371,17 @@ const Writer = struct {
                 try self.appendByte(0x40);
                 try self.appendByte(0x00);
                 try self.writeValTypeWithTidx(et, table.type_idx);
-                try self.writeLimits(table.type.limits);
+                try self.writeLimits(table.type.limits, .table);
                 try self.appendSlice(table.init_expr_bytes);
                 try self.appendByte(0x0b);
             } else if ((et == .concrete_ref_null or et == .concrete_ref) and table.type_idx != 0xFFFFFFFF) {
                 // Typed reference: write prefix + concrete type index
                 try self.appendByte(if (et == .concrete_ref_null) reader.ref_null_prefix else reader.ref_prefix);
                 try self.writeS64Leb(@intCast(table.type_idx));
-                try self.writeLimits(table.type.limits);
+                try self.writeLimits(table.type.limits, .table);
             } else {
                 try self.writeValType(et);
-                try self.writeLimits(table.type.limits);
+                try self.writeLimits(table.type.limits, .table);
             }
         }
         self.endSection(ph);
@@ -368,7 +393,7 @@ const Writer = struct {
         const ph = try self.beginSection(5);
         try self.writeU32Leb(@intCast(defined));
         for (module.memories.items[module.num_memory_imports..]) |mem| {
-            try self.writeLimits(mem.type.limits);
+            try self.writeLimits(mem.type.limits, .memory);
         }
         self.endSection(ph);
     }

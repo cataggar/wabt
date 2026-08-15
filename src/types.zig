@@ -16,6 +16,7 @@ pub const invalid_index: Index = std.math.maxInt(Index);
 pub const invalid_address: Address = std.math.maxInt(Address);
 pub const invalid_offset: Offset = std.math.maxInt(Offset);
 pub const default_page_size: u32 = 0x10000; // 64 KiB
+pub const one_byte_page_size: u32 = 1;
 
 // ── Reference types ───────────────────────────────────────────────────────
 
@@ -315,13 +316,39 @@ pub const Limits = struct {
     is_shared: bool = false,
     is_64: bool = false,
     page_size: u32 = default_page_size,
+    /// Whether the custom-page-size flag was present. This remains distinct
+    /// from `page_size` because explicitly stating 64 KiB is observable.
+    has_page_size: bool = false,
 
     /// Returns `.i64` when the `memory64` proposal is in effect, `.i32`
     /// otherwise.
     pub fn indexType(self: Limits) ValType {
         return if (self.is_64) .i64 else .i32;
     }
+
+    pub fn usesCustomPageSize(self: Limits) bool {
+        return self.has_page_size or self.page_size != default_page_size;
+    }
 };
+
+/// The current custom-page-sizes proposal admits only 1-byte and 64-KiB
+/// pages. Return the binary exponent only for those exact values.
+pub fn memoryPageSizeLog2(page_size: u32) ?u32 {
+    return switch (page_size) {
+        one_byte_page_size => 0,
+        default_page_size => 16,
+        else => null,
+    };
+}
+
+/// Maximum encodable page count whose byte length fits the memory's address
+/// space. The one-byte case is capped by the limits field's integer width.
+pub fn memoryMaxPages(is_64: bool, page_size: u32) ?u64 {
+    if (memoryPageSizeLog2(page_size) == null) return null;
+    const max_count: u64 = if (is_64) std.math.maxInt(u64) else std.math.maxInt(u32);
+    if (page_size == one_byte_page_size) return max_count;
+    return max_count / page_size + 1;
+}
 
 // ── Composite types ──────────────────────────────────────────────────────
 
@@ -495,6 +522,26 @@ test "Limits.indexType" {
 
     const lim64 = Limits{ .is_64 = true };
     try std.testing.expectEqual(ValType.i64, lim64.indexType());
+}
+
+test "custom memory page-size domain and address-space bounds" {
+    try std.testing.expectEqual(@as(?u32, 0), memoryPageSizeLog2(1));
+    try std.testing.expectEqual(@as(?u32, 16), memoryPageSizeLog2(65536));
+    try std.testing.expectEqual(@as(?u32, null), memoryPageSizeLog2(0));
+    try std.testing.expectEqual(@as(?u32, null), memoryPageSizeLog2(2));
+    try std.testing.expectEqual(@as(?u32, null), memoryPageSizeLog2(3));
+    try std.testing.expectEqual(@as(?u32, null), memoryPageSizeLog2(32768));
+    try std.testing.expectEqual(@as(?u32, null), memoryPageSizeLog2(131072));
+
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u32)), memoryMaxPages(false, 1));
+    try std.testing.expectEqual(@as(?u64, 1 << 16), memoryMaxPages(false, 65536));
+    try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64)), memoryMaxPages(true, 1));
+    try std.testing.expectEqual(@as(?u64, 1 << 48), memoryMaxPages(true, 65536));
+    try std.testing.expectEqual(@as(?u64, null), memoryMaxPages(false, 3));
+
+    try std.testing.expect(!(Limits{}).usesCustomPageSize());
+    try std.testing.expect((Limits{ .page_size = 1 }).usesCustomPageSize());
+    try std.testing.expect((Limits{ .has_page_size = true }).usesCustomPageSize());
 }
 
 test "ValType.isRefType" {

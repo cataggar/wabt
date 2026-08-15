@@ -99,4 +99,5 @@ test {
     _ = @import("integration_tests.zig");
     _ = @import("gc_regression.zig");
     _ = @import("wide_arithmetic_regression.zig");
+    _ = @import("custom_page_sizes_regression.zig");
 }

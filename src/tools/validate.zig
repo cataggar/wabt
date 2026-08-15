@@ -9,6 +9,8 @@ pub const usage =
     \\(preamble \0asm 0d 00 01 00) are accepted.
     \\
     \\Options:
+    \\  --enable-custom-page-sizes
+    \\                       Enable 1-byte and explicit 64-KiB memory pages
     \\  --enable-wide-arithmetic
     \\                       Enable i64.add128/sub128/mul_wide_{s,u}
     \\
@@ -65,7 +67,9 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
+        if (std.mem.eql(u8, arg, "--enable-custom-page-sizes")) {
+            validator_options.features.custom_page_sizes = true;
+        } else if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
             validator_options.features.wide_arithmetic = true;
         } else {
             input_file = arg;
