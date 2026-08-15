@@ -156,7 +156,13 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
             return error.InvalidElemType;
         if (!checkConcreteTypeIndex(m, table.type.elem_type, table.type_idx))
             return error.InvalidTypeIndex;
-        try checkLimits(table.@"type".limits, std.math.maxInt(u32));
+        // Threads covers shared memories only. Shared tables require the
+        // separate shared-everything-threads proposal, which is not modeled.
+        if (table.type.limits.is_shared)
+            return error.InvalidLimits;
+        if (table.type.limits.usesCustomPageSize())
+            return error.InvalidLimits;
+        try checkLimits(table.type.limits, std.math.maxInt(u32));
         const elem = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
         if (table.init_expr_bytes.len > 0) {
             // A table's initializer is a constant expression like any other,
@@ -179,11 +185,16 @@ fn checkMemories(m: *const Mod.Module, options: Options) Error!void {
         return error.TooManyMemories;
 
     for (m.memories.items) |mem| {
-        const max_pages: u64 = if (mem.type.limits.is_64)
-            1 << 48
-        else
-            65536; // 4GiB = 65536 pages of 64KiB
-        try checkLimits(mem.type.limits, max_pages);
+        const limits = mem.type.limits;
+        const max_pages = types.memoryMaxPages(limits.is_64, limits.page_size) orelse
+            return error.InvalidLimits;
+        if (limits.usesCustomPageSize() and !options.features.custom_page_sizes)
+            return error.InvalidLimits;
+        if (limits.is_64 and !options.features.memory64)
+            return error.InvalidLimits;
+        if (limits.is_shared and !options.features.threads)
+            return error.InvalidLimits;
+        try checkLimits(limits, max_pages);
     }
 }
 
@@ -352,6 +363,8 @@ fn checkDataSegments(m: *const Mod.Module, options: Options) Error!void {
 }
 
 fn checkLimits(limits: types.Limits, absolute_max: u64) Error!void {
+    if (limits.is_shared and !limits.has_max)
+        return error.InvalidLimits;
     if (limits.initial > absolute_max)
         return error.InvalidLimits;
     if (limits.has_max) {

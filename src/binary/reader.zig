@@ -196,6 +196,26 @@ const Reader = struct {
         return result.value;
     }
 
+    fn readLimitU32(self: *Reader) ReadError!u32 {
+        if (self.pos >= self.data.len) return error.UnexpectedEof;
+        const result = leb128.readU32Leb128(self.data[self.pos..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.UnexpectedEof,
+            error.Overflow => error.InvalidLimits,
+        };
+        self.pos += result.bytes_read;
+        return result.value;
+    }
+
+    fn readLimitU64(self: *Reader) ReadError!u64 {
+        if (self.pos >= self.data.len) return error.UnexpectedEof;
+        const result = leb128.readU64Leb128(self.data[self.pos..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.UnexpectedEof,
+            error.Overflow => error.InvalidLimits,
+        };
+        self.pos += result.bytes_read;
+        return result.value;
+    }
+
     fn readS33(self: *Reader) ReadError!i64 {
         if (self.pos >= self.data.len) return error.UnexpectedEof;
         const result = leb128.readS33Leb128(self.data[self.pos..]) catch |err| return switch (err) {
@@ -264,12 +284,13 @@ const Reader = struct {
         return indexed;
     }
 
-    fn readLimits(self: *Reader) ReadError!types.Limits {
+    fn readLimits(self: *Reader, allow_page_size: bool) ReadError!types.Limits {
         const flags = try self.readByte();
-        // Valid flags: 0x01 (max), 0x02 (shared), 0x04 (memory64) and 0x08
-        // (custom page size). Masking 0x08 away as unknown made the page-size
-        // branch below unreachable.
-        if (flags & 0xF0 != 0) return error.InvalidLimits;
+        // Tables do not admit 0x02 here: shared tables require the
+        // shared-everything-threads type system, which this repository does
+        // not model. 0x08 likewise belongs only to memory types.
+        const valid_flags: u8 = if (allow_page_size) 0x0F else 0x05;
+        if (flags & ~valid_flags != 0) return error.InvalidLimits;
         if (flags & 0x02 != 0 and flags & 0x01 == 0) return error.InvalidLimits; // shared requires max
         var limits = types.Limits{};
         limits.has_max = (flags & 0x01) != 0;
@@ -277,17 +298,18 @@ const Reader = struct {
         limits.is_64 = (flags & 0x04) != 0;
 
         if (limits.is_64) {
-            limits.initial = try self.readU64();
-            if (limits.has_max) limits.max = try self.readU64();
+            limits.initial = try self.readLimitU64();
+            if (limits.has_max) limits.max = try self.readLimitU64();
         } else {
-            limits.initial = try self.readU32();
-            if (limits.has_max) limits.max = try self.readU32();
+            limits.initial = try self.readLimitU32();
+            if (limits.has_max) limits.max = try self.readLimitU32();
         }
 
         if (flags & 0x08 != 0) {
-            const log2 = try self.readU32();
-            if (log2 > 16) return error.InvalidLimits;
+            const log2 = try self.readLimitU32();
+            if (log2 != 0 and log2 != 16) return error.InvalidLimits;
             limits.page_size = @as(u32, 1) << @intCast(log2);
+            limits.has_page_size = true;
         }
 
         return limits;
@@ -596,7 +618,7 @@ const Reader = struct {
                 .table => {
                     const indexed = try self.checkTypeIndex(try self.readValType());
                     const elem_type = indexed.vt;
-                    const limits = try self.readLimits();
+                    const limits = try self.readLimits(false);
                     import.table_type_idx = indexed.type_idx;
                     import.table = .{ .elem_type = elem_type, .limits = limits };
                     try self.module.tables.append(self.allocator, .{
@@ -607,7 +629,7 @@ const Reader = struct {
                     self.module.num_table_imports += 1;
                 },
                 .memory => {
-                    const limits = try self.readLimits();
+                    const limits = try self.readLimits(true);
                     import.memory = .{ .limits = limits };
                     try self.module.memories.append(self.allocator, .{
                         .type = .{ .limits = limits },
@@ -664,7 +686,7 @@ const Reader = struct {
                 const has_init = true; // 0x40 prefix indicates init expr
                 const indexed = try self.checkTypeIndex(try self.readRefType());
                 const elem_type = indexed.vt;
-                const limits = try self.readLimits();
+                const limits = try self.readLimits(false);
                 var init_bytes: []const u8 = &.{};
                 if (has_init) {
                     const expr_with_end = try self.readInitExprBytes();
@@ -684,7 +706,7 @@ const Reader = struct {
                 });
             } else {
                 const indexed = try self.checkTypeIndex(try self.readValType());
-                const limits = try self.readLimits();
+                const limits = try self.readLimits(false);
                 try self.module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = indexed.vt, .limits = limits },
                     .type_idx = indexed.type_idx,
@@ -696,7 +718,7 @@ const Reader = struct {
     fn readMemorySection(self: *Reader, _: usize) ReadError!void {
         const count = try self.readU32();
         for (0..count) |_| {
-            const limits = try self.readLimits();
+            const limits = try self.readLimits(true);
             try self.module.memories.append(self.allocator, .{
                 .type = .{ .limits = limits },
             });

@@ -4002,7 +4002,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_table64 = true;
                 }
-                const limits = try self.parseLimitsTail(is_table64);
+                const limits = try self.parseLimitsTail(is_table64, false);
                 self.skipAnnotations();
                 const indexed = try self.parseIndexedValType();
                 var import = Mod.Import{
@@ -4153,7 +4153,7 @@ const Parser = struct {
             return;
         }
 
-        const limits = try self.parseLimitsTail(is_table64);
+        const limits = try self.parseLimitsTail(is_table64, false);
         self.skipAnnotations();
         // Capture concrete type index if elem type is (ref null $t) / (ref $t)
         const saved_refs_len = self.collected_type_refs.items.len;
@@ -4197,12 +4197,11 @@ const Parser = struct {
         });
     }
 
-    /// Parse the bounds that follow a table's or memory's index type: an
-    /// initial size, an optional maximum, and the `shared` and `(pagesize N)`
-    /// markers. All six places that accept limits share this so that a form
-    /// the writer emits cannot be accepted in one position and rejected in
-    /// another.
-    fn parseLimitsTail(self: *Parser, is_64: bool) ParseError!types.Limits {
+    /// Parse the bounds that follow a table's or memory's index type.
+    fn parseLimitsTail(
+        self: *Parser, is_64: bool,
+        allow_page_size: bool,
+    ) ParseError!types.Limits {
         self.skipAnnotations();
         const initial = if (is_64) try self.parseU64() else @as(u64, try self.parseU32());
         var limits = types.Limits{ .initial = initial, .is_64 = is_64 };
@@ -4214,7 +4213,13 @@ const Parser = struct {
         }
         if (self.peek().kind == .kw_shared) {
             _ = self.advance();
-            limits.is_shared = true;
+            // Shared tables belong to shared-everything-threads, whose
+            // shared type system is not represented by this feature set.
+            if (!allow_page_size) {
+                self.markMalformed(@src());
+            } else {
+                limits.is_shared = true;
+            }
             self.skipAnnotations();
         }
         // `(pagesize N)` states the memory's page size, which is otherwise
@@ -4227,7 +4232,13 @@ const Parser = struct {
             if (self.peek().kind == .kw_pagesize) {
                 _ = self.advance();
                 self.skipAnnotations();
-                limits.page_size = try self.parseU32();
+                const page_size = try self.parseU32();
+                if (!allow_page_size or types.memoryPageSizeLog2(page_size) == null) {
+                    self.markMalformed(@src());
+                } else {
+                    limits.page_size = page_size;
+                    limits.has_page_size = true;
+                }
                 self.skipAnnotations();
                 try self.expect(.r_paren);
                 self.skipAnnotations();
@@ -4250,15 +4261,7 @@ const Parser = struct {
             self.memory_names.put(self.allocator, name, mem_idx) catch {};
         }
 
-        self.skipAnnotations();
-        // Check for i64 keyword (memory64)
-        var is_memory64 = false;
-        if (self.peek().kind == .kw_i64) {
-            _ = self.advance();
-            is_memory64 = true;
-        }
-
-        // Handle inline (export "name") declarations
+        // Inline exports precede every form of the memory body.
         self.skipAnnotations();
         while (self.peek().kind == .l_paren) {
             const sp = self.lexer.pos;
@@ -4278,61 +4281,35 @@ const Parser = struct {
                     .var_ = .{ .index = mem_idx },
                 }) catch return error.OutOfMemory;
                 self.skipAnnotations();
-            } else if (self.peek().kind == .kw_data) {
-                // Inline (data "...") abbreviation
-                _ = self.advance(); // consume 'data'
-                var data_parts: std.ArrayListUnmanaged(u8) = .empty;
-                defer data_parts.deinit(self.allocator);
-                while (self.peek().kind == .string) {
-                    const tok = self.advance();
-                    const stripped = stripQuotes(tok.text);
-                    decodeWatStringInto(stripped, &data_parts, self.allocator);
-                }
-                try self.expect(.r_paren); // close (data ...)
-                const data_len: u64 = @intCast(data_parts.items.len);
-                const page_size: u64 = 65536;
-                const pages: u64 = if (data_len == 0) 0 else (data_len + page_size - 1) / page_size;
-                try module.memories.append(self.allocator, .{
-                    .type = .{ .limits = .{ .initial = pages, .max = pages, .has_max = true, .is_64 = is_memory64 } },
-                });
-                // Create active data segment at offset 0
-                var seg = Mod.DataSegment{};
-                seg.kind = .active;
-                seg.memory_var = .{ .index = mem_idx };
-                if (is_memory64) {
-                    const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
-                    ob[0] = 0x42; // i64.const
-                    ob[1] = 0x00; // 0
-                    seg.offset_expr_bytes = ob;
-                } else {
-                    const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
-                    ob[0] = 0x41; // i32.const
-                    ob[1] = 0x00; // 0
-                    seg.offset_expr_bytes = ob;
-                }
-                seg.owns_offset_expr_bytes = true;
-                if (data_parts.items.len > 0) {
-                    seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
-                    seg.owns_data = true;
-                }
-                try module.data_segments.append(self.allocator, seg);
-                return;
-            } else if (self.peek().kind == .kw_import) {
-                // Inline (import "mod" "name") abbreviation for memory
-                _ = self.advance(); // consume 'import'
+            } else {
+                self.lexer.pos = sp;
+                self.peeked = spk;
+                break;
+            }
+        }
+
+        // An inline import follows all inline exports and is followed by the
+        // ordinary memory type.
+        self.skipAnnotations();
+        if (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance();
+            self.skipAnnotations();
+            if (self.peek().kind == .kw_import) {
+                _ = self.advance();
                 self.skipAnnotations();
                 const mod_name = self.parseName(self.advance().text);
                 self.skipAnnotations();
                 const field_name = self.parseName(self.advance().text);
                 self.skipAnnotations();
-                try self.expect(.r_paren); // close (import ...)
+                try self.expect(.r_paren);
                 self.skipAnnotations();
-                // Check for i64 keyword after import (memory64)
-                if (!is_memory64 and self.peek().kind == .kw_i64) {
+                const is_memory64 = if (self.peek().kind == .kw_i64) blk: {
                     _ = self.advance();
-                    is_memory64 = true;
-                }
-                const limits = try self.parseLimitsTail(is_memory64);
+                    break :blk true;
+                } else false;
+                const limits = try self.parseLimitsTail(is_memory64, true);
                 try module.memories.append(self.allocator, .{
                     .type = .{ .limits = limits },
                     .is_import = true,
@@ -4346,21 +4323,97 @@ const Parser = struct {
                 import.memory = .{ .limits = limits };
                 try module.imports.append(self.allocator, import);
                 return;
+            }
+            self.lexer.pos = sp;
+            self.peeked = spk;
+        }
+
+        // The inline-data abbreviation is ordered as exports, optional i64,
+        // optional page size, then data, matching wasm-tools' grammar.
+        self.skipAnnotations();
+        const is_memory64 = if (self.peek().kind == .kw_i64) blk: {
+            _ = self.advance();
+            break :blk true;
+        } else false;
+
+        var inline_page_size: u32 = types.default_page_size;
+        var has_inline_page_size = false;
+        self.skipAnnotations();
+        if (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
+            _ = self.advance();
+            self.skipAnnotations();
+            if (self.peek().kind == .kw_pagesize) {
+                _ = self.advance();
+                self.skipAnnotations();
+                const page_size = try self.parseU32();
+                if (types.memoryPageSizeLog2(page_size) == null) {
+                    self.markMalformed(@src());
+                } else {
+                    inline_page_size = page_size;
+                    has_inline_page_size = true;
+                }
+                self.skipAnnotations();
+                try self.expect(.r_paren);
+                self.skipAnnotations();
             } else {
                 self.lexer.pos = sp;
                 self.peeked = spk;
-                break;
             }
         }
 
-        // Check for i64 keyword after export/import clauses
         self.skipAnnotations();
-        if (!is_memory64 and self.peek().kind == .kw_i64) {
+        if (self.peek().kind == .l_paren) {
+            const sp = self.lexer.pos;
+            const spk = self.peeked;
             _ = self.advance();
-            is_memory64 = true;
+            self.skipAnnotations();
+            if (self.peek().kind == .kw_data) {
+                _ = self.advance();
+                var data_parts: std.ArrayListUnmanaged(u8) = .empty;
+                defer data_parts.deinit(self.allocator);
+                while (self.peek().kind == .string) {
+                    const tok = self.advance();
+                    decodeWatStringInto(stripQuotes(tok.text), &data_parts, self.allocator);
+                }
+                try self.expect(.r_paren);
+                const data_len: u64 = @intCast(data_parts.items.len);
+                const page_size: u64 = inline_page_size;
+                const pages = data_len / page_size + @intFromBool(data_len % page_size != 0);
+                try module.memories.append(self.allocator, .{
+                    .type = .{ .limits = .{
+                        .initial = pages,
+                        .max = pages,
+                        .has_max = true,
+                        .is_64 = is_memory64,
+                        .page_size = inline_page_size,
+                        .has_page_size = has_inline_page_size,
+                    } },
+                });
+
+                var seg = Mod.DataSegment{
+                    .kind = .active,
+                    .memory_var = .{ .index = mem_idx },
+                };
+                const ob = self.allocator.alloc(u8, 2) catch return error.OutOfMemory;
+                ob[0] = if (is_memory64) 0x42 else 0x41;
+                ob[1] = 0x00;
+                seg.offset_expr_bytes = ob;
+                seg.owns_offset_expr_bytes = true;
+                if (data_parts.items.len > 0) {
+                    seg.data = data_parts.toOwnedSlice(self.allocator) catch &.{};
+                    seg.owns_data = true;
+                }
+                try module.data_segments.append(self.allocator, seg);
+                return;
+            }
+            self.lexer.pos = sp;
+            self.peeked = spk;
         }
 
-        const limits = try self.parseLimitsTail(is_memory64);
+        if (has_inline_page_size) self.markMalformed(@src());
+        const limits = try self.parseLimitsTail(is_memory64, true);
         try module.memories.append(self.allocator, .{
             .@"type" = .{ .limits = limits },
         });
@@ -4851,7 +4904,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_memory64 = true;
                 }
-                const limits = try self.parseLimitsTail(is_memory64);
+                const limits = try self.parseLimitsTail(is_memory64, true);
                 self.skipAnnotations();
                 import.memory = .{ .limits = limits };
                 try module.memories.append(self.allocator, .{
@@ -4878,7 +4931,7 @@ const Parser = struct {
                     _ = self.advance();
                     is_table64 = true;
                 }
-                const t_limits = try self.parseLimitsTail(is_table64);
+                const t_limits = try self.parseLimitsTail(is_table64, false);
                 self.skipAnnotations();
                 const indexed = try self.parseIndexedValType();
                 self.skipAnnotations();
@@ -7948,7 +8001,7 @@ test "an inline signature must agree with its type reference about referenced ty
     try std.testing.expectEqual(@as(u32, 1), ok.funcs.items[0].decl.type_var.index);
 }
 
-test "a memory or table states shared and its page size in every position" {
+test "limits and memory page sizes parse in every supported position" {
     const allocator = std.testing.allocator;
     // Limits are accepted in six places -- a plain table or memory, either
     // written with an inline `(import ...)` or listed under an `(import ...)`
@@ -7990,6 +8043,8 @@ test "a memory or table states shared and its page size in every position" {
     defer ps.deinit();
     try std.testing.expectEqual(@as(u32, 1), ps.memories.items[0].type.limits.page_size);
     try std.testing.expectEqual(@as(u32, 0x10000), ps.memories.items[1].type.limits.page_size);
+    try std.testing.expect(ps.memories.items[0].type.limits.has_page_size);
+    try std.testing.expect(ps.memories.items[1].type.limits.has_page_size);
     // The bounds are still the bounds, not the page size.
     try std.testing.expectEqual(@as(u64, 1), ps.memories.items[0].type.limits.initial);
     try std.testing.expectEqual(@as(u64, 2), ps.memories.items[1].type.limits.initial);
@@ -8024,6 +8079,18 @@ test "a page size survives being written back out" {
     var back = try @import("../binary/reader.zig").readModule(allocator, bytes);
     defer back.deinit();
     try std.testing.expectEqual(@as(u32, 1), back.memories.items[0].type.limits.page_size);
+    try std.testing.expect(back.memories.items[0].type.limits.has_page_size);
+
+    // Explicitly stating the default is preserved rather than collapsed into
+    // the unflagged default form.
+    var e = try parseModule(allocator, "(module (memory 1 (pagesize 65536)))");
+    defer e.deinit();
+    const ebytes = try @import("../binary/writer.zig").writeModule(allocator, &e);
+    defer allocator.free(ebytes);
+    var eback = try @import("../binary/reader.zig").readModule(allocator, ebytes);
+    defer eback.deinit();
+    try std.testing.expectEqual(types.default_page_size, eback.memories.items[0].type.limits.page_size);
+    try std.testing.expect(eback.memories.items[0].type.limits.has_page_size);
 
     // A memory that never stated one keeps the default and gains no flag.
     var d = try parseModule(allocator, "(module (memory 1))");
@@ -8033,6 +8100,7 @@ test "a page size survives being written back out" {
     var dback = try @import("../binary/reader.zig").readModule(allocator, dbytes);
     defer dback.deinit();
     try std.testing.expectEqual(types.default_page_size, dback.memories.items[0].type.limits.page_size);
+    try std.testing.expect(!dback.memories.items[0].type.limits.has_page_size);
     try std.testing.expectEqual(bytes.len - 1, dbytes.len);
 }
 
