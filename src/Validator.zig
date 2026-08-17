@@ -1646,12 +1646,20 @@ fn checkOneBody(
                 val_stack.append(gpa(m), result) catch return error.OutOfMemory;
             },
             0x1c => { // select t
-                const count = readU32(bytes, &pos);
-                for (0..count) |_| _ = readU32(bytes, &pos); // skip types
+                // Typed select is part of reference-types even when its
+                // declared result is numeric. The immediate is a value-type
+                // vector, not a vector of u32s, and the current core spec
+                // requires that vector to contain exactly one type.
+                if (!features.reference_types) return error.UnsupportedOpcode;
+                const count = try readU32Immediate(bytes, &pos);
+                if (count != 1) return error.TypeMismatch;
+                const declared = try readTypedSelectType(m, bytes, &pos);
+                if (!valueTypeEnabled(m, declared, features))
+                    return error.UnsupportedOpcode;
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
-                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
-                _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
-                val_stack.append(gpa(m), StackType.unknown()) catch return error.OutOfMemory;
+                try popExpect(m, &val_stack, &ctrl_stack, declared);
+                try popExpect(m, &val_stack, &ctrl_stack, declared);
+                val_stack.append(gpa(m), declared) catch return error.OutOfMemory;
             },
             0x20 => { // local.get
                 const idx = readU32(bytes, &pos);
@@ -2389,7 +2397,7 @@ const single_val_types = blk: {
         if (f.value < 0 or f.value > 0xff) continue;
         const vt: types.ValType = @enumFromInt(f.value);
         switch (vt) {
-            .func, .struct_, .array, .i8, .i16 => continue,
+            .func, .struct_, .array, .i8, .i16, .void_ => continue,
             else => {},
         }
         table[@as(usize, f.value)] = .{vt};
@@ -2468,6 +2476,82 @@ fn readHeapStackTypeImmediate(
     const idx: u32 = @intCast(result.value);
     if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
     return StackType.fromRefType(types.RefType.concrete(nullable, idx));
+}
+
+/// Decode the sole value type in a typed-select immediate.
+///
+/// A non-negative s33 directly denotes `(ref null <typeidx>)`. The general
+/// `ref`/`ref null` forms remain valid for explicit concrete and non-null
+/// references. Single-byte numeric, vector, and abbreviated nullable
+/// reference types are handled before the s33 fallback so their negative
+/// signed values are not mistaken for indices.
+fn readTypedSelectType(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    pos: *usize,
+) Error!StackType {
+    if (pos.* >= bytes.len) return error.UnexpectedEnd;
+    const byte = bytes[pos.*];
+    if (byte == reader.ref_null_prefix or byte == reader.ref_prefix) {
+        pos.* += 1;
+        const nullable = byte == reader.ref_null_prefix;
+        if (pos.* >= bytes.len) return error.UnexpectedEnd;
+        const result = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.UnexpectedEnd,
+            error.Overflow => error.InvalidTypeIndex,
+        };
+        pos.* += result.bytes_read;
+        if (result.value < 0 and result.bytes_read != 1)
+            return error.InvalidTypeIndex;
+        if (types.AbstractHeapType.fromCode(result.value)) |heap| {
+            return StackType.fromRefType(types.RefType.abstract(nullable, heap));
+        }
+        if (result.value < 0 or result.value > std.math.maxInt(u32))
+            return error.InvalidTypeIndex;
+        const idx: u32 = @intCast(result.value);
+        if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+        return StackType.fromRefType(types.RefType.concrete(nullable, idx));
+    }
+
+    if (single_val_types[byte]) |value_type| {
+        pos.* += 1;
+        return StackType.fromValType(value_type[0]);
+    }
+
+    const result = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+        error.UnexpectedEnd => error.UnexpectedEnd,
+        error.Overflow => error.InvalidTypeIndex,
+    };
+    pos.* += result.bytes_read;
+    if (result.value < 0 or result.value > std.math.maxInt(u32))
+        return error.InvalidTypeIndex;
+    const idx: u32 = @intCast(result.value);
+    if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
+    return StackType.fromRefType(types.RefType.concrete(true, idx));
+}
+
+/// Whether a value type is available under the configured proposals.
+fn valueTypeEnabled(
+    m: *const Mod.Module,
+    value_type: StackType,
+    features: Feature.Set,
+) bool {
+    const vt = value_type.toValType() orelse return false;
+    if (vt == .v128) return features.simd;
+    const ref_type = value_type.asRefType() orelse return true;
+    if (!features.reference_types) return false;
+
+    return switch (ref_type.heap) {
+        .abstract => |heap| switch (heap) {
+            .func, .extern_ => ref_type.nullable or features.function_references,
+            .nofunc, .noextern, .any, .eq, .i31, .struct_, .array, .none => features.gc,
+            .exn, .noexn => features.exceptions,
+        },
+        .concrete => |idx| switch (concreteKind(m, idx) orelse return false) {
+            .func => features.function_references or features.gc,
+            .struct_, .array => features.gc,
+        },
+    };
 }
 
 fn pushCtrl(ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), val_stack: *ValStack, opcode: u8, start: TypeSeq, end: TypeSeq, alloc: std.mem.Allocator) !void {

@@ -100,4 +100,5 @@ test {
     _ = @import("gc_regression.zig");
     _ = @import("wide_arithmetic_regression.zig");
     _ = @import("custom_page_sizes_regression.zig");
+    _ = @import("typed_select_regression.zig");
 }
