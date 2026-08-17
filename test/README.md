@@ -92,6 +92,36 @@ wasm-tools 1.250.0 rejects them with its default features and accepts a
 well-typed shared-table binary with `--features all`; WABT will continue to
 reject them until a dedicated feature and shared types are implemented.
 
+## Typed select differential matrix
+
+`src/fixtures/typed-select-regression/corpus.json` supplements the inactive
+C++-era typed-select goldens with an embedded suite run by
+`src/typed_select_regression.zig`. It covers exact numeric and SIMD typing,
+abstract and indexed references, recursive and declared subtyping,
+nullability and bottom types, polymorphic stacks, feature gates, vector
+arity, malformed LEBs, and text/binary round trips.
+
+Run the wasm-tools 1.250.0 differential matrix with:
+
+```console
+$ zig build
+$ scripts/typed_select_regression.py \
+    zig-out/bin/wabt \
+    /path/to/wasm-tools-1.250.0
+```
+
+Typed select belongs to reference-types even for numeric results; disabling
+multi-value does not disable it. Type-specific SIMD, function-reference, GC,
+and exception gates are checked through `Validator.Options` in the embedded
+suite. The differential runner checks every combination of reference-types,
+function-references, GC, and exceptions against wasm-tools: nullable
+`func`/`extern` need only reference-types, their non-null forms need
+function-references, GC heap types (including `nofunc`/`noextern`) need GC,
+exception heap types need exceptions, and concrete function types need
+function-references or GC. The CLI does not currently expose switches to
+disable those default-on proposals, and proposal gating for instructions
+outside typed select remains outside this regression's scope.
+
 ## Legacy C++-era test corpus
 
 The `parse/`, `regress/`, `spec-new/`, and `typecheck/` directories
@@ -102,4 +132,6 @@ removed when the CLI was reorganized under subject roots (#137).
 
 The data is preserved as a corpus so a future Zig-native harness can
 resurrect the coverage. Until that work happens these `.txt` files are
-not exercised by any tooling.
+not exercised by any tooling. Active Zig coverage may duplicate a legacy
+golden, but does not replace it; preserving the historical corpus is the
+repository policy.

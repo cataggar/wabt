@@ -870,8 +870,9 @@ pub const Code = enum(u32) {
             .i31_get_u,
             => features.gc,
 
-            // Multi-value (select_t enabled by default)
-            .select_t => features.multi_value,
+            // Typed select was introduced by reference-types. Its immediate
+            // vector has arity one; it does not require multi-value.
+            .select_t => features.reference_types,
 
             // Wide arithmetic
             .i64_add128,
@@ -2158,11 +2159,14 @@ test "isEnabled — feature-gated opcodes respect flags" {
     try std.testing.expect(Code.br_on_cast.isEnabled(with_gc));
     try std.testing.expect(Code.i31_get_u.isEnabled(with_gc));
 
-    // Multi-value (select_t)
+    // Typed select belongs to reference-types, not multi-value.
     try std.testing.expect(!Code.select_t.isEnabled(none));
-    var with_mv = none;
-    with_mv.multi_value = true;
-    try std.testing.expect(Code.select_t.isEnabled(with_mv));
+    var with_ref_select = none;
+    with_ref_select.reference_types = true;
+    try std.testing.expect(Code.select_t.isEnabled(with_ref_select));
+    var with_mv_only = none;
+    with_mv_only.multi_value = true;
+    try std.testing.expect(!Code.select_t.isEnabled(with_mv_only));
 
     // Wide arithmetic
     try std.testing.expect(!Code.i64_add128.isEnabled(none));

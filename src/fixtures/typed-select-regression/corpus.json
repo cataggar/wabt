@@ -1,0 +1,651 @@
+{
+  "version": 1,
+  "feature_gates": [
+    {
+      "name": "nullable-func-gate",
+      "gate": "reference-types",
+      "wat": "(module (func (result (ref null func)) unreachable select (result (ref null func))))"
+    },
+    {
+      "name": "nonnull-func-gate",
+      "gate": "function-references",
+      "wat": "(module (func (result (ref func)) unreachable select (result (ref func))))"
+    },
+    {
+      "name": "nullable-extern-gate",
+      "gate": "reference-types",
+      "wat": "(module (func (result (ref null extern)) unreachable select (result (ref null extern))))"
+    },
+    {
+      "name": "nonnull-extern-gate",
+      "gate": "function-references",
+      "wat": "(module (func (result (ref extern)) unreachable select (result (ref extern))))"
+    },
+    {
+      "name": "nullable-nofunc-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null nofunc)) unreachable select (result (ref null nofunc))))"
+    },
+    {
+      "name": "nonnull-nofunc-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref nofunc)) unreachable select (result (ref nofunc))))"
+    },
+    {
+      "name": "nullable-noextern-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null noextern)) unreachable select (result (ref null noextern))))"
+    },
+    {
+      "name": "nonnull-noextern-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref noextern)) unreachable select (result (ref noextern))))"
+    },
+    {
+      "name": "nullable-exn-gate",
+      "gate": "exceptions",
+      "wat": "(module (func (result (ref null exn)) unreachable select (result (ref null exn))))"
+    },
+    {
+      "name": "nonnull-exn-gate",
+      "gate": "exceptions",
+      "wat": "(module (func (result (ref exn)) unreachable select (result (ref exn))))"
+    },
+    {
+      "name": "nullable-noexn-gate",
+      "gate": "exceptions",
+      "wat": "(module (func (result (ref null noexn)) unreachable select (result (ref null noexn))))"
+    },
+    {
+      "name": "nonnull-noexn-gate",
+      "gate": "exceptions",
+      "wat": "(module (func (result (ref noexn)) unreachable select (result (ref noexn))))"
+    },
+    {
+      "name": "nullable-any-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null any)) unreachable select (result (ref null any))))"
+    },
+    {
+      "name": "nonnull-any-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref any)) unreachable select (result (ref any))))"
+    },
+    {
+      "name": "nullable-eq-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null eq)) unreachable select (result (ref null eq))))"
+    },
+    {
+      "name": "nonnull-eq-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref eq)) unreachable select (result (ref eq))))"
+    },
+    {
+      "name": "nullable-i31-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null i31)) unreachable select (result (ref null i31))))"
+    },
+    {
+      "name": "nonnull-i31-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref i31)) unreachable select (result (ref i31))))"
+    },
+    {
+      "name": "nullable-struct-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null struct)) unreachable select (result (ref null struct))))"
+    },
+    {
+      "name": "nonnull-struct-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref struct)) unreachable select (result (ref struct))))"
+    },
+    {
+      "name": "nullable-array-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null array)) unreachable select (result (ref null array))))"
+    },
+    {
+      "name": "nonnull-array-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref array)) unreachable select (result (ref array))))"
+    },
+    {
+      "name": "nullable-none-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref null none)) unreachable select (result (ref null none))))"
+    },
+    {
+      "name": "nonnull-none-gate",
+      "gate": "gc",
+      "wat": "(module (func (result (ref none)) unreachable select (result (ref none))))"
+    },
+    {
+      "name": "nullable-concrete-func-gate",
+      "gate": "function-references-or-gc",
+      "wat": "(module (type $t (func)) (func (result (ref null $t)) unreachable select (result (ref null $t))))"
+    },
+    {
+      "name": "nonnull-concrete-func-gate",
+      "gate": "function-references-or-gc",
+      "wat": "(module (type $t (func)) (func (result (ref $t)) unreachable select (result (ref $t))))"
+    },
+    {
+      "name": "nullable-concrete-struct-gate",
+      "gate": "gc",
+      "wat": "(module (type $t (struct)) (func (result (ref null $t)) unreachable select (result (ref null $t))))"
+    },
+    {
+      "name": "nonnull-concrete-struct-gate",
+      "gate": "gc",
+      "wat": "(module (type $t (struct)) (func (result (ref $t)) unreachable select (result (ref $t))))"
+    },
+    {
+      "name": "nullable-concrete-array-gate",
+      "gate": "gc",
+      "wat": "(module (type $t (array i32)) (func (result (ref null $t)) unreachable select (result (ref null $t))))"
+    },
+    {
+      "name": "nonnull-concrete-array-gate",
+      "gate": "gc",
+      "wat": "(module (type $t (array i32)) (func (result (ref $t)) unreachable select (result (ref $t))))"
+    }
+  ],
+  "valid": [
+    {
+      "name": "i32",
+      "family": "numeric",
+      "wat": "(module (func (result i32) i32.const 1 i32.const 2 i32.const 0 select (result i32)))"
+    },
+    {
+      "name": "i64",
+      "family": "numeric",
+      "wat": "(module (func (result i64) i64.const 1 i64.const 2 i32.const 0 select (result i64)))"
+    },
+    {
+      "name": "f32",
+      "family": "numeric",
+      "wat": "(module (func (result f32) f32.const 1 f32.const 2 i32.const 0 select (result f32)))"
+    },
+    {
+      "name": "f64",
+      "family": "numeric",
+      "wat": "(module (func (result f64) f64.const 1 f64.const 2 i32.const 0 select (result f64)))"
+    },
+    {
+      "name": "v128",
+      "family": "simd",
+      "wat": "(module (func (result v128) v128.const i32x4 0 0 0 0 v128.const i32x4 1 1 1 1 i32.const 0 select (result v128)))"
+    },
+    {
+      "name": "funcref-bottom",
+      "family": "abstract-ref",
+      "wat": "(module (func (result funcref) ref.null func ref.null nofunc i32.const 0 select (result funcref)))"
+    },
+    {
+      "name": "externref-bottom",
+      "family": "abstract-ref",
+      "wat": "(module (func (result externref) ref.null extern ref.null noextern i32.const 0 select (result externref)))"
+    },
+    {
+      "name": "anyref-bottom",
+      "family": "abstract-ref",
+      "wat": "(module (func (result anyref) ref.null none ref.null struct i32.const 0 select (result anyref)))"
+    },
+    {
+      "name": "eqref-bottom",
+      "family": "abstract-ref",
+      "wat": "(module (func (result eqref) ref.null i31 ref.null none i32.const 0 select (result eqref)))"
+    },
+    {
+      "name": "i31ref",
+      "family": "abstract-ref",
+      "wat": "(module (func (result i31ref) i32.const 1 ref.i31 i32.const 2 ref.i31 i32.const 0 select (result i31ref)))"
+    },
+    {
+      "name": "structref",
+      "family": "abstract-ref",
+      "wat": "(module (type $s (struct)) (func (result structref) struct.new_default $s ref.null struct i32.const 0 select (result structref)))"
+    },
+    {
+      "name": "arrayref",
+      "family": "abstract-ref",
+      "wat": "(module (type $a (array i32)) (func (result arrayref) i32.const 0 array.new_default $a ref.null array i32.const 0 select (result arrayref)))"
+    },
+    {
+      "name": "exnref-bottom",
+      "family": "abstract-ref",
+      "wat": "(module (func (result exnref) ref.null exn ref.null noexn i32.const 0 select (result exnref)))"
+    },
+    {
+      "name": "nonnull-bottom-none",
+      "family": "bottom-ref",
+      "printed": "select (result (ref none))",
+      "wat": "(module (func (result (ref none)) unreachable select (result (ref none))))"
+    },
+    {
+      "name": "nonnull-bottom-nofunc",
+      "family": "bottom-ref",
+      "printed": "select (result (ref nofunc))",
+      "wat": "(module (func (result (ref nofunc)) unreachable select (result (ref nofunc))))"
+    },
+    {
+      "name": "nonnull-bottom-noextern",
+      "family": "bottom-ref",
+      "printed": "select (result (ref noextern))",
+      "wat": "(module (func (result (ref noextern)) unreachable select (result (ref noextern))))"
+    },
+    {
+      "name": "nonnull-bottom-noexn",
+      "family": "bottom-ref",
+      "printed": "select (result (ref noexn))",
+      "wat": "(module (func (result (ref noexn)) unreachable select (result (ref noexn))))"
+    },
+    {
+      "name": "recursive-concrete",
+      "family": "concrete-ref",
+      "printed": "select (result (ref null 0))",
+      "wat": "(module (rec (type $node (sub (struct (field (ref null $node)))))) (func (param (ref null $node)) (result (ref null $node)) local.get 0 local.get 0 i32.const 0 select (result (ref null $node))))"
+    },
+    {
+      "name": "declared-subtype",
+      "family": "subtyping",
+      "printed": "select (result (ref 0))",
+      "wat": "(module (type $parent (sub (struct))) (type $child (sub $parent (struct (field i32)))) (func (param (ref $child)) (param (ref $parent)) (result (ref $parent)) local.get 0 local.get 1 i32.const 0 select (result (ref $parent))))"
+    },
+    {
+      "name": "nullable-declared-subtype",
+      "family": "subtyping",
+      "printed": "select (result (ref null 0))",
+      "wat": "(module (type $parent (sub (struct))) (type $child (sub $parent (struct (field i32)))) (func (param (ref null $child)) (param (ref $parent)) (result (ref null $parent)) local.get 0 local.get 1 i32.const 0 select (result (ref null $parent))))"
+    },
+    {
+      "name": "nullable-concrete-func-bottom",
+      "family": "concrete-ref",
+      "printed": "select (result (ref null 0))",
+      "wat": "(module (type $ft (func)) (func (result (ref null $ft)) ref.null nofunc ref.null nofunc i32.const 0 select (result (ref null $ft))))"
+    },
+    {
+      "name": "nonnull-concrete-func",
+      "family": "concrete-ref",
+      "printed": "select (result (ref 0))",
+      "wat": "(module (type $ft (func)) (func (param (ref $ft)) (result (ref $ft)) local.get 0 local.get 0 i32.const 0 select (result (ref $ft))))"
+    },
+    {
+      "name": "unreachable-constrained",
+      "family": "polymorphic",
+      "wat": "(module (func (result i32) unreachable select (result i32)))"
+    }
+  ],
+  "invalid_wat": [
+    {
+      "name": "repro-i64-operands-i32-result",
+      "family": "operand",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i32) i64.const 1 i64.const 2 i32.const 0 select (result i32)))"
+    },
+    {
+      "name": "mixed-i32-i64-operands",
+      "family": "operand",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i32) i32.const 1 i64.const 2 i32.const 0 select (result i32)))"
+    },
+    {
+      "name": "i32-operands-i64-result",
+      "family": "operand",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i64) i32.const 1 i32.const 2 i32.const 0 select (result i64)))"
+    },
+    {
+      "name": "wrong-condition",
+      "family": "condition",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i32) i32.const 1 i32.const 2 i64.const 0 select (result i32)))"
+    },
+    {
+      "name": "missing-operand",
+      "family": "operand",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i32) i32.const 1 i32.const 0 select (result i32)))"
+    },
+    {
+      "name": "funcref-externref-mismatch",
+      "family": "abstract-ref",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result funcref) ref.null func ref.null extern i32.const 0 select (result funcref)))"
+    },
+    {
+      "name": "anyref-externref-mismatch",
+      "family": "abstract-ref",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result anyref) ref.null any ref.null extern i32.const 0 select (result anyref)))"
+    },
+    {
+      "name": "nullable-to-nonnull",
+      "family": "nullability",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $s (struct)) (func (param (ref $s)) (result (ref $s)) local.get 0 ref.null $s i32.const 0 select (result (ref $s))))"
+    },
+    {
+      "name": "supertype-to-subtype",
+      "family": "subtyping",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $parent (sub (struct))) (type $child (sub $parent (struct (field i32)))) (func (param (ref $child)) (param (ref $parent)) (result (ref $child)) local.get 0 local.get 1 i32.const 0 select (result (ref $child))))"
+    },
+    {
+      "name": "unrelated-concrete-types",
+      "family": "subtyping",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (type $a (struct)) (type $b (array i32)) (func (param (ref $a)) (param (ref $b)) (result (ref $a)) local.get 0 local.get 1 i32.const 0 select (result (ref $a))))"
+    },
+    {
+      "name": "v128-i32-mismatch",
+      "family": "simd",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result v128) v128.const i32x4 0 0 0 0 i32.const 1 i32.const 0 select (result v128)))"
+    },
+    {
+      "name": "unreachable-result-stays-i32",
+      "family": "polymorphic",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i64) unreachable select (result i32)))"
+    },
+    {
+      "name": "unreachable-real-operand-still-checked",
+      "family": "polymorphic",
+      "stage": "validation",
+      "wabt_error": "TypeMismatch",
+      "wat": "(module (func (result i32) unreachable i64.const 0 i32.const 0 select (result i32)))"
+    },
+    {
+      "name": "zero-result-vector",
+      "family": "arity",
+      "stage": "parse",
+      "wabt_error": "InvalidModule",
+      "wat": "(module (func i32.const 1 i32.const 2 i32.const 0 select (result) drop))"
+    },
+    {
+      "name": "multiple-result-vector",
+      "family": "arity",
+      "stage": "parse",
+      "wabt_error": "InvalidModule",
+      "wat": "(module (func i32.const 1 i32.const 2 i32.const 0 select (result i32 i32) drop))"
+    },
+    {
+      "name": "repeated-result-vector",
+      "family": "arity",
+      "stage": "parse",
+      "wabt_error": "InvalidModule",
+      "wat": "(module (func i32.const 1 i32.const 2 i32.const 0 select (result i32) (result i32) drop))"
+    },
+    {
+      "name": "packed-result-type",
+      "family": "value-type",
+      "stage": "validation",
+      "wabt_error": "InvalidTypeIndex",
+      "wat": "(module (func unreachable select (result i8) drop))"
+    },
+    {
+      "name": "invalid-concrete-type-index",
+      "family": "type-index",
+      "stage": "parse",
+      "wabt_error": "InvalidModule",
+      "wat": "(module (type (func)) (func unreachable select (result (ref null 1)) drop))"
+    }
+  ],
+  "valid_binary": [
+    {
+      "name": "binary-i32",
+      "family": "value-type",
+      "body_hex": "001c017f1a0b"
+    },
+    {
+      "name": "binary-nonnull-func",
+      "family": "signed-heap-type",
+      "printed": "select (result (ref func))",
+      "body_hex": "001c0164701a0b"
+    },
+    {
+      "name": "binary-concrete-null",
+      "family": "type-index",
+      "printed": "select (result (ref null 0))",
+      "body_hex": "001c0163001a0b"
+    },
+    {
+      "name": "binary-direct-index-zero",
+      "family": "direct-type-index",
+      "printed": "select (result (ref null 0))",
+      "body_hex": "001c01001a0b"
+    },
+    {
+      "name": "binary-direct-index-128",
+      "family": "direct-type-index",
+      "printed": "select (result (ref null 128))",
+      "type_index": 128,
+      "body_hex": "001c0180011a0b"
+    },
+    {
+      "name": "binary-direct-index-padded-three-bytes",
+      "family": "overlong-valid",
+      "printed": "select (result (ref null 0))",
+      "body_hex": "001c018080001a0b"
+    },
+    {
+      "name": "binary-direct-index-padded-five-bytes",
+      "family": "overlong-valid",
+      "printed": "select (result (ref null 0))",
+      "body_hex": "001c0180808080001a0b"
+    },
+    {
+      "name": "binary-direct-concrete-function",
+      "family": "direct-concrete-kind",
+      "printed": "select (result (ref null 0))",
+      "type_kind": "func",
+      "body_hex": "001c01001a0b"
+    },
+    {
+      "name": "binary-direct-concrete-struct",
+      "family": "direct-concrete-kind",
+      "printed": "select (result (ref null 0))",
+      "type_kind": "struct",
+      "body_hex": "001c01001a0b"
+    },
+    {
+      "name": "binary-direct-concrete-array",
+      "family": "direct-concrete-kind",
+      "printed": "select (result (ref null 0))",
+      "type_kind": "array",
+      "body_hex": "001c01001a0b"
+    },
+    {
+      "name": "binary-direct-recursive-struct",
+      "family": "direct-recursive-kind",
+      "printed": "select (result (ref null 0))",
+      "type_kind": "recursive-struct",
+      "body_hex": "001c01001a0b"
+    },
+    {
+      "name": "binary-overlong-concrete-index",
+      "family": "overlong-valid",
+      "printed": "select (result (ref null 0))",
+      "body_hex": "001c01638080001a0b"
+    },
+    {
+      "name": "binary-overlong-vector-length",
+      "family": "overlong-valid",
+      "body_hex": "001c81808080007f1a0b"
+    }
+  ],
+  "invalid_binary": [
+    {
+      "name": "binary-zero-result-vector",
+      "family": "arity",
+      "validator_error": "TypeMismatch",
+      "binary_error": "TypeMismatch",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c000b"
+    },
+    {
+      "name": "binary-multiple-result-vector",
+      "family": "arity",
+      "validator_error": "TypeMismatch",
+      "binary_error": "TypeMismatch",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c027f7e1a0b"
+    },
+    {
+      "name": "binary-overflow-vector-length",
+      "family": "malformed-vector",
+      "validator_error": "UnexpectedEnd",
+      "binary_error": "UnexpectedEnd",
+      "scanner_error": "TruncatedBody",
+      "body_hex": "001c8180808080007f1a0b"
+    },
+    {
+      "name": "binary-truncated-vector-length",
+      "family": "truncated",
+      "validator_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "scanner_error": "TruncatedBody",
+      "body_hex": "001c80"
+    },
+    {
+      "name": "binary-missing-result-type",
+      "family": "truncated",
+      "validator_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "scanner_error": "TruncatedBody",
+      "body_hex": "001c01"
+    },
+    {
+      "name": "binary-truncated-ref-type",
+      "family": "truncated",
+      "validator_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "scanner_error": "TruncatedBody",
+      "body_hex": "001c0163"
+    },
+    {
+      "name": "binary-unknown-value-type",
+      "family": "value-type",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c01761a0b"
+    },
+    {
+      "name": "binary-packed-value-type",
+      "family": "value-type",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c01781a0b"
+    },
+    {
+      "name": "binary-void-value-type",
+      "family": "value-type",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c01401a0b"
+    },
+    {
+      "name": "binary-invalid-concrete-index",
+      "family": "type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "body_hex": "001c0163011a0b"
+    },
+    {
+      "name": "binary-invalid-direct-index",
+      "family": "direct-type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "body_hex": "001c01011a0b"
+    },
+    {
+      "name": "binary-invalid-direct-max-u32-index",
+      "family": "direct-type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "body_hex": "001c01ffffffff0f1a0b"
+    },
+    {
+      "name": "binary-negative-unknown-direct-type",
+      "family": "signed-type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c01681a0b"
+    },
+    {
+      "name": "binary-padded-negative-unknown-direct-type",
+      "family": "signed-type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c01e87f1a0b"
+    },
+    {
+      "name": "binary-truncated-direct-type-index",
+      "family": "truncated",
+      "validator_error": "UnexpectedEnd",
+      "binary_error": "InvalidSection",
+      "scanner_error": "TruncatedBody",
+      "body_hex": "001c0180"
+    },
+    {
+      "name": "binary-overlong-direct-type-index",
+      "family": "overlong-invalid",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c018080808080001a0b"
+    },
+    {
+      "name": "binary-overflow-direct-type-index",
+      "family": "malformed-type-index",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c0180808080101a0b"
+    },
+    {
+      "name": "binary-unknown-heap-type",
+      "family": "heap-type",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c0163681a0b"
+    },
+    {
+      "name": "binary-overlong-abstract-heap",
+      "family": "overlong-invalid",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c0163ee7f1a0b"
+    },
+    {
+      "name": "binary-overflow-heap-type",
+      "family": "malformed-heap",
+      "validator_error": "InvalidTypeIndex",
+      "binary_error": "InvalidTypeIndex",
+      "scanner_error": "UnsupportedOpcode",
+      "body_hex": "001c016380808080101a0b"
+    }
+  ]
+}

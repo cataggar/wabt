@@ -214,6 +214,50 @@ fn skipHeapType(bytes: []const u8, pos: *usize) Error!void {
     _ = try readS33At(bytes, pos);
 }
 
+/// Step over one value type in a typed-select vector.
+///
+/// Most value types are one byte, while the general reference forms carry an
+/// s33 heap type. A non-negative s33 also directly denotes a nullable
+/// concrete reference. Direct indices may use any valid s33 width.
+fn skipSelectValueType(bytes: []const u8, pos: *usize) Error!void {
+    if (pos.* >= bytes.len) return error.TruncatedBody;
+    const byte = bytes[pos.*];
+    if (byte == 0x63 or byte == 0x64) {
+        pos.* += 1;
+        const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+            error.UnexpectedEnd => error.TruncatedBody,
+            error.Overflow => error.UnsupportedOpcode,
+        };
+        pos.* += r.bytes_read;
+        if (r.value < 0) {
+            if (r.bytes_read != 1 or types.AbstractHeapType.fromCode(r.value) == null)
+                return error.UnsupportedOpcode;
+        } else if (r.value > std.math.maxInt(u32)) {
+            return error.UnsupportedOpcode;
+        }
+        return;
+    }
+    if (select_value_type_bytes[byte]) {
+        pos.* += 1;
+        return;
+    }
+
+    const value = try readS33At(bytes, pos);
+    if (value < 0 or value > std.math.maxInt(u32))
+        return error.UnsupportedOpcode;
+}
+
+const select_value_type_bytes = blk: {
+    var table = [_]bool{false} ** 256;
+    for (@typeInfo(types.ValType).@"enum".fields) |field| {
+        if (field.value < 0 or field.value > 0xff) continue;
+        const vt: types.ValType = @enumFromInt(field.value);
+        if (vt.isNumType() or vt.isRefType())
+            table[@as(usize, field.value)] = true;
+    }
+    break :blk table;
+};
+
 /// A memarg is an alignment, an optional memory index that bit `0x40` of the
 /// alignment announces, and an offset.
 fn skipMemArg(bytes: []const u8, pos: *usize) Error!void {
@@ -260,7 +304,8 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
         },
         .select_types => {
             const count = try readU32At(bytes, pos);
-            try skipBytes(count, bytes, pos);
+            if (count != 1) return error.UnsupportedOpcode;
+            try skipSelectValueType(bytes, pos);
         },
         .try_table => {
             try skipBlockType(bytes, pos);
@@ -301,4 +346,49 @@ test "wide arithmetic opcodes have no immediates" {
 
     var truncated_pos: usize = 0;
     try std.testing.expectError(error.TruncatedBody, decode(&.{0xfc}, &truncated_pos));
+}
+
+test "typed select scanner requires one complete value type" {
+    const valid = [_][]const u8{
+        &.{ 0x1c, 0x01, 0x7f },
+        &.{ 0x1c, 0x81, 0x80, 0x80, 0x80, 0x00, 0x7f },
+        &.{ 0x1c, 0x01, 0x00 },
+        &.{ 0x1c, 0x01, 0x80, 0x01 },
+        &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x00 },
+        &.{ 0x1c, 0x01, 0x63, 0x80, 0x80, 0x00 },
+        &.{ 0x1c, 0x01, 0x64, 0x00 },
+    };
+    for (valid) |body| {
+        var pos: usize = 0;
+        const decoded = try decode(body, &pos);
+        try skipImmediates(decoded.shape, body, &pos);
+        try std.testing.expectEqual(body.len, pos);
+    }
+
+    const invalid = [_]struct {
+        body: []const u8,
+        expected: Error,
+    }{
+        .{ .body = &.{ 0x1c, 0x00 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x02, 0x7f, 0x7e }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x80 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x81, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x80 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x68 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0xe8, 0x7f }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x10 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x63 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x63, 0xee, 0x7f }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x63, 0x80, 0x80, 0x80, 0x80, 0x10 }, .expected = error.UnsupportedOpcode },
+    };
+    for (invalid) |case| {
+        var pos: usize = 0;
+        const decoded = try decode(case.body, &pos);
+        try std.testing.expectError(
+            case.expected,
+            skipImmediates(decoded.shape, case.body, &pos),
+        );
+    }
 }

@@ -490,12 +490,10 @@ const WatWriter = struct {
             },
             .select_types => {
                 const count = try readU32At(bytes, pos);
-                for (0..count) |_| {
-                    try self.append(" (result ");
-                    const b = try readByteAt(bytes, pos);
-                    try self.append(valTypeNameFromByte(@intCast(b)) orelse return error.UnsupportedOpcode);
-                    try self.appendByte(')');
-                }
+                if (count != 1) return error.UnsupportedOpcode;
+                try self.append(" (result ");
+                try self.writeSelectValueType(bytes, pos);
+                try self.appendByte(')');
             },
             .try_table => {
                 try self.writeBlockType(bytes, pos);
@@ -567,6 +565,46 @@ const WatWriter = struct {
         try self.append("(ref ");
         if (form == 0x63) try self.append("null ");
         try self.writeHeapType(bytes, pos);
+        try self.appendByte(')');
+    }
+
+    /// Write one value type from a typed-select vector, including direct s33
+    /// type indices and the general `(ref null? heaptype)` encodings.
+    fn writeSelectValueType(self: *WatWriter, bytes: []const u8, pos: *usize) WriteError!void {
+        if (pos.* >= bytes.len) return error.TruncatedBody;
+        const byte = bytes[pos.*];
+        if (byte == 0x63 or byte == 0x64) {
+            pos.* += 1;
+            try self.append("(ref ");
+            if (byte == 0x63) try self.append("null ");
+            const r = leb128.readS33Leb128(bytes[pos.*..]) catch |err| return switch (err) {
+                error.UnexpectedEnd => error.TruncatedBody,
+                error.Overflow => error.UnsupportedOpcode,
+            };
+            pos.* += r.bytes_read;
+            if (r.value < 0) {
+                if (r.bytes_read != 1) return error.UnsupportedOpcode;
+                const heap = types.AbstractHeapType.fromCode(r.value) orelse
+                    return error.UnsupportedOpcode;
+                try self.append(heapTypeName(heap));
+            } else {
+                if (r.value > std.math.maxInt(u32)) return error.UnsupportedOpcode;
+                try self.writeU32(@intCast(r.value));
+            }
+            try self.appendByte(')');
+            return;
+        }
+
+        if (val_type_by_byte[byte]) |vt| {
+            if (!vt.isNumType() and !vt.isRefType()) return error.UnsupportedOpcode;
+            pos.* += 1;
+            try self.append(vt.name());
+            return;
+        }
+
+        const type_idx = try readTypeIndexS33(bytes, pos);
+        try self.append("(ref null ");
+        try self.writeU32(type_idx);
         try self.appendByte(')');
     }
 
@@ -1468,6 +1506,78 @@ test "an instruction that cannot be printed is reported, not skipped" {
     // A body that ends mid-immediate is truncated, not merely unknown: here
     // f32.const's four operand bytes run past the end of the body.
     try std.testing.expectError(error.TruncatedBody, printBody(alloc, &[_]u8{ 0x43, 0x00, 0x0b }));
+}
+
+test "typed select writer requires one complete value type" {
+    const invalid = [_]struct {
+        body: []const u8,
+        expected: WriteError,
+    }{
+        .{ .body = &.{ 0x1c, 0x00 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x02, 0x7f, 0x7e }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x80 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x81, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x80 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x68 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0xe8, 0x7f }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x10 }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x63 }, .expected = error.TruncatedBody },
+        .{ .body = &.{ 0x1c, 0x01, 0x63, 0xee, 0x7f }, .expected = error.UnsupportedOpcode },
+        .{ .body = &.{ 0x1c, 0x01, 0x63, 0x80, 0x80, 0x80, 0x80, 0x10 }, .expected = error.UnsupportedOpcode },
+    };
+    for (invalid) |case| {
+        var writer = WatWriter{ .allocator = std.testing.allocator, .buf = .empty };
+        defer writer.buf.deinit(std.testing.allocator);
+        try std.testing.expectError(case.expected, writer.writeBody(case.body));
+    }
+
+    const concrete = [_]struct {
+        body: []const u8,
+        canonical: []const u8,
+        printed: []const u8,
+    }{
+        .{
+            .body = &.{ 0x00, 0x1c, 0x01, 0x00, 0x1a, 0x0b },
+            .canonical = &.{ 0x00, 0x1c, 0x01, 0x63, 0x00, 0x1a, 0x0b },
+            .printed = "select (result (ref null 0))",
+        },
+        .{
+            .body = &.{ 0x00, 0x1c, 0x01, 0x80, 0x80, 0x80, 0x80, 0x00, 0x1a, 0x0b },
+            .canonical = &.{ 0x00, 0x1c, 0x01, 0x63, 0x00, 0x1a, 0x0b },
+            .printed = "select (result (ref null 0))",
+        },
+        .{
+            .body = &.{ 0x00, 0x1c, 0x01, 0x63, 0x80, 0x80, 0x00, 0x1a, 0x0b },
+            .canonical = &.{ 0x00, 0x1c, 0x01, 0x63, 0x00, 0x1a, 0x0b },
+            .printed = "select (result (ref null 0))",
+        },
+        .{
+            .body = &.{ 0x00, 0x1c, 0x01, 0x64, 0x00, 0x1a, 0x0b },
+            .canonical = &.{ 0x00, 0x1c, 0x01, 0x64, 0x00, 0x1a, 0x0b },
+            .printed = "select (result (ref 0))",
+        },
+    };
+    for (concrete) |case| {
+        const body_text = try printBody(std.testing.allocator, case.body);
+        defer std.testing.allocator.free(body_text);
+        try std.testing.expect(std.mem.indexOf(u8, body_text, case.printed) != null);
+
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "(module (type (func)) (func\n{s}))",
+            .{body_text},
+        );
+        defer std.testing.allocator.free(source);
+        var reparsed = try @import("Parser.zig").parseModule(std.testing.allocator, source);
+        defer reparsed.deinit();
+        try std.testing.expectEqualSlices(
+            u8,
+            case.canonical,
+            reparsed.funcs.items[0].code_bytes,
+        );
+    }
 }
 
 test "a function restates its signature alongside its type index" {

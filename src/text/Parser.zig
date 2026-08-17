@@ -2568,27 +2568,34 @@ const Parser = struct {
                     if (self.peek().kind == .kw_result) {
                         _ = self.advance(); // consume 'result'
                         code.append(self.allocator, 0x1c) catch return; // typed select
-                        var sel_types: [8]types.ValType = undefined;
+                        var encoded_types: std.ArrayListUnmanaged(u8) = .empty;
+                        defer encoded_types.deinit(self.allocator);
                         var count: u32 = 0;
                         while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
-                            const vt = self.parseValType() catch break;
-                            if (count < 8) sel_types[count] = vt;
-                            count += 1;
-                        }
-                        self.emitLeb128U32(code, count);
-                        for (0..count) |ci| {
-                            if (ci < 8) {
-                                const raw: u32 = @bitCast(@intFromEnum(sel_types[ci]));
-                                code.append(self.allocator, @truncate(raw)) catch {};
+                            const indexed = self.parseIndexedValType() catch {
+                                self.markMalformed(@src());
+                                break;
+                            };
+                            if (count == std.math.maxInt(u32)) {
+                                self.markMalformed(@src());
+                                break;
                             }
+                            count += 1;
+                            self.emitIndexedValType(&encoded_types, indexed);
                         }
+                        if (count != 1) self.markMalformed(@src());
+                        self.emitLeb128U32(code, count);
+                        code.appendSlice(self.allocator, encoded_types.items) catch {};
                         if (self.peek().kind == .r_paren) _ = self.advance();
-                        // Consume additional (result ...) annotations
+                        // A typed select has one result vector, not a series
+                        // of result annotations. Consume extras only to keep
+                        // parser recovery deterministic, and reject them.
                         while (self.peek().kind == .l_paren) {
                             const sp3 = self.lexer.pos;
                             const spk3 = self.peeked;
                             _ = self.advance();
                             if (self.peek().kind == .kw_result) {
+                                self.markMalformed(@src());
                                 _ = self.advance();
                                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) _ = self.advance();
                                 if (self.peek().kind == .r_paren) _ = self.advance();
@@ -3097,6 +3104,37 @@ const Parser = struct {
         var buf: [10]u8 = undefined;
         const n = leb128.writeS64Leb128(&buf, val);
         code.appendSlice(self.allocator, buf[0..n]) catch {};
+    }
+
+    /// Emit a value type used by an instruction immediate. Concrete and
+    /// non-null references use the general prefix + s33 heap-type encoding;
+    /// nullable abstract references retain their one-byte abbreviations.
+    fn emitIndexedValType(
+        self: *Parser,
+        code: *std.ArrayListUnmanaged(u8),
+        indexed: IndexedValType,
+    ) void {
+        const raw = @intFromEnum(indexed.val_type);
+        if (raw >= 0) {
+            code.append(self.allocator, @intCast(raw)) catch {};
+            return;
+        }
+
+        const ref_type = types.RefType.fromValTypeAndIndex(
+            indexed.val_type,
+            indexed.type_idx,
+        ) orelse {
+            self.markMalformed(@src());
+            return;
+        };
+        code.append(
+            self.allocator,
+            if (ref_type.nullable) binary_reader.ref_null_prefix else binary_reader.ref_prefix,
+        ) catch {};
+        switch (ref_type.heap) {
+            .abstract => |heap| self.emitLeb128S64(code, @intFromEnum(heap)),
+            .concrete => |idx| self.emitLeb128S64(code, @intCast(idx)),
+        }
     }
 
     const RefTestCastImmediate = struct {
