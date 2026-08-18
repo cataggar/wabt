@@ -138,11 +138,15 @@ pub fn immediateShape(prefix: u8, code: u32) ?Imm {
     };
 }
 
+/// An opcode without its payload immediates.
+pub const Opcode = struct { prefix: u8, code: u32 };
+
 /// An opcode and the shape of the immediates that follow it.
 pub const Decoded = struct { prefix: u8, code: u32, shape: Imm };
 
 /// Read the opcode at `pos`, advancing past it and its prefix.
-pub fn decode(bytes: []const u8, pos: *usize) Error!Decoded {
+pub fn decodeOpcode(bytes: []const u8, pos: *usize) Error!Opcode {
+    if (pos.* >= bytes.len) return error.TruncatedBody;
     const byte = bytes[pos.*];
     pos.* += 1;
 
@@ -153,13 +157,18 @@ pub fn decode(bytes: []const u8, pos: *usize) Error!Decoded {
         code = try readU32At(bytes, pos);
     }
 
-    return .{
-        .prefix = prefix,
-        .code = code,
-        .shape = immediateShape(prefix, code) orelse return error.UnsupportedOpcode,
-    };
+    return .{ .prefix = prefix, .code = code };
 }
 
+/// Read the opcode at `pos`, advancing past it and its prefix.
+pub fn decode(bytes: []const u8, pos: *usize) Error!Decoded {
+    const opcode = try decodeOpcode(bytes, pos);
+    return .{
+        .prefix = opcode.prefix,
+        .code = opcode.code,
+        .shape = immediateShape(opcode.prefix, opcode.code) orelse return error.UnsupportedOpcode,
+    };
+}
 
 fn readU32At(bytes: []const u8, pos: *usize) Error!u32 {
     const r = leb128.readU32Leb128(bytes[pos.*..]) catch return error.TruncatedBody;
@@ -191,6 +200,12 @@ fn readS33At(bytes: []const u8, pos: *usize) Error!i64 {
 fn skipBytes(n: usize, bytes: []const u8, pos: *usize) Error!void {
     if (pos.* + n > bytes.len) return error.TruncatedBody;
     pos.* += n;
+}
+
+fn skipReservedZero(bytes: []const u8, pos: *usize) Error!void {
+    if (pos.* >= bytes.len) return error.TruncatedBody;
+    if (bytes[pos.*] != 0) return error.UnsupportedOpcode;
+    pos.* += 1;
 }
 
 /// Step over a block signature: `0x40`, a reference type, a value type, or an
@@ -287,7 +302,8 @@ pub fn skipImmediates(shape: Imm, bytes: []const u8, pos: *usize) Error!void {
             try skipMemArg(bytes, pos);
             try skipBytes(1, bytes, pos);
         },
-        .lane, .reserved_byte => try skipBytes(1, bytes, pos),
+        .lane => try skipBytes(1, bytes, pos),
+        .reserved_byte => try skipReservedZero(bytes, pos),
         .shuffle, .v128 => try skipBytes(16, bytes, pos),
         .s32, .s64 => _ = try readS64At(bytes, pos),
         .f32 => try skipBytes(4, bytes, pos),

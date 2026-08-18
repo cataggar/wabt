@@ -620,6 +620,31 @@ const legacy_eh_opcodes = [_]u8{
     0x19, // catch_all
 };
 
+fn isLegacyEhOpcode(prefix: ?u8, code: u32) bool {
+    return prefix == null and code <= 0xff and
+        std.mem.indexOfScalar(u8, &legacy_eh_opcodes, @intCast(code)) != null;
+}
+
+/// Pack an instruction encoding the way `Opcode.Code` stores its declared
+/// fields. The representation is not injective for arbitrary sub-opcodes, so
+/// callers must verify the candidate round-trips before accepting it.
+fn opcodeDiscriminant(prefix: ?u8, code: u32) u32 {
+    return if (prefix) |p|
+        (if (code <= 0xff) (@as(u32, p) << 8) | code else (@as(u32, p) << 12) | code)
+    else
+        code;
+}
+
+/// Return the declared opcode for an instruction encoding, if any.
+fn declaredOpcode(prefix: ?u8, code: u32) ?Opcode.Code {
+    const tag: Opcode.Code = @enumFromInt(opcodeDiscriminant(prefix, code));
+    if (std.enums.tagName(Opcode.Code, tag) == null) return null;
+
+    const tag_prefix: ?u8 = if (tag.isPrefixed()) tag.getPrefix() else null;
+    if (tag_prefix != prefix or tag.getCode() != code) return null;
+    return tag;
+}
+
 /// Classify an opcode the instruction switch has no arm for.
 ///
 /// Returns `UnsupportedOpcode` when `Opcode.Code` declares the instruction —
@@ -640,21 +665,105 @@ fn classifyOpcode(prefix: ?u8, code: u32) Error {
     // error rather than being lumped in with the backlog. Checked before the
     // `Opcode.Code` lookup, which would answer `UnsupportedOpcode` for all
     // five and lose the distinction.
-    if (prefix == null and code <= 0xff and
-        std.mem.indexOfScalar(u8, &legacy_eh_opcodes, @intCast(code)) != null)
-    {
+    if (isLegacyEhOpcode(prefix, code)) {
         return error.LegacyExceptionsUnsupported;
     }
-    // Opcode.Code packs prefixed opcodes at variable width: 0xPPCC for
-    // sub-opcodes that fit in a byte, 0xPPCCC for the wider ones (relaxed
-    // SIMD starts at 0xfd100). Mirror Opcode.getPrefix/getCode exactly --
-    // a fixed <<8 would fold 0xfd 0x100 onto 0xfd00, i.e. v128.load.
-    const disc: u32 = if (prefix) |p|
-        (if (code <= 0xff) (@as(u32, p) << 8) | code else (@as(u32, p) << 12) | code)
-    else
-        code;
-    const tag: Opcode.Code = @enumFromInt(disc);
-    if (std.enums.tagName(Opcode.Code, tag) == null) return error.UnknownOpcode;
+    if (declaredOpcode(prefix, code) == null) return error.UnknownOpcode;
+    return error.UnsupportedOpcode;
+}
+
+/// Recover the validator's precise malformed-immediate error when the shared
+/// shape scanner reports that an immediate is invalid rather than truncated.
+fn diagnoseMalformedImmediate(
+    m: *const Mod.Module,
+    shape: instr.Imm,
+    bytes: []const u8,
+    payload_pos: usize,
+    scratch: std.mem.Allocator,
+) Error!void {
+    var pos = payload_pos;
+    switch (shape) {
+        .block_type => _ = try readBlockType(m, bytes, &pos, scratch),
+        .heap_type => {
+            _ = readHeapStackType(m, bytes, &pos, true) orelse
+                return error.InvalidTypeIndex;
+        },
+        .ref_type, .ref_null_type => _ = try readHeapStackTypeImmediate(
+            m,
+            bytes,
+            &pos,
+            shape == .ref_null_type,
+        ),
+        .cast_branch => {
+            if (pos >= bytes.len) return error.UnexpectedEnd;
+            const flags = bytes[pos];
+            pos += 1;
+            if (flags > 0x03) return error.InvalidCastFlags;
+            _ = try readU32Immediate(bytes, &pos);
+            _ = try readHeapStackTypeImmediate(m, bytes, &pos, (flags & 0x01) != 0);
+            _ = try readHeapStackTypeImmediate(m, bytes, &pos, (flags & 0x02) != 0);
+        },
+        .select_types => {
+            const count = try readU32Immediate(bytes, &pos);
+            if (count != 1) return error.TypeMismatch;
+            _ = try readTypedSelectType(m, bytes, &pos);
+        },
+        .try_table => {
+            _ = try readBlockType(m, bytes, &pos, scratch);
+            const count = try readU32Immediate(bytes, &pos);
+            for (0..count) |_| {
+                if (pos >= bytes.len) return error.UnexpectedEnd;
+                const kind = bytes[pos];
+                pos += 1;
+                if (kind > 0x03) return error.InvalidCatchKind;
+                if (kind == 0x00 or kind == 0x01)
+                    _ = try readU32Immediate(bytes, &pos);
+                _ = try readU32Immediate(bytes, &pos);
+            }
+        },
+        .reserved_byte => {
+            if (pos >= bytes.len) return error.UnexpectedEnd;
+            if (bytes[pos] != 0) return error.InvalidMemoryIndex;
+        },
+        else => {},
+    }
+    return error.UnsupportedOpcode;
+}
+
+/// Classify and gate one body instruction without advancing the real body
+/// cursor. Disabled instructions are scanned through their complete immediate
+/// shape first so truncation and malformed-immediate errors retain precedence.
+fn checkBodyOpcodeEnabled(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    instruction_pos: usize,
+    features: Feature.Set,
+    scratch: std.mem.Allocator,
+) Error!void {
+    var probe = instruction_pos;
+    const decoded = instr.decodeOpcode(bytes, &probe) catch return error.UnexpectedEnd;
+    const prefix: ?u8 = if (decoded.prefix == 0) null else decoded.prefix;
+
+    if (isLegacyEhOpcode(prefix, decoded.code))
+        return error.LegacyExceptionsUnsupported;
+
+    const code = declaredOpcode(prefix, decoded.code) orelse
+        return error.UnknownOpcode;
+    if (code.isEnabled(features)) return;
+
+    const shape = instr.immediateShape(decoded.prefix, decoded.code) orelse
+        return error.UnsupportedOpcode;
+    const payload_pos = probe;
+    instr.skipImmediates(shape, bytes, &probe) catch |err| switch (err) {
+        error.TruncatedBody => return error.UnexpectedEnd,
+        error.UnsupportedOpcode => return diagnoseMalformedImmediate(
+            m,
+            shape,
+            bytes,
+            payload_pos,
+            scratch,
+        ),
+    };
     return error.UnsupportedOpcode;
 }
 
@@ -1382,6 +1491,13 @@ fn checkOneBody(
     const bytes = func.code_bytes;
 
     while (pos < bytes.len) {
+        try checkBodyOpcodeEnabled(
+            m,
+            bytes,
+            pos,
+            features,
+            block_types.allocator(),
+        );
         const opcode = bytes[pos];
         pos += 1;
 
@@ -1650,7 +1766,6 @@ fn checkOneBody(
                 // declared result is numeric. The immediate is a value-type
                 // vector, not a vector of u32s, and the current core spec
                 // requires that vector to contain exactly one type.
-                if (!features.reference_types) return error.UnsupportedOpcode;
                 const count = try readU32Immediate(bytes, &pos);
                 if (count != 1) return error.TypeMismatch;
                 const declared = try readTypedSelectType(m, bytes, &pos);
@@ -2029,7 +2144,6 @@ fn checkOneBody(
                         try popExpect(m, &val_stack, &ctrl_stack, StackType.known(it)); // dst
                     },
                     0x13, 0x14 => { // i64.add128, i64.sub128
-                        if (!features.wide_arithmetic) return error.UnsupportedOpcode;
                         try checkWideArithmetic(
                             m,
                             &val_stack,
@@ -2039,7 +2153,6 @@ fn checkOneBody(
                         );
                     },
                     0x15, 0x16 => { // i64.mul_wide_s, i64.mul_wide_u
-                        if (!features.wide_arithmetic) return error.UnsupportedOpcode;
                         try checkWideArithmetic(
                             m,
                             &val_stack,
@@ -2064,7 +2177,6 @@ fn checkOneBody(
                 try checkSimd(m, bytes, &pos, &val_stack, &ctrl_stack, simd_sig, gpa(m));
             },
             0xfb => {
-                if (!features.gc) return error.UnsupportedOpcode;
                 const sub = try readU32Immediate(bytes, &pos);
                 switch (sub) {
                     0x00, 0x01 => {
@@ -3936,6 +4048,61 @@ fn testModuleWithSignatureAndBody(
     return module;
 }
 
+fn writeMinimalImmediate(buf: *[64]u8, pos: *usize, shape: instr.Imm) void {
+    const zero_count: ?usize = switch (shape) {
+        .shuffle, .v128 => 16,
+        .f32 => 4,
+        .f64 => 8,
+        else => null,
+    };
+    if (zero_count) |count| {
+        @memset(buf[pos.*..][0..count], 0);
+        pos.* += count;
+        return;
+    }
+    const bytes: []const u8 = switch (shape) {
+        .none => &.{},
+        .block_type => &.{0x40},
+        .index => &.{0x00},
+        .index_pair, .index_pair_swapped, .call_indirect => &.{ 0x00, 0x00 },
+        .br_table => &.{ 0x00, 0x00 },
+        .mem_arg => &.{ 0x00, 0x00 },
+        .mem_arg_lane => &.{ 0x00, 0x00, 0x00 },
+        .lane, .reserved_byte => &.{0x00},
+        .shuffle, .v128 => unreachable,
+        .s32, .s64 => &.{0x00},
+        .f32, .f64 => unreachable,
+        .heap_type, .ref_type, .ref_null_type => &.{0x70},
+        .cast_branch => &.{ 0x00, 0x00, 0x70, 0x70 },
+        .select_types => &.{ 0x01, 0x7f },
+        .try_table => &.{ 0x40, 0x00 },
+    };
+    @memcpy(buf[pos.*..][0..bytes.len], bytes);
+    pos.* += bytes.len;
+}
+
+fn minimalBodyForOpcode(code: Opcode.Code, is_unreachable: bool, buf: *[64]u8) ![]const u8 {
+    var pos: usize = 0;
+    if (is_unreachable) {
+        buf[pos] = 0x00;
+        pos += 1;
+    }
+    var opcode_bytes: [6]u8 = undefined;
+    const opcode_len = code.getBytes(&opcode_bytes);
+    @memcpy(buf[pos..][0..opcode_len], opcode_bytes[0..opcode_len]);
+    pos += opcode_len;
+    const shape = instr.immediateShape(code.getPrefix(), code.getCode()) orelse {
+        const prefix: ?u8 = if (code.isPrefixed()) code.getPrefix() else null;
+        if (!isLegacyEhOpcode(prefix, code.getCode()))
+            return error.TestUnexpectedResult;
+        buf[pos] = 0x0b;
+        return buf[0 .. pos + 1];
+    };
+    writeMinimalImmediate(buf, &pos, shape);
+    buf[pos] = 0x0b;
+    return buf[0 .. pos + 1];
+}
+
 fn appendFuncTypeForTest(
     module: *Mod.Module,
     params: []const types.ValType,
@@ -5410,6 +5577,14 @@ test "meaningless opcodes are distinguished from unimplemented ones" {
 test "classifyOpcode separates declared opcodes from undeclared encodings" {
     // Code is a non-exhaustive enum, so this must test for a declared field
     // rather than a successful @enumFromInt.
+    try std.testing.expectEqual(Opcode.Code.return_call, declaredOpcode(null, 0x12).?);
+    try std.testing.expect(declaredOpcode(@as(?u8, 0), 0x12) == null);
+    try std.testing.expectEqual(Opcode.Code.v128_const, declaredOpcode(Opcode.prefix_simd, 0x0c).?);
+    try std.testing.expectEqual(
+        Opcode.Code.i8x16_relaxed_swizzle,
+        declaredOpcode(Opcode.prefix_simd, 0x100).?,
+    );
+    try std.testing.expect(declaredOpcode(Opcode.prefix_simd, 0x1fe) == null);
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(null, 0x12)); // return_call
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(null, 0x27)); // unassigned
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_simd, 0x0c)); // v128.const
@@ -5421,6 +5596,190 @@ test "classifyOpcode separates declared opcodes from undeclared encodings" {
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_simd, 0x1fe));
     try std.testing.expectEqual(error.UnsupportedOpcode, classifyOpcode(Opcode.prefix_gc, 0x18));
     try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(Opcode.prefix_gc, 0x1f));
+}
+
+test "large prefixed subopcodes cannot alias declared opcode discriminants" {
+    const alloc = std.testing.allocator;
+    const no_features = std.mem.zeroes(Feature.Set);
+    const cases = [_]struct {
+        prefix: u8,
+        code: u32,
+        body: []const u8,
+    }{
+        .{ .prefix = 0xfc, .code = 0x1000, .body = &.{ 0xfc, 0x80, 0x20, 0x0b } },
+        // Variable-width OR packing maps this exact encoding to 0xfd100,
+        // i8x16.relaxed_swizzle, unless the candidate is round-tripped.
+        .{ .prefix = 0xfc, .code = 0x1100, .body = &.{ 0xfc, 0x80, 0x22, 0x0b } },
+        .{ .prefix = 0xfd, .code = 0x1000, .body = &.{ 0xfd, 0x80, 0x20, 0x0b } },
+        .{ .prefix = 0xfe, .code = 0x1000, .body = &.{ 0xfe, 0x80, 0x20, 0x0b } },
+        .{ .prefix = 0xfb, .code = 0x1000, .body = &.{ 0xfb, 0x80, 0x20, 0x0b } },
+    };
+
+    for (cases) |case| {
+        try std.testing.expect(declaredOpcode(case.prefix, case.code) == null);
+        try std.testing.expectEqual(error.UnknownOpcode, classifyOpcode(case.prefix, case.code));
+
+        var module = try testModuleWithBody(alloc, case.body);
+        defer module.deinit();
+        try std.testing.expectError(error.UnknownOpcode, validate(&module, .{}));
+        try std.testing.expectError(
+            error.UnknownOpcode,
+            validate(&module, .{ .features = no_features }),
+        );
+    }
+}
+
+test "every declared non-MVP body opcode is gated in reachable and unreachable code" {
+    const alloc = std.testing.allocator;
+    const no_features = std.mem.zeroes(Feature.Set);
+    const opcode_values = comptime blk: {
+        const fields = @typeInfo(Opcode.Code).@"enum".fields;
+        var values: [fields.len]u32 = undefined;
+        for (fields, 0..) |field, i| values[i] = field.value;
+        break :blk values;
+    };
+    var checked: usize = 0;
+    var relaxed_checked: usize = 0;
+
+    for (opcode_values) |value| {
+        const code: Opcode.Code = @enumFromInt(value);
+        if (code.isEnabled(no_features)) continue;
+        checked += 1;
+        if (code.getPrefix() == Opcode.prefix_simd and code.getCode() > 0xff)
+            relaxed_checked += 1;
+
+        for ([_]bool{ false, true }) |is_unreachable| {
+            var storage: [64]u8 = undefined;
+            const body = try minimalBodyForOpcode(code, is_unreachable, &storage);
+            var module = try testModuleWithBody(alloc, body);
+            defer module.deinit();
+            const prefix: ?u8 = if (code.isPrefixed()) code.getPrefix() else null;
+            if (isLegacyEhOpcode(prefix, code.getCode())) {
+                try std.testing.expectError(
+                    error.LegacyExceptionsUnsupported,
+                    validate(&module, .{ .features = no_features }),
+                );
+            } else {
+                try std.testing.expectError(
+                    error.UnsupportedOpcode,
+                    validate(&module, .{ .features = no_features }),
+                );
+            }
+        }
+    }
+
+    try std.testing.expectEqual(@as(usize, 403), checked);
+    try std.testing.expectEqual(@as(usize, 20), relaxed_checked);
+}
+
+test "body feature gates preserve classification and immediate precedence" {
+    const alloc = std.testing.allocator;
+
+    const truncated_cases = [_]struct {
+        body: []const u8,
+        features: Feature.Set,
+    }{
+        .{ .body = &.{0x12}, .features = .{ .tail_call = false } },
+        .{
+            .body = &.{ 0xfd, 0x0c, 0, 0, 0, 0, 0, 0 },
+            .features = .{ .simd = false },
+        },
+        .{ .body = &.{0xfb}, .features = .{ .gc = false } },
+    };
+    for (truncated_cases) |case| {
+        var module = try testModuleWithBody(alloc, case.body);
+        defer module.deinit();
+        try std.testing.expectError(
+            error.UnexpectedEnd,
+            validate(&module, .{ .features = case.features }),
+        );
+    }
+
+    const unknown_cases = [_]struct {
+        body: []const u8,
+        features: Feature.Set,
+    }{
+        .{
+            .body = &.{ 0xfc, 0x12, 0x0b },
+            .features = .{ .wide_arithmetic = false },
+        },
+        .{
+            .body = &.{ 0xfd, 0xfe, 0x03, 0x0b },
+            .features = .{ .relaxed_simd = false },
+        },
+    };
+    for (unknown_cases) |case| {
+        var module = try testModuleWithBody(alloc, case.body);
+        defer module.deinit();
+        try std.testing.expectError(
+            error.UnknownOpcode,
+            validate(&module, .{ .features = case.features }),
+        );
+    }
+
+    for (legacy_eh_opcodes) |opcode| {
+        const body = [_]u8{ opcode, 0x0b };
+        var module = try testModuleWithBody(alloc, &body);
+        defer module.deinit();
+        try std.testing.expectError(
+            error.LegacyExceptionsUnsupported,
+            validate(&module, .{ .features = .{ .exceptions = false } }),
+        );
+    }
+
+    const bad_select = [_]u8{ 0x1c, 0x00, 0x0b };
+    var select_module = try testModuleWithBody(alloc, &bad_select);
+    defer select_module.deinit();
+    try std.testing.expectError(
+        error.TypeMismatch,
+        validate(&select_module, .{ .features = .{ .reference_types = false } }),
+    );
+
+    const bad_catch_kind = [_]u8{ 0x1f, 0x40, 0x01, 0x04, 0x0b };
+    var catch_module = try testModuleWithBody(alloc, &bad_catch_kind);
+    defer catch_module.deinit();
+    try std.testing.expectError(
+        error.InvalidCatchKind,
+        validate(&catch_module, .{ .features = .{ .exceptions = false } }),
+    );
+
+    const bad_cast_flags = [_]u8{ 0xfb, 0x18, 0x04, 0x0b };
+    var cast_module = try testModuleWithBody(alloc, &bad_cast_flags);
+    defer cast_module.deinit();
+    try std.testing.expectError(
+        error.InvalidCastFlags,
+        validate(&cast_module, .{ .features = .{ .gc = false } }),
+    );
+
+    const bad_lane = [_]u8{ 0x00, 0xfd, 0x15, 0x10, 0x0b };
+    var lane_module = try testModuleWithBody(alloc, &bad_lane);
+    defer lane_module.deinit();
+    try std.testing.expectError(
+        error.InvalidLaneIndex,
+        validate(&lane_module, .{ .features = .{ .simd = true } }),
+    );
+
+    const bad_gc_type = [_]u8{ 0xfb, 0x16, 0x7f, 0x0b };
+    var gc_module = try testModuleWithBody(alloc, &bad_gc_type);
+    defer gc_module.deinit();
+    try std.testing.expectError(
+        error.InvalidTypeIndex,
+        validate(&gc_module, .{ .features = .{ .gc = true } }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validate(&gc_module, .{ .features = .{ .gc = false } }),
+    );
+
+    const bad_tail_index = [_]u8{ 0x12, 0x01, 0x0b };
+    var tail_module = try testModuleWithBody(alloc, &bad_tail_index);
+    defer tail_module.deinit();
+    try std.testing.expectError(error.InvalidFuncIndex, validate(&tail_module, .{}));
+
+    const enabled = [_]u8{ 0x41, 0x00, 0xc0, 0x1a, 0x0b };
+    var enabled_module = try testModuleWithBody(alloc, &enabled);
+    defer enabled_module.deinit();
+    try validate(&enabled_module, .{ .features = .{ .sign_extension = true } });
 }
 
 test "every declared single-byte opcode is handled or explicitly unsupported" {
@@ -5926,7 +6285,11 @@ test "relaxed SIMD opcodes above 0xff are type-checked" {
     const body = three ++ three ++ three ++ [_]u8{ 0xfd, 0x85, 0x02, 0x1a, 0x0b };
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
-    try validate(&module, .{});
+    try validate(&module, .{ .features = .{ .relaxed_simd = true } });
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validate(&module, .{ .features = .{ .relaxed_simd = false } }),
+    );
 }
 
 // ── Tail calls (issue #347) ─────────────────────────────────────────────
@@ -6210,17 +6573,57 @@ test "memory.atomic.wait and notify signatures" {
     }
 }
 
-test "atomic.fence takes a reserved zero byte and no operands" {
+test "atomic.fence validates its reserved zero byte before feature gating" {
     const alloc = std.testing.allocator;
+    const enabled = Feature.Set{ .threads = true };
+    const disabled = Feature.Set{ .threads = false };
+
     const ok = [_]u8{ 0xfe, 0x03, 0x00, 0x0b };
     var m_ok = try testModuleWithBody(alloc, &ok);
     defer m_ok.deinit();
-    try validate(&m_ok, .{});
+    try validate(&m_ok, .{ .features = enabled });
+    try std.testing.expectError(
+        error.UnsupportedOpcode,
+        validate(&m_ok, .{ .features = disabled }),
+    );
 
     const bad = [_]u8{ 0xfe, 0x03, 0x01, 0x0b };
     var m_bad = try testModuleWithBody(alloc, &bad);
     defer m_bad.deinit();
-    try std.testing.expectError(error.InvalidMemoryIndex, validate(&m_bad, .{}));
+    try std.testing.expectError(
+        error.InvalidMemoryIndex,
+        validate(&m_bad, .{ .features = enabled }),
+    );
+    try std.testing.expectError(
+        error.InvalidMemoryIndex,
+        validate(&m_bad, .{ .features = disabled }),
+    );
+
+    const truncated = [_]u8{ 0xfe, 0x03 };
+    var m_truncated = try testModuleWithBody(alloc, &truncated);
+    defer m_truncated.deinit();
+    try std.testing.expectError(
+        error.UnexpectedEnd,
+        validate(&m_truncated, .{ .features = enabled }),
+    );
+    try std.testing.expectError(
+        error.UnexpectedEnd,
+        validate(&m_truncated, .{ .features = disabled }),
+    );
+
+    // The immediate is one raw byte, not a u32 LEB. This overlong encoding
+    // of zero therefore has a non-zero reserved byte and must be rejected.
+    const overlong = [_]u8{ 0xfe, 0x03, 0x80, 0x00, 0x0b };
+    var m_overlong = try testModuleWithBody(alloc, &overlong);
+    defer m_overlong.deinit();
+    try std.testing.expectError(
+        error.InvalidMemoryIndex,
+        validate(&m_overlong, .{ .features = enabled }),
+    );
+    try std.testing.expectError(
+        error.InvalidMemoryIndex,
+        validate(&m_overlong, .{ .features = disabled }),
+    );
 }
 
 test "atomics require a memory to be declared" {
