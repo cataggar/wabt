@@ -516,7 +516,8 @@ const WatWriter = struct {
                 }
             },
             .reserved_byte => {
-                _ = try readByteAt(bytes, pos);
+                if (try readByteAt(bytes, pos) != 0)
+                    return error.UnsupportedOpcode;
             },
         }
     }
