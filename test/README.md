@@ -46,9 +46,9 @@ wabt-produced binaries with wasm-tools, checks GC-disabled rejection, and
 compares canonical wasm-tools prints across wabt's print/reparse round-trip.
 It downloads nothing, is not part of `zig build test`, exits nonzero on any
 mismatch, and removes materialized files after a successful run unless
-`--keep-work` is passed. Since the wabt CLI has no feature-selection option,
-its GC-disabled check remains in the embedded Zig suite; the external runner
-checks the wasm-tools `-gc` verdict.
+`--keep-work` is passed. The script predates the shared CLI `--features`
+selector, so its GC-disabled check remains in the embedded Zig suite; the
+external runner checks the wasm-tools `-gc` verdict.
 
 ## Wide arithmetic differential matrix
 

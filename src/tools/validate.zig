@@ -1,5 +1,6 @@
 const std = @import("std");
 const wabt = @import("wabt");
+const feature_options = @import("features.zig");
 
 pub const usage =
     \\Usage: wabt module validate [options] <file.wasm>
@@ -9,10 +10,13 @@ pub const usage =
     \\(preamble \0asm 0d 00 01 00) are accepted.
     \\
     \\Options:
+    \\  --features <selectors>
+    \\                       Apply comma-separated feature, -feature, all,
+    \\                       or -all selectors from left to right
     \\  --enable-custom-page-sizes
-    \\                       Enable 1-byte and explicit 64-KiB memory pages
+    \\                       Alias for --features custom-page-sizes
     \\  --enable-wide-arithmetic
-    \\                       Enable i64.add128/sub128/mul_wide_{s,u}
+    \\                       Alias for --features wide-arithmetic
     \\
 ;
 
@@ -67,7 +71,22 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
     var i: usize = 0;
     while (i < sub_args.len) : (i += 1) {
         const arg = sub_args[i];
-        if (std.mem.eql(u8, arg, "--enable-custom-page-sizes")) {
+        if (std.mem.eql(u8, arg, "--features")) {
+            i += 1;
+            if (i >= sub_args.len) {
+                std.debug.print("error: --features requires an argument\n", .{});
+                std.process.exit(1);
+            }
+            if (feature_options.apply(&validator_options.features, sub_args[i])) |failure| {
+                feature_options.reportFailure(failure);
+                std.process.exit(1);
+            }
+        } else if (std.mem.startsWith(u8, arg, "--features=")) {
+            if (feature_options.apply(&validator_options.features, arg["--features=".len..])) |failure| {
+                feature_options.reportFailure(failure);
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, arg, "--enable-custom-page-sizes")) {
             validator_options.features.custom_page_sizes = true;
         } else if (std.mem.eql(u8, arg, "--enable-wide-arithmetic")) {
             validator_options.features.wide_arithmetic = true;

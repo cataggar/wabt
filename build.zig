@@ -323,6 +323,7 @@ pub fn build(b: *std.Build) void {
             nested_help.addArgs(&.{ "help", c[0], c[1] });
             nested_help.expectExitCode(0);
             nested_help.expectStdOutMatch(c[2]);
+            nested_help.expectStdOutMatch("--features <selectors>");
             nested_help.expectStdOutMatch("--enable-wide-arithmetic");
             test_step.dependOn(&nested_help.step);
 
@@ -337,8 +338,95 @@ pub fn build(b: *std.Build) void {
         subject_local_nested_help.addArgs(&.{ "text", "help", "parse" });
         subject_local_nested_help.expectExitCode(0);
         subject_local_nested_help.expectStdOutMatch("Usage: wabt text parse [options] <file.wat>");
+        subject_local_nested_help.expectStdOutMatch("--features <selectors>");
         subject_local_nested_help.expectStdOutMatch("--enable-wide-arithmetic");
         test_step.dependOn(&subject_local_nested_help.step);
+
+        const cli_feature_fixtures = b.addWriteFiles();
+        const wide_wat = cli_feature_fixtures.add(
+            "wide-feature.wat",
+            "(module (func (param i64 i64) (result i64 i64) local.get 0 local.get 1 i64.mul_wide_u))\n",
+        );
+        const custom_page_wat = cli_feature_fixtures.add(
+            "custom-page-feature.wat",
+            "(module (memory 0 (pagesize 1)))\n",
+        );
+
+        const parse_wide_alias = b.addRunArtifact(wabt_exe);
+        parse_wide_alias.addArgs(&.{ "text", "parse", "--enable-wide-arithmetic" });
+        parse_wide_alias.addFileArg(wide_wat);
+        parse_wide_alias.addArg("-o");
+        const wide_wasm = parse_wide_alias.addOutputFileArg("wide-feature.wasm");
+        parse_wide_alias.expectExitCode(0);
+        test_step.dependOn(&parse_wide_alias.step);
+
+        const parse_wide_alias_after_selector = b.addRunArtifact(wabt_exe);
+        parse_wide_alias_after_selector.addArgs(&.{
+            "text", "parse", "--features=-all,multi-value", "--enable-wide-arithmetic",
+        });
+        parse_wide_alias_after_selector.addFileArg(wide_wat);
+        parse_wide_alias_after_selector.addArg("-o");
+        _ = parse_wide_alias_after_selector.addOutputFileArg("wide-alias-after-selector.wasm");
+        parse_wide_alias_after_selector.expectExitCode(0);
+        test_step.dependOn(&parse_wide_alias_after_selector.step);
+
+        const parse_wide_selector_after_alias = b.addRunArtifact(wabt_exe);
+        parse_wide_selector_after_alias.addArgs(&.{
+            "text", "parse", "--enable-wide-arithmetic", "--features=-wide-arithmetic",
+        });
+        parse_wide_selector_after_alias.addFileArg(wide_wat);
+        parse_wide_selector_after_alias.addArgs(&.{ "-o", "wide-selector-after-alias.wasm" });
+        parse_wide_selector_after_alias.expectExitCode(1);
+        parse_wide_selector_after_alias.expectStdErrMatch("error.UnsupportedOpcode");
+        test_step.dependOn(&parse_wide_selector_after_alias.step);
+
+        const parse_custom_page_alias = b.addRunArtifact(wabt_exe);
+        parse_custom_page_alias.addArgs(&.{ "text", "parse", "--enable-custom-page-sizes" });
+        parse_custom_page_alias.addFileArg(custom_page_wat);
+        parse_custom_page_alias.addArg("-o");
+        const custom_page_wasm = parse_custom_page_alias.addOutputFileArg("custom-page-feature.wasm");
+        parse_custom_page_alias.expectExitCode(0);
+        test_step.dependOn(&parse_custom_page_alias.step);
+
+        const parse_custom_page_selector_after_alias = b.addRunArtifact(wabt_exe);
+        parse_custom_page_selector_after_alias.addArgs(&.{
+            "text", "parse", "--enable-custom-page-sizes", "--features=-custom-page-sizes",
+        });
+        parse_custom_page_selector_after_alias.addFileArg(custom_page_wat);
+        parse_custom_page_selector_after_alias.addArgs(&.{ "-o", "custom-page-selector-after-alias.wasm" });
+        parse_custom_page_selector_after_alias.expectExitCode(1);
+        parse_custom_page_selector_after_alias.expectStdErrMatch("error.InvalidLimits");
+        test_step.dependOn(&parse_custom_page_selector_after_alias.step);
+
+        const validate_wide_alias = b.addRunArtifact(wabt_exe);
+        validate_wide_alias.addArgs(&.{ "module", "validate", "--enable-wide-arithmetic" });
+        validate_wide_alias.addFileArg(wide_wasm);
+        validate_wide_alias.expectExitCode(0);
+        test_step.dependOn(&validate_wide_alias.step);
+
+        const validate_wide_selector_after_alias = b.addRunArtifact(wabt_exe);
+        validate_wide_selector_after_alias.addArgs(&.{
+            "module", "validate", "--enable-wide-arithmetic", "--features=-wide-arithmetic",
+        });
+        validate_wide_selector_after_alias.addFileArg(wide_wasm);
+        validate_wide_selector_after_alias.expectExitCode(1);
+        validate_wide_selector_after_alias.expectStdErrMatch("error.UnsupportedOpcode");
+        test_step.dependOn(&validate_wide_selector_after_alias.step);
+
+        const validate_custom_page_alias = b.addRunArtifact(wabt_exe);
+        validate_custom_page_alias.addArgs(&.{ "module", "validate", "--enable-custom-page-sizes" });
+        validate_custom_page_alias.addFileArg(custom_page_wasm);
+        validate_custom_page_alias.expectExitCode(0);
+        test_step.dependOn(&validate_custom_page_alias.step);
+
+        const validate_custom_page_selector_after_alias = b.addRunArtifact(wabt_exe);
+        validate_custom_page_selector_after_alias.addArgs(&.{
+            "module", "validate", "--enable-custom-page-sizes", "--features=-custom-page-sizes",
+        });
+        validate_custom_page_selector_after_alias.addFileArg(custom_page_wasm);
+        validate_custom_page_selector_after_alias.expectExitCode(1);
+        validate_custom_page_selector_after_alias.expectStdErrMatch("error.InvalidLimits");
+        test_step.dependOn(&validate_custom_page_selector_after_alias.step);
 
         const wabt_no_subcmd = b.addRunArtifact(wabt_exe);
         wabt_no_subcmd.expectExitCode(1);
