@@ -4214,7 +4214,9 @@ const Parser = struct {
         self.skipAnnotations();
         var table_init_bytes: []const u8 = &.{};
         var owns_table_init_bytes = false;
+        var has_table_init = false;
         if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
+            has_table_init = true;
             var init_code: std.ArrayListUnmanaged(u8) = .empty;
             defer init_code.deinit(self.allocator);
             self.parseInitExpr(&init_code);
@@ -4228,6 +4230,7 @@ const Parser = struct {
             self.allocator.free(table_init_bytes);
         try module.tables.append(self.allocator, .{
             .@"type" = .{ .elem_type = elem_type, .limits = limits },
+            .has_init_expr = has_table_init,
             .init_expr_bytes = table_init_bytes,
             .owns_init_expr_bytes = owns_table_init_bytes,
             .type_idx = table_type_idx,

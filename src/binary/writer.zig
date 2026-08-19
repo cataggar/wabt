@@ -366,7 +366,7 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(defined));
         for (module.tables.items[module.num_table_imports..]) |table| {
             const et = table.type.elem_type;
-            if (table.init_expr_bytes.len > 0) {
+            if (table.hasInitExpr()) {
                 // Table with init expression: 0x40 0x00 reftype limits expr
                 try self.appendByte(0x40);
                 try self.appendByte(0x00);

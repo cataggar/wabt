@@ -245,6 +245,10 @@ pub const Global = struct {
 pub const Table = struct {
     name: ?[]const u8 = null,
     @"type": types.TableType = .{},
+    /// Whether the table declaration contains an initializer. This cannot be
+    /// inferred from the body: an explicitly encoded end-only expression has
+    /// an empty body after the binary reader strips its terminator.
+    has_init_expr: bool = false,
     /// Raw bytecode for the init expression (constant expr).
     /// Points into the original wasm bytes (binary path) or an owned buffer (text path).
     init_expr_bytes: []const u8 = &.{},
@@ -254,6 +258,12 @@ pub const Table = struct {
     loc: Location = .{},
     is_import: bool = false,
     is_table64: bool = false,
+
+    /// Non-empty bodies built by older programmatic callers necessarily
+    /// denote an initializer too. The explicit bit covers the empty case.
+    pub fn hasInitExpr(self: Table) bool {
+        return self.has_init_expr or self.init_expr_bytes.len > 0;
+    }
 };
 
 /// A defined or imported memory.
