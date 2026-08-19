@@ -79,6 +79,7 @@ pub fn validate(module: *const Mod.Module, options: Options) Error!void {
     try checkStart(module);
     try checkElemSegments(module, options);
     try checkDataSegments(module, options);
+    try checkDeclarationFeatures(module, options.features);
     try checkFunctionBodies(module, options.features);
 }
 
@@ -90,22 +91,34 @@ fn checkTypes(m: *const Mod.Module) Error!void {
             .func_type => |ft| {
                 for (ft.params, 0..) |p, i| {
                     if (!p.isNumType() and !p.isRefType()) return error.InvalidTypeIndex;
-                    if (!checkConcreteTypeIndex(m, p, typeIndexAt(ft.param_type_idxs, i))) return error.InvalidTypeIndex;
+                    if (!checkConcreteTypeIndexFrom(
+                        m,
+                        @intCast(idx),
+                        p,
+                        typeIndexAt(ft.param_type_idxs, i),
+                    )) return error.InvalidTypeIndex;
                 }
                 for (ft.results, 0..) |r, i| {
                     if (!r.isNumType() and !r.isRefType()) return error.InvalidTypeIndex;
-                    if (!checkConcreteTypeIndex(m, r, typeIndexAt(ft.result_type_idxs, i))) return error.InvalidTypeIndex;
+                    if (!checkConcreteTypeIndexFrom(
+                        m,
+                        @intCast(idx),
+                        r,
+                        typeIndexAt(ft.result_type_idxs, i),
+                    )) return error.InvalidTypeIndex;
                 }
             },
             // Fields and array elements are *storage* types, so the packed
             // types are admissible here and nowhere else.
             .struct_type => |st| for (st.fields.items) |f| {
                 if (!isStorageType(f.@"type")) return error.InvalidTypeIndex;
-                if (!checkConcreteTypeIndex(m, f.@"type", f.type_idx)) return error.InvalidTypeIndex;
+                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), f.@"type", f.type_idx))
+                    return error.InvalidTypeIndex;
             },
             .array_type => |at| {
                 if (!isStorageType(at.field.@"type")) return error.InvalidTypeIndex;
-                if (!checkConcreteTypeIndex(m, at.field.@"type", at.field.type_idx)) return error.InvalidTypeIndex;
+                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), at.field.@"type", at.field.type_idx))
+                    return error.InvalidTypeIndex;
             },
         }
         if (idx < m.type_meta.items.len and m.type_meta.items[idx].kind != typeEntryKind(entry))
@@ -114,8 +127,10 @@ fn checkTypes(m: *const Mod.Module) Error!void {
     // Validate GC subtype declarations
     for (m.type_meta.items, 0..) |meta, idx| {
         if (meta.parent != std.math.maxInt(u32)) {
-            // Has a parent — validate subtyping
-            if (meta.parent >= m.type_meta.items.len) return error.InvalidTypeIndex;
+            // Supertypes must already have been declared. This also rejects
+            // self references and out-of-range indices before inspecting the
+            // purported parent's shape.
+            if (@as(usize, meta.parent) >= idx) return error.InvalidTypeIndex;
             const parent_meta = m.type_meta.items[meta.parent];
             // Parent must be non-final (declared with 'sub' and not 'final')
             if (parent_meta.is_final) return error.TypeMismatch;
@@ -144,6 +159,12 @@ fn checkFunctions(m: *const Mod.Module) Error!void {
             if (func.decl.type_var.index >= m.module_types.items.len)
                 return error.InvalidTypeIndex;
         }
+        for (func.local_types.items, 0..) |local, i| {
+            if (!local.isNumType() and !local.isRefType())
+                return error.InvalidTypeIndex;
+            if (!checkConcreteTypeIndex(m, local, typeIndexAt(func.local_type_idxs.items, i)))
+                return error.InvalidTypeIndex;
+        }
     }
 }
 
@@ -163,8 +184,12 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
         if (table.type.limits.usesCustomPageSize())
             return error.InvalidLimits;
         try checkLimits(table.type.limits, std.math.maxInt(u32));
+        if (table.type.limits.is_64 and !options.features.memory64)
+            return error.UnsupportedOpcode;
         const elem = StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx);
-        if (table.init_expr_bytes.len > 0) {
+        if (table.hasInitExpr()) {
+            if (!options.features.function_references)
+                return error.UnsupportedOpcode;
             // A table's initializer is a constant expression like any other,
             // so it is type-checked like any other rather than by inspecting
             // its first byte. The table section precedes the global section,
@@ -226,6 +251,14 @@ fn checkTags(m: *const Mod.Module) Error!void {
                 else => return error.InvalidTypeIndex,
             }
         }
+        if (tag.type_idx == std.math.maxInt(u32)) {
+            for (tag.type.sig.params, 0..) |param, i| {
+                if (!param.isNumType() and !param.isRefType())
+                    return error.InvalidTypeIndex;
+                if (!checkConcreteTypeIndex(m, param, typeIndexAt(tag.type.sig.param_type_idxs, i)))
+                    return error.InvalidTypeIndex;
+            }
+        }
     }
 }
 
@@ -272,6 +305,7 @@ fn checkStart(m: *const Mod.Module) Error!void {
 
 fn checkElemSegments(m: *const Mod.Module, options: Options) Error!void {
     for (m.elem_segments.items) |seg| {
+        if (!seg.elem_type.isRefType()) return error.InvalidElemType;
         // Validate elem type index references a valid type
         if (seg.elem_type_idx != 0xFFFFFFFF and seg.elem_type_idx >= m.module_types.items.len)
             return error.InvalidTypeIndex;
@@ -362,6 +396,121 @@ fn checkDataSegments(m: *const Mod.Module, options: Options) Error!void {
     }
 }
 
+fn checkDeclarationFeatures(m: *const Mod.Module, features: Feature.Set) Error!void {
+    if (m.empty_rec_group_positions.items.len > 0 and !features.gc)
+        return error.UnsupportedOpcode;
+
+    for (m.module_types.items, 0..) |entry, idx| {
+        if (idx < m.type_meta.items.len) {
+            const meta = m.type_meta.items[idx];
+            if ((meta.in_rec_group or meta.is_sub or !meta.is_final or
+                meta.parent != std.math.maxInt(u32)) and !features.gc)
+                return error.UnsupportedOpcode;
+        }
+        switch (entry) {
+            .func_type => |ft| {
+                try checkDeclaredTypeSeqFeatures(m, @intCast(idx), funcParams(ft), features);
+                try checkDeclaredTypeSeqFeatures(m, @intCast(idx), funcResults(ft), features);
+                if (ft.results.len > 1 and !features.multi_value)
+                    return error.UnsupportedOpcode;
+            },
+            .struct_type => |st| {
+                if (!features.gc) return error.UnsupportedOpcode;
+                for (st.fields.items) |field| {
+                    if (!field.type.isPackedType())
+                        try requireValueTypeEnabled(
+                            m,
+                            StackType.fromValTypeAndIndex(field.type, field.type_idx),
+                            features,
+                        );
+                }
+            },
+            .array_type => |at| {
+                if (!features.gc) return error.UnsupportedOpcode;
+                if (!at.field.type.isPackedType())
+                    try requireValueTypeEnabled(
+                        m,
+                        StackType.fromValTypeAndIndex(at.field.type, at.field.type_idx),
+                        features,
+                    );
+            },
+        }
+    }
+
+    for (m.funcs.items) |func| {
+        for (func.local_types.items, 0..) |local, i| {
+            try requireValueTypeEnabled(
+                m,
+                StackType.fromValTypeAndIndex(local, typeIndexAt(func.local_type_idxs.items, i)),
+                features,
+            );
+        }
+    }
+
+    for (m.tables.items) |table| {
+        // The MVP table element type is the abbreviated nullable funcref.
+        // Every other table reference type follows the ordinary value-type
+        // proposal matrix.
+        if (table.type.elem_type != .funcref) {
+            try requireValueTypeEnabled(
+                m,
+                StackType.fromValTypeAndIndex(table.type.elem_type, table.type_idx),
+                features,
+            );
+        }
+    }
+
+    for (m.globals.items) |global| {
+        try requireValueTypeEnabled(
+            m,
+            StackType.fromValTypeAndIndex(global.type.val_type, global.type_idx),
+            features,
+        );
+        // Mutable globals defined inside a module are MVP. The proposal
+        // controls mutable globals crossing the import/export boundary.
+        if (global.is_import and global.type.mutability == .mutable and
+            !features.mutable_globals)
+            return error.UnsupportedOpcode;
+    }
+
+    for (m.tags.items) |tag| {
+        if (!features.exceptions) return error.UnsupportedOpcode;
+        if (tag.type_idx == std.math.maxInt(u32)) {
+            try checkTypeSeqFeatures(m, .{
+                .vts = tag.type.sig.params,
+                .type_idxs = tag.type.sig.param_type_idxs,
+            }, features);
+        }
+    }
+
+    if (!features.mutable_globals) {
+        for (m.exports.items) |exp| {
+            if (exp.kind == .global and
+                m.globals.items[exp.var_.index].type.mutability == .mutable)
+                return error.UnsupportedOpcode;
+        }
+    }
+
+    for (m.elem_segments.items) |seg| {
+        if (seg.kind != .active and !features.bulk_memory)
+            return error.UnsupportedOpcode;
+        // Function-index segments are the MVP form. Expression segments
+        // encode an actual reference type, including when it is `funcref`.
+        if (seg.uses_elem_exprs) {
+            try requireValueTypeEnabled(
+                m,
+                StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx),
+                features,
+            );
+        }
+    }
+
+    for (m.data_segments.items) |seg| {
+        if (seg.kind == .passive and !features.bulk_memory)
+            return error.UnsupportedOpcode;
+    }
+}
+
 fn checkLimits(limits: types.Limits, absolute_max: u64) Error!void {
     if (limits.is_shared and !limits.has_max)
         return error.InvalidLimits;
@@ -404,23 +553,28 @@ fn checkConstExpr(
     defer stack.deinit(gpa(m));
 
     while (pos < bytes.len) {
+        const instruction_pos = pos;
         const opcode = bytes[pos];
         pos += 1;
 
         switch (opcode) {
             0x41 => { // i32.const
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
                 _ = readS32(bytes, &pos);
                 try push(m, &stack, StackType.known(.i32));
             },
             0x42 => { // i64.const
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
                 _ = readS64(bytes, &pos);
                 try push(m, &stack, StackType.known(.i64));
             },
             0x43 => { // f32.const
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
                 pos += 4;
                 try push(m, &stack, StackType.known(.f32));
             },
             0x44 => { // f64.const
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
                 pos += 8;
                 try push(m, &stack, StackType.known(.f64));
             },
@@ -435,12 +589,17 @@ fn checkConstExpr(
                 try push(m, &stack, StackType.known(vt));
             },
             0xd0 => { // ref.null
-                const t = readHeapStackType(m, bytes, &pos, true) orelse return error.InvalidTypeIndex;
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
+                const t = try readHeapStackTypeImmediate(m, bytes, &pos, true);
+                if (!valueTypeEnabled(m, t, features))
+                    return error.ConstantExprRequired;
                 try push(m, &stack, t);
             },
             0xd2 => { // ref.func
-                const idx = readU32(bytes, &pos);
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
+                const idx = try readU32Immediate(bytes, &pos);
                 if (idx >= m.funcs.items.len) return error.InvalidFuncIndex;
+                if (!features.reference_types) return error.ConstantExprRequired;
                 const type_idx = m.funcs.items[idx].decl.type_var.index;
                 try push(m, &stack, if (type_idx != types.invalid_index and type_idx < m.module_types.items.len)
                     StackType.fromRefType(types.RefType.concrete(false, type_idx))
@@ -448,7 +607,8 @@ fn checkConstExpr(
                     StackType.known(.ref_func));
             },
             0x23 => { // global.get
-                const idx = readU32(bytes, &pos);
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
+                const idx = try readU32Immediate(bytes, &pos);
                 // In a global init only globals before this one are in scope;
                 // elsewhere any global is.
                 const limit = global_limit orelse m.globals.items.len;
@@ -468,32 +628,40 @@ fn checkConstExpr(
                 ));
             },
             0xfd => { // SIMD prefix; v128.const is the only constant form
-                const sub = readU32(bytes, &pos);
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
+                const sub = try readU32Immediate(bytes, &pos);
                 if (sub != 0x0c) return error.ConstantExprRequired;
                 pos += 16;
-                if (pos > bytes.len) return error.UnexpectedEnd;
+                if (!features.simd) return error.ConstantExprRequired;
                 try push(m, &stack, StackType.known(.v128));
             },
             0xfb => {
-                if (!features.gc) return error.ConstantExprRequired;
+                try checkConstImmediateWellFormed(m, bytes, instruction_pos);
                 const sub = try readU32Immediate(bytes, &pos);
                 if (sub == 0x00 or sub == 0x01) {
                     const type_idx = try readU32Immediate(bytes, &pos);
+                    _ = try structTypeAt(m, type_idx);
+                    if (!features.gc) return error.ConstantExprRequired;
                     try checkConstStructNew(m, &stack, type_idx, sub == 0x01);
                     continue;
                 }
                 if (sub == 0x06 or sub == 0x07) {
                     const type_idx = try readU32Immediate(bytes, &pos);
+                    _ = try arrayTypeAt(m, type_idx);
+                    if (!features.gc) return error.ConstantExprRequired;
                     try checkConstArrayNew(m, &stack, type_idx, sub == 0x07);
                     continue;
                 }
                 if (sub == 0x08) {
                     const type_idx = try readU32Immediate(bytes, &pos);
                     const count = try readU32Immediate(bytes, &pos);
+                    _ = try arrayTypeAt(m, type_idx);
+                    if (!features.gc) return error.ConstantExprRequired;
                     try checkConstArrayNewFixed(m, &stack, type_idx, count);
                     continue;
                 }
                 if (sub == 0x1c) {
+                    if (!features.gc) return error.ConstantExprRequired;
                     try popExpecting(m, &stack, .i32);
                     try push(m, &stack, StackType.known(.ref_i31));
                     continue;
@@ -503,6 +671,7 @@ fn checkConstExpr(
                     0x1b => .{ .any, .extern_ },
                     else => return error.ConstantExprRequired,
                 };
+                if (!features.gc) return error.ConstantExprRequired;
                 const actual = stack.pop() orelse return error.TypeMismatch;
                 try push(m, &stack, try gcConvertedRef(m, actual, heaps[0], heaps[1]));
             },
@@ -517,6 +686,33 @@ fn checkConstExpr(
     // Must leave exactly one value, which must suit the slot it initialises.
     if (stack.items.len != 1) return error.TypeMismatch;
     if (!stack.items[0].isSubtypeOf(m, expected)) return error.TypeMismatch;
+}
+
+/// Scan a constant-capable instruction's complete immediate before proposal
+/// gating. This matches body validation: truncation and malformed type
+/// encodings are properties of the module, not consequences of a disabled
+/// feature.
+fn checkConstImmediateWellFormed(
+    m: *const Mod.Module,
+    bytes: []const u8,
+    instruction_pos: usize,
+) Error!void {
+    var probe = instruction_pos;
+    const decoded = instr.decodeOpcode(bytes, &probe) catch return error.UnexpectedEnd;
+    const prefix: ?u8 = if (decoded.prefix == 0) null else decoded.prefix;
+    if (declaredOpcode(prefix, decoded.code) == null) return;
+    const shape = instr.immediateShape(decoded.prefix, decoded.code) orelse return;
+    const payload_pos = probe;
+    instr.skipImmediates(shape, bytes, &probe) catch |err| switch (err) {
+        error.TruncatedBody => return error.UnexpectedEnd,
+        error.UnsupportedOpcode => return diagnoseMalformedImmediate(
+            m,
+            shape,
+            bytes,
+            payload_pos,
+            gpa(m),
+        ),
+    };
 }
 
 fn push(m: *const Mod.Module, stack: *std.ArrayListUnmanaged(StackType), t: StackType) Error!void {
@@ -1224,6 +1420,33 @@ fn checkConcreteTypeIndex(m: *const Mod.Module, vt: types.ValType, type_idx: u32
     return type_idx != types.invalid_index and type_idx < m.module_types.items.len;
 }
 
+/// Concrete references in a type may point into their own recursion group or
+/// to an earlier group, but not forward into a later group. A standalone type
+/// is an implicit singleton recursion group even though `in_rec_group` is
+/// false.
+fn checkConcreteTypeIndexFrom(
+    m: *const Mod.Module,
+    source_type_idx: u32,
+    vt: types.ValType,
+    target_type_idx: u32,
+) bool {
+    if (!checkConcreteTypeIndex(m, vt, target_type_idx)) return false;
+    if (vt != .concrete_ref and vt != .concrete_ref_null) return true;
+    if (source_type_idx >= m.module_types.items.len) return false;
+
+    const group_end = if (source_type_idx < m.type_meta.items.len) blk: {
+        const meta = m.type_meta.items[source_type_idx];
+        if (meta.rec_group != types.invalid_index and
+            meta.rec_group <= source_type_idx and
+            @as(u64, meta.rec_group) + meta.rec_group_size <= m.module_types.items.len)
+        {
+            break :blk meta.rec_group + meta.rec_group_size;
+        }
+        break :blk source_type_idx + 1;
+    } else source_type_idx + 1;
+    return target_type_idx < group_end;
+}
+
 fn typeEntryKind(entry: Mod.TypeEntry) Mod.TypeMeta.Kind {
     return switch (entry) {
         .func_type => .func,
@@ -1508,6 +1731,7 @@ fn checkOneBody(
             0x01 => {}, // nop
             0x02 => { // block
                 const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
+                try checkBlockTypeFeatures(m, bt, features);
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x02, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
@@ -1516,6 +1740,7 @@ fn checkOneBody(
             },
             0x03 => { // loop
                 const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
+                try checkBlockTypeFeatures(m, bt, features);
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
                 pushCtrl(&ctrl_stack, &val_stack, 0x03, bt.params, bt.results, gpa(m)) catch return error.OutOfMemory;
@@ -1524,6 +1749,7 @@ fn checkOneBody(
             },
             0x04 => { // if
                 const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
+                try checkBlockTypeFeatures(m, bt, features);
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.known(.i32));
                 if (bt.params.len() > 0)
                     try popVals(m, &val_stack, &ctrl_stack.items[ctrl_stack.items.len - 1], bt.params);
@@ -1709,6 +1935,7 @@ fn checkOneBody(
             },
             0x1f => { // try_table
                 const bt = try readBlockType(m, bytes, &pos, block_types.allocator());
+                try checkBlockTypeFeatures(m, bt, features);
                 const clause_count = readU32(bytes, &pos);
                 // The catch clauses are checked against the *enclosing*
                 // label stack. `try_table`'s own frame is not pushed until
@@ -2404,6 +2631,9 @@ fn gpa(m: *const Mod.Module) std.mem.Allocator {
 const BlockType = struct {
     params: TypeSeq,
     results: TypeSeq,
+    /// True when the binary blocktype was an s33 type index rather than an
+    /// inline empty or single-result form.
+    uses_type_index: bool = false,
 };
 
 /// Read a block signature: `blocktype ::= 0x40 | valtype | s33 typeidx`.
@@ -2465,7 +2695,11 @@ fn readBlockType(
     const idx: u32 = @intCast(result.value);
     if (idx >= m.module_types.items.len) return error.InvalidTypeIndex;
     return switch (m.module_types.items[idx]) {
-        .func_type => |ft| .{ .params = funcParams(ft), .results = funcResults(ft) },
+        .func_type => |ft| .{
+            .params = funcParams(ft),
+            .results = funcResults(ft),
+            .uses_type_index = true,
+        },
         // A block signature names a function type; a struct or array type
         // in that position is not a signature at all.
         else => error.TypeMismatch,
@@ -2664,6 +2898,70 @@ fn valueTypeEnabled(
             .struct_, .array => features.gc,
         },
     };
+}
+
+fn requireValueTypeEnabled(
+    m: *const Mod.Module,
+    value_type: StackType,
+    features: Feature.Set,
+) Error!void {
+    if (!valueTypeEnabled(m, value_type, features))
+        return error.UnsupportedOpcode;
+}
+
+fn checkTypeSeqFeatures(
+    m: *const Mod.Module,
+    seq: TypeSeq,
+    features: Feature.Set,
+) Error!void {
+    for (seq.vts, 0..) |_, i|
+        try requireValueTypeEnabled(m, seq.at(i), features);
+}
+
+fn sameRecGroup(m: *const Mod.Module, a: u32, b: u32) bool {
+    if (a >= m.module_types.items.len or b >= m.module_types.items.len)
+        return false;
+    if (a < m.type_meta.items.len and b < m.type_meta.items.len) {
+        const am = m.type_meta.items[a];
+        const bm = m.type_meta.items[b];
+        if (am.rec_group != types.invalid_index and
+            bm.rec_group != types.invalid_index)
+            return am.rec_group == bm.rec_group;
+    }
+    return a == b;
+}
+
+fn checkDeclaredTypeSeqFeatures(
+    m: *const Mod.Module,
+    source_type_idx: u32,
+    seq: TypeSeq,
+    features: Feature.Set,
+) Error!void {
+    for (seq.vts, 0..) |_, i| {
+        const value_type = seq.at(i);
+        if (value_type.asRefType()) |ref_type| {
+            switch (ref_type.heap) {
+                .concrete => |target_type_idx| {
+                    if (sameRecGroup(m, source_type_idx, target_type_idx) and
+                        !features.gc)
+                        return error.UnsupportedOpcode;
+                },
+                .abstract => {},
+            }
+        }
+        try requireValueTypeEnabled(m, value_type, features);
+    }
+}
+
+fn checkBlockTypeFeatures(
+    m: *const Mod.Module,
+    block_type: BlockType,
+    features: Feature.Set,
+) Error!void {
+    try checkTypeSeqFeatures(m, block_type.params, features);
+    try checkTypeSeqFeatures(m, block_type.results, features);
+    if (block_type.uses_type_index and !features.multi_value)
+        return error.UnsupportedOpcode;
 }
 
 fn pushCtrl(ctrl_stack: *std.ArrayListUnmanaged(CtrlFrame), val_stack: *ValStack, opcode: u8, start: TypeSeq, end: TypeSeq, alloc: std.mem.Allocator) !void {
@@ -3717,6 +4015,43 @@ test "validate invalid type index in func" {
     var module = Mod.Module.init(std.testing.allocator);
     defer module.deinit();
     try module.funcs.append(std.testing.allocator, .{ .decl = .{ .type_var = .{ .index = 99 } } });
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+}
+
+test "programmatic subtype parents must precede their children" {
+    const allocator = std.testing.allocator;
+    var module = Mod.Module.init(allocator);
+    defer module.deinit();
+    try module.module_types.append(allocator, .{ .func_type = .{} });
+    try module.type_meta.append(allocator, .{
+        .is_sub = true,
+        .is_final = false,
+    });
+    try module.module_types.append(allocator, .{ .func_type = .{} });
+    try module.type_meta.append(allocator, .{
+        .is_sub = true,
+        .parent = 0,
+    });
+
+    // A previously declared parent is valid, including within one rec group.
+    try validate(&module, .{});
+    for (module.type_meta.items, 0..) |*meta, idx| {
+        meta.in_rec_group = true;
+        meta.rec_group = 0;
+        meta.rec_group_size = 2;
+        meta.rec_position = @intCast(idx);
+    }
+    try validate(&module, .{});
+
+    module.type_meta.items[1].parent = 1;
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+
+    module.type_meta.items[1].parent = 0;
+    module.type_meta.items[0].parent = 1;
+    // Index 1 is final, but the forward reference is reported first.
+    try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
+
+    module.type_meta.items[0].parent = 9;
     try std.testing.expectError(error.InvalidTypeIndex, validate(&module, .{}));
 }
 

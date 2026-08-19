@@ -796,7 +796,10 @@ const WatWriter = struct {
             // either way, but `ref.func 0` is not, and an element type with
             // no null is only legal because the initializer is there. It is
             // a constant expression like a global's, so it prints like one.
-            if (table.init_expr_bytes.len > 0) {
+            if (table.hasInitExpr()) {
+                // An end-only binary initializer has no text-format spelling.
+                // Refuse to erase its presence by printing it as no initializer.
+                if (table.init_expr_bytes.len == 0) return error.UnsupportedOpcode;
                 try self.appendByte(' ');
                 _ = try self.writeConstExprFlat(table.init_expr_bytes);
             }

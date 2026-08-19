@@ -679,28 +679,27 @@ const Reader = struct {
         for (0..count) |_| {
             const first_byte = try self.peekByte();
             if (first_byte == 0x40) {
-                // Extended table type: 0x40 flags reftype limits [initexpr]
+                // Extended table type: 0x40 0x00 reftype limits initexpr.
+                // The second byte is reserved; table64 is encoded by the
+                // limits' index-type bit, just as it is for ordinary tables.
                 _ = try self.readByte(); // consume 0x40
-                const table_flags = try self.readByte(); // 0x00 = no table64
-                const is_table64 = (table_flags & 0x01) != 0;
-                const has_init = true; // 0x40 prefix indicates init expr
+                if (try self.readByte() != 0) return error.InvalidType;
                 const indexed = try self.checkTypeIndex(try self.readRefType());
                 const elem_type = indexed.vt;
                 const limits = try self.readLimits(false);
                 var init_bytes: []const u8 = &.{};
-                if (has_init) {
-                    const expr_with_end = try self.readInitExprBytes();
-                    // Writer appends its own trailing 0x0b — match the
-                    // global init-expr convention and strip it here.
-                    init_bytes = if (expr_with_end.len > 0)
-                        expr_with_end[0 .. expr_with_end.len - 1]
-                    else
-                        expr_with_end;
-                }
+                const expr_with_end = try self.readInitExprBytes();
+                // Writer appends its own trailing 0x0b — match the global
+                // init-expr convention and strip it here.
+                init_bytes = if (expr_with_end.len > 0)
+                    expr_with_end[0 .. expr_with_end.len - 1]
+                else
+                    expr_with_end;
                 try self.module.tables.append(self.allocator, .{
                     .type = .{ .elem_type = elem_type, .limits = limits },
                     .type_idx = indexed.type_idx,
-                    .is_table64 = is_table64,
+                    .is_table64 = limits.is_64,
+                    .has_init_expr = true,
                     .init_expr_bytes = init_bytes,
                     .owns_init_expr_bytes = false,
                 });
@@ -774,6 +773,7 @@ const Reader = struct {
         const count = try self.readU32();
         for (0..count) |_| {
             const flags = try self.readU32();
+            if (flags > 7) return error.InvalidSection;
             var seg = Mod.ElemSegment{};
 
             const is_passive = (flags & 1) != 0;
@@ -812,7 +812,8 @@ const Reader = struct {
                     // Element segment type must be a reference type
                     if (!seg.elem_type.isRefType()) return error.InvalidType;
                 } else {
-                    _ = try self.readByte(); // external kind (0=func)
+                    if (try self.readByte() != 0)
+                        return error.InvalidSection; // external kind (0=func)
                 }
             }
 
@@ -884,6 +885,7 @@ const Reader = struct {
         const count = try self.readU32();
         for (0..count) |_| {
             const flags = try self.readU32();
+            if (flags > 2) return error.InvalidSection;
             var seg = Mod.DataSegment{};
 
             if (flags & 1 != 0) {
@@ -1819,4 +1821,127 @@ test "malformed type definitions are rejected" {
     // A field naming a type index past the end of the section.
     const bad_field_idx = header ++ [_]u8{ 0x01, 0x06, 0x01, 0x5f, 0x01, 0x63, 0x09, 0x00 };
     try std.testing.expectError(error.InvalidType, readModule(allocator, &bad_field_idx));
+}
+
+test "binary subtype parents must precede their children" {
+    const allocator = std.testing.allocator;
+    const Validator = @import("../Validator.zig");
+    const header = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+
+    const self_parent = header ++ [_]u8{
+        0x01, 0x07, 0x01,
+        0x50, 0x01, 0x00,
+        0x60, 0x00, 0x00,
+    };
+    var self_module = try readModule(allocator, &self_parent);
+    defer self_module.deinit();
+    try std.testing.expectError(
+        error.InvalidTypeIndex,
+        Validator.validate(&self_module, .{}),
+    );
+
+    // Type 0 points forward to the ordinary, final function type at index 1.
+    // Declaration order wins over the final-parent structural diagnostic.
+    const forward_parent = header ++ [_]u8{
+        0x01, 0x0a, 0x02,
+        0x50, 0x01, 0x01,
+        0x60, 0x00, 0x00,
+        0x60, 0x00, 0x00,
+    };
+    var forward_module = try readModule(allocator, &forward_parent);
+    defer forward_module.deinit();
+    try std.testing.expectError(
+        error.InvalidTypeIndex,
+        Validator.validate(&forward_module, .{}),
+    );
+
+    const out_of_range = header ++ [_]u8{
+        0x01, 0x07, 0x01,
+        0x50, 0x01, 0x09,
+        0x60, 0x00, 0x00,
+    };
+    try std.testing.expectError(
+        error.InvalidType,
+        readModule(allocator, &out_of_range),
+    );
+
+    const backward_parent = header ++ [_]u8{
+        0x01, 0x0c, 0x02,
+        0x50, 0x00, 0x60,
+        0x00, 0x00, 0x50,
+        0x01, 0x00, 0x60,
+        0x00, 0x00,
+    };
+    var backward_module = try readModule(allocator, &backward_parent);
+    defer backward_module.deinit();
+    try Validator.validate(&backward_module, .{});
+
+    // Earlier members of the same recursion group remain valid parents.
+    const recursive_backward = header ++ [_]u8{
+        0x01, 0x0e, 0x01, 0x4e, 0x02,
+        0x50, 0x00, 0x60, 0x00, 0x00,
+        0x50, 0x01, 0x00, 0x60, 0x00,
+        0x00,
+    };
+    var recursive_module = try readModule(allocator, &recursive_backward);
+    defer recursive_module.deinit();
+    try Validator.validate(&recursive_module, .{});
+}
+
+test "initialized table reserved byte is exactly zero" {
+    const allocator = std.testing.allocator;
+    const writer = @import("writer.zig");
+    const header = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
+
+    const table32 = header ++ [_]u8{
+        0x04, 0x09, 0x01,
+        0x40, 0x00, 0x70,
+        0x00, 0x01, 0xd0,
+        0x70, 0x0b,
+    };
+    var decoded32 = try readModule(allocator, &table32);
+    defer decoded32.deinit();
+    try std.testing.expect(!decoded32.tables.items[0].type.limits.is_64);
+    try std.testing.expect(!decoded32.tables.items[0].is_table64);
+
+    const nonzero_reserved = header ++ [_]u8{
+        0x04, 0x09, 0x01,
+        0x40, 0x01, 0x70,
+        0x00, 0x01, 0xd0,
+        0x70, 0x0b,
+    };
+    try std.testing.expectError(
+        error.InvalidType,
+        readModule(allocator, &nonzero_reserved),
+    );
+
+    const truncated_reserved = header ++ [_]u8{
+        0x04, 0x02, 0x01, 0x40,
+    };
+    try std.testing.expectError(
+        error.UnexpectedEof,
+        readModule(allocator, &truncated_reserved),
+    );
+
+    const table64 = header ++ [_]u8{
+        0x04, 0x09, 0x01,
+        0x40, 0x00, 0x70,
+        0x04, 0x01, 0xd0,
+        0x70, 0x0b,
+    };
+    var decoded64 = try readModule(allocator, &table64);
+    defer decoded64.deinit();
+    try std.testing.expect(decoded64.tables.items[0].type.limits.is_64);
+    try std.testing.expect(decoded64.tables.items[0].is_table64);
+
+    const roundtrip_cases = [_]*const Mod.Module{ &decoded32, &decoded64 };
+    const expected_limits = [_][]const u8{
+        &.{ 0x40, 0x00, 0x70, 0x00, 0x01 },
+        &.{ 0x40, 0x00, 0x70, 0x04, 0x01 },
+    };
+    for (roundtrip_cases, expected_limits) |module, expected| {
+        const encoded = try writer.writeModule(allocator, module);
+        defer allocator.free(encoded);
+        try std.testing.expect(std.mem.indexOf(u8, encoded, expected) != null);
+    }
 }
