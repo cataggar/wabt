@@ -118,9 +118,9 @@ function-references, GC, and exceptions against wasm-tools: nullable
 `func`/`extern` need only reference-types, their non-null forms need
 function-references, GC heap types (including `nofunc`/`noextern`) need GC,
 exception heap types need exceptions, and concrete function types need
-function-references or GC. The CLI does not currently expose switches to
-disable those default-on proposals, and proposal gating for instructions
-outside typed select remains outside this regression's scope.
+function-references or GC. The consolidated cross-feature corpus below uses
+the shared CLI `--features` selector to cover proposal gates outside typed
+select.
 
 ## Declaration feature-gate oracle
 
@@ -132,6 +132,26 @@ and binary expectations with wasm-tools 1.250.0 using:
 $ scripts/declaration_feature_gate_regression.py \
     /path/to/wasm-tools-1.250.0
 ```
+
+## Cross-feature differential corpus
+
+`src/fixtures/cross-feature-regression/corpus.json` freezes expected CLI exit
+statuses across function bodies, constant expressions, declarations, raw
+dependency combinations, malformed WAT, and malformed or truncated binaries.
+Run every case against wabt and wasm-tools 1.250.0 with:
+
+```console
+$ zig build
+$ scripts/cross_feature_regression.py \
+    zig-out/bin/wabt \
+    /path/to/wasm-tools-1.250.0
+```
+
+The runner checks WAT and binary verdicts under equivalent feature selectors,
+validates wabt-produced binaries with wasm-tools, downloads nothing, and
+removes its `zig-out/cross-feature-matrix` workspace after a successful run.
+The corpus records the one spelling translation needed by the pinned oracle:
+wabt's `mutable-globals` is wasm-tools' `mutable-global`.
 
 ## Legacy C++-era test corpus
 
