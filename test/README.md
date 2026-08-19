@@ -122,6 +122,17 @@ function-references or GC. The CLI does not currently expose switches to
 disable those default-on proposals, and proposal gating for instructions
 outside typed select remains outside this regression's scope.
 
+## Declaration feature-gate oracle
+
+`src/declaration_feature_gate_regression.zig` checks proposal gates across
+types, tables, globals, tags, blocks, and element segments. Compare its WAT
+and binary expectations with wasm-tools 1.250.0 using:
+
+```console
+$ scripts/declaration_feature_gate_regression.py \
+    /path/to/wasm-tools-1.250.0
+```
+
 ## Legacy C++-era test corpus
 
 The `parse/`, `regress/`, `spec-new/`, and `typecheck/` directories
