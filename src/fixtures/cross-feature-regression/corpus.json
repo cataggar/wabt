@@ -1,0 +1,213 @@
+{
+  "version": 1,
+  "wat_cases": [
+    {
+      "name": "body-tail-call",
+      "surface": "body",
+      "wat": "(module (func $callee) (func return_call $callee))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-tail-call", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "body-sign-extension",
+      "surface": "body",
+      "wat": "(module (func i32.const 0 i32.extend8_s drop))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-sign-extension", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "body-wide-arithmetic",
+      "surface": "body",
+      "wat": "(module (func (result i64 i64) unreachable i64.add128))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-wide-arithmetic", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "body-relaxed-simd",
+      "surface": "body",
+      "wat": "(module (func unreachable i8x16.relaxed_swizzle drop))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-relaxed-simd", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "constant-v128",
+      "surface": "constant",
+      "wat": "(module (global v128 (v128.const i32x4 0 0 0 0)))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-simd", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "constant-extended",
+      "surface": "constant",
+      "wat": "(module (global i32 (i32.add (i32.const 1) (i32.const 2))))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-extended-const", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "constant-gc",
+      "surface": "constant",
+      "wat": "(module (global i31ref (ref.i31 (i32.const 0))))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-gc", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "declaration-struct",
+      "surface": "declaration",
+      "wat": "(module (type (struct (field i32))))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-gc", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "declaration-tag",
+      "surface": "declaration",
+      "wat": "(module (tag))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-exceptions", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "declaration-multi-value",
+      "surface": "declaration",
+      "wat": "(module (type (func (result i32 i32))))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-multi-value", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "declaration-mutable-global",
+      "surface": "declaration",
+      "wat": "(module (import \"m\" \"g\" (global (mut i32))))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        {
+          "features": "all,-mutable-globals",
+          "wasm_tools_features": "all,-mutable-global",
+          "expected_exit": 1
+        }
+      ]
+    },
+    {
+      "name": "declaration-table64",
+      "surface": "declaration",
+      "wat": "(module (table i64 1 funcref))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-memory64", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "declaration-passive-data",
+      "surface": "declaration",
+      "wat": "(module (memory 1) (data \"x\"))",
+      "variants": [
+        { "features": "all", "expected_exit": 0 },
+        { "features": "all,-bulk-memory", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "dependency-function-reference",
+      "surface": "dependency",
+      "wat": "(module (func (result (ref func)) ref.null func ref.as_non_null))",
+      "variants": [
+        {
+          "features": "reference-types,function-references",
+          "expected_exit": 0
+        },
+        {
+          "features": "-reference-types,function-references",
+          "expected_exit": 1
+        },
+        { "features": "reference-types,-function-references", "expected_exit": 1 }
+      ]
+    },
+    {
+      "name": "dependency-gc-reference",
+      "surface": "dependency",
+      "wat": "(module (type $s (struct)) (global (ref null $s) (ref.null $s)))",
+      "variants": [
+        {
+          "features": "reference-types,function-references,gc",
+          "expected_exit": 0
+        },
+        {
+          "features": "reference-types,function-references,-gc",
+          "expected_exit": 1
+        },
+        {
+          "features": "-reference-types,function-references,gc",
+          "expected_exit": 1
+        }
+      ]
+    }
+  ],
+  "invalid_wat_cases": [
+    {
+      "name": "truncated-immediate",
+      "surface": "malformed",
+      "failure_kind": "truncated",
+      "features": "all",
+      "expected_exit": 1,
+      "wat": "(module (func i32.const))"
+    },
+    {
+      "name": "malformed-type-index",
+      "surface": "malformed",
+      "failure_kind": "malformed",
+      "features": "all",
+      "expected_exit": 1,
+      "wat": "(module (func (type 1)))"
+    }
+  ],
+  "binary_cases": [
+    {
+      "name": "truncated-prefixed-opcode",
+      "surface": "malformed",
+      "failure_kind": "truncated",
+      "features": "all",
+      "expected_exit": 1,
+      "hex": "0061736d010000000a04010200fc"
+    },
+    {
+      "name": "unknown-opcode",
+      "surface": "malformed",
+      "failure_kind": "malformed",
+      "features": "all",
+      "expected_exit": 1,
+      "hex": "0061736d010000000a05010300ff0b"
+    },
+    {
+      "name": "initialized-table-reserved-byte",
+      "surface": "malformed",
+      "failure_kind": "malformed",
+      "features": "all",
+      "expected_exit": 1,
+      "hex": "0061736d010000000409014001700001d0700b"
+    },
+    {
+      "name": "initialized-table-truncated",
+      "surface": "malformed",
+      "failure_kind": "truncated",
+      "features": "all",
+      "expected_exit": 1,
+      "hex": "0061736d0100000004020140"
+    }
+  ]
+}
