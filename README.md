@@ -63,4 +63,6 @@ $ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
 
 ## License
 
-[Apache 2.0](LICENSE)
+WABT is licensed under [Apache 2.0](LICENSE). See
+[Third-Party Notices](THIRD_PARTY_NOTICES.md) for licenses and provenance of
+adapted code.

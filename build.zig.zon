@@ -9,6 +9,9 @@
         "adapters",
         "src",
         "LICENSE",
+        "LICENSES",
         "README.md",
+        "SOURCE_PROVENANCE.md",
+        "THIRD_PARTY_NOTICES.md",
     },
 }

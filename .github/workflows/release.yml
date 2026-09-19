@@ -82,7 +82,9 @@ jobs:
             *)           EXT="" ;;
           esac
           cp "zig-out/bin/wabt${EXT}" "$PKGNAME/bin/"
-          cp LICENSE README.md "$PKGNAME/"
+          mkdir -p "$PKGNAME/LICENSES"
+          cp LICENSE README.md SOURCE_PROVENANCE.md THIRD_PARTY_NOTICES.md "$PKGNAME/"
+          cp LICENSES/miz-MIT.txt "$PKGNAME/LICENSES/"
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
 
       - name: Generate SBOM

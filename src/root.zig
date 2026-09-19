@@ -16,6 +16,7 @@ pub const Validator = @import("Validator.zig");
 pub const CWriter = @import("CWriter.zig");
 pub const Decompiler = @import("Decompiler.zig");
 pub const wast_runner = @import("wast_runner.zig");
+pub const oci = @import("oci.zig");
 
 pub const leb128 = @import("leb128.zig");
 
@@ -104,4 +105,5 @@ test {
     _ = @import("typed_select_regression.zig");
     _ = @import("feature_gate_regression.zig");
     _ = @import("declaration_feature_gate_regression.zig");
+    _ = @import("oci.zig");
 }
