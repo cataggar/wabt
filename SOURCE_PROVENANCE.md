@@ -18,9 +18,9 @@ The following paths identify the pinned sources and their WABT destinations:
 | `packages/miz/src/oci/layout.zig` | `src/oci/layout.zig`, `src/oci/integration_tests.zig` |
 | `packages/miz/src/oci/copy.zig` | `src/oci/copy.zig`, `src/oci/graph.zig`, `src/oci/integration_tests.zig` |
 
-The adaptation will not copy miz's `oci.zig` facade wholesale or its
+The adaptation does not copy miz's `oci.zig` facade wholesale or its
 authentication, registry, image, layer, filesystem, bundle, snapshot, repack,
-signing, disk-image, or QEMU integrations. WABT's implementation will use
+signing, disk-image, or QEMU integrations. WABT's implementation uses
 scheme-less explicit registry references, artifact-capable generic
 validation, one bounded graph planner, and explicit rejection of
 subject-bearing and unknown graph nodes.

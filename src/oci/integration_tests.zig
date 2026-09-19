@@ -4,6 +4,7 @@ const copy = @import("copy.zig");
 const layout = @import("layout.zig");
 const model = @import("model.zig");
 const reference = @import("reference.zig");
+const transport = @import("transport.zig");
 
 const ManifestOptions = struct {
     tag: ?[]const u8 = "source",
@@ -157,6 +158,7 @@ test "copy preserves exact direct manifest artifact and catalog extensions" {
         destination_path,
         .{
             .tag = "old",
+            .root_extension = ",\"x-old-root-extension\":{\"kept\":true}",
             .catalog_extension = ",\"x-top-level\":{\"kept\":true}",
         },
     );
@@ -189,6 +191,9 @@ test "copy preserves exact direct manifest artifact and catalog extensions" {
     defer std.testing.allocator.free(index);
     try std.testing.expect(std.mem.indexOf(u8, index, "\"x-top-level\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, index, "\"x-root-extension\"") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, index, "\"x-old-root-extension\"") != null,
+    );
 
     var destination = layout.Source.init(
         std.testing.io,
@@ -489,18 +494,160 @@ test "destination preflight and failures preserve atomic visibility" {
         try conflict_source.blobState(fixture.root),
     );
 
+    const points = [_]layout.FailurePoint{
+        .after_blob_temp_sync,
+        .before_index_publish,
+        .after_index_temp_sync,
+    };
+    for (points) |point| {
+        try std.testing.expectError(
+            error.InjectedFailure,
+            copy.layoutToLayout(
+                std.testing.io,
+                std.testing.allocator,
+                .{ .path = source_path, .selection = .{ .tag = "source" } },
+                .{ .path = failed_path, .selection = .{ .tag = "copy" } },
+                .{ .failure_point = point },
+            ),
+        );
+        try expectMissingLayout(std.testing.io, failed_path);
+        try expectNoStaging(std.testing.io, root, "failed");
+    }
+}
+
+test "destination commit revalidates exact root bytes" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testRoot(allocator, &tmp.sub_path);
+    const destination_path = try childPath(allocator, root, "destination");
+    _ = try makeManifestLayout(
+        std.testing.io,
+        allocator,
+        destination_path,
+        .{ .tag = "old" },
+    );
+    const before = try readFile(
+        std.testing.io,
+        std.testing.allocator,
+        destination_path,
+        "index.json",
+    );
+    defer std.testing.allocator.free(before);
+
+    const invalid_bytes = "{}";
+    const invalid_root = try testDescriptor(
+        allocator,
+        model.media_type_oci_manifest,
+        invalid_bytes,
+    );
+    const publication: transport.RootPublication = .{
+        .descriptor = invalid_root,
+        .descriptor_json = null,
+        .exact_bytes = invalid_bytes,
+    };
+    var destination = try layout.Destination.init(
+        std.testing.io,
+        std.testing.allocator,
+        destination_path,
+    );
+    defer destination.deinit();
+    try destination.prepareRoot(invalid_root, .{ .tag = "invalid" });
+    _ = try destination.stageRoot(publication);
     try std.testing.expectError(
-        error.InjectedFailure,
-        copy.layoutToLayout(
+        error.InvalidIndex,
+        destination.commitRoot(publication, .{ .tag = "invalid" }),
+    );
+
+    const after = try readFile(
+        std.testing.io,
+        std.testing.allocator,
+        destination_path,
+        "index.json",
+    );
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualSlices(u8, before, after);
+    try expectNoTemporaryFiles(std.testing.io, destination_path);
+}
+
+test "new destination installation never clobbers a racing path" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const root = try testRoot(allocator, &tmp.sub_path);
+    const source_path = try childPath(allocator, root, "source");
+    const destination_path = try childPath(allocator, root, "destination");
+    const fixture = try makeManifestLayout(
+        std.testing.io,
+        allocator,
+        source_path,
+        .{},
+    );
+    var source = layout.Source.init(
+        std.testing.io,
+        std.testing.allocator,
+        source_path,
+    );
+
+    {
+        var destination = try layout.Destination.init(
             std.testing.io,
             std.testing.allocator,
-            .{ .path = source_path, .selection = .{ .tag = "source" } },
-            .{ .path = failed_path, .selection = .{ .tag = "copy" } },
-            .{ .failure_point = .before_index_publish },
-        ),
-    );
-    try expectMissingLayout(std.testing.io, failed_path);
-    try expectNoStaging(std.testing.io, root, "failed");
+            destination_path,
+        );
+        defer destination.deinit();
+        const selection: reference.Selection = .{ .tag = "copy" };
+        try destination.prepareRoot(fixture.root, selection);
+        _ = try destination.ensureDescriptor(.{
+            .descriptor = fixture.config,
+            .roles = transport.DescriptorRoles.init(.config),
+            .data = .{ .opaque_blob = source.asTransport() },
+        });
+        _ = try destination.ensureDescriptor(.{
+            .descriptor = fixture.layer,
+            .roles = transport.DescriptorRoles.init(.layer),
+            .data = .{ .opaque_blob = source.asTransport() },
+        });
+        const publication: transport.RootPublication = .{
+            .descriptor = fixture.root,
+            .descriptor_json = null,
+            .exact_bytes = fixture.root_bytes,
+        };
+        _ = try destination.stageRoot(publication);
+        _ = try destination.commitRoot(publication, selection);
+
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, destination_path);
+        var refused = false;
+        destination.finish() catch |err| switch (err) {
+            error.PathAlreadyExists,
+            error.AccessDenied,
+            error.OperationUnsupported,
+            => refused = true,
+            else => return err,
+        };
+        try std.testing.expect(refused);
+
+        var final_dir = try std.Io.Dir.cwd().openDir(
+            std.testing.io,
+            destination_path,
+            .{},
+        );
+        defer final_dir.close(std.testing.io);
+        var installed = false;
+        if (final_dir.openFile(std.testing.io, "oci-layout", .{})) |file| {
+            file.close(std.testing.io);
+            installed = true;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        try std.testing.expect(!installed);
+    }
+    try expectNoStaging(std.testing.io, root, "destination");
 }
 
 test "existing layout keeps old catalog and cleans temporary files on failure" {
