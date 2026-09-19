@@ -37,6 +37,26 @@ const FakeRuntime = struct {
     }
 };
 
+const FileProbe = struct {
+    calls: usize = 0,
+
+    fn reader(self: *FileProbe) auth.FileReader {
+        return .{ .context = self, .read = read };
+    }
+
+    fn read(
+        context: ?*anyopaque,
+        _: Allocator,
+        _: std.Io,
+        _: []const u8,
+        _: usize,
+    ) auth.FileReadError![]u8 {
+        const self: *FileProbe = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        return error.FileNotFound;
+    }
+};
+
 const Step = struct {
     path_suffix: []const u8,
     class: registry_http.RequestClass,
@@ -437,6 +457,39 @@ test "production source initialization is explicit and loopback HTTP only" {
             },
         ),
     );
+
+    var runtime: FakeRuntime = .{};
+    const no_steps = [_]Step{};
+    var backend: ScriptedBackend = .{
+        .runtime = &runtime,
+        .steps = &no_steps,
+    };
+    var files: FileProbe = .{};
+    try std.testing.expectError(
+        error.InsecureTransport,
+        registry.Source.initWithBackend(
+            std.testing.io,
+            std.testing.allocator,
+            .{
+                .authority = "registry.example",
+                .repository = "repo",
+                .selection = null,
+            },
+            backend.backend(),
+            runtime.clock(),
+            runtime.sleeper(),
+            .{
+                .plain_http = true,
+                .credential_policy = .{ .auth_file = "must-not-read.json" },
+                .auth_context = .{
+                    .io = std.testing.io,
+                    .files = files.reader(),
+                },
+                .deadline = .after(runtime.clock(), 60 * std.time.ns_per_s),
+            },
+        ),
+    );
+    try std.testing.expectEqual(@as(usize, 0), files.calls);
 }
 
 test "production loopback backend negotiates manifests and streams verified blobs" {
@@ -616,6 +669,21 @@ test "resolve pins a moved tag once and all later reads use exact digest paths" 
         &root_value.digest_text,
     ));
 
+    try std.testing.expectError(
+        error.LimitExceeded,
+        source.inspectResolved(&resolved, .{
+            .limits = .{ .max_nodes = 0 },
+        }),
+    );
+    try std.testing.expectEqual(
+        registry.Category.limit,
+        source.lastDiagnostic().?.category,
+    );
+    try std.testing.expectEqual(
+        registry.Operation.inspect,
+        source.lastDiagnostic().?.operation,
+    );
+
     var inspected = try source.inspectResolved(&resolved, .{});
     defer inspected.deinit();
     try std.testing.expectEqual(@as(usize, 1), fake.index);
@@ -696,6 +764,34 @@ test "digest resolution verifies bytes and conflicting digest headers are never 
     defer resolved.deinit();
     try std.testing.expect(resolved.requested_tag == null);
 
+    const corrupt_manifest = try allocator.dupe(u8, manifest);
+    defer allocator.free(corrupt_manifest);
+    corrupt_manifest[corrupt_manifest.len - 1] = ' ';
+    const corrupt_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .registry,
+        .headers = good_headers.values,
+        .body = corrupt_manifest,
+    }};
+    var corrupt_runtime: FakeRuntime = .{};
+    var corrupt_fake: ScriptedBackend = .{
+        .runtime = &corrupt_runtime,
+        .steps = &corrupt_steps,
+    };
+    var corrupt_source = try initSource(
+        &corrupt_fake,
+        &corrupt_runtime,
+        .{ .digest = root_value.digest },
+        .none,
+        .{},
+    );
+    defer corrupt_source.deinit();
+    try std.testing.expectError(error.InvalidContent, corrupt_source.resolve(.{
+        .authority = "localhost:5000",
+        .repository = "repo",
+        .selection = .{ .digest = root_value.digest },
+    }));
+
     var bad_runtime: FakeRuntime = .{};
     const wrong_digest = content.digestBytes("wrong").format();
     const bad_headers = try headersFor(
@@ -725,6 +821,37 @@ test "digest resolution verifies bytes and conflicting digest headers are never 
     );
     defer bad_source.deinit();
     try std.testing.expectError(error.InvalidContent, bad_source.resolve(.{
+        .authority = "localhost:5000",
+        .repository = "repo",
+        .selection = .{ .digest = root_value.digest },
+    }));
+
+    const duplicate_headers = [_]registry_http.Header{
+        .{ .name = "Content-Length", .value = good_headers.length },
+        .{ .name = "Content-Type", .value = model.media_type_oci_manifest },
+        .{ .name = "Docker-Content-Digest", .value = &root_value.digest_text },
+        .{ .name = "Docker-Content-Digest", .value = &root_value.digest_text },
+    };
+    const duplicate_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .registry,
+        .headers = &duplicate_headers,
+        .body = manifest,
+    }};
+    var duplicate_runtime: FakeRuntime = .{};
+    var duplicate_fake: ScriptedBackend = .{
+        .runtime = &duplicate_runtime,
+        .steps = &duplicate_steps,
+    };
+    var duplicate_source = try initSource(
+        &duplicate_fake,
+        &duplicate_runtime,
+        .{ .digest = root_value.digest },
+        .none,
+        .{},
+    );
+    defer duplicate_source.deinit();
+    try std.testing.expectError(error.InvalidContent, duplicate_source.resolve(.{
         .authority = "localhost:5000",
         .repository = "repo",
         .selection = .{ .digest = root_value.digest },
@@ -762,6 +889,68 @@ test "metadata uses descriptor endpoints with exact length digest and media chec
     var metadata = try source.readMetadata(allocator, value.value(), bytes.len);
     defer metadata.deinit();
     try std.testing.expectEqualSlices(u8, bytes, metadata.bytes);
+
+    const no_length_headers = [_]registry_http.Header{
+        .{ .name = "Docker-Content-Digest", .value = &value.digest_text },
+    };
+    const no_length_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .blob,
+        .headers = &no_length_headers,
+        .body = bytes,
+    }};
+    var no_length_runtime: FakeRuntime = .{};
+    var no_length_fake: ScriptedBackend = .{
+        .runtime = &no_length_runtime,
+        .steps = &no_length_steps,
+    };
+    var no_length_source = try initSource(
+        &no_length_fake,
+        &no_length_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer no_length_source.deinit();
+    var no_length_metadata = try no_length_source.readMetadata(
+        allocator,
+        value.value(),
+        bytes.len,
+    );
+    defer no_length_metadata.deinit();
+    try std.testing.expectEqualSlices(u8, bytes, no_length_metadata.bytes);
+
+    const encoded_headers = [_]registry_http.Header{
+        .{ .name = "Content-Length", .value = good_headers.length },
+        .{ .name = "Content-Encoding", .value = "gzip" },
+    };
+    const encoded_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .blob,
+        .headers = &encoded_headers,
+        .body = bytes,
+    }};
+    var encoded_runtime: FakeRuntime = .{};
+    var encoded_fake: ScriptedBackend = .{
+        .runtime = &encoded_runtime,
+        .steps = &encoded_steps,
+    };
+    var encoded_source = try initSource(
+        &encoded_fake,
+        &encoded_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer encoded_source.deinit();
+    try std.testing.expectError(
+        error.InvalidContent,
+        encoded_source.readMetadata(allocator, value.value(), bytes.len),
+    );
+    try std.testing.expectEqual(
+        registry.Category.invalid_content,
+        encoded_source.lastDiagnostic().?.category,
+    );
 
     var bad_runtime: FakeRuntime = .{};
     const bad_length = "999";
@@ -936,6 +1125,47 @@ test "bearer token acquisition is scope exact cached and secret safe" {
         "Bearer scope-token",
         fake.authorization(4).?,
     );
+
+    const duplicate_token_headers = [_]registry_http.Header{
+        .{ .name = "Content-Length", .value = token_headers.length },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Content-Type", .value = "text/plain" },
+    };
+    const duplicate_token_steps = [_]Step{
+        .{
+            .path_suffix = "/v2/repo/manifests/latest",
+            .class = .registry,
+            .status = 401,
+            .headers = &challenge_headers,
+        },
+        .{
+            .path_suffix = "/token?service=registry.local&scope=repository%3Arepo%3Apull",
+            .class = .token,
+            .headers = &duplicate_token_headers,
+            .body = token_body,
+        },
+    };
+    var duplicate_token_runtime: FakeRuntime = .{};
+    var duplicate_token_fake: ScriptedBackend = .{
+        .runtime = &duplicate_token_runtime,
+        .steps = &duplicate_token_steps,
+    };
+    var duplicate_token_source = try initSource(
+        &duplicate_token_fake,
+        &duplicate_token_runtime,
+        .{ .tag = "latest" },
+        .none,
+        .{},
+    );
+    defer duplicate_token_source.deinit();
+    try std.testing.expectError(
+        error.AuthenticationFailed,
+        duplicate_token_source.resolve(.{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = .{ .tag = "latest" },
+        }),
+    );
 }
 
 test "paginated tags deduplicate sort and reject loops and hostile origins" {
@@ -1060,6 +1290,70 @@ test "paginated tags deduplicate sort and reject loops and hostile origins" {
         .repository = "repo",
         .selection = null,
     }));
+
+    const duplicate_json_steps = [_]Step{.{
+        .path_suffix = "/v2/repo/tags/list",
+        .class = .registry,
+        .headers = &json_headers,
+        .body = "{\"name\":\"repo\",\"tags\":[],\"tags\":[\"hidden\"]}",
+    }};
+    var duplicate_json_runtime: FakeRuntime = .{};
+    var duplicate_json_fake: ScriptedBackend = .{
+        .runtime = &duplicate_json_runtime,
+        .steps = &duplicate_json_steps,
+    };
+    var duplicate_json_source = try initSource(
+        &duplicate_json_fake,
+        &duplicate_json_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer duplicate_json_source.deinit();
+    try std.testing.expectError(
+        error.InvalidContent,
+        duplicate_json_source.listTags(.{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = null,
+        }),
+    );
+
+    const ambiguous_link_headers = [_]registry_http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Link", .value = "</v2/repo/tags/list?n=2>; rel=next; rel=prev" },
+    };
+    const ambiguous_link_steps = [_]Step{.{
+        .path_suffix = "/v2/repo/tags/list",
+        .class = .registry,
+        .headers = &ambiguous_link_headers,
+        .body = second,
+    }};
+    var ambiguous_link_runtime: FakeRuntime = .{};
+    var ambiguous_link_fake: ScriptedBackend = .{
+        .runtime = &ambiguous_link_runtime,
+        .steps = &ambiguous_link_steps,
+    };
+    var ambiguous_link_source = try initSource(
+        &ambiguous_link_fake,
+        &ambiguous_link_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer ambiguous_link_source.deinit();
+    try std.testing.expectError(
+        error.PaginationFailed,
+        ambiguous_link_source.listTags(.{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = null,
+        }),
+    );
+    try std.testing.expectEqual(
+        registry.Category.pagination,
+        ambiguous_link_source.lastDiagnostic().?.category,
+    );
 }
 
 test "stream retries rewind destination and final corruption removes partial output" {
@@ -1139,6 +1433,86 @@ test "stream retries rewind destination and final corruption removes partial out
         corrupt_source.copyVerifiedTo(value.value(), output),
     );
     try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
+
+    const opaque_document_bytes = "opaque-document-media";
+    const opaque_document = descriptor(
+        opaque_document_bytes,
+        model.media_type_oci_manifest,
+    );
+    const opaque_document_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/repo/blobs/{s}",
+        .{&opaque_document.digest_text},
+    );
+    defer allocator.free(opaque_document_path);
+    const no_length_headers = [_]registry_http.Header{
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &opaque_document.digest_text,
+        },
+    };
+    const no_length_steps = [_]Step{.{
+        .path_suffix = opaque_document_path,
+        .class = .blob,
+        .headers = &no_length_headers,
+        .body = opaque_document_bytes,
+    }};
+    var no_length_runtime: FakeRuntime = .{};
+    var no_length_fake: ScriptedBackend = .{
+        .runtime = &no_length_runtime,
+        .steps = &no_length_steps,
+    };
+    var no_length_source = try initSource(
+        &no_length_fake,
+        &no_length_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer no_length_source.deinit();
+    try no_length_source.copyVerifiedTo(opaque_document.value(), output);
+    try std.testing.expectEqual(
+        @as(u64, opaque_document_bytes.len),
+        try output.length(std.testing.io),
+    );
+
+    const duplicate_digest_headers = [_]registry_http.Header{
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &opaque_document.digest_text,
+        },
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &opaque_document.digest_text,
+        },
+    };
+    const duplicate_digest_steps = [_]Step{.{
+        .path_suffix = opaque_document_path,
+        .class = .blob,
+        .headers = &duplicate_digest_headers,
+        .body = opaque_document_bytes,
+    }};
+    var duplicate_digest_runtime: FakeRuntime = .{};
+    var duplicate_digest_fake: ScriptedBackend = .{
+        .runtime = &duplicate_digest_runtime,
+        .steps = &duplicate_digest_steps,
+    };
+    var duplicate_digest_source = try initSource(
+        &duplicate_digest_fake,
+        &duplicate_digest_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer duplicate_digest_source.deinit();
+    try std.testing.expectError(
+        error.InvalidContent,
+        duplicate_digest_source.copyVerifiedTo(
+            opaque_document.value(),
+            output,
+        ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
 }
 
 test "unknown index children use manifest endpoints and status diagnostics are sanitized" {
@@ -1214,6 +1588,84 @@ test "unknown index children use manifest endpoints and status diagnostics are s
     defer inspected.deinit();
     try std.testing.expectEqual(@as(usize, 2), fake.index);
     try std.testing.expect(std.mem.endsWith(u8, fake.url(1), child_path));
+
+    const malformed_child_bytes = "{}";
+    const malformed_child = descriptor(
+        malformed_child_bytes,
+        model.media_type_oci_manifest,
+    );
+    const malformed_index = try makeIndex(
+        allocator,
+        malformed_child.value(),
+    );
+    defer allocator.free(malformed_index);
+    const malformed_root = descriptor(
+        malformed_index,
+        model.media_type_oci_index,
+    );
+    const malformed_root_headers = try headersFor(
+        allocator,
+        model.media_type_oci_index,
+        malformed_index,
+        &malformed_root.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, malformed_root_headers);
+    const malformed_child_headers = try headersFor(
+        allocator,
+        model.media_type_oci_manifest,
+        malformed_child_bytes,
+        &malformed_child.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, malformed_child_headers);
+    const malformed_child_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/repo/manifests/{s}",
+        .{&malformed_child.digest_text},
+    );
+    defer allocator.free(malformed_child_path);
+    const malformed_steps = [_]Step{
+        .{
+            .path_suffix = "/v2/repo/manifests/latest",
+            .class = .registry,
+            .headers = malformed_root_headers.values,
+            .body = malformed_index,
+        },
+        .{
+            .path_suffix = malformed_child_path,
+            .class = .registry,
+            .headers = malformed_child_headers.values,
+            .body = malformed_child_bytes,
+        },
+    };
+    var malformed_runtime: FakeRuntime = .{};
+    var malformed_fake: ScriptedBackend = .{
+        .runtime = &malformed_runtime,
+        .steps = &malformed_steps,
+    };
+    var malformed_source = try initSource(
+        &malformed_fake,
+        &malformed_runtime,
+        .{ .tag = "latest" },
+        .none,
+        .{},
+    );
+    defer malformed_source.deinit();
+    var malformed_resolved = try malformed_source.resolve(.{
+        .authority = "localhost:5000",
+        .repository = "repo",
+        .selection = .{ .tag = "latest" },
+    });
+    defer malformed_resolved.deinit();
+    try std.testing.expectError(
+        error.InvalidContent,
+        malformed_source.inspectResolved(&malformed_resolved, .{}),
+    );
+    try std.testing.expectEqual(
+        registry.Category.invalid_content,
+        malformed_source.lastDiagnostic().?.category,
+    );
 
     const denied_body =
         "{\"errors\":[{\"code\":\"DENIED\",\"message\":\"no\",\"detail\":\"secret-token signed=abc\"}]}";

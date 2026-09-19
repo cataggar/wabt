@@ -9,6 +9,7 @@ pub const content = @import("oci/content.zig");
 pub const reference = @import("oci/reference.zig");
 pub const auth = @import("oci/auth.zig");
 pub const registry_http = @import("oci/registry_http.zig");
+pub const registry = @import("oci/registry.zig");
 pub const model = @import("oci/model.zig");
 pub const transport = @import("oci/transport.zig");
 pub const graph = @import("oci/graph.zig");
@@ -47,6 +48,19 @@ pub const RegistryHttpDeadline = registry_http.Deadline;
 pub const RegistryHttpRequestOptions = registry_http.RequestOptions;
 pub const RegistryHttpResponse = registry_http.Response;
 pub const RegistryHttpDiagnostic = registry_http.Diagnostic;
+
+pub const RegistrySource = registry.Source;
+pub const RegistryResolvedRoot = registry.ResolvedRoot;
+pub const RegistryTagList = registry.TagList;
+pub const RegistryInspectOptions = registry.InspectOptions;
+pub const RegistryInspectResult = registry.InspectResult;
+pub const RegistryOptions = registry.Options;
+pub const RegistryLimits = registry.Limits;
+pub const RegistryOperation = registry.Operation;
+pub const RegistryCategory = registry.Category;
+pub const RegistryDiagnostic = registry.Diagnostic;
+pub const RegistryError = registry.Error;
+pub const registry_manifest_accept = registry.manifest_accept;
 
 pub const Descriptor = model.Descriptor;
 pub const Platform = model.Platform;
@@ -102,6 +116,7 @@ test {
     _ = @import("oci/reference.zig");
     _ = @import("oci/auth.zig");
     _ = @import("oci/registry_http.zig");
+    _ = @import("oci/registry.zig");
     _ = @import("oci/model.zig");
     _ = @import("oci/transport.zig");
     _ = @import("oci/graph.zig");

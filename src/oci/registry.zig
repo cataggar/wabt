@@ -312,7 +312,9 @@ const TokenContext = struct {
         if (response.status != 200) {
             return error.AuthenticationFailed;
         }
-        if (response.header("Content-Type")) |value| {
+        const content_type = singleHeader(response, "Content-Type") catch
+            return error.InvalidResponse;
+        if (content_type) |value| {
             const media_type = mediaTypeBase(value) orelse
                 return error.InvalidResponse;
             if (!std.ascii.eqlIgnoreCase(media_type, "application/json")) {
@@ -476,6 +478,16 @@ pub const Source = struct {
         options.auth_limits.validate() catch return error.InvalidConfiguration;
         options.http_limits.validate() catch return error.InvalidConfiguration;
         options.timeouts.validate() catch return error.InvalidConfiguration;
+        var validated_endpoint = registry_http.Endpoint.init(
+            allocator,
+            .{
+                .authority = registry_reference.authority,
+                .plain_http = options.plain_http,
+                .additional_ca = options.additional_ca,
+            },
+            options.http_limits,
+        ) catch |err| return mapInitHttpError(err);
+        defer validated_endpoint.deinit();
         const initialization_now = clock.now();
         if (initialization_now >= options.deadline.at_ns) return error.DeadlineExceeded;
         const remaining_i128 = options.deadline.at_ns - initialization_now;
@@ -627,12 +639,12 @@ pub const Source = struct {
         defer response.deinit();
         try self.requireSuccess(response, .resolve, expectedSelectionDigest(selection));
 
-        if (response.header("Content-Length")) |_| {
-            const length = try self.contentLength(response, .resolve, expectedSelectionDigest(selection));
-            if (length != response.body.len) {
-                return self.fail(error.InvalidContent, .resolve, .invalid_content, response.status, null, expectedSelectionDigest(selection));
-            }
-        }
+        try self.corroborateContentLength(
+            response,
+            @intCast(response.body.len),
+            .resolve,
+            expectedSelectionDigest(selection),
+        );
         const response_media_type = try self.manifestContentType(
             response,
             .resolve,
@@ -713,7 +725,7 @@ pub const Source = struct {
         self: *Source,
         registry_reference: reference.RegistryReference,
         options: InspectOptions,
-    ) !InspectResult {
+    ) Error!InspectResult {
         var resolved = try self.resolve(registry_reference);
         defer resolved.deinit();
         return self.inspectResolved(&resolved, options);
@@ -723,7 +735,7 @@ pub const Source = struct {
         self: *Source,
         resolved: *const ResolvedRoot,
         options: InspectOptions,
-    ) !InspectResult {
+    ) Error!InspectResult {
         self.last_diagnostic = null;
         var resolved_source: ResolvedSource = .{
             .registry = self,
@@ -738,18 +750,49 @@ pub const Source = struct {
             },
             options.limits,
         ) catch |err| {
-            if (self.last_diagnostic == null) {
-                self.last_diagnostic = Diagnostic.init(
+            if (self.last_diagnostic) |diagnostic| {
+                return switch (diagnostic.category) {
+                    .authentication => error.AuthenticationFailed,
+                    .authorization => error.AuthorizationDenied,
+                    .not_found => error.ContentNotFound,
+                    .unsupported_content => error.UnsupportedContent,
+                    .invalid_content => error.InvalidContent,
+                    .transport => error.TransportFailed,
+                    .tls => error.TlsValidationFailed,
+                    .deadline => error.DeadlineExceeded,
+                    .retry_limit => error.RetryLimitExceeded,
+                    .insecure_transport => error.InsecureTransport,
+                    .redirect => error.RedirectRejected,
+                    .limit => error.LimitExceeded,
+                    .pagination => error.PaginationFailed,
+                    .registry => error.RegistryFailed,
+                };
+            }
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.MaximumDepthExceeded,
+                error.MaximumDescriptorsExceeded,
+                error.MaximumTotalBytesExceeded,
+                error.TotalSizeOverflow,
+                error.MaximumMetadataBytesExceeded,
+                error.LimitExceeded,
+                => self.fail(
+                    error.LimitExceeded,
+                    .inspect,
+                    .limit,
+                    null,
+                    null,
+                    resolved.descriptor.parsedDigest() catch null,
+                ),
+                else => self.fail(
+                    error.InvalidContent,
                     .inspect,
                     .invalid_content,
                     null,
-                    self.authority,
-                    self.repository,
                     null,
                     resolved.descriptor.parsedDigest() catch null,
-                );
-            }
-            return err;
+                ),
+            };
         };
         errdefer plan.deinit();
         const canonical_reference = try self.allocator.dupe(
@@ -849,8 +892,13 @@ pub const Source = struct {
         }) catch |err| return self.mapHttpFailure(err, operation, digest);
         defer response.deinit();
         try self.requireSuccess(response, operation, digest);
-        const length = try self.contentLength(response, operation, digest);
-        if (length != descriptor.size or length != response.body.len) {
+        try self.corroborateContentLength(
+            response,
+            descriptor.size,
+            operation,
+            digest,
+        );
+        if (response.body.len != descriptor.size) {
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
         }
         content.verifyBytes(digest, descriptor.size, response.body) catch
@@ -863,25 +911,25 @@ pub const Source = struct {
                 return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest)) orelse
                 return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
             if (!std.mem.eql(u8, base, descriptor.mediaType)) {
-                return self.fail(error.UnsupportedContent, operation, .unsupported_content, response.status, null, digest);
+                return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
             }
+            var document = model.parseDocument(self.allocator, response.body) catch
+                return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
+            defer document.deinit();
             if (class.isDocument()) {
-                var document = model.parseDocument(self.allocator, response.body) catch
-                    return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
-                defer document.deinit();
                 if ((class.isIndex() and document.kind() != .index) or
                     (class.isManifest() and document.kind() != .manifest))
                 {
                     return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
                 }
-                const document_media_type = switch (document.value) {
-                    .index => |parsed| parsed.value.mediaType,
-                    .manifest => |parsed| parsed.value.mediaType,
-                };
-                if (document_media_type) |actual| {
-                    if (!std.mem.eql(u8, actual, descriptor.mediaType)) {
-                        return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
-                    }
+            }
+            const document_media_type = switch (document.value) {
+                .index => |parsed| parsed.value.mediaType,
+                .manifest => |parsed| parsed.value.mediaType,
+            };
+            if (document_media_type) |actual| {
+                if (!std.mem.eql(u8, actual, descriptor.mediaType)) {
+                    return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, digest);
                 }
             }
         } else if (singleHeader(response, "Content-Type") catch
@@ -906,21 +954,12 @@ pub const Source = struct {
         self.last_diagnostic = null;
         const digest = model.validateDescriptor(descriptor) catch
             return self.fail(error.InvalidContent, .copy_blob, .invalid_content, null, null, null);
-        const class = model.classifyMediaType(descriptor.mediaType);
-        const is_manifest = class.isDocument();
         const digest_text = digest.format();
-        const path = if (is_manifest)
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/v2/{s}/manifests/{s}",
-                .{ self.repository, &digest_text },
-            )
-        else
-            try std.fmt.allocPrint(
-                self.allocator,
-                "/v2/{s}/blobs/{s}",
-                .{ self.repository, &digest_text },
-            );
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/blobs/{s}",
+            .{ self.repository, &digest_text },
+        );
         defer self.allocator.free(path);
 
         var sink_state: VerifiedFileSink = .{
@@ -934,14 +973,9 @@ pub const Source = struct {
         var success = false;
         defer if (!success) sink_state.cleanup();
 
-        const headers: []const registry_http.Header = if (is_manifest)
-            &.{.{ .name = "Accept", .value = descriptor.mediaType }}
-        else
-            &.{};
         var response = self.client.execute(.{
             .path_and_query = path,
-            .class = if (is_manifest) .registry else .blob,
-            .headers = headers,
+            .class = .blob,
             .max_body_bytes = descriptor.size,
             .body_sink = registry_http.BodySink.init(&sink_state),
             .deadline = self.deadline,
@@ -964,21 +998,13 @@ pub const Source = struct {
         };
         defer response.deinit();
         try self.requireSuccess(response, .copy_blob, digest);
-        const length = try self.contentLength(response, .copy_blob, digest);
-        if (length != descriptor.size) {
-            return self.fail(error.InvalidContent, .copy_blob, .invalid_content, response.status, null, digest);
-        }
+        try self.corroborateContentLength(
+            response,
+            descriptor.size,
+            .copy_blob,
+            digest,
+        );
         try self.corroborateDigestHeader(response, digest, .copy_blob);
-        if (is_manifest) {
-            const response_media_type = try self.manifestContentType(
-                response,
-                .copy_blob,
-                digest,
-            );
-            if (!std.mem.eql(u8, response_media_type, descriptor.mediaType)) {
-                return self.fail(error.UnsupportedContent, .copy_blob, .unsupported_content, response.status, null, digest);
-            }
-        }
         success = true;
         self.last_diagnostic = null;
     }
@@ -1042,10 +1068,10 @@ pub const Source = struct {
             const content_type = singleHeader(response, "Content-Type") catch
                 return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
             const base = mediaTypeBase(content_type orelse
-                return self.fail(error.UnsupportedContent, .list_tags, .unsupported_content, response.status, null, null)) orelse
+                return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null)) orelse
                 return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
             if (!std.ascii.eqlIgnoreCase(base, "application/json")) {
-                return self.fail(error.UnsupportedContent, .list_tags, .unsupported_content, response.status, null, null);
+                return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
             }
             try self.appendTagPage(response, &tags, &seen);
 
@@ -1079,24 +1105,24 @@ pub const Source = struct {
         tags: *std.array_list.Managed([]u8),
         seen: *std.StringHashMap(void),
     ) Error!void {
+        const Document = struct {
+            name: []const u8,
+            tags: std.json.Value,
+        };
         var parsed = std.json.parseFromSlice(
-            std.json.Value,
+            Document,
             self.allocator,
             response.body,
-            .{},
+            .{
+                .ignore_unknown_fields = true,
+                .duplicate_field_behavior = .@"error",
+            },
         ) catch return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
         defer parsed.deinit();
-        const object = switch (parsed.value) {
-            .object => |object| object,
-            else => return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null),
-        };
-        const name = object.get("name") orelse
-            return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
-        if (name != .string or !std.mem.eql(u8, name.string, self.repository)) {
+        if (!std.mem.eql(u8, parsed.value.name, self.repository)) {
             return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
         }
-        const tag_value = object.get("tags") orelse
-            return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
+        const tag_value = parsed.value.tags;
         if (tag_value == .null) return;
         if (tag_value != .array) {
             return self.fail(error.InvalidContent, .list_tags, .invalid_content, response.status, null, null);
@@ -1135,16 +1161,26 @@ pub const Source = struct {
     ) Error!?[]u8 {
         var found: ?[]u8 = null;
         errdefer if (found) |value| self.allocator.free(value);
+        var total_link_bytes: usize = 0;
         for (response.headers) |header| {
             if (!std.ascii.eqlIgnoreCase(header.name, "Link")) continue;
-            if (header.value.len == 0 or header.value.len > self.limits.max_link_bytes) {
+            total_link_bytes = std.math.add(
+                usize,
+                total_link_bytes,
+                header.value.len,
+            ) catch return self.fail(error.PaginationFailed, .list_tags, .pagination, response.status, null, null);
+            if (header.value.len == 0 or
+                total_link_bytes > self.limits.max_link_bytes)
+            {
                 return self.fail(error.PaginationFailed, .list_tags, .pagination, response.status, null, null);
             }
             var parser: LinkParser = .{
                 .input = header.value,
                 .max_target_bytes = self.limits.max_link_bytes,
             };
-            while (try parser.next()) |link| {
+            while (parser.next() catch
+                return self.fail(error.PaginationFailed, .list_tags, .pagination, response.status, null, null)) |link|
+            {
                 if (!link.next) continue;
                 if (found != null) {
                     return self.fail(error.PaginationFailed, .list_tags, .pagination, response.status, null, null);
@@ -1164,24 +1200,24 @@ pub const Source = struct {
         const value = singleHeader(response, "Content-Type") catch
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
         const base = mediaTypeBase(value orelse
-            return self.fail(error.UnsupportedContent, operation, .unsupported_content, response.status, null, expected)) orelse
+            return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected)) orelse
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
         if (!acceptedManifestMediaType(base)) {
-            return self.fail(error.UnsupportedContent, operation, .unsupported_content, response.status, null, expected);
+            return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
         }
         return base;
     }
 
-    fn contentLength(
+    fn corroborateContentLength(
         self: *Source,
         response: registry_http.Response,
+        expected_size: u64,
         operation: Operation,
         expected: ?content.Digest,
-    ) Error!u64 {
+    ) Error!void {
         const value = singleHeader(response, "Content-Length") catch
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
-        const text = std.mem.trim(u8, value orelse
-            return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected), " \t");
+        const text = std.mem.trim(u8, value orelse return, " \t");
         if (text.len == 0) {
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
         }
@@ -1190,8 +1226,11 @@ pub const Source = struct {
                 return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
             }
         }
-        return std.fmt.parseInt(u64, text, 10) catch
+        const actual = std.fmt.parseInt(u64, text, 10) catch
             return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
+        if (actual != expected_size) {
+            return self.fail(error.InvalidContent, operation, .invalid_content, response.status, null, expected);
+        }
     }
 
     fn corroborateDigestHeader(
@@ -1290,6 +1329,7 @@ pub const Source = struct {
             error.TlsValidationFailed => self.fail(error.TlsValidationFailed, operation, .tls, status, null, expected),
             error.TransportFailed => self.fail(error.TransportFailed, operation, .transport, status, null, expected),
             error.CertificateAuthorityLoadFailed => self.fail(error.CertificateAuthorityLoadFailed, operation, .tls, status, null, expected),
+            error.ContentEncodingRejected => self.fail(error.InvalidContent, operation, .invalid_content, status, null, expected),
             error.BodySinkFailed,
             error.InvalidLimits,
             error.InvalidEndpoint,
@@ -1395,7 +1435,8 @@ const VerifiedFileSink = struct {
             self.failure = error.TransportFailed;
             return error.SinkFailed;
         };
-        if (content_length == null or content_length.? != self.size) {
+        if (content_length) |length| {
+            if (length == self.size) return;
             self.failure = error.InvalidContent;
             return error.SinkFailed;
         }
@@ -1465,6 +1506,7 @@ const LinkParser = struct {
         const target = self.input[target_start..self.index];
         self.index += 1;
         var is_next = false;
+        var saw_rel = false;
         while (true) {
             self.skipOws();
             if (self.index == self.input.len or self.input[self.index] == ',') break;
@@ -1483,10 +1525,19 @@ const LinkParser = struct {
             else
                 try self.token();
             if (std.ascii.eqlIgnoreCase(name, "rel")) {
+                if (saw_rel) return error.PaginationFailed;
+                saw_rel = true;
                 var relations = std.mem.tokenizeAny(u8, value, " \t");
+                var relation_count: usize = 0;
+                var next_count: usize = 0;
                 while (relations.next()) |relation| {
-                    if (std.ascii.eqlIgnoreCase(relation, "next")) is_next = true;
+                    relation_count += 1;
+                    if (std.ascii.eqlIgnoreCase(relation, "next")) next_count += 1;
                 }
+                if (relation_count == 0 or next_count > 1) {
+                    return error.PaginationFailed;
+                }
+                is_next = next_count == 1;
             }
         }
         if (self.index < self.input.len) {

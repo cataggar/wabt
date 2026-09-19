@@ -29,6 +29,7 @@ pub const Error = error{
     TransportFailed,
     TlsValidationFailed,
     ProtocolError,
+    ContentEncodingRejected,
     BodySinkFailed,
 };
 
@@ -899,6 +900,10 @@ pub const Client = struct {
                 response.deinit();
                 return self.fail(err, .limit, options.class, null, current_origin.canonical);
             };
+            validateIdentityContentEncoding(response) catch |err| {
+                response.deinit();
+                return self.fail(err, .protocol, options.class, response.status, current_origin.canonical);
+            };
 
             if (isRedirectStatus(response.status)) {
                 const redirect_status = response.status;
@@ -1277,9 +1282,6 @@ pub const StdBackend = struct {
         }
         var std_response = std_request.receiveHead(&.{}) catch |err|
             return mapStdBackendError(err);
-        if (std_response.head.content_encoding != .identity) {
-            return error.ProtocolFailure;
-        }
 
         var headers = std.array_list.Managed(OwnedHeader).init(allocator);
         errdefer {
@@ -1707,6 +1709,19 @@ fn validateResponseLimits(
     }
     if (@as(u64, @intCast(response.body.len)) > body_limit) {
         return error.LimitExceeded;
+    }
+}
+
+fn validateIdentityContentEncoding(response: Response) Error!void {
+    var value: ?[]const u8 = null;
+    for (response.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "Content-Encoding")) continue;
+        if (value != null) return error.ContentEncodingRejected;
+        value = header.value;
+    }
+    const encoding = std.mem.trim(u8, value orelse return, " \t");
+    if (!std.ascii.eqlIgnoreCase(encoding, "identity")) {
+        return error.ContentEncodingRejected;
     }
 }
 
