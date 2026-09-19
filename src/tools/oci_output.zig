@@ -64,23 +64,58 @@ pub const PullV1 = struct {
     size: u64,
 };
 
+pub const PushV1 = struct {
+    schema: []const u8 = "wabt.oci.push",
+    schemaVersion: u32 = 1,
+    originalReference: []const u8,
+    reference: []const u8,
+    profile: []const u8,
+    created: []const u8,
+    createdSource: []const u8,
+    root: DescriptorV1,
+    manifest: DescriptorV1,
+    config: DescriptorV1,
+    payload: DescriptorV1,
+};
+
+pub const CopyV1 = struct {
+    schema: []const u8 = "wabt.oci.copy",
+    schemaVersion: u32 = 1,
+    sourceReference: []const u8,
+    sourceRootReference: []const u8,
+    destinationReference: []const u8,
+    destinationRootReference: []const u8,
+    root: DescriptorV1,
+    transferred: u64,
+    reused: u64,
+    mounted: u64,
+};
+
 pub const ExecutionError = error{
     OutOfMemory,
+    InvalidPayload,
+    InvalidProfile,
     AuthenticationFailed,
     AuthorizationDenied,
     NotFound,
+    Conflict,
+    Corruption,
     UnsupportedContent,
     InvalidContent,
     TransportFailed,
     TlsValidationFailed,
     DeadlineExceeded,
     CertificateAuthorityFailed,
+    UploadAmbiguous,
     LimitExceeded,
     OutputExists,
+    LocalReadFailed,
     LocalWriteFailed,
     SecretInputFailed,
     StdoutWriteFailed,
     StderrWriteFailed,
+    ProgressWriteFailed,
+    CommittedButReportingFailed,
     UnexpectedFailure,
 };
 
@@ -123,6 +158,13 @@ pub fn writeText(
     text: []const u8,
 ) ExecutionError!void {
     runtime.writeStdout(text) catch return error.StdoutWriteFailed;
+}
+
+pub fn writeProgress(
+    runtime: *runtime_mod.Runtime,
+    text: []const u8,
+) ExecutionError!void {
+    runtime.writeProgress(text) catch return error.ProgressWriteFailed;
 }
 
 pub fn writeDiagnostic(
@@ -281,23 +323,123 @@ pub fn mapLocalWriteError(err: anyerror) ExecutionError {
     };
 }
 
+pub fn mapLocalReadError(err: anyerror) ExecutionError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.PayloadTooLarge => error.LimitExceeded,
+        error.AccessDenied,
+        error.FileNotFound,
+        error.PathNotFound,
+        error.IsDir,
+        error.InputChanged,
+        error.UnexpectedEndOfFile,
+        error.ReadFailed,
+        => error.LocalReadFailed,
+        else => mapExecutionError(err),
+    };
+}
+
+pub fn mapPushError(err: anyerror) ExecutionError {
+    return switch (err) {
+        error.InvalidWasmMagic,
+        error.UnsupportedWasmVersion,
+        error.InvalidWasm,
+        error.UnexpectedEndOfWasm,
+        error.ComponentMetadataTooLarge,
+        => error.InvalidPayload,
+
+        error.InvalidCreated,
+        error.InvalidAuthor,
+        error.UnsupportedProfile,
+        => error.InvalidProfile,
+
+        error.DestinationStateConflict,
+        error.DestinationNotPrepared,
+        error.DestinationNotStaged,
+        error.DestinationNotCommitted,
+        => error.Conflict,
+
+        error.UploadAmbiguous,
+        error.UploadIncomplete,
+        error.PublicationUnconfirmed,
+        => error.UploadAmbiguous,
+
+        error.InjectedFailure => error.LocalWriteFailed,
+        error.InvalidDestinationPath,
+        error.AccessDenied,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.ReadOnlyFileSystem,
+        => error.LocalWriteFailed,
+
+        else => mapExecutionError(err),
+    };
+}
+
+pub fn mapCopyError(err: anyerror) ExecutionError {
+    return switch (err) {
+        error.DestinationStateConflict,
+        error.DestinationNotPrepared,
+        error.DestinationNotStaged,
+        error.DestinationNotCommitted,
+        error.RootNotStaged,
+        => error.Conflict,
+
+        error.CorruptBlob,
+        error.DescriptorMismatch,
+        error.ConflictingDescriptor,
+        error.DescriptorDocumentMismatch,
+        error.RootDescriptorMismatch,
+        error.SourceContractViolation,
+        error.DigestMismatch,
+        error.SizeMismatch,
+        error.InvalidLayout,
+        error.InvalidLayoutVersion,
+        error.InvalidIndex,
+        => error.Corruption,
+
+        error.UploadAmbiguous,
+        error.UploadIncomplete,
+        error.PublicationUnconfirmed,
+        => error.UploadAmbiguous,
+
+        error.InjectedFailure => error.LocalWriteFailed,
+        error.InvalidDestinationPath,
+        error.AccessDenied,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.ReadOnlyFileSystem,
+        => error.LocalWriteFailed,
+
+        else => mapExecutionError(err),
+    };
+}
+
 pub fn diagnosticText(err: anyerror) []const u8 {
     return switch (err) {
+        error.InvalidPayload => "invalid or unsupported WebAssembly payload",
+        error.InvalidProfile => "invalid artifact profile or profile metadata",
         error.AuthenticationFailed => "authentication failed",
         error.AuthorizationDenied => "authorization denied",
         error.NotFound => "content not found",
+        error.Conflict => "destination state conflict",
+        error.Corruption => "source or destination content is corrupt",
         error.UnsupportedContent => "unsupported OCI content",
         error.InvalidContent => "invalid or corrupt OCI content",
         error.TransportFailed => "registry transport failed",
         error.TlsValidationFailed => "TLS validation failed",
         error.DeadlineExceeded => "operation deadline exceeded",
         error.CertificateAuthorityFailed => "additional CA could not be loaded",
+        error.UploadAmbiguous => "registry upload or publication could not be confirmed",
         error.LimitExceeded => "OCI operation limit exceeded",
         error.OutputExists => "output exists or cannot be replaced safely",
+        error.LocalReadFailed => "local input file could not be read",
         error.LocalWriteFailed => "local file operation failed",
         error.SecretInputFailed => "secret input could not be read",
         error.StdoutWriteFailed => "failed to write stdout",
         error.StderrWriteFailed => "failed to write stderr",
+        error.ProgressWriteFailed => "failed to write progress",
+        error.CommittedButReportingFailed => "publication committed but reporting failed",
         error.OutOfMemory => "out of memory",
         error.UnexpectedFailure => "OCI operation failed",
         else => @errorName(err),
@@ -384,6 +526,55 @@ test "inspect and pull DTO JSON schemas are stable" {
     });
     try std.testing.expectEqualStrings(
         "{\"schema\":\"wabt.oci.pull\",\"schemaVersion\":1,\"originalReference\":\"oci:layout\",\"reference\":\"oci:layout@sha256:abc\",\"root\":{\"mediaType\":\"application/wasm\",\"digest\":\"sha256:abc\",\"size\":8},\"manifest\":{\"mediaType\":\"application/wasm\",\"digest\":\"sha256:abc\",\"size\":8},\"config\":{\"mediaType\":\"application/wasm\",\"digest\":\"sha256:abc\",\"size\":8},\"payload\":{\"mediaType\":\"application/wasm\",\"digest\":\"sha256:abc\",\"size\":8},\"profile\":\"oci-1.0\",\"output\":\"app.wasm\",\"size\":8}\n",
+        bytes[0..stdout_writer.end],
+    );
+}
+
+test "push and copy DTO JSON schemas are stable" {
+    const descriptor_value: DescriptorV1 = .{
+        .mediaType = "application/vnd.oci.image.manifest.v1+json",
+        .digest = "sha256:abc",
+        .size = 8,
+    };
+    var bytes: [4096]u8 = undefined;
+    var stdout_writer = std.Io.Writer.fixed(&bytes);
+    var counters: runtime_mod.Counters = .{};
+    var runtime = runtime_mod.Runtime.initForTest(
+        std.testing.allocator,
+        std.testing.io,
+        &counters,
+    );
+    runtime.stdout = runtime_mod.OutputSink.fromWriter(&stdout_writer);
+
+    try writeJson(&runtime, PushV1{
+        .originalReference = "registry.example/repo:tag",
+        .reference = "registry.example/repo@sha256:abc",
+        .profile = "wasm-v0",
+        .created = "2026-09-19T00:00:00Z",
+        .createdSource = "explicit",
+        .root = descriptor_value,
+        .manifest = descriptor_value,
+        .config = descriptor_value,
+        .payload = descriptor_value,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"wabt.oci.push\",\"schemaVersion\":1,\"originalReference\":\"registry.example/repo:tag\",\"reference\":\"registry.example/repo@sha256:abc\",\"profile\":\"wasm-v0\",\"created\":\"2026-09-19T00:00:00Z\",\"createdSource\":\"explicit\",\"root\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"manifest\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"config\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"payload\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8}}\n",
+        bytes[0..stdout_writer.end],
+    );
+
+    stdout_writer = std.Io.Writer.fixed(&bytes);
+    try writeJson(&runtime, CopyV1{
+        .sourceReference = "oci:source:tag",
+        .sourceRootReference = "oci:source@sha256:abc",
+        .destinationReference = "registry.example/repo:tag",
+        .destinationRootReference = "registry.example/repo@sha256:abc",
+        .root = descriptor_value,
+        .transferred = 3,
+        .reused = 2,
+        .mounted = 1,
+    });
+    try std.testing.expectEqualStrings(
+        "{\"schema\":\"wabt.oci.copy\",\"schemaVersion\":1,\"sourceReference\":\"oci:source:tag\",\"sourceRootReference\":\"oci:source@sha256:abc\",\"destinationReference\":\"registry.example/repo:tag\",\"destinationRootReference\":\"registry.example/repo@sha256:abc\",\"root\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"transferred\":3,\"reused\":2,\"mounted\":1}\n",
         bytes[0..stdout_writer.end],
     );
 }

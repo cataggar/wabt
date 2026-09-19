@@ -107,6 +107,76 @@ pub const RegistryFactory = struct {
     }
 };
 
+pub const RegistryDestinationHandle = struct {
+    context: *anyopaque,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        as_transport: *const fn (*anyopaque) wabt.oci.Destination,
+        deinit: *const fn (*anyopaque) void,
+    };
+
+    pub fn init(pointer: anytype) RegistryDestinationHandle {
+        const Pointer = @TypeOf(pointer);
+        const Adapter = struct {
+            fn asTransport(context: *anyopaque) wabt.oci.Destination {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.asTransport();
+            }
+
+            fn deinit(context: *anyopaque) void {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                implementation.deinit();
+            }
+
+            const vtable: VTable = .{
+                .as_transport = @This().asTransport,
+                .deinit = @This().deinit,
+            };
+        };
+        return .{
+            .context = pointer,
+            .vtable = &Adapter.vtable,
+        };
+    }
+
+    pub fn asTransport(self: RegistryDestinationHandle) wabt.oci.Destination {
+        return self.vtable.as_transport(self.context);
+    }
+
+    pub fn deinit(self: *RegistryDestinationHandle) void {
+        self.vtable.deinit(self.context);
+        self.* = undefined;
+    }
+};
+
+pub const RegistryDestinationFactory = struct {
+    context: ?*anyopaque = null,
+    create_fn: *const fn (
+        ?*anyopaque,
+        std.Io,
+        std.mem.Allocator,
+        wabt.oci.RegistryReference,
+        wabt.oci.RegistryDestinationOptions,
+    ) anyerror!RegistryDestinationHandle = createProductionDestination,
+
+    pub fn create(
+        self: RegistryDestinationFactory,
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        reference: wabt.oci.RegistryReference,
+        destination_options: wabt.oci.RegistryDestinationOptions,
+    ) !RegistryDestinationHandle {
+        return self.create_fn(
+            self.context,
+            io,
+            allocator,
+            reference,
+            destination_options,
+        );
+    }
+};
+
 pub const Clock = struct {
     context: *anyopaque,
     now_fn: *const fn (*anyopaque) i128,
@@ -124,6 +194,29 @@ pub const Clock = struct {
 
     pub fn now(self: Clock) i128 {
         return self.now_fn(self.context);
+    }
+};
+
+pub const WallClock = struct {
+    context: *anyopaque,
+    unix_seconds_fn: *const fn (*anyopaque) i64,
+
+    pub fn init(pointer: anytype) WallClock {
+        const Pointer = @TypeOf(pointer);
+        const Adapter = struct {
+            fn unixSeconds(context: *anyopaque) i64 {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.unixSeconds();
+            }
+        };
+        return .{
+            .context = pointer,
+            .unix_seconds_fn = Adapter.unixSeconds,
+        };
+    }
+
+    pub fn unixSeconds(self: WallClock) i64 {
+        return self.unix_seconds_fn(self.context);
     }
 };
 
@@ -150,9 +243,14 @@ pub const Runtime = struct {
     counters: *Counters,
     stdout: ?OutputSink = null,
     stderr: ?OutputSink = null,
+    progress: ?OutputSink = null,
     secret_provider: ?SecretProvider = null,
     registry_factory: RegistryFactory = .{},
+    registry_destination_factory: RegistryDestinationFactory = .{},
     clock: ?Clock = null,
+    wall_clock: ?WallClock = null,
+    graph_limits: wabt.oci.GraphLimits = .{},
+    layout_failure_point: wabt.oci.LayoutFailurePoint = .none,
 
     pub fn initProcess(
         init: std.process.Init,
@@ -191,9 +289,18 @@ pub const Runtime = struct {
         return file.writeStreamingAll(self.io, bytes);
     }
 
+    pub fn writeProgress(self: *Runtime, bytes: []const u8) !void {
+        if (self.progress) |sink| return sink.write(bytes);
+    }
+
     pub fn nowNs(self: *Runtime) i128 {
         if (self.clock) |clock| return clock.now();
         return std.Io.Clock.awake.now(self.io).toNanoseconds();
+    }
+
+    pub fn unixSeconds(self: *Runtime) i64 {
+        if (self.wall_clock) |clock| return clock.unixSeconds();
+        return std.Io.Clock.real.now(self.io).toSeconds();
     }
 
     /// Reads any required caller/stdin secret, resolves the absolute deadline
@@ -277,6 +384,87 @@ pub const Runtime = struct {
         );
     }
 
+    /// Reads only the destination secret, resolves one independent absolute
+    /// deadline, and then constructs the destination boundary.
+    pub fn openRegistryDestination(
+        self: *Runtime,
+        reference: wabt.oci.RegistryReference,
+        endpoint: options_mod.EndpointOptions,
+    ) !RegistryDestinationHandle {
+        const now_ns = self.nowNs();
+        const deadline_ns = if (endpoint.deadline) |deadline|
+            try deadline.absoluteNs(now_ns)
+        else
+            std.math.add(
+                i128,
+                now_ns,
+                @as(i128, default_deadline_ns),
+            ) catch return error.DeadlineOverflow;
+
+        var owned_secret: ?OwnedSecret = null;
+        defer if (owned_secret) |*secret| secret.deinit();
+
+        const credential_policy: wabt.oci.CredentialPolicy = switch (endpoint.credentials) {
+            .discover => blk: {
+                self.counters.credential_discoveries += 1;
+                break :blk .discover;
+            },
+            .none => .none,
+            .auth_file => |path| .{ .auth_file = path },
+            .basic => |basic| .{ .supplied = .{ .basic = .{
+                .username = basic.username,
+                .secret = switch (basic.secret) {
+                    .caller => |value| value,
+                    .stdin => blk: {
+                        owned_secret = try self.readSecret();
+                        break :blk owned_secret.?.value();
+                    },
+                },
+            } } },
+            .bearer => |secret| .{ .supplied = .{
+                .bearer_token = switch (secret) {
+                    .caller => |value| value,
+                    .stdin => blk: {
+                        owned_secret = try self.readSecret();
+                        break :blk owned_secret.?.value();
+                    },
+                },
+            } },
+        };
+
+        const tracked_files: wabt.oci.auth.FileReader = .{
+            .context = self,
+            .read = trackedFileRead,
+        };
+        const tracked_process: wabt.oci.auth.ProcessRunner = .{
+            .context = self,
+            .run = trackedProcessRun,
+        };
+        const destination_options: wabt.oci.RegistryDestinationOptions = .{
+            .plain_http = endpoint.plain_http,
+            .additional_ca = if (endpoint.additional_ca_file) |path|
+                .{ .file_path = path }
+            else
+                null,
+            .credential_policy = credential_policy,
+            .auth_context = .{
+                .io = self.io,
+                .environment = self.environment,
+                .files = tracked_files,
+                .process = tracked_process,
+            },
+            .deadline = .{ .at_ns = deadline_ns },
+        };
+
+        self.counters.network_clients += 1;
+        return self.registry_destination_factory.create(
+            self.io,
+            self.allocator,
+            reference,
+            destination_options,
+        );
+    }
+
     fn readSecret(self: *Runtime) !OwnedSecret {
         self.counters.stdin_reads += 1;
         const bytes = if (self.secret_provider) |provider|
@@ -326,6 +514,42 @@ fn createProductionSource(
         reference,
         source_options,
     );
+}
+
+const OwnedRegistryDestination = struct {
+    allocator: std.mem.Allocator,
+    value: wabt.oci.RegistryDestination,
+
+    fn asTransport(self: *OwnedRegistryDestination) wabt.oci.Destination {
+        return self.value.asTransport();
+    }
+
+    fn deinit(self: *OwnedRegistryDestination) void {
+        const allocator = self.allocator;
+        self.value.deinit();
+        allocator.destroy(self);
+    }
+};
+
+fn createProductionDestination(
+    _: ?*anyopaque,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    reference: wabt.oci.RegistryReference,
+    destination_options: wabt.oci.RegistryDestinationOptions,
+) !RegistryDestinationHandle {
+    const owned = try allocator.create(OwnedRegistryDestination);
+    errdefer allocator.destroy(owned);
+    owned.* = .{
+        .allocator = allocator,
+        .value = try wabt.oci.RegistryDestination.init(
+            io,
+            allocator,
+            reference,
+            destination_options,
+        ),
+    };
+    return RegistryDestinationHandle.init(owned);
 }
 
 fn readSecretFromStdin(

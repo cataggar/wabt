@@ -1,16 +1,18 @@
 const std = @import("std");
 const wabt = @import("wabt");
 const options = @import("oci_options.zig");
+const output = @import("oci_output.zig");
 const runtime_mod = @import("oci_runtime.zig");
 
 pub const usage =
     "Usage: wabt oci copy SOURCE DESTINATION [options]\n" ++
     "\n" ++
-    "Validate registry and/or oci: layout references for a complete graph copy.\n" ++
-    "Execution is not implemented; it is planned for the next increment.\n" ++
+    "Copy one complete bounded OCI graph without platform selection.\n" ++
+    "Registry destinations require an explicit tag. Registry and oci: layout\n" ++
+    "endpoints are instantiated independently; layout-only copies stay offline.\n" ++
     "\n" ++
     "Options:\n" ++
-    "  --json                            Select the future versioned JSON result\n" ++
+    "  --json                            Emit the versioned JSON result\n" ++
     options.copy_endpoint_help;
 
 pub const Options = struct {
@@ -45,11 +47,12 @@ pub const StdinRequests = struct {
     len: usize,
 };
 
-pub const Error = options.Error || wabt.oci.reference.Error || error{
+pub const Error = options.Error || wabt.oci.reference.Error ||
+    output.ExecutionError || error{
     MissingSource,
     MissingDestination,
     UnexpectedArgument,
-    CommandNotImplemented,
+    DestinationTagRequired,
 };
 
 pub fn parseArgs(args: []const []const u8) Error!Options {
@@ -85,6 +88,11 @@ pub fn parseArgs(args: []const []const u8) Error!Options {
 
     const source = try wabt.oci.parseReference(positionals[0].?, .source);
     const destination = try wabt.oci.parseReference(positionals[1].?, .destination);
+    if (destination == .registry) {
+        const selection = destination.registry.selection orelse
+            return error.DestinationTagRequired;
+        if (selection != .tag) return error.DestinationTagRequired;
+    }
     return .{
         .source_text = positionals[0].?,
         .source = source,
@@ -100,9 +108,197 @@ pub fn execute(
     args: []const []const u8,
     runtime: *runtime_mod.Runtime,
 ) Error!void {
-    _ = runtime;
-    _ = try parseArgs(args);
-    return error.CommandNotImplemented;
+    const parsed = try parseArgs(args);
+    const start = std.fmt.allocPrint(
+        runtime.allocator,
+        "copying {s} to {s}\n",
+        .{ parsed.source_text, parsed.destination_text },
+    ) catch return error.OutOfMemory;
+    defer runtime.allocator.free(start);
+    try output.writeProgress(runtime, start);
+
+    switch (parsed.source) {
+        .registry => |reference| {
+            var source = runtime.openRegistrySource(
+                reference,
+                parsed.source_endpoint.?,
+            ) catch |err| return output.mapCopyError(err);
+            defer source.deinit();
+            var resolved = source.resolve(reference) catch |err|
+                return output.mapCopyError(err);
+            defer resolved.deinit();
+            var immutable_source = source.resolvedSource(&resolved);
+            try copyResolved(
+                runtime,
+                parsed,
+                resolved.canonical_reference,
+                immutable_source.asTransport(),
+                resolved.descriptor,
+                resolved.descriptor_json,
+            );
+        },
+        .layout => |reference| {
+            var source = wabt.oci.LayoutSource.init(
+                runtime.io,
+                runtime.allocator,
+                reference.path,
+            );
+            var resolved = source.resolve(reference) catch |err|
+                return output.mapCopyError(err);
+            defer resolved.deinit();
+            const canonical = immutableLayoutReferenceAlloc(
+                runtime.allocator,
+                reference.path,
+                resolved.descriptor.digest,
+            ) catch return error.OutOfMemory;
+            defer runtime.allocator.free(canonical);
+            try copyResolved(
+                runtime,
+                parsed,
+                canonical,
+                source.asTransport(),
+                resolved.descriptor,
+                resolved.descriptor_json,
+            );
+        },
+    }
+}
+
+fn copyResolved(
+    runtime: *runtime_mod.Runtime,
+    parsed: Options,
+    source_canonical: []const u8,
+    source: wabt.oci.Source,
+    root_descriptor: wabt.oci.Descriptor,
+    root_descriptor_json: ?[]const u8,
+) output.ExecutionError!void {
+    var plan = wabt.oci.planGraphCopy(
+        runtime.allocator,
+        source,
+        .{
+            .descriptor = root_descriptor,
+            .descriptor_json = root_descriptor_json,
+        },
+        runtime.graph_limits,
+    ) catch |err| return output.mapCopyError(err);
+    defer plan.deinit();
+
+    const result = switch (parsed.destination) {
+        .registry => |reference| blk: {
+            var destination = runtime.openRegistryDestination(
+                reference,
+                parsed.destination_endpoint.?,
+            ) catch |err| return output.mapCopyError(err);
+            defer destination.deinit();
+            break :blk wabt.oci.copyPlannedGraph(
+                &plan,
+                source,
+                destination.asTransport(),
+                reference.selection,
+            ) catch |err| return output.mapCopyError(err);
+        },
+        .layout => |reference| blk: {
+            var destination = wabt.oci.LayoutDestination.init(
+                runtime.io,
+                runtime.allocator,
+                reference.path,
+            ) catch |err| return output.mapCopyError(err);
+            defer destination.deinit();
+            destination.failure_point = runtime.layout_failure_point;
+            break :blk wabt.oci.copyPlannedGraph(
+                &plan,
+                source,
+                destination.asTransport(),
+                reference.selection,
+            ) catch |err| return output.mapCopyError(err);
+        },
+    };
+
+    const destination_canonical = switch (parsed.destination) {
+        .registry => |reference| immutableRegistryReferenceAlloc(
+            runtime.allocator,
+            reference,
+            root_descriptor.digest,
+        ),
+        .layout => |reference| immutableLayoutReferenceAlloc(
+            runtime.allocator,
+            reference.path,
+            root_descriptor.digest,
+        ),
+    } catch return error.CommittedButReportingFailed;
+    defer runtime.allocator.free(destination_canonical);
+
+    const completed = std.fmt.allocPrint(
+        runtime.allocator,
+        "committed {s}\n",
+        .{destination_canonical},
+    ) catch return error.CommittedButReportingFailed;
+    defer runtime.allocator.free(completed);
+    output.writeProgress(runtime, completed) catch
+        return error.CommittedButReportingFailed;
+
+    emit(
+        runtime,
+        parsed,
+        source_canonical,
+        destination_canonical,
+        root_descriptor,
+        result,
+    ) catch return error.CommittedButReportingFailed;
+}
+
+fn immutableRegistryReferenceAlloc(
+    allocator: std.mem.Allocator,
+    reference: wabt.oci.RegistryReference,
+    digest: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}/{s}@{s}",
+        .{ reference.authority, reference.repository, digest },
+    );
+}
+
+fn immutableLayoutReferenceAlloc(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    digest: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "oci:{s}@{s}",
+        .{ path, digest },
+    );
+}
+
+fn emit(
+    runtime: *runtime_mod.Runtime,
+    parsed: Options,
+    source_canonical: []const u8,
+    destination_canonical: []const u8,
+    root_descriptor: wabt.oci.Descriptor,
+    result: wabt.oci.TransferResult,
+) output.ExecutionError!void {
+    if (parsed.json) {
+        return output.writeJson(runtime, output.CopyV1{
+            .sourceReference = parsed.source_text,
+            .sourceRootReference = source_canonical,
+            .destinationReference = parsed.destination_text,
+            .destinationRootReference = destination_canonical,
+            .root = output.descriptor(root_descriptor),
+            .transferred = result.counts.transferred,
+            .reused = result.counts.reused,
+            .mounted = result.counts.mounted,
+        });
+    }
+    const digest_text = result.root.format();
+    const line = std.fmt.allocPrint(
+        runtime.allocator,
+        "{s}\n",
+        .{&digest_text},
+    ) catch return error.OutOfMemory;
+    defer runtime.allocator.free(line);
+    return output.writeText(runtime, line);
 }
 
 test "copy parses every endpoint pairing and keeps endpoint options separate" {
@@ -193,5 +389,13 @@ test "copy rejects registry options on layouts and unprefixed endpoint options" 
     try std.testing.expectError(
         error.UnexpectedArgument,
         parseArgs(&.{ "oci:a", "oci:b", "extra" }),
+    );
+    try std.testing.expectError(
+        error.DestinationTagRequired,
+        parseArgs(&.{
+            "oci:a",
+            "registry.example/team/dest@" ++
+                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        }),
     );
 }
