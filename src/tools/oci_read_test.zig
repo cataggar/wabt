@@ -650,7 +650,6 @@ test "pull resolves tag once supports profiles and atomically replaces only with
                 "registry.example/team/app:latest",
                 "-o",
                 output_path,
-                "--json",
                 "--no-credential-discovery",
             }, &runtime),
         );
@@ -967,6 +966,7 @@ test "pull corruption cleans staging and stdout failure remains nonzero after co
             "registry.example/team/app:latest",
             "-o",
             output_path,
+            "--json",
             "--no-credential-discovery",
         }, &runtime),
     );
@@ -1025,11 +1025,12 @@ test "pull corruption cleans staging and stdout failure remains nonzero after co
     var failing = std.Io.Writer.failing;
     runtime.stdout = runtime_mod.OutputSink.fromWriter(&failing);
     try std.testing.expectError(
-        error.StdoutWriteFailed,
+        error.CommittedButReportingFailed,
         pull_cmd.execute(&.{
             "registry.example/team/app:latest",
             "-o",
             output_path,
+            "--json",
             "--no-credential-discovery",
         }, &runtime),
     );

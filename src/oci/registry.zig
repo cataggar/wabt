@@ -806,7 +806,7 @@ pub const Source = struct {
             &plan,
             resolved_source.asTransport(),
             destination.asTransport(),
-            .{ .tag = destination.tag },
+            destination.selection,
         );
     }
 
@@ -1686,11 +1686,11 @@ const UploadSession = struct {
 };
 
 /// Registry destination with verified blob upload, immutable child/root
-/// staging, and a root-tag-last commit lifecycle.
+/// staging, and an explicit tag-or-digest root commit lifecycle.
 pub const Destination = struct {
     allocator: Allocator,
     remote: Source,
-    tag: []u8,
+    selection: reference.Selection,
     graph_limits: graph.Limits,
     mount_policy: MountPolicy,
     upload_chunk_bytes: ?u64,
@@ -1708,7 +1708,7 @@ pub const Destination = struct {
         destination: reference.RegistryReference,
         options: DestinationOptions,
     ) Error!Destination {
-        const tag = try validateDestinationConfiguration(destination, options);
+        const selection = try validateDestinationConfiguration(destination, options);
         var remote = try Source.init(
             io,
             allocator,
@@ -1716,8 +1716,8 @@ pub const Destination = struct {
             options.sourceOptions(),
         );
         errdefer remote.deinit();
-        const owned_tag = try allocator.dupe(u8, tag);
-        errdefer allocator.free(owned_tag);
+        const owned_selection = try cloneSelection(allocator, selection);
+        errdefer deinitSelection(allocator, owned_selection);
         const spool_directory = try allocator.dupe(
             u8,
             options.spool_directory orelse ".",
@@ -1725,7 +1725,7 @@ pub const Destination = struct {
         return .{
             .allocator = allocator,
             .remote = remote,
-            .tag = owned_tag,
+            .selection = owned_selection,
             .graph_limits = options.graph_limits,
             .mount_policy = options.mount_policy,
             .upload_chunk_bytes = options.upload_chunk_bytes,
@@ -1745,7 +1745,7 @@ pub const Destination = struct {
         sleeper: registry_http.Sleeper,
         options: DestinationOptions,
     ) Error!Destination {
-        const tag = try validateDestinationConfiguration(destination, options);
+        const selection = try validateDestinationConfiguration(destination, options);
         var remote = try Source.initWithBackend(
             io,
             allocator,
@@ -1756,8 +1756,8 @@ pub const Destination = struct {
             options.sourceOptions(),
         );
         errdefer remote.deinit();
-        const owned_tag = try allocator.dupe(u8, tag);
-        errdefer allocator.free(owned_tag);
+        const owned_selection = try cloneSelection(allocator, selection);
+        errdefer deinitSelection(allocator, owned_selection);
         const spool_directory = try allocator.dupe(
             u8,
             options.spool_directory orelse ".",
@@ -1765,7 +1765,7 @@ pub const Destination = struct {
         return .{
             .allocator = allocator,
             .remote = remote,
-            .tag = owned_tag,
+            .selection = owned_selection,
             .graph_limits = options.graph_limits,
             .mount_policy = options.mount_policy,
             .upload_chunk_bytes = options.upload_chunk_bytes,
@@ -1782,7 +1782,7 @@ pub const Destination = struct {
         }
         self.seen.deinit();
         self.allocator.free(self.spool_directory);
-        self.allocator.free(self.tag);
+        deinitSelection(self.allocator, self.selection);
         self.remote.deinit();
         self.* = undefined;
     }
@@ -1820,7 +1820,7 @@ pub const Destination = struct {
             &plan,
             source.asTransport(),
             self.asTransport(),
-            .{ .tag = self.tag },
+            self.selection,
         );
     }
 
@@ -1878,12 +1878,11 @@ pub const Destination = struct {
                 null,
                 null,
             );
-        const tag = switch (selection orelse
-            return error.TagRequired) {
-            .tag => |value| value,
-            .digest => return error.TagRequired,
-        };
-        if (!std.mem.eql(u8, tag, self.tag)) return error.InvalidReference;
+        const selected = selection orelse return error.TagRequired;
+        if (!selectionEql(selected, self.selection)) return error.InvalidReference;
+        if (selected == .digest and !digest.eql(selected.digest)) {
+            return error.InvalidReference;
+        }
         if (root.size > self.graph_limits.max_metadata_bytes or
             root.size > self.graph_limits.max_total_bytes)
         {
@@ -3753,16 +3752,19 @@ pub const Destination = struct {
             self.state_value = .failed;
             return err;
         };
-        self.putManifest(
-            publication.descriptor,
-            publication.exact_bytes,
-            self.tag,
-            .commit_root,
-            true,
-        ) catch |err| {
-            self.state_value = .failed;
-            return err;
-        };
+        switch (self.selection) {
+            .tag => |tag| self.putManifest(
+                publication.descriptor,
+                publication.exact_bytes,
+                tag,
+                .commit_root,
+                true,
+            ) catch |err| {
+                self.state_value = .failed;
+                return err;
+            },
+            .digest => {},
+        }
         self.state_value = .committed;
         return .published;
     }
@@ -3771,8 +3773,8 @@ pub const Destination = struct {
         if (self.state_value != .committed) {
             return error.DestinationNotCommitted;
         }
-        // commitRoot already confirmed both the mutable tag and immutable
-        // digest. No fallible work may follow that final visibility change.
+        // commitRoot already confirmed the explicit selector. No fallible work
+        // may follow that final visibility change.
         self.state_value = .finished;
     }
 
@@ -3845,11 +3847,10 @@ pub const Destination = struct {
             publication.exact_bytes,
         ) catch return error.InvalidContent;
         if (selection) |selected| {
-            const tag = switch (selected) {
-                .tag => |value| value,
-                .digest => return error.TagRequired,
-            };
-            if (!std.mem.eql(u8, tag, self.tag)) {
+            if (!selectionEql(selected, self.selection)) {
+                return error.InvalidReference;
+            }
+            if (selected == .digest and !digest.eql(selected.digest)) {
                 return error.InvalidReference;
             }
         }
@@ -4463,14 +4464,13 @@ fn expectedSelectionDigest(selection: reference.Selection) ?content.Digest {
 fn validateDestinationConfiguration(
     destination: reference.RegistryReference,
     options: DestinationOptions,
-) Error![]const u8 {
-    const tag = switch (destination.selection orelse
-        return error.TagRequired) {
-        .tag => |value| value,
-        .digest => return error.TagRequired,
-    };
-    if (!validTag(tag, options.limits.max_tag_length)) {
-        return error.InvalidReference;
+) Error!reference.Selection {
+    const selection = destination.selection orelse return error.TagRequired;
+    switch (selection) {
+        .tag => |tag| if (!validTag(tag, options.limits.max_tag_length)) {
+            return error.InvalidReference;
+        },
+        .digest => {},
     }
     try options.limits.validate();
     options.auth_limits.validate() catch return error.InvalidConfiguration;
@@ -4492,7 +4492,43 @@ fn validateDestinationConfiguration(
             return error.InvalidConfiguration;
         }
     }
-    return tag;
+    return selection;
+}
+
+fn cloneSelection(
+    allocator: Allocator,
+    selection: reference.Selection,
+) Allocator.Error!reference.Selection {
+    return switch (selection) {
+        .tag => |tag| .{ .tag = try allocator.dupe(u8, tag) },
+        .digest => |digest| .{ .digest = digest },
+    };
+}
+
+fn deinitSelection(
+    allocator: Allocator,
+    selection: reference.Selection,
+) void {
+    switch (selection) {
+        .tag => |tag| allocator.free(tag),
+        .digest => {},
+    }
+}
+
+fn selectionEql(
+    left: reference.Selection,
+    right: reference.Selection,
+) bool {
+    return switch (left) {
+        .tag => |left_tag| switch (right) {
+            .tag => |right_tag| std.mem.eql(u8, left_tag, right_tag),
+            .digest => false,
+        },
+        .digest => |left_digest| switch (right) {
+            .tag => false,
+            .digest => |right_digest| left_digest.eql(right_digest),
+        },
+    };
 }
 
 fn percentEncodeQueryAlloc(

@@ -4,8 +4,9 @@
 //! recorded in `SOURCE_PROVENANCE.md`.
 //! Registry destinations verify/reuse or upload opaque blobs, publish exact
 //! child/root documents by immutable digest, and expose a destination tag only
-//! through the final `commitRoot` lifecycle operation. All registry/layout
-//! source and destination pairings use one complete-graph planner/executor.
+//! through the final `commitRoot` lifecycle operation. Digest destinations
+//! commit the exact immutable root. All registry/layout source and destination
+//! pairings use one complete-graph planner/executor.
 //! CLI behavior remains outside this increment.
 
 const std = @import("std");

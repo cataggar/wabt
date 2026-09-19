@@ -132,6 +132,11 @@ def build_wheel(
 
     readme_path = repo_root / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
+    entries.append((
+        f"{dist_info_dir}/README.md",
+        readme_text.encode(),
+        False,
+    ))
 
     metadata = (
         f"Metadata-Version: 2.4\n"

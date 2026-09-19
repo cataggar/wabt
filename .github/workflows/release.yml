@@ -84,7 +84,12 @@ jobs:
             *)         WABT="./zig-out/bin/wabt" ;;
           esac
           "$WABT" help oci
-          "$WABT" oci resolve help
+          "$WABT" oci help
+          for verb in push pull copy inspect resolve list-tags; do
+            "$WABT" help oci "$verb"
+            "$WABT" oci help "$verb"
+            "$WABT" oci "$verb" help
+          done
 
       - name: Package
         shell: bash
@@ -103,6 +108,7 @@ jobs:
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           test "$(tar tzf "$PKGNAME.tar.gz" | grep -Ec '/bin/[^/]+$')" -eq 1
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/LICENSE"
+          tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/README.md"
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/SOURCE_PROVENANCE.md"
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/THIRD_PARTY_NOTICES.md"
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/LICENSES/miz-MIT.txt"
@@ -138,6 +144,13 @@ jobs:
         run: |
           PKGNAME="wabt-${{ steps.version.outputs.version }}"
           git archive --format=tar --prefix="$PKGNAME/" HEAD | xz > "$PKGNAME.tar.xz"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/LICENSE"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/README.md"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/SOURCE_PROVENANCE.md"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/THIRD_PARTY_NOTICES.md"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/LICENSES/miz-MIT.txt"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/src/tools/wabt.zig"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/src/tools/oci.zig"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

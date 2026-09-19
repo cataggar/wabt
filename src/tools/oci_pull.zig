@@ -179,7 +179,7 @@ fn pullResolved(
     const payload = manifest.layers[0];
 
     if (parsed.json) {
-        return output.writeJson(runtime, output.PullV1{
+        output.writeJson(runtime, output.PullV1{
             .originalReference = parsed.reference_text,
             .reference = canonical,
             .root = output.descriptor(root_descriptor),
@@ -189,16 +189,8 @@ fn pullResolved(
             .profile = output.profileText(result.profile),
             .output = parsed.output_file,
             .size = result.bytes_written,
-        });
+        }) catch return error.CommittedButReportingFailed;
     }
-
-    const line = std.fmt.allocPrint(
-        runtime.allocator,
-        "pulled {s} to {s}\n",
-        .{ payload.digest, parsed.output_file },
-    ) catch return error.OutOfMemory;
-    defer runtime.allocator.free(line);
-    return output.writeText(runtime, line);
 }
 
 const digest =

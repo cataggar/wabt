@@ -251,6 +251,8 @@ pub const Runtime = struct {
     wall_clock: ?WallClock = null,
     graph_limits: wabt.oci.GraphLimits = .{},
     layout_failure_point: wabt.oci.LayoutFailurePoint = .none,
+    stdin_buffer: [max_secret_bytes + 2]u8 = undefined,
+    stdin_reader: ?std.Io.File.Reader = null,
 
     pub fn initProcess(
         init: std.process.Init,
@@ -474,11 +476,7 @@ pub const Runtime = struct {
                 max_secret_bytes + 2,
             ) catch return error.SecretReadFailed
         else
-            readSecretFromStdin(
-                self.allocator,
-                self.io,
-                max_secret_bytes,
-            ) catch |err| return err;
+            self.readSecretFromStdin() catch |err| return err;
         errdefer {
             std.crypto.secureZero(u8, bytes);
             self.allocator.free(bytes);
@@ -498,6 +496,22 @@ pub const Runtime = struct {
             .bytes = bytes,
             .value_len = value_len,
         };
+    }
+
+    fn readSecretFromStdin(self: *Runtime) ![]u8 {
+        if (self.stdin_reader == null) {
+            self.stdin_reader = std.Io.File.stdin().readerStreaming(
+                self.io,
+                &self.stdin_buffer,
+            );
+        }
+        const reader = &self.stdin_reader.?;
+        const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.SecretTooLarge,
+            error.ReadFailed => return error.SecretReadFailed,
+        } orelse return error.EmptySecret;
+        if (line.len > max_secret_bytes + 1) return error.SecretTooLarge;
+        return self.allocator.dupe(u8, line);
     }
 };
 
@@ -550,21 +564,6 @@ fn createProductionDestination(
         ),
     };
     return RegistryDestinationHandle.init(owned);
-}
-
-fn readSecretFromStdin(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    limit: usize,
-) ![]u8 {
-    var buffer: [max_secret_bytes + 2]u8 = undefined;
-    var reader = std.Io.File.stdin().readerStreaming(io, &buffer);
-    const line = reader.interface.takeDelimiter('\n') catch |err| switch (err) {
-        error.StreamTooLong => return error.SecretTooLarge,
-        error.ReadFailed => return error.SecretReadFailed,
-    } orelse return error.EmptySecret;
-    if (line.len > limit + 2) return error.SecretTooLarge;
-    return allocator.dupe(u8, line);
 }
 
 fn trackedFileRead(
@@ -661,4 +660,35 @@ test "caller-owned secrets avoid stdin and are not retained by runtime" {
     try std.testing.expect(factory.saw_secret);
     try std.testing.expectEqual(@as(usize, 0), counters.stdin_reads);
     try std.testing.expectEqual(@as(usize, 1), counters.network_clients);
+}
+
+test "stdin secret reader preserves buffered source and destination records" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "secrets",
+        .data = "source-password\ndestination-token\n",
+    });
+    var file = try temporary.dir.openFile(std.testing.io, "secrets", .{});
+    defer file.close(std.testing.io);
+
+    var counters: Counters = .{};
+    var runtime = Runtime.initForTest(
+        std.testing.allocator,
+        std.testing.io,
+        &counters,
+    );
+    runtime.stdin_reader = file.readerStreaming(
+        std.testing.io,
+        &runtime.stdin_buffer,
+    );
+
+    var source = try runtime.readSecret();
+    defer source.deinit();
+    var destination = try runtime.readSecret();
+    defer destination.deinit();
+    try std.testing.expectEqualStrings("source-password", source.value());
+    try std.testing.expectEqualStrings("destination-token", destination.value());
+    try std.testing.expectEqual(@as(usize, 2), counters.stdin_reads);
+    try std.testing.expectError(error.EmptySecret, runtime.readSecret());
 }
