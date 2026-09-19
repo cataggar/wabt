@@ -127,3 +127,53 @@ profile is the OCI 1.1/ORAS shape with the canonical empty JSON config; it is
 generic-OCI compatible but intentionally not accepted by wkg's Wasm-v0 config
 check. The OCI 1.0 ORAS shape is accepted for reads only. Tests do not invoke
 ORAS, wkg, a registry, an archive tool, or a runtime.
+
+## OCI interoperability fixture producers
+
+The checked-in corpus under `src/fixtures/oci/` is generated separately from
+ordinary tests. `src/fixtures/oci/manifest.json` is the machine-readable source
+of truth for every producer command, root/config/payload descriptor, file hash,
+expected acceptance or rejection, and actual executable/compiler hash. The
+offline verifier and default Zig tests consume only committed bytes.
+
+- **ORAS CLI 1.3.4:** signed tag commit
+  [`db9e29505c3059f2b8fde34ae8cae266c5c765e9`](https://github.com/oras-project/oras/commit/db9e29505c3059f2b8fde34ae8cae266c5c765e9).
+  The official checksum-list SHA-256 is
+  `19d479e497fb5e30c7de3c621e3ed337e3857de0d96542021a73e2d8016dbe5a`;
+  the Linux arm64 archive SHA-256 is
+  `15702c6e3a4a56a8bd8ac5c17efdbcab56d9bada661ccbcf017f5b10c1d89399`.
+  The executed binary reported Go 1.25.14, commit `db9e295…`, and SHA-256
+  `2915306a072ba69e4efbbe20d79246c5dbba8158efc8c4400841eca70dd5f458`.
+- **wkg 0.16.1:** verified wasm-pkg-tools revision
+  [`5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a`](https://github.com/bytecodealliance/wasm-pkg-tools/commit/5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a),
+  tree `ea20d1f82502eec5c5bc7315bc0fd7653a154221`, with `Cargo.lock`
+  SHA-256 `bf465c989fa26cb06778624fd2de843ca5d6318b4a58418c9e392e13dc02d732`.
+  It was built `--locked` by rustc 1.97.0
+  (`2d8144b7880597b6e6d3dfd63a9a9efae3f533d3`, binary SHA-256
+  `cb482cd75185f5dde1d40e50b258c5cd6a4465dcf3f494f2dc0e57224bf314b2`)
+  and Cargo 1.97.0 (binary SHA-256
+  `48465d951d7b6a98f2fd9cddfa3bfde8ad81796d8c4b56d1f1e4c45775740b53`)
+  using Zig 0.16.0 as the native linker. The executed normalized wkg binary
+  SHA-256 is
+  `f37d41d16bf3f1759e36e7604629d52826ad5f9da6008940e33c8823e888383e`.
+- **oci-wasm 0.6.0:** crates.io checksum
+  `87689298bd74f0f2675fcac99956a34c31098ca3bdced3d7635e71dc03c5ca21`;
+  tag commit
+  [`8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd`](https://github.com/bytecodealliance/rust-oci-wasm/commit/8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd).
+  Generation checks both the locked crate checksum and authoritative tag
+  identity.
+- **Distribution registry 3.1.1:** official Linux arm64 archive SHA-256
+  `8167316d2b4a57e10d44f8c8a3c75fea5f3ec1c71872760bb903e5e8e52e9ad6`;
+  executed binary SHA-256
+  `669f0d9892da6ccd44a40954f39a3b929f4455d7ed02a806828346feac572834`.
+  It is bound only to loopback and stores disposable data below `zig-out`.
+- **Fixed realtime interposer:** WABT-owned source
+  `scripts/oci/fixed_realtime.c`, SHA-256
+  `6ff9857612af1f1ef6cdc33908026c6e804c3f65f00c204b907db3c0d5428fbe`,
+  fixes only realtime clocks at `2026-09-19T00:00:00Z`; monotonic clocks
+  remain real. Its generated binary hash is recorded in the fixture manifest.
+
+These programs are fixture/test producers, not linked WABT dependencies.
+Successful transport interoperability does not claim signature verification,
+runtime compatibility, production readiness, or general cross-runtime
+support.

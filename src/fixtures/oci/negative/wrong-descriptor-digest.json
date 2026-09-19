@@ -1,0 +1,30 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "category": "descriptor-digest-mismatch",
+    "destinationTag": "absent-or-unchanged",
+    "finalOutput": "absent-or-byte-identical",
+    "result": "reject",
+    "staging": "removed"
+  },
+  "id": "wrong-descriptor-digest",
+  "mutations": [
+    {
+      "operation": "replace",
+      "target": "root.digest",
+      "value": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "operation": "replace",
+      "target": "manifest.config.digest",
+      "value": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "operation": "replace",
+      "target": "manifest.layers[0].digest",
+      "value": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    }
+  ],
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

@@ -1,0 +1,17 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "category": "unsupported-layer-media-type",
+    "finalOutput": "absent",
+    "result": "reject",
+    "unpacked": false
+  },
+  "id": "tar-labeled-raw-wasm",
+  "mutation": {
+    "operation": "replace",
+    "target": "manifest.layers[0].mediaType",
+    "value": "application/vnd.oci.image.layer.v1.tar"
+  },
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

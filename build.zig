@@ -292,6 +292,21 @@ pub fn build(b: *std.Build) void {
     oci_registry_test_step.dependOn(&run_oci_registry_tests.step);
     test_step.dependOn(oci_registry_test_step);
 
+    const oci_fixture_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/oci_fixture_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wabt", .module = wabt_mod },
+        },
+    });
+    const oci_fixture_tests = b.addTest(.{
+        .root_module = oci_fixture_test_mod,
+    });
+    const run_oci_fixture_tests = b.addRunArtifact(oci_fixture_tests);
+    test_step.dependOn(&run_oci_fixture_tests.step);
+    oci_cli_test_step.dependOn(&run_oci_fixture_tests.step);
+
     // Per-subcommand inline tests
     for (subcommand_sources) |src| {
         const sub_mod = b.createModule(.{

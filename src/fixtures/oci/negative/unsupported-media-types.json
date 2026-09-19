@@ -1,0 +1,28 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "category": "unsupported-profile-or-media-type",
+    "finalOutput": "absent",
+    "result": "reject"
+  },
+  "id": "unsupported-media-types",
+  "mutations": [
+    {
+      "operation": "replace",
+      "target": "root.mediaType",
+      "value": "application/vnd.example.root"
+    },
+    {
+      "operation": "replace",
+      "target": "manifest.config.mediaType",
+      "value": "application/vnd.example.config"
+    },
+    {
+      "operation": "replace",
+      "target": "manifest.layers[0].mediaType",
+      "value": "application/vnd.example.layer"
+    }
+  ],
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

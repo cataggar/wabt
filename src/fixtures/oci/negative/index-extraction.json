@@ -1,0 +1,13 @@
+{
+  "baseLayout": "index",
+  "expected": {
+    "copy": "preserve-complete-graph",
+    "finalOutput": "absent",
+    "inspect": "accept-complete-graph",
+    "platformSelection": false,
+    "pull": "reject"
+  },
+  "id": "index-extraction",
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

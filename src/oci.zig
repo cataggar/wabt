@@ -24,6 +24,7 @@ pub const copy = @import("oci/copy.zig");
 pub const wasm_metadata = @import("oci/wasm_metadata.zig");
 pub const wasm = @import("oci/wasm.zig");
 pub const extract = @import("oci/extract.zig");
+pub const fixture_support = @import("oci/fixture_support.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -173,4 +174,5 @@ test {
     _ = @import("oci/wasm.zig");
     _ = @import("oci/extract.zig");
     _ = @import("oci/integration_tests.zig");
+    _ = @import("oci/interoperability_tests.zig");
 }

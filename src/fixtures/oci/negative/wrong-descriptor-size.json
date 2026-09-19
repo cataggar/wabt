@@ -1,0 +1,29 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "category": "descriptor-size-mismatch",
+    "destinationTag": "absent-or-unchanged",
+    "finalOutput": "absent-or-byte-identical",
+    "result": "reject"
+  },
+  "id": "wrong-descriptor-size",
+  "mutations": [
+    {
+      "operation": "add",
+      "target": "root.size",
+      "value": 1
+    },
+    {
+      "operation": "add",
+      "target": "manifest.config.size",
+      "value": 1
+    },
+    {
+      "operation": "add",
+      "target": "manifest.layers[0].size",
+      "value": 1
+    }
+  ],
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

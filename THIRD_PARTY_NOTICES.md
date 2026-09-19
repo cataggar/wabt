@@ -26,3 +26,24 @@ subject-bearing or unsupported graph nodes.
 
 miz is licensed under the MIT License. The complete license text from the
 pinned revision is reproduced in [`LICENSES/miz-MIT.txt`](LICENSES/miz-MIT.txt).
+
+## OCI fixture producers
+
+The regeneration script downloads or builds these pinned public tools only to
+produce interoperability test data:
+
+- ORAS CLI v1.3.4, Apache License 2.0
+- wasm-pkg-tools `wkg` revision
+  `5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a`, Apache License 2.0 with LLVM
+  exception
+- oci-wasm v0.6.0, Apache License 2.0 with LLVM exception
+- Distribution registry v3.1.1, Apache License 2.0
+- Rust 1.97.0/rustup 1.28.2, used only as the pinned wkg build toolchain
+
+Their binaries and source trees are not redistributed, linked into WABT, or
+required by normal builds, tests, packages, or runtime use. Exact source and
+release URLs, checksums, versions, commands, and generated hashes are recorded
+in [`SOURCE_PROVENANCE.md`](SOURCE_PROVENANCE.md) and
+[`src/fixtures/oci/manifest.json`](src/fixtures/oci/manifest.json). These
+notices describe the fixture production boundary and do not apply third-party
+licenses to WABT as a whole.

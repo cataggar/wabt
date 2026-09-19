@@ -1,0 +1,1 @@
+{"schemaVersion":2,"manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:f987dbe05025e936f0043c6ce69199d14baddbe972f56806e3b5b251c7b39642","size":437,"annotations":{"org.opencontainers.image.ref.name":"fixture"}}]}
