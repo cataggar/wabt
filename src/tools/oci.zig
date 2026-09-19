@@ -1,7 +1,7 @@
 //! `wabt oci <verb>` — canonical OCI artifact commands.
 //!
-//! Read commands execute through injected runtime boundaries. Push and copy
-//! remain explicit non-successes for the next increment.
+//! All registry access executes through injected runtime boundaries. Local
+//! layout operations remain offline and instantiate no registry endpoint.
 
 const std = @import("std");
 
@@ -18,9 +18,9 @@ pub const usage =
     "Usage: wabt oci <verb> [args...]\n" ++
     "\n" ++
     "OCI WebAssembly artifact commands:\n" ++
-    "  push       Not implemented (planned next increment)\n" ++
+    "  push       Publish a validated Wasm artifact to a registry tag\n" ++
     "  pull       Atomically extract one supported direct Wasm artifact\n" ++
-    "  copy       Not implemented (planned next increment)\n" ++
+    "  copy       Copy a complete OCI graph between registries/layouts\n" ++
     "  inspect    Inspect a verified registry or OCI layout graph\n" ++
     "  resolve    Resolve a mutable or local reference immutably\n" ++
     "  list-tags  List all tags in one registry repository\n" ++
@@ -160,9 +160,9 @@ test "subject and leaf help are stable and side-effect free" {
         "Usage: wabt oci <verb> [args...]\n" ++
         "\n" ++
         "OCI WebAssembly artifact commands:\n" ++
-        "  push       Not implemented (planned next increment)\n" ++
+        "  push       Publish a validated Wasm artifact to a registry tag\n" ++
         "  pull       Atomically extract one supported direct Wasm artifact\n" ++
-        "  copy       Not implemented (planned next increment)\n" ++
+        "  copy       Copy a complete OCI graph between registries/layouts\n" ++
         "  inspect    Inspect a verified registry or OCI layout graph\n" ++
         "  resolve    Resolve a mutable or local reference immutably\n" ++
         "  list-tags  List all tags in one registry repository\n" ++
@@ -196,38 +196,6 @@ test "subject and leaf help are stable and side-effect free" {
         try std.testing.expectEqualStrings(case.expected, result.help);
     }
     try std.testing.expect(counters.isZero());
-}
-
-test "well-formed mutating commands remain explicitly unimplemented" {
-    const commands = [_][]const []const u8{
-        &.{ "push", "registry.example/team/app:tag", "app.wasm" },
-        &.{ "copy", "oci:source", "oci:destination" },
-        &.{
-            "copy",
-            "localhost:5000/team/source:tag",
-            "localhost:6000/team/destination:tag",
-            "--source-password-stdin",
-            "--source-username",
-            "source-user",
-            "--destination-token-stdin",
-            "--source-plain-http",
-            "--destination-plain-http",
-        },
-    };
-
-    for (commands) |command| {
-        var counters: runtime_mod.Counters = .{};
-        var runtime = runtime_mod.Runtime.initForTest(
-            std.testing.allocator,
-            std.testing.io,
-            &counters,
-        );
-        try std.testing.expectError(
-            error.CommandNotImplemented,
-            dispatch(command, &runtime),
-        );
-        try std.testing.expect(counters.isZero());
-    }
 }
 
 test "invalid parse paths return before all runtime boundaries" {

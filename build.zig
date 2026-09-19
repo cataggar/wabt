@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         "src/tools/oci_runtime.zig",
         "src/tools/oci_output.zig",
         "src/tools/oci_read_test.zig",
+        "src/tools/oci_write_test.zig",
         "src/tools/oci_push.zig",
         "src/tools/oci_pull.zig",
         "src/tools/oci_copy.zig",
@@ -361,9 +362,9 @@ pub fn build(b: *std.Build) void {
             "Usage: wabt oci <verb> [args...]\n" ++
             "\n" ++
             "OCI WebAssembly artifact commands:\n" ++
-            "  push       Not implemented (planned next increment)\n" ++
+            "  push       Publish a validated Wasm artifact to a registry tag\n" ++
             "  pull       Atomically extract one supported direct Wasm artifact\n" ++
-            "  copy       Not implemented (planned next increment)\n" ++
+            "  copy       Copy a complete OCI graph between registries/layouts\n" ++
             "  inspect    Inspect a verified registry or OCI layout graph\n" ++
             "  resolve    Resolve a mutable or local reference immutably\n" ++
             "  list-tags  List all tags in one registry repository\n" ++
@@ -434,23 +435,6 @@ pub fn build(b: *std.Build) void {
             oci_cli_test_step.dependOn(&dash_help.step);
         }
 
-        const oci_valid_cases = [_][]const []const u8{
-            &.{ "oci", "push", "registry.example/team/app:tag", "app.wasm" },
-            &.{ "oci", "copy", "oci:source-layout", "oci:destination-layout" },
-        };
-        inline for (oci_valid_cases) |case| {
-            const unwired = b.addRunArtifact(wabt_exe);
-            unwired.addArgs(case);
-            unwired.expectExitCode(1);
-            unwired.expectStdOutEqual("");
-            unwired.expectStdErrEqual(b.fmt(
-                "error: wabt oci {s}: CommandNotImplemented\n",
-                .{case[1]},
-            ));
-            test_step.dependOn(&unwired.step);
-            oci_cli_test_step.dependOn(&unwired.step);
-        }
-
         const oci_layout_fixture = b.addWriteFiles();
         _ = oci_layout_fixture.add(
             "oci-layout",
@@ -519,6 +503,39 @@ pub fn build(b: *std.Build) void {
         layout_pull.expectStdErrEqual("");
         test_step.dependOn(&layout_pull.step);
         oci_cli_test_step.dependOn(&layout_pull.step);
+
+        const layout_copy = b.addRunArtifact(wabt_exe);
+        layout_copy.addArgs(&.{ "oci", "copy" });
+        layout_copy.addDecoratedDirectoryArg(
+            "oci:",
+            layout_directory,
+            ":smoke",
+        );
+        const copied_layout = layout_copy.addPrefixedOutputFileArg(
+            "oci:",
+            "copied-layout",
+        );
+        layout_copy.expectExitCode(0);
+        layout_copy.expectStdOutEqual(
+            "sha256:5786275fcb65fe4d8856d79f032d2835db65e4795d83628a5313f54eefeed241\n",
+        );
+        layout_copy.expectStdErrEqual("");
+        test_step.dependOn(&layout_copy.step);
+        oci_cli_test_step.dependOn(&layout_copy.step);
+
+        const copied_layout_resolve = b.addRunArtifact(wabt_exe);
+        copied_layout_resolve.addArgs(&.{ "oci", "resolve" });
+        copied_layout_resolve.addPrefixedDirectoryArg(
+            "oci:",
+            copied_layout,
+        );
+        copied_layout_resolve.expectExitCode(0);
+        copied_layout_resolve.expectStdOutMatch(
+            "@sha256:5786275fcb65fe4d8856d79f032d2835db65e4795d83628a5313f54eefeed241",
+        );
+        copied_layout_resolve.expectStdErrEqual("");
+        test_step.dependOn(&copied_layout_resolve.step);
+        oci_cli_test_step.dependOn(&copied_layout_resolve.step);
 
         const oci_invalid_cases = [_]struct {
             args: []const []const u8,
