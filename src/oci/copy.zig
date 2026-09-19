@@ -333,6 +333,7 @@ const RecordingDestination = struct {
         finished,
     } = .initial,
     dependency_count: usize = 0,
+    fail_finish: bool = false,
 
     pub fn prepareRoot(
         self: *RecordingDestination,
@@ -441,6 +442,7 @@ const RecordingDestination = struct {
 
     pub fn finish(self: *RecordingDestination) !void {
         try testing.expectEqual(.committed, self.phase);
+        if (self.fail_finish) return error.InjectedFailure;
         self.phase = .finished;
     }
 };
@@ -493,6 +495,27 @@ test "prepared package uses bounded generic copy and publishes root last" {
             result.root,
         ),
     );
+
+    var failed_temporary = testing.tmpDir(.{});
+    defer failed_temporary.cleanup();
+    var failed_finish: RecordingDestination = .{
+        .io = testing.io,
+        .directory = &failed_temporary.dir,
+        .package = &package,
+        .fail_finish = true,
+    };
+    try testing.expectError(
+        error.InjectedFailure,
+        planAndCopy(
+            testing.allocator,
+            source.asTransport(),
+            source.root(),
+            transport.Destination.init(&failed_finish),
+            .{ .tag = "generic" },
+            limits,
+        ),
+    );
+    try testing.expectEqual(.committed, failed_finish.phase);
 
     var bounded_destination: RecordingDestination = .{
         .io = testing.io,

@@ -986,6 +986,7 @@ pub const Source = struct {
                 error.MaximumTotalBytesExceeded,
                 error.TotalSizeOverflow,
                 error.MaximumMetadataBytesExceeded,
+                error.MaximumTotalMetadataBytesExceeded,
                 error.LimitExceeded,
                 => self.fail(
                     error.LimitExceeded,
@@ -1659,7 +1660,8 @@ const SeenDescriptor = struct {
     size: u64,
     media_type: []u8,
     roles: transport.DescriptorRoles,
-    outcome: ?transport.DescriptorResult = null,
+    blob_outcome: ?transport.DescriptorResult = null,
+    document_outcome: ?transport.DescriptorResult = null,
 };
 
 const MountOutcome = union(enum) {
@@ -1698,6 +1700,7 @@ pub const Destination = struct {
     seen: std.AutoHashMap(content.Digest, SeenDescriptor),
     total_declared_bytes: u64 = 0,
     pending_upload: ?UploadHandoff = null,
+    upload_retry_permitted: bool = false,
 
     pub fn init(
         io: Io,
@@ -1970,13 +1973,12 @@ pub const Destination = struct {
                     bytes,
                     .publish_manifest,
                 );
-                self.setOutcome(digest, outcome);
+                self.setOutcome(digest, transfer.roles, outcome);
                 return outcome;
             },
             .opaque_blob => |source| {
                 if (transfer.roles.root or transfer.roles.index_child or
-                    (!transfer.roles.config and !transfer.roles.layer) or
-                    model.classifyMediaType(transfer.descriptor.mediaType).isDocument())
+                    (!transfer.roles.config and !transfer.roles.layer))
                 {
                     return error.InvalidContent;
                 }
@@ -1998,7 +2000,7 @@ pub const Destination = struct {
         const digest = model.validateDescriptor(descriptor) catch
             return error.InvalidContent;
         if (try self.blobState(descriptor) == .verified) {
-            self.setOutcome(digest, .reused);
+            self.setOutcome(digest, roles, .reused);
             return .reused;
         }
 
@@ -2008,7 +2010,7 @@ pub const Destination = struct {
             if (try self.mountEligible(identity)) {
                 switch (try self.tryMount(identity, descriptor)) {
                     .mounted => {
-                        self.setOutcome(digest, .mounted);
+                        self.setOutcome(digest, roles, .mounted);
                         return .mounted;
                     },
                     .declined => |session| {
@@ -2032,48 +2034,88 @@ pub const Destination = struct {
         defer spool.deinit(self.remote.io, self.allocator);
 
         const used_mount_session = mount_session != null;
-        var session = if (mount_session) |owned_session| blk: {
+        var session: ?UploadSession = if (mount_session) |owned_session| blk: {
             mount_session = null;
-            break :blk @as(?UploadSession, owned_session);
-        } else try self.beginUpload(descriptor, roles);
-        if (session == null) {
-            self.setOutcome(digest, .reused);
-            self.clearPendingUpload();
-            return .reused;
-        }
-        try self.trackPendingUpload(
-            descriptor,
-            roles,
-            (if (source.registry_identity == null)
-                .blob_missing
-            else if (used_mount_session)
-                .mount_declined
-            else
-                .mount_not_permitted),
-            &session.?,
-            true,
-        );
-        defer session.?.deinit(self.allocator);
+            break :blk owned_session;
+        } else null;
+        defer if (session) |*owned_session| {
+            owned_session.deinit(self.allocator);
+        };
 
-        const completed = if (self.upload_chunk_bytes) |chunk_bytes|
-            try self.uploadChunked(
-                &session.?,
-                spool.file,
+        var attempt: u16 = 0;
+        while (attempt < self.remote.client.limits.max_attempts) {
+            attempt += 1;
+            if (session == null) {
+                self.upload_retry_permitted = false;
+                session = self.beginUpload(descriptor, roles) catch |err| {
+                    if (err == error.UploadIncomplete and
+                        self.upload_retry_permitted and
+                        self.uploadRetryAvailable(attempt))
+                    {
+                        continue;
+                    }
+                    return err;
+                };
+                if (session == null) {
+                    self.setOutcome(digest, roles, .reused);
+                    self.clearPendingUpload();
+                    return .reused;
+                }
+            }
+            try self.trackPendingUpload(
                 descriptor,
                 roles,
-                chunk_bytes,
-            )
-        else
-            try self.uploadMonolithic(
+                (if (source.registry_identity == null)
+                    .blob_missing
+                else if (used_mount_session and attempt == 1)
+                    .mount_declined
+                else
+                    .mount_not_permitted),
                 &session.?,
-                spool.file,
-                descriptor,
-                roles,
+                true,
             );
-        if (!completed) return error.UploadIncomplete;
-        self.setOutcome(digest, .transferred);
-        self.clearPendingUpload();
-        return .transferred;
+
+            self.upload_retry_permitted = false;
+            const completed = if (self.upload_chunk_bytes) |chunk_bytes|
+                self.uploadChunked(
+                    &session.?,
+                    spool.file,
+                    descriptor,
+                    roles,
+                    chunk_bytes,
+                )
+            else
+                self.uploadMonolithic(
+                    &session.?,
+                    spool.file,
+                    descriptor,
+                    roles,
+                );
+            const upload_complete = completed catch |err| {
+                if (err == error.UploadAmbiguous and
+                    self.upload_retry_permitted and
+                    self.uploadRetryAvailable(attempt))
+                {
+                    session.?.deinit(self.allocator);
+                    session = null;
+                    continue;
+                }
+                return err;
+            };
+            if (!upload_complete) return error.UploadIncomplete;
+            self.setOutcome(digest, roles, .transferred);
+            self.clearPendingUpload();
+            return .transferred;
+        }
+        return error.UploadIncomplete;
+    }
+
+    fn uploadRetryAvailable(
+        self: *const Destination,
+        attempt: u16,
+    ) bool {
+        return attempt < self.remote.client.limits.max_attempts and
+            self.remote.client.clock.now() < self.remote.deadline.at_ns;
     }
 
     fn clearPendingUpload(self: *Destination) void {
@@ -2318,6 +2360,7 @@ pub const Destination = struct {
             );
         };
         if (blob_state == .verified) return null;
+        self.upload_retry_permitted = true;
         try self.trackPendingUpload(
             descriptor,
             roles,
@@ -2354,11 +2397,16 @@ pub const Destination = struct {
             @memset(target, 0);
             self.allocator.free(target);
         }
+        var verification = UploadVerification.init(
+            digest,
+            descriptor.size,
+        ) catch return error.InvalidContent;
         var file_source: FileBodySource = .{
             .io = self.remote.io,
             .file = file,
             .start = 0,
             .length = descriptor.size,
+            .verification = &verification,
         };
         const headers = [_]registry_http.Header{.{
             .name = "Content-Type",
@@ -2377,15 +2425,34 @@ pub const Destination = struct {
             ),
             .allow_auth_replay = false,
             .deadline = self.remote.deadline,
-        }) catch |err| return self.resolveAmbiguousBlobWrite(
-            err,
-            session,
-            descriptor,
-            roles,
-            .write_ambiguous,
-            .destination_upload_write,
-        );
+        }) catch |err| {
+            if (verification.failure) |failure| {
+                return self.mapUploadReadFailure(
+                    failure,
+                    descriptor,
+                    .destination_upload_write,
+                );
+            }
+            return self.resolveAmbiguousBlobWrite(
+                err,
+                session,
+                descriptor,
+                roles,
+                .write_ambiguous,
+                .destination_upload_write,
+            );
+        };
         defer response.deinit();
+        if (!verification.finished) {
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_upload_write,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        }
         if (registry_http.isRetryableStatus(response.status)) {
             return self.resolveAmbiguousBlobResponse(
                 session,
@@ -2437,6 +2504,10 @@ pub const Destination = struct {
                 digest,
             );
         }
+        var verification = UploadVerification.init(
+            digest,
+            descriptor.size,
+        ) catch return error.InvalidContent;
 
         while (session.offset < descriptor.size) {
             const length = @min(
@@ -2450,6 +2521,7 @@ pub const Destination = struct {
                 .file = file,
                 .start = session.offset,
                 .length = length,
+                .verification = &verification,
             };
             var range_buffer: [96]u8 = undefined;
             const range = std.fmt.bufPrint(
@@ -2477,14 +2549,23 @@ pub const Destination = struct {
                 ),
                 .allow_auth_replay = false,
                 .deadline = self.remote.deadline,
-            }) catch |err| return self.resolveAmbiguousBlobWrite(
-                err,
-                session,
-                descriptor,
-                roles,
-                .write_ambiguous,
-                .destination_upload_write,
-            );
+            }) catch |err| {
+                if (verification.failure) |failure| {
+                    return self.mapUploadReadFailure(
+                        failure,
+                        descriptor,
+                        .destination_upload_write,
+                    );
+                }
+                return self.resolveAmbiguousBlobWrite(
+                    err,
+                    session,
+                    descriptor,
+                    roles,
+                    .write_ambiguous,
+                    .destination_upload_write,
+                );
+            };
             defer response.deinit();
             if (registry_http.isRetryableStatus(response.status)) {
                 return self.resolveAmbiguousBlobResponse(
@@ -2512,6 +2593,16 @@ pub const Destination = struct {
             );
             session.deinit(self.allocator);
             session.* = next;
+        }
+        if (!verification.finished) {
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_upload_write,
+                .invalid_content,
+                null,
+                null,
+                digest,
+            );
         }
 
         const target = try appendDigestQueryAlloc(
@@ -2564,6 +2655,33 @@ pub const Destination = struct {
             .destination_upload_finalize,
         );
         return true;
+    }
+
+    fn mapUploadReadFailure(
+        self: *Destination,
+        failure: UploadReadFailure,
+        descriptor: model.Descriptor,
+        operation: Operation,
+    ) Error {
+        const digest = descriptor.parsedDigest() catch null;
+        return switch (failure) {
+            .invalid_content => self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                null,
+                null,
+                digest,
+            ),
+            .transport => self.remote.fail(
+                error.TransportFailed,
+                operation,
+                .transport,
+                null,
+                null,
+                digest,
+            ),
+        };
     }
 
     fn resolveAmbiguousBlobWrite(
@@ -2623,6 +2741,7 @@ pub const Destination = struct {
             self.remote.last_diagnostic = null;
             return true;
         }
+        self.upload_retry_permitted = true;
         try self.trackPendingUpload(
             descriptor,
             roles,
@@ -2979,6 +3098,11 @@ pub const Destination = struct {
         };
         defer response.deinit();
 
+        if (registry_http.isRetryableStatus(response.status)) {
+            if (try self.blobState(descriptor) == .verified) return .mounted;
+            self.remote.last_diagnostic = null;
+            return .fallback;
+        }
         switch (response.status) {
             201 => {
                 try self.remote.corroborateDigestHeader(
@@ -3604,7 +3728,11 @@ pub const Destination = struct {
             self.state_value = .failed;
             return error.InvalidContent;
         };
-        self.setOutcome(digest, result);
+        self.setOutcome(
+            digest,
+            transport.DescriptorRoles.init(.root),
+            result,
+        );
         self.state_value = .staged;
         return result;
     }
@@ -3658,14 +3786,12 @@ pub const Destination = struct {
         if (!roles.root and !roles.index_child and !roles.config and !roles.layer) {
             return error.InvalidContent;
         }
+        const is_document = roles.root or roles.index_child;
+        const is_blob = roles.config or roles.layer;
+        if (is_document == is_blob) return error.InvalidContent;
         if (self.seen.getPtr(digest)) |existing| {
             if (existing.size != descriptor.size or
                 !std.mem.eql(u8, existing.media_type, descriptor.mediaType))
-            {
-                return error.InvalidContent;
-            }
-            if (existing.roles.root != roles.root and
-                (existing.roles.root or roles.root))
             {
                 return error.InvalidContent;
             }
@@ -3674,7 +3800,10 @@ pub const Destination = struct {
                 existing.roles.index_child or roles.index_child;
             existing.roles.config = existing.roles.config or roles.config;
             existing.roles.layer = existing.roles.layer or roles.layer;
-            return existing.outcome;
+            return if (is_document)
+                existing.document_outcome
+            else
+                existing.blob_outcome;
         }
         if (@as(u64, @intCast(self.seen.count())) >=
             self.graph_limits.max_nodes)
@@ -3729,9 +3858,15 @@ pub const Destination = struct {
     fn setOutcome(
         self: *Destination,
         digest: content.Digest,
+        roles: transport.DescriptorRoles,
         outcome: transport.DescriptorResult,
     ) void {
-        self.seen.getPtr(digest).?.outcome = outcome;
+        const entry = self.seen.getPtr(digest).?;
+        if (roles.root or roles.index_child) {
+            entry.document_outcome = outcome;
+        } else {
+            entry.blob_outcome = outcome;
+        }
     }
 };
 
@@ -3758,11 +3893,67 @@ const SpoolFile = struct {
     }
 };
 
+const UploadReadFailure = enum {
+    invalid_content,
+    transport,
+};
+
+const UploadVerification = struct {
+    verifier: content.Verifier,
+    size: u64,
+    offset: u64 = 0,
+    finished: bool = false,
+    failure: ?UploadReadFailure = null,
+
+    fn init(digest: content.Digest, size: u64) !UploadVerification {
+        var result: UploadVerification = .{
+            .verifier = content.Verifier.init(digest, size),
+            .size = size,
+        };
+        if (size == 0) {
+            try result.verifier.finish();
+            result.finished = true;
+        }
+        return result;
+    }
+
+    fn update(
+        self: *UploadVerification,
+        position: u64,
+        bytes: []const u8,
+    ) registry_http.BodySourceError!void {
+        if (self.failure != null or self.finished or position != self.offset) {
+            self.failure = .invalid_content;
+            return error.SourceFailed;
+        }
+        self.verifier.update(bytes) catch {
+            self.failure = .invalid_content;
+            return error.SourceFailed;
+        };
+        self.offset = std.math.add(
+            u64,
+            self.offset,
+            @intCast(bytes.len),
+        ) catch {
+            self.failure = .invalid_content;
+            return error.SourceFailed;
+        };
+        if (self.offset == self.size) {
+            self.verifier.finish() catch {
+                self.failure = .invalid_content;
+                return error.SourceFailed;
+            };
+            self.finished = true;
+        }
+    }
+};
+
 const FileBodySource = struct {
     io: Io,
     file: Io.File,
     start: u64,
     length: u64,
+    verification: *UploadVerification,
 
     pub fn read(
         self: *FileBodySource,
@@ -3776,11 +3967,20 @@ const FileBodySource = struct {
         ));
         const position = std.math.add(u64, self.start, offset) catch
             return error.SourceFailed;
-        return self.file.readPositional(
+        const count = self.file.readPositional(
             self.io,
             &.{buffer[0..remaining]},
             position,
-        ) catch error.SourceFailed;
+        ) catch {
+            self.verification.failure = .transport;
+            return error.SourceFailed;
+        };
+        if (count == 0) {
+            self.verification.failure = .invalid_content;
+            return error.SourceFailed;
+        }
+        try self.verification.update(position, buffer[0..count]);
+        return count;
     }
 };
 
@@ -4279,7 +4479,8 @@ fn validateDestinationConfiguration(
     if (options.graph_limits.max_depth == 0 or
         options.graph_limits.max_nodes == 0 or
         options.graph_limits.max_total_bytes == 0 or
-        options.graph_limits.max_metadata_bytes == 0)
+        options.graph_limits.max_metadata_bytes == 0 or
+        options.graph_limits.max_total_metadata_bytes == 0)
     {
         return error.InvalidConfiguration;
     }

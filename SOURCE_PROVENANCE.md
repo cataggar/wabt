@@ -66,13 +66,16 @@ WABT requires an explicit destination tag and independent destination
 authentication context, re-verifies blob bytes before reuse and after a 201
 mount, percent-encodes mount parameters, and disables non-idempotent
 redirect/retry/authentication replay. Missing opaque blobs are streamed once
-into exclusive private spool files, independently reverified, and uploaded
-through bounded monolithic PUT or explicitly configured PATCH/finalize flows.
-Every returned session Location is bounded and revalidated; signed queries are
-preserved, cross-origin authorization is stripped, offsets/UUIDs/session paths
-are checked, and ambiguous writes are resolved only by safe exact-state probes.
-Owned redacted incomplete-upload state documents remote sessions that may
-remain while local spool files are always removed.
+into exclusive private spool files, independently reverified, rehashed again
+while serving upload bodies, and uploaded through bounded monolithic PUT or
+explicitly configured PATCH/finalize flows. Every returned session Location is
+bounded and revalidated; signed queries are preserved, cross-origin
+authorization is stripped, offsets/UUIDs/session paths are checked, and
+ambiguous writes are resolved by safe exact-state probes before any fresh
+session resends the spool from byte zero. Owned redacted incomplete-upload
+state documents remote sessions that may remain while local spool files are
+always removed; successful recovery may also leave an abandoned remote
+session for registry garbage collection.
 
 Exact child manifests/indexes and the root are published at immutable digest
 references without JSON reserialization. The destination tag PUT is the final
@@ -94,8 +97,9 @@ registry destination rather than the transport-neutral graph engine.
 `model.resolveGraph` and `copy.Context.planAll` into one implementation.
 Unlike those pinned functions, it performs complete artifact-capable
 discovery with explicit depth, descriptor-count, total-byte, and per-document
-bounds; verifies exact metadata before parsing; retains content-addressed
-bytes; rejects subjects, cycles, conflicts, and unsupported graph nodes; and
+bounds plus a cumulative retained-metadata bound; verifies exact metadata
+before parsing; retains separate blob/document work for a digest used in both
+roles; rejects subjects, cycles, conflicts, and unsupported graph nodes; and
 does not select a host platform.
 
 `src/oci/layout.zig` adapts miz `layout.Source.resolve`,
