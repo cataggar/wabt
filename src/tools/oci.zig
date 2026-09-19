@@ -25,6 +25,9 @@ pub const usage =
     "  resolve    Resolve a mutable or local reference immutably\n" ++
     "  list-tags  List all tags in one registry repository\n" ++
     "\n" ++
+    "Transport only: these commands never execute downloaded WebAssembly.\n" ++
+    "Guide: https://github.com/cataggar/wabt/blob/main/docs/oci.md\n" ++
+    "\n" ++
     "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
 
 pub const Verb = enum {
@@ -166,6 +169,9 @@ test "subject and leaf help are stable and side-effect free" {
         "  inspect    Inspect a verified registry or OCI layout graph\n" ++
         "  resolve    Resolve a mutable or local reference immutably\n" ++
         "  list-tags  List all tags in one registry repository\n" ++
+        "\n" ++
+        "Transport only: these commands never execute downloaded WebAssembly.\n" ++
+        "Guide: https://github.com/cataggar/wabt/blob/main/docs/oci.md\n" ++
         "\n" ++
         "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
     try std.testing.expectEqualStrings(expected_subject, usage);

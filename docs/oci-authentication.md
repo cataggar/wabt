@@ -1,5 +1,12 @@
 # OCI authentication library policy
 
+For command syntax, reference grammar, stable JSON, and the operator-run ACR
+procedure, see the canonical [OCI artifacts user guide](oci.md). CLI secrets
+are accepted only as a bounded line on standard input through
+`--password-stdin` or `--token-stdin`; password/token argv options are rejected.
+Copy endpoints use independent `--source-*` and `--destination-*` policies and
+read a requested source secret before a requested destination secret.
+
 WABT's OCI authentication module is a pure library policy layer. Importing or
 testing `wabt.oci.auth` does not inspect the environment, read files, spawn
 credential helpers, access a registry, or acquire a token. Callers must invoke

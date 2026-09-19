@@ -22,11 +22,51 @@ $ ./zig-out/bin/wabt spec to-json input.wast
 
 ## OCI foundation
 
-The public `wabt.oci` namespace currently establishes module discovery and
-the license/provenance boundary for the OCI foundation. This initial skeleton
-does not yet provide content, reference, model, graph, layout, copy,
-networking, or CLI behavior. OCI tests will remain part of the normal
-`zig build test` suite as those library modules are added.
+The public `wabt.oci` namespace and `wabt oci` commands have hermetic unit,
+fake-registry, layout, failure, and CLI coverage in the normal test suite:
+
+```console
+$ zig build test
+$ zig build test-oci-cli
+```
+
+The ordinary Ubuntu/macOS/Windows Debug/ReleaseSafe matrix does not spawn
+ORAS, wkg, Docker, a live registry, or credential discovery.
+
+Committed interoperability fixtures are checked without network access:
+
+```console
+$ bash scripts/oci/verify_interop_fixtures.sh
+```
+
+Refreshing them is a deliberate Linux external-tool operation using the
+versions and hashes recorded in `src/fixtures/oci/manifest.json`:
+
+```console
+$ bash scripts/oci/generate_interop_fixtures.sh
+$ bash scripts/oci/verify_interop_fixtures.sh
+```
+
+The separate pinned workflow performs two clean refreshes and the complete
+loopback ORAS/wkg matrix. With the exact tools and a disposable loopback
+registry already available, its non-default runner is:
+
+```console
+$ ORAS=/path/to/oras WKG=/path/to/wkg \
+    OCI_REGISTRY=127.0.0.1:5000 \
+    zig build oci-interop -Doptimize=ReleaseSafe
+```
+
+Static workflow, documentation, and package checks can run before the fixture
+branch is rebased:
+
+```console
+$ zig build test-oci-qualification
+```
+
+See [the OCI user guide](../docs/oci.md). External tools are qualification
+producers only; they are not runtime dependencies, and the matrix never uses
+Azure or other cloud credentials.
 
 ## Core GC regression corpus
 

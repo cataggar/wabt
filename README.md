@@ -38,6 +38,35 @@ Global:
 
 Run `wabt help <subject>` for the verbs in that subject.
 
+## OCI artifacts
+
+WABT can push, resolve, inspect, pull, copy, and list tags for validated
+WebAssembly artifacts in OCI registries and image layouts.
+
+The default Wasm-v0 profile is qualified with pinned `wkg`/oci-wasm producers:
+
+```console
+$ wabt oci push registry.example/team/echo:v1 component.wasm \
+    --format wasm-v0 --created 2026-09-19T14:44:44Z
+$ wabt oci pull registry.example/team/echo@sha256:... \
+    -o downloaded-component.wasm
+```
+
+The explicit generic profile is ORAS-compatible and intentionally not
+automatically wkg-compatible:
+
+```console
+$ wabt oci push registry.example/team/echo:generic component.wasm \
+    --format oci --created 2026-09-19T14:44:44Z
+```
+
+See the [OCI user guide](docs/oci.md) and
+[authentication policy](docs/oci-authentication.md). OCI commands preserve and
+verify transport bytes; WABT does not execute downloaded WebAssembly. ORAS,
+wkg, registries, and runtimes used for qualification are external test tools,
+not runtime dependencies, and successful transport is not runtime,
+signature-verification, or production-readiness evidence.
+
 ## Building
 
 Requires [Zig](https://ziglang.org/) 0.16. No other dependencies.
