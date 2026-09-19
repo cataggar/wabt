@@ -53,7 +53,7 @@ const SectionId = enum(u8) {
     type = 7,
     canon = 8,
     start = 9,
-    @"import" = 10,
+    import = 10,
     @"export" = 11,
     value = 12,
 
@@ -69,7 +69,7 @@ const SectionId = enum(u8) {
             .type => "type",
             .canon => "canon",
             .start => "start",
-            .@"import" => "import",
+            .import => "import",
             .@"export" => "export",
             .value => "value",
         };
@@ -168,7 +168,14 @@ pub fn dump(allocator: std.mem.Allocator, bytes: []const u8) DumpError![]u8 {
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    const comp = try wabt.component.loader.load(bytes, arena_alloc);
+    const comp = wabt.component.loader.load(bytes, arena_alloc) catch |err| switch (err) {
+        error.DuplicateSection,
+        error.DuplicateName,
+        error.DuplicateAttribute,
+        error.UnsupportedSection,
+        => return error.InvalidEncoding,
+        else => |load_err| return load_err,
+    };
     const walk = walkSections(arena_alloc, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Overflow => return error.Overflow,
@@ -236,7 +243,14 @@ pub const ReemitError = DumpError || error{ValueTooLarge};
 pub fn reemit(allocator: std.mem.Allocator, bytes: []const u8) ReemitError![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const comp = try wabt.component.loader.loadVerbatim(bytes, arena.allocator());
+    const comp = wabt.component.loader.loadVerbatim(bytes, arena.allocator()) catch |err| switch (err) {
+        error.DuplicateSection,
+        error.DuplicateName,
+        error.DuplicateAttribute,
+        error.UnsupportedSection,
+        => return error.InvalidEncoding,
+        else => |load_err| return load_err,
+    };
     return wabt.component.writer.encode(allocator, &comp);
 }
 
@@ -325,7 +339,8 @@ test "dump renders summary block for minimal component with one custom section" 
         // custom section: id=0, size=14
         0x00, 0x0e,
         // name length=13 + "wit-component"
-        0x0d, 'w', 'i', 't', '-', 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't',
+        0x0d, 'w',  'i',  't',  '-',  'c',
+        'o',  'm',  'p',  'o',  'n',  'e',  'n',  't',
     };
     const out = try dump(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(out);
@@ -349,8 +364,8 @@ test "reemit round-trips a component through the loader + writer" {
     // loader would drop.
     const bytes = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
-        0x00, 0x0e,
-        0x0d, 'w', 'i', 't', '-', 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't',
+        0x00, 0x0e, 0x0d, 'w',  'i',  't',  '-',  'c',
+        'o',  'm',  'p',  'o',  'n',  'e',  'n',  't',
     };
     const out = try reemit(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(out);

@@ -29,39 +29,53 @@ pub const LoadError = error{
     OutOfMemory,
     Overflow,
     InvalidUtf8,
+    DuplicateSection,
+    DuplicateName,
+    DuplicateAttribute,
+    UnsupportedSection,
 };
 
 /// A streaming reader over the component binary.
 const BinaryReader = struct {
     data: []const u8,
     pos: usize = 0,
+    limit: usize = 0,
+
+    fn end(self: *const BinaryReader) usize {
+        return if (self.limit == 0) self.data.len else self.limit;
+    }
 
     fn remaining(self: *const BinaryReader) usize {
-        return self.data.len - self.pos;
+        return self.end() - self.pos;
     }
 
     fn readByte(self: *BinaryReader) LoadError!u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
         const b = self.data[self.pos];
         self.pos += 1;
         return b;
     }
 
     fn peekByte(self: *BinaryReader) LoadError!u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
         return self.data[self.pos];
     }
 
     fn readBytes(self: *BinaryReader, n: usize) LoadError![]const u8 {
-        if (self.pos + n > self.data.len) return error.UnexpectedEnd;
+        if (n > self.remaining()) return error.UnexpectedEnd;
         const slice = self.data[self.pos .. self.pos + n];
         self.pos += n;
         return slice;
     }
 
     fn readU32(self: *BinaryReader) LoadError!u32 {
-        const slice = self.data[self.pos..];
-        const result = leb128.readU32Leb128(slice) catch return error.UnexpectedEnd;
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
+        const result = leb128.readU32Leb128(slice) catch |err| switch (err) {
+            error.Overflow => return error.InvalidEncoding,
+            error.UnexpectedEnd => return error.UnexpectedEnd,
+        };
         self.pos += result.bytes_read;
         return result.value;
     }
@@ -70,30 +84,25 @@ const BinaryReader = struct {
     /// Non-negative values are type indices; negative values encode primitive
     /// valtypes and handle forms.
     fn readS33(self: *BinaryReader) LoadError!i64 {
-        const slice = self.data[self.pos..];
-        const result = leb128.readS64Leb128(slice) catch |err| switch (err) {
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
+        const result = leb128.readS33Leb128(slice) catch |err| switch (err) {
             error.Overflow => return error.InvalidEncoding,
             error.UnexpectedEnd => return error.UnexpectedEnd,
         };
-        // s33: value must fit in 33 signed bits.
-        if (result.value < -(@as(i64, 1) << 32) or result.value >= (@as(i64, 1) << 32))
-            return error.InvalidEncoding;
         self.pos += result.bytes_read;
         return result.value;
     }
 
     fn readFixedU32(self: *BinaryReader) LoadError!u32 {
-        if (self.pos + 4 > self.data.len) return error.UnexpectedEnd;
-        const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
-        self.pos += 4;
-        return val;
+        const bytes = try self.readBytes(4);
+        return std.mem.readInt(u32, bytes[0..4], .little);
     }
 
     fn readName(self: *BinaryReader) LoadError![]const u8 {
         const len = try self.readU32();
-        if (self.pos + len > self.data.len) return error.UnexpectedEnd;
-        const name = self.data[self.pos .. self.pos + len];
-        self.pos += len;
+        const name = try self.readBytes(len);
         // Validate UTF-8
         if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
         return name;
@@ -112,14 +121,20 @@ const SectionId = enum(u8) {
     type = 7,
     canon = 8,
     start = 9,
-    @"import" = 10,
+    import = 10,
     @"export" = 11,
     value = 12,
 };
 
 /// Load a WebAssembly Component from binary data.
 pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
-    return loadInner(data, allocator, false);
+    return loadInner(data, allocator, .{});
+}
+
+/// Decode the complete supported component subset without silently skipping
+/// sections that are not represented by the AST.
+pub fn loadStrict(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
+    return loadInner(data, allocator, .{ .strict = true });
 }
 
 /// Like `load`, but additionally captures the physical section layout
@@ -131,11 +146,17 @@ pub fn load(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Com
 /// re-encoding (e.g. compose / component-new transforms): the captured
 /// `section_order` indices would go stale against the edited arrays.
 pub fn loadVerbatim(data: []const u8, allocator: std.mem.Allocator) LoadError!ctypes.Component {
-    return loadInner(data, allocator, true);
+    return loadInner(data, allocator, .{ .capture_layout = true });
 }
 
-fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: bool) LoadError!ctypes.Component {
-    var reader = BinaryReader{ .data = data };
+const LoadOptions = struct {
+    capture_layout: bool = false,
+    strict: bool = false,
+};
+
+fn loadInner(data: []const u8, allocator: std.mem.Allocator, options: LoadOptions) LoadError!ctypes.Component {
+    const capture_layout = options.capture_layout;
+    var reader = BinaryReader{ .data = data, .limit = data.len };
 
     // Validate preamble
     const magic = try reader.readFixedU32();
@@ -190,10 +211,14 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
         const section_size = try reader.readU32();
 
         const section_start = reader.pos;
-        if (section_start + section_size > reader.data.len) return error.InvalidSectionSize;
+        const section_end = std.math.add(usize, section_start, section_size) catch
+            return error.InvalidSectionSize;
+        if (section_end > reader.limit) return error.InvalidSectionSize;
 
         const section_id = std.enums.fromInt(SectionId, section_id_byte) orelse
             return error.InvalidSectionId;
+        const outer_limit = reader.limit;
+        reader.limit = section_end;
 
         // Snapshot per-section array lengths so we can record a
         // `SectionEntry` (start + count) for this physical section after
@@ -214,21 +239,25 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
 
         switch (section_id) {
             .custom => {
+                // A custom section always starts with a valid UTF-8 name.
+                // Validate it even when the caller does not retain layout;
+                // skipping the whole body used to accept malformed sections.
+                const name = try reader.readName();
+                if (reader.pos > section_end) return error.InvalidSectionSize;
                 if (capture_layout) {
                     // Preserve the custom section: name (LEB-prefixed) then
                     // the remaining bytes as opaque payload.
-                    const name = try reader.readName();
-                    const payload = reader.data[reader.pos .. section_start + section_size];
+                    const payload = reader.data[reader.pos..section_end];
                     try custom_sections.append(allocator, .{ .name = name, .payload = payload });
                 }
                 // Skip to the end (whether or not we captured the name).
-                reader.pos = section_start + section_size;
+                reader.pos = section_end;
             },
             .core_module => {
                 // The core module is stored as raw bytes (nested module binary)
-                const module_data = reader.data[section_start .. section_start + section_size];
+                const module_data = reader.data[section_start..section_end];
                 try core_modules.append(allocator, .{ .data = module_data });
-                reader.pos = section_start + section_size;
+                reader.pos = section_end;
             },
             .core_instance => {
                 const count = try reader.readU32();
@@ -250,11 +279,11 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 // their section order + custom sections; otherwise the
                 // writer re-orders them and breaks their internal index
                 // spaces on re-emit (#267).
-                const comp_data = reader.data[section_start .. section_start + section_size];
+                const comp_data = reader.data[section_start..section_end];
                 const child = try allocator.create(ctypes.Component);
-                child.* = try loadInner(comp_data, allocator, capture_layout);
+                child.* = try loadInner(comp_data, allocator, options);
                 try components.append(allocator, child);
-                reader.pos = section_start + section_size;
+                reader.pos = section_end;
             },
             .instance => {
                 const count = try reader.readU32();
@@ -319,14 +348,17 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 }
             },
             .start => {
+                if (start != null) return error.DuplicateSection;
                 start = try parseStart(&reader, allocator);
             },
-            .@"import" => {
+            .import => {
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
                     const local_idx: u32 = @intCast(imports.items.len);
-                    const imp = try parseImport(&reader);
+                    const imp = try parseImport(&reader, allocator);
+                    if (options.strict and containsImportName(imports.items, imp.name))
+                        return error.DuplicateName;
                     try imports.append(allocator, imp);
                     if (imp.desc == .type) try type_indexspace.append(allocator, .{ .import = local_idx });
                     // Instance-typed imports contribute to the
@@ -340,18 +372,23 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
-                    try exports.append(allocator, try parseTopLevelExport(&reader));
+                    const exp = try parseTopLevelExport(&reader, allocator);
+                    if (options.strict and containsExportName(exports.items, exp.name))
+                        return error.DuplicateName;
+                    try exports.append(allocator, exp);
                 }
             },
             .value => {
-                // Value definitions — skip for now (gated feature)
-                reader.pos = section_start + section_size;
+                if (options.strict) return error.UnsupportedSection;
+                // Value definitions are not represented by the current AST.
+                reader.pos = section_end;
             },
         }
         // Defensive: every typed-section parser above should have consumed
         // exactly `section_size` bytes. If a bug causes under- or over-read
         // we'd otherwise misalign the next section header.
-        if (reader.pos != section_start + section_size) return error.InvalidSectionSize;
+        if (reader.pos != section_end) return error.InvalidSectionSize;
+        reader.limit = outer_limit;
 
         // Record this physical section's layout entry (one per section).
         if (capture_layout) {
@@ -367,7 +404,7 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 .type => mkEntry(.type, len_before.type, type_defs.items.len),
                 .canon => mkEntry(.canon, len_before.canon, canons.items.len),
                 .start => ctypes.SectionEntry{ .kind = Kind.start, .start = 0, .count = 0 },
-                .@"import" => mkEntry(.import, len_before.@"import", imports.items.len),
+                .import => mkEntry(.import, len_before.import, imports.items.len),
                 .@"export" => mkEntry(.@"export", len_before.@"export", exports.items.len),
                 // `value` sections aren't materialized, so the layout
                 // cannot be faithfully reproduced — disable layout capture.
@@ -401,6 +438,20 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
         else
             null,
     };
+}
+
+fn containsImportName(imports: []const ctypes.ImportDecl, name: []const u8) bool {
+    for (imports) |imp| {
+        if (std.mem.eql(u8, imp.name, name)) return true;
+    }
+    return false;
+}
+
+fn containsExportName(exports: []const ctypes.ExportDecl, name: []const u8) bool {
+    for (exports) |exp| {
+        if (std.mem.eql(u8, exp.name, name)) return true;
+    }
+    return false;
 }
 
 /// Build a `SectionEntry` from a per-section array's before/after length.
@@ -512,7 +563,9 @@ fn parseInstance(reader: *BinaryReader, allocator: std.mem.Allocator) LoadError!
             const count = try reader.readU32();
             const exps = try allocator.alloc(ctypes.InlineExport, count);
             for (exps) |*e| {
-                e.name = try readExternName(reader);
+                const parsed_name = try readExternName(reader, allocator);
+                e.name = parsed_name.name;
+                e.attributes = parsed_name.attributes;
                 e.sort_idx = try readSortIdx(reader);
             }
             return .{ .exports = exps };
@@ -712,9 +765,9 @@ fn parseDecl(
         0x02 => .{ .alias = try parseAlias(reader) },
         0x03 => blk: {
             if (scope != .component_type) return error.InvalidEncoding;
-            break :blk .{ .import = try parseImport(reader) };
+            break :blk .{ .import = try parseImport(reader, allocator) };
         },
-        0x04 => .{ .@"export" = try parseExport(reader) },
+        0x04 => .{ .@"export" = try parseExport(reader, allocator) },
         else => error.InvalidEncoding,
     };
 }
@@ -984,36 +1037,83 @@ fn readExternDesc(reader: *BinaryReader) LoadError!ctypes.ExternDesc {
 
 /// Read an `importname'` / `exportname'` (identical grammar per spec):
 ///
-///   importname' ::= 0x00 len:<u32> in:<importname>
-///                 | 0x01 len:<u32> in:<importname>
-///                 | 0x02 len:<u32> in:<importname> vs:<versionsuffix>
+///   nameattributes ::= 0x00 len:<u32> en:<externname>
+///                    | 0x01 len:<u32> en:<externname>
+///                    | 0x02 len:<u32> en:<externname> a*:vec(<attribute>)
 ///
-/// The prefix tag distinguishes plain names from annotated/versioned names.
-/// For now we return the raw `in` bytes and swallow any `versionsuffix` —
-/// the runtime only needs the interface name to match against host bindings.
-fn readExternName(reader: *BinaryReader) LoadError![]const u8 {
+/// Attribute kinds are unique within the vector. Retaining them is necessary
+/// to reconstruct a complete version from a canonical interface name and its
+/// `versionsuffix`.
+const ParsedExternName = struct {
+    name: []const u8,
+    attributes: []const ctypes.ExternNameAttribute,
+};
+
+fn readExternName(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ParsedExternName {
     const prefix = try reader.readByte();
     if (prefix > 0x02) return error.InvalidEncoding;
     const name = try reader.readName();
-    if (prefix == 0x02) {
-        // versionsuffix ::= len:<u32> vs:<semversuffix> — skip over it.
-        _ = try reader.readName();
+    if (prefix != 0x02) return .{ .name = name, .attributes = &.{} };
+
+    const count = try reader.readU32();
+    const attributes = try allocator.alloc(ctypes.ExternNameAttribute, count);
+    errdefer allocator.free(attributes);
+    var seen_implements = false;
+    var seen_version_suffix = false;
+    var seen_external_id = false;
+    for (attributes) |*attribute| {
+        const tag = try reader.readByte();
+        attribute.* = switch (tag) {
+            0x00 => blk: {
+                if (seen_implements) return error.DuplicateAttribute;
+                seen_implements = true;
+                break :blk .{ .implements = try reader.readName() };
+            },
+            0x01 => blk: {
+                if (seen_version_suffix) return error.DuplicateAttribute;
+                seen_version_suffix = true;
+                break :blk .{ .version_suffix = try reader.readName() };
+            },
+            0x02 => blk: {
+                if (seen_external_id) return error.DuplicateAttribute;
+                seen_external_id = true;
+                break :blk .{ .external_id = try reader.readName() };
+            },
+            else => return error.InvalidEncoding,
+        };
     }
-    return name;
+    return .{ .name = name, .attributes = attributes };
 }
 
-fn parseImport(reader: *BinaryReader) LoadError!ctypes.ImportDecl {
-    const name = try readExternName(reader);
+fn parseImport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ImportDecl {
+    const parsed_name = try readExternName(reader, allocator);
     const desc = try readExternDesc(reader);
-    return .{ .name = name, .desc = desc };
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+    };
 }
 
-fn parseExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
+fn parseExport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ExportDecl {
     // exportdecl (used inside component/instance type bodies):
     //   en:<exportname'> ed:<externdesc>
-    const name = try readExternName(reader);
+    const parsed_name = try readExternName(reader, allocator);
     const desc = try readExternDesc(reader);
-    return .{ .name = name, .desc = desc };
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+    };
 }
 
 /// Parse a top-level `export` entry from the export section:
@@ -1021,8 +1121,11 @@ fn parseExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
 ///
 /// Distinct from `parseExport` (the declarator form used inside
 /// component/instance types), which has no sortidx and a mandatory descriptor.
-fn parseTopLevelExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
-    const name = try readExternName(reader);
+fn parseTopLevelExport(
+    reader: *BinaryReader,
+    allocator: std.mem.Allocator,
+) LoadError!ctypes.ExportDecl {
+    const parsed_name = try readExternName(reader, allocator);
     const sort_idx = try readSortIdx(reader);
     const has_desc = try reader.readByte();
     const desc: ctypes.ExternDesc = switch (has_desc) {
@@ -1030,7 +1133,12 @@ fn parseTopLevelExport(reader: *BinaryReader) LoadError!ctypes.ExportDecl {
         0x01 => try readExternDesc(reader),
         else => return error.InvalidEncoding,
     };
-    return .{ .name = name, .desc = desc, .sort_idx = sort_idx };
+    return .{
+        .name = parsed_name.name,
+        .desc = desc,
+        .attributes = parsed_name.attributes,
+        .sort_idx = sort_idx,
+    };
 }
 
 /// When a top-level export omits its externdesc, the sortidx itself describes
@@ -1229,9 +1337,15 @@ test "parseTypeDef: instance type with `sub resource` type decl" {
     //     0x00 0x00       ; bound: eq, typeidx 0
     const data = [_]u8{
         0x42, 0x02,
-        0x01, 0x3F, 0x7F, 0x00,
-        0x04, 0x00, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
-        0x03, 0x00, 0x00,
+        0x01, 0x3F,
+        0x7F, 0x00,
+        0x04, 0x00,
+        0x08, 'p',
+        'o',  'l',
+        'l',  'a',
+        'b',  'l',
+        'e',  0x03,
+        0x00, 0x00,
     };
     var reader = BinaryReader{ .data = &data };
     const td = try parseTypeDef(&reader, std.testing.allocator);
