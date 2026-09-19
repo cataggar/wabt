@@ -1370,10 +1370,7 @@ fn parseInlineCredential(
     const auth_value = object.get("auth");
     const username_value = object.get("username");
     const password_value = object.get("password");
-    if (auth_value != null and (username_value != null or password_value != null)) {
-        return error.InvalidAuthFile;
-    }
-    if ((username_value == null) != (password_value == null)) {
+    if (username_value != null or password_value != null) {
         return error.UnsupportedCredentialType;
     }
 
@@ -1385,23 +1382,6 @@ fn parseInlineCredential(
         return .{ .basic = try decodeInlineBasic(allocator, encoded, limits) };
     }
 
-    if (username_value) |raw_username| {
-        const username = switch (raw_username) {
-            .string => |result| result,
-            else => return error.InvalidAuthFile,
-        };
-        const password = switch (password_value.?) {
-            .string => |result| result,
-            else => return error.InvalidAuthFile,
-        };
-        try validateBasicCredential(.{ .username = username, .secret = password }, limits);
-        const owned_username = try allocator.dupe(u8, username);
-        errdefer secureFree(allocator, owned_username);
-        return .{ .basic = .{
-            .username = owned_username,
-            .secret = try allocator.dupe(u8, password),
-        } };
-    }
     return error.UnsupportedCredentialType;
 }
 
@@ -2629,6 +2609,37 @@ test "discovery order is deterministic and malformed authoritative files stop" {
     try std.testing.expectEqualStrings("user", resolved.credential.basic.username);
     try std.testing.expect(files.valid);
 
+    var unsupported_files = TestFiles{
+        .records = &.{
+            .{
+                .path = "/run/user/1000/containers/auth.json",
+                .contents = "{\"auths\":{\"registry.example\":{\"username\":\"user\",\"password\":\"secret\"}}}",
+            },
+            .{
+                .path = "/config/containers/auth.json",
+                .contents = "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpzZWNyZXQ=\"}}}",
+            },
+        },
+        .expected_paths = &.{"/run/user/1000/containers/auth.json"},
+    };
+    try std.testing.expectError(
+        error.UnsupportedCredentialType,
+        resolveCredential(
+            std.testing.allocator,
+            .discover,
+            .{ .authority = "registry.example", .repository = "team/image" },
+            .{
+                .io = std.testing.io,
+                .environment = &environment,
+                .files = unsupported_files.boundary(),
+                .path_flavor = .posix,
+            },
+            .{},
+        ),
+    );
+    try std.testing.expect(unsupported_files.valid);
+    try std.testing.expectEqual(@as(usize, 1), unsupported_files.reads);
+
     var authoritative_environment = std.process.Environ.Map.init(std.testing.allocator);
     defer authoritative_environment.deinit();
     try authoritative_environment.put("REGISTRY_AUTH_FILE", "/authoritative.json");
@@ -2728,26 +2739,23 @@ test "auth records use exact normalized authorities and most-specific paths" {
     try std.testing.expect(files.valid);
 }
 
-test "inline records support strict auth and username password forms" {
-    var standalone_files = TestFiles{
-        .records = &.{.{
-            .path = "/standalone.json",
-            .contents = "{\"auths\":{\"registry.example\":{\"username\":\"user\",\"password\":\"secret\"}}}",
-        }},
-        .expected_paths = &.{"/standalone.json"},
-    };
-    var standalone = (try resolveCredential(
-        std.testing.allocator,
-        .{ .auth_file = "/standalone.json" },
-        .{ .authority = "registry.example", .repository = "team/image" },
-        .{ .io = std.testing.io, .files = standalone_files.boundary() },
-        .{},
-    )).?;
-    defer standalone.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("user", standalone.credential.basic.username);
-    try std.testing.expectEqualStrings("secret", standalone.credential.basic.secret);
-
+test "inline records support strict auth and reject unsupported forms" {
     inline for (.{
+        .{
+            .path = "/standalone.json",
+            .document = "{\"auths\":{\"registry.example\":{\"username\":\"user\",\"password\":\"secret\"}}}",
+            .expected = error.UnsupportedCredentialType,
+        },
+        .{
+            .path = "/partial-standalone.json",
+            .document = "{\"auths\":{\"registry.example\":{\"username\":\"user\"}}}",
+            .expected = error.UnsupportedCredentialType,
+        },
+        .{
+            .path = "/mixed.json",
+            .document = "{\"auths\":{\"registry.example\":{\"auth\":\"dXNlcjpzZWNyZXQ=\",\"username\":\"user\",\"password\":\"secret\"}}}",
+            .expected = error.UnsupportedCredentialType,
+        },
         .{
             .path = "/identity.json",
             .document = "{\"auths\":{\"registry.example\":{\"identitytoken\":\"sensitive-token\"}}}",

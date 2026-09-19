@@ -386,6 +386,45 @@ const AbsoluteTarget = struct {
     }
 };
 
+const DeadlineProcessRunner = struct {
+    process: auth.ProcessRunner,
+    clock: registry_http.Clock,
+    deadline: registry_http.Deadline,
+
+    fn boundary(self: *DeadlineProcessRunner) auth.ProcessRunner {
+        return .{ .context = self, .run = run };
+    }
+
+    fn run(
+        context: ?*anyopaque,
+        allocator: Allocator,
+        io: Io,
+        argv: []const []const u8,
+        stdin_data: []const u8,
+        max_output: usize,
+        timeout_ns: u64,
+    ) auth.ProcessError!auth.ProcessResult {
+        const self: *DeadlineProcessRunner = @ptrCast(@alignCast(context orelse
+            return error.DeadlineExceeded));
+        const now = self.clock.now();
+        if (now >= self.deadline.at_ns) return error.DeadlineExceeded;
+        const remaining_i128 = self.deadline.at_ns - now;
+        const remaining_ns: u64 = @intCast(@min(
+            remaining_i128,
+            @as(i128, std.math.maxInt(u64)),
+        ));
+        return self.process.run(
+            self.process.context,
+            allocator,
+            io,
+            argv,
+            stdin_data,
+            max_output,
+            @min(timeout_ns, remaining_ns),
+        );
+    }
+};
+
 pub const Source = struct {
     io: Io,
     allocator: Allocator,
@@ -517,13 +556,25 @@ pub const Source = struct {
         const repository = try allocator.dupe(u8, registry_reference.repository);
         errdefer allocator.free(repository);
 
+        var deadline_process: DeadlineProcessRunner = .{
+            .process = options.auth_context.process,
+            .clock = clock,
+            .deadline = options.deadline,
+        };
+        var effective_auth_context = options.auth_context;
+        effective_auth_context.process = deadline_process.boundary();
         var credential = auth.resolveCredential(
             allocator,
             options.credential_policy,
             .{ .authority = authority, .repository = repository },
-            options.auth_context,
+            effective_auth_context,
             effective_auth_limits,
-        ) catch |err| return mapCredentialError(err);
+        ) catch |err| {
+            if (clock.now() >= options.deadline.at_ns) {
+                return error.DeadlineExceeded;
+            }
+            return mapCredentialError(err);
+        };
         errdefer if (credential) |*value| value.deinit(allocator);
         if (clock.now() >= options.deadline.at_ns) return error.DeadlineExceeded;
 
