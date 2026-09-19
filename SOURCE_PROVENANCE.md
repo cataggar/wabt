@@ -13,17 +13,30 @@ The following paths identify the pinned sources and their WABT destinations:
 | --- | --- |
 | `packages/miz/src/oci/content.zig` | `src/oci/content.zig` |
 | `packages/miz/src/oci/reference.zig` | `src/oci/reference.zig` |
+| `packages/miz/src/oci/auth.zig` | `src/oci/auth.zig` |
 | `packages/miz/src/oci/model.zig` | `src/oci/model.zig`, `src/oci/graph.zig` |
 | `packages/miz/src/oci/transport.zig` | `src/oci/transport.zig` |
 | `packages/miz/src/oci/layout.zig` | `src/oci/layout.zig`, `src/oci/integration_tests.zig` |
 | `packages/miz/src/oci/copy.zig` | `src/oci/copy.zig`, `src/oci/graph.zig`, `src/oci/integration_tests.zig` |
 
-The adaptation does not copy miz's `oci.zig` facade wholesale or its
-authentication, registry, image, layer, filesystem, bundle, snapshot, repack,
-signing, disk-image, or QEMU integrations. WABT's implementation uses
+The adaptation does not copy miz's `oci.zig` facade wholesale or its registry,
+image, layer, filesystem, bundle, snapshot, repack, signing, disk-image, or
+QEMU integrations. WABT's implementation uses
 scheme-less explicit registry references, artifact-capable generic
 validation, one bounded graph planner, and explicit rejection of
 subject-bearing and unknown graph nodes.
+
+`src/oci/auth.zig` adapts miz's bounded RFC 9110 challenge parser, Docker and
+containers credential-file matching, credential-helper protocol, Basic
+authorization construction, token-response parsing, and token-cache ideas.
+WABT adds a mutually exclusive credential-policy union, caller-injected
+file/environment/process/token boundaries, cumulative parser bounds,
+duplicate-parameter rejection, exact normalized authority matching, strict
+base64 decoding, explicit unsupported identity-token handling, helper
+deadlines, redacted formatting, deterministic scope canonicalization, and
+registry-origin/context/generation cache isolation. It performs no HTTP and
+does not inspect ambient credentials unless the caller invokes the enabled
+policy.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
 the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned
