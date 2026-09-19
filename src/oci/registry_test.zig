@@ -492,6 +492,155 @@ test "production source initialization is explicit and loopback HTTP only" {
     try std.testing.expectEqual(@as(usize, 0), files.calls);
 }
 
+test "credential helpers consume only the remaining source deadline" {
+    const DelayedFiles = struct {
+        runtime: *FakeRuntime,
+        advance_ns: u64,
+
+        fn reader(self: *@This()) auth.FileReader {
+            return .{ .context = self, .read = read };
+        }
+
+        fn read(
+            context: ?*anyopaque,
+            allocator: Allocator,
+            _: std.Io,
+            path: []const u8,
+            limit: usize,
+        ) auth.FileReadError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.runtime.now_ns += self.advance_ns;
+            if (!std.mem.eql(u8, path, "auth.json")) return error.FileNotFound;
+            const document = "{\"credsStore\":\"test\"}";
+            if (document.len > limit) return error.InputTooLarge;
+            return allocator.dupe(u8, document);
+        }
+    };
+    const Helper = struct {
+        runtime: *FakeRuntime,
+        fail_on_deadline: bool = false,
+        calls: usize = 0,
+        timeout_ns: u64 = 0,
+        valid: bool = true,
+
+        fn runner(self: *@This()) auth.ProcessRunner {
+            return .{ .context = self, .run = run };
+        }
+
+        fn run(
+            context: ?*anyopaque,
+            allocator: Allocator,
+            _: std.Io,
+            argv: []const []const u8,
+            stdin_data: []const u8,
+            _: usize,
+            timeout_ns: u64,
+        ) auth.ProcessError!auth.ProcessResult {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            self.calls += 1;
+            self.timeout_ns = timeout_ns;
+            if (argv.len != 2 or
+                !std.mem.eql(u8, argv[0], "docker-credential-test") or
+                !std.mem.eql(u8, argv[1], "get") or
+                !std.mem.eql(u8, stdin_data, "localhost:5000\n"))
+            {
+                self.valid = false;
+            }
+            if (self.fail_on_deadline) {
+                self.runtime.now_ns += timeout_ns;
+                return error.DeadlineExceeded;
+            }
+            return .{ .stdout = try allocator.dupe(
+                u8,
+                "{\"Username\":\"reader\",\"Secret\":\"secret\"}",
+            ) };
+        }
+    };
+
+    const no_steps = [_]Step{};
+    var runtime: FakeRuntime = .{};
+    var backend: ScriptedBackend = .{
+        .runtime = &runtime,
+        .steps = &no_steps,
+    };
+    var files: DelayedFiles = .{
+        .runtime = &runtime,
+        .advance_ns = 9 * std.time.ns_per_s,
+    };
+    var helper: Helper = .{ .runtime = &runtime };
+    var source = try registry.Source.initWithBackend(
+        std.testing.io,
+        std.testing.allocator,
+        .{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = null,
+        },
+        backend.backend(),
+        runtime.clock(),
+        runtime.sleeper(),
+        .{
+            .plain_http = true,
+            .credential_policy = .{ .auth_file = "auth.json" },
+            .auth_context = .{
+                .io = std.testing.io,
+                .files = files.reader(),
+                .process = helper.runner(),
+            },
+            .deadline = .after(runtime.clock(), 10 * std.time.ns_per_s),
+        },
+    );
+    source.deinit();
+    try std.testing.expect(helper.valid);
+    try std.testing.expectEqual(@as(usize, 1), helper.calls);
+    try std.testing.expectEqual(std.time.ns_per_s, helper.timeout_ns);
+
+    var deadline_runtime: FakeRuntime = .{};
+    var deadline_backend: ScriptedBackend = .{
+        .runtime = &deadline_runtime,
+        .steps = &no_steps,
+    };
+    var deadline_files: DelayedFiles = .{
+        .runtime = &deadline_runtime,
+        .advance_ns = 9 * std.time.ns_per_s,
+    };
+    var deadline_helper: Helper = .{
+        .runtime = &deadline_runtime,
+        .fail_on_deadline = true,
+    };
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        registry.Source.initWithBackend(
+            std.testing.io,
+            std.testing.allocator,
+            .{
+                .authority = "localhost:5000",
+                .repository = "repo",
+                .selection = null,
+            },
+            deadline_backend.backend(),
+            deadline_runtime.clock(),
+            deadline_runtime.sleeper(),
+            .{
+                .plain_http = true,
+                .credential_policy = .{ .auth_file = "auth.json" },
+                .auth_context = .{
+                    .io = std.testing.io,
+                    .files = deadline_files.reader(),
+                    .process = deadline_helper.runner(),
+                },
+                .deadline = .after(
+                    deadline_runtime.clock(),
+                    10 * std.time.ns_per_s,
+                ),
+            },
+        ),
+    );
+    try std.testing.expect(deadline_helper.valid);
+    try std.testing.expectEqual(@as(usize, 1), deadline_helper.calls);
+    try std.testing.expectEqual(std.time.ns_per_s, deadline_helper.timeout_ns);
+}
+
 test "production loopback backend negotiates manifests and streams verified blobs" {
     const allocator = std.testing.allocator;
     const blob_bytes = "wire-streamed-blob";
@@ -1354,9 +1503,38 @@ test "paginated tags deduplicate sort and reject loops and hostile origins" {
         registry.Category.pagination,
         ambiguous_link_source.lastDiagnostic().?.category,
     );
+
+    var page_limit_runtime: FakeRuntime = .{};
+    const page_limit_steps = [_]Step{.{
+        .path_suffix = "/v2/repo/tags/list",
+        .class = .registry,
+        .headers = &link_headers,
+        .body = first,
+    }};
+    var page_limit_fake: ScriptedBackend = .{
+        .runtime = &page_limit_runtime,
+        .steps = &page_limit_steps,
+    };
+    var page_limit_source = try initSource(
+        &page_limit_fake,
+        &page_limit_runtime,
+        null,
+        .none,
+        .{ .max_tag_pages = 1 },
+    );
+    defer page_limit_source.deinit();
+    try std.testing.expectError(
+        error.LimitExceeded,
+        page_limit_source.listTags(.{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = null,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 1), page_limit_fake.index);
 }
 
-test "stream retries rewind destination and final corruption removes partial output" {
+test "stream retries rewind destination and final failures remove partial output" {
     const allocator = std.testing.allocator;
     const bytes = "streamed-payload";
     const value = descriptor(bytes, "application/octet-stream");
@@ -1511,6 +1689,145 @@ test "stream retries rewind destination and final corruption removes partial out
             opaque_document.value(),
             output,
         ),
+    );
+    try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
+
+    const retry_limit_steps = [_]Step{
+        .{
+            .path_suffix = path,
+            .class = .blob,
+            .headers = headers.values,
+            .body = bytes,
+            .stream_failure_after = 5,
+        },
+        .{
+            .path_suffix = path,
+            .class = .blob,
+            .headers = headers.values,
+            .body = bytes,
+            .stream_failure_after = 5,
+        },
+        .{
+            .path_suffix = path,
+            .class = .blob,
+            .headers = headers.values,
+            .body = bytes,
+            .stream_failure_after = 5,
+        },
+    };
+    var retry_limit_runtime: FakeRuntime = .{};
+    var retry_limit_fake: ScriptedBackend = .{
+        .runtime = &retry_limit_runtime,
+        .steps = &retry_limit_steps,
+    };
+    var retry_limit_source = try initSource(
+        &retry_limit_fake,
+        &retry_limit_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer retry_limit_source.deinit();
+    try output.writePositionalAll(std.testing.io, "stale", 0);
+    try std.testing.expectError(
+        error.RetryLimitExceeded,
+        retry_limit_source.copyVerifiedTo(value.value(), output),
+    );
+    try std.testing.expectEqual(@as(usize, 3), retry_limit_fake.index);
+    try std.testing.expectEqual(
+        registry.Category.retry_limit,
+        retry_limit_source.lastDiagnostic().?.category,
+    );
+    try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
+
+    const deadline_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .blob,
+        .headers = headers.values,
+        .body = bytes,
+        .stream_failure_after = 5,
+        .advance_ns = 61 * std.time.ns_per_s,
+    }};
+    var deadline_runtime: FakeRuntime = .{};
+    var deadline_fake: ScriptedBackend = .{
+        .runtime = &deadline_runtime,
+        .steps = &deadline_steps,
+    };
+    var deadline_source = try initSource(
+        &deadline_fake,
+        &deadline_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer deadline_source.deinit();
+    try output.writePositionalAll(std.testing.io, "stale", 0);
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        deadline_source.copyVerifiedTo(value.value(), output),
+    );
+    try std.testing.expectEqual(
+        registry.Category.deadline,
+        deadline_source.lastDiagnostic().?.category,
+    );
+    try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
+
+    const missing_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .blob,
+        .status = 404,
+        .body = "{\"errors\":[{\"code\":\"BLOB_UNKNOWN\"}]}",
+    }};
+    var missing_runtime: FakeRuntime = .{};
+    var missing_fake: ScriptedBackend = .{
+        .runtime = &missing_runtime,
+        .steps = &missing_steps,
+    };
+    var missing_source = try initSource(
+        &missing_fake,
+        &missing_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer missing_source.deinit();
+    try output.writePositionalAll(std.testing.io, "stale", 0);
+    try std.testing.expectError(
+        error.ContentNotFound,
+        missing_source.copyVerifiedTo(value.value(), output),
+    );
+    try std.testing.expectEqual(
+        registry.Category.not_found,
+        missing_source.lastDiagnostic().?.category,
+    );
+    try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
+
+    const transport_steps = [_]Step{.{
+        .path_suffix = path,
+        .class = .blob,
+        .failure = error.DnsFailure,
+    }};
+    var transport_runtime: FakeRuntime = .{};
+    var transport_fake: ScriptedBackend = .{
+        .runtime = &transport_runtime,
+        .steps = &transport_steps,
+    };
+    var transport_source = try initSource(
+        &transport_fake,
+        &transport_runtime,
+        null,
+        .none,
+        .{},
+    );
+    defer transport_source.deinit();
+    try output.writePositionalAll(std.testing.io, "stale", 0);
+    try std.testing.expectError(
+        error.TransportFailed,
+        transport_source.copyVerifiedTo(value.value(), output),
+    );
+    try std.testing.expectEqual(
+        registry.Category.transport,
+        transport_source.lastDiagnostic().?.category,
     );
     try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
 }

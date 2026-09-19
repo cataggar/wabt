@@ -148,10 +148,10 @@ paths use the most-specific segment-boundary match. Docker Hub's documented
 aliases are equivalent, with an exact normalized authority preferred.
 
 Supported inline records are strict canonical base64 `auth` values containing
-`username:secret`, and paired `username`/`password` strings. Matching
-`identitytoken`, `registrytoken`, partial, empty, or otherwise unsupported
-credential records fail as `UnsupportedCredentialType`; they are not treated
-as anonymous credentials.
+`username:secret`. Matching `username`/`password`, `identitytoken`,
+`registrytoken`, partial, empty, mixed, or otherwise unsupported credential
+records fail as `UnsupportedCredentialType`; they are not treated as anonymous
+credentials.
 
 ## Credential helpers
 
@@ -171,7 +171,8 @@ Helper names, input, stdout, stderr, and duration are bounded. The process
 boundary must kill and reap timed-out helpers. Captured stderr is wiped and is
 never returned in diagnostics. Malformed output, the helper `<token>` identity
 form, nonzero exit, timeout, and output-limit failures are final and do not
-fall back to inline credentials.
+fall back to inline credentials. Registry source construction also clamps each
+helper invocation to the remaining absolute source deadline.
 
 ## Challenges and tokens
 
