@@ -1,17 +1,18 @@
-//! Transport-neutral execution of one fully discovered OCI graph plan.
+//! Public constructors for the shared OCI graph-copy engine.
 const std = @import("std");
 const content = @import("content.zig");
+const engine = @import("copy_engine.zig");
 const graph = @import("graph.zig");
 const layout = @import("layout.zig");
 const model = @import("model.zig");
 const reference = @import("reference.zig");
+const registry = @import("registry.zig");
 const transport = @import("transport.zig");
 const wasm = @import("wasm.zig");
 
-pub const Options = struct {
-    limits: graph.Limits = .{},
-    failure_point: layout.FailurePoint = .none,
-};
+pub const Options = engine.Options;
+pub const planAndCopy = engine.planAndCopy;
+pub const executePlan = engine.executePlan;
 
 /// Transport adapter over the exact bytes returned by `wasm.prepare`.
 ///
@@ -149,6 +150,130 @@ pub fn layoutToLayout(
     );
 }
 
+pub const localToLocal = layoutToLayout;
+pub const copyLayoutToLayout = layoutToLayout;
+
+/// Resolves one registry source selector, discovers the complete immutable
+/// graph, and only then creates the layout destination.
+pub fn registryToLayout(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_reference: reference.RegistryReference,
+    source_options: registry.Options,
+    destination_reference: reference.LayoutReference,
+    options: Options,
+) !transport.Result {
+    var source = try registry.Source.init(
+        io,
+        allocator,
+        source_reference,
+        source_options,
+    );
+    defer source.deinit();
+    return source.copyToLayout(
+        source_reference,
+        destination_reference,
+        options,
+    );
+}
+
+pub const copyRegistryToLayout = registryToLayout;
+
+/// Copies a fully discovered layout graph into a separately configured
+/// registry destination. The destination selector must be an explicit tag.
+pub fn layoutToRegistry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_reference: reference.LayoutReference,
+    destination_reference: reference.RegistryReference,
+    destination_options: registry.DestinationOptions,
+    options: Options,
+) !transport.Result {
+    var source = layout.Source.initWithMetadataLimit(
+        io,
+        allocator,
+        source_reference.path,
+        options.limits.max_metadata_bytes,
+    );
+    var resolved = try source.resolve(source_reference);
+    defer resolved.deinit();
+    var plan = try graph.planCopy(
+        allocator,
+        source.asTransport(),
+        .{
+            .descriptor = resolved.descriptor,
+            .descriptor_json = resolved.descriptor_json,
+        },
+        options.limits,
+    );
+    defer plan.deinit();
+
+    var destination = try registry.Destination.init(
+        io,
+        allocator,
+        destination_reference,
+        destination_options,
+    );
+    defer destination.deinit();
+    return executePlan(
+        &plan,
+        source.asTransport(),
+        destination.asTransport(),
+        destination_reference.selection,
+    );
+}
+
+pub const copyLayoutToRegistry = layoutToRegistry;
+
+/// Uses distinct source and destination registry clients. Source resolution
+/// and complete graph discovery finish before destination initialization.
+pub fn registryToRegistry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    source_reference: reference.RegistryReference,
+    source_options: registry.Options,
+    destination_reference: reference.RegistryReference,
+    destination_options: registry.DestinationOptions,
+    options: Options,
+) !transport.Result {
+    var source = try registry.Source.init(
+        io,
+        allocator,
+        source_reference,
+        source_options,
+    );
+    defer source.deinit();
+    var resolved = try source.resolve(source_reference);
+    defer resolved.deinit();
+    var resolved_source = source.resolvedSource(&resolved);
+    var plan = try graph.planCopy(
+        allocator,
+        resolved_source.asTransport(),
+        .{
+            .descriptor = resolved.descriptor,
+            .descriptor_json = resolved.descriptor_json,
+        },
+        options.limits,
+    );
+    defer plan.deinit();
+
+    var destination = try registry.Destination.init(
+        io,
+        allocator,
+        destination_reference,
+        destination_options,
+    );
+    defer destination.deinit();
+    return executePlan(
+        &plan,
+        resolved_source.asTransport(),
+        destination.asTransport(),
+        destination_reference.selection,
+    );
+}
+
+pub const copyRegistryToRegistry = registryToRegistry;
+
 /// Publishes one prepared profile package through the shared graph planner and
 /// copy engine. This works for both new and existing OCI layouts.
 pub fn packageToLayout(
@@ -175,54 +300,6 @@ pub fn packageToLayout(
         destination_reference.selection,
         options.limits,
     );
-}
-
-/// Reusable source/destination entry point for later registry pairings.
-pub fn planAndCopy(
-    allocator: std.mem.Allocator,
-    source: transport.Source,
-    root: graph.Root,
-    destination: transport.Destination,
-    selection: ?reference.Selection,
-    limits: graph.Limits,
-) !transport.Result {
-    var plan = try graph.planCopy(allocator, source, root, limits);
-    defer plan.deinit();
-    return executePlan(&plan, source, destination, selection);
-}
-
-/// Executes only a complete plan: dependencies first, the exact root last,
-/// then reference publication and destination finalization.
-pub fn executePlan(
-    plan: *const graph.Plan,
-    source: transport.Source,
-    destination: transport.Destination,
-    selection: ?reference.Selection,
-) !transport.Result {
-    const root_entry = plan.rootEntry();
-    try destination.prepareRoot(root_entry.descriptor, selection);
-
-    var counts: transport.Counts = .{};
-    for (plan.dependencyEntries()) |entry| {
-        const outcome = try destination.ensureDescriptor(
-            entry.transfer(source),
-        );
-        try counts.record(outcome);
-    }
-
-    const publication = plan.rootPublication();
-    const root_outcome = try destination.stageRoot(publication);
-    try counts.record(root_outcome);
-    const commit = try destination.commitRoot(publication, selection);
-    try destination.finish();
-
-    const digest = content.Digest.parse(publication.descriptor.digest) catch
-        return error.InvalidDigest;
-    return .{
-        .root = digest,
-        .counts = counts,
-        .commit = commit,
-    };
 }
 
 fn descriptorIdentityEqual(

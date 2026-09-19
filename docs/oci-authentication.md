@@ -160,12 +160,46 @@ does the same for the exact root and does not access the destination tag.
 manifest writes are confirmed with bounded exact reads. An ambiguous final PUT
 succeeds only when both the tag and immutable digest resolve to the expected
 bytes; otherwise `PublicationUnconfirmed` is returned and no copy result is
-created. Pre-commit failures may leave verified unreferenced blobs, child
-documents, or remote upload sessions, but they do not update the new root tag.
+created. After confirmation, `finish` performs no fallible registry work.
+Pre-commit failures may leave verified unreferenced blobs, child documents, or
+remote upload sessions, but they do not update the new root tag.
 
-These are library APIs only. They do not add registry commands, convenience
-copy pairings, profile-specific upload behavior, deletion, signatures, or
-referrers. No live/cloud registry behavior is used by tests.
+## Copy pairing behavior
+
+The library exposes all four source/destination combinations through one
+bounded planner and executor:
+
+- `copy.localToLocal` / `copy.layoutToLayout`;
+- `registry.Source.copyToLayout` / `copy.registryToLayout`;
+- `registry.Destination.copyFromLayout` / `copy.layoutToRegistry`;
+- `registry.Source.copyToDestination` (`copyToRegistry`) /
+  `copy.registryToRegistry`.
+
+Registry-to-registry constructors use separate source and destination clients,
+so credentials, token caches, additional CAs, deadlines, redirects, and
+diagnostics remain independent. A mutable source tag is resolved exactly once;
+the returned root descriptor and exact bytes are then immutable, and all
+descendants are digest-addressed. Only normalized, credential-free source
+identity crosses into destination mount eligibility.
+
+Every pairing discovers and validates the complete supported index graph
+before destination preflight or filesystem mutation. Traversal never derives a
+host platform. Subjects, unknown index-child document types, cycles,
+descriptor conflicts, corrupt bytes, and graph-limit exhaustion fail before
+publication. Original manifest/index bytes and layout root-descriptor JSON are
+retained; named layout copies only adjust the canonical reference-name
+annotation.
+
+Execution is post-order and counts each unique descriptor once as transferred,
+reused, or mounted. Dependencies and child documents finish before the exact
+root is staged. The destination tag or layout catalog is the final visibility
+change, and a `Result` containing the root digest is created only after
+destination finish. Layout-only copies instantiate no registry client and
+perform no authentication discovery or network operation.
+
+These are library APIs only. They do not add registry commands,
+profile-specific upload behavior, deletion, signatures, or referrers. No
+live/cloud registry behavior is used by tests.
 
 ## Credential policies
 

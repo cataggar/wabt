@@ -2,6 +2,8 @@ const std = @import("std");
 const oci = @import("wabt").oci;
 const auth = oci.auth;
 const content = oci.content;
+const copy = oci.copy;
+const layout = oci.layout;
 const model = oci.model;
 const reference = oci.reference;
 const registry = oci.registry;
@@ -4533,8 +4535,8 @@ test "final manifest ambiguity succeeds only for exact tag and finish is strict"
             ),
         );
         runtime.now_ns = 60 * std.time.ns_per_s;
-        try std.testing.expectError(error.DeadlineExceeded, destination.finish());
-        try std.testing.expect(!destination.committed());
+        try destination.finish();
+        try std.testing.expect(destination.committed());
     }
 
     {
@@ -4599,5 +4601,1112 @@ test "final manifest ambiguity succeeds only for exact tag and finish is strict"
             ),
         );
         try std.testing.expect(!destination.committed());
+    }
+}
+
+const PairingContent = struct {
+    descriptor: model.Descriptor,
+    bytes: []const u8,
+};
+
+const PairingGraph = struct {
+    config: TestDescriptor,
+    layer_one: TestDescriptor,
+    layer_two: TestDescriptor,
+    manifest_one: TestDescriptor,
+    manifest_two: TestDescriptor,
+    nested: TestDescriptor,
+    root: TestDescriptor,
+    config_bytes: []const u8,
+    layer_one_bytes: []const u8,
+    layer_two_bytes: []const u8,
+    manifest_one_bytes: []const u8,
+    manifest_two_bytes: []const u8,
+    nested_bytes: []const u8,
+    root_bytes: []const u8,
+
+    fn init(allocator: Allocator) !PairingGraph {
+        const config_bytes =
+            "{\"architecture\":\"wasm\",\"os\":\"wasi\",\"x-config\":true}";
+        const layer_one_bytes = "pairing-amd64-payload";
+        const layer_two_bytes = "pairing-arm64-payload";
+        const config = descriptor(
+            config_bytes,
+            "application/vnd.example.config.v1+json",
+        );
+        const layer_one = descriptor(
+            layer_one_bytes,
+            "application/vnd.example.layer.v1",
+        );
+        const layer_two = descriptor(
+            layer_two_bytes,
+            "application/vnd.example.layer.v1",
+        );
+        const manifest_one_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"artifactType\":\"application/vnd.example.wasm\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}],\"annotations\":{{\"example.branch\":\"one\"}},\"x-manifest\":{{\"kept\":1}}}}",
+            .{
+                model.media_type_oci_manifest,
+                config.media_type,
+                &config.digest_text,
+                config.size,
+                layer_one.media_type,
+                &layer_one.digest_text,
+                layer_one.size,
+            },
+        );
+        const manifest_one = descriptor(
+            manifest_one_bytes,
+            model.media_type_oci_manifest,
+        );
+        const manifest_two_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"artifactType\":\"application/vnd.example.wasm\",\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}}],\"annotations\":{{\"example.branch\":\"two\"}},\"x-manifest\":{{\"kept\":2}}}}",
+            .{
+                model.media_type_oci_manifest,
+                config.media_type,
+                &config.digest_text,
+                config.size,
+                layer_two.media_type,
+                &layer_two.digest_text,
+                layer_two.size,
+            },
+        );
+        const manifest_two = descriptor(
+            manifest_two_bytes,
+            model.media_type_oci_manifest,
+        );
+        const nested_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}},\"x-child\":1}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"architecture\":\"arm64\",\"os\":\"linux\"}},\"x-child\":2}}],\"annotations\":{{\"example.index\":\"nested\"}},\"x-index\":[1,2]}}",
+            .{
+                model.media_type_oci_index,
+                manifest_one.media_type,
+                &manifest_one.digest_text,
+                manifest_one.size,
+                manifest_two.media_type,
+                &manifest_two.digest_text,
+                manifest_two.size,
+            },
+        );
+        const nested = descriptor(nested_bytes, model.media_type_oci_index);
+        const root_bytes = try std.fmt.allocPrint(
+            allocator,
+            "{{\"schemaVersion\":2,\"mediaType\":\"{s}\",\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"example.root-child\":\"nested\"}}}},{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"platform\":{{\"architecture\":\"amd64\",\"os\":\"linux\"}},\"x-shared\":true}}],\"annotations\":{{\"example.index\":\"root\"}},\"x-root-document\":{{\"kept\":true}}}}",
+            .{
+                model.media_type_oci_index,
+                nested.media_type,
+                &nested.digest_text,
+                nested.size,
+                manifest_one.media_type,
+                &manifest_one.digest_text,
+                manifest_one.size,
+            },
+        );
+        return .{
+            .config = config,
+            .layer_one = layer_one,
+            .layer_two = layer_two,
+            .manifest_one = manifest_one,
+            .manifest_two = manifest_two,
+            .nested = nested,
+            .root = descriptor(root_bytes, model.media_type_oci_index),
+            .config_bytes = config_bytes,
+            .layer_one_bytes = layer_one_bytes,
+            .layer_two_bytes = layer_two_bytes,
+            .manifest_one_bytes = manifest_one_bytes,
+            .manifest_two_bytes = manifest_two_bytes,
+            .nested_bytes = nested_bytes,
+            .root_bytes = root_bytes,
+        };
+    }
+
+    fn document(
+        self: *const PairingGraph,
+        digest_text: []const u8,
+    ) ?PairingContent {
+        if (std.mem.eql(u8, digest_text, &self.root.digest_text)) {
+            return .{ .descriptor = self.root.value(), .bytes = self.root_bytes };
+        }
+        if (std.mem.eql(u8, digest_text, &self.nested.digest_text)) {
+            return .{
+                .descriptor = self.nested.value(),
+                .bytes = self.nested_bytes,
+            };
+        }
+        if (std.mem.eql(u8, digest_text, &self.manifest_one.digest_text)) {
+            return .{
+                .descriptor = self.manifest_one.value(),
+                .bytes = self.manifest_one_bytes,
+            };
+        }
+        if (std.mem.eql(u8, digest_text, &self.manifest_two.digest_text)) {
+            return .{
+                .descriptor = self.manifest_two.value(),
+                .bytes = self.manifest_two_bytes,
+            };
+        }
+        return null;
+    }
+
+    fn blob(
+        self: *const PairingGraph,
+        digest_text: []const u8,
+    ) ?PairingContent {
+        if (std.mem.eql(u8, digest_text, &self.config.digest_text)) {
+            return .{
+                .descriptor = self.config.value(),
+                .bytes = self.config_bytes,
+            };
+        }
+        if (std.mem.eql(u8, digest_text, &self.layer_one.digest_text)) {
+            return .{
+                .descriptor = self.layer_one.value(),
+                .bytes = self.layer_one_bytes,
+            };
+        }
+        if (std.mem.eql(u8, digest_text, &self.layer_two.digest_text)) {
+            return .{
+                .descriptor = self.layer_two.value(),
+                .bytes = self.layer_two_bytes,
+            };
+        }
+        return null;
+    }
+
+    fn content(
+        self: *const PairingGraph,
+        digest_text: []const u8,
+    ) ?PairingContent {
+        return self.document(digest_text) orelse self.blob(digest_text);
+    }
+
+    fn directRoot(self: *const PairingGraph) PairingContent {
+        return .{
+            .descriptor = self.manifest_one.value(),
+            .bytes = self.manifest_one_bytes,
+        };
+    }
+
+    fn nestedRoot(self: *const PairingGraph) PairingContent {
+        return .{
+            .descriptor = self.root.value(),
+            .bytes = self.root_bytes,
+        };
+    }
+};
+
+const PairingMutation = enum {
+    none,
+    mount,
+    upload,
+    manifest,
+    tag,
+};
+
+const PairingRegistry = struct {
+    allocator: Allocator,
+    graph: *const PairingGraph,
+    source_root_digest: []const u8,
+    decline_mount_digest: ?[]const u8 = null,
+    destination_blobs: std.StringHashMap(void),
+    destination_manifests: std.StringHashMap(void),
+    destination_tag_digest: ?[]const u8 = null,
+    requests: usize = 0,
+    source_tag_reads: usize = 0,
+    source_document_reads: usize = 0,
+    source_blob_reads: usize = 0,
+    require_source_discovery_before_destination: bool = false,
+    mount_count: usize = 0,
+    upload_count: usize = 0,
+    manifest_publication_started: bool = false,
+    last_mutation: PairingMutation = .none,
+
+    fn init(
+        allocator: Allocator,
+        graph_value: *const PairingGraph,
+        source_root_digest: []const u8,
+    ) PairingRegistry {
+        return .{
+            .allocator = allocator,
+            .graph = graph_value,
+            .source_root_digest = source_root_digest,
+            .destination_blobs = std.StringHashMap(void).init(allocator),
+            .destination_manifests = std.StringHashMap(void).init(allocator),
+        };
+    }
+
+    fn deinit(self: *PairingRegistry) void {
+        self.destination_blobs.deinit();
+        self.destination_manifests.deinit();
+        self.* = undefined;
+    }
+
+    fn backend(self: *PairingRegistry) registry_http.Backend {
+        return registry_http.Backend.init(self, .{
+            .absolute_deadline = true,
+            .dns_timeout = true,
+            .connect_timeout = true,
+            .tls_handshake_timeout = true,
+            .write_timeout = true,
+            .response_head_timeout = true,
+            .body_idle_timeout = true,
+        });
+    }
+
+    pub fn request(
+        self: *PairingRegistry,
+        allocator: Allocator,
+        options: registry_http.BackendRequest,
+    ) registry_http.BackendError!registry_http.Response {
+        self.requests += 1;
+        const marker = std.mem.indexOf(u8, options.url, "/v2/") orelse
+            return error.ProtocolFailure;
+        const target = options.url[marker..];
+        try self.requireAuthorization(target, options.authorization);
+        if (std.mem.eql(u8, target, "/v2/")) {
+            if (options.method != .GET) return error.ProtocolFailure;
+            if (self.require_source_discovery_before_destination) {
+                const expected: usize = if (std.mem.eql(
+                    u8,
+                    self.source_root_digest,
+                    &self.graph.root.digest_text,
+                ))
+                    4
+                else
+                    1;
+                if (self.source_document_reads != expected) {
+                    return error.ProtocolFailure;
+                }
+            }
+            return registry_http.Response.initCopy(
+                allocator,
+                200,
+                &.{},
+                "",
+            ) catch error.OutOfMemory;
+        }
+        if (std.mem.startsWith(u8, target, "/v2/source/manifests/")) {
+            if (options.method != .GET) return error.ProtocolFailure;
+            const selector = target["/v2/source/manifests/".len..];
+            const digest_text = if (std.mem.eql(u8, selector, "moving")) blk: {
+                self.source_tag_reads += 1;
+                if (self.source_tag_reads != 1) return error.ProtocolFailure;
+                break :blk self.source_root_digest;
+            } else selector;
+            const value = self.graph.document(digest_text) orelse
+                return self.notFound(allocator);
+            self.source_document_reads += 1;
+            return self.contentResponse(allocator, options, value, false);
+        }
+        if (std.mem.startsWith(u8, target, "/v2/source/blobs/")) {
+            if (options.method != .GET) return error.ProtocolFailure;
+            const digest_text = target["/v2/source/blobs/".len..];
+            const value = self.graph.blob(digest_text) orelse
+                return self.notFound(allocator);
+            self.source_blob_reads += 1;
+            return self.contentResponse(allocator, options, value, false);
+        }
+        if (std.mem.startsWith(u8, target, "/v2/dest/blobs/uploads/?mount=")) {
+            if (options.method != .POST) return error.ProtocolFailure;
+            const value = self.blobFromEncodedDigest(target) orelse
+                return error.ProtocolFailure;
+            self.mount_count += 1;
+            if (self.decline_mount_digest) |declined| {
+                if (std.mem.eql(u8, declined, value.descriptor.digest)) {
+                    const headers = [_]registry_http.Header{
+                        .{
+                            .name = "Location",
+                            .value = "/v2/dest/blobs/uploads/mount-declined",
+                        },
+                        .{
+                            .name = "Docker-Upload-UUID",
+                            .value = "mount-declined",
+                        },
+                        .{ .name = "Range", .value = "0-0" },
+                    };
+                    return registry_http.Response.initCopy(
+                        allocator,
+                        202,
+                        &headers,
+                        "",
+                    ) catch error.OutOfMemory;
+                }
+            }
+            if (self.manifest_publication_started) {
+                return error.ProtocolFailure;
+            }
+            try self.destination_blobs.put(value.descriptor.digest, {});
+            self.last_mutation = .mount;
+            return self.mutationResponse(
+                allocator,
+                201,
+                value.descriptor.digest,
+                "/v2/dest/blobs/mounted",
+            );
+        }
+        if (std.mem.eql(u8, target, "/v2/dest/blobs/uploads/")) {
+            if (options.method != .POST) return error.ProtocolFailure;
+            const headers = [_]registry_http.Header{
+                .{
+                    .name = "Location",
+                    .value = "/v2/dest/blobs/uploads/ordinary",
+                },
+                .{ .name = "Docker-Upload-UUID", .value = "ordinary" },
+                .{ .name = "Range", .value = "0-0" },
+            };
+            return registry_http.Response.initCopy(
+                allocator,
+                202,
+                &headers,
+                "",
+            ) catch error.OutOfMemory;
+        }
+        if (std.mem.startsWith(u8, target, "/v2/dest/blobs/uploads/")) {
+            if (options.method != .PUT) return error.ProtocolFailure;
+            const value = self.blobFromEncodedDigest(target) orelse
+                return error.ProtocolFailure;
+            if (self.manifest_publication_started) {
+                return error.ProtocolFailure;
+            }
+            try consumeExpectedBody(options, value.bytes);
+            try self.destination_blobs.put(value.descriptor.digest, {});
+            self.upload_count += 1;
+            self.last_mutation = .upload;
+            var location_buffer: [256]u8 = undefined;
+            const location = std.fmt.bufPrint(
+                &location_buffer,
+                "/v2/dest/blobs/{s}",
+                .{value.descriptor.digest},
+            ) catch return error.ProtocolFailure;
+            return self.mutationResponse(
+                allocator,
+                201,
+                value.descriptor.digest,
+                location,
+            );
+        }
+        if (std.mem.startsWith(u8, target, "/v2/dest/blobs/")) {
+            const digest_text = target["/v2/dest/blobs/".len..];
+            if (!self.destination_blobs.contains(digest_text)) {
+                return self.notFound(allocator);
+            }
+            const value = self.graph.blob(digest_text) orelse
+                return error.ProtocolFailure;
+            return switch (options.method) {
+                .HEAD => self.contentResponse(allocator, options, value, true),
+                .GET => self.contentResponse(allocator, options, value, false),
+                else => error.ProtocolFailure,
+            };
+        }
+        if (std.mem.startsWith(u8, target, "/v2/dest/manifests/")) {
+            const selector = target["/v2/dest/manifests/".len..];
+            return switch (options.method) {
+                .GET => self.getDestinationManifest(
+                    allocator,
+                    options,
+                    selector,
+                ),
+                .PUT => self.putDestinationManifest(
+                    allocator,
+                    options,
+                    selector,
+                ),
+                else => error.ProtocolFailure,
+            };
+        }
+        return error.ProtocolFailure;
+    }
+
+    fn requireAuthorization(
+        _: *PairingRegistry,
+        target: []const u8,
+        authorization: ?[]const u8,
+    ) registry_http.BackendError!void {
+        const expected = if (std.mem.startsWith(u8, target, "/v2/source/"))
+            "Basic cmVhZGVyOnNvdXJjZS1zZWNyZXQ="
+        else
+            "Basic d3JpdGVyOmRlc3Qtc2VjcmV0";
+        if (authorization == null or
+            !std.mem.eql(u8, authorization.?, expected))
+        {
+            return error.ProtocolFailure;
+        }
+    }
+
+    fn notFound(
+        _: *PairingRegistry,
+        allocator: Allocator,
+    ) registry_http.BackendError!registry_http.Response {
+        return registry_http.Response.initCopy(
+            allocator,
+            404,
+            &.{},
+            "",
+        ) catch error.OutOfMemory;
+    }
+
+    fn contentResponse(
+        _: *PairingRegistry,
+        allocator: Allocator,
+        options: registry_http.BackendRequest,
+        value: PairingContent,
+        head_only: bool,
+    ) registry_http.BackendError!registry_http.Response {
+        var length_buffer: [32]u8 = undefined;
+        const length = std.fmt.bufPrint(
+            &length_buffer,
+            "{d}",
+            .{value.bytes.len},
+        ) catch return error.ProtocolFailure;
+        const headers = [_]registry_http.Header{
+            .{ .name = "Content-Length", .value = length },
+            .{ .name = "Content-Type", .value = value.descriptor.mediaType },
+            .{
+                .name = "Docker-Content-Digest",
+                .value = value.descriptor.digest,
+            },
+        };
+        const body = if (head_only) "" else value.bytes;
+        if (!head_only and options.body_sink != null) {
+            const sink = options.body_sink.?;
+            sink.begin(value.bytes.len) catch return error.BodySinkFailed;
+            var offset: usize = 0;
+            while (offset < value.bytes.len) {
+                const end = @min(offset + 9, value.bytes.len);
+                sink.write(value.bytes[offset..end]) catch
+                    return error.BodySinkFailed;
+                offset = end;
+            }
+            sink.finish() catch return error.BodySinkFailed;
+            return registry_http.Response.initCopy(
+                allocator,
+                200,
+                &headers,
+                "",
+            ) catch error.OutOfMemory;
+        }
+        return registry_http.Response.initCopy(
+            allocator,
+            200,
+            &headers,
+            body,
+        ) catch error.OutOfMemory;
+    }
+
+    fn mutationResponse(
+        _: *PairingRegistry,
+        allocator: Allocator,
+        status: u16,
+        digest_text: []const u8,
+        location: []const u8,
+    ) registry_http.BackendError!registry_http.Response {
+        const headers = [_]registry_http.Header{
+            .{ .name = "Location", .value = location },
+            .{ .name = "Docker-Content-Digest", .value = digest_text },
+        };
+        return registry_http.Response.initCopy(
+            allocator,
+            status,
+            &headers,
+            "",
+        ) catch error.OutOfMemory;
+    }
+
+    fn blobFromEncodedDigest(
+        self: *PairingRegistry,
+        target: []const u8,
+    ) ?PairingContent {
+        const values = [_]PairingContent{
+            .{
+                .descriptor = self.graph.config.value(),
+                .bytes = self.graph.config_bytes,
+            },
+            .{
+                .descriptor = self.graph.layer_one.value(),
+                .bytes = self.graph.layer_one_bytes,
+            },
+            .{
+                .descriptor = self.graph.layer_two.value(),
+                .bytes = self.graph.layer_two_bytes,
+            },
+        };
+        for (values) |value| {
+            if (std.mem.indexOf(
+                u8,
+                target,
+                value.descriptor.digest["sha256:".len..],
+            ) != null) return value;
+        }
+        return null;
+    }
+
+    fn getDestinationManifest(
+        self: *PairingRegistry,
+        allocator: Allocator,
+        options: registry_http.BackendRequest,
+        selector: []const u8,
+    ) registry_http.BackendError!registry_http.Response {
+        const digest_text = if (std.mem.startsWith(u8, selector, "sha256:"))
+            selector
+        else
+            self.destination_tag_digest orelse return self.notFound(allocator);
+        if (!self.destination_manifests.contains(digest_text)) {
+            return self.notFound(allocator);
+        }
+        const value = self.graph.document(digest_text) orelse
+            return error.ProtocolFailure;
+        return self.contentResponse(allocator, options, value, false);
+    }
+
+    fn putDestinationManifest(
+        self: *PairingRegistry,
+        allocator: Allocator,
+        options: registry_http.BackendRequest,
+        selector: []const u8,
+    ) registry_http.BackendError!registry_http.Response {
+        const source = options.body_source orelse return error.ProtocolFailure;
+        var bytes = try self.allocator.alloc(u8, @intCast(source.length));
+        defer self.allocator.free(bytes);
+        var offset: u64 = 0;
+        while (offset < source.length) {
+            const start: usize = @intCast(offset);
+            const count = source.read(offset, bytes[start..]) catch
+                return error.BodySourceFailed;
+            if (count == 0) return error.ProtocolFailure;
+            offset += count;
+        }
+        const description = content.describeBytes(bytes) catch
+            return error.ProtocolFailure;
+        const digest_buffer = description.digest.format();
+        const value = self.graph.document(&digest_buffer) orelse
+            return error.ProtocolFailure;
+        if (!std.mem.eql(u8, value.bytes, bytes)) return error.ProtocolFailure;
+        try self.destination_manifests.put(value.descriptor.digest, {});
+
+        if (std.mem.startsWith(u8, selector, "sha256:")) {
+            if (!std.mem.eql(u8, selector, value.descriptor.digest)) {
+                return error.ProtocolFailure;
+            }
+            self.manifest_publication_started = true;
+            self.last_mutation = .manifest;
+        } else {
+            self.destination_tag_digest = value.descriptor.digest;
+            self.last_mutation = .tag;
+        }
+        var location_buffer: [256]u8 = undefined;
+        const location = std.fmt.bufPrint(
+            &location_buffer,
+            "/v2/dest/manifests/{s}",
+            .{value.descriptor.digest},
+        ) catch return error.ProtocolFailure;
+        return self.mutationResponse(
+            allocator,
+            201,
+            value.descriptor.digest,
+            location,
+        );
+    }
+};
+
+fn consumeExpectedBody(
+    options: registry_http.BackendRequest,
+    expected: []const u8,
+) registry_http.BackendError!void {
+    const source = options.body_source orelse return error.ProtocolFailure;
+    if (source.length != expected.len) return error.ProtocolFailure;
+    var offset: u64 = 0;
+    var buffer: [13]u8 = undefined;
+    while (offset < source.length) {
+        const count = source.read(offset, &buffer) catch
+            return error.BodySourceFailed;
+        if (count == 0) return error.ProtocolFailure;
+        const start: usize = @intCast(offset);
+        if (!std.mem.eql(
+            u8,
+            buffer[0..count],
+            expected[start..][0..count],
+        )) return error.ProtocolFailure;
+        offset += count;
+    }
+}
+
+fn writePairingLayout(
+    allocator: Allocator,
+    path: []const u8,
+    graph_value: *const PairingGraph,
+    root: PairingContent,
+    tag: []const u8,
+) !void {
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, path);
+    var directory = try std.Io.Dir.cwd().openDir(std.testing.io, path, .{});
+    defer directory.close(std.testing.io);
+    try directory.createDirPath(std.testing.io, "blobs/sha256");
+    try directory.writeFile(std.testing.io, .{
+        .sub_path = "oci-layout",
+        .data = "{\"imageLayoutVersion\":\"1.0.0\"}\n",
+    });
+    const values = [_]PairingContent{
+        .{
+            .descriptor = graph_value.config.value(),
+            .bytes = graph_value.config_bytes,
+        },
+        .{
+            .descriptor = graph_value.layer_one.value(),
+            .bytes = graph_value.layer_one_bytes,
+        },
+        .{
+            .descriptor = graph_value.layer_two.value(),
+            .bytes = graph_value.layer_two_bytes,
+        },
+        .{
+            .descriptor = graph_value.manifest_one.value(),
+            .bytes = graph_value.manifest_one_bytes,
+        },
+        .{
+            .descriptor = graph_value.manifest_two.value(),
+            .bytes = graph_value.manifest_two_bytes,
+        },
+        .{
+            .descriptor = graph_value.nested.value(),
+            .bytes = graph_value.nested_bytes,
+        },
+        .{
+            .descriptor = graph_value.root.value(),
+            .bytes = graph_value.root_bytes,
+        },
+    };
+    for (values) |value| {
+        const digest = try content.Digest.parse(value.descriptor.digest);
+        const blob_path = digest.blobPath();
+        try directory.writeFile(std.testing.io, .{
+            .sub_path = &blob_path,
+            .data = value.bytes,
+        });
+    }
+    const index_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"manifests\":[{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d},\"annotations\":{{\"org.opencontainers.image.ref.name\":\"{s}\",\"example.root\":\"kept\"}},\"x-root-descriptor\":{{\"kept\":true}}}}],\"x-catalog\":{{\"kept\":true}}}}",
+        .{
+            root.descriptor.mediaType,
+            root.descriptor.digest,
+            root.descriptor.size,
+            tag,
+        },
+    );
+    try directory.writeFile(std.testing.io, .{
+        .sub_path = "index.json",
+        .data = index_bytes,
+    });
+}
+
+fn pairingSource(
+    fake: *PairingRegistry,
+    runtime: *FakeRuntime,
+) !registry.Source {
+    return registry.Source.initWithBackend(
+        std.testing.io,
+        std.testing.allocator,
+        .{
+            .authority = "localhost:5000",
+            .repository = "source",
+            .selection = .{ .tag = "moving" },
+        },
+        fake.backend(),
+        runtime.clock(),
+        runtime.sleeper(),
+        .{
+            .plain_http = true,
+            .credential_policy = .{ .supplied = .{ .basic = .{
+                .username = "reader",
+                .secret = "source-secret",
+            } } },
+            .auth_context = .{ .io = std.testing.io },
+            .deadline = .after(runtime.clock(), 60 * std.time.ns_per_s),
+        },
+    );
+}
+
+fn pairingDestination(
+    fake: *PairingRegistry,
+    runtime: *FakeRuntime,
+    tag: []const u8,
+    spool_directory: []const u8,
+) !registry.Destination {
+    return registry.Destination.initWithBackend(
+        std.testing.io,
+        std.testing.allocator,
+        .{
+            .authority = "localhost:5000",
+            .repository = "dest",
+            .selection = .{ .tag = tag },
+        },
+        fake.backend(),
+        runtime.clock(),
+        runtime.sleeper(),
+        .{
+            .plain_http = true,
+            .credential_policy = .{ .supplied = .{ .basic = .{
+                .username = "writer",
+                .secret = "dest-secret",
+            } } },
+            .auth_context = .{ .io = std.testing.io },
+            .deadline = .after(runtime.clock(), 60 * std.time.ns_per_s),
+            .spool_directory = spool_directory,
+        },
+    );
+}
+
+fn expectPairingLayoutBytes(
+    path: []const u8,
+    graph_value: *const PairingGraph,
+    root: PairingContent,
+    tag: []const u8,
+    expect_root_extension: bool,
+) !void {
+    var source = layout.Source.init(
+        std.testing.io,
+        std.testing.allocator,
+        path,
+    );
+    var resolved = try source.resolve(.{
+        .path = path,
+        .selection = .{ .tag = tag },
+    });
+    defer resolved.deinit();
+    try std.testing.expectEqualStrings(
+        root.descriptor.digest,
+        resolved.descriptor.digest,
+    );
+    try std.testing.expectEqualSlices(u8, root.bytes, resolved.bytes);
+    const index_path = try std.fs.path.join(
+        std.testing.allocator,
+        &.{ path, "index.json" },
+    );
+    defer std.testing.allocator.free(index_path);
+    const index_bytes = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        index_path,
+        std.testing.allocator,
+        .limited(layout.default_metadata_limit),
+    );
+    defer std.testing.allocator.free(index_bytes);
+    if (expect_root_extension) {
+        try std.testing.expect(
+            std.mem.indexOf(u8, index_bytes, "\"x-root-descriptor\"") != null,
+        );
+    }
+    _ = graph_value;
+}
+
+test "all copy pairings support direct manifests without hidden layout networking" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var graph_value = try PairingGraph.init(allocator);
+    const direct = graph_value.directRoot();
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const base = try temporaryPath(allocator, &temporary);
+    const source_layout = try std.fs.path.join(
+        allocator,
+        &.{ base, "direct-source" },
+    );
+    const local_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "direct-local" },
+    );
+    const registry_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "direct-registry" },
+    );
+    try writePairingLayout(
+        allocator,
+        source_layout,
+        &graph_value,
+        direct,
+        "source",
+    );
+
+    const local_result = try copy.localToLocal(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .path = source_layout, .selection = .{ .tag = "source" } },
+        .{
+            .path = local_destination,
+            .selection = .{ .tag = "copied" },
+        },
+        .{},
+    );
+    try std.testing.expectEqual(@as(u64, 3), local_result.counts.transferred);
+    try expectPairingLayoutBytes(
+        local_destination,
+        &graph_value,
+        direct,
+        "copied",
+        true,
+    );
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        const result = try source.copyToLayout(
+            .{
+                .authority = "localhost:5000",
+                .repository = "source",
+                .selection = .{ .tag = "moving" },
+            },
+            .{
+                .path = registry_destination,
+                .selection = .{ .tag = "copied" },
+            },
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 3), result.counts.transferred);
+        try std.testing.expectEqual(@as(usize, 1), fake.source_tag_reads);
+        try std.testing.expectEqual(@as(usize, 2), fake.source_blob_reads);
+        try expectPairingLayoutBytes(
+            registry_destination,
+            &graph_value,
+            direct,
+            "copied",
+            false,
+        );
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer destination.deinit();
+        const result = try destination.copyFromLayout(
+            .{ .path = source_layout, .selection = .{ .tag = "source" } },
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 3), result.counts.transferred);
+        try std.testing.expectEqual(@as(usize, 0), fake.source_tag_reads);
+        try std.testing.expectEqualStrings(
+            direct.descriptor.digest,
+            fake.destination_tag_digest.?,
+        );
+        try std.testing.expectEqual(.tag, fake.last_mutation);
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        fake.require_source_discovery_before_destination = true;
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer destination.deinit();
+        const result = try source.copyToDestination(
+            .{
+                .authority = "localhost:5000",
+                .repository = "source",
+                .selection = .{ .tag = "moving" },
+            },
+            &destination,
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 1), result.counts.transferred);
+        try std.testing.expectEqual(@as(u64, 2), result.counts.mounted);
+        try std.testing.expectEqual(@as(usize, 0), fake.source_blob_reads);
+        try std.testing.expectEqual(@as(usize, 1), fake.source_tag_reads);
+        try std.testing.expectEqual(.tag, fake.last_mutation);
+    }
+}
+
+test "all copy pairings preserve complete nested shared graph and exact counts" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var graph_value = try PairingGraph.init(allocator);
+    const nested = graph_value.nestedRoot();
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const base = try temporaryPath(allocator, &temporary);
+    const source_layout = try std.fs.path.join(
+        allocator,
+        &.{ base, "nested-source" },
+    );
+    const local_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "nested-local" },
+    );
+    const registry_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "nested-registry" },
+    );
+    try writePairingLayout(
+        allocator,
+        source_layout,
+        &graph_value,
+        nested,
+        "source",
+    );
+
+    const local_result = try copy.localToLocal(
+        std.testing.io,
+        std.testing.allocator,
+        .{ .path = source_layout, .selection = .{ .tag = "source" } },
+        .{
+            .path = local_destination,
+            .selection = .{ .tag = "copied" },
+        },
+        .{},
+    );
+    try std.testing.expectEqual(@as(u64, 7), local_result.counts.transferred);
+    try expectPairingLayoutBytes(
+        local_destination,
+        &graph_value,
+        nested,
+        "copied",
+        true,
+    );
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            nested.descriptor.digest,
+        );
+        defer fake.deinit();
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        const result = try source.copyToLayout(
+            .{
+                .authority = "localhost:5000",
+                .repository = "source",
+                .selection = .{ .tag = "moving" },
+            },
+            .{
+                .path = registry_destination,
+                .selection = .{ .tag = "copied" },
+            },
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 7), result.counts.transferred);
+        try std.testing.expectEqual(@as(usize, 3), fake.source_blob_reads);
+        try std.testing.expectEqual(@as(usize, 1), fake.source_tag_reads);
+        try expectPairingLayoutBytes(
+            registry_destination,
+            &graph_value,
+            nested,
+            "copied",
+            false,
+        );
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            nested.descriptor.digest,
+        );
+        defer fake.deinit();
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        errdefer destination.deinit();
+        const first = try destination.copyFromLayout(
+            .{ .path = source_layout, .selection = .{ .tag = "source" } },
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 7), first.counts.transferred);
+        try std.testing.expectEqual(.tag, fake.last_mutation);
+        destination.deinit();
+
+        var repeated_destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer repeated_destination.deinit();
+        const repeated = try repeated_destination.copyFromLayout(
+            .{ .path = source_layout, .selection = .{ .tag = "source" } },
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 0), repeated.counts.transferred);
+        try std.testing.expectEqual(@as(u64, 7), repeated.counts.reused);
+        try std.testing.expectEqualStrings(
+            nested.descriptor.digest,
+            fake.destination_tag_digest.?,
+        );
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            nested.descriptor.digest,
+        );
+        defer fake.deinit();
+        fake.require_source_discovery_before_destination = true;
+        fake.decline_mount_digest = graph_value.layer_two.value().digest;
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer destination.deinit();
+        const result = try source.copyToRegistry(
+            .{
+                .authority = "localhost:5000",
+                .repository = "source",
+                .selection = .{ .tag = "moving" },
+            },
+            &destination,
+            .{},
+        );
+        try std.testing.expectEqual(@as(u64, 5), result.counts.transferred);
+        try std.testing.expectEqual(@as(u64, 2), result.counts.mounted);
+        try std.testing.expectEqual(@as(u64, 0), result.counts.reused);
+        try std.testing.expectEqual(@as(usize, 3), fake.mount_count);
+        try std.testing.expectEqual(@as(usize, 1), fake.upload_count);
+        try std.testing.expectEqual(@as(usize, 1), fake.source_blob_reads);
+        try std.testing.expectEqual(@as(usize, 1), fake.source_tag_reads);
+        try std.testing.expectEqual(.tag, fake.last_mutation);
+        try std.testing.expectEqualStrings(
+            nested.descriptor.digest,
+            fake.destination_tag_digest.?,
+        );
     }
 }

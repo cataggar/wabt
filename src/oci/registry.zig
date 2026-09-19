@@ -10,7 +10,9 @@ const std = @import("std");
 const builtin = @import("builtin");
 const auth = @import("auth.zig");
 const content = @import("content.zig");
+const copy_engine = @import("copy_engine.zig");
 const graph = @import("graph.zig");
+const layout = @import("layout.zig");
 const model = @import("model.zig");
 const reference = @import("reference.zig");
 const registry_http = @import("registry_http.zig");
@@ -101,6 +103,8 @@ pub const MountPolicy = enum {
     disabled,
     same_origin,
 };
+
+pub const CopyOptions = copy_engine.Options;
 
 /// Destination initialization is intentionally separate from source options
 /// so pull and push credentials, token caches, deadlines, and CA policy cannot
@@ -729,6 +733,84 @@ pub const Source = struct {
             .plain_http = self.plain_http,
         });
     }
+
+    /// Binds graph reads to a root that has already been resolved from a
+    /// mutable selector. Root bytes are served from that immutable snapshot.
+    pub fn resolvedSource(
+        self: *Source,
+        resolved: *const ResolvedRoot,
+    ) ResolvedSource {
+        return .{ .registry = self, .resolved = resolved };
+    }
+
+    /// Registry -> layout adapter over the shared complete-graph engine.
+    /// Discovery finishes before the destination layout is created or opened.
+    pub fn copyToLayout(
+        self: *Source,
+        source_reference: reference.RegistryReference,
+        destination_reference: reference.LayoutReference,
+        options: copy_engine.Options,
+    ) !transport.Result {
+        var resolved = try self.resolve(source_reference);
+        defer resolved.deinit();
+        var resolved_source = self.resolvedSource(&resolved);
+        var plan = try graph.planCopy(
+            self.allocator,
+            resolved_source.asTransport(),
+            .{
+                .descriptor = resolved.descriptor,
+                .descriptor_json = resolved.descriptor_json,
+            },
+            options.limits,
+        );
+        defer plan.deinit();
+
+        var destination = try layout.Destination.init(
+            self.io,
+            self.allocator,
+            destination_reference.path,
+        );
+        defer destination.deinit();
+        destination.failure_point = options.failure_point;
+        return copy_engine.executePlan(
+            &plan,
+            resolved_source.asTransport(),
+            destination.asTransport(),
+            destination_reference.selection,
+        );
+    }
+
+    /// Registry -> registry adapter using independently initialized source and
+    /// destination clients. Only credential-free source identity is exposed
+    /// to destination mount eligibility.
+    pub fn copyToDestination(
+        self: *Source,
+        source_reference: reference.RegistryReference,
+        destination: *Destination,
+        options: copy_engine.Options,
+    ) !transport.Result {
+        var resolved = try self.resolve(source_reference);
+        defer resolved.deinit();
+        var resolved_source = self.resolvedSource(&resolved);
+        var plan = try graph.planCopy(
+            self.allocator,
+            resolved_source.asTransport(),
+            .{
+                .descriptor = resolved.descriptor,
+                .descriptor_json = resolved.descriptor_json,
+            },
+            options.limits,
+        );
+        defer plan.deinit();
+        return copy_engine.executePlan(
+            &plan,
+            resolved_source.asTransport(),
+            destination.asTransport(),
+            .{ .tag = destination.tag },
+        );
+    }
+
+    pub const copyToRegistry = copyToDestination;
 
     pub fn lastDiagnostic(self: *const Source) ?*const Diagnostic {
         return if (self.last_diagnostic) |*diagnostic| diagnostic else null;
@@ -1704,6 +1786,39 @@ pub const Destination = struct {
 
     pub fn asTransport(self: *Destination) transport.Destination {
         return transport.Destination.init(self);
+    }
+
+    /// Layout -> registry adapter. The source graph is fully resolved and
+    /// validated before destination preflight performs a network request.
+    pub fn copyFromLayout(
+        self: *Destination,
+        source_reference: reference.LayoutReference,
+        options: copy_engine.Options,
+    ) !transport.Result {
+        var source = layout.Source.initWithMetadataLimit(
+            self.remote.io,
+            self.allocator,
+            source_reference.path,
+            options.limits.max_metadata_bytes,
+        );
+        var resolved = try source.resolve(source_reference);
+        defer resolved.deinit();
+        var plan = try graph.planCopy(
+            self.allocator,
+            source.asTransport(),
+            .{
+                .descriptor = resolved.descriptor,
+                .descriptor_json = resolved.descriptor_json,
+            },
+            options.limits,
+        );
+        defer plan.deinit();
+        return copy_engine.executePlan(
+            &plan,
+            source.asTransport(),
+            self.asTransport(),
+            .{ .tag = self.tag },
+        );
     }
 
     pub fn state(self: *const Destination) DestinationState {
@@ -3528,17 +3643,8 @@ pub const Destination = struct {
         if (self.state_value != .committed) {
             return error.DestinationNotCommitted;
         }
-        if (self.remote.client.clock.now() >= self.remote.deadline.at_ns) {
-            self.state_value = .failed;
-            return self.remote.fail(
-                error.DeadlineExceeded,
-                .finish,
-                .deadline,
-                null,
-                null,
-                self.root_digest,
-            );
-        }
+        // commitRoot already confirmed both the mutable tag and immutable
+        // digest. No fallible work may follow that final visibility change.
         self.state_value = .finished;
     }
 
@@ -3888,12 +3994,17 @@ const VerifySink = struct {
     }
 };
 
-const ResolvedSource = struct {
+pub const ResolvedSource = struct {
     registry: *Source,
     resolved: *const ResolvedRoot,
 
-    fn asTransport(self: *ResolvedSource) transport.Source {
-        return transport.Source.init(self);
+    pub fn asTransport(self: *ResolvedSource) transport.Source {
+        return transport.Source.initWithRegistryIdentity(self, .{
+            .origin = self.registry.client.endpoint.canonicalOrigin(),
+            .authority = self.registry.authority,
+            .repository = self.registry.repository,
+            .plain_http = self.registry.plain_http,
+        });
     }
 
     pub fn readMetadata(

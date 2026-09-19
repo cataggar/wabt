@@ -4,8 +4,9 @@
 //! recorded in `SOURCE_PROVENANCE.md`.
 //! Registry destinations verify/reuse or upload opaque blobs, publish exact
 //! child/root documents by immutable digest, and expose a destination tag only
-//! through the final `commitRoot` lifecycle operation. Copy pairing
-//! conveniences and CLI behavior remain outside this increment.
+//! through the final `commitRoot` lifecycle operation. All registry/layout
+//! source and destination pairings use one complete-graph planner/executor.
+//! CLI behavior remains outside this increment.
 
 const std = @import("std");
 
@@ -59,11 +60,13 @@ pub const RegistryUploadLocation = registry_http.ResolvedUploadLocation;
 pub const RegistrySource = registry.Source;
 pub const RegistryDestination = registry.Destination;
 pub const RegistryResolvedRoot = registry.ResolvedRoot;
+pub const RegistryResolvedSource = registry.ResolvedSource;
 pub const RegistryTagList = registry.TagList;
 pub const RegistryInspectOptions = registry.InspectOptions;
 pub const RegistryInspectResult = registry.InspectResult;
 pub const RegistryOptions = registry.Options;
 pub const RegistryDestinationOptions = registry.DestinationOptions;
+pub const RegistryCopyOptions = registry.CopyOptions;
 pub const RegistryLimits = registry.Limits;
 pub const RegistryMountPolicy = registry.MountPolicy;
 pub const RegistryBlobState = registry.BlobState;
@@ -108,7 +111,11 @@ pub const LayoutResolvedRoot = layout.ResolvedRoot;
 pub const LayoutFailurePoint = layout.FailurePoint;
 pub const PackageSource = copy.PackageSource;
 pub const CopyOptions = copy.Options;
+pub const copyLocalToLocal = copy.localToLocal;
 pub const copyLayoutToLayout = copy.layoutToLayout;
+pub const copyRegistryToLayout = copy.registryToLayout;
+pub const copyLayoutToRegistry = copy.layoutToRegistry;
+pub const copyRegistryToRegistry = copy.registryToRegistry;
 pub const copyPackageToLayout = copy.packageToLayout;
 pub const copySourceToDestination = copy.planAndCopy;
 pub const copyPlannedGraph = copy.executePlan;

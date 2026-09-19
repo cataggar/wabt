@@ -424,6 +424,22 @@ const Context = struct {
             root_index,
         );
         defer self.allocator.free(order);
+        const transfer_order = try self.allocator.alloc(usize, order.len);
+        defer self.allocator.free(transfer_order);
+        var transfer_index: usize = 0;
+        for (order) |record_index| {
+            if (self.records.items[record_index].document == null) {
+                transfer_order[transfer_index] = record_index;
+                transfer_index += 1;
+            }
+        }
+        for (order) |record_index| {
+            if (self.records.items[record_index].document != null) {
+                transfer_order[transfer_index] = record_index;
+                transfer_index += 1;
+            }
+        }
+        std.debug.assert(transfer_index == transfer_order.len);
 
         var node_count: usize = 0;
         for (self.records.items) |record| {
@@ -471,9 +487,9 @@ const Context = struct {
             next_node += 1;
         }
 
-        const entries = try self.allocator.alloc(Entry, order.len);
+        const entries = try self.allocator.alloc(Entry, transfer_order.len);
         errdefer self.allocator.free(entries);
-        for (order, 0..) |record_index, entry_index| {
+        for (transfer_order, 0..) |record_index, entry_index| {
             const record = self.records.items[record_index];
             entries[entry_index] = .{
                 .descriptor = record.descriptor,
@@ -488,7 +504,9 @@ const Context = struct {
                     .opaque_blob,
             };
         }
-        if (order.len == 0 or order[order.len - 1] != root_index) {
+        if (transfer_order.len == 0 or
+            transfer_order[transfer_order.len - 1] != root_index)
+        {
             return error.CycleDetected;
         }
 
@@ -1530,8 +1548,14 @@ test "all index children are planned without host platform filtering" {
     defer plan.deinit();
 
     try std.testing.expectEqual(@as(usize, 5), plan.entries.len);
-    try expectEntryDigest(plan.entries[1], &first.digest_text);
+    try expectEntryDigest(plan.entries[0], &first_config.digest_text);
+    try expectEntryDigest(plan.entries[1], &second_config.digest_text);
+    try expectEntryDigest(plan.entries[2], &first.digest_text);
     try expectEntryDigest(plan.entries[3], &second.digest_text);
+    try std.testing.expect(plan.entries[0].data == .opaque_blob);
+    try std.testing.expect(plan.entries[1].data == .opaque_blob);
+    try std.testing.expect(plan.entries[2].data == .exact_metadata);
+    try std.testing.expect(plan.entries[3].data == .exact_metadata);
     try std.testing.expectEqual(@as(usize, 1), fake.metadata_calls);
     try std.testing.expectEqual(@as(usize, 2), fake.manifest_metadata_calls);
 }

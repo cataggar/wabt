@@ -18,7 +18,7 @@ The following paths identify the pinned sources and their WABT destinations:
 | `packages/miz/src/oci/model.zig` | `src/oci/model.zig`, `src/oci/graph.zig` |
 | `packages/miz/src/oci/transport.zig` | `src/oci/transport.zig` |
 | `packages/miz/src/oci/layout.zig` | `src/oci/layout.zig`, `src/oci/integration_tests.zig` |
-| `packages/miz/src/oci/copy.zig` | `src/oci/copy.zig`, `src/oci/graph.zig`, `src/oci/integration_tests.zig` |
+| `packages/miz/src/oci/copy.zig` | `src/oci/copy.zig`, `src/oci/copy_engine.zig`, `src/oci/graph.zig`, `src/oci/integration_tests.zig`, `src/oci/registry_test.zig` |
 
 The adaptation does not copy miz's `oci.zig` facade wholesale or its registry,
 image, layer, filesystem, bundle, snapshot, repack, signing, disk-image, or
@@ -77,8 +77,10 @@ remain while local spool files are always removed.
 Exact child manifests/indexes and the root are published at immutable digest
 references without JSON reserialization. The destination tag PUT is the final
 visibility operation, and an ambiguous final PUT succeeds only after both the
-tag and immutable digest resolve to the expected exact content. This increment
-does not adapt miz's convenience copy pairing entry points, CLI/profile upload
+tag and immutable digest resolve to the expected exact content. After that
+confirmation, registry `finish` performs no fallible work, so the shared engine
+cannot report failure after the tag has become visible. This increment adapts
+the four registry/layout copy pairing constructors, but not CLI/profile upload
 logic, deletion, signatures, or referrers.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
@@ -101,10 +103,13 @@ does not select a host platform.
 `layout.Destination.commitExact`, and its lock/temp helpers. WABT uses the
 frozen transport interfaces, `.wabt-oci-*` staging/temp names, generic
 artifact validation, bounded metadata reads, and separate missing-versus-
-corrupt blob errors. `src/oci/copy.zig` adapts the dependency-first execution
-portion of miz `copy.resolvedToDestination`; discovery remains exclusively in
-WABT's single `graph.planCopy` implementation and performs no platform
-selection.
+corrupt blob errors. `src/oci/copy_engine.zig` adapts the dependency-first
+execution portion of miz `copy.resolvedToDestination`; `src/oci/copy.zig` and
+the registry source/destination methods provide thin constructors for all four
+pairings. Discovery remains exclusively in WABT's single `graph.planCopy`
+implementation and performs no platform selection. Registry roots resolved
+from tags retain their exact first response bytes and expose only
+credential-free origin/repository identity to destination mount policy.
 
 ## OCI Wasm profile contracts
 
