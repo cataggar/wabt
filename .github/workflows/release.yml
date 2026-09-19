@@ -105,6 +105,7 @@ jobs:
           mkdir -p "$PKGNAME/LICENSES"
           cp LICENSE README.md SOURCE_PROVENANCE.md THIRD_PARTY_NOTICES.md "$PKGNAME/"
           cp LICENSES/miz-MIT.txt "$PKGNAME/LICENSES/"
+          cp -R docs "$PKGNAME/"
           tar czf "$PKGNAME.tar.gz" "$PKGNAME"
           test "$(tar tzf "$PKGNAME.tar.gz" | grep -Ec '/bin/[^/]+$')" -eq 1
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/LICENSE"
@@ -112,6 +113,8 @@ jobs:
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/SOURCE_PROVENANCE.md"
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/THIRD_PARTY_NOTICES.md"
           tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/LICENSES/miz-MIT.txt"
+          tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/docs/oci.md"
+          tar tzf "$PKGNAME.tar.gz" | grep -Fx "$PKGNAME/docs/oci-authentication.md"
 
       - name: Generate SBOM
         uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
@@ -149,6 +152,8 @@ jobs:
           tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/SOURCE_PROVENANCE.md"
           tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/THIRD_PARTY_NOTICES.md"
           tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/LICENSES/miz-MIT.txt"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/docs/oci.md"
+          tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/docs/oci-authentication.md"
           tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/src/tools/wabt.zig"
           tar tJf "$PKGNAME.tar.xz" | grep -Fx "$PKGNAME/src/tools/oci.zig"
 
@@ -205,7 +210,17 @@ jobs:
         with:
           name: wabt ${{ steps.version.outputs.version }}
           body: |
-            **Install:**
+            ## Highlights
+
+            - Native single-binary OCI transport supports push, resolve, inspect, pull, copy, and tag listing for validated WebAssembly artifacts and OCI layouts.
+            - Interoperability is qualified separately against pinned ORAS and wkg/oci-wasm producers; those tools and a WebAssembly runtime are not mandatory dependencies.
+            - OCI transport does not execute code and is not a production-readiness, signature-verification, attestation-verification, or cross-runtime compatibility claim.
+
+            ## Full changelog
+
+            See the commit history and generated release assets for `${{ github.ref_name }}`.
+
+            ## Install
 
             ```
             ghr install cataggar/wabt@v${{ steps.version.outputs.version }} RWSBnHWjwk/kkqdYc74cGupHMNVobpmF3lPc7b8RIllYMmYBr5G2EyF0
@@ -215,5 +230,6 @@ jobs:
             wabt-*.tar.xz
             wabt-*.sbom.spdx.json
             wabt-*.minisig
+          generate_release_notes: true
           draft: false
           prerelease: ${{ contains(steps.version.outputs.version, 'dev') }}

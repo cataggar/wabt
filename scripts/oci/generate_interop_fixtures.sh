@@ -2,10 +2,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-case "$ROOT" in
-  /d/wabt-worktrees/*) ;;
+MODE="${WABT_OCI_INTEROP_MODE:-refresh}"
+case "$MODE" in
+  refresh | qualify) ;;
   *)
-    echo "fixture generation requires a dedicated /d/wabt-worktrees checkout" >&2
+    echo "WABT_OCI_INTEROP_MODE must be refresh or qualify" >&2
     exit 1
     ;;
 esac
@@ -15,10 +16,47 @@ if [[ "$(uname -s)" != Linux || "$(uname -m)" != aarch64 ]]; then
   exit 1
 fi
 
-TOOLS="$ROOT/zig-out/oci-tools"
-CACHE="$ROOT/zig-out/oci-cache"
-WORK="$ROOT/zig-out/oci-fixture-work"
-RESULTS="$ROOT/zig-out/oci-fixture-results"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+  : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE is required in GitHub Actions}"
+  : "${RUNNER_TEMP:?RUNNER_TEMP is required in GitHub Actions}"
+  [[ "$ROOT" == "$(cd "$GITHUB_WORKSPACE" && pwd)" ]]
+  STATE_ROOT="${WABT_OCI_INTEROP_STATE_DIR:-$RUNNER_TEMP/wabt-oci-interoperability}"
+  STATE_ROOT="$(mkdir -p "$STATE_ROOT" && cd "$STATE_ROOT" && pwd)"
+  RUNNER_TEMP_REAL="$(cd "$RUNNER_TEMP" && pwd)"
+  case "$STATE_ROOT/" in
+    "$RUNNER_TEMP_REAL"/*) ;;
+    *)
+      echo "GitHub Actions state must remain below RUNNER_TEMP" >&2
+      exit 1
+      ;;
+  esac
+else
+  case "$ROOT" in
+    /d/wabt-worktrees/*) ;;
+    *)
+      echo "fixture generation requires a dedicated /d/wabt-worktrees checkout" >&2
+      exit 1
+      ;;
+  esac
+  STATE_ROOT="${WABT_OCI_INTEROP_STATE_DIR:-$ROOT/zig-out/oci-interoperability}"
+  STATE_ROOT="$(mkdir -p "$STATE_ROOT" && cd "$STATE_ROOT" && pwd)"
+  case "$STATE_ROOT/" in
+    /d/*) ;;
+    *)
+      echo "local interoperability state must remain below /d" >&2
+      exit 1
+      ;;
+  esac
+fi
+
+MAX_STATE_KIB="${WABT_OCI_INTEROP_MAX_STATE_KIB:-12582912}"
+[[ "$MAX_STATE_KIB" =~ ^[0-9]+$ ]] && [[ "$MAX_STATE_KIB" -gt 0 ]]
+ulimit -f 524288
+
+TOOLS="$STATE_ROOT/tools"
+CACHE="$STATE_ROOT/cache"
+WORK="$STATE_ROOT/work"
+RESULTS="$STATE_ROOT/results"
 DOWNLOADS="$TOOLS/downloads"
 BIN="$TOOLS/bin"
 RUSTUP_HOME="$TOOLS/rustup"
@@ -173,7 +211,8 @@ rm -rf "$SOURCE"
 mkdir -p "$SOURCE"
 git -C "$SOURCE" init --quiet
 git -C "$SOURCE" remote add origin https://github.com/bytecodealliance/wasm-pkg-tools.git
-GIT_CONFIG_GLOBAL=/dev/null git -C "$SOURCE" fetch --quiet --depth=1 origin "$WKG_REVISION"
+GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+  git -C "$SOURCE" fetch --quiet --depth=1 origin "$WKG_REVISION"
 git -C "$SOURCE" checkout --quiet --detach FETCH_HEAD
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$WKG_REVISION" ]]
 [[ "$(git -C "$SOURCE" rev-parse HEAD^{tree})" == ea20d1f82502eec5c5bc7315bc0fd7653a154221 ]]
@@ -507,17 +546,25 @@ find "$WORK/layouts" -type f \
   \( -name '.wabt-oci.lock' -o -name '.*.wabt-oci-bootstrap.lock' \) \
   -delete
 
-python3 "$ROOT/scripts/oci/fixture_manifest.py" write \
-  --repo "$ROOT" \
-  --work "$WORK" \
-  --tools "$TOOLS"
+if [[ "$MODE" == refresh ]]; then
+  python3 "$ROOT/scripts/oci/fixture_manifest.py" write \
+    --repo "$ROOT" \
+    --work "$WORK" \
+    --tools "$TOOLS" \
+    --update
+else
+  python3 "$ROOT/scripts/oci/fixture_manifest.py" qualify \
+    --repo "$ROOT" \
+    --work "$WORK" \
+    --tools "$TOOLS"
+fi
 python3 "$ROOT/scripts/oci/fixture_manifest.py" verify \
   --fixtures "$ROOT/src/fixtures/oci"
 
 rm -rf "$RESULTS"
 mkdir -p "$RESULTS"
 cp "$ROOT/src/fixtures/oci/manifest.json" "$RESULTS/manifest.json"
-printf 'verified=%s\n' "$FIXED_CREATED" >"$RESULTS/status.txt"
+printf 'mode=%s\nverified=%s\n' "$MODE" "$FIXED_CREATED" >"$RESULTS/status.txt"
 
 find "$WORK/layouts" \
   \( -name '.wabt-oci*' -o -name '.*.wabt-oci-bootstrap.lock' -o \
@@ -527,4 +574,10 @@ find "$WORK/layouts" \
     exit 1
   }
 
-echo "generated and verified pinned OCI interoperability fixtures"
+STATE_KIB="$(du -sk "$STATE_ROOT" | awk '{print $1}')"
+if [[ "$STATE_KIB" -gt "$MAX_STATE_KIB" ]]; then
+  echo "interoperability state exceeded ${MAX_STATE_KIB} KiB" >&2
+  exit 1
+fi
+
+echo "$MODE completed for pinned OCI interoperability fixtures"

@@ -4,8 +4,8 @@
   "fixtureFiles": [
     {
       "path": "README.md",
-      "sha256": "34d54b9eb696d8e5a6cbadf658530a324d295edd0ec6edab60ac84276cb3def9",
-      "size": 642
+      "sha256": "ec0b9a645465be211422649cac798b7c44ebfbe61ce8fe301e3ebb36cd4b204d",
+      "size": 944
     },
     {
       "path": "layouts/copy-roundtrip/blobs/sha256/0fa2124f4fe3cec3eddb6b73bb4c49c15fbf71d78199b76f1e0bd79ee0a526e9",
@@ -263,13 +263,13 @@
       },
       {
         "path": "scripts/oci/fixture_manifest.py",
-        "sha256": "3dae89c0306c9cca79e5c12bf0ddfad717d5012235121c112728e73c04e6ab60",
-        "size": 35493
+        "sha256": "e51f58dfc7b3f6de94e3b4bb1252f1777efe4b310149a3724fbdf82e67f20871",
+        "size": 39920
       },
       {
         "path": "scripts/oci/generate_interop_fixtures.sh",
-        "sha256": "8e65cc2f3a9976073d2d6d8836a44082a8ee261128fc9c19aabc77f0b729553a",
-        "size": 19234
+        "sha256": "b2886832eda1a75d5175bd3d77d3ee5a0c4e243a6ac11ca0e16808e03df9f3da",
+        "size": 20836
       },
       {
         "path": "scripts/oci/verify_interop_fixtures.sh",
@@ -1013,7 +1013,7 @@
   ],
   "producers": {
     "fixedRealtime": {
-      "binarySha256": "adafccc1c1f509241bf5bcfa94f214a7d0a92f38de9cd9150240e393c5f3d4a1",
+      "binarySha256": "b828a3588bbf0d0a7dbe563f002d7ba15cdb50734884a71876601119e4eec13e",
       "fixedUtc": "2026-09-19T00:00:00Z",
       "scope": "fixture refresh only; monotonic clocks remain real",
       "source": {
@@ -1085,14 +1085,14 @@
       "version": "1.28.2"
     },
     "wabtUnderTest": {
-      "sha256": "c4232ecea46842cb3411322b8acbf499145d2fcf59c74e070f8550657c21b16e",
+      "sha256": "05e832389c96bdfb9c108155a800b7c2aeb1ab4d3625e38b21b271d1c26080f9",
       "versionOutput": [
         "wabt oci-fixtures"
       ]
     },
     "wkg": {
       "binary": {
-        "sha256": "f37d41d16bf3f1759e36e7604629d52826ad5f9da6008940e33c8823e888383e",
+        "sha256": "da4d86375734ae975007eef0617fb0fd43721ee89e48de7eca50c2d16229d18a",
         "versionOutput": [
           "wkg 0.16.1"
         ]

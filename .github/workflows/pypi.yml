@@ -45,6 +45,8 @@ jobs:
               "licenses/SOURCE_PROVENANCE.md",
               "licenses/THIRD_PARTY_NOTICES.md",
               "licenses/LICENSES/miz-MIT.txt",
+              "docs/oci.md",
+              "docs/oci-authentication.md",
           }
           wheels = sorted(Path("dist").glob("*.whl"))
           assert wheels

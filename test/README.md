@@ -22,11 +22,55 @@ $ ./zig-out/bin/wabt spec to-json input.wast
 
 ## OCI foundation
 
-The public `wabt.oci` namespace currently establishes module discovery and
-the license/provenance boundary for the OCI foundation. This initial skeleton
-does not yet provide content, reference, model, graph, layout, copy,
-networking, or CLI behavior. OCI tests will remain part of the normal
-`zig build test` suite as those library modules are added.
+The public `wabt.oci` namespace and `wabt oci` commands have hermetic unit,
+fake-registry, layout, failure, and CLI coverage in the normal test suite:
+
+```console
+$ zig build test
+$ zig build test-oci-cli
+```
+
+The ordinary Ubuntu/macOS/Windows Debug/ReleaseSafe matrix does not spawn
+ORAS, wkg, Docker, a live registry, or credential discovery.
+
+Committed interoperability fixtures are checked without network access:
+
+```console
+$ bash scripts/oci/verify_interop_fixtures.sh
+```
+
+Refreshing them is a deliberate Linux external-tool operation using the
+Linux/arm64 versions and hashes recorded in
+`src/fixtures/oci/manifest.json`. All writable state must remain below an
+explicit `/d` path:
+
+```console
+$ WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \
+    bash scripts/oci/generate_interop_fixtures.sh
+$ bash scripts/oci/verify_interop_fixtures.sh
+```
+
+The separate pinned workflow runs the same producer script twice in
+qualification mode. That mode performs the complete loopback ORAS/wkg matrix
+and requires every generated layout byte to equal the checked-in corpus,
+without replacing the recorded producer metadata:
+
+```console
+$ WABT_OCI_INTEROP_MODE=qualify \
+    WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \
+    bash scripts/oci/generate_interop_fixtures.sh
+```
+
+Static workflow, documentation, manifest, and package checks are available
+through:
+
+```console
+$ zig build test-oci-qualification
+```
+
+See [the OCI user guide](../docs/oci.md). External tools are qualification
+producers only; they are not runtime dependencies, and the matrix never uses
+Azure or other cloud credentials.
 
 ## Core GC regression corpus
 

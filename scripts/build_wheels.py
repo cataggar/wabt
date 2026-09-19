@@ -130,6 +130,17 @@ def build_wheel(
             False,
         ))
 
+    doc_files = (
+        ("docs/oci.md", "docs/oci.md"),
+        ("docs/oci-authentication.md", "docs/oci-authentication.md"),
+    )
+    for source_name, wheel_name in doc_files:
+        entries.append((
+            f"{dist_info_dir}/{wheel_name}",
+            (repo_root / source_name).read_bytes(),
+            False,
+        ))
+
     readme_path = repo_root / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
     entries.append((
