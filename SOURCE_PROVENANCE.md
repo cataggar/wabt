@@ -56,13 +56,25 @@ opaque blob streaming, enforces bounded same-origin pagination, and returns
 typed redacted diagnostics. `src/oci/registry_test.zig` replaces miz's
 platform-specific/live assumptions with deterministic injected and loopback
 fixtures covering authentication, retries, redirects, corruption, pagination,
-and output cleanup.
+output cleanup, destination preflight, verified blob reuse, and same-origin
+cross-repository mount outcomes.
+
+The registry destination state and mount request shape adapt miz
+`Destination.prepareTransport`, `ensureBlob`, `tryMount`, `mountUrl`, and
+`resolveUploadLocation`. WABT requires an explicit destination tag and
+independent destination authentication context, re-verifies blob bytes before
+reuse and after a 201 mount, percent-encodes mount parameters, disables
+non-idempotent redirect/retry/authentication replay, and returns an owned
+redacted upload-session handoff for a valid 202 decline. This increment does
+not adapt miz's spooling, ordinary upload start/body/finalization, manifest
+publication, convenience copy entry points, or root commit.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
 the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned
 bounded metadata, typed stage/commit results, centralized implementation
-adapters, and sanitized progress/failure events; it omits miz's registry
-identity and upload-specific details.
+adapters, a credential-free normalized registry identity for mount policy, and
+sanitized progress/failure events. Upload-session state remains owned by the
+registry destination rather than the transport-neutral graph engine.
 
 `src/oci/graph.zig` adapts the traversal ideas from miz
 `model.resolveGraph` and `copy.Context.planAll` into one implementation.

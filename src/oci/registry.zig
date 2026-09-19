@@ -1,9 +1,10 @@
-//! Verified OCI Distribution registry reads.
+//! Verified OCI Distribution registry reads and bounded destination preflight.
 //!
 //! Registry semantics are layered on the shared authentication and HTTP
 //! policy modules. Initialization is explicit; importing this module performs
 //! no credential discovery, file access, or network access.
-//! Distribution read behavior was adapted from cataggar/miz commit
+//! Distribution read and destination state behavior was adapted from
+//! cataggar/miz commit
 //! 669a27982b376311f558e820b69e9a692735b0cd (MIT).
 const std = @import("std");
 const auth = @import("auth.zig");
@@ -26,6 +27,7 @@ pub const manifest_accept =
 pub const Error = error{
     InvalidConfiguration,
     InvalidReference,
+    TagRequired,
     AuthenticationFailed,
     AuthorizationDenied,
     ContentNotFound,
@@ -42,10 +44,17 @@ pub const Error = error{
     RegistryFailed,
     UnsupportedCredentialType,
     CertificateAuthorityLoadFailed,
+    DestinationNotPrepared,
+    DestinationStateConflict,
+    UploadRequired,
+    ManifestPublicationNotImplemented,
+    RootPublicationNotImplemented,
+    DestinationNotCommitted,
 } || Allocator.Error;
 
 pub const Limits = struct {
     max_metadata_bytes: u64 = 16 * 1024 * 1024,
+    max_preflight_body_bytes: usize = 4 * 1024,
     max_tag_page_bytes: usize = 16 * 1024 * 1024,
     max_tag_pages: usize = 128,
     max_tags: usize = 100_000,
@@ -56,6 +65,7 @@ pub const Limits = struct {
     pub fn validate(self: Limits) Error!void {
         if (self.max_metadata_bytes == 0 or
             self.max_metadata_bytes > std.math.maxInt(usize) or
+            self.max_preflight_body_bytes == 0 or
             self.max_tag_page_bytes == 0 or
             self.max_tag_pages == 0 or
             self.max_tags == 0 or
@@ -83,6 +93,46 @@ pub const Options = struct {
     credential_generation: u64 = 0,
 };
 
+pub const MountPolicy = enum {
+    disabled,
+    same_origin,
+};
+
+/// Destination initialization is intentionally separate from source options
+/// so pull and push credentials, token caches, deadlines, and CA policy cannot
+/// be shared accidentally.
+pub const DestinationOptions = struct {
+    plain_http: bool = false,
+    additional_ca: ?registry_http.AdditionalCa = null,
+    credential_policy: auth.CredentialPolicy = .none,
+    auth_context: auth.ResolutionContext,
+    auth_limits: auth.Limits = .{},
+    http_limits: registry_http.Limits = .{},
+    timeouts: registry_http.Timeouts = .{},
+    limits: Limits = .{},
+    graph_limits: graph.Limits = .{},
+    deadline: registry_http.Deadline,
+    auth_context_id: u64 = 0,
+    credential_generation: u64 = 0,
+    mount_policy: MountPolicy = .same_origin,
+
+    fn sourceOptions(self: DestinationOptions) Options {
+        return .{
+            .plain_http = self.plain_http,
+            .additional_ca = self.additional_ca,
+            .credential_policy = self.credential_policy,
+            .auth_context = self.auth_context,
+            .auth_limits = self.auth_limits,
+            .http_limits = self.http_limits,
+            .timeouts = self.timeouts,
+            .limits = self.limits,
+            .deadline = self.deadline,
+            .auth_context_id = self.auth_context_id,
+            .credential_generation = self.credential_generation,
+        };
+    }
+};
+
 pub const Operation = enum {
     resolve,
     inspect,
@@ -90,6 +140,12 @@ pub const Operation = enum {
     read_metadata,
     read_manifest_metadata,
     copy_blob,
+    destination_preflight,
+    destination_probe,
+    destination_mount,
+    stage_root,
+    commit_root,
+    finish,
 };
 
 pub const Category = enum {
@@ -430,6 +486,7 @@ pub const Source = struct {
     allocator: Allocator,
     authority: []u8,
     repository: []u8,
+    plain_http: bool,
     limits: Limits,
     deadline: registry_http.Deadline,
     client: registry_http.Client,
@@ -626,6 +683,7 @@ pub const Source = struct {
             .allocator = allocator,
             .authority = authority,
             .repository = repository,
+            .plain_http = options.plain_http,
             .limits = options.limits,
             .deadline = options.deadline,
             .client = client,
@@ -649,7 +707,12 @@ pub const Source = struct {
     }
 
     pub fn asTransport(self: *Source) transport.Source {
-        return transport.Source.init(self);
+        return transport.Source.initWithRegistryIdentity(self, .{
+            .origin = self.client.endpoint.canonicalOrigin(),
+            .authority = self.authority,
+            .repository = self.repository,
+            .plain_http = self.plain_http,
+        });
     }
 
     pub fn lastDiagnostic(self: *const Source) ?*const Diagnostic {
@@ -1413,6 +1476,907 @@ pub const Source = struct {
     }
 };
 
+pub const BlobState = enum {
+    missing,
+    verified,
+};
+
+pub const DestinationState = enum {
+    initialized,
+    prepared,
+    upload_required,
+    failed,
+};
+
+pub const UploadReason = enum {
+    blob_missing,
+    mount_declined,
+    mount_not_permitted,
+};
+
+pub const ReplaySafety = struct {
+    /// No source bytes have been read or spooled in this increment.
+    source_verified: bool = false,
+    /// Mount/start POSTs and future body requests are never replay-safe.
+    non_idempotent_replay_allowed: bool = false,
+    /// The final digest must be probed before any later retry decision.
+    probe_before_retry: bool = true,
+};
+
+/// Owned continuation state for the upload increment. Formatting never
+/// exposes the upload URL or a provider-signed query.
+pub const UploadHandoff = struct {
+    digest: content.Digest,
+    size: u64,
+    roles: transport.DescriptorRoles,
+    reason: UploadReason,
+    session: ?registry_http.ResolvedUploadLocation = null,
+    replay: ReplaySafety = .{},
+
+    pub fn deinit(self: *UploadHandoff) void {
+        if (self.session) |*session| session.deinit();
+        self.* = undefined;
+    }
+
+    pub fn format(
+        self: UploadHandoff,
+        writer: *Io.Writer,
+    ) Io.Writer.Error!void {
+        const digest_text = self.digest.format();
+        try writer.print(
+            "upload-required(digest={s}, size={d}, reason={s}",
+            .{ &digest_text, self.size, @tagName(self.reason) },
+        );
+        if (self.session) |session| {
+            try writer.print(
+                ", origin={s}, authorization={s}",
+                .{
+                    session.origin.canonical,
+                    if (session.authorization_stripped) "stripped" else "destination",
+                },
+            );
+        }
+        try writer.writeByte(')');
+    }
+};
+
+const SeenDescriptor = struct {
+    size: u64,
+    media_type: []u8,
+    roles: transport.DescriptorRoles,
+    outcome: ?transport.DescriptorResult = null,
+};
+
+const MountOutcome = union(enum) {
+    mounted,
+    declined: registry_http.ResolvedUploadLocation,
+};
+
+/// Registry destination increment implementing only preflight, verified blob
+/// reuse, and same-origin mount. It cannot publish manifests or report a
+/// committed root.
+pub const Destination = struct {
+    allocator: Allocator,
+    remote: Source,
+    tag: []u8,
+    graph_limits: graph.Limits,
+    mount_policy: MountPolicy,
+    state_value: DestinationState = .initialized,
+    root_digest: ?content.Digest = null,
+    seen: std.AutoHashMap(content.Digest, SeenDescriptor),
+    total_declared_bytes: u64 = 0,
+    pending_upload: ?UploadHandoff = null,
+
+    pub fn init(
+        io: Io,
+        allocator: Allocator,
+        destination: reference.RegistryReference,
+        options: DestinationOptions,
+    ) Error!Destination {
+        const tag = try validateDestinationConfiguration(destination, options);
+        var remote = try Source.init(
+            io,
+            allocator,
+            destination,
+            options.sourceOptions(),
+        );
+        errdefer remote.deinit();
+        const owned_tag = try allocator.dupe(u8, tag);
+        return .{
+            .allocator = allocator,
+            .remote = remote,
+            .tag = owned_tag,
+            .graph_limits = options.graph_limits,
+            .mount_policy = options.mount_policy,
+            .seen = std.AutoHashMap(content.Digest, SeenDescriptor).init(allocator),
+        };
+    }
+
+    /// Injectable initialization used by deterministic tests and embedders.
+    /// Backend/runtime ownership remains with the caller.
+    pub fn initWithBackend(
+        io: Io,
+        allocator: Allocator,
+        destination: reference.RegistryReference,
+        backend: registry_http.Backend,
+        clock: registry_http.Clock,
+        sleeper: registry_http.Sleeper,
+        options: DestinationOptions,
+    ) Error!Destination {
+        const tag = try validateDestinationConfiguration(destination, options);
+        var remote = try Source.initWithBackend(
+            io,
+            allocator,
+            destination,
+            backend,
+            clock,
+            sleeper,
+            options.sourceOptions(),
+        );
+        errdefer remote.deinit();
+        const owned_tag = try allocator.dupe(u8, tag);
+        return .{
+            .allocator = allocator,
+            .remote = remote,
+            .tag = owned_tag,
+            .graph_limits = options.graph_limits,
+            .mount_policy = options.mount_policy,
+            .seen = std.AutoHashMap(content.Digest, SeenDescriptor).init(allocator),
+        };
+    }
+
+    pub fn deinit(self: *Destination) void {
+        if (self.pending_upload) |*handoff| handoff.deinit();
+        var iterator = self.seen.valueIterator();
+        while (iterator.next()) |entry| {
+            self.allocator.free(entry.media_type);
+        }
+        self.seen.deinit();
+        self.allocator.free(self.tag);
+        self.remote.deinit();
+        self.* = undefined;
+    }
+
+    pub fn asTransport(self: *Destination) transport.Destination {
+        return transport.Destination.init(self);
+    }
+
+    pub fn state(self: *const Destination) DestinationState {
+        return self.state_value;
+    }
+
+    pub fn pendingUpload(self: *const Destination) ?*const UploadHandoff {
+        return if (self.pending_upload) |*handoff| handoff else null;
+    }
+
+    pub fn lastDiagnostic(self: *const Destination) ?*const Diagnostic {
+        return self.remote.lastDiagnostic();
+    }
+
+    /// This increment has no state from which committed success is possible.
+    pub fn committed(_: *const Destination) bool {
+        return false;
+    }
+
+    pub fn prepareRoot(
+        self: *Destination,
+        root: model.Descriptor,
+        selection: ?reference.Selection,
+    ) Error!void {
+        if (self.state_value != .initialized) {
+            return error.DestinationStateConflict;
+        }
+        self.prepareRootInner(root, selection) catch |err| {
+            self.state_value = .failed;
+            return err;
+        };
+        self.state_value = .prepared;
+    }
+
+    fn prepareRootInner(
+        self: *Destination,
+        root: model.Descriptor,
+        selection: ?reference.Selection,
+    ) Error!void {
+        model.validateRootDescriptor(root) catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_preflight,
+                .invalid_content,
+                null,
+                null,
+                null,
+            );
+        const digest = root.parsedDigest() catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_preflight,
+                .invalid_content,
+                null,
+                null,
+                null,
+            );
+        const tag = switch (selection orelse
+            return error.TagRequired) {
+            .tag => |value| value,
+            .digest => return error.TagRequired,
+        };
+        if (!std.mem.eql(u8, tag, self.tag)) return error.InvalidReference;
+        if (root.size > self.graph_limits.max_metadata_bytes or
+            root.size > self.graph_limits.max_total_bytes)
+        {
+            return self.remote.fail(
+                error.LimitExceeded,
+                .destination_preflight,
+                .limit,
+                null,
+                null,
+                digest,
+            );
+        }
+
+        var response = self.remote.client.execute(.{
+            .path_and_query = "/v2/",
+            .class = .registry,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .deadline = self.remote.deadline,
+        }) catch |err| return self.remote.mapHttpFailure(
+            err,
+            .destination_preflight,
+            digest,
+        );
+        defer response.deinit();
+        try self.remote.requireSuccess(
+            response,
+            .destination_preflight,
+            digest,
+        );
+
+        _ = try self.registerDescriptor(
+            root,
+            transport.DescriptorRoles.init(.root),
+        );
+        self.root_digest = digest;
+        self.remote.last_diagnostic = null;
+    }
+
+    pub fn ensureDescriptor(
+        self: *Destination,
+        transfer: transport.DescriptorTransfer,
+    ) Error!transport.DescriptorResult {
+        if (self.state_value != .prepared) {
+            return if (self.state_value == .upload_required)
+                error.UploadRequired
+            else
+                error.DestinationNotPrepared;
+        }
+        return self.ensureDescriptorInner(transfer) catch |err| {
+            if (err != error.UploadRequired) self.state_value = .failed;
+            return err;
+        };
+    }
+
+    fn ensureDescriptorInner(
+        self: *Destination,
+        transfer: transport.DescriptorTransfer,
+    ) Error!transport.DescriptorResult {
+        const digest = model.validateDescriptor(transfer.descriptor) catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                null,
+                null,
+                null,
+            );
+        const existing = try self.registerDescriptor(
+            transfer.descriptor,
+            transfer.roles,
+        );
+        if (existing) |result| return result;
+
+        switch (transfer.data) {
+            .exact_metadata => |bytes| {
+                if (!transfer.roles.index_child or transfer.roles.root or
+                    transfer.roles.config or transfer.roles.layer or
+                    !model.classifyMediaType(transfer.descriptor.mediaType).isDocument())
+                {
+                    return error.InvalidContent;
+                }
+                content.verifyBytes(
+                    digest,
+                    transfer.descriptor.size,
+                    bytes,
+                ) catch return error.InvalidContent;
+                return error.ManifestPublicationNotImplemented;
+            },
+            .opaque_blob => |source| {
+                if (transfer.roles.root or transfer.roles.index_child or
+                    (!transfer.roles.config and !transfer.roles.layer) or
+                    model.classifyMediaType(transfer.descriptor.mediaType).isDocument())
+                {
+                    return error.InvalidContent;
+                }
+                return self.ensureBlob(
+                    source,
+                    transfer.descriptor,
+                    transfer.roles,
+                );
+            },
+        }
+    }
+
+    fn ensureBlob(
+        self: *Destination,
+        source: transport.Source,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+    ) Error!transport.DescriptorResult {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        if (try self.blobState(descriptor) == .verified) {
+            self.setOutcome(digest, .reused);
+            return .reused;
+        }
+
+        if (source.registry_identity) |identity| {
+            if (try self.mountEligible(identity)) {
+                switch (try self.tryMount(identity, descriptor)) {
+                    .mounted => {
+                        self.setOutcome(digest, .mounted);
+                        return .mounted;
+                    },
+                    .declined => |session| {
+                        self.pending_upload = .{
+                            .digest = digest,
+                            .size = descriptor.size,
+                            .roles = roles,
+                            .reason = .mount_declined,
+                            .session = session,
+                        };
+                        self.state_value = .upload_required;
+                        return error.UploadRequired;
+                    },
+                }
+            }
+        }
+
+        self.pending_upload = .{
+            .digest = digest,
+            .size = descriptor.size,
+            .roles = roles,
+            .reason = if (source.registry_identity == null)
+                .blob_missing
+            else
+                .mount_not_permitted,
+        };
+        self.state_value = .upload_required;
+        return error.UploadRequired;
+    }
+
+    /// A 404 HEAD is missing. Unsupported or successful HEAD responses are
+    /// followed by a bounded verified GET before reuse is reported.
+    fn blobState(
+        self: *Destination,
+        descriptor: model.Descriptor,
+    ) Error!BlobState {
+        const digest = model.validateDescriptor(descriptor) catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                null,
+                null,
+                null,
+            );
+        const digest_text = digest.format();
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/blobs/{s}",
+            .{ self.remote.repository, &digest_text },
+        );
+        defer self.allocator.free(path);
+
+        var head = self.remote.client.execute(.{
+            .method = .HEAD,
+            .path_and_query = path,
+            .class = .blob,
+            .max_body_bytes = 0,
+            .deadline = self.remote.deadline,
+        }) catch |err| return self.remote.mapHttpFailure(
+            err,
+            .destination_probe,
+            digest,
+        );
+        defer head.deinit();
+
+        var head_reported_present = false;
+        switch (head.status) {
+            404 => return .missing,
+            405, 501 => {},
+            200 => {
+                head_reported_present = true;
+                try self.verifyHeadHeaders(head, descriptor, digest);
+            },
+            else => try self.remote.requireSuccess(
+                head,
+                .destination_probe,
+                digest,
+            ),
+        }
+
+        var sink: VerifySink = .{
+            .digest = digest,
+            .size = descriptor.size,
+        };
+        var response = self.remote.client.execute(.{
+            .path_and_query = path,
+            .class = .blob,
+            .max_body_bytes = descriptor.size,
+            .body_sink = registry_http.BodySink.init(&sink),
+            .deadline = self.remote.deadline,
+        }) catch |err| {
+            if (err == error.BodySinkFailed) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    .destination_probe,
+                    .invalid_content,
+                    null,
+                    null,
+                    digest,
+                );
+            }
+            return self.remote.mapHttpFailure(
+                err,
+                .destination_probe,
+                digest,
+            );
+        };
+        defer response.deinit();
+        if (response.status == 404) {
+            if (!head_reported_present) return .missing;
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        }
+        try self.remote.requireSuccess(
+            response,
+            .destination_probe,
+            digest,
+        );
+        try self.remote.corroborateContentLength(
+            response,
+            descriptor.size,
+            .destination_probe,
+            digest,
+        );
+        try self.remote.corroborateDigestHeader(
+            response,
+            digest,
+            .destination_probe,
+        );
+        if (singleHeader(response, "Content-Type") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) |value|
+        {
+            const base = mediaTypeBase(value) orelse
+                return self.remote.fail(
+                    error.InvalidContent,
+                    .destination_probe,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            model.validateMediaType(base) catch
+                return self.remote.fail(
+                    error.InvalidContent,
+                    .destination_probe,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+        }
+        self.remote.last_diagnostic = null;
+        return .verified;
+    }
+
+    fn verifyHeadHeaders(
+        self: *Destination,
+        response: registry_http.Response,
+        descriptor: model.Descriptor,
+        digest: content.Digest,
+    ) Error!void {
+        if (singleHeader(response, "Content-Length") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) |value|
+        {
+            const actual = std.fmt.parseInt(
+                u64,
+                std.mem.trim(u8, value, " \t"),
+                10,
+            ) catch return self.remote.fail(
+                error.InvalidContent,
+                .destination_probe,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+            if (actual != descriptor.size) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    .destination_probe,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            }
+        }
+        try self.remote.corroborateDigestHeader(
+            response,
+            digest,
+            .destination_probe,
+        );
+    }
+
+    fn mountEligible(
+        self: *Destination,
+        identity: transport.RegistryIdentity,
+    ) Error!bool {
+        if (self.mount_policy == .disabled or
+            std.mem.eql(u8, identity.repository, self.remote.repository))
+        {
+            return false;
+        }
+        if (!std.mem.eql(
+            u8,
+            identity.origin,
+            self.remote.client.endpoint.canonicalOrigin(),
+        )) {
+            return false;
+        }
+        var endpoint = registry_http.Endpoint.init(
+            self.allocator,
+            .{
+                .authority = identity.authority,
+                .plain_http = identity.plain_http,
+            },
+            self.remote.client.limits,
+        ) catch return error.InvalidReference;
+        defer endpoint.deinit();
+        if (!std.mem.eql(u8, endpoint.canonicalOrigin(), identity.origin)) {
+            return error.InvalidReference;
+        }
+        try validateRepositoryBinding(
+            self.allocator,
+            identity.authority,
+            identity.repository,
+        );
+        return true;
+    }
+
+    fn tryMount(
+        self: *Destination,
+        identity: transport.RegistryIdentity,
+        descriptor: model.Descriptor,
+    ) Error!MountOutcome {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const digest_text = digest.format();
+        const encoded_digest = try percentEncodeQueryAlloc(
+            self.allocator,
+            &digest_text,
+        );
+        defer self.allocator.free(encoded_digest);
+        const encoded_source = try percentEncodeQueryAlloc(
+            self.allocator,
+            identity.repository,
+        );
+        defer self.allocator.free(encoded_source);
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/blobs/uploads/?mount={s}&from={s}",
+            .{ self.remote.repository, encoded_digest, encoded_source },
+        );
+        defer self.allocator.free(path);
+
+        var response = self.remote.client.execute(.{
+            .method = .POST,
+            .path_and_query = path,
+            .class = .registry,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .allow_auth_replay = false,
+            .deadline = self.remote.deadline,
+        }) catch |err| return self.remote.mapHttpFailure(
+            err,
+            .destination_mount,
+            digest,
+        );
+        defer response.deinit();
+
+        switch (response.status) {
+            201 => {
+                try self.remote.corroborateDigestHeader(
+                    response,
+                    digest,
+                    .destination_mount,
+                );
+                if (singleHeader(response, "Location") catch
+                    return self.remote.fail(
+                        error.InvalidContent,
+                        .destination_mount,
+                        .invalid_content,
+                        response.status,
+                        null,
+                        digest,
+                    )) |location|
+                {
+                    var completed = registry_http.resolveUploadLocationAlloc(
+                        self.allocator,
+                        self.remote.client.endpoint,
+                        path,
+                        location,
+                        self.remote.client.limits.max_location_bytes,
+                    ) catch |err| return switch (err) {
+                        error.OutOfMemory => error.OutOfMemory,
+                        else => self.remote.fail(
+                            error.RedirectRejected,
+                            .destination_mount,
+                            .redirect,
+                            response.status,
+                            null,
+                            digest,
+                        ),
+                    };
+                    completed.deinit();
+                }
+                if (try self.blobState(descriptor) != .verified) {
+                    return self.remote.fail(
+                        error.InvalidContent,
+                        .destination_mount,
+                        .invalid_content,
+                        response.status,
+                        null,
+                        digest,
+                    );
+                }
+                self.remote.last_diagnostic = null;
+                return .mounted;
+            },
+            202 => {
+                try self.remote.corroborateDigestHeader(
+                    response,
+                    digest,
+                    .destination_mount,
+                );
+                const location = (singleHeader(response, "Location") catch
+                    return self.remote.fail(
+                        error.InvalidContent,
+                        .destination_mount,
+                        .invalid_content,
+                        response.status,
+                        null,
+                        digest,
+                    )) orelse return self.remote.fail(
+                    error.InvalidContent,
+                    .destination_mount,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+                const session = registry_http.resolveUploadLocationAlloc(
+                    self.allocator,
+                    self.remote.client.endpoint,
+                    path,
+                    location,
+                    self.remote.client.limits.max_location_bytes,
+                ) catch |err| return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => self.remote.fail(
+                        error.RedirectRejected,
+                        .destination_mount,
+                        .redirect,
+                        response.status,
+                        null,
+                        digest,
+                    ),
+                };
+                self.remote.last_diagnostic = null;
+                return .{ .declined = session };
+            },
+            else => {
+                try self.remote.requireSuccess(
+                    response,
+                    .destination_mount,
+                    digest,
+                );
+                return self.remote.fail(
+                    error.RegistryFailed,
+                    .destination_mount,
+                    .registry,
+                    response.status,
+                    null,
+                    digest,
+                );
+            },
+        }
+    }
+
+    pub fn stageRoot(
+        self: *Destination,
+        publication: transport.RootPublication,
+    ) Error!transport.DescriptorResult {
+        if (self.state_value != .prepared) {
+            return error.DestinationNotPrepared;
+        }
+        self.validatePublication(publication, null) catch |err| {
+            self.state_value = .failed;
+            return err;
+        };
+        self.state_value = .failed;
+        return error.RootPublicationNotImplemented;
+    }
+
+    pub fn commitRoot(
+        self: *Destination,
+        publication: transport.RootPublication,
+        selection: ?reference.Selection,
+    ) Error!transport.CommitResult {
+        if (self.state_value != .prepared) {
+            return error.DestinationNotPrepared;
+        }
+        if (selection == null) {
+            self.state_value = .failed;
+            return error.TagRequired;
+        }
+        self.validatePublication(publication, selection) catch |err| {
+            self.state_value = .failed;
+            return err;
+        };
+        self.state_value = .failed;
+        return error.RootPublicationNotImplemented;
+    }
+
+    pub fn finish(self: *Destination) Error!void {
+        self.state_value = .failed;
+        return error.DestinationNotCommitted;
+    }
+
+    fn registerDescriptor(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+    ) Error!?transport.DescriptorResult {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        if (!roles.root and !roles.index_child and !roles.config and !roles.layer) {
+            return error.InvalidContent;
+        }
+        if (self.seen.getPtr(digest)) |existing| {
+            if (existing.size != descriptor.size or
+                !std.mem.eql(u8, existing.media_type, descriptor.mediaType))
+            {
+                return error.InvalidContent;
+            }
+            if (existing.roles.root != roles.root and
+                (existing.roles.root or roles.root))
+            {
+                return error.InvalidContent;
+            }
+            existing.roles.root = existing.roles.root or roles.root;
+            existing.roles.index_child =
+                existing.roles.index_child or roles.index_child;
+            existing.roles.config = existing.roles.config or roles.config;
+            existing.roles.layer = existing.roles.layer or roles.layer;
+            return existing.outcome;
+        }
+        if (@as(u64, @intCast(self.seen.count())) >=
+            self.graph_limits.max_nodes)
+        {
+            return error.LimitExceeded;
+        }
+        const total = std.math.add(
+            u64,
+            self.total_declared_bytes,
+            descriptor.size,
+        ) catch return error.LimitExceeded;
+        if (total > self.graph_limits.max_total_bytes) {
+            return error.LimitExceeded;
+        }
+        const media_type = try self.allocator.dupe(u8, descriptor.mediaType);
+        errdefer self.allocator.free(media_type);
+        try self.seen.put(digest, .{
+            .size = descriptor.size,
+            .media_type = media_type,
+            .roles = roles,
+        });
+        self.total_declared_bytes = total;
+        return null;
+    }
+
+    fn validatePublication(
+        self: *Destination,
+        publication: transport.RootPublication,
+        selection: ?reference.Selection,
+    ) Error!void {
+        const digest = model.validateDescriptor(publication.descriptor) catch
+            return error.InvalidContent;
+        if (self.root_digest == null or !digest.eql(self.root_digest.?)) {
+            return error.InvalidContent;
+        }
+        content.verifyBytes(
+            digest,
+            publication.descriptor.size,
+            publication.exact_bytes,
+        ) catch return error.InvalidContent;
+        if (selection) |selected| {
+            const tag = switch (selected) {
+                .tag => |value| value,
+                .digest => return error.TagRequired,
+            };
+            if (!std.mem.eql(u8, tag, self.tag)) {
+                return error.InvalidReference;
+            }
+        }
+    }
+
+    fn setOutcome(
+        self: *Destination,
+        digest: content.Digest,
+        outcome: transport.DescriptorResult,
+    ) void {
+        self.seen.getPtr(digest).?.outcome = outcome;
+    }
+};
+
+const VerifySink = struct {
+    digest: content.Digest,
+    size: u64,
+    verifier: ?content.Verifier = null,
+
+    pub fn begin(
+        self: *VerifySink,
+        content_length: ?u64,
+    ) registry_http.BodySinkError!void {
+        if (content_length) |length| {
+            if (length != self.size) return error.SinkFailed;
+        }
+        self.verifier = content.Verifier.init(self.digest, self.size);
+    }
+
+    pub fn write(
+        self: *VerifySink,
+        bytes: []const u8,
+    ) registry_http.BodySinkError!void {
+        self.verifier.?.update(bytes) catch return error.SinkFailed;
+    }
+
+    pub fn finish(self: *VerifySink) registry_http.BodySinkError!void {
+        self.verifier.?.finish() catch return error.SinkFailed;
+    }
+};
+
 const ResolvedSource = struct {
     registry: *Source,
     resolved: *const ResolvedRoot,
@@ -1672,6 +2636,65 @@ fn expectedSelectionDigest(selection: reference.Selection) ?content.Digest {
         .tag => null,
         .digest => |digest| digest,
     };
+}
+
+fn validateDestinationConfiguration(
+    destination: reference.RegistryReference,
+    options: DestinationOptions,
+) Error![]const u8 {
+    const tag = switch (destination.selection orelse
+        return error.TagRequired) {
+        .tag => |value| value,
+        .digest => return error.TagRequired,
+    };
+    if (!validTag(tag, options.limits.max_tag_length)) {
+        return error.InvalidReference;
+    }
+    try options.limits.validate();
+    options.auth_limits.validate() catch return error.InvalidConfiguration;
+    options.http_limits.validate() catch return error.InvalidConfiguration;
+    options.timeouts.validate() catch return error.InvalidConfiguration;
+    if (options.graph_limits.max_depth == 0 or
+        options.graph_limits.max_nodes == 0 or
+        options.graph_limits.max_total_bytes == 0 or
+        options.graph_limits.max_metadata_bytes == 0)
+    {
+        return error.InvalidConfiguration;
+    }
+    return tag;
+}
+
+fn percentEncodeQueryAlloc(
+    allocator: Allocator,
+    value: []const u8,
+) Allocator.Error![]u8 {
+    var required: usize = 0;
+    for (value) |byte| {
+        const amount: usize = if (std.ascii.isAlphanumeric(byte) or
+            byte == '-' or byte == '.' or byte == '_' or byte == '~')
+            1
+        else
+            3;
+        required = std.math.add(usize, required, amount) catch
+            return error.OutOfMemory;
+    }
+    const output = try allocator.alloc(u8, required);
+    var index: usize = 0;
+    for (value) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '-' or byte == '.' or
+            byte == '_' or byte == '~')
+        {
+            output[index] = byte;
+            index += 1;
+        } else {
+            output[index] = '%';
+            const encoded = std.fmt.bytesToHex([_]u8{byte}, .upper);
+            output[index + 1] = encoded[0];
+            output[index + 2] = encoded[1];
+            index += 3;
+        }
+    }
+    return output;
 }
 
 fn validateRepositoryBinding(
