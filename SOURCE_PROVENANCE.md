@@ -7,11 +7,9 @@
 - **Pinned source tree:** <https://github.com/cataggar/miz/tree/669a27982b376311f558e820b69e9a692735b0cd/packages/miz/src/oci>
 - **License:** MIT; see [`LICENSES/miz-MIT.txt`](LICENSES/miz-MIT.txt)
 
-The initial `src/oci.zig` namespace is WABT-owned scaffolding and contains no
-adapted implementation. The following paths identify the pinned sources and
-planned WABT destinations for later foundation increments:
+The following paths identify the pinned sources and their WABT destinations:
 
-| Pinned miz source | Planned WABT destination |
+| Pinned miz source | WABT destination |
 | --- | --- |
 | `packages/miz/src/oci/content.zig` | `src/oci/content.zig` |
 | `packages/miz/src/oci/reference.zig` | `src/oci/reference.zig` |
@@ -26,3 +24,17 @@ signing, disk-image, or QEMU integrations. WABT's implementation will use
 scheme-less explicit registry references, artifact-capable generic
 validation, one bounded graph planner, and explicit rejection of
 subject-bearing and unknown graph nodes.
+
+The transport `Source`, `Destination`, and transfer-counting callbacks adapt
+the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned
+bounded metadata, typed stage/commit results, centralized implementation
+adapters, and sanitized progress/failure events; it omits miz's registry
+identity and upload-specific details.
+
+`src/oci/graph.zig` adapts the traversal ideas from miz
+`model.resolveGraph` and `copy.Context.planAll` into one implementation.
+Unlike those pinned functions, it performs complete artifact-capable
+discovery with explicit depth, descriptor-count, total-byte, and per-document
+bounds; verifies exact metadata before parsing; retains content-addressed
+bytes; rejects subjects, cycles, conflicts, and unsupported graph nodes; and
+does not select a host platform.
