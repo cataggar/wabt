@@ -7,6 +7,7 @@ const std = @import("std");
 
 pub const content = @import("oci/content.zig");
 pub const reference = @import("oci/reference.zig");
+pub const auth = @import("oci/auth.zig");
 pub const model = @import("oci/model.zig");
 pub const transport = @import("oci/transport.zig");
 pub const graph = @import("oci/graph.zig");
@@ -15,6 +16,22 @@ pub const copy = @import("oci/copy.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
+
+pub const CredentialPolicy = auth.CredentialPolicy;
+pub const SuppliedCredential = auth.SuppliedCredential;
+pub const BasicCredential = auth.BasicCredential;
+pub const OwnedCredential = auth.OwnedCredential;
+pub const ResolvedCredential = auth.ResolvedCredential;
+pub const CredentialTarget = auth.CredentialTarget;
+pub const AuthLimits = auth.Limits;
+pub const AuthResolutionContext = auth.ResolutionContext;
+pub const DistributionChallenge = auth.DistributionChallenge;
+pub const Token = auth.Token;
+pub const TokenCache = auth.TokenCache;
+pub const TokenCacheKey = auth.TokenCacheKey;
+pub const resolveCredential = auth.resolveCredential;
+pub const parseWwwAuthenticate = auth.parseWwwAuthenticate;
+pub const selectDistributionChallenge = auth.selectDistributionChallenge;
 
 pub const Descriptor = model.Descriptor;
 pub const Platform = model.Platform;
@@ -58,6 +75,7 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("oci/content.zig");
     _ = @import("oci/reference.zig");
+    _ = @import("oci/auth.zig");
     _ = @import("oci/model.zig");
     _ = @import("oci/transport.zig");
     _ = @import("oci/graph.zig");
