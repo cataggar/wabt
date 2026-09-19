@@ -41,7 +41,11 @@ NEGATIVE_CASES = {
     "wrong-descriptor-digest": {
         "baseLayout": "wabt-oci-v1.1",
         "mutations": [
-            {"target": "root.digest", "operation": "replace", "value": "sha256:" + "0" * 64},
+            {
+                "target": "root.digest",
+                "operation": "replace",
+                "value": "sha256:" + "0" * 64,
+            },
             {
                 "target": "manifest.config.digest",
                 "operation": "replace",
@@ -246,7 +250,9 @@ def graph_for_layout(layout_path):
     def blob_path(descriptor):
         algorithm, encoded = descriptor["digest"].split(":", 1)
         if algorithm != "sha256" or len(encoded) != 64:
-            raise ValueError(f"{layout_path}: unsupported digest {descriptor['digest']}")
+            raise ValueError(
+                f"{layout_path}: unsupported digest {descriptor['digest']}"
+            )
         return layout_path / "blobs" / "sha256" / encoded
 
     def visit_document(descriptor, role):
@@ -257,8 +263,13 @@ def graph_for_layout(layout_path):
         documents.add(key)
         path = blob_path(descriptor)
         data = path.read_bytes()
-        if len(data) != descriptor["size"] or sha256_bytes(data) != descriptor["digest"][7:]:
-            raise ValueError(f"{layout_path}: corrupt descriptor {descriptor['digest']}")
+        if (
+            len(data) != descriptor["size"]
+            or sha256_bytes(data) != descriptor["digest"][7:]
+        ):
+            raise ValueError(
+                f"{layout_path}: corrupt descriptor {descriptor['digest']}"
+            )
         document = json.loads(data)
         media_type = descriptor["mediaType"]
         if media_type == "application/vnd.oci.image.index.v1+json":
@@ -468,7 +479,16 @@ Pinned Linux/arm64 regeneration (network and a loopback-only disposable
 registry are required):
 
 ```sh
-scripts/oci/generate_interop_fixtures.sh
+WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \\
+  scripts/oci/generate_interop_fixtures.sh
+```
+
+To execute the same live matrix without replacing producer metadata:
+
+```sh
+WABT_OCI_INTEROP_MODE=qualify \\
+  WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \\
+  scripts/oci/generate_interop_fixtures.sh
 ```
 
 The fixed producer timestamp is `2026-09-19T00:00:00Z`. External tools are
@@ -525,15 +545,12 @@ def build_manifest(args, candidate):
     root = Path(args.repo).resolve()
     work = Path(args.work).resolve()
     tools = Path(args.tools).resolve()
-    cache = tools.parent / "oci-cache"
+    cache = tools.parent / "cache"
     source = cache / "source" / "wasm-pkg-tools"
     cargo_home = tools / "cargo"
     rustup_home = tools / "rustup"
     toolchain_bin = (
-        rustup_home
-        / "toolchains"
-        / "1.97.0-aarch64-unknown-linux-gnu"
-        / "bin"
+        rustup_home / "toolchains" / "1.97.0-aarch64-unknown-linux-gnu" / "bin"
     )
     tool_bin = tools / "bin"
     wabt = root / "zig-out" / "bin" / "wabt"
@@ -634,16 +651,15 @@ def build_manifest(args, candidate):
             },
             "binarySha256": sha256_file(tool_bin / "rustup-init"),
         },
-        "python": binary_record(
-            python_path, run_output([python_path, "--version"])
-        ),
+        "python": binary_record(python_path, run_output([python_path, "--version"])),
         "wabtUnderTest": binary_record(wabt, run_output([wabt, "version"])),
     }
     if sha256_file(source / "Cargo.lock") != producers["wkg"]["cargoLockSha256"]:
         raise ValueError("wkg Cargo.lock changed")
-    if run_output(["git", "-C", source, "rev-parse", "HEAD"]) != producers["wkg"][
-        "sourceRevision"
-    ]:
+    if (
+        run_output(["git", "-C", source, "rev-parse", "HEAD"])
+        != producers["wkg"]["sourceRevision"]
+    ):
         raise ValueError("wkg source revision changed")
 
     layouts = {}
@@ -665,9 +681,7 @@ def build_manifest(args, candidate):
             **graph,
         }
 
-    roots = {
-        name: layouts[name]["roots"][0]["digest"] for name in LAYOUT_NAMES
-    }
+    roots = {name: layouts[name]["roots"][0]["digest"] for name in LAYOUT_NAMES}
     matrix = [
         {
             "id": "wkg-to-wabt",
@@ -831,10 +845,7 @@ def build_manifest(args, candidate):
     }
 
 
-def assemble(args):
-    root = Path(args.repo).resolve()
-    work = Path(args.work).resolve()
-    target = root / "src" / "fixtures" / "oci"
+def assemble_candidate(root, work):
     candidate = work / "candidate"
     if candidate.exists():
         shutil.rmtree(candidate)
@@ -843,7 +854,10 @@ def assemble(args):
     (candidate / "negative").mkdir()
 
     component = root / "src" / "component" / "fixtures" / "stdio-echo.wasm"
-    if component.stat().st_size != PAYLOAD_SIZE or sha256_file(component) != PAYLOAD_SHA256:
+    if (
+        component.stat().st_size != PAYLOAD_SIZE
+        or sha256_file(component) != PAYLOAD_SHA256
+    ):
         raise ValueError("component payload changed")
     shutil.copyfile(component, candidate / "profiles" / "component.wasm")
     (candidate / "profiles" / "core.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
@@ -867,21 +881,114 @@ def assemble(args):
         )
 
     create_readme(candidate / "README.md")
+    return candidate
+
+
+def assemble(args):
+    root = Path(args.repo).resolve()
+    work = Path(args.work).resolve()
+    target = root / "src" / "fixtures" / "oci"
+    candidate = assemble_candidate(root, work)
     manifest = build_manifest(args, candidate)
     (candidate / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    verify_tree(candidate)
-    if target.exists():
+    verify_tree(candidate, root)
+    if target.exists() and not args.update:
         compare_trees(target, candidate)
         shutil.rmtree(candidate)
     else:
         publish_candidate(candidate, target)
-    verify_tree(target)
+    verify_tree(target, root)
 
 
-def verify_tree(target):
+def verify_qualification_producers(root, tools, manifest):
+    producers = manifest["producers"]
+    tool_bin = tools / "bin"
+    cache = tools.parent / "cache"
+    source = cache / "source" / "wasm-pkg-tools"
+    rustup_home = tools / "rustup"
+    toolchain_bin = (
+        rustup_home / "toolchains" / "1.97.0-aarch64-unknown-linux-gnu" / "bin"
+    )
+
+    expected_files = {
+        tool_bin / "oras": producers["oras"]["binary"]["sha256"],
+        tool_bin / "registry": producers["registry"]["binary"]["sha256"],
+        tool_bin / "rustup-init": producers["rustup"]["binarySha256"],
+        toolchain_bin / "rustc": producers["wkg"]["build"]["compiler"]["sha256"],
+        toolchain_bin / "cargo": producers["wkg"]["build"]["cargo"]["sha256"],
+        Path(shutil.which("zig") or ""): producers["wkg"]["build"]["zigLinker"][
+            "sha256"
+        ],
+    }
+    for path, expected in expected_files.items():
+        if not path.is_file() or sha256_file(path) != expected:
+            raise ValueError(f"qualification producer binary drift: {path}")
+
+    if (
+        run_output([tool_bin / "oras", "version"]).splitlines()
+        != producers["oras"]["binary"]["versionOutput"]
+    ):
+        raise ValueError("ORAS version output drift")
+    if run_output([tool_bin / "wkg", "--version"]) != "wkg 0.16.1":
+        raise ValueError("wkg version output drift")
+    if (
+        sha256_file(root / producers["fixedRealtime"]["source"]["path"])
+        != producers["fixedRealtime"]["source"]["sha256"]
+    ):
+        raise ValueError("fixed realtime source drift")
+    if " 3.1.1" not in run_output([tool_bin / "registry", "--version"]):
+        raise ValueError("registry version output drift")
+    if run_output(["zig", "version"]) != "0.16.0":
+        raise ValueError("Zig version drift")
+    if not run_output([toolchain_bin / "rustc", "--version"]).startswith(
+        "rustc 1.97.0 "
+    ):
+        raise ValueError("Rust compiler version drift")
+    if not run_output([toolchain_bin / "cargo", "--version"]).startswith(
+        "cargo 1.97.0 "
+    ):
+        raise ValueError("Cargo version drift")
+
+    if sha256_file(source / "Cargo.lock") != producers["wkg"]["cargoLockSha256"]:
+        raise ValueError("wkg Cargo.lock changed")
+    if (
+        run_output(["git", "-C", source, "rev-parse", "HEAD"])
+        != producers["wkg"]["sourceRevision"]
+    ):
+        raise ValueError("wkg source revision changed")
+    if (
+        run_output(["git", "-C", source, "rev-parse", "HEAD^{tree}"])
+        != producers["wkg"]["sourceTree"]
+    ):
+        raise ValueError("wkg source tree changed")
+
+    wabt = root / "zig-out" / "bin" / "wabt"
+    if run_output([wabt, "version"]) != "wabt oci-fixtures":
+        raise ValueError("WABT qualification build version drift")
+
+
+def qualify(args):
+    root = Path(args.repo).resolve()
+    work = Path(args.work).resolve()
+    tools = Path(args.tools).resolve()
+    target = root / "src" / "fixtures" / "oci"
+    verify_tree(target, root)
+
+    candidate = assemble_candidate(root, work)
+    shutil.copyfile(target / "manifest.json", candidate / "manifest.json")
+    compare_trees(target, candidate)
+    verify_qualification_producers(
+        root,
+        tools,
+        json.loads((target / "manifest.json").read_text(encoding="utf-8")),
+    )
+    shutil.rmtree(candidate)
+
+
+def verify_tree(target, repo=None):
     manifest_path = target / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("schema") != SCHEMA or manifest.get("schemaVersion") != 1:
@@ -890,13 +997,16 @@ def verify_tree(target):
         raise ValueError("fixture timestamp drift")
     if manifest.get("executionPlatform") != "linux/arm64":
         raise ValueError("fixture producer platform drift")
-    repo = target.parents[2]
+    repo = Path(repo).resolve() if repo is not None else target.parents[2]
     generator = manifest.get("generator", {})
     if generator.get("ordinaryVerification") != "offline":
         raise ValueError("ordinary fixture verification must remain offline")
     for source in generator.get("sources", []):
         path = repo / source["path"]
-        if path.stat().st_size != source["size"] or sha256_file(path) != source["sha256"]:
+        if (
+            path.stat().st_size != source["size"]
+            or sha256_file(path) != source["sha256"]
+        ):
             raise ValueError(f"fixture generator source drift: {source['path']}")
 
     producers = manifest["producers"]
@@ -905,9 +1015,15 @@ def verify_tree(target):
         ("oras", "commit"): "db9e29505c3059f2b8fde34ae8cae266c5c765e9",
         ("wkg", "version"): "0.16.1",
         ("wkg", "sourceRevision"): "5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a",
-        ("wkg", "cargoLockSha256"): "bf465c989fa26cb06778624fd2de843ca5d6318b4a58418c9e392e13dc02d732",
+        (
+            "wkg",
+            "cargoLockSha256",
+        ): "bf465c989fa26cb06778624fd2de843ca5d6318b4a58418c9e392e13dc02d732",
         ("oci-wasm", "version"): "0.6.0",
-        ("oci-wasm", "crateChecksumSha256"): "87689298bd74f0f2675fcac99956a34c31098ca3bdced3d7635e71dc03c5ca21",
+        (
+            "oci-wasm",
+            "crateChecksumSha256",
+        ): "87689298bd74f0f2675fcac99956a34c31098ca3bdced3d7635e71dc03c5ca21",
         ("oci-wasm", "tagCommit"): "8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd",
         ("registry", "version"): "3.1.1",
     }
@@ -916,7 +1032,10 @@ def verify_tree(target):
             raise ValueError(f"{producer} {field} drift")
 
     component = target / manifest["profiles"]["component"]["path"]
-    if component.stat().st_size != PAYLOAD_SIZE or sha256_file(component) != PAYLOAD_SHA256:
+    if (
+        component.stat().st_size != PAYLOAD_SIZE
+        or sha256_file(component) != PAYLOAD_SHA256
+    ):
         raise ValueError("component profile drift")
     core = target / manifest["profiles"]["core"]["path"]
     if core.read_bytes() != b"\x00asm\x01\x00\x00\x00":
@@ -953,9 +1072,7 @@ def verify_tree(target):
         ):
             raise ValueError(f"{name}: missing generation argv")
 
-    negative = {
-        item["id"]: item["path"] for item in manifest.get("negativeCases", [])
-    }
+    negative = {item["id"]: item["path"] for item in manifest.get("negativeCases", [])}
     if set(negative) != set(NEGATIVE_CASES):
         raise ValueError("negative fixture set drift")
     for case_id, relative in negative.items():
@@ -1003,6 +1120,11 @@ def main():
     write.add_argument("--repo", required=True)
     write.add_argument("--work", required=True)
     write.add_argument("--tools", required=True)
+    write.add_argument("--update", action="store_true")
+    qualify_parser = subparsers.add_parser("qualify")
+    qualify_parser.add_argument("--repo", required=True)
+    qualify_parser.add_argument("--work", required=True)
+    qualify_parser.add_argument("--tools", required=True)
     verify = subparsers.add_parser("verify")
     verify.add_argument("--fixtures", required=True)
     args = parser.parse_args()
@@ -1010,6 +1132,8 @@ def main():
     try:
         if args.command == "write":
             assemble(args)
+        elif args.command == "qualify":
+            qualify(args)
         else:
             verify_tree(Path(args.fixtures).resolve())
     except (KeyError, OSError, ValueError, subprocess.CalledProcessError) as error:

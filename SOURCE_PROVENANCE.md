@@ -153,9 +153,18 @@ offline verifier and default Zig tests consume only committed bytes.
   `cb482cd75185f5dde1d40e50b258c5cd6a4465dcf3f494f2dc0e57224bf314b2`)
   and Cargo 1.97.0 (binary SHA-256
   `48465d951d7b6a98f2fd9cddfa3bfde8ad81796d8c4b56d1f1e4c45775740b53`)
-  using Zig 0.16.0 as the native linker. The executed normalized wkg binary
-  SHA-256 is
-  `f37d41d16bf3f1759e36e7604629d52826ad5f9da6008940e33c8823e888383e`.
+  using Zig 0.16.0 as the native linker (binary SHA-256
+  `6e2989a7efbd4e81acbacb6c6378e34340d8e88bb023b10c4a941021be55cdcb`).
+  Rust was installed by rustup 1.28.2 from the Linux arm64 `rustup-init`
+  binary with SHA-256
+  `e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c`.
+  The fixture-generation run's normalized wkg binary SHA-256 is
+  `da4d86375734ae975007eef0617fb0fd43721ee89e48de7eca50c2d16229d18a`.
+  That built-binary hash is recorded as provenance rather than a portable
+  rebuild pin because release-mode Rust panic strings and unused RUNPATH
+  entries retain absolute Cargo/Rustup state paths. Qualification instead
+  pins the source revision/tree, lock file, oci-wasm checksum, Rust/Cargo/Zig
+  binaries, and requires the generated OCI bytes to match the corpus exactly.
 - **oci-wasm 0.6.0:** crates.io checksum
   `87689298bd74f0f2675fcac99956a34c31098ca3bdced3d7635e71dc03c5ca21`;
   tag commit
@@ -166,7 +175,8 @@ offline verifier and default Zig tests consume only committed bytes.
   `8167316d2b4a57e10d44f8c8a3c75fea5f3ec1c71872760bb903e5e8e52e9ad6`;
   executed binary SHA-256
   `669f0d9892da6ccd44a40954f39a3b929f4455d7ed02a806828346feac572834`.
-  It is bound only to loopback and stores disposable data below `zig-out`.
+  It is bound only to loopback and stores disposable data below the explicit
+  interoperability state directory.
 - **Fixed realtime interposer:** WABT-owned source
   `scripts/oci/fixed_realtime.c`, SHA-256
   `6ff9857612af1f1ef6cdc33908026c6e804c3f65f00c204b907db3c0d5428fbe`,
@@ -177,3 +187,14 @@ These programs are fixture/test producers, not linked WABT dependencies.
 Successful transport interoperability does not claim signature verification,
 runtime compatibility, production readiness, or general cross-runtime
 support.
+
+The external qualification workflow runs the same
+`scripts/oci/generate_interop_fixtures.sh` producer path in `qualify` mode on
+Linux/arm64; there is no second schema adapter or interoperability runner. It
+builds the pinned producer set, starts the pinned registry binary directly on
+`127.0.0.1`, and compares every regenerated layout byte with the committed
+corpus twice. The expected generic-WABT-to-wkg rejection and all
+digest-preserving registry/layout copy directions are part of that producer
+path. GitHub Actions state is confined below `RUNNER_TEMP`; local state must be
+below `/d`. The workflow has no Azure or other external registry credential
+and uploads only a bounded redacted text summary on failure.

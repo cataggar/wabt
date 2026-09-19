@@ -75,9 +75,22 @@ ORAS OCI 1.0 single-Wasm shape for reads, but does not produce OCI 1.0.
 
 The external qualification workflow pins ORAS v1.3.4, wasm-pkg-tools revision
 `5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a` (`wkg` 0.16.1), and oci-wasm
-0.6.0. These are fixture/test producers, not runtime dependencies. Ordinary
-Linux, macOS, and Windows Zig tests do not download them, start a registry, or
-use credentials.
+0.6.0, plus Distribution registry 3.1.1, Rust 1.97.0/rustup 1.28.2, and Zig
+0.16.0. Exact archives, checksums, source revisions, compiler and producer
+binary hashes, generation argv, layout descriptors, and expected outcomes are
+recorded in [`src/fixtures/oci/manifest.json`](../src/fixtures/oci/manifest.json)
+and summarized in [`SOURCE_PROVENANCE.md`](../SOURCE_PROVENANCE.md).
+
+The committed Linux/arm64 layouts are `wkg-wasm-v0`, `wabt-wasm-v0`,
+`oras-oci-v1.0`, `oras-oci-v1.1`, `wabt-oci-v1.1`, `copy-roundtrip`, and
+`index`. The matrix requires byte-identical payloads, exact digest-preserving
+copies in every registry/layout direction, complete index preservation with
+extraction rejection, and the expected rejection of generic OCI output by
+wkg. The workflow invokes the fixture producer itself twice in qualification
+mode, uses the pinned registry binary on disposable loopback storage, and
+rejects any fixture drift or partial output. It has no cloud-registry
+credentials. Ordinary Linux, macOS, and Windows Zig tests remain offline with
+respect to these external producers.
 
 ## Commands
 
@@ -387,6 +400,21 @@ COPIED_ROOT="$(
       --destination-password-stdin
 )"
 test "$COPIED_ROOT" = "$ROOT_DIGEST"
+
+COPY_RESOLVED="$(
+  acr_token |
+    wabt oci resolve "$COPY_REF" \
+      --username "$ACR_TOKEN_USER" \
+      --password-stdin
+)"
+test "$COPY_RESOLVED" = "$IMMUTABLE"
+
+acr_token |
+  wabt oci pull "$COPY_RESOLVED" \
+    -o "$RUN_DIR/copied-component.wasm" \
+    --username "$ACR_TOKEN_USER" \
+    --password-stdin
+cmp "$SOURCE" "$RUN_DIR/copied-component.wasm"
 ```
 
 Expected authorization failures are useful evidence:
@@ -405,8 +433,8 @@ Create a redacted run sheet containing only:
 - optional ORAS/wkg/runtime version strings and binary hashes;
 - input/output SHA-256;
 - manifest/root, config, and payload digests and sizes from `inspect.json`;
-- pass/fail for push, tag-to-digest resolution, pull, byte comparison, and
-  copies.
+- pass/fail for push, both tag-to-digest resolutions, both pulls, byte
+  comparisons, and both copy directions.
 
 Before closing the implementation issue or publishing the first release with
 OCI support, an operator should complete this procedure once and attach only
@@ -419,17 +447,18 @@ Remove local material after recording the sanitized fields:
 
 ```bash
 rm -rf "$RUN_DIR"
-unset LOGIN_SERVER TAG_REF COPY_REF IMMUTABLE RESOLVED ROOT_DIGEST
+unset LOGIN_SERVER TAG_REF COPY_REF IMMUTABLE RESOLVED COPY_RESOLVED ROOT_DIGEST
 ```
 
 WABT has no deletion command. Remove disposable ACR tags only through the
 operator's approved ACR/ORAS retention or deletion procedure, then clear the
 Azure CLI session as required by local policy.
 
-### Optional separate runtime smoke test
+### Runtime execution is outside transport qualification
 
-A downloaded component may be run later, as a separate process, when its world
-is supported by the selected host:
+WAMR and Wasmtime execution is outside transport qualification. A downloaded
+component may be run later, as a separate operator process, when its world is
+supported by the selected host:
 
 ```console
 $ wasmtime --version

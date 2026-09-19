@@ -275,25 +275,12 @@ pub fn build(b: *std.Build) void {
     const oci_qualification_check = b.addSystemCommand(&.{
         "python3",
         "scripts/check_oci_qualification.py",
-        "--allow-missing-fixtures",
     });
     const oci_qualification_test_step = b.step(
         "test-oci-qualification",
         "Lint OCI qualification documentation, workflow pins, and packaging",
     );
     oci_qualification_test_step.dependOn(&oci_qualification_check.step);
-
-    const oci_interop_runner = b.addSystemCommand(&.{
-        "python3",
-        "scripts/oci_interop.py",
-        "--wabt",
-    });
-    oci_interop_runner.addArtifactArg(wabt_exe);
-    const oci_interop_step = b.step(
-        "oci-interop",
-        "Run the external ORAS/wkg interoperability matrix (requires pinned tools and a loopback registry)",
-    );
-    oci_interop_step.dependOn(&oci_interop_runner.step);
 
     const oci_registry_test_mod = b.createModule(.{
         .root_source_file = b.path("src/oci/registry_test.zig"),

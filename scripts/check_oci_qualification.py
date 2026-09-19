@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Static checks for OCI qualification docs, workflow pins, and packaging."""
+"""Check OCI qualification workflow, documentation, and package contracts."""
 
 from __future__ import annotations
 
-import argparse
+import json
 import re
 import sys
 from pathlib import Path
@@ -38,17 +38,13 @@ def require_normalized_text(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--allow-missing-fixtures",
-        action="store_true",
-        help="permit the fixture-branch contract paths to be absent before rebase",
-    )
-    args = parser.parse_args()
     errors: list[str] = []
-
     workflow_path = ".github/workflows/oci-interop.yml"
     workflow = read(workflow_path)
+    generator = read("scripts/oci/generate_interop_fixtures.sh")
+    manifest = json.loads(read("src/fixtures/oci/manifest.json"))
+    producers = manifest["producers"]
+
     action_refs = re.findall(r"^\s*uses:\s*[^@\s]+@([^\s#]+)", workflow, re.MULTILINE)
     require(bool(action_refs), f"{workflow_path}: no actions found", errors)
     for action_ref in action_refs:
@@ -57,24 +53,116 @@ def main() -> int:
             f"{workflow_path}: action is not pinned by a full commit SHA: {action_ref}",
             errors,
         )
-    require("secrets." not in workflow, f"{workflow_path}: must not consume repository secrets", errors)
-    require("azure" not in workflow.lower(), f"{workflow_path}: must not run cloud qualification", errors)
+    require(
+        "secrets." not in workflow, f"{workflow_path}: must not consume secrets", errors
+    )
+    require(
+        "azure" not in workflow.lower(), f"{workflow_path}: must not run Azure", errors
+    )
+    require("acr" not in workflow.lower(), f"{workflow_path}: must not run ACR", errors)
+    require(
+        "docker " not in workflow,
+        f"{workflow_path}: must use the pinned registry binary",
+        errors,
+    )
     require_text(
         workflow_path,
         (
-            "ORAS_VERSION: 1.3.4",
-            "db9e29505c3059f2b8fde34ae8cae266c5c765e9",
-            "f27adb935022d94df8dc77719c322dda592c78a0d57a6f7dcdd8d900b248c454",
-            "19d479e497fb5e30c7de3c621e3ed337e3857de0d96542021a73e2d8016dbe5a",
-            "5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a",
-            "bf465c989fa26cb06778624fd2de843ca5d6318b4a58418c9e392e13dc02d732",
-            "87689298bd74f0f2675fcac99956a34c31098ca3bdced3d7635e71dc03c5ca21",
-            "8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd",
-            "registry:3.0.0@sha256:6c5666b861f3505b116bb9aa9b25175e71210414bd010d92035ff64018f9457e",
+            "runs-on: ubuntu-22.04-arm",
+            "persist-credentials: false",
+            "WABT_OCI_INTEROP_MODE: qualify",
+            "${{ runner.temp }}/wabt-oci-interoperability",
+            "for pass in one two",
             "scripts/oci/generate_interop_fixtures.sh",
             "scripts/oci/verify_interop_fixtures.sh",
+            "git diff --exit-code -- src/fixtures/oci",
             "if: failure()",
+            "summary.txt",
+            "retention-days: 3",
         ),
+        errors,
+    )
+
+    require(
+        manifest.get("schema") == "wabt.oci.interop-fixtures",
+        "fixture schema drift",
+        errors,
+    )
+    require(manifest.get("schemaVersion") == 1, "fixture schema version drift", errors)
+    require(
+        manifest.get("executionPlatform") == "linux/arm64",
+        "fixture platform drift",
+        errors,
+    )
+    require(
+        set(manifest["layouts"])
+        == {
+            "copy-roundtrip",
+            "index",
+            "oras-oci-v1.0",
+            "oras-oci-v1.1",
+            "wabt-oci-v1.1",
+            "wabt-wasm-v0",
+            "wkg-wasm-v0",
+        },
+        "fixture layout set drift",
+        errors,
+    )
+    matrix = {item["id"]: item for item in manifest["matrix"]}
+    for case in (
+        "wkg-to-wabt",
+        "wabt-wasm-v0-to-wkg",
+        "oras-oci-1.0-to-wabt",
+        "oras-oci-1.1-to-wabt",
+        "wabt-generic-to-oras",
+        "wabt-generic-to-wkg",
+        "digest-preserving-copies",
+        "index-preservation-and-extraction-rejection",
+    ):
+        require(case in matrix, f"fixture matrix missing {case}", errors)
+    require(
+        matrix.get("wabt-generic-to-wkg", {}).get("result")
+        == "pass-expected-rejection",
+        "generic-to-wkg must remain an expected rejection",
+        errors,
+    )
+
+    pinned_values = (
+        producers["oras"]["version"],
+        producers["oras"]["commit"],
+        producers["oras"]["checksumList"]["sha256"],
+        producers["oras"]["archive"]["sha256"],
+        producers["wkg"]["version"],
+        producers["wkg"]["sourceRevision"],
+        producers["wkg"]["sourceTree"],
+        producers["wkg"]["cargoLockSha256"],
+        producers["oci-wasm"]["version"],
+        producers["oci-wasm"]["crateChecksumSha256"],
+        producers["oci-wasm"]["tagCommit"],
+        producers["registry"]["version"],
+        producers["registry"]["archive"]["sha256"],
+        producers["rustup"]["version"],
+        producers["rustup"]["archive"]["sha256"],
+        producers["wkg"]["build"]["compiler"]["versionOutput"][0].split()[1],
+    )
+    for value in pinned_values:
+        require(value in generator, f"generator missing manifest pin {value}", errors)
+    require_text(
+        "scripts/oci/generate_interop_fixtures.sh",
+        (
+            "WABT_OCI_INTEROP_MODE",
+            "WABT_OCI_INTEROP_STATE_DIR",
+            "RUNNER_TEMP",
+            'registry" serve',
+            'fixture_manifest.py" qualify',
+            'fixture_manifest.py" verify',
+            "MAX_STATE_KIB",
+        ),
+        errors,
+    )
+    require(
+        not (ROOT / "scripts/oci_interop.py").exists(),
+        "duplicate scripts/oci_interop.py must not be retained",
         errors,
     )
 
@@ -93,14 +181,15 @@ def main() -> int:
             "wabt.oci.inspect",
             "wabt.oci.resolve",
             "wabt.oci.list-tags",
+            "operator-run azure container registry walkthrough",
             "00000000-0000-0000-0000-000000000000",
-            "az acr login --name \"$ACR_NAME\" --expose-token",
+            'az acr login --name "$acr_name" --expose-token',
             "transport evidence is not runtime qualification",
             "not automatically wkg-compatible",
             "does not execute",
             "signing or signature verification",
             "production-readiness",
-            "Kusto",
+            "wamr and wasmtime execution is outside transport qualification",
         ),
         errors,
     )
@@ -147,42 +236,45 @@ def main() -> int:
         ("docs/oci.md", "docs/oci-authentication.md"),
         errors,
     )
+
+    provenance_values = (
+        producers["oras"]["archive"]["sha256"],
+        producers["oras"]["binary"]["sha256"],
+        producers["wkg"]["binary"]["sha256"],
+        producers["registry"]["archive"]["sha256"],
+        producers["registry"]["binary"]["sha256"],
+        producers["wkg"]["build"]["compiler"]["sha256"],
+        producers["wkg"]["build"]["cargo"]["sha256"],
+        producers["wkg"]["build"]["zigLinker"]["sha256"],
+    )
+    provenance = read("SOURCE_PROVENANCE.md")
+    for value in provenance_values:
+        require(value in provenance, f"SOURCE_PROVENANCE.md missing {value}", errors)
     require_normalized_text(
         "SOURCE_PROVENANCE.md",
         (
-            "ORAS v1.3.4",
-            "wasm-pkg-tools",
+            "oras cli 1.3.4",
+            "wkg 0.16.1",
             "oci-wasm 0.6.0",
-            "Distribution registry",
-            "transport does not verify signatures",
+            "distribution registry 3.1.1",
+            "transport interoperability does not claim signature verification",
         ),
         errors,
     )
     require_normalized_text(
         "THIRD_PARTY_NOTICES.md",
-        ("External OCI qualification producers", "not WABT runtime dependencies"),
+        ("oci fixture and qualification producers", "not runtime dependencies"),
         errors,
     )
 
     ci = read(".github/workflows/ci.yml")
-    require("oci-interop" not in ci, ".github/workflows/ci.yml: external tools leaked into normal CI", errors)
+    require("oci-interop" not in ci, "external tools leaked into normal CI", errors)
     require(
         "os: [ubuntu-22.04, macos-latest, windows-latest]" in ci
         and "optimize: [Debug, ReleaseSafe]" in ci,
-        ".github/workflows/ci.yml: ordinary six-cell matrix changed",
+        "ordinary six-cell matrix changed",
         errors,
     )
-
-    fixture_paths = (
-        "src/fixtures/oci/manifest.json",
-        "scripts/oci/generate_interop_fixtures.sh",
-        "scripts/oci/verify_interop_fixtures.sh",
-    )
-    missing = [path for path in fixture_paths if not (ROOT / path).is_file()]
-    if missing and not args.allow_missing_fixtures:
-        errors.append("fixture branch contract is missing: " + ", ".join(missing))
-    elif missing:
-        print("fixture contract pending rebase: " + ", ".join(missing))
 
     if errors:
         for error in errors:

@@ -40,25 +40,29 @@ $ bash scripts/oci/verify_interop_fixtures.sh
 ```
 
 Refreshing them is a deliberate Linux external-tool operation using the
-versions and hashes recorded in `src/fixtures/oci/manifest.json`:
+Linux/arm64 versions and hashes recorded in
+`src/fixtures/oci/manifest.json`. All writable state must remain below an
+explicit `/d` path:
 
 ```console
-$ bash scripts/oci/generate_interop_fixtures.sh
+$ WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \
+    bash scripts/oci/generate_interop_fixtures.sh
 $ bash scripts/oci/verify_interop_fixtures.sh
 ```
 
-The separate pinned workflow performs two clean refreshes and the complete
-loopback ORAS/wkg matrix. With the exact tools and a disposable loopback
-registry already available, its non-default runner is:
+The separate pinned workflow runs the same producer script twice in
+qualification mode. That mode performs the complete loopback ORAS/wkg matrix
+and requires every generated layout byte to equal the checked-in corpus,
+without replacing the recorded producer metadata:
 
 ```console
-$ ORAS=/path/to/oras WKG=/path/to/wkg \
-    OCI_REGISTRY=127.0.0.1:5000 \
-    zig build oci-interop -Doptimize=ReleaseSafe
+$ WABT_OCI_INTEROP_MODE=qualify \
+    WABT_OCI_INTEROP_STATE_DIR=/d/wabt-worktrees/.cache/wabt-oci-interop \
+    bash scripts/oci/generate_interop_fixtures.sh
 ```
 
-Static workflow, documentation, and package checks can run before the fixture
-branch is rebased:
+Static workflow, documentation, manifest, and package checks are available
+through:
 
 ```console
 $ zig build test-oci-qualification
