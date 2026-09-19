@@ -420,8 +420,12 @@ test "unknown fields parse compatibly while exact document bytes remain availabl
 test "document media classes distinguish OCI and Docker schema two" {
     try std.testing.expectEqual(.oci_manifest, classifyMediaType(media_type_oci_manifest));
     try std.testing.expectEqual(.oci_index, classifyMediaType(media_type_oci_index));
+    try std.testing.expectEqual(.oci_config, classifyMediaType(media_type_oci_config));
+    try std.testing.expectEqual(.oci_layer, classifyMediaType(media_type_oci_layer_zstd));
     try std.testing.expectEqual(.docker_manifest, classifyMediaType(media_type_docker_manifest));
     try std.testing.expectEqual(.docker_manifest_list, classifyMediaType(media_type_docker_manifest_list));
+    try std.testing.expectEqual(.docker_config, classifyMediaType(media_type_docker_config));
+    try std.testing.expectEqual(.docker_layer, classifyMediaType(media_type_docker_foreign_layer_gzip));
     try std.testing.expect(classifyMediaType(media_type_oci_manifest).isManifest());
     try std.testing.expect(classifyMediaType(media_type_docker_manifest_list).isIndex());
     try std.testing.expectEqual(.unknown, classifyMediaType("application/vnd.example.document+json"));
@@ -454,6 +458,23 @@ test "artifact manifest accepts generic payloads rejected by image validation" {
 
     try validateArtifactManifest(manifest);
     try std.testing.expectError(error.UnsupportedConfigMediaType, validateImageManifest(manifest));
+
+    const image_config_artifact = Manifest{
+        .schemaVersion = 2,
+        .mediaType = media_type_oci_manifest,
+        .artifactType = manifest.artifactType,
+        .config = .{
+            .mediaType = media_type_oci_config,
+            .digest = digest_a,
+            .size = 2,
+        },
+        .layers = manifest.layers,
+    };
+    try validateArtifactManifest(image_config_artifact);
+    try std.testing.expectError(
+        error.UnsupportedLayerMediaType,
+        validateImageManifest(image_config_artifact),
+    );
 }
 
 test "OCI and Docker image document roles validate strictly" {
@@ -509,6 +530,31 @@ test "subject and OCI 1.1 artifact fields parse and validate" {
     try validateArtifactManifest(manifest);
 }
 
+test "index and descriptors retain all standard fields" {
+    const json =
+        \\{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","artifactType":"application/vnd.example.collection","x-index":"keep","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":7,"urls":["https://registry.example/blob"],"annotations":{"org.example.kind":"child"},"data":"cGF5bG9hZA==","artifactType":"application/vnd.example.child","platform":{"architecture":"amd64","os":"linux","os.version":"6.0","os.features":["feature-a"],"variant":"v1","features":["legacy"]},"x-descriptor":"keep"}],"subject":{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","size":123}}
+    ;
+    var document = try parseDocument(std.testing.allocator, json);
+    defer document.deinit();
+
+    try std.testing.expectEqual(DocumentKind.index, document.kind());
+    try std.testing.expectEqualStrings(json, document.raw);
+    const index = document.value.index.value;
+    try std.testing.expectEqualStrings("application/vnd.example.collection", index.artifactType.?);
+    try std.testing.expectEqualStrings(digest_c, index.subject.?.digest);
+
+    const descriptor = index.manifests[0];
+    try std.testing.expectEqualStrings("https://registry.example/blob", descriptor.urls.?[0]);
+    try std.testing.expectEqualStrings("cGF5bG9hZA==", descriptor.data.?);
+    try std.testing.expectEqualStrings("application/vnd.example.child", descriptor.artifactType.?);
+    try std.testing.expectEqualStrings("amd64", descriptor.platform.?.architecture);
+    try std.testing.expectEqualStrings("linux", descriptor.platform.?.os);
+    try std.testing.expectEqualStrings("6.0", descriptor.platform.?.@"os.version".?);
+    try std.testing.expectEqualStrings("feature-a", descriptor.platform.?.@"os.features".?[0]);
+    try std.testing.expectEqualStrings("v1", descriptor.platform.?.variant.?);
+    try std.testing.expectEqualStrings("legacy", descriptor.platform.?.features.?[0]);
+}
+
 test "media type validation rejects header and control injection" {
     const invalid = [_][]const u8{
         "application/example\r\nAuthorization: injected",
@@ -524,6 +570,14 @@ test "media type validation rejects header and control injection" {
     }
     try validateMediaType("application/vnd.example.artifact.v1+json");
     try validateMediaType("application/wasm");
+
+    var maximum: [max_media_type_len]u8 = @splat('a');
+    maximum[1] = '/';
+    try validateMediaType(&maximum);
+
+    var oversized: [max_media_type_len + 1]u8 = @splat('a');
+    oversized[1] = '/';
+    try std.testing.expectError(error.InvalidMediaType, validateMediaType(&oversized));
 }
 
 test "schema media descriptor and document shape errors are explicit" {

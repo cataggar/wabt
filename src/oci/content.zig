@@ -15,6 +15,7 @@ pub const Error = error{
     SizeMismatch,
     DigestMismatch,
     SizeOverflow,
+    VerifierFinished,
 };
 
 /// A parsed canonical SHA-256 OCI content digest.
@@ -97,12 +98,14 @@ pub const Verifier = struct {
     expected_size: u64,
     size: u64 = 0,
     hash: Sha256 = Sha256.init(.{}),
+    finished: bool = false,
 
     pub fn init(expected: Digest, expected_size: u64) Verifier {
         return .{ .expected = expected, .expected_size = expected_size };
     }
 
     pub fn update(self: *Verifier, bytes: []const u8) Error!void {
+        if (self.finished) return error.VerifierFinished;
         const byte_count = try checkedSize(bytes.len);
         const new_size = try checkedAddSize(self.size, byte_count);
         if (new_size > self.expected_size) return error.SizeMismatch;
@@ -110,7 +113,10 @@ pub const Verifier = struct {
         self.size = new_size;
     }
 
+    /// Finishing is terminal, including size or digest mismatch results.
     pub fn finish(self: *Verifier) Error!void {
+        if (self.finished) return error.VerifierFinished;
+        self.finished = true;
         if (self.size != self.expected_size) return error.SizeMismatch;
 
         var actual: [digest_size]u8 = undefined;
@@ -208,6 +214,28 @@ test "verifier distinguishes early and late size mismatches" {
 test "verifier distinguishes digest mismatch" {
     const digest = digestBytes("abc");
     try std.testing.expectError(error.DigestMismatch, verifyBytes(digest, 3, "abd"));
+}
+
+test "verifier finish is terminal on success and failure" {
+    const digest = digestBytes("abc");
+
+    var complete = Verifier.init(digest, 3);
+    try complete.update("abc");
+    try complete.finish();
+    try std.testing.expectError(error.VerifierFinished, complete.update(""));
+    try std.testing.expectError(error.VerifierFinished, complete.finish());
+
+    var incomplete = Verifier.init(digest, 3);
+    try incomplete.update("ab");
+    try std.testing.expectError(error.SizeMismatch, incomplete.finish());
+    try std.testing.expectError(error.VerifierFinished, incomplete.update("c"));
+    try std.testing.expectError(error.VerifierFinished, incomplete.finish());
+
+    var mismatched = Verifier.init(digest, 3);
+    try mismatched.update("abd");
+    try std.testing.expectError(error.DigestMismatch, mismatched.finish());
+    try std.testing.expectError(error.VerifierFinished, mismatched.update(""));
+    try std.testing.expectError(error.VerifierFinished, mismatched.finish());
 }
 
 test "size accounting is checked" {

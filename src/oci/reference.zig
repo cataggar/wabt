@@ -314,7 +314,10 @@ test "accepted references cover registry layout and operation modes" {
         kind: std.meta.Tag(Reference),
     }{
         .{ .text = "registry.example/team/image:stable", .operation = .source, .kind = .registry },
+        .{ .text = "registry.example:1/team/image:latest", .operation = .source, .kind = .registry },
+        .{ .text = "registry.example:65535/team/image:stable", .operation = .destination, .kind = .registry },
         .{ .text = "localhost:5000/repo:Tag_1.2", .operation = .destination, .kind = .registry },
+        .{ .text = "[2001:db8::1]/team/image:stable", .operation = .source, .kind = .registry },
         .{ .text = "[2001:db8::1]:5000/team/image@" ++ test_digest, .operation = .source, .kind = .registry },
         .{ .text = "registry.example/team/image", .operation = .list_tags, .kind = .registry },
         .{ .text = "oci:/var/lib/layout", .operation = .source, .kind = .layout },
@@ -323,6 +326,7 @@ test "accepted references cover registry layout and operation modes" {
         .{ .text = "oci:C:/images/layout@" ++ test_digest, .operation = .source, .kind = .layout },
         .{ .text = "oci:\\\\server\\share\\layout:stable", .operation = .source, .kind = .layout },
         .{ .text = "oci://server/share/layout", .operation = .destination, .kind = .layout },
+        .{ .text = "oci://server/share/layout:stable", .operation = .destination, .kind = .layout },
     };
 
     for (cases) |case| {
@@ -360,6 +364,8 @@ test "rejected references cover unsafe ambiguous and mode-invalid forms" {
         .{ .text = "registry.example/team/image:tag", .operation = .list_tags, .expected = error.UnexpectedSelection },
         .{ .text = "oci:/layout", .operation = .list_tags, .expected = error.InvalidReference },
         .{ .text = "user@registry.example/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
+        .{ .text = "user:password@registry.example/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
+        .{ .text = "registry.example:/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
         .{ .text = "registry.example:0/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
         .{ .text = "registry.example:65536/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
         .{ .text = "[2001:db8:::1]/team/image:tag", .operation = .source, .expected = error.InvalidAuthority },
