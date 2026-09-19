@@ -634,7 +634,15 @@ pub const Destination = struct {
             return error.DescriptorMismatch;
         }
 
-        try Io.Dir.renamePreserve(
+        const existing = Io.Dir.cwd().openDir(self.io, self.path, .{}) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (existing) |dir| {
+            dir.close(self.io);
+            return error.PathAlreadyExists;
+        }
+        try Io.Dir.rename(
             Io.Dir.cwd(),
             self.work_path,
             Io.Dir.cwd(),
