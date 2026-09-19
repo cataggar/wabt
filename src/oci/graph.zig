@@ -197,7 +197,7 @@ const Context = struct {
 
         const digest = try model.validateDescriptor(descriptor);
         const requires_document = role == .root or role == .index_child;
-        if (requires_document and
+        if (role == .root and
             !model.classifyMediaType(descriptor.mediaType).isDocument())
         {
             return error.UnsupportedGraphNode;
@@ -271,11 +271,18 @@ const Context = struct {
             return error.MaximumMetadataBytesExceeded;
         }
 
-        var metadata = try self.source.readMetadata(
-            self.allocator,
-            descriptor,
-            self.limits.max_metadata_bytes,
-        );
+        var metadata = if (self.records.items[index].roles.index_child)
+            try self.source.readManifestMetadata(
+                self.allocator,
+                descriptor,
+                self.limits.max_metadata_bytes,
+            )
+        else
+            try self.source.readMetadata(
+                self.allocator,
+                descriptor,
+                self.limits.max_metadata_bytes,
+            );
         var metadata_owned = true;
         defer if (metadata_owned) metadata.deinit();
 
@@ -720,6 +727,7 @@ const TestMapping = struct {
 const FakeSource = struct {
     mappings: []const TestMapping,
     metadata_calls: usize = 0,
+    manifest_metadata_calls: usize = 0,
     copy_calls: usize = 0,
     largest_requested: u64 = 0,
     ignore_limit: bool = false,
@@ -731,6 +739,24 @@ const FakeSource = struct {
         max_bytes: u64,
     ) !transport.Metadata {
         self.metadata_calls += 1;
+        self.largest_requested = @max(self.largest_requested, max_bytes);
+        for (self.mappings) |mapping| {
+            if (!std.mem.eql(u8, mapping.digest, descriptor.digest)) continue;
+            if (!self.ignore_limit and mapping.bytes.len > max_bytes) {
+                return error.MetadataTooLarge;
+            }
+            return transport.Metadata.copy(allocator, mapping.bytes);
+        }
+        return error.DescriptorNotFound;
+    }
+
+    pub fn readManifestMetadata(
+        self: *FakeSource,
+        allocator: std.mem.Allocator,
+        descriptor: model.Descriptor,
+        max_bytes: u64,
+    ) !transport.Metadata {
+        self.manifest_metadata_calls += 1;
         self.largest_requested = @max(self.largest_requested, max_bytes);
         for (self.mappings) |mapping| {
             if (!std.mem.eql(u8, mapping.digest, descriptor.digest)) continue;
@@ -931,7 +957,8 @@ test "manifest and nested index plans are deterministic and dependency first" {
     try expectEntryDigest(plan.entries[5], &root.digest_text);
     try std.testing.expect(plan.entries[0].data == .opaque_blob);
     try std.testing.expect(plan.entries[3].data == .exact_metadata);
-    try std.testing.expectEqual(@as(usize, 3), fake.metadata_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.metadata_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.manifest_metadata_calls);
     try std.testing.expectEqual(@as(usize, 3), plan.nodes.len);
 }
 
@@ -1273,7 +1300,7 @@ test "metadata digest and declared size are independently verified" {
     );
 }
 
-test "unsupported root and index child formats have a dedicated error" {
+test "unsupported roots reject while extension index children use manifest reads" {
     const allocator = std.testing.allocator;
     const unknown = TestBlob.init(
         "unknown-document",
@@ -1292,20 +1319,36 @@ test "unsupported root and index child formats have a dedicated error" {
     );
     try std.testing.expectEqual(@as(usize, 0), root_source.metadata_calls);
 
-    var index = try makeIndex(allocator, &.{unknown.descriptor()}, null);
-    defer index.deinit();
-    const mappings = [_]TestMapping{index.mapping()};
-    var child_source: FakeSource = .{ .mappings = &mappings };
-    try std.testing.expectError(
-        error.UnsupportedGraphNode,
-        planTestGraph(
-            allocator,
-            &child_source,
-            .{ .descriptor = index.descriptor() },
-            .{},
-        ),
+    const config = TestBlob.init(
+        "{}",
+        model.media_type_oci_empty_config,
+        2,
     );
+    const child_bytes = try std.fmt.allocPrint(
+        allocator,
+        "{{\"schemaVersion\":2,\"config\":{{\"mediaType\":\"{s}\",\"digest\":\"{s}\",\"size\":{d}}},\"layers\":[]}}",
+        .{ config.media_type, &config.digest_text, config.size },
+    );
+    var child = TestDocument.init(
+        allocator,
+        child_bytes,
+        "application/vnd.example.unknown+json",
+    );
+    defer child.deinit();
+    var index = try makeIndex(allocator, &.{child.descriptor()}, null);
+    defer index.deinit();
+    const mappings = [_]TestMapping{ index.mapping(), child.mapping() };
+    var child_source: FakeSource = .{ .mappings = &mappings };
+    var plan = try planTestGraph(
+        allocator,
+        &child_source,
+        .{ .descriptor = index.descriptor() },
+        .{},
+    );
+    defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), child_source.metadata_calls);
+    try std.testing.expectEqual(@as(usize, 1), child_source.manifest_metadata_calls);
+    try std.testing.expectEqual(@as(usize, 2), plan.nodes.len);
 }
 
 test "opaque artifact config and layers are accepted without image validation" {
@@ -1489,7 +1532,8 @@ test "all index children are planned without host platform filtering" {
     try std.testing.expectEqual(@as(usize, 5), plan.entries.len);
     try expectEntryDigest(plan.entries[1], &first.digest_text);
     try expectEntryDigest(plan.entries[3], &second.digest_text);
-    try std.testing.expectEqual(@as(usize, 3), fake.metadata_calls);
+    try std.testing.expectEqual(@as(usize, 1), fake.metadata_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.manifest_metadata_calls);
 }
 
 test "Docker schema two manifest lists and manifests are complete graph nodes" {
