@@ -171,6 +171,7 @@ const Context = struct {
     allocator: std.mem.Allocator,
     source: transport.Source,
     limits: Limits,
+    allow_subject_metadata: bool,
     records: std.array_list.Managed(Record),
     by_digest: std.AutoHashMap(content.Digest, DigestRecords),
     total_bytes: u64 = 0,
@@ -180,11 +181,13 @@ const Context = struct {
         allocator: std.mem.Allocator,
         source: transport.Source,
         limits: Limits,
+        allow_subject_metadata: bool,
     ) Context {
         return .{
             .allocator = allocator,
             .source = source,
             .limits = limits,
+            .allow_subject_metadata = allow_subject_metadata,
             .records = std.array_list.Managed(Record).init(allocator),
             .by_digest = std.AutoHashMap(
                 content.Digest,
@@ -370,7 +373,8 @@ const Context = struct {
             .index => |parsed| parsed.value.subject,
             .manifest => |parsed| parsed.value.subject,
         };
-        if (subject != null) return error.SubjectGraphUnsupported;
+        if (subject != null and !self.allow_subject_metadata)
+            return error.SubjectGraphUnsupported;
 
         const child_depth = std.math.add(u64, depth, 1) catch
             return error.MaximumDepthExceeded;
@@ -581,7 +585,23 @@ pub fn planCopy(
     root: Root,
     limits: Limits,
 ) !Plan {
-    var context = Context.init(allocator, source, limits);
+    var context = Context.init(allocator, source, limits, false);
+    defer context.deinit();
+
+    const root_index = try context.visit(root.descriptor, .root, 0);
+    return context.finish(root_index, root.descriptor_json);
+}
+
+/// Discovers the same bounded descriptor graph used by copy while retaining
+/// subject descriptors as metadata-only edges. Subject content is never
+/// traversed or fetched.
+pub fn planInspect(
+    allocator: std.mem.Allocator,
+    source: transport.Source,
+    root: Root,
+    limits: Limits,
+) !Plan {
+    var context = Context.init(allocator, source, limits, true);
     defer context.deinit();
 
     const root_index = try context.visit(root.descriptor, .root, 0);
@@ -1347,6 +1367,7 @@ test "topological cycle detection rejects active digest loops" {
         allocator,
         transport.Source.init(&fake),
         .{},
+        false,
     );
     defer context.deinit();
     try context.records.append(.{

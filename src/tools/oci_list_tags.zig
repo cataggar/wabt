@@ -1,16 +1,17 @@
 const std = @import("std");
 const wabt = @import("wabt");
 const options = @import("oci_options.zig");
+const output = @import("oci_output.zig");
 const runtime_mod = @import("oci_runtime.zig");
 
 pub const usage =
     "Usage: wabt oci list-tags REGISTRY/REPOSITORY [options]\n" ++
     "\n" ++
-    "Validate one selector-less registry repository for future tag listing.\n" ++
-    "JSON is the future default output; execution is not implemented yet.\n" ++
+    "List all tags from one registry repository using bounded pagination.\n" ++
+    "Output is stable versioned JSON with deterministic tag ordering.\n" ++
     "\n" ++
     "Options:\n" ++
-    "  --json                            Select versioned JSON (default)\n" ++
+    "  --json                            Emit versioned JSON (default)\n" ++
     options.endpoint_help;
 
 pub const Options = struct {
@@ -20,10 +21,10 @@ pub const Options = struct {
     endpoint: options.EndpointOptions,
 };
 
-pub const Error = options.Error || wabt.oci.reference.Error || error{
+pub const Error = options.Error || wabt.oci.reference.Error ||
+    output.ExecutionError || error{
     MissingRepository,
     UnexpectedArgument,
-    CommandNotImplemented,
 };
 
 pub fn parseArgs(args: []const []const u8) Error!Options {
@@ -62,9 +63,33 @@ pub fn execute(
     args: []const []const u8,
     runtime: *runtime_mod.Runtime,
 ) Error!void {
-    _ = runtime;
-    _ = try parseArgs(args);
-    return error.CommandNotImplemented;
+    const parsed = try parseArgs(args);
+    var source = runtime.openRegistrySource(
+        parsed.repository,
+        parsed.endpoint,
+    ) catch |err| return output.mapExecutionError(err);
+    defer source.deinit();
+    var result = source.listTags(parsed.repository) catch |err|
+        return output.mapExecutionError(err);
+    defer result.deinit();
+
+    const repository = std.fmt.allocPrint(
+        runtime.allocator,
+        "{s}/{s}",
+        .{ parsed.repository.authority, parsed.repository.repository },
+    ) catch return error.OutOfMemory;
+    defer runtime.allocator.free(repository);
+    const tags = runtime.allocator.alloc(
+        []const u8,
+        result.tags.len,
+    ) catch return error.OutOfMemory;
+    defer runtime.allocator.free(tags);
+    for (result.tags, 0..) |tag, index| tags[index] = tag;
+
+    try output.writeJson(runtime, output.ListTagsV1{
+        .repository = repository,
+        .tags = tags,
+    });
 }
 
 test "list-tags parses only selector-less registry repositories" {
@@ -76,7 +101,10 @@ test "list-tags parses only selector-less registry repositories" {
     });
     try std.testing.expect(parsed.json);
     try std.testing.expect(parsed.repository.selection == null);
-    try std.testing.expectEqualStrings("ca.pem", parsed.endpoint.additional_ca_file.?);
+    try std.testing.expectEqualStrings(
+        "ca.pem",
+        parsed.endpoint.additional_ca_file.?,
+    );
 }
 
 test "list-tags rejects selectors layouts duplicates and extras" {

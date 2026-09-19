@@ -157,6 +157,21 @@ pub const Result = struct {
     bytes_written: u64,
 };
 
+/// Performs only local destination checks. Call this before credentials,
+/// registry construction, or network access; extraction repeats the checks
+/// and retains the final race-safe atomic commit semantics.
+pub fn preflightOutput(
+    io: Io,
+    output_path: []const u8,
+    options: Options,
+) !void {
+    const output_name = try outputName(output_path);
+    const parent_path = std.fs.path.dirname(output_path) orelse ".";
+    var parent = try Io.Dir.cwd().openDir(io, parent_path, .{});
+    defer parent.close(io);
+    _ = try initialDestination(io, parent, output_name, options.force);
+}
+
 const DestinationSnapshot = union(enum) {
     missing,
     file: FileIdentity,

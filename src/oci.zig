@@ -104,6 +104,7 @@ pub const GraphLimits = graph.Limits;
 pub const GraphRoot = graph.Root;
 pub const GraphPlan = graph.Plan;
 pub const planGraphCopy = graph.planCopy;
+pub const planGraphInspect = graph.planInspect;
 
 pub const LayoutSource = layout.Source;
 pub const LayoutDestination = layout.Destination;
@@ -145,6 +146,7 @@ pub const extractDirectManifest = extract.directManifest;
 pub const extractResolvedSource = extract.fromResolvedSource;
 pub const extractLayoutSource = extract.fromLayoutSource;
 pub const extractRegistrySource = extract.fromRegistrySource;
+pub const preflightExtractionOutput = extract.preflightOutput;
 
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;

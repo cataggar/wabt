@@ -7,7 +7,7 @@ pub const usage =
     "Usage: wabt oci copy SOURCE DESTINATION [options]\n" ++
     "\n" ++
     "Validate registry and/or oci: layout references for a complete graph copy.\n" ++
-    "Execution is not implemented in this command-shell increment.\n" ++
+    "Execution is not implemented; it is planned for the next increment.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --json                            Select the future versioned JSON result\n" ++

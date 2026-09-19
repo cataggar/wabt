@@ -63,9 +63,11 @@ pub fn build(b: *std.Build) void {
         "src/tools/interface.zig",
         "src/tools/compose.zig",
         "src/tools/spec.zig",
-        // OCI command shell and shared pure option/runtime boundaries.
+        // OCI commands and shared option/runtime/output boundaries.
         "src/tools/oci_options.zig",
         "src/tools/oci_runtime.zig",
+        "src/tools/oci_output.zig",
+        "src/tools/oci_read_test.zig",
         "src/tools/oci_push.zig",
         "src/tools/oci_pull.zig",
         "src/tools/oci_copy.zig",
@@ -344,7 +346,7 @@ pub fn build(b: *std.Build) void {
         wabt_help_run.addArg("help");
         wabt_help_run.expectExitCode(0);
         wabt_help_run.expectStdOutMatch(
-            "oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags",
+            "oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags",
         );
         wabt_help_run.expectStdErrEqual("");
         test_step.dependOn(&wabt_help_run.step);
@@ -358,13 +360,13 @@ pub fn build(b: *std.Build) void {
         const oci_subject_help =
             "Usage: wabt oci <verb> [args...]\n" ++
             "\n" ++
-            "OCI artifact command shell (argument validation only; execution pending):\n" ++
-            "  push       Validate a tagged registry destination and Wasm file\n" ++
-            "  pull       Validate a selected registry source and output filename\n" ++
-            "  copy       Validate registry/layout source and destination references\n" ++
-            "  inspect    Validate a selected registry reference for inspection\n" ++
-            "  resolve    Validate a selected registry reference for resolution\n" ++
-            "  list-tags  Validate a selector-less registry repository\n" ++
+            "OCI WebAssembly artifact commands:\n" ++
+            "  push       Not implemented (planned next increment)\n" ++
+            "  pull       Atomically extract one supported direct Wasm artifact\n" ++
+            "  copy       Not implemented (planned next increment)\n" ++
+            "  inspect    Inspect a verified registry or OCI layout graph\n" ++
+            "  resolve    Resolve a mutable or local reference immutably\n" ++
+            "  list-tags  List all tags in one registry repository\n" ++
             "\n" ++
             "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
 
@@ -434,11 +436,7 @@ pub fn build(b: *std.Build) void {
 
         const oci_valid_cases = [_][]const []const u8{
             &.{ "oci", "push", "registry.example/team/app:tag", "app.wasm" },
-            &.{ "oci", "pull", "registry.example/team/app:tag", "-o", "app.wasm" },
             &.{ "oci", "copy", "oci:source-layout", "oci:destination-layout" },
-            &.{ "oci", "inspect", "registry.example/team/app:tag" },
-            &.{ "oci", "resolve", "registry.example/team/app:tag" },
-            &.{ "oci", "list-tags", "registry.example/team/app" },
         };
         inline for (oci_valid_cases) |case| {
             const unwired = b.addRunArtifact(wabt_exe);
@@ -452,6 +450,75 @@ pub fn build(b: *std.Build) void {
             test_step.dependOn(&unwired.step);
             oci_cli_test_step.dependOn(&unwired.step);
         }
+
+        const oci_layout_fixture = b.addWriteFiles();
+        _ = oci_layout_fixture.add(
+            "oci-layout",
+            "{\"imageLayoutVersion\":\"1.0.0\"}",
+        );
+        _ = oci_layout_fixture.add(
+            "index.json",
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:5786275fcb65fe4d8856d79f032d2835db65e4795d83628a5313f54eefeed241\",\"size\":467,\"annotations\":{\"org.opencontainers.image.ref.name\":\"smoke\"}}]}",
+        );
+        _ = oci_layout_fixture.add(
+            "blobs/sha256/5786275fcb65fe4d8856d79f032d2835db65e4795d83628a5313f54eefeed241",
+            "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"artifactType\":\"application/wasm\",\"config\":{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2},\"layers\":[{\"mediaType\":\"application/wasm\",\"digest\":\"sha256:93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476\",\"size\":8,\"annotations\":{\"org.opencontainers.image.title\":\"../../hostile.wasm\"}}]}",
+        );
+        _ = oci_layout_fixture.add(
+            "blobs/sha256/44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            "{}",
+        );
+        _ = oci_layout_fixture.add(
+            "blobs/sha256/93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+            "\x00asm\x01\x00\x00\x00",
+        );
+        const layout_directory = oci_layout_fixture.getDirectory();
+
+        const layout_resolve = b.addRunArtifact(wabt_exe);
+        layout_resolve.addArgs(&.{ "oci", "resolve" });
+        layout_resolve.addDecoratedDirectoryArg(
+            "oci:",
+            layout_directory,
+            ":smoke",
+        );
+        layout_resolve.expectExitCode(0);
+        layout_resolve.expectStdOutMatch(
+            "@sha256:5786275fcb65fe4d8856d79f032d2835db65e4795d83628a5313f54eefeed241",
+        );
+        layout_resolve.expectStdErrEqual("");
+        test_step.dependOn(&layout_resolve.step);
+        oci_cli_test_step.dependOn(&layout_resolve.step);
+
+        const layout_inspect = b.addRunArtifact(wabt_exe);
+        layout_inspect.addArgs(&.{ "oci", "inspect" });
+        layout_inspect.addDecoratedDirectoryArg(
+            "oci:",
+            layout_directory,
+            ":smoke",
+        );
+        layout_inspect.expectExitCode(0);
+        layout_inspect.expectStdOutMatch("\"schema\":\"wabt.oci.inspect\"");
+        layout_inspect.expectStdOutMatch("\"profile\":\"oci-1.1\"");
+        layout_inspect.expectStdErrEqual("");
+        test_step.dependOn(&layout_inspect.step);
+        oci_cli_test_step.dependOn(&layout_inspect.step);
+
+        const layout_pull = b.addRunArtifact(wabt_exe);
+        layout_pull.addArgs(&.{ "oci", "pull" });
+        layout_pull.addDecoratedDirectoryArg(
+            "oci:",
+            layout_directory,
+            ":smoke",
+        );
+        layout_pull.addArg("-o");
+        _ = layout_pull.addOutputFileArg("layout-smoke.wasm");
+        layout_pull.expectExitCode(0);
+        layout_pull.expectStdOutMatch(
+            "pulled sha256:93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
+        );
+        layout_pull.expectStdErrEqual("");
+        test_step.dependOn(&layout_pull.step);
+        oci_cli_test_step.dependOn(&layout_pull.step);
 
         const oci_invalid_cases = [_]struct {
             args: []const []const u8,
