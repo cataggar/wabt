@@ -116,7 +116,21 @@ def build_wheel(
     for name, binary_data in sorted(tool_binaries.items()):
         entries.append((f"{data_scripts_dir}/{name}", binary_data, True))
 
-    readme_path = Path(__file__).resolve().parent.parent / "README.md"
+    repo_root = Path(__file__).resolve().parent.parent
+    license_files = (
+        ("LICENSE", "LICENSE"),
+        ("SOURCE_PROVENANCE.md", "SOURCE_PROVENANCE.md"),
+        ("THIRD_PARTY_NOTICES.md", "THIRD_PARTY_NOTICES.md"),
+        ("LICENSES/miz-MIT.txt", "LICENSES/miz-MIT.txt"),
+    )
+    for source_name, wheel_name in license_files:
+        entries.append((
+            f"{dist_info_dir}/licenses/{wheel_name}",
+            (repo_root / source_name).read_bytes(),
+            False,
+        ))
+
+    readme_path = repo_root / "README.md"
     readme_text = readme_path.read_text(encoding="utf-8") if readme_path.exists() else ""
 
     metadata = (
@@ -126,6 +140,10 @@ def build_wheel(
         f"Summary: WebAssembly Binary Toolkit — native CLI tools\n"
         f"Home-page: https://github.com/cataggar/wabt\n"
         f"License: Apache-2.0\n"
+        f"License-File: LICENSE\n"
+        f"License-File: SOURCE_PROVENANCE.md\n"
+        f"License-File: THIRD_PARTY_NOTICES.md\n"
+        f"License-File: LICENSES/miz-MIT.txt\n"
         f"Requires-Python: >=3.9\n"
         f"Description-Content-Type: text/markdown\n"
         f"\n"

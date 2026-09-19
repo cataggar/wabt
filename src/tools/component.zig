@@ -94,4 +94,5 @@ test "parseVerb rejects unknown verbs" {
     try std.testing.expectEqual(@as(?Verb, null), parseVerb("wit"));
     try std.testing.expectEqual(@as(?Verb, null), parseVerb("dump"));
     try std.testing.expectEqual(@as(?Verb, null), parseVerb("Embed"));
+    try std.testing.expectEqual(@as(?Verb, null), parseVerb("push"));
 }

@@ -29,6 +29,7 @@ Subjects:
   module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
   component  Component-model work — new, embed, compose
   spec       Spec testing (.wast) work — run, to-json
+  oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags
 
 Global:
   version    Print the wabt version and exit
