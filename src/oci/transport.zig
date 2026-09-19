@@ -6,6 +6,15 @@ const reference = @import("reference.zig");
 
 pub const copy_buffer_size = 64 * 1024;
 
+/// Borrowed, credential-free registry identity used only to decide whether a
+/// destination may attempt a same-origin cross-repository blob mount.
+pub const RegistryIdentity = struct {
+    origin: []const u8,
+    authority: []const u8,
+    repository: []const u8,
+    plain_http: bool,
+};
+
 pub const DescriptorRole = enum {
     root,
     index_child,
@@ -69,6 +78,7 @@ pub const Metadata = struct {
 pub const Source = struct {
     context: *anyopaque,
     vtable: *const VTable,
+    registry_identity: ?RegistryIdentity = null,
 
     pub const VTable = struct {
         read_metadata: *const fn (
@@ -93,6 +103,13 @@ pub const Source = struct {
     /// Adapts a mutable implementation pointer. Implementations provide
     /// `readMetadata` and `copyVerifiedTo`; casts remain centralized here.
     pub fn init(pointer: anytype) Source {
+        return initWithRegistryIdentity(pointer, null);
+    }
+
+    pub fn initWithRegistryIdentity(
+        pointer: anytype,
+        registry_identity: ?RegistryIdentity,
+    ) Source {
         const Pointer = @TypeOf(pointer);
         const Adapter = struct {
             fn readMetadata(
@@ -141,6 +158,7 @@ pub const Source = struct {
         return .{
             .context = pointer,
             .vtable = &Adapter.vtable,
+            .registry_identity = registry_identity,
         };
     }
 

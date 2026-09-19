@@ -97,9 +97,47 @@ authority/repository, and expected-digest context; response detail, bodies,
 credentials, tokens, helper output, and full URLs or queries are never
 retained.
 
-These APIs implement library reads only. They do not provide uploads,
-destinations, registry commands, command-line secret handling, or live/cloud
-test behavior.
+## Registry destination preflight and mount behavior
+
+`wabt.oci.registry.Destination` is initialized from one normalized repository
+and an explicit tag. Selector-less and digest-only destinations are rejected
+before credential resolution or network activity. A destination owns a client,
+credential policy, authentication context, token cache, additional-CA policy,
+absolute deadline, and limits independently from every source.
+
+`prepareRoot` validates the tag, root descriptor/media type, and graph limits,
+then performs a bounded `/v2/` preflight before descriptor transfer. Lifecycle
+state is strict: descriptor operations require successful preflight, an upload
+handoff stops further transfer, and this increment has no state that can report
+a committed root.
+
+Existing destination blobs are never reused from status alone. `HEAD` treats
+only 404 as missing and rejects contradictory length or digest headers.
+Successful or unsupported `HEAD` behavior is followed by a bounded GET streamed
+through the shared size/SHA-256 verifier. Authentication, transport, redirect,
+deadline, header contradiction, and corrupt content failures are fatal rather
+than upload cache misses.
+
+For a missing blob, a registry source may expose only its credential-free
+normalized origin and repository. When destination policy permits and the
+origins match, the destination sends one percent-encoded cross-repository mount
+POST using destination authorization only. The POST is not redirected,
+retried, or replayed after an authentication challenge. A 201 result counts as
+mounted only after destination re-verification. A valid 202 result owns a
+bounded upload-session Location and returns an explicit upload-required
+handoff. Absolute signed queries are preserved, userinfo/fragments and HTTPS
+downgrades are rejected, and authorization is marked stripped for a permitted
+cross-origin HTTPS session.
+
+The handoff records that source bytes are not yet verified/spooled, mutating
+requests are not replay-safe, and the final digest must be probed before a later
+retry. Formatting and diagnostics expose no upload path, query, credential, or
+authorization value.
+
+These APIs do not yet send ordinary upload bodies, start or finalize ordinary
+upload sessions, publish child manifests, publish a root tag, provide registry
+commands, or claim push/copy success. No live/cloud registry behavior is used
+by tests.
 
 ## Credential policies
 

@@ -49,14 +49,23 @@ pub const RegistryHttpDeadline = registry_http.Deadline;
 pub const RegistryHttpRequestOptions = registry_http.RequestOptions;
 pub const RegistryHttpResponse = registry_http.Response;
 pub const RegistryHttpDiagnostic = registry_http.Diagnostic;
+pub const RegistryUploadLocation = registry_http.ResolvedUploadLocation;
 
 pub const RegistrySource = registry.Source;
+pub const RegistryDestination = registry.Destination;
 pub const RegistryResolvedRoot = registry.ResolvedRoot;
 pub const RegistryTagList = registry.TagList;
 pub const RegistryInspectOptions = registry.InspectOptions;
 pub const RegistryInspectResult = registry.InspectResult;
 pub const RegistryOptions = registry.Options;
+pub const RegistryDestinationOptions = registry.DestinationOptions;
 pub const RegistryLimits = registry.Limits;
+pub const RegistryMountPolicy = registry.MountPolicy;
+pub const RegistryBlobState = registry.BlobState;
+pub const RegistryDestinationState = registry.DestinationState;
+pub const RegistryUploadHandoff = registry.UploadHandoff;
+pub const RegistryUploadReason = registry.UploadReason;
+pub const RegistryUploadReplaySafety = registry.ReplaySafety;
 pub const RegistryOperation = registry.Operation;
 pub const RegistryCategory = registry.Category;
 pub const RegistryDiagnostic = registry.Diagnostic;
@@ -78,6 +87,7 @@ pub const validateImageManifest = model.validateImageManifest;
 
 pub const Source = transport.Source;
 pub const Destination = transport.Destination;
+pub const RegistryIdentity = transport.RegistryIdentity;
 pub const TransferCounts = transport.Counts;
 pub const TransferResult = transport.Result;
 

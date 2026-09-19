@@ -633,6 +633,9 @@ pub const RequestOptions = struct {
     headers: []const Header = &.{},
     max_body_bytes: ?u64 = null,
     body_sink: ?BodySink = null,
+    /// Authentication challenge handling can replay a request. Mutating
+    /// registry operations disable it and surface 401 instead.
+    allow_auth_replay: bool = true,
     deadline: Deadline,
 };
 
@@ -1023,6 +1026,10 @@ pub const Client = struct {
 
             if (response.status == 401 and options.class != .token) {
                 if (authorization_stripped) {
+                    response.deinit();
+                    return self.fail(error.AuthenticationFailed, .authentication, options.class, 401, current_origin.canonical);
+                }
+                if (!options.allow_auth_replay) {
                     response.deinit();
                     return self.fail(error.AuthenticationFailed, .authentication, options.class, 401, current_origin.canonical);
                 }
@@ -1653,6 +1660,112 @@ pub fn resolveSameOriginPathAlloc(
     }
     if (suffix.len + 1 > max_result_bytes) return error.RedirectRejected;
     return std.fmt.allocPrint(allocator, "/{s}", .{suffix}) catch error.OutOfMemory;
+}
+
+/// Owned, validated upload-session location. The URL may retain an opaque
+/// provider-signed query; formatting deliberately exposes only the origin.
+pub const ResolvedUploadLocation = struct {
+    allocator: Allocator,
+    url: []u8,
+    origin: Origin,
+    authorization_stripped: bool,
+
+    pub fn deinit(self: *ResolvedUploadLocation) void {
+        self.allocator.free(self.url);
+        self.origin.deinit();
+        self.* = undefined;
+    }
+
+    pub fn format(
+        self: ResolvedUploadLocation,
+        writer: *Io.Writer,
+    ) Io.Writer.Error!void {
+        try writer.print(
+            "upload-location(origin={s}, authorization={s})",
+            .{
+                self.origin.canonical,
+                if (self.authorization_stripped) "stripped" else "destination",
+            },
+        );
+    }
+};
+
+/// Resolves one Distribution upload Location without following it. Absolute
+/// locations preserve their exact query bytes. Userinfo, fragments, HTTPS
+/// downgrade, and cross-origin cleartext locations are rejected.
+pub fn resolveUploadLocationAlloc(
+    allocator: Allocator,
+    endpoint: Endpoint,
+    current_path_and_query: []const u8,
+    location: []const u8,
+    max_result_bytes: usize,
+) Error!ResolvedUploadLocation {
+    if (max_result_bytes == 0 or location.len == 0 or
+        location.len > max_result_bytes or containsUnsafeUriByte(location) or
+        !hasValidPercentEncoding(location))
+    {
+        return error.RedirectRejected;
+    }
+
+    const current_url = try endpoint.urlAlloc(current_path_and_query);
+    defer endpoint.allocator.free(current_url);
+    const absolute = hasUriScheme(location);
+    const url = if (absolute)
+        try duplicateAbsoluteLocationAlloc(allocator, location)
+    else
+        try resolveRedirectAlloc(
+            allocator,
+            current_url,
+            location,
+            std.math.add(usize, current_url.len, max_result_bytes) catch
+                return error.RedirectRejected,
+        );
+    errdefer allocator.free(url);
+    if (url.len > max_result_bytes and absolute) return error.RedirectRejected;
+
+    var origin = try parseOrigin(allocator, url);
+    errdefer origin.deinit();
+    const same_origin = endpoint.origin.eql(origin);
+    if (endpoint.origin.scheme == .https and origin.scheme == .http) {
+        return error.RedirectRejected;
+    }
+    if (!same_origin and origin.scheme != .https) {
+        return error.RedirectRejected;
+    }
+    return .{
+        .allocator = allocator,
+        .url = url,
+        .origin = origin,
+        .authorization_stripped = !same_origin,
+    };
+}
+
+fn duplicateAbsoluteLocationAlloc(
+    allocator: Allocator,
+    location: []const u8,
+) Error![]u8 {
+    const uri = std.Uri.parse(location) catch return error.RedirectRejected;
+    if (uri.host == null or uri.user != null or uri.password != null or
+        uri.fragment != null or
+        (!std.ascii.eqlIgnoreCase(uri.scheme, "https") and
+            !std.ascii.eqlIgnoreCase(uri.scheme, "http")))
+    {
+        return error.RedirectRejected;
+    }
+    return allocator.dupe(u8, location) catch error.OutOfMemory;
+}
+
+fn hasUriScheme(value: []const u8) bool {
+    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
+    for (value[1..]) |byte| {
+        if (byte == ':') return true;
+        if (!std.ascii.isAlphanumeric(byte) and byte != '+' and
+            byte != '-' and byte != '.')
+        {
+            return false;
+        }
+    }
+    return false;
 }
 
 fn parseDistributionChallenge(
