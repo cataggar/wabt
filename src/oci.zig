@@ -13,6 +13,7 @@ pub const transport = @import("oci/transport.zig");
 pub const graph = @import("oci/graph.zig");
 pub const layout = @import("oci/layout.zig");
 pub const copy = @import("oci/copy.zig");
+pub const wasm_metadata = @import("oci/wasm_metadata.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -63,6 +64,16 @@ pub const LayoutFailurePoint = layout.FailurePoint;
 pub const copyLayoutToLayout = copy.layoutToLayout;
 pub const copyPlannedGraph = copy.executePlan;
 
+pub const WasmKind = wasm_metadata.WasmKind;
+pub const WasmV0Target = wasm_metadata.WasmV0Target;
+pub const WasmExternKind = wasm_metadata.ExternKind;
+pub const WasmExtern = wasm_metadata.Extern;
+pub const WasmComponentMetadata = wasm_metadata.ComponentMetadata;
+pub const WasmPayloadMetadata = wasm_metadata.PayloadMetadata;
+pub const WasmValidationError = wasm_metadata.ValidationError;
+pub const validateWasmPayload = wasm_metadata.validatePayload;
+pub const classifyWasmPayload = wasm_metadata.classifyPayload;
+
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;
 pub const RegistryReference = reference.RegistryReference;
@@ -81,5 +92,6 @@ test {
     _ = @import("oci/graph.zig");
     _ = @import("oci/layout.zig");
     _ = @import("oci/copy.zig");
+    _ = @import("oci/wasm_metadata.zig");
     _ = @import("oci/integration_tests.zig");
 }

@@ -39,20 +39,25 @@ pub const LoadError = error{
 const BinaryReader = struct {
     data: []const u8,
     pos: usize = 0,
+    limit: usize = 0,
+
+    fn end(self: *const BinaryReader) usize {
+        return if (self.limit == 0) self.data.len else self.limit;
+    }
 
     fn remaining(self: *const BinaryReader) usize {
-        return self.data.len - self.pos;
+        return self.end() - self.pos;
     }
 
     fn readByte(self: *BinaryReader) LoadError!u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
         const b = self.data[self.pos];
         self.pos += 1;
         return b;
     }
 
     fn peekByte(self: *BinaryReader) LoadError!u8 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
+        if (self.pos >= self.end()) return error.UnexpectedEnd;
         return self.data[self.pos];
     }
 
@@ -64,8 +69,9 @@ const BinaryReader = struct {
     }
 
     fn readU32(self: *BinaryReader) LoadError!u32 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
-        const slice = self.data[self.pos..];
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
         const result = leb128.readU32Leb128(slice) catch |err| switch (err) {
             error.Overflow => return error.InvalidEncoding,
             error.UnexpectedEnd => return error.UnexpectedEnd,
@@ -78,8 +84,9 @@ const BinaryReader = struct {
     /// Non-negative values are type indices; negative values encode primitive
     /// valtypes and handle forms.
     fn readS33(self: *BinaryReader) LoadError!i64 {
-        if (self.pos >= self.data.len) return error.UnexpectedEnd;
-        const slice = self.data[self.pos..];
+        const end_pos = self.end();
+        if (self.pos >= end_pos) return error.UnexpectedEnd;
+        const slice = self.data[self.pos..end_pos];
         const result = leb128.readS33Leb128(slice) catch |err| switch (err) {
             error.Overflow => return error.InvalidEncoding,
             error.UnexpectedEnd => return error.UnexpectedEnd,
@@ -89,10 +96,8 @@ const BinaryReader = struct {
     }
 
     fn readFixedU32(self: *BinaryReader) LoadError!u32 {
-        if (self.pos + 4 > self.data.len) return error.UnexpectedEnd;
-        const val = std.mem.readInt(u32, self.data[self.pos..][0..4], .little);
-        self.pos += 4;
-        return val;
+        const bytes = try self.readBytes(4);
+        return std.mem.readInt(u32, bytes[0..4], .little);
     }
 
     fn readName(self: *BinaryReader) LoadError![]const u8 {
@@ -151,7 +156,7 @@ const LoadOptions = struct {
 
 fn loadInner(data: []const u8, allocator: std.mem.Allocator, options: LoadOptions) LoadError!ctypes.Component {
     const capture_layout = options.capture_layout;
-    var reader = BinaryReader{ .data = data };
+    var reader = BinaryReader{ .data = data, .limit = data.len };
 
     // Validate preamble
     const magic = try reader.readFixedU32();
@@ -208,10 +213,12 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, options: LoadOption
         const section_start = reader.pos;
         const section_end = std.math.add(usize, section_start, section_size) catch
             return error.InvalidSectionSize;
-        if (section_end > reader.data.len) return error.InvalidSectionSize;
+        if (section_end > reader.limit) return error.InvalidSectionSize;
 
         const section_id = std.enums.fromInt(SectionId, section_id_byte) orelse
             return error.InvalidSectionId;
+        const outer_limit = reader.limit;
+        reader.limit = section_end;
 
         // Snapshot per-section array lengths so we can record a
         // `SectionEntry` (start + count) for this physical section after
@@ -381,6 +388,7 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, options: LoadOption
         // exactly `section_size` bytes. If a bug causes under- or over-read
         // we'd otherwise misalign the next section header.
         if (reader.pos != section_end) return error.InvalidSectionSize;
+        reader.limit = outer_limit;
 
         // Record this physical section's layout entry (one per section).
         if (capture_layout) {

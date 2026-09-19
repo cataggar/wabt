@@ -171,6 +171,7 @@ fn validateCoreModule(
         error.UnsupportedOpcode => return error.UnsupportedCoreFeature,
         else => return error.InvalidWasm,
     };
+    try validateCoreNames(&module);
     Validator.validate(&module, .{ .features = Feature.Set.all }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedOpcode, error.LegacyExceptionsUnsupported => return error.UnsupportedCoreFeature,
@@ -182,6 +183,18 @@ fn validateCoreModule(
             return .wasip1;
     }
     return null;
+}
+
+fn validateCoreNames(module: *const @import("../Module.zig").Module) ValidationError!void {
+    for (module.imports.items) |import| {
+        if (!std.unicode.utf8ValidateSlice(import.module_name) or
+            !std.unicode.utf8ValidateSlice(import.field_name))
+            return error.InvalidWasm;
+    }
+    for (module.exports.items) |export_| {
+        if (!std.unicode.utf8ValidateSlice(export_.name))
+            return error.InvalidWasm;
+    }
 }
 
 fn mapComponentLoadError(err: component_loader.LoadError) ValidationError {
@@ -209,28 +222,43 @@ fn validateComponentTree(
 }
 
 fn validateComponentShape(component: *const component_types.Component) ValidationError!void {
-    if (component.imports.len == 0 and component.exports.len != 0) {
-        var only_type_exports = true;
-        for (component.exports) |exp| {
-            if (!exportsComponentType(component, exp)) {
-                only_type_exports = false;
-                break;
-            }
-        }
-        if (only_type_exports) return error.BinaryWitUnsupported;
-    }
-
     const has_runtime_definition =
         component.core_modules.len != 0 or
         component.core_instances.len != 0 or
         component.components.len != 0 or
         component.instances.len != 0 or
         component.canons.len != 0 or
-        component.start != null or
+        component.start != null;
+
+    if (!has_runtime_definition and
+        (component.imports.len != 0 or component.exports.len != 0))
+    {
+        var type_only_surface = true;
+        for (component.imports) |imp| {
+            if (imp.desc != .type) {
+                type_only_surface = false;
+                break;
+            }
+        }
+        for (component.exports) |exp| {
+            const sort_idx = exp.sort_idx orelse {
+                type_only_surface = false;
+                break;
+            };
+            if (sort_idx.sort != .type or exp.desc != .type) {
+                type_only_surface = false;
+                break;
+            }
+        }
+        if (type_only_surface) return error.BinaryWitUnsupported;
+    }
+
+    const has_representable_definition =
+        has_runtime_definition or
         component.imports.len != 0 or
         component.exports.len != 0;
 
-    if (!has_runtime_definition) {
+    if (!has_representable_definition) {
         // An actually empty component is a representable component with empty
         // lists. Type/package-only binaries are ambiguous without a binary-WIT
         // decoder and must not be mislabeled as such a component.
@@ -238,26 +266,6 @@ fn validateComponentShape(component: *const component_types.Component) Validatio
             return error.BinaryWitUnsupported;
         if (component.aliases.len != 0) return error.UnsupportedComponentShape;
     }
-}
-
-fn exportsComponentType(
-    component: *const component_types.Component,
-    exp: component_types.ExportDecl,
-) bool {
-    const sort_idx = exp.sort_idx orelse return false;
-    if (sort_idx.sort != .type or exp.desc != .type) return false;
-
-    const local_idx = if (component.type_indexspace.len == 0)
-        sort_idx.idx
-    else if (sort_idx.idx < component.type_indexspace.len)
-        switch (component.type_indexspace[sort_idx.idx]) {
-            .type_def => |idx| idx,
-            else => return false,
-        }
-    else
-        return false;
-    if (local_idx >= component.types.len) return false;
-    return component.types[local_idx] == .component;
 }
 
 fn extractImports(
@@ -356,6 +364,8 @@ fn completeExternName(
         },
         .version_suffix => |suffix| {
             if (version_suffix != null) return error.DuplicateAttribute;
+            if (kind != .instance or suffix.len == 0)
+                return error.InvalidVersionedName;
             version_suffix = suffix;
         },
         .external_id => {
@@ -716,6 +726,21 @@ test "empty component is distinct from unsupported type-only binary WIT shape" {
         error.BinaryWitUnsupported,
         validatePayload(allocator, encoded_package.items),
     );
+
+    var instance_type_package: std.ArrayListUnmanaged(u8) = .empty;
+    defer instance_type_package.deinit(allocator);
+    try componentPreamble(&instance_type_package, allocator);
+    try appendSection(&instance_type_package, allocator, 7, &.{ 0x01, 0x42, 0x00 });
+    var instance_type_export: std.ArrayListUnmanaged(u8) = .empty;
+    defer instance_type_export.deinit(allocator);
+    try instance_type_export.append(allocator, 0x01);
+    try appendExternName(&instance_type_export, allocator, "interface", &.{});
+    try instance_type_export.appendSlice(allocator, &.{ 0x03, 0x00, 0x00 });
+    try appendSection(&instance_type_package, allocator, 11, instance_type_export.items);
+    try testing.expectError(
+        error.BinaryWitUnsupported,
+        validatePayload(allocator, instance_type_package.items),
+    );
 }
 
 test "strict component decoding rejects skipped sections, duplicate names, and attributes" {
@@ -815,6 +840,15 @@ test "rejects malformed lengths, LEB, UTF-8, trailing data, and aliases" {
         0x06, 0x03, 0x01, 0x01, 0xff,
     };
     try testing.expectError(error.InvalidWasm, validatePayload(allocator, &malformed_alias));
+
+    const alias_only = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
+        0x06, 0x05, 0x01, 0x03, 0x02, 0x00, 0x00,
+    };
+    try testing.expectError(
+        error.UnsupportedComponentShape,
+        validatePayload(allocator, &alias_only),
+    );
 }
 
 test "rejects unsupported metadata kinds and malformed structured versions" {
@@ -839,6 +873,68 @@ test "rejects unsupported metadata kinds and malformed structured versions" {
     try testing.expectError(
         error.InvalidVersionedName,
         validatePayload(allocator, bad_version),
+    );
+
+    const empty_suffix_attributes = [_]component_types.ExternNameAttribute{
+        .{ .version_suffix = "" },
+    };
+    try testing.expectError(
+        error.InvalidVersionedName,
+        completeExternName(
+            allocator,
+            "wasi:example/api@1",
+            &empty_suffix_attributes,
+            .instance,
+        ),
+    );
+    try testing.expectError(
+        error.InvalidVersionedName,
+        completeExternName(
+            allocator,
+            "wasi:example/api@1",
+            &.{.{ .version_suffix = ".2.3" }},
+            .func,
+        ),
+    );
+}
+
+test "core parsing rejects invalid UTF-8 names and trailing malformed sections" {
+    const allocator = testing.allocator;
+    const invalid_utf8 = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x02, 0x07,
+        0x01, 0x01, 0xff, 0x01, 'x',  0x00, 0x00,
+    };
+    try testing.expectError(
+        error.InvalidWasm,
+        validatePayload(allocator, &invalid_utf8),
+    );
+
+    const section_overrun = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00,
+    };
+    try testing.expectError(
+        error.InvalidWasm,
+        validatePayload(allocator, &section_overrun),
+    );
+
+    const overlong_leb = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00,
+    };
+    try testing.expectError(
+        error.InvalidWasm,
+        validatePayload(allocator, &overlong_leb),
+    );
+
+    const unconsumed_section_byte = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x01, 0x02, 0x00, 0x00,
+    };
+    try testing.expectError(
+        error.InvalidWasm,
+        validatePayload(allocator, &unconsumed_section_byte),
     );
 }
 
