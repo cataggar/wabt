@@ -1,6 +1,6 @@
 //! wabt — WebAssembly Binary Toolkit (single-binary CLI).
 //!
-//! Commands are organized under six conceptual-subject roots:
+//! Commands are organized under conceptual-subject roots:
 //!
 //!   wabt text <verb>        Text format (.wat) work
 //!   wabt module <verb>      Core wasm (.wasm) work
@@ -8,6 +8,7 @@
 //!   wabt interface <verb>   WIT IDL (.wit) work
 //!   wabt compose <verb>     WAC composition (.wac) work
 //!   wabt spec <verb>        Spec testing (.wast) work
+//!   wabt oci <verb>         OCI artifact command shell
 //!   wabt version            Print version
 //!   wabt help [topic]       Print help
 //!
@@ -24,6 +25,7 @@ const component_cmd = @import("component.zig");
 const interface_cmd = @import("interface.zig");
 const compose_cmd = @import("compose.zig");
 const spec_cmd = @import("spec.zig");
+const oci_cmd = @import("oci.zig");
 
 pub const Subcommand = enum {
     text,
@@ -32,6 +34,7 @@ pub const Subcommand = enum {
     interface,
     compose,
     spec,
+    oci,
     version,
     help,
 };
@@ -43,6 +46,7 @@ pub fn parseSubcommand(s: []const u8) ?Subcommand {
     if (std.mem.eql(u8, s, "interface")) return .interface;
     if (std.mem.eql(u8, s, "compose")) return .compose;
     if (std.mem.eql(u8, s, "spec")) return .spec;
+    if (std.mem.eql(u8, s, "oci")) return .oci;
     if (std.mem.eql(u8, s, "version")) return .version;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
@@ -80,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
         .interface => try interface_cmd.run(init, sub_args),
         .compose => try compose_cmd.run(init, sub_args),
         .spec => try spec_cmd.run(init, sub_args),
+        .oci => try oci_cmd.run(init, sub_args),
     }
 }
 
@@ -93,6 +98,7 @@ const top_usage =
     \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
     \\  component  Component-model work — new, embed, compose
     \\  spec       Spec testing (.wast) work — run, to-json
+    \\  oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags
     \\
     \\Global:
     \\  version    Print the wabt version and exit
@@ -141,6 +147,7 @@ fn runHelp(init: std.process.Init, args: []const []const u8) !void {
             .interface => return interface_cmd.run(init, forwarded_args),
             .compose => return compose_cmd.run(init, forwarded_args),
             .spec => return spec_cmd.run(init, forwarded_args),
+            .oci => return oci_cmd.run(init, forwarded_args),
             .version, .help => {},
         }
     }
@@ -152,6 +159,7 @@ fn runHelp(init: std.process.Init, args: []const []const u8) !void {
         .interface => writeStdout(init.io, interface_cmd.usage),
         .compose => writeStdout(init.io, compose_cmd.usage),
         .spec => writeStdout(init.io, spec_cmd.usage),
+        .oci => writeStdout(init.io, oci_cmd.usage),
         .version => writeStdout(init.io, version_usage),
         .help => writeStdout(init.io, help_usage),
     }
@@ -164,8 +172,32 @@ test "parseSubcommand recognizes subject roots" {
     try std.testing.expectEqual(@as(?Subcommand, .interface), parseSubcommand("interface"));
     try std.testing.expectEqual(@as(?Subcommand, .compose), parseSubcommand("compose"));
     try std.testing.expectEqual(@as(?Subcommand, .spec), parseSubcommand("spec"));
+    try std.testing.expectEqual(@as(?Subcommand, .oci), parseSubcommand("oci"));
     try std.testing.expectEqual(@as(?Subcommand, .version), parseSubcommand("version"));
     try std.testing.expectEqual(@as(?Subcommand, .help), parseSubcommand("help"));
+}
+
+test "top-level help has the stable OCI subject spelling" {
+    const expected =
+        \\wabt - WebAssembly Binary Toolkit
+        \\
+        \\Usage: wabt <subject> <verb> [args...]
+        \\
+        \\Subjects:
+        \\  text       Text format (.wat) work — parse, print, desugar
+        \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+        \\  component  Component-model work — new, embed, compose
+        \\  spec       Spec testing (.wast) work — run, to-json
+        \\  oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags
+        \\
+        \\Global:
+        \\  version    Print the wabt version and exit
+        \\  help       Print this help; `wabt help <subject>` for details
+        \\
+        \\Run `wabt help <subject>` for the verbs in that subject.
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, top_usage);
 }
 
 test "parseSubcommand rejects flat verbs (no longer top-level)" {
@@ -202,4 +234,8 @@ test "parseSubcommand rejects unknown and old names" {
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wasm"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wast"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("wac"));
+    // OCI has one canonical subject spelling and no transport/artifact aliases.
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("registry"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("artifact"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("pin"));
 }

@@ -33,6 +33,12 @@ jobs:
           echo "version=${V#v}" >> "$GITHUB_OUTPUT"
       - name: Build wheels
         run: uv run scripts/build_wheels.py ${{ steps.version.outputs.version }}
+      - name: Smoke host wheel OCI command help
+        run: |
+          uv venv .wheel-smoke
+          uv pip install --python .wheel-smoke/bin/python dist/*manylinux_2_17_x86_64*.whl
+          PATH="$PWD/.wheel-smoke/bin:$PATH" wabt help oci
+          PATH="$PWD/.wheel-smoke/bin:$PATH" wabt oci resolve help
       - uses: actions/upload-artifact@v4
         with:
           name: dist

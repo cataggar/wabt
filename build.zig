@@ -57,12 +57,22 @@ pub fn build(b: *std.Build) void {
         "src/tools/component_new.zig",
         "src/tools/component_compose.zig",
         "src/tools/component_objdump.zig",
-        // Subject dispatchers (added by #137 — six conceptual roots).
+        // Subject dispatchers (the original #137 roots plus OCI).
         "src/tools/text.zig",
         "src/tools/module.zig",
         "src/tools/interface.zig",
         "src/tools/compose.zig",
         "src/tools/spec.zig",
+        // OCI command shell and shared pure option/runtime boundaries.
+        "src/tools/oci_options.zig",
+        "src/tools/oci_runtime.zig",
+        "src/tools/oci_push.zig",
+        "src/tools/oci_pull.zig",
+        "src/tools/oci_copy.zig",
+        "src/tools/oci_inspect.zig",
+        "src/tools/oci_resolve.zig",
+        "src/tools/oci_list_tags.zig",
+        "src/tools/oci.zig",
     };
 
     // Single wabt CLI exe — dispatches to subcommand modules at runtime.
@@ -255,6 +265,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
+    const oci_cli_test_step = b.step(
+        "test-oci-cli",
+        "Run focused OCI command-shell unit and CLI tests",
+    );
 
     const oci_registry_test_mod = b.createModule(.{
         .root_source_file = b.path("src/oci/registry_test.zig"),
@@ -296,6 +310,9 @@ pub fn build(b: *std.Build) void {
         });
         const run_sub_test = b.addRunArtifact(sub_test);
         test_step.dependOn(&run_sub_test.step);
+        if (std.mem.startsWith(u8, src, "src/tools/oci")) {
+            oci_cli_test_step.dependOn(&run_sub_test.step);
+        }
     }
 
     // Inline tests for the dispatcher itself (parseSubcommand etc.).
@@ -311,6 +328,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_dispatcher_test = b.addRunArtifact(dispatcher_test);
     test_step.dependOn(&run_dispatcher_test.step);
+    oci_cli_test_step.dependOn(&run_dispatcher_test.step);
 
     // CLI smoke assertions: subcommand layout, exit codes, version-on-stdout.
     {
@@ -325,6 +343,10 @@ pub fn build(b: *std.Build) void {
         const wabt_help_run = b.addRunArtifact(wabt_exe);
         wabt_help_run.addArg("help");
         wabt_help_run.expectExitCode(0);
+        wabt_help_run.expectStdOutMatch(
+            "oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags",
+        );
+        wabt_help_run.expectStdErrEqual("");
         test_step.dependOn(&wabt_help_run.step);
 
         const wabt_text_help_run = b.addRunArtifact(wabt_exe);
@@ -332,6 +354,163 @@ pub fn build(b: *std.Build) void {
         wabt_text_help_run.expectExitCode(0);
         wabt_text_help_run.expectStdOutMatch("Usage: wabt text <verb> [args...]");
         test_step.dependOn(&wabt_text_help_run.step);
+
+        const oci_subject_help =
+            "Usage: wabt oci <verb> [args...]\n" ++
+            "\n" ++
+            "OCI artifact command shell (argument validation only; execution pending):\n" ++
+            "  push       Validate a tagged registry destination and Wasm file\n" ++
+            "  pull       Validate a selected registry source and output filename\n" ++
+            "  copy       Validate registry/layout source and destination references\n" ++
+            "  inspect    Validate a selected registry reference for inspection\n" ++
+            "  resolve    Validate a selected registry reference for resolution\n" ++
+            "  list-tags  Validate a selector-less registry repository\n" ++
+            "\n" ++
+            "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
+
+        const global_oci_help = b.addRunArtifact(wabt_exe);
+        global_oci_help.addArgs(&.{ "help", "oci" });
+        global_oci_help.expectExitCode(0);
+        global_oci_help.expectStdOutEqual(oci_subject_help);
+        global_oci_help.expectStdErrEqual("");
+        test_step.dependOn(&global_oci_help.step);
+        oci_cli_test_step.dependOn(&global_oci_help.step);
+
+        const local_oci_help = b.addRunArtifact(wabt_exe);
+        local_oci_help.addArgs(&.{ "oci", "help" });
+        local_oci_help.expectExitCode(0);
+        local_oci_help.expectStdOutEqual(oci_subject_help);
+        local_oci_help.expectStdErrEqual("");
+        test_step.dependOn(&local_oci_help.step);
+        oci_cli_test_step.dependOn(&local_oci_help.step);
+
+        const oci_help_cases = [_][2][]const u8{
+            .{ "push", "Usage: wabt oci push REF FILE [options]" },
+            .{ "pull", "Usage: wabt oci pull REF -o FILE [options]" },
+            .{ "copy", "Usage: wabt oci copy SOURCE DESTINATION [options]" },
+            .{ "inspect", "Usage: wabt oci inspect REF [options]" },
+            .{ "resolve", "Usage: wabt oci resolve REF [options]" },
+            .{ "list-tags", "Usage: wabt oci list-tags REGISTRY/REPOSITORY [options]" },
+        };
+        inline for (oci_help_cases) |case| {
+            const global_leaf_help = b.addRunArtifact(wabt_exe);
+            global_leaf_help.addArgs(&.{ "help", "oci", case[0] });
+            global_leaf_help.expectExitCode(0);
+            global_leaf_help.expectStdOutMatch(case[1]);
+            global_leaf_help.expectStdErrEqual("");
+            test_step.dependOn(&global_leaf_help.step);
+            oci_cli_test_step.dependOn(&global_leaf_help.step);
+
+            const local_leaf_help = b.addRunArtifact(wabt_exe);
+            local_leaf_help.addArgs(&.{ "oci", "help", case[0] });
+            local_leaf_help.expectExitCode(0);
+            local_leaf_help.expectStdOutMatch(case[1]);
+            local_leaf_help.expectStdErrEqual("");
+            test_step.dependOn(&local_leaf_help.step);
+            oci_cli_test_step.dependOn(&local_leaf_help.step);
+
+            const positional_leaf_help = b.addRunArtifact(wabt_exe);
+            positional_leaf_help.addArgs(&.{ "oci", case[0], "help" });
+            positional_leaf_help.expectExitCode(0);
+            positional_leaf_help.expectStdOutMatch(case[1]);
+            positional_leaf_help.expectStdErrEqual("");
+            test_step.dependOn(&positional_leaf_help.step);
+            oci_cli_test_step.dependOn(&positional_leaf_help.step);
+
+            const dash_h = b.addRunArtifact(wabt_exe);
+            dash_h.addArgs(&.{ "oci", case[0], "-h" });
+            dash_h.expectExitCode(1);
+            dash_h.expectStdOutEqual("");
+            test_step.dependOn(&dash_h.step);
+            oci_cli_test_step.dependOn(&dash_h.step);
+
+            const dash_help = b.addRunArtifact(wabt_exe);
+            dash_help.addArgs(&.{ "oci", case[0], "--help" });
+            dash_help.expectExitCode(1);
+            dash_help.expectStdOutEqual("");
+            test_step.dependOn(&dash_help.step);
+            oci_cli_test_step.dependOn(&dash_help.step);
+        }
+
+        const oci_valid_cases = [_][]const []const u8{
+            &.{ "oci", "push", "registry.example/team/app:tag", "app.wasm" },
+            &.{ "oci", "pull", "registry.example/team/app:tag", "-o", "app.wasm" },
+            &.{ "oci", "copy", "oci:source-layout", "oci:destination-layout" },
+            &.{ "oci", "inspect", "registry.example/team/app:tag" },
+            &.{ "oci", "resolve", "registry.example/team/app:tag" },
+            &.{ "oci", "list-tags", "registry.example/team/app" },
+        };
+        inline for (oci_valid_cases) |case| {
+            const unwired = b.addRunArtifact(wabt_exe);
+            unwired.addArgs(case);
+            unwired.expectExitCode(1);
+            unwired.expectStdOutEqual("");
+            unwired.expectStdErrEqual(b.fmt(
+                "error: wabt oci {s}: CommandNotImplemented\n",
+                .{case[1]},
+            ));
+            test_step.dependOn(&unwired.step);
+            oci_cli_test_step.dependOn(&unwired.step);
+        }
+
+        const oci_invalid_cases = [_]struct {
+            args: []const []const u8,
+            diagnostic: []const u8,
+        }{
+            .{
+                .args = &.{ "oci", "push", "registry.example/team/app", "app.wasm" },
+                .diagnostic = "error: wabt oci push: MissingSelection\n",
+            },
+            .{
+                .args = &.{ "oci", "pull", "registry.example/team/app:tag", "-o", "out/" },
+                .diagnostic = "error: wabt oci pull: InvalidOutputFile\n",
+            },
+            .{
+                .args = &.{
+                    "oci",                "copy",      "oci:source", "oci:destination",
+                    "--source-auth-file", "auth.json",
+                },
+                .diagnostic = "error: wabt oci copy: RegistryOptionForLayout\n",
+            },
+            .{
+                .args = &.{
+                    "oci",        "resolve",                  "registry.example/team/app:tag",
+                    "--password", "DO_NOT_PRINT_THIS_SECRET",
+                },
+                .diagnostic = "error: wabt oci resolve: PlaintextSecretOption\n",
+            },
+            .{
+                .args = &.{
+                    "oci",        "inspect", "registry.example/team/app:tag",
+                    "--deadline", "0s",
+                },
+                .diagnostic = "error: wabt oci inspect: InvalidDuration\n",
+            },
+        };
+        inline for (oci_invalid_cases) |case| {
+            const invalid = b.addRunArtifact(wabt_exe);
+            invalid.addArgs(case.args);
+            invalid.expectExitCode(1);
+            invalid.expectStdOutEqual("");
+            invalid.expectStdErrEqual(case.diagnostic);
+            test_step.dependOn(&invalid.step);
+            oci_cli_test_step.dependOn(&invalid.step);
+        }
+
+        const oci_aliases = [_][]const []const u8{
+            &.{ "oci", "registry" },
+            &.{ "oci", "pin" },
+            &.{ "oci", "list_tags" },
+            &.{ "component", "push" },
+        };
+        inline for (oci_aliases) |case| {
+            const rejected = b.addRunArtifact(wabt_exe);
+            rejected.addArgs(case);
+            rejected.expectExitCode(1);
+            rejected.expectStdOutEqual("");
+            test_step.dependOn(&rejected.step);
+            oci_cli_test_step.dependOn(&rejected.step);
+        }
 
         const global_nested_help_cases = [_][3][]const u8{
             .{ "text", "parse", "Usage: wabt text parse [options] <file.wat>" },
