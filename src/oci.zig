@@ -8,6 +8,7 @@ const std = @import("std");
 pub const content = @import("oci/content.zig");
 pub const reference = @import("oci/reference.zig");
 pub const auth = @import("oci/auth.zig");
+pub const registry_http = @import("oci/registry_http.zig");
 pub const model = @import("oci/model.zig");
 pub const transport = @import("oci/transport.zig");
 pub const graph = @import("oci/graph.zig");
@@ -33,6 +34,18 @@ pub const TokenCacheKey = auth.TokenCacheKey;
 pub const resolveCredential = auth.resolveCredential;
 pub const parseWwwAuthenticate = auth.parseWwwAuthenticate;
 pub const selectDistributionChallenge = auth.selectDistributionChallenge;
+
+pub const RegistryHttpClient = registry_http.Client;
+pub const RegistryHttpStdBackend = registry_http.StdBackend;
+pub const RegistryHttpBackend = registry_http.Backend;
+pub const RegistryHttpEndpoint = registry_http.Endpoint;
+pub const RegistryHttpEndpointOptions = registry_http.EndpointOptions;
+pub const RegistryHttpLimits = registry_http.Limits;
+pub const RegistryHttpTimeouts = registry_http.Timeouts;
+pub const RegistryHttpDeadline = registry_http.Deadline;
+pub const RegistryHttpRequestOptions = registry_http.RequestOptions;
+pub const RegistryHttpResponse = registry_http.Response;
+pub const RegistryHttpDiagnostic = registry_http.Diagnostic;
 
 pub const Descriptor = model.Descriptor;
 pub const Platform = model.Platform;
@@ -87,6 +100,7 @@ test {
     _ = @import("oci/content.zig");
     _ = @import("oci/reference.zig");
     _ = @import("oci/auth.zig");
+    _ = @import("oci/registry_http.zig");
     _ = @import("oci/model.zig");
     _ = @import("oci/transport.zig");
     _ = @import("oci/graph.zig");
