@@ -74,6 +74,7 @@ const Step = struct {
     expected_body: ?[]const u8 = null,
     required_headers: []const registry_http.Header = &.{},
     stream_failure_after: ?usize = null,
+    corrupt_spool_before_body: bool = false,
     advance_ns: u64 = 0,
 };
 
@@ -86,6 +87,7 @@ const ScriptedBackend = struct {
     authorizations: [64][1024]u8 = undefined,
     authorization_lengths: [64]usize = @splat(0),
     request_body_lengths: [64]u64 = @splat(0),
+    spool_directory: ?[]const u8 = null,
 
     fn backend(self: *ScriptedBackend) registry_http.Backend {
         return registry_http.Backend.init(self, .{
@@ -140,6 +142,9 @@ const ScriptedBackend = struct {
             if (!found) return error.ProtocolFailure;
         }
         if (options.body_source) |source| {
+            if (step.corrupt_spool_before_body) {
+                try self.corruptSpool();
+            }
             self.request_body_lengths[current] = source.length;
             if (step.expected_body) |expected| {
                 if (source.length != expected.len) {
@@ -207,6 +212,32 @@ const ScriptedBackend = struct {
             step.headers,
             step.body,
         ) catch error.OutOfMemory;
+    }
+
+    fn corruptSpool(self: *ScriptedBackend) registry_http.BackendError!void {
+        const path = self.spool_directory orelse return error.ProtocolFailure;
+        var directory = std.Io.Dir.cwd().openDir(
+            std.testing.io,
+            path,
+            .{ .iterate = true },
+        ) catch return error.ProtocolFailure;
+        defer directory.close(std.testing.io);
+        var iterator = directory.iterate();
+        const entry = (iterator.next(std.testing.io) catch
+            return error.ProtocolFailure) orelse return error.ProtocolFailure;
+        if ((iterator.next(std.testing.io) catch
+            return error.ProtocolFailure) != null)
+        {
+            return error.ProtocolFailure;
+        }
+        var file = directory.createFile(std.testing.io, entry.name, .{
+            .read = true,
+            .truncate = false,
+        }) catch return error.ProtocolFailure;
+        defer file.close(std.testing.io);
+        file.writePositionalAll(std.testing.io, "X", 0) catch
+            return error.ProtocolFailure;
+        file.sync(std.testing.io) catch return error.ProtocolFailure;
     }
 
     fn url(self: *const ScriptedBackend, index: usize) []const u8 {
@@ -2218,7 +2249,7 @@ test "stream retries rewind destination and final failures remove partial output
     try std.testing.expectEqual(@as(u64, 0), try output.length(std.testing.io));
 }
 
-test "unknown index children use manifest endpoints and status diagnostics are sanitized" {
+test "unknown index children reject before fetch and status diagnostics are sanitized" {
     const allocator = std.testing.allocator;
     const config_value = descriptor("{}", model.media_type_oci_empty_config);
     const child_manifest = try makeManifest(
@@ -2243,34 +2274,12 @@ test "unknown index children use manifest endpoints and status diagnostics are s
         &.{},
     );
     defer freeHeaders(allocator, root_headers);
-    const child_headers = try headersFor(
-        allocator,
-        child_value.value().mediaType,
-        child_manifest,
-        &child_value.digest_text,
-        &.{},
-    );
-    defer freeHeaders(allocator, child_headers);
-    const child_path = try std.fmt.allocPrint(
-        allocator,
-        "/v2/repo/manifests/{s}",
-        .{&child_value.digest_text},
-    );
-    defer allocator.free(child_path);
-    const steps = [_]Step{
-        .{
-            .path_suffix = "/v2/repo/manifests/latest",
-            .class = .registry,
-            .headers = root_headers.values,
-            .body = index,
-        },
-        .{
-            .path_suffix = child_path,
-            .class = .registry,
-            .headers = child_headers.values,
-            .body = child_manifest,
-        },
-    };
+    const steps = [_]Step{.{
+        .path_suffix = "/v2/repo/manifests/latest",
+        .class = .registry,
+        .headers = root_headers.values,
+        .body = index,
+    }};
     var runtime: FakeRuntime = .{};
     var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
     var source = try initSource(
@@ -2287,10 +2296,11 @@ test "unknown index children use manifest endpoints and status diagnostics are s
         .selection = .{ .tag = "latest" },
     });
     defer resolved.deinit();
-    var inspected = try source.inspectResolved(&resolved, .{});
-    defer inspected.deinit();
-    try std.testing.expectEqual(@as(usize, 2), fake.index);
-    try std.testing.expect(std.mem.endsWith(u8, fake.url(1), child_path));
+    try std.testing.expectError(
+        error.InvalidContent,
+        source.inspectResolved(&resolved, .{}),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.index);
 
     const malformed_child_bytes = "{}";
     const malformed_child = descriptor(
@@ -3027,6 +3037,62 @@ test "same-origin mount uses destination credentials and returns safe handoff" {
     }
 
     {
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = mount_path,
+                .class = .registry,
+                .status = 503,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+            },
+            .{
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+                .body = bytes,
+            },
+        };
+        var source_impl: NoReadSource = .{};
+        const source = transport.Source.initWithRegistryIdentity(
+            &source_impl,
+            .{
+                .origin = "http://localhost:5000",
+                .authority = "localhost:5000",
+                .repository = "source/team",
+                .plain_http = true,
+            },
+        );
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+        var destination = try initDestination(&fake, &runtime, .{
+            .repository = "dest/team",
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        try std.testing.expectEqual(
+            transport.DescriptorResult.mounted,
+            try destination.ensureDescriptor(blobTransfer(
+                source,
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expectEqual(@as(usize, 0), source_impl.reads);
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+    }
+
+    {
         const declined_headers = [_]registry_http.Header{
             .{
                 .name = "Location",
@@ -3625,6 +3691,155 @@ test "ordinary monolithic upload streams multiple buffers and cleans spool" {
     try expectDirectoryEmpty(temporary.dir);
 }
 
+test "one digest is confirmed independently as blob and manifest" {
+    const allocator = std.testing.allocator;
+    const bytes =
+        "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2},\"layers\":[]}";
+    const value = descriptor(bytes, model.media_type_oci_manifest);
+    const root_value = descriptor("{}", model.media_type_oci_manifest);
+    const blob_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/blobs/{s}",
+        .{&value.digest_text},
+    );
+    defer allocator.free(blob_path);
+    const manifest_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/manifests/{s}",
+        .{&value.digest_text},
+    );
+    defer allocator.free(manifest_path);
+    const upload_target = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/blobs/uploads/shared?digest=sha256%3A{s}",
+        .{value.digest_text["sha256:".len..]},
+    );
+    defer allocator.free(upload_target);
+    const begin_headers = [_]registry_http.Header{
+        .{
+            .name = "Location",
+            .value = "/v2/dest/blobs/uploads/shared",
+        },
+        .{ .name = "Docker-Upload-UUID", .value = "shared" },
+        .{ .name = "Range", .value = "0-0" },
+    };
+    const completion_headers = [_]registry_http.Header{
+        .{ .name = "Location", .value = blob_path },
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &value.digest_text,
+        },
+    };
+    const manifest_put_headers = [_]registry_http.Header{
+        .{ .name = "Location", .value = manifest_path },
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &value.digest_text,
+        },
+    };
+    const blob_headers = try headersFor(
+        allocator,
+        "application/octet-stream",
+        bytes,
+        &value.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, blob_headers);
+    const manifest_headers = try headersFor(
+        allocator,
+        model.media_type_oci_manifest,
+        bytes,
+        &value.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, manifest_headers);
+    const steps = [_]Step{
+        .{ .path_suffix = "/v2/", .class = .registry },
+        .{
+            .method = .HEAD,
+            .path_suffix = blob_path,
+            .class = .blob,
+            .status = 404,
+        },
+        .{
+            .method = .POST,
+            .path_suffix = "/v2/dest/blobs/uploads/",
+            .class = .registry,
+            .status = 202,
+            .headers = &begin_headers,
+        },
+        .{
+            .method = .PUT,
+            .path_suffix = upload_target,
+            .class = .registry,
+            .status = 201,
+            .headers = &completion_headers,
+            .expected_body = bytes,
+        },
+        .{
+            .method = .HEAD,
+            .path_suffix = blob_path,
+            .class = .blob,
+            .headers = blob_headers.values,
+        },
+        .{
+            .path_suffix = blob_path,
+            .class = .blob,
+            .headers = blob_headers.values,
+            .body = bytes,
+        },
+        .{
+            .path_suffix = manifest_path,
+            .class = .registry,
+            .status = 404,
+        },
+        .{
+            .method = .PUT,
+            .path_suffix = manifest_path,
+            .class = .registry,
+            .status = 201,
+            .headers = &manifest_put_headers,
+            .expected_body = bytes,
+        },
+        .{
+            .path_suffix = manifest_path,
+            .class = .registry,
+            .headers = manifest_headers.values,
+            .body = bytes,
+        },
+    };
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const spool_path = try temporaryPath(allocator, &temporary);
+    defer allocator.free(spool_path);
+    var runtime: FakeRuntime = .{};
+    var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+    var destination = try initDestination(&fake, &runtime, .{
+        .spool_directory = spool_path,
+    });
+    defer destination.deinit();
+    try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+    var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+    try std.testing.expectEqual(
+        transport.DescriptorResult.transferred,
+        try destination.ensureDescriptor(.{
+            .descriptor = value.value(),
+            .roles = transport.DescriptorRoles.init(.config),
+            .data = .{ .opaque_blob = transport.Source.init(&source) },
+        }),
+    );
+    try std.testing.expectEqual(
+        transport.DescriptorResult.transferred,
+        try destination.ensureDescriptor(.{
+            .descriptor = value.value(),
+            .roles = transport.DescriptorRoles.init(.index_child),
+            .data = .{ .exact_metadata = bytes },
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+    try expectDirectoryEmpty(temporary.dir);
+}
+
 test "chunked upload tracks ranges locations and finalizes without replay" {
     const allocator = std.testing.allocator;
     const bytes = "abcdefghijklmnopqrstuvwxyz";
@@ -3794,6 +4009,318 @@ test "chunked upload tracks ranges locations and finalizes without replay" {
     try expectDirectoryEmpty(temporary.dir);
 }
 
+test "ambiguous PATCH retries fresh and ambiguous finalize probes exact blob" {
+    const allocator = std.testing.allocator;
+    const bytes = "abcdefgh";
+    const blob_value = descriptor(bytes, "application/octet-stream");
+    const root_value = descriptor("{}", model.media_type_oci_manifest);
+    const blob_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/blobs/{s}",
+        .{&blob_value.digest_text},
+    );
+    defer allocator.free(blob_path);
+    const verified_headers = try headersFor(
+        allocator,
+        "application/octet-stream",
+        bytes,
+        &blob_value.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, verified_headers);
+    const completion_headers = [_]registry_http.Header{
+        .{ .name = "Location", .value = blob_path },
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &blob_value.digest_text,
+        },
+    };
+
+    {
+        const first_headers = [_]registry_http.Header{
+            .{ .name = "Location", .value = "/v2/dest/blobs/uploads/u1" },
+            .{ .name = "Docker-Upload-UUID", .value = "u1" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const retry_headers = [_]registry_http.Header{
+            .{ .name = "Location", .value = "/v2/dest/blobs/uploads/u2" },
+            .{ .name = "Docker-Upload-UUID", .value = "u2" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const retry_patch_one = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/u2?part=1",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "u2" },
+            .{ .name = "Range", .value = "0-3" },
+        };
+        const retry_patch_two = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/u2?part=2",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "u2" },
+            .{ .name = "Range", .value = "0-7" },
+        };
+        const final_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/dest/blobs/uploads/u2?part=2&digest=sha256%3A{s}",
+            .{blob_value.digest_text["sha256:".len..]},
+        );
+        defer allocator.free(final_target);
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &first_headers,
+            },
+            .{
+                .method = .PATCH,
+                .path_suffix = "/v2/dest/blobs/uploads/u1",
+                .class = .registry,
+                .expected_body = bytes[0..4],
+                .failure_after_body = error.ConnectionReset,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &retry_headers,
+            },
+            .{
+                .method = .PATCH,
+                .path_suffix = "/v2/dest/blobs/uploads/u2",
+                .class = .registry,
+                .status = 202,
+                .headers = &retry_patch_one,
+                .expected_body = bytes[0..4],
+            },
+            .{
+                .method = .PATCH,
+                .path_suffix = "/v2/dest/blobs/uploads/u2?part=1",
+                .class = .registry,
+                .status = 202,
+                .headers = &retry_patch_two,
+                .expected_body = bytes[4..8],
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = final_target,
+                .class = .registry,
+                .status = 201,
+                .headers = &completion_headers,
+                .expected_body = "",
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+            },
+            .{
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+                .body = bytes,
+            },
+        };
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const spool_path = try temporaryPath(allocator, &temporary);
+        defer allocator.free(spool_path);
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+        var destination = try initDestination(&fake, &runtime, .{
+            .upload_chunk_bytes = 4,
+            .spool_directory = spool_path,
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+        try std.testing.expectEqual(
+            transport.DescriptorResult.transferred,
+            try destination.ensureDescriptor(blobTransfer(
+                transport.Source.init(&source),
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+        try expectDirectoryEmpty(temporary.dir);
+    }
+
+    {
+        const begin_headers = [_]registry_http.Header{
+            .{ .name = "Location", .value = "/v2/dest/blobs/uploads/u3" },
+            .{ .name = "Docker-Upload-UUID", .value = "u3" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const patch_headers = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/u3?part=1",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "u3" },
+            .{ .name = "Range", .value = "0-7" },
+        };
+        const final_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/dest/blobs/uploads/u3?part=1&digest=sha256%3A{s}",
+            .{blob_value.digest_text["sha256:".len..]},
+        );
+        defer allocator.free(final_target);
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &begin_headers,
+            },
+            .{
+                .method = .PATCH,
+                .path_suffix = "/v2/dest/blobs/uploads/u3",
+                .class = .registry,
+                .status = 202,
+                .headers = &patch_headers,
+                .expected_body = bytes,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = final_target,
+                .class = .registry,
+                .expected_body = "",
+                .failure_after_body = error.ConnectionReset,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+            },
+            .{
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+                .body = bytes,
+            },
+        };
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const spool_path = try temporaryPath(allocator, &temporary);
+        defer allocator.free(spool_path);
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+        var destination = try initDestination(&fake, &runtime, .{
+            .upload_chunk_bytes = bytes.len,
+            .spool_directory = spool_path,
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+        try std.testing.expectEqual(
+            transport.DescriptorResult.transferred,
+            try destination.ensureDescriptor(blobTransfer(
+                transport.Source.init(&source),
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+        try expectDirectoryEmpty(temporary.dir);
+    }
+
+    {
+        const probe_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/dest/blobs/uploads/probe?digest=sha256%3A{s}",
+            .{blob_value.digest_text["sha256:".len..]},
+        );
+        defer allocator.free(probe_target);
+        const probe_begin_headers = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/probe",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "probe" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &probe_begin_headers,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = probe_target,
+                .class = .registry,
+                .expected_body = bytes,
+                .failure_after_body = error.ConnectionReset,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .failure = error.DnsFailure,
+            },
+        };
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const spool_path = try temporaryPath(allocator, &temporary);
+        defer allocator.free(spool_path);
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+        var destination = try initDestination(&fake, &runtime, .{
+            .spool_directory = spool_path,
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+        try std.testing.expectError(
+            error.UploadAmbiguous,
+            destination.ensureDescriptor(blobTransfer(
+                transport.Source.init(&source),
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+        try std.testing.expect(destination.pendingUpload() != null);
+        try expectDirectoryEmpty(temporary.dir);
+    }
+}
+
 test "ambiguous upload probes exact digest and reports sanitized incomplete state" {
     const allocator = std.testing.allocator;
     const bytes = "ambiguous-payload";
@@ -3823,6 +4350,27 @@ test "ambiguous upload probes exact digest and reports sanitized incomplete stat
         .name = "Location",
         .value = "https://uploads.example/upload/session?ticket=signed-secret",
     }};
+    const retry_target = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/blobs/uploads/retry?digest=sha256%3A{s}",
+        .{blob_value.digest_text["sha256:".len..]},
+    );
+    defer allocator.free(retry_target);
+    const retry_headers = [_]registry_http.Header{
+        .{
+            .name = "Location",
+            .value = "/v2/dest/blobs/uploads/retry",
+        },
+        .{ .name = "Docker-Upload-UUID", .value = "retry" },
+        .{ .name = "Range", .value = "0-0" },
+    };
+    const completion_headers = [_]registry_http.Header{
+        .{ .name = "Location", .value = blob_path },
+        .{
+            .name = "Docker-Content-Digest",
+            .value = &blob_value.digest_text,
+        },
+    };
 
     {
         const steps = [_]Step{
@@ -3917,6 +4465,33 @@ test "ambiguous upload probes exact digest and reports sanitized incomplete stat
                 .class = .blob,
                 .status = 404,
             },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &retry_headers,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = retry_target,
+                .class = .registry,
+                .status = 201,
+                .headers = &completion_headers,
+                .expected_body = bytes,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+            },
+            .{
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+                .body = bytes,
+            },
         };
         var temporary = std.testing.tmpDir(.{ .iterate = true });
         defer temporary.cleanup();
@@ -3925,6 +4500,61 @@ test "ambiguous upload probes exact digest and reports sanitized incomplete stat
         var runtime: FakeRuntime = .{};
         var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
         var destination = try initDestination(&fake, &runtime, .{
+            .spool_directory = spool_path,
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+        try std.testing.expectEqual(
+            transport.DescriptorResult.transferred,
+            try destination.ensureDescriptor(blobTransfer(
+                transport.Source.init(&source),
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expect(destination.pendingUpload() == null);
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
+        try expectDirectoryEmpty(temporary.dir);
+    }
+
+    {
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &begin_headers,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = target,
+                .class = .registry,
+                .expected_body = bytes,
+                .failure_after_body = error.ConnectionReset,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+        };
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const spool_path = try temporaryPath(allocator, &temporary);
+        defer allocator.free(spool_path);
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+        var destination = try initDestination(&fake, &runtime, .{
+            .http_limits = .{ .max_attempts = 1 },
             .spool_directory = spool_path,
         });
         defer destination.deinit();
@@ -4003,6 +4633,72 @@ test "source corruption and upload session corruption never count success" {
             )),
         );
         try std.testing.expectEqual(@as(usize, 2), fake.index);
+        try expectDirectoryEmpty(temporary.dir);
+    }
+
+    {
+        const upload_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/dest/blobs/uploads/changed?digest=sha256%3A{s}",
+            .{blob_value.digest_text["sha256:".len..]},
+        );
+        defer allocator.free(upload_target);
+        const begin_headers = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/changed",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "changed" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const steps = [_]Step{
+            .{ .path_suffix = "/v2/", .class = .registry },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .status = 404,
+            },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &begin_headers,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = upload_target,
+                .class = .registry,
+                .corrupt_spool_before_body = true,
+            },
+        };
+        var temporary = std.testing.tmpDir(.{ .iterate = true });
+        defer temporary.cleanup();
+        const spool_path = try temporaryPath(allocator, &temporary);
+        defer allocator.free(spool_path);
+        var runtime: FakeRuntime = .{};
+        var fake: ScriptedBackend = .{
+            .runtime = &runtime,
+            .steps = &steps,
+            .spool_directory = spool_path,
+        };
+        var destination = try initDestination(&fake, &runtime, .{
+            .spool_directory = spool_path,
+        });
+        defer destination.deinit();
+        try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
+        var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
+        try std.testing.expectError(
+            error.InvalidContent,
+            destination.ensureDescriptor(blobTransfer(
+                transport.Source.init(&source),
+                blob_value.value(),
+            )),
+        );
+        try std.testing.expect(!destination.committed());
+        try std.testing.expect(destination.pendingUpload() != null);
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
         try expectDirectoryEmpty(temporary.dir);
     }
 
@@ -4107,7 +4803,7 @@ test "source corruption and upload session corruption never count success" {
     }
 }
 
-test "interrupted initiation is incomplete and mount decline reuses its session" {
+test "interrupted initiation starts fresh and mount decline reuses its session" {
     const allocator = std.testing.allocator;
     const bytes = "mount-fallback";
     const blob_value = descriptor(bytes, "application/octet-stream");
@@ -4120,6 +4816,35 @@ test "interrupted initiation is incomplete and mount decline reuses its session"
     defer allocator.free(blob_path);
 
     {
+        const retry_target = try std.fmt.allocPrint(
+            allocator,
+            "/v2/dest/blobs/uploads/retry?digest=sha256%3A{s}",
+            .{blob_value.digest_text["sha256:".len..]},
+        );
+        defer allocator.free(retry_target);
+        const begin_headers = [_]registry_http.Header{
+            .{
+                .name = "Location",
+                .value = "/v2/dest/blobs/uploads/retry",
+            },
+            .{ .name = "Docker-Upload-UUID", .value = "retry" },
+            .{ .name = "Range", .value = "0-0" },
+        };
+        const completion_headers = [_]registry_http.Header{
+            .{ .name = "Location", .value = blob_path },
+            .{
+                .name = "Docker-Content-Digest",
+                .value = &blob_value.digest_text,
+            },
+        };
+        const verified_headers = try headersFor(
+            allocator,
+            "application/octet-stream",
+            bytes,
+            &blob_value.digest_text,
+            &.{},
+        );
+        defer freeHeaders(allocator, verified_headers);
         const steps = [_]Step{
             .{ .path_suffix = "/v2/", .class = .registry },
             .{
@@ -4140,6 +4865,33 @@ test "interrupted initiation is incomplete and mount decline reuses its session"
                 .class = .blob,
                 .status = 404,
             },
+            .{
+                .method = .POST,
+                .path_suffix = "/v2/dest/blobs/uploads/",
+                .class = .registry,
+                .status = 202,
+                .headers = &begin_headers,
+            },
+            .{
+                .method = .PUT,
+                .path_suffix = retry_target,
+                .class = .registry,
+                .status = 201,
+                .headers = &completion_headers,
+                .expected_body = bytes,
+            },
+            .{
+                .method = .HEAD,
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+            },
+            .{
+                .path_suffix = blob_path,
+                .class = .blob,
+                .headers = verified_headers.values,
+                .body = bytes,
+            },
         };
         var temporary = std.testing.tmpDir(.{ .iterate = true });
         defer temporary.cleanup();
@@ -4153,20 +4905,15 @@ test "interrupted initiation is incomplete and mount decline reuses its session"
         defer destination.deinit();
         try destination.prepareRoot(root_value.value(), .{ .tag = "latest" });
         var source: BlobSource = .{ .io = std.testing.io, .bytes = bytes };
-        try std.testing.expectError(
-            error.UploadIncomplete,
-            destination.ensureDescriptor(blobTransfer(
+        try std.testing.expectEqual(
+            transport.DescriptorResult.transferred,
+            try destination.ensureDescriptor(blobTransfer(
                 transport.Source.init(&source),
                 blob_value.value(),
             )),
         );
-        const pending = destination.pendingUpload().?;
-        try std.testing.expectEqual(
-            registry.UploadReason.initiation_ambiguous,
-            pending.reason,
-        );
-        try std.testing.expect(pending.session == null);
-        try std.testing.expect(pending.replay.source_verified);
+        try std.testing.expect(destination.pendingUpload() == null);
+        try std.testing.expectEqual(@as(usize, steps.len), fake.index);
         try expectDirectoryEmpty(temporary.dir);
     }
 
@@ -4446,6 +5193,53 @@ test "exact child and root manifests publish by digest before final tag" {
     try std.testing.expectEqualStrings(child_path, fake.url(1)["http://localhost:5000".len..]);
     try std.testing.expectEqualStrings(root_path, fake.url(4)["http://localhost:5000".len..]);
     try std.testing.expectEqualStrings(tag_path, fake.url(7)["http://localhost:5000".len..]);
+}
+
+test "child manifest failure prevents root staging and tag publication" {
+    const allocator = std.testing.allocator;
+    const child_bytes =
+        "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"config\":{\"mediaType\":\"application/vnd.oci.empty.v1+json\",\"digest\":\"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a\",\"size\":2},\"layers\":[]}";
+    const child = descriptor(child_bytes, model.media_type_oci_manifest);
+    const root_bytes = try makeIndex(allocator, child.value());
+    defer allocator.free(root_bytes);
+    const root = descriptor(root_bytes, model.media_type_oci_index);
+    const child_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/manifests/{s}",
+        .{&child.digest_text},
+    );
+    defer allocator.free(child_path);
+    const steps = [_]Step{
+        .{ .path_suffix = "/v2/", .class = .registry },
+        .{ .path_suffix = child_path, .class = .registry, .status = 404 },
+        .{
+            .method = .PUT,
+            .path_suffix = child_path,
+            .class = .registry,
+            .status = 500,
+            .expected_body = child_bytes,
+        },
+        .{ .path_suffix = child_path, .class = .registry, .status = 404 },
+    };
+    var runtime: FakeRuntime = .{};
+    var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+    var destination = try initDestination(&fake, &runtime, .{});
+    defer destination.deinit();
+    try destination.prepareRoot(root.value(), .{ .tag = "latest" });
+    try std.testing.expectError(
+        error.PublicationUnconfirmed,
+        destination.ensureDescriptor(.{
+            .descriptor = child.value(),
+            .roles = transport.DescriptorRoles.init(.index_child),
+            .data = .{ .exact_metadata = child_bytes },
+        }),
+    );
+    try std.testing.expectEqual(
+        registry.DestinationState.failed,
+        destination.state(),
+    );
+    try std.testing.expect(!destination.committed());
+    try std.testing.expectEqual(@as(usize, steps.len), fake.index);
 }
 
 test "final manifest ambiguity succeeds only for exact tag and finish is strict" {
@@ -4820,6 +5614,7 @@ const PairingRegistry = struct {
     mount_count: usize = 0,
     upload_count: usize = 0,
     manifest_publication_started: bool = false,
+    reject_tag_put: bool = false,
     last_mutation: PairingMutation = .none,
 
     fn init(
@@ -5191,6 +5986,14 @@ const PairingRegistry = struct {
             self.manifest_publication_started = true;
             self.last_mutation = .manifest;
         } else {
+            if (self.reject_tag_put) {
+                return registry_http.Response.initCopy(
+                    allocator,
+                    500,
+                    &.{},
+                    "",
+                ) catch error.OutOfMemory;
+            }
             self.destination_tag_digest = value.descriptor.digest;
             self.last_mutation = .tag;
         }
@@ -5427,7 +6230,6 @@ test "all copy pairings support direct manifests without hidden layout networkin
         direct,
         "source",
     );
-
     const local_result = try copy.localToLocal(
         std.testing.io,
         std.testing.allocator,
@@ -5541,6 +6343,207 @@ test "all copy pairings support direct manifests without hidden layout networkin
         try std.testing.expectEqual(@as(usize, 0), fake.source_blob_reads);
         try std.testing.expectEqual(@as(usize, 1), fake.source_tag_reads);
         try std.testing.expectEqual(.tag, fake.last_mutation);
+    }
+}
+
+test "all copy pairings preserve roots when publication is interrupted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var graph_value = try PairingGraph.init(allocator);
+    const direct = graph_value.directRoot();
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    const base = try temporaryPath(allocator, &temporary);
+    const source_layout = try std.fs.path.join(
+        allocator,
+        &.{ base, "failure-source" },
+    );
+    const local_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "failure-local" },
+    );
+    const registry_layout_destination = try std.fs.path.join(
+        allocator,
+        &.{ base, "failure-registry-layout" },
+    );
+    try writePairingLayout(
+        allocator,
+        source_layout,
+        &graph_value,
+        direct,
+        "source",
+    );
+    try writePairingLayout(
+        allocator,
+        registry_layout_destination,
+        &graph_value,
+        .{
+            .descriptor = graph_value.manifest_two.value(),
+            .bytes = graph_value.manifest_two_bytes,
+        },
+        "old",
+    );
+    const existing_index_path = try std.fs.path.join(
+        allocator,
+        &.{ registry_layout_destination, "index.json" },
+    );
+    const existing_index_before = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        existing_index_path,
+        std.testing.allocator,
+        .limited(layout.default_metadata_limit),
+    );
+    defer std.testing.allocator.free(existing_index_before);
+
+    try std.testing.expectError(
+        error.InjectedFailure,
+        copy.localToLocal(
+            std.testing.io,
+            std.testing.allocator,
+            .{ .path = source_layout, .selection = .{ .tag = "source" } },
+            .{
+                .path = local_destination,
+                .selection = .{ .tag = "copied" },
+            },
+            .{ .failure_point = .after_index_temp_sync },
+        ),
+    );
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openDir(std.testing.io, local_destination, .{}),
+    );
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        try std.testing.expectError(
+            error.InjectedFailure,
+            source.copyToLayout(
+                .{
+                    .authority = "localhost:5000",
+                    .repository = "source",
+                    .selection = .{ .tag = "moving" },
+                },
+                .{
+                    .path = registry_layout_destination,
+                    .selection = .{ .tag = "copied" },
+                },
+                .{ .failure_point = .after_index_temp_sync },
+            ),
+        );
+        const existing_index_after = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            existing_index_path,
+            std.testing.allocator,
+            .limited(layout.default_metadata_limit),
+        );
+        defer std.testing.allocator.free(existing_index_after);
+        try std.testing.expectEqualSlices(
+            u8,
+            existing_index_before,
+            existing_index_after,
+        );
+        try expectPairingLayoutBytes(
+            registry_layout_destination,
+            &graph_value,
+            .{
+                .descriptor = graph_value.manifest_two.value(),
+                .bytes = graph_value.manifest_two_bytes,
+            },
+            "old",
+            true,
+        );
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        try fake.destination_manifests.put(
+            graph_value.manifest_two.value().digest,
+            {},
+        );
+        fake.destination_tag_digest =
+            graph_value.manifest_two.value().digest;
+        fake.reject_tag_put = true;
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer destination.deinit();
+        try std.testing.expectError(
+            error.PublicationUnconfirmed,
+            destination.copyFromLayout(
+                .{
+                    .path = source_layout,
+                    .selection = .{ .tag = "source" },
+                },
+                .{},
+            ),
+        );
+        try std.testing.expectEqualStrings(
+            graph_value.manifest_two.value().digest,
+            fake.destination_tag_digest.?,
+        );
+        try std.testing.expect(fake.last_mutation != .tag);
+    }
+
+    {
+        var runtime: FakeRuntime = .{};
+        var fake = PairingRegistry.init(
+            std.testing.allocator,
+            &graph_value,
+            direct.descriptor.digest,
+        );
+        defer fake.deinit();
+        try fake.destination_manifests.put(
+            graph_value.manifest_two.value().digest,
+            {},
+        );
+        fake.destination_tag_digest =
+            graph_value.manifest_two.value().digest;
+        fake.reject_tag_put = true;
+        fake.require_source_discovery_before_destination = true;
+        var source = try pairingSource(&fake, &runtime);
+        defer source.deinit();
+        var destination = try pairingDestination(
+            &fake,
+            &runtime,
+            "copied",
+            base,
+        );
+        defer destination.deinit();
+        try std.testing.expectError(
+            error.PublicationUnconfirmed,
+            source.copyToDestination(
+                .{
+                    .authority = "localhost:5000",
+                    .repository = "source",
+                    .selection = .{ .tag = "moving" },
+                },
+                &destination,
+                .{},
+            ),
+        );
+        try std.testing.expectEqualStrings(
+            graph_value.manifest_two.value().digest,
+            fake.destination_tag_digest.?,
+        );
+        try std.testing.expect(fake.last_mutation != .tag);
     }
 }
 

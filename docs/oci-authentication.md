@@ -131,10 +131,12 @@ mounted, otherwise ordinary upload fallback begins without replaying the mount.
 
 Missing opaque bytes are streamed from the source into an exclusive private
 spool file through fixed buffers, synced, and independently rehashed/recounted
-before any body request. Spools are removed on every success or failure path.
-The default upload is one monolithic body PUT. Callers may select a bounded
-PATCH chunk size, in which case each accepted range advances an owned offset
-and a final empty PUT supplies the digest. UUID, Range, and session-path
+before any body request. The spool is hashed again, in order, as the HTTP body
+source reads it; local mutation or truncation therefore fails before the
+descriptor can be counted. Spools are removed on every success or failure
+path. The default upload is one monolithic body PUT. Callers may select a
+bounded PATCH chunk size, in which case each accepted range advances an owned
+offset and a final empty PUT supplies the digest. UUID, Range, and session-path
 changes must be consistent. Chunk counts are bounded.
 
 Every upload Location is treated as untrusted input. Relative locations are
@@ -147,11 +149,15 @@ credentials are never available to the destination client.
 POST, PATCH, and PUT operations are not redirected, retried, or replayed by
 the HTTP policy, including after an authentication challenge. After an
 ambiguous body write or finalize, the destination probes the expected blob.
-Only exact size/SHA-256 verification completes the descriptor; otherwise the
-call returns `UploadAmbiguous`. An ambiguous initiation with no verified blob
-returns `UploadIncomplete`. Redacted `UploadHandoff` state may identify that a
-remote upload session can remain for registry garbage collection, but its
-formatting omits paths, signed queries, credentials, and authorization values.
+Only exact size/SHA-256 verification completes the descriptor. If the blob is
+still absent and the shared attempt/deadline budget remains, the uncertain
+session is abandoned, a fresh initiation is performed, and the verified spool
+is resent from byte zero. Exhausted initiation or body ambiguity returns
+`UploadIncomplete` or `UploadAmbiguous`. Redacted `UploadHandoff` state may
+identify the last remote upload session that can remain for registry garbage
+collection, but its formatting omits paths, signed queries, credentials, and
+authorization values. Successful recovery can also leave earlier abandoned
+sessions for registry garbage collection.
 
 Child manifests and indexes are published by immutable digest only after
 their dependencies, using their exact verified media type and bytes. `stageRoot`
@@ -186,13 +192,17 @@ Every pairing discovers and validates the complete supported index graph
 before destination preflight or filesystem mutation. Traversal never derives a
 host platform. Subjects, unknown index-child document types, cycles,
 descriptor conflicts, corrupt bytes, and graph-limit exhaustion fail before
-publication. Original manifest/index bytes and layout root-descriptor JSON are
-retained; named layout copies only adjust the canonical reference-name
-annotation.
+publication. Per-document and cumulative retained-metadata bounds apply in
+addition to unique-descriptor and declared-byte bounds. Original
+manifest/index bytes and layout root-descriptor JSON are retained; named layout
+copies only adjust the canonical reference-name annotation.
 
-Execution is post-order and counts each unique descriptor once as transferred,
-reused, or mounted. Dependencies and child documents finish before the exact
-root is staged. The destination tag or layout catalog is the final visibility
+Execution is post-order and counts each unique descriptor once per required
+blob or document role as transferred, reused, or mounted. This matters when
+the same digest is both an opaque config/layer dependency and a recognized
+manifest/index: registry blob and manifest endpoints are confirmed
+independently. Dependencies and child documents finish before the exact root
+is staged. The destination tag or layout catalog is the final visibility
 change, and a `Result` containing the root digest is created only after
 destination finish. Layout-only copies instantiate no registry client and
 perform no authentication discovery or network operation.

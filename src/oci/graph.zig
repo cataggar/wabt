@@ -9,6 +9,7 @@ pub const Limits = struct {
     max_nodes: u64 = 10_000,
     max_total_bytes: u64 = 64 * 1024 * 1024 * 1024,
     max_metadata_bytes: u64 = 16 * 1024 * 1024,
+    max_total_metadata_bytes: u64 = 64 * 1024 * 1024,
 };
 
 pub const Error = error{
@@ -17,6 +18,7 @@ pub const Error = error{
     MaximumTotalBytesExceeded,
     TotalSizeOverflow,
     MaximumMetadataBytesExceeded,
+    MaximumTotalMetadataBytesExceeded,
     SourceContractViolation,
     CycleDetected,
     ConflictingDescriptor,
@@ -159,13 +161,20 @@ const Record = struct {
     }
 };
 
+const DigestRecords = struct {
+    exemplar: usize,
+    blob: ?usize = null,
+    document: ?usize = null,
+};
+
 const Context = struct {
     allocator: std.mem.Allocator,
     source: transport.Source,
     limits: Limits,
     records: std.array_list.Managed(Record),
-    by_digest: std.AutoHashMap(content.Digest, usize),
+    by_digest: std.AutoHashMap(content.Digest, DigestRecords),
     total_bytes: u64 = 0,
+    total_metadata_bytes: u64 = 0,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -177,7 +186,10 @@ const Context = struct {
             .source = source,
             .limits = limits,
             .records = std.array_list.Managed(Record).init(allocator),
-            .by_digest = std.AutoHashMap(content.Digest, usize).init(allocator),
+            .by_digest = std.AutoHashMap(
+                content.Digest,
+                DigestRecords,
+            ).init(allocator),
         };
     }
 
@@ -202,32 +214,57 @@ const Context = struct {
         {
             return error.UnsupportedGraphNode;
         }
+        if (role == .index_child and
+            !model.classifyMediaType(descriptor.mediaType).isDocument())
+        {
+            return error.UnsupportedGraphNode;
+        }
         if (requires_document and
             descriptor.size > self.limits.max_metadata_bytes)
         {
             return error.MaximumMetadataBytesExceeded;
         }
 
-        if (self.by_digest.get(digest)) |index| {
-            const previous = self.records.items[index].descriptor;
+        if (self.by_digest.getPtr(digest)) |records| {
+            const previous = self.records.items[records.exemplar].descriptor;
             if (previous.size != descriptor.size or
                 !std.mem.eql(u8, previous.mediaType, descriptor.mediaType))
             {
                 return error.ConflictingDescriptor;
             }
 
-            self.records.items[index].roles.add(role);
-            if (self.records.items[index].state == .active) {
-                return error.CycleDetected;
+            const existing = if (requires_document)
+                records.document
+            else
+                records.blob;
+            if (existing) |index| {
+                self.records.items[index].roles.add(role);
+                if (self.records.items[index].state == .active) {
+                    return error.CycleDetected;
+                }
+                return index;
             }
-            if (requires_document and self.records.items[index].document == null) {
-                self.records.items[index].state = .active;
+
+            const index = self.records.items.len;
+            try self.records.append(.{
+                .descriptor = descriptor,
+                .digest = digest,
+                .roles = transport.DescriptorRoles.init(role),
+                .state = if (requires_document) .active else .completed,
+                .dependencies = std.array_list.Managed(Edge).init(
+                    self.allocator,
+                ),
+            });
+            if (requires_document) {
+                records.document = index;
                 try self.discoverDocument(index, descriptor, depth);
+            } else {
+                records.blob = index;
             }
             return index;
         }
 
-        const node_count: u64 = @intCast(self.records.items.len);
+        const node_count: u64 = @intCast(self.by_digest.count());
         if (node_count >= self.limits.max_nodes) {
             return error.MaximumDescriptorsExceeded;
         }
@@ -248,7 +285,11 @@ const Context = struct {
             .state = if (requires_document) .active else .completed,
             .dependencies = std.array_list.Managed(Edge).init(self.allocator),
         });
-        self.by_digest.put(digest, index) catch |err| {
+        self.by_digest.put(digest, .{
+            .exemplar = index,
+            .blob = if (requires_document) null else index,
+            .document = if (requires_document) index else null,
+        }) catch |err| {
             self.records.items[index].dependencies.deinit();
             self.records.items.len = index;
             return err;
@@ -269,6 +310,14 @@ const Context = struct {
     ) anyerror!void {
         if (descriptor.size > self.limits.max_metadata_bytes) {
             return error.MaximumMetadataBytesExceeded;
+        }
+        const new_metadata_total = std.math.add(
+            u64,
+            self.total_metadata_bytes,
+            descriptor.size,
+        ) catch return error.TotalSizeOverflow;
+        if (new_metadata_total > self.limits.max_total_metadata_bytes) {
+            return error.MaximumTotalMetadataBytesExceeded;
         }
 
         var metadata = if (self.records.items[index].roles.index_child)
@@ -295,6 +344,7 @@ const Context = struct {
             descriptor.size,
             metadata.bytes,
         );
+        self.total_metadata_bytes = new_metadata_total;
 
         var document = try model.parseDocument(self.allocator, metadata.bytes);
         var document_owned = true;
@@ -676,6 +726,10 @@ test "default graph limits are concrete and safe" {
         @as(u64, 16 * 1024 * 1024),
         limits.max_metadata_bytes,
     );
+    try std.testing.expectEqual(
+        @as(u64, 64 * 1024 * 1024),
+        limits.max_total_metadata_bytes,
+    );
 }
 
 const TestDocument = struct {
@@ -1034,6 +1088,73 @@ test "shared descriptors are deduplicated while retaining every role" {
     );
 }
 
+test "one digest used as blob and document retains both transfer roles" {
+    const allocator = std.testing.allocator;
+    const child_config = TestBlob.init(
+        "{}",
+        model.media_type_oci_empty_config,
+        2,
+    );
+    var child = try makeManifest(
+        allocator,
+        child_config.descriptor(),
+        &.{},
+        null,
+    );
+    defer child.deinit();
+    var parent = try makeManifest(
+        allocator,
+        child.descriptor(),
+        &.{},
+        null,
+    );
+    defer parent.deinit();
+    var root = try makeIndex(
+        allocator,
+        &.{ child.descriptor(), parent.descriptor() },
+        null,
+    );
+    defer root.deinit();
+
+    const mappings = [_]TestMapping{
+        root.mapping(),
+        child.mapping(),
+        parent.mapping(),
+    };
+    var fake: FakeSource = .{ .mappings = &mappings };
+    var plan = try planTestGraph(
+        allocator,
+        &fake,
+        .{ .descriptor = root.descriptor() },
+        .{},
+    );
+    defer plan.deinit();
+
+    var child_blob_count: usize = 0;
+    var child_document_count: usize = 0;
+    for (plan.entries) |entry| {
+        if (!std.mem.eql(u8, entry.descriptor.digest, child.descriptor().digest)) {
+            continue;
+        }
+        switch (entry.data) {
+            .opaque_blob => {
+                child_blob_count += 1;
+                try std.testing.expect(entry.roles.contains(.config));
+            },
+            .exact_metadata => {
+                child_document_count += 1;
+                try std.testing.expect(entry.roles.contains(.index_child));
+            },
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), child_blob_count);
+    try std.testing.expectEqual(@as(usize, 1), child_document_count);
+    try std.testing.expectEqual(@as(u64, 2), plan.total_bytes -
+        @as(u64, @intCast(root.bytes.len)) -
+        @as(u64, @intCast(parent.bytes.len)) -
+        @as(u64, @intCast(child.bytes.len)));
+}
+
 test "depth limit accepts exactly 32 edges and rejects 33" {
     const allocator = std.testing.allocator;
     var exact = try makeIndexChain(allocator, 32);
@@ -1119,6 +1240,21 @@ test "node and total byte bounds accept exact values and reject one over" {
             .{
                 .max_nodes = 4,
                 .max_total_bytes = total - 1,
+            },
+        ),
+    );
+
+    var metadata_source: FakeSource = .{ .mappings = &mappings };
+    try std.testing.expectError(
+        error.MaximumTotalMetadataBytesExceeded,
+        planTestGraph(
+            allocator,
+            &metadata_source,
+            .{ .descriptor = root.descriptor() },
+            .{
+                .max_nodes = 4,
+                .max_total_bytes = total,
+                .max_total_metadata_bytes = @as(u64, @intCast(root.bytes.len)) - 1,
             },
         ),
     );
@@ -1222,7 +1358,7 @@ test "topological cycle detection rejects active digest loops" {
     });
     try context.by_digest.put(
         try content.Digest.parse(descriptor_a.digest),
-        0,
+        .{ .exemplar = 0, .document = 0 },
     );
     try std.testing.expectError(
         error.CycleDetected,
@@ -1318,7 +1454,7 @@ test "metadata digest and declared size are independently verified" {
     );
 }
 
-test "unsupported roots reject while extension index children use manifest reads" {
+test "unsupported roots and index children reject before source reads" {
     const allocator = std.testing.allocator;
     const unknown = TestBlob.init(
         "unknown-document",
@@ -1357,16 +1493,17 @@ test "unsupported roots reject while extension index children use manifest reads
     defer index.deinit();
     const mappings = [_]TestMapping{ index.mapping(), child.mapping() };
     var child_source: FakeSource = .{ .mappings = &mappings };
-    var plan = try planTestGraph(
-        allocator,
-        &child_source,
-        .{ .descriptor = index.descriptor() },
-        .{},
+    try std.testing.expectError(
+        error.UnsupportedGraphNode,
+        planTestGraph(
+            allocator,
+            &child_source,
+            .{ .descriptor = index.descriptor() },
+            .{},
+        ),
     );
-    defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), child_source.metadata_calls);
-    try std.testing.expectEqual(@as(usize, 1), child_source.manifest_metadata_calls);
-    try std.testing.expectEqual(@as(usize, 2), plan.nodes.len);
+    try std.testing.expectEqual(@as(usize, 0), child_source.manifest_metadata_calls);
 }
 
 test "opaque artifact config and layers are accepted without image validation" {
