@@ -17,6 +17,7 @@ pub const layout = @import("oci/layout.zig");
 pub const copy = @import("oci/copy.zig");
 pub const wasm_metadata = @import("oci/wasm_metadata.zig");
 pub const wasm = @import("oci/wasm.zig");
+pub const extract = @import("oci/extract.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -102,6 +103,11 @@ pub const WasmValidationError = wasm_metadata.ValidationError;
 pub const validateWasmPayload = wasm_metadata.validatePayload;
 pub const classifyWasmPayload = wasm_metadata.classifyPayload;
 
+pub const ExtractionLayerSource = extract.LayerSource;
+pub const ExtractionOptions = extract.Options;
+pub const ExtractionResult = extract.Result;
+pub const extractDirectManifest = extract.directManifest;
+
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;
 pub const RegistryReference = reference.RegistryReference;
@@ -124,5 +130,6 @@ test {
     _ = @import("oci/copy.zig");
     _ = @import("oci/wasm_metadata.zig");
     _ = @import("oci/wasm.zig");
+    _ = @import("oci/extract.zig");
     _ = @import("oci/integration_tests.zig");
 }
