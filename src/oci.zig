@@ -8,6 +8,8 @@ const std = @import("std");
 pub const content = @import("oci/content.zig");
 pub const reference = @import("oci/reference.zig");
 pub const model = @import("oci/model.zig");
+pub const transport = @import("oci/transport.zig");
+pub const graph = @import("oci/graph.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -25,6 +27,16 @@ pub const parseDocument = model.parseDocument;
 pub const validateArtifactManifest = model.validateArtifactManifest;
 pub const validateImageManifest = model.validateImageManifest;
 
+pub const Source = transport.Source;
+pub const Destination = transport.Destination;
+pub const TransferCounts = transport.Counts;
+pub const TransferResult = transport.Result;
+
+pub const GraphLimits = graph.Limits;
+pub const GraphRoot = graph.Root;
+pub const GraphPlan = graph.Plan;
+pub const planGraphCopy = graph.planCopy;
+
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;
 pub const RegistryReference = reference.RegistryReference;
@@ -38,4 +50,6 @@ test {
     _ = @import("oci/content.zig");
     _ = @import("oci/reference.zig");
     _ = @import("oci/model.zig");
+    _ = @import("oci/transport.zig");
+    _ = @import("oci/graph.zig");
 }
