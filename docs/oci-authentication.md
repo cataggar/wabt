@@ -97,7 +97,7 @@ authority/repository, and expected-digest context; response detail, bodies,
 credentials, tokens, helper output, and full URLs or queries are never
 retained.
 
-## Registry destination preflight and mount behavior
+## Registry destination upload and publication behavior
 
 `wabt.oci.registry.Destination` is initialized from one normalized repository
 and an explicit tag. Selector-less and digest-only destinations are rejected
@@ -107,9 +107,10 @@ absolute deadline, and limits independently from every source.
 
 `prepareRoot` validates the tag, root descriptor/media type, and graph limits,
 then performs a bounded `/v2/` preflight before descriptor transfer. Lifecycle
-state is strict: descriptor operations require successful preflight, an upload
-handoff stops further transfer, and this increment has no state that can report
-a committed root.
+state is strict and ordered: prepare, dependency ensure, root stage, tag
+commit, and finish. Duplicate or out-of-order calls fail. A committed root
+digest/count result is constructed by the shared copy engine only after
+`finish` succeeds.
 
 Existing destination blobs are never reused from status alone. `HEAD` treats
 only 404 as missing and rejects contradictory length or digest headers.
@@ -123,21 +124,48 @@ normalized origin and repository. When destination policy permits and the
 origins match, the destination sends one percent-encoded cross-repository mount
 POST using destination authorization only. The POST is not redirected,
 retried, or replayed after an authentication challenge. A 201 result counts as
-mounted only after destination re-verification. A valid 202 result owns a
-bounded upload-session Location and returns an explicit upload-required
-handoff. Absolute signed queries are preserved, userinfo/fragments and HTTPS
-downgrades are rejected, and authorization is marked stripped for a permitted
-cross-origin HTTPS session.
+mounted only after destination re-verification. A valid 202 result supplies a
+bounded upload session and falls through to the same verified spool upload.
+An ambiguous mount is probed safely; an exact destination blob may count as
+mounted, otherwise ordinary upload fallback begins without replaying the mount.
 
-The handoff records that source bytes are not yet verified/spooled, mutating
-requests are not replay-safe, and the final digest must be probed before a later
-retry. Formatting and diagnostics expose no upload path, query, credential, or
-authorization value.
+Missing opaque bytes are streamed from the source into an exclusive private
+spool file through fixed buffers, synced, and independently rehashed/recounted
+before any body request. Spools are removed on every success or failure path.
+The default upload is one monolithic body PUT. Callers may select a bounded
+PATCH chunk size, in which case each accepted range advances an owned offset
+and a final empty PUT supplies the digest. UUID, Range, and session-path
+changes must be consistent. Chunk counts are bounded.
 
-These APIs do not yet send ordinary upload bodies, start or finalize ordinary
-upload sessions, publish child manifests, publish a root tag, provide registry
-commands, or claim push/copy success. No live/cloud registry behavior is used
-by tests.
+Every upload Location is treated as untrusted input. Relative locations are
+resolved with a size bound; absolute signed queries are preserved exactly.
+Userinfo, fragments, invalid encoding, HTTPS downgrade, and cross-origin
+cleartext are rejected. A permitted cross-origin HTTPS session permanently
+strips destination authorization and caller-marked secret headers. Source
+credentials are never available to the destination client.
+
+POST, PATCH, and PUT operations are not redirected, retried, or replayed by
+the HTTP policy, including after an authentication challenge. After an
+ambiguous body write or finalize, the destination probes the expected blob.
+Only exact size/SHA-256 verification completes the descriptor; otherwise the
+call returns `UploadAmbiguous`. An ambiguous initiation with no verified blob
+returns `UploadIncomplete`. Redacted `UploadHandoff` state may identify that a
+remote upload session can remain for registry garbage collection, but its
+formatting omits paths, signed queries, credentials, and authorization values.
+
+Child manifests and indexes are published by immutable digest only after
+their dependencies, using their exact verified media type and bytes. `stageRoot`
+does the same for the exact root and does not access the destination tag.
+`commitRoot` performs the tag PUT as the final visibility operation. All
+manifest writes are confirmed with bounded exact reads. An ambiguous final PUT
+succeeds only when both the tag and immutable digest resolve to the expected
+bytes; otherwise `PublicationUnconfirmed` is returned and no copy result is
+created. Pre-commit failures may leave verified unreferenced blobs, child
+documents, or remote upload sessions, but they do not update the new root tag.
+
+These are library APIs only. They do not add registry commands, convenience
+copy pairings, profile-specific upload behavior, deletion, signatures, or
+referrers. No live/cloud registry behavior is used by tests.
 
 ## Credential policies
 
