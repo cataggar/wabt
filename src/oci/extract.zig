@@ -13,7 +13,10 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const content = @import("content.zig");
+const layout = @import("layout.zig");
 const model = @import("model.zig");
+const reference = @import("reference.zig");
+const registry = @import("registry.zig");
 const transport = @import("transport.zig");
 const wasm = @import("wasm.zig");
 
@@ -154,11 +157,6 @@ pub const Result = struct {
     bytes_written: u64,
 };
 
-const LayerExpectation = struct {
-    digest: content.Digest,
-    size: u64,
-};
-
 const DestinationSnapshot = union(enum) {
     missing,
     file: FileIdentity,
@@ -174,6 +172,16 @@ const FileIdentity = struct {
 const Temporary = struct {
     name: []u8,
     file: Io.File,
+};
+
+const ConfigInput = union(enum) {
+    exact: []const u8,
+    source: transport.Source,
+};
+
+const LayerInput = union(enum) {
+    sequential: LayerSource,
+    source: transport.Source,
 };
 
 /// Extract exactly one supported raw `application/wasm` layer.
@@ -195,11 +203,80 @@ pub fn directManifest(
         allocator,
         root_descriptor,
         manifest_bytes,
-        config_bytes,
-        layer_source,
+        .{ .exact = config_bytes },
+        .{ .sequential = layer_source },
         output_path,
         options,
         .{},
+    );
+}
+
+/// Extracts one already-resolved direct manifest through a generic transport
+/// source. The exact resolved manifest is never fetched again; only its
+/// bounded config blob and selected raw Wasm layer are requested by digest.
+pub fn fromResolvedSource(
+    io: Io,
+    allocator: std.mem.Allocator,
+    source: transport.Source,
+    root_descriptor: model.Descriptor,
+    manifest_bytes: []const u8,
+    output_path: []const u8,
+    options: Options,
+) !Result {
+    return directManifestImpl(
+        io,
+        allocator,
+        root_descriptor,
+        manifest_bytes,
+        .{ .source = source },
+        .{ .source = source },
+        output_path,
+        options,
+        .{},
+    );
+}
+
+/// Resolves one layout root and extracts it only if that root is a supported
+/// direct manifest. Index children and host platforms are never selected.
+pub fn fromLayoutSource(
+    allocator: std.mem.Allocator,
+    source: *layout.Source,
+    layout_reference: reference.LayoutReference,
+    output_path: []const u8,
+    options: Options,
+) !Result {
+    var resolved = try source.resolve(layout_reference);
+    defer resolved.deinit();
+    return fromResolvedSource(
+        source.io,
+        allocator,
+        source.asTransport(),
+        resolved.descriptor,
+        resolved.bytes,
+        output_path,
+        options,
+    );
+}
+
+/// Resolves a registry tag or digest exactly once, then reads config and layer
+/// content only through the immutable descriptors from that response.
+pub fn fromRegistrySource(
+    allocator: std.mem.Allocator,
+    source: *registry.Source,
+    registry_reference: reference.RegistryReference,
+    output_path: []const u8,
+    options: Options,
+) !Result {
+    var resolved = try source.resolve(registry_reference);
+    defer resolved.deinit();
+    return fromResolvedSource(
+        source.io,
+        allocator,
+        source.asTransport(),
+        resolved.descriptor,
+        resolved.bytes,
+        output_path,
+        options,
     );
 }
 
@@ -208,8 +285,8 @@ fn directManifestImpl(
     allocator: std.mem.Allocator,
     root_descriptor: model.Descriptor,
     manifest_bytes: []const u8,
-    config_bytes: []const u8,
-    layer_source: LayerSource,
+    config_input: ConfigInput,
+    layer_input: LayerInput,
     output_path: []const u8,
     options: Options,
     test_options: TestOptions,
@@ -225,13 +302,30 @@ fn directManifestImpl(
         output_name,
         options.force,
     );
-    const expected = try preflightDirectManifest(
+
+    var candidate = try inspectDirectManifest(
         allocator,
         root_descriptor,
         manifest_bytes,
-        config_bytes,
     );
-    if (expected.size > wasm.max_payload_bytes) return error.PayloadTooLarge;
+    defer candidate.deinit();
+    if (candidate.layer_descriptor.size > wasm.max_payload_bytes)
+        return error.PayloadTooLarge;
+
+    var config_metadata: ?transport.Metadata = null;
+    defer if (config_metadata) |*metadata| metadata.deinit();
+    const config_bytes = switch (config_input) {
+        .exact => |bytes| bytes,
+        .source => |source| blk: {
+            config_metadata = try source.readVerifiedBlob(
+                allocator,
+                candidate.config_descriptor,
+                wasm.max_config_bytes,
+            );
+            break :blk config_metadata.?.bytes;
+        },
+    };
+    try validateCandidateConfig(&candidate, config_bytes);
 
     const temporary = try createUniqueTemporary(io, allocator, parent);
     defer allocator.free(temporary.name);
@@ -243,22 +337,38 @@ fn directManifestImpl(
         if (!published) parent.deleteFile(io, temporary.name) catch {};
     }
 
-    var verifier = content.Verifier.init(expected.digest, expected.size);
-    var buffer: [transport.copy_buffer_size]u8 = undefined;
-    var wrote_any = false;
-    while (true) {
-        const count = try layer_source.read(&buffer);
-        if (count == 0) break;
-        const chunk = buffer[0..count];
-        try verifier.update(chunk);
-        try file.writeStreamingAll(io, chunk);
-        if (!wrote_any) {
-            wrote_any = true;
-            if (test_options.failure_point == .after_first_write)
-                return error.InjectedWriteFailure;
-        }
+    switch (layer_input) {
+        .sequential => |layer_source| {
+            var verifier = content.Verifier.init(
+                try content.Digest.parse(candidate.layer_descriptor.digest),
+                candidate.layer_descriptor.size,
+            );
+            var buffer: [transport.copy_buffer_size]u8 = undefined;
+            var wrote_any = false;
+            while (true) {
+                const count = try layer_source.read(&buffer);
+                if (count == 0) break;
+                const chunk = buffer[0..count];
+                try verifier.update(chunk);
+                try file.writeStreamingAll(io, chunk);
+                if (!wrote_any) {
+                    wrote_any = true;
+                    if (test_options.failure_point == .after_first_write)
+                        return error.InjectedWriteFailure;
+                }
+            }
+            try verifier.finish();
+        },
+        .source => |source| try source.copyVerifiedTo(
+            candidate.layer_descriptor,
+            file,
+        ),
     }
-    try verifier.finish();
+    try verifyStagedDescriptor(
+        io,
+        file,
+        candidate.layer_descriptor,
+    );
 
     if (test_options.failure_point == .before_file_sync)
         return error.InjectedSyncFailure;
@@ -268,7 +378,7 @@ fn directManifestImpl(
         io,
         allocator,
         file,
-        expected.size,
+        candidate.layer_descriptor.size,
     );
     defer allocator.free(payload);
 
@@ -283,7 +393,7 @@ fn directManifestImpl(
     const result: Result = .{
         .profile = plan.profile,
         .kind = plan.kind,
-        .bytes_written = expected.size,
+        .bytes_written = candidate.layer_descriptor.size,
     };
 
     const staged_identity = fileIdentity(try file.stat(io));
@@ -341,16 +451,25 @@ fn outputName(output_path: []const u8) Error![]const u8 {
     return name;
 }
 
-fn preflightDirectManifest(
+const DirectManifestCandidate = struct {
+    document: model.ParsedDocument,
+    profile: wasm.DirectManifestProfile,
+    config_descriptor: model.Descriptor,
+    layer_descriptor: model.Descriptor,
+
+    fn deinit(self: *DirectManifestCandidate) void {
+        self.document.deinit();
+        self.* = undefined;
+    }
+};
+
+fn inspectDirectManifest(
     allocator: std.mem.Allocator,
     root_descriptor: model.Descriptor,
     manifest_bytes: []const u8,
-    config_bytes: []const u8,
-) Error!LayerExpectation {
+) Error!DirectManifestCandidate {
     if (manifest_bytes.len > wasm.max_manifest_bytes)
         return error.ManifestTooLarge;
-    if (config_bytes.len > wasm.max_config_bytes)
-        return error.ConfigTooLarge;
     if (std.mem.eql(u8, root_descriptor.mediaType, wasm.media_type_index))
         return error.DirectManifestRequired;
     if (!std.mem.eql(u8, root_descriptor.mediaType, wasm.media_type_manifest))
@@ -362,7 +481,7 @@ fn preflightDirectManifest(
         error.UnsupportedDocumentMediaType, error.DocumentMediaTypeMismatch => return error.UnsupportedManifestMediaType,
         else => return error.MalformedManifest,
     };
-    defer document.deinit();
+    errdefer document.deinit();
     const manifest = switch (document.value) {
         .index => return error.DirectManifestRequired,
         .manifest => |parsed| parsed.value,
@@ -377,30 +496,43 @@ fn preflightDirectManifest(
     const layer = manifest.layers[0];
     if (!std.mem.eql(u8, layer.mediaType, wasm.media_type_wasm))
         return error.UnsupportedLayerMediaType;
-    try verifyDescriptorBytes(manifest.config, config_bytes);
 
-    if (manifest.artifactType) |artifact_type| {
+    const profile: wasm.DirectManifestProfile = if (manifest.artifactType) |artifact_type| blk: {
         if (!std.mem.eql(u8, artifact_type, wasm.artifact_type_wasm) or
             !std.mem.eql(u8, manifest.config.mediaType, wasm.media_type_empty_config))
             return error.UnsupportedProfile;
-        if (!std.mem.eql(u8, config_bytes, wasm.empty_config_bytes))
-            return error.InvalidEmptyConfig;
-    } else {
+        break :blk .oci_1_1;
+    } else blk: {
         if (fields.artifact_type) return error.UnsupportedProfile;
         if (std.mem.eql(u8, manifest.config.mediaType, wasm.media_type_wasm_config)) {
-            // Native kind/config consistency is checked after streaming.
+            break :blk .wasm_v0;
         } else if (std.mem.eql(u8, manifest.config.mediaType, wasm.media_type_wasm)) {
-            if (!std.mem.eql(u8, config_bytes, wasm.empty_config_bytes))
-                return error.InvalidEmptyConfig;
+            break :blk .oci_1_0;
         } else {
             return error.UnsupportedProfile;
         }
-    }
+    };
 
     return .{
-        .digest = try content.Digest.parse(layer.digest),
-        .size = layer.size,
+        .document = document,
+        .profile = profile,
+        .config_descriptor = manifest.config,
+        .layer_descriptor = layer,
     };
+}
+
+fn validateCandidateConfig(
+    candidate: *const DirectManifestCandidate,
+    config_bytes: []const u8,
+) Error!void {
+    if (config_bytes.len > wasm.max_config_bytes)
+        return error.ConfigTooLarge;
+    try verifyDescriptorBytes(candidate.config_descriptor, config_bytes);
+    if (candidate.profile != .wasm_v0 and
+        !std.mem.eql(u8, config_bytes, wasm.empty_config_bytes))
+    {
+        return error.InvalidEmptyConfig;
+    }
 }
 
 fn verifyDescriptorBytes(
@@ -409,6 +541,34 @@ fn verifyDescriptorBytes(
 ) Error!void {
     const digest = try content.Digest.parse(descriptor.digest);
     try content.verifyBytes(digest, descriptor.size, bytes);
+}
+
+fn verifyStagedDescriptor(
+    io: Io,
+    file: Io.File,
+    descriptor: model.Descriptor,
+) !void {
+    if (try file.length(io) != descriptor.size)
+        return error.SizeMismatch;
+    const digest = try content.Digest.parse(descriptor.digest);
+    var verifier = content.Verifier.init(digest, descriptor.size);
+    var buffer: [transport.copy_buffer_size]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < descriptor.size) {
+        const remaining: usize = @intCast(@min(
+            descriptor.size - offset,
+            buffer.len,
+        ));
+        const count = try file.readPositional(
+            io,
+            &.{buffer[0..remaining]},
+            offset,
+        );
+        if (count == 0) return error.SizeMismatch;
+        try verifier.update(buffer[0..count]);
+        offset += count;
+    }
+    try verifier.finish();
 }
 
 const ManifestFields = struct {
@@ -621,6 +781,63 @@ const SliceSource = struct {
         return count;
     }
 };
+
+const TransportFixture = struct {
+    config_descriptor: model.Descriptor,
+    layer_descriptor: model.Descriptor,
+    config_bytes: []const u8,
+    payload_bytes: []const u8,
+    corrupt_config: bool = false,
+    interrupt_after: ?usize = null,
+    metadata_reads: usize = 0,
+    layer_copies: usize = 0,
+
+    pub fn readMetadata(
+        self: *TransportFixture,
+        allocator: std.mem.Allocator,
+        descriptor: model.Descriptor,
+        max_bytes: u64,
+    ) !transport.Metadata {
+        self.metadata_reads += 1;
+        if (!sameDescriptorIdentity(descriptor, self.config_descriptor))
+            return error.UnexpectedDescriptor;
+        if (descriptor.size > max_bytes) return error.MetadataTooLarge;
+        return transport.Metadata.copy(
+            allocator,
+            if (self.corrupt_config) "[]" else self.config_bytes,
+        );
+    }
+
+    pub fn copyVerifiedTo(
+        self: *TransportFixture,
+        descriptor: model.Descriptor,
+        destination: Io.File,
+    ) !void {
+        self.layer_copies += 1;
+        if (!sameDescriptorIdentity(descriptor, self.layer_descriptor))
+            return error.UnexpectedDescriptor;
+        const limit = self.interrupt_after orelse self.payload_bytes.len;
+        var offset: usize = 0;
+        while (offset < @min(limit, self.payload_bytes.len)) {
+            const end = @min(
+                offset + 3,
+                @min(limit, self.payload_bytes.len),
+            );
+            try destination.writeStreamingAll(
+                testing.io,
+                self.payload_bytes[offset..end],
+            );
+            offset = end;
+        }
+        if (self.interrupt_after != null) return error.SourceInterrupted;
+    }
+};
+
+fn sameDescriptorIdentity(a: model.Descriptor, b: model.Descriptor) bool {
+    return a.size == b.size and
+        std.mem.eql(u8, a.mediaType, b.mediaType) and
+        std.mem.eql(u8, a.digest, b.digest);
+}
 
 const JsonDescriptor = struct {
     mediaType: []const u8,
@@ -1113,8 +1330,8 @@ test "oci extraction: force failures preserve old bytes and remove staging" {
             allocator,
             fixture.rootDescriptor(),
             fixture.bytes,
-            wasm.empty_config_bytes,
-            LayerSource.init(&source),
+            .{ .exact = wasm.empty_config_bytes },
+            .{ .sequential = LayerSource.init(&source) },
             output,
             .{ .force = true },
             .{ .failure_point = case.point },
@@ -1190,8 +1407,8 @@ test "oci extraction: destination race does not overwrite the racer" {
         allocator,
         fixture.rootDescriptor(),
         fixture.bytes,
-        wasm.empty_config_bytes,
-        LayerSource.init(&source),
+        .{ .exact = wasm.empty_config_bytes },
+        .{ .sequential = LayerSource.init(&source) },
         output,
         .{},
         .{ .after_checks = PublishHook.init(&race) },
@@ -1245,8 +1462,8 @@ test "oci extraction: replaced staging file is never published" {
         allocator,
         fixture.rootDescriptor(),
         fixture.bytes,
-        wasm.empty_config_bytes,
-        LayerSource.init(&source),
+        .{ .exact = wasm.empty_config_bytes },
+        .{ .sequential = LayerSource.init(&source) },
         output,
         .{ .force = true },
         .{ .before_checks = PublishHook.init(&race) },
@@ -1760,8 +1977,8 @@ test "oci extraction: force detects replacement race" {
         allocator,
         fixture.rootDescriptor(),
         fixture.bytes,
-        wasm.empty_config_bytes,
-        LayerSource.init(&source),
+        .{ .exact = wasm.empty_config_bytes },
+        .{ .sequential = LayerSource.init(&source) },
         output,
         .{ .force = true },
         .{ .before_checks = PublishHook.init(&race) },
@@ -1825,8 +2042,8 @@ test "oci extraction: success follows the synced-file hook boundary" {
         allocator,
         fixture.rootDescriptor(),
         fixture.bytes,
-        wasm.empty_config_bytes,
-        LayerSource.init(&source),
+        .{ .exact = wasm.empty_config_bytes },
+        .{ .sequential = LayerSource.init(&source) },
         output,
         .{},
         .{ .before_checks = PublishHook.init(&observer) },
@@ -1835,6 +2052,125 @@ test "oci extraction: success follows the synced-file hook boundary" {
     const actual = try readOutput(allocator, output);
     defer allocator.free(actual);
     try testing.expectEqualSlices(u8, &payload, actual);
+    try expectNoTemporaryFiles(root);
+}
+
+test "oci extraction: resolved transport source is bounded streamed and cleaned" {
+    const allocator = testing.allocator;
+    const payload = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x04, 0x03, 0x61, 0x62, 0x63,
+    };
+    var package = try wasm.prepare(allocator, &payload, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:00Z",
+        .source_name = "../../ignored.wasm",
+    });
+    defer package.deinit();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp.sub_path);
+    defer allocator.free(root);
+
+    var source_impl: TransportFixture = .{
+        .config_descriptor = package.config_descriptor,
+        .layer_descriptor = package.layer_descriptor,
+        .config_bytes = package.config_bytes,
+        .payload_bytes = package.payload_bytes,
+    };
+    const existing = try childPath(allocator, root, "existing.wasm");
+    defer allocator.free(existing);
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = existing,
+        .data = "old",
+    });
+    try testing.expectError(
+        error.DestinationExists,
+        fromResolvedSource(
+            testing.io,
+            allocator,
+            transport.Source.init(&source_impl),
+            package.root_descriptor,
+            package.manifest_bytes,
+            existing,
+            .{},
+        ),
+    );
+    try testing.expectEqual(@as(usize, 0), source_impl.metadata_reads);
+    try testing.expectEqual(@as(usize, 0), source_impl.layer_copies);
+
+    const output = try childPath(allocator, root, "selected.wasm");
+    defer allocator.free(output);
+    const result = try fromResolvedSource(
+        testing.io,
+        allocator,
+        transport.Source.init(&source_impl),
+        package.root_descriptor,
+        package.manifest_bytes,
+        output,
+        .{},
+    );
+    try testing.expectEqual(wasm.DirectManifestProfile.oci_1_1, result.profile);
+    try testing.expectEqual(wasm.WasmKind.core_module, result.kind);
+    try testing.expectEqual(@as(usize, 1), source_impl.metadata_reads);
+    try testing.expectEqual(@as(usize, 1), source_impl.layer_copies);
+    const actual = try readOutput(allocator, output);
+    defer allocator.free(actual);
+    try testing.expectEqualSlices(u8, &payload, actual);
+
+    var corrupt_config: TransportFixture = .{
+        .config_descriptor = package.config_descriptor,
+        .layer_descriptor = package.layer_descriptor,
+        .config_bytes = package.config_bytes,
+        .payload_bytes = package.payload_bytes,
+        .corrupt_config = true,
+    };
+    const corrupt_output = try childPath(allocator, root, "corrupt-config.wasm");
+    defer allocator.free(corrupt_output);
+    try testing.expectError(
+        error.DigestMismatch,
+        fromResolvedSource(
+            testing.io,
+            allocator,
+            transport.Source.init(&corrupt_config),
+            package.root_descriptor,
+            package.manifest_bytes,
+            corrupt_output,
+            .{},
+        ),
+    );
+    try testing.expectEqual(@as(usize, 1), corrupt_config.metadata_reads);
+    try testing.expectEqual(@as(usize, 0), corrupt_config.layer_copies);
+
+    var interrupted: TransportFixture = .{
+        .config_descriptor = package.config_descriptor,
+        .layer_descriptor = package.layer_descriptor,
+        .config_bytes = package.config_bytes,
+        .payload_bytes = package.payload_bytes,
+        .interrupt_after = 5,
+    };
+    const interrupted_output = try childPath(
+        allocator,
+        root,
+        "interrupted.wasm",
+    );
+    defer allocator.free(interrupted_output);
+    try testing.expectError(
+        error.SourceInterrupted,
+        fromResolvedSource(
+            testing.io,
+            allocator,
+            transport.Source.init(&interrupted),
+            package.root_descriptor,
+            package.manifest_bytes,
+            interrupted_output,
+            .{},
+        ),
+    );
+    try testing.expectError(
+        error.FileNotFound,
+        Io.Dir.cwd().statFile(testing.io, interrupted_output, .{}),
+    );
     try expectNoTemporaryFiles(root);
 }
 

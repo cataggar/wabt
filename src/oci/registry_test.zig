@@ -1,10 +1,12 @@
 const std = @import("std");
-const auth = @import("auth.zig");
-const content = @import("content.zig");
-const model = @import("model.zig");
-const reference = @import("reference.zig");
-const registry = @import("registry.zig");
-const registry_http = @import("registry_http.zig");
+const oci = @import("wabt").oci;
+const auth = oci.auth;
+const content = oci.content;
+const model = oci.model;
+const reference = oci.reference;
+const registry = oci.registry;
+const registry_http = oci.registry_http;
+const wasm = oci.wasm;
 
 const Allocator = std.mem.Allocator;
 
@@ -867,6 +869,157 @@ test "resolve pins a moved tag once and all later reads use exact digest paths" 
         moved.descriptor.digest,
     ));
     try std.testing.expectEqual(@as(usize, 3), fake.index);
+}
+
+test "registry extraction resolves once before a tag moves" {
+    const allocator = std.testing.allocator;
+    const payload = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x04, 0x03, 0x61, 0x62, 0x63,
+    };
+    var package = try wasm.prepare(allocator, &payload, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:00Z",
+        .source_name = "registry.wasm",
+    });
+    defer package.deinit();
+    var moved_package = try wasm.prepare(allocator, &payload, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:01Z",
+        .source_name = "registry.wasm",
+    });
+    defer moved_package.deinit();
+
+    const manifest_headers = try headersFor(
+        allocator,
+        wasm.media_type_manifest,
+        package.manifest_bytes,
+        package.root_descriptor.digest,
+        &.{},
+    );
+    defer freeHeaders(allocator, manifest_headers);
+    const moved_headers = try headersFor(
+        allocator,
+        wasm.media_type_manifest,
+        moved_package.manifest_bytes,
+        moved_package.root_descriptor.digest,
+        &.{},
+    );
+    defer freeHeaders(allocator, moved_headers);
+    const config_headers = try headersFor(
+        allocator,
+        "application/octet-stream",
+        package.config_bytes,
+        package.config_descriptor.digest,
+        &.{},
+    );
+    defer freeHeaders(allocator, config_headers);
+    const layer_headers = try headersFor(
+        allocator,
+        "application/octet-stream",
+        package.payload_bytes,
+        package.layer_descriptor.digest,
+        &.{},
+    );
+    defer freeHeaders(allocator, layer_headers);
+    const config_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/repo/blobs/{s}",
+        .{package.config_descriptor.digest},
+    );
+    defer allocator.free(config_path);
+    const layer_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/repo/blobs/{s}",
+        .{package.layer_descriptor.digest},
+    );
+    defer allocator.free(layer_path);
+    const steps = [_]Step{
+        .{
+            .path_suffix = "/v2/repo/manifests/latest",
+            .class = .registry,
+            .headers = manifest_headers.values,
+            .body = package.manifest_bytes,
+        },
+        .{
+            .path_suffix = config_path,
+            .class = .blob,
+            .headers = config_headers.values,
+            .body = package.config_bytes,
+        },
+        .{
+            .path_suffix = layer_path,
+            .class = .blob,
+            .headers = layer_headers.values,
+            .body = package.payload_bytes,
+        },
+        .{
+            .path_suffix = "/v2/repo/manifests/latest",
+            .class = .registry,
+            .headers = moved_headers.values,
+            .body = moved_package.manifest_bytes,
+        },
+    };
+    var runtime: FakeRuntime = .{};
+    var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+    var source = try initSource(
+        &fake,
+        &runtime,
+        .{ .tag = "latest" },
+        .none,
+        .{},
+    );
+    defer source.deinit();
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const output = try std.fmt.allocPrint(
+        allocator,
+        ".zig-cache/tmp/{s}/registry-extracted.wasm",
+        .{tmp.sub_path},
+    );
+    defer allocator.free(output);
+    const result = try oci.extractRegistrySource(
+        allocator,
+        &source,
+        .{
+            .authority = "localhost:5000",
+            .repository = "repo",
+            .selection = .{ .tag = "latest" },
+        },
+        output,
+        .{},
+    );
+    try std.testing.expectEqual(wasm.DirectManifestProfile.oci_1_1, result.profile);
+    try std.testing.expectEqual(wasm.WasmKind.core_module, result.kind);
+    try std.testing.expectEqual(@as(usize, 3), fake.index);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        fake.url(0),
+        "/v2/repo/manifests/latest",
+    ));
+    try std.testing.expect(std.mem.endsWith(u8, fake.url(1), config_path));
+    try std.testing.expect(std.mem.endsWith(u8, fake.url(2), layer_path));
+    const extracted = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        output,
+        allocator,
+        .limited(wasm.max_payload_bytes),
+    );
+    defer allocator.free(extracted);
+    try std.testing.expectEqualSlices(u8, &payload, extracted);
+
+    var moved = try source.resolve(.{
+        .authority = "localhost:5000",
+        .repository = "repo",
+        .selection = .{ .tag = "latest" },
+    });
+    defer moved.deinit();
+    try std.testing.expectEqualStrings(
+        moved_package.root_descriptor.digest,
+        moved.descriptor.digest,
+    );
+    try std.testing.expectEqual(@as(usize, 4), fake.index);
 }
 
 test "digest resolution verifies bytes and conflicting digest headers are never trusted" {

@@ -1,10 +1,12 @@
 const std = @import("std");
 const content = @import("content.zig");
 const copy = @import("copy.zig");
+const extract = @import("extract.zig");
 const layout = @import("layout.zig");
 const model = @import("model.zig");
 const reference = @import("reference.zig");
 const transport = @import("transport.zig");
+const wasm = @import("wasm.zig");
 
 const ManifestOptions = struct {
     tag: ?[]const u8 = "source",
@@ -761,6 +763,228 @@ test "concurrent first and existing layout writers retain references" {
         .selection = .{ .tag = "old" },
     });
     defer old.deinit();
+}
+
+test "prepared profiles publish and extract through shared layout contracts" {
+    const allocator = std.testing.allocator;
+    const core = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x04, 0x03, 0x61, 0x62, 0x63,
+    };
+    const component = [_]u8{
+        0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
+    };
+    var large_core: std.ArrayListUnmanaged(u8) = .empty;
+    defer large_core.deinit(allocator);
+    try large_core.appendSlice(allocator, core[0..8]);
+    try large_core.append(allocator, 0);
+    const custom_size = transport.copy_buffer_size * 2 + 17;
+    var encoded_size: [5]u8 = undefined;
+    const encoded_size_len = @import("../leb128.zig").writeU32Leb128(
+        &encoded_size,
+        @intCast(custom_size + 1),
+    );
+    try large_core.appendSlice(allocator, encoded_size[0..encoded_size_len]);
+    try large_core.append(allocator, 0);
+    for (0..custom_size) |index|
+        try large_core.append(allocator, @truncate(index));
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp.sub_path);
+    defer allocator.free(root);
+    const layout_path = try childPath(allocator, root, "profiles");
+    defer allocator.free(layout_path);
+
+    const Case = struct {
+        profile: wasm.Profile,
+        expected_profile: wasm.DirectManifestProfile,
+        expected_kind: wasm.WasmKind,
+        payload: []const u8,
+        tag: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .profile = .wasm_v0,
+            .expected_profile = .wasm_v0,
+            .expected_kind = .core_module,
+            .payload = &core,
+            .tag = "v0-core",
+        },
+        .{
+            .profile = .wasm_v0,
+            .expected_profile = .wasm_v0,
+            .expected_kind = .component,
+            .payload = &component,
+            .tag = "v0-component",
+        },
+        .{
+            .profile = .oci,
+            .expected_profile = .oci_1_1,
+            .expected_kind = .core_module,
+            .payload = large_core.items,
+            .tag = "generic-large",
+        },
+    };
+
+    for (cases) |case| {
+        var package = try wasm.prepare(allocator, case.payload, .{
+            .profile = case.profile,
+            .created = "2026-09-19T00:00:00Z",
+            .author = "adapter-test",
+            .source_name = "../../hostile.wasm",
+        });
+        defer package.deinit();
+
+        const publication = try copy.packageToLayout(
+            std.testing.io,
+            allocator,
+            &package,
+            .{
+                .path = layout_path,
+                .selection = .{ .tag = case.tag },
+            },
+            .{},
+        );
+        try std.testing.expect(
+            (try content.Digest.parse(package.root_descriptor.digest)).eql(
+                publication.root,
+            ),
+        );
+
+        const manifest = try readBlob(
+            std.testing.io,
+            allocator,
+            layout_path,
+            package.root_descriptor,
+        );
+        defer allocator.free(manifest);
+        try std.testing.expectEqualSlices(
+            u8,
+            package.manifest_bytes,
+            manifest,
+        );
+        const config = try readBlob(
+            std.testing.io,
+            allocator,
+            layout_path,
+            package.config_descriptor,
+        );
+        defer allocator.free(config);
+        try std.testing.expectEqualSlices(u8, package.config_bytes, config);
+        const payload = try readBlob(
+            std.testing.io,
+            allocator,
+            layout_path,
+            package.layer_descriptor,
+        );
+        defer allocator.free(payload);
+        try std.testing.expectEqualSlices(u8, case.payload, payload);
+
+        var source = layout.Source.init(
+            std.testing.io,
+            allocator,
+            layout_path,
+        );
+        var resolved = try source.resolve(.{
+            .path = layout_path,
+            .selection = .{ .tag = case.tag },
+        });
+        defer resolved.deinit();
+        try std.testing.expectEqualStrings(
+            package.root_descriptor.digest,
+            resolved.descriptor.digest,
+        );
+        try std.testing.expectEqualSlices(
+            u8,
+            package.manifest_bytes,
+            resolved.bytes,
+        );
+
+        const output = try std.fmt.allocPrint(
+            allocator,
+            "{s}/{s}.wasm",
+            .{ root, case.tag },
+        );
+        defer allocator.free(output);
+        const extracted = try extract.fromLayoutSource(
+            allocator,
+            &source,
+            .{
+                .path = layout_path,
+                .selection = .{ .tag = case.tag },
+            },
+            output,
+            .{},
+        );
+        try std.testing.expectEqual(case.expected_profile, extracted.profile);
+        try std.testing.expectEqual(case.expected_kind, extracted.kind);
+        const output_bytes = try std.Io.Dir.cwd().readFileAlloc(
+            std.testing.io,
+            output,
+            allocator,
+            .limited(wasm.max_payload_bytes),
+        );
+        defer allocator.free(output_bytes);
+        try std.testing.expectEqualSlices(u8, case.payload, output_bytes);
+    }
+
+    var first = try wasm.prepare(allocator, &core, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:00Z",
+        .source_name = "same.wasm",
+    });
+    defer first.deinit();
+    var same = try wasm.prepare(allocator, &core, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:00Z",
+        .source_name = "same.wasm",
+    });
+    defer same.deinit();
+    var later = try wasm.prepare(allocator, &core, .{
+        .profile = .oci,
+        .created = "2026-09-19T00:00:01Z",
+        .source_name = "same.wasm",
+    });
+    defer later.deinit();
+    try std.testing.expectEqualStrings(
+        first.root_descriptor.digest,
+        same.root_descriptor.digest,
+    );
+    try std.testing.expectEqualStrings(
+        first.layer_descriptor.digest,
+        later.layer_descriptor.digest,
+    );
+    try std.testing.expectEqualStrings(
+        first.config_descriptor.digest,
+        later.config_descriptor.digest,
+    );
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        first.root_descriptor.digest,
+        later.root_descriptor.digest,
+    ));
+    _ = try copy.packageToLayout(
+        std.testing.io,
+        allocator,
+        &first,
+        .{
+            .path = layout_path,
+            .selection = .{ .tag = "generic-fixed" },
+        },
+        .{},
+    );
+    const repeated = try copy.packageToLayout(
+        std.testing.io,
+        allocator,
+        &same,
+        .{
+            .path = layout_path,
+            .selection = .{ .tag = "generic-repeated" },
+        },
+        .{},
+    );
+    try std.testing.expectEqual(transport.CommitResult.published, repeated.commit);
+    try std.testing.expectEqual(@as(u64, 3), repeated.counts.reused);
 }
 
 fn makeManifestLayout(

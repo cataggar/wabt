@@ -176,6 +176,33 @@ pub const Source = struct {
         );
     }
 
+    /// Reads one bounded non-document blob and independently checks the
+    /// source result against the exact descriptor. Manifests and indexes must
+    /// continue through the manifest-aware metadata methods above.
+    pub fn readVerifiedBlob(
+        self: Source,
+        allocator: std.mem.Allocator,
+        descriptor: model.Descriptor,
+        max_bytes: u64,
+    ) !Metadata {
+        if (model.classifyMediaType(descriptor.mediaType).isDocument()) {
+            return error.DocumentRoleMismatch;
+        }
+        const digest = try model.validateDescriptor(descriptor);
+        if (descriptor.size > max_bytes) return error.MaximumBlobBytesExceeded;
+
+        var metadata = try self.readMetadata(
+            allocator,
+            descriptor,
+            max_bytes,
+        );
+        errdefer metadata.deinit();
+        const actual_size = try content.checkedSize(metadata.bytes.len);
+        if (actual_size > max_bytes) return error.SourceContractViolation;
+        try content.verifyBytes(digest, descriptor.size, metadata.bytes);
+        return metadata;
+    }
+
     /// Streams an opaque descriptor into a destination-owned file while
     /// verifying its declared size and digest.
     pub fn copyVerifiedTo(
@@ -571,6 +598,37 @@ test "source destination and lifecycle adapters preserve typed boundaries" {
     var metadata = try source.readMetadata(std.testing.allocator, descriptor, 2);
     defer metadata.deinit();
     try std.testing.expectEqualStrings("{}", metadata.bytes);
+    var blob = try source.readVerifiedBlob(
+        std.testing.allocator,
+        .{
+            .mediaType = model.media_type_oci_empty_config,
+            .digest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+            .size = 2,
+        },
+        2,
+    );
+    defer blob.deinit();
+    try std.testing.expectEqualStrings("{}", blob.bytes);
+    try std.testing.expectError(
+        error.DocumentRoleMismatch,
+        source.readVerifiedBlob(
+            std.testing.allocator,
+            descriptor,
+            2,
+        ),
+    );
+    try std.testing.expectError(
+        error.MaximumBlobBytesExceeded,
+        source.readVerifiedBlob(
+            std.testing.allocator,
+            .{
+                .mediaType = model.media_type_oci_empty_config,
+                .digest = "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                .size = 2,
+            },
+            1,
+        ),
+    );
 
     var destination_impl: DestinationImpl = .{};
     const destination = Destination.init(&destination_impl);

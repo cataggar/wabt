@@ -81,3 +81,16 @@ corrupt blob errors. `src/oci/copy.zig` adapts the dependency-first execution
 portion of miz `copy.resolvedToDestination`; discovery remains exclusively in
 WABT's single `graph.planCopy` implementation and performs no platform
 selection.
+
+## OCI Wasm profile contracts
+
+- **Wasm-v0 source:** [rust-oci-wasm v0.6.0](https://github.com/bytecodealliance/rust-oci-wasm/tree/v0.6.0), commit [`8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd`](https://github.com/bytecodealliance/rust-oci-wasm/commit/8d1cecafef729cbd7240d9701d2dea5eaa6f4fdd)
+- **wkg compatibility reference:** [wasm-pkg-tools `wkg` OCI commands](https://github.com/bytecodealliance/wasm-pkg-tools/blob/5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a/crates/wkg/src/oci.rs), commit [`5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a`](https://github.com/bytecodealliance/wasm-pkg-tools/commit/5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a)
+
+`src/oci/wasm.zig` implements these profile contracts with handcrafted,
+deterministic fixtures rather than copied upstream binaries. Wasm-v0 uses the
+versioned config media type and native WABT parsing for metadata. The generic
+profile is the OCI 1.1/ORAS shape with the canonical empty JSON config; it is
+generic-OCI compatible but intentionally not accepted by wkg's Wasm-v0 config
+check. The OCI 1.0 ORAS shape is accepted for reads only. Tests do not invoke
+ORAS, wkg, a registry, an archive tool, or a runtime.
