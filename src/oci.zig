@@ -15,6 +15,7 @@ pub const graph = @import("oci/graph.zig");
 pub const layout = @import("oci/layout.zig");
 pub const copy = @import("oci/copy.zig");
 pub const wasm_metadata = @import("oci/wasm_metadata.zig");
+pub const wasm = @import("oci/wasm.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -107,5 +108,6 @@ test {
     _ = @import("oci/layout.zig");
     _ = @import("oci/copy.zig");
     _ = @import("oci/wasm_metadata.zig");
+    _ = @import("oci/wasm.zig");
     _ = @import("oci/integration_tests.zig");
 }

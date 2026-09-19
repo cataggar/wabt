@@ -17,7 +17,7 @@ pub const WasmKind = enum {
     component,
 };
 
-/// Wasm-v0's historical `os` profile label, when native parsing proves it.
+/// Wasm-v0's historical `os` profile label.
 pub const WasmV0Target = enum {
     wasip1,
     wasip2,
@@ -63,7 +63,7 @@ pub const PayloadMetadata = struct {
     /// The caller's original bytes, borrowed unchanged.
     payload: []const u8,
     kind: WasmKind,
-    wasm_v0_target: ?WasmV0Target,
+    wasm_v0_target: WasmV0Target,
     component: ?ComponentMetadata,
 
     pub fn deinit(self: *PayloadMetadata, allocator: std.mem.Allocator) void {
@@ -71,10 +71,10 @@ pub const PayloadMetadata = struct {
         self.* = undefined;
     }
 
-    /// Return the Wasm-v0 profile label only when it is supported by native
-    /// evidence. A generic core module is not automatically WASI Preview 1.
-    pub fn wasmV0Os(self: PayloadMetadata) ValidationError![]const u8 {
-        return (self.wasm_v0_target orelse return error.UnsupportedCoreTarget).string();
+    /// Return the Wasm-v0 profile label assigned after native validation.
+    /// `wasip1` and `wasip2` are packaging labels, not runtime qualification.
+    pub fn wasmV0Os(self: PayloadMetadata) []const u8 {
+        return self.wasm_v0_target.string();
     }
 };
 
@@ -85,7 +85,6 @@ pub const ValidationError = error{
     UnsupportedComponentShape,
     BinaryWitUnsupported,
     UnsupportedExternKind,
-    UnsupportedCoreTarget,
     DuplicateExternName,
     DuplicateAttribute,
     InvalidExternName,
@@ -113,7 +112,10 @@ pub fn validatePayload(
         .core_module => .{
             .payload = bytes,
             .kind = .core_module,
-            .wasm_v0_target = try validateCoreModule(scratch, bytes),
+            .wasm_v0_target = target: {
+                try validateCoreModule(scratch, bytes);
+                break :target .wasip1;
+            },
             .component = null,
         },
         .component => blk: {
@@ -165,7 +167,7 @@ fn detectKind(bytes: []const u8) ValidationError!WasmKind {
 fn validateCoreModule(
     allocator: std.mem.Allocator,
     bytes: []const u8,
-) ValidationError!?WasmV0Target {
+) ValidationError!void {
     const module = core_reader.readModule(allocator, bytes) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.UnsupportedOpcode => return error.UnsupportedCoreFeature,
@@ -177,12 +179,6 @@ fn validateCoreModule(
         error.UnsupportedOpcode, error.LegacyExceptionsUnsupported => return error.UnsupportedCoreFeature,
         else => return error.InvalidWasm,
     };
-
-    for (module.imports.items) |import| {
-        if (std.mem.eql(u8, import.module_name, "wasi_snapshot_preview1"))
-            return .wasip1;
-    }
-    return null;
 }
 
 fn validateCoreNames(module: *const @import("../Module.zig").Module) ValidationError!void {
@@ -626,13 +622,12 @@ test "classifies validated core, component, and invalid payloads" {
     );
 }
 
-test "core target requires native WASI Preview 1 import evidence" {
+test "validated core modules use the Wasm-v0 wasip1 profile label" {
     const allocator = testing.allocator;
     const generic = [_]u8{ 0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00 };
     var generic_metadata = try validatePayload(allocator, &generic);
     defer generic_metadata.deinit(allocator);
-    try testing.expect(generic_metadata.wasm_v0_target == null);
-    try testing.expectError(error.UnsupportedCoreTarget, generic_metadata.wasmV0Os());
+    try testing.expectEqualStrings("wasip1", generic_metadata.wasmV0Os());
     try testing.expectEqual(generic[0..].ptr, generic_metadata.payload.ptr);
     try testing.expectEqualSlices(u8, &generic, generic_metadata.payload);
 
@@ -640,7 +635,7 @@ test "core target requires native WASI Preview 1 import evidence" {
     defer allocator.free(wasi);
     var wasi_metadata = try validatePayload(allocator, wasi);
     defer wasi_metadata.deinit(allocator);
-    try testing.expectEqualStrings("wasip1", try wasi_metadata.wasmV0Os());
+    try testing.expectEqualStrings("wasip1", wasi_metadata.wasmV0Os());
 }
 
 test "extracts complete versioned component names and supported kinds" {
@@ -651,7 +646,7 @@ test "extracts complete versioned component names and supported kinds" {
     var metadata = try validatePayload(allocator, bytes);
     defer metadata.deinit(allocator);
     try testing.expectEqual(WasmKind.component, metadata.kind);
-    try testing.expectEqualStrings("wasip2", try metadata.wasmV0Os());
+    try testing.expectEqualStrings("wasip2", metadata.wasmV0Os());
     try testing.expectEqual(bytes.ptr, metadata.payload.ptr);
     try testing.expectEqualSlices(u8, bytes, metadata.payload);
 
