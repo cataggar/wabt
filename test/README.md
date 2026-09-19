@@ -20,6 +20,14 @@ To convert a single `.wast` file to JSON + `.wasm` modules:
 $ ./zig-out/bin/wabt spec to-json input.wast
 ```
 
+## OCI foundation
+
+The public `wabt.oci` namespace currently establishes module discovery and
+the license/provenance boundary for the OCI foundation. This initial skeleton
+does not yet provide content, reference, model, graph, layout, copy,
+networking, or CLI behavior. OCI tests will remain part of the normal
+`zig build test` suite as those library modules are added.
+
 ## Core GC regression corpus
 
 `src/fixtures/gc-regression/corpus.json` is embedded by
