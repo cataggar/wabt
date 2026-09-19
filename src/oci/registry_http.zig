@@ -31,6 +31,7 @@ pub const Error = error{
     ProtocolError,
     ContentEncodingRejected,
     BodySinkFailed,
+    BodySourceFailed,
 };
 
 pub const Limits = struct {
@@ -392,6 +393,48 @@ pub const BodySink = struct {
     }
 };
 
+pub const BodySourceError = error{SourceFailed};
+
+/// A fixed-length, replay-neutral request body. The HTTP policy never retries
+/// methods with request bodies; backends consume bytes positionally so short
+/// reads remain bounded and deterministic.
+pub const BodySource = struct {
+    context: *anyopaque,
+    length: u64,
+    read_fn: *const fn (
+        *anyopaque,
+        offset: u64,
+        buffer: []u8,
+    ) BodySourceError!usize,
+
+    pub fn init(pointer: anytype, length: u64) BodySource {
+        const Pointer = @TypeOf(pointer);
+        const Adapter = struct {
+            fn read(
+                context: *anyopaque,
+                offset: u64,
+                buffer: []u8,
+            ) BodySourceError!usize {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.read(offset, buffer);
+            }
+        };
+        return .{
+            .context = pointer,
+            .length = length,
+            .read_fn = Adapter.read,
+        };
+    }
+
+    pub fn read(
+        self: BodySource,
+        offset: u64,
+        buffer: []u8,
+    ) BodySourceError!usize {
+        return self.read_fn(self.context, offset, buffer);
+    }
+};
+
 pub const BackendCapabilities = struct {
     absolute_deadline: bool = false,
     dns_timeout: bool = false,
@@ -411,6 +454,7 @@ pub const BackendRequest = struct {
     response_header_limit: usize,
     body_limit: u64,
     error_body_limit: usize = 64 * 1024,
+    body_source: ?BodySource = null,
     body_sink: ?BodySink = null,
     absolute_deadline_ns: i128,
     attempt_timeout_ns: u64,
@@ -446,6 +490,7 @@ pub const BackendError = error{
     Timeout,
     HeaderLimitExceeded,
     BodyLimitExceeded,
+    BodySourceFailed,
     BodySinkFailed,
     TransportFailure,
     ProtocolFailure,
@@ -628,10 +673,15 @@ pub const ClientOptions = struct {
 
 pub const RequestOptions = struct {
     method: std.http.Method = .GET,
-    path_and_query: []const u8,
+    path_and_query: []const u8 = "",
+    /// Used only for a previously validated Distribution upload Location.
+    /// Cross-origin targets require `authorization_stripped`.
+    absolute_url: ?[]const u8 = null,
+    authorization_stripped: bool = false,
     class: RequestClass = .registry,
     headers: []const Header = &.{},
     max_body_bytes: ?u64 = null,
+    body_source: ?BodySource = null,
     body_sink: ?BodySink = null,
     /// Authentication challenge handling can replay a request. Mutating
     /// registry operations disable it and surface 401 instead.
@@ -794,17 +844,46 @@ pub const Client = struct {
             return self.fail(error.InvalidRequest, .protocol, options.class, null, self.endpoint.origin.canonical);
         }
         const body_limit = options.max_body_bytes orelse self.limits.max_metadata_body_bytes;
-        if ((body_limit == 0 and options.method != .HEAD and options.body_sink == null) or
+        if ((body_limit == 0 and options.method != .HEAD and
+            options.body_sink == null and options.body_source == null) or
             (options.body_sink == null and body_limit > self.limits.max_metadata_body_bytes))
         {
             return self.fail(error.LimitExceeded, .limit, options.class, null, self.endpoint.origin.canonical);
         }
+        if ((options.body_source != null and !options.method.requestHasBody()) or
+            (options.body_source != null and options.body_sink != null) or
+            (options.method.requestHasBody() and options.allow_auth_replay))
+        {
+            return self.fail(error.InvalidRequest, .protocol, options.class, null, self.endpoint.origin.canonical);
+        }
         try self.checkDeadline(options.deadline, options.class, self.endpoint.origin.canonical);
 
-        var current_url = try self.endpoint.urlAlloc(options.path_and_query);
+        var current_url = if (options.absolute_url) |absolute| blk: {
+            if (options.path_and_query.len != 0 or
+                absolute.len == 0 or
+                absolute.len > self.limits.max_location_bytes)
+            {
+                return self.fail(error.InvalidRequest, .protocol, options.class, null, self.endpoint.origin.canonical);
+            }
+            break :blk try self.allocator.dupe(u8, absolute);
+        } else try self.endpoint.urlAlloc(options.path_and_query);
         defer self.allocator.free(current_url);
-        var current_origin = try self.endpoint.origin.clone(self.allocator);
+        var current_origin = try parseOrigin(self.allocator, current_url);
         defer current_origin.deinit();
+        if (options.absolute_url != null) {
+            const same_origin = self.endpoint.origin.eql(current_origin);
+            if (!same_origin and
+                (!options.authorization_stripped or
+                    current_origin.scheme != .https))
+            {
+                return self.fail(error.RedirectRejected, .redirect, options.class, null, self.endpoint.origin.canonical);
+            }
+            if (self.endpoint.origin.scheme == .https and
+                current_origin.scheme == .http)
+            {
+                return self.fail(error.RedirectRejected, .redirect, options.class, null, self.endpoint.origin.canonical);
+            }
+        }
 
         var visited = std.array_list.Managed([32]u8).init(self.allocator);
         defer visited.deinit();
@@ -812,7 +891,7 @@ pub const Client = struct {
 
         var redirects: u16 = 0;
         var retry_attempts: u16 = 0;
-        var authorization_stripped = false;
+        var authorization_stripped = options.authorization_stripped;
         var bearer_attempts: u8 = 0;
         var dynamic_authorization: ?auth.Authorization = null;
         defer if (dynamic_authorization) |*value| value.deinit(self.allocator);
@@ -849,6 +928,7 @@ pub const Client = struct {
                 .response_header_limit = self.limits.max_response_header_bytes,
                 .body_limit = body_limit,
                 .error_body_limit = self.limits.max_error_body_bytes,
+                .body_source = options.body_source,
                 .body_sink = options.body_sink,
                 .absolute_deadline_ns = options.deadline.at_ns,
                 .attempt_timeout_ns = attempt_timeout,
@@ -875,6 +955,7 @@ pub const Client = struct {
                     error.TlsFailure => self.fail(error.TlsValidationFailed, .tls, options.class, null, current_origin.canonical),
                     error.Timeout => self.fail(error.DeadlineExceeded, .deadline, options.class, null, current_origin.canonical),
                     error.HeaderLimitExceeded, error.BodyLimitExceeded => self.fail(error.LimitExceeded, .limit, options.class, null, current_origin.canonical),
+                    error.BodySourceFailed => self.fail(error.BodySourceFailed, .protocol, options.class, null, current_origin.canonical),
                     error.BodySinkFailed => self.fail(error.BodySinkFailed, .protocol, options.class, null, current_origin.canonical),
                     error.ProtocolFailure => self.fail(error.ProtocolError, .protocol, options.class, null, current_origin.canonical),
                     error.DnsFailure,
@@ -1282,8 +1363,39 @@ pub const StdBackend = struct {
         }) catch |err| return mapStdBackendError(err);
         defer std_request.deinit();
         if (options.method.requestHasBody()) {
-            std_request.sendBodyComplete(&.{}) catch |err|
-                return mapStdBackendError(err);
+            if (options.body_source) |source| {
+                std_request.transfer_encoding = .{
+                    .content_length = source.length,
+                };
+                var writer_buffer: [16 * 1024]u8 = undefined;
+                var transfer_buffer: [64 * 1024]u8 = undefined;
+                var body_writer = std_request.sendBody(&writer_buffer) catch |err|
+                    return mapStdBackendError(err);
+                var offset: u64 = 0;
+                while (offset < source.length) {
+                    const remaining = source.length - offset;
+                    const request_size: usize = @intCast(@min(
+                        remaining,
+                        transfer_buffer.len,
+                    ));
+                    const count = source.read(
+                        offset,
+                        transfer_buffer[0..request_size],
+                    ) catch return error.BodySourceFailed;
+                    if (count == 0 or count > request_size) {
+                        return error.BodySourceFailed;
+                    }
+                    body_writer.writer.writeAll(
+                        transfer_buffer[0..count],
+                    ) catch |err| return mapStdBackendError(err);
+                    offset = std.math.add(u64, offset, count) catch
+                        return error.BodySourceFailed;
+                }
+                body_writer.end() catch |err| return mapStdBackendError(err);
+            } else {
+                std_request.sendBodyComplete(&.{}) catch |err|
+                    return mapStdBackendError(err);
+            }
         } else {
             std_request.sendBodiless() catch |err| return mapStdBackendError(err);
         }
@@ -1671,6 +1783,7 @@ pub const ResolvedUploadLocation = struct {
     authorization_stripped: bool,
 
     pub fn deinit(self: *ResolvedUploadLocation) void {
+        @memset(self.url, 0);
         self.allocator.free(self.url);
         self.origin.deinit();
         self.* = undefined;
@@ -1707,8 +1820,35 @@ pub fn resolveUploadLocationAlloc(
         return error.RedirectRejected;
     }
 
-    const current_url = try endpoint.urlAlloc(current_path_and_query);
-    defer endpoint.allocator.free(current_url);
+    const current_url = if (hasUriScheme(current_path_and_query)) blk: {
+        if (current_path_and_query.len > max_result_bytes) {
+            return error.RedirectRejected;
+        }
+        const copy = try duplicateAbsoluteLocationAlloc(
+            allocator,
+            current_path_and_query,
+        );
+        var current_origin = try parseOrigin(allocator, copy);
+        defer current_origin.deinit();
+        if (endpoint.origin.scheme == .https and
+            current_origin.scheme == .http)
+        {
+            allocator.free(copy);
+            return error.RedirectRejected;
+        }
+        if (!endpoint.origin.eql(current_origin) and
+            current_origin.scheme != .https)
+        {
+            allocator.free(copy);
+            return error.RedirectRejected;
+        }
+        break :blk copy;
+    } else blk: {
+        const endpoint_url = try endpoint.urlAlloc(current_path_and_query);
+        defer endpoint.allocator.free(endpoint_url);
+        break :blk try allocator.dupe(u8, endpoint_url);
+    };
+    defer allocator.free(current_url);
     const absolute = hasUriScheme(location);
     const url = if (absolute)
         try duplicateAbsoluteLocationAlloc(allocator, location)
@@ -1876,6 +2016,7 @@ pub fn isRetryableBackendError(err: BackendError) bool {
         error.TlsFailure,
         error.HeaderLimitExceeded,
         error.BodyLimitExceeded,
+        error.BodySourceFailed,
         error.BodySinkFailed,
         error.TransportFailure,
         error.ProtocolFailure,
@@ -2992,6 +3133,7 @@ test "retry policy is limited to idempotent reads and narrow statuses and errors
         var response = try client.execute(.{
             .method = .POST,
             .path_and_query = "/v2/upload",
+            .allow_auth_replay = false,
             .deadline = .after(runtime.clock(), std.time.ns_per_s),
         });
         defer response.deinit();
@@ -3019,6 +3161,7 @@ test "retry policy is limited to idempotent reads and narrow statuses and errors
             client.execute(.{
                 .method = .PUT,
                 .path_and_query = "/v2/upload",
+                .allow_auth_replay = false,
                 .deadline = .after(runtime.clock(), std.time.ns_per_s),
             }),
         );

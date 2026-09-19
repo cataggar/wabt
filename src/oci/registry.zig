@@ -7,6 +7,7 @@
 //! cataggar/miz commit
 //! 669a27982b376311f558e820b69e9a692735b0cd (MIT).
 const std = @import("std");
+const builtin = @import("builtin");
 const auth = @import("auth.zig");
 const content = @import("content.zig");
 const graph = @import("graph.zig");
@@ -46,9 +47,10 @@ pub const Error = error{
     CertificateAuthorityLoadFailed,
     DestinationNotPrepared,
     DestinationStateConflict,
-    UploadRequired,
-    ManifestPublicationNotImplemented,
-    RootPublicationNotImplemented,
+    UploadIncomplete,
+    UploadAmbiguous,
+    PublicationUnconfirmed,
+    DestinationNotStaged,
     DestinationNotCommitted,
 } || Allocator.Error;
 
@@ -61,6 +63,7 @@ pub const Limits = struct {
     max_total_tag_bytes: u64 = 16 * 1024 * 1024,
     max_tag_length: usize = 128,
     max_link_bytes: usize = 16 * 1024,
+    max_upload_chunks: u64 = 4096,
 
     pub fn validate(self: Limits) Error!void {
         if (self.max_metadata_bytes == 0 or
@@ -72,7 +75,8 @@ pub const Limits = struct {
             self.max_total_tag_bytes == 0 or
             self.max_tag_length == 0 or
             self.max_tag_length > 128 or
-            self.max_link_bytes == 0)
+            self.max_link_bytes == 0 or
+            self.max_upload_chunks == 0)
         {
             return error.InvalidConfiguration;
         }
@@ -115,6 +119,13 @@ pub const DestinationOptions = struct {
     auth_context_id: u64 = 0,
     credential_generation: u64 = 0,
     mount_policy: MountPolicy = .same_origin,
+    /// Null selects one monolithic upload PUT. A nonzero value selects
+    /// PATCH chunks of at most this many bytes followed by an empty finalize
+    /// PUT. The fixed transport buffer remains 64 KiB in both modes.
+    upload_chunk_bytes: ?u64 = null,
+    /// Directory used for exclusive private spool files. The current
+    /// directory is used when omitted; every spool is removed on return.
+    spool_directory: ?[]const u8 = null,
 
     fn sourceOptions(self: DestinationOptions) Options {
         return .{
@@ -143,6 +154,10 @@ pub const Operation = enum {
     destination_preflight,
     destination_probe,
     destination_mount,
+    destination_upload_start,
+    destination_upload_write,
+    destination_upload_finalize,
+    publish_manifest,
     stage_root,
     commit_root,
     finish,
@@ -1444,6 +1459,7 @@ pub const Source = struct {
             error.TransportFailed => self.fail(error.TransportFailed, operation, .transport, status, null, expected),
             error.CertificateAuthorityLoadFailed => self.fail(error.CertificateAuthorityLoadFailed, operation, .tls, status, null, expected),
             error.ContentEncodingRejected => self.fail(error.InvalidContent, operation, .invalid_content, status, null, expected),
+            error.BodySourceFailed,
             error.BodySinkFailed,
             error.InvalidLimits,
             error.InvalidEndpoint,
@@ -1484,7 +1500,9 @@ pub const BlobState = enum {
 pub const DestinationState = enum {
     initialized,
     prepared,
-    upload_required,
+    staged,
+    committed,
+    finished,
     failed,
 };
 
@@ -1492,10 +1510,14 @@ pub const UploadReason = enum {
     blob_missing,
     mount_declined,
     mount_not_permitted,
+    initiation_ambiguous,
+    write_ambiguous,
+    finalize_ambiguous,
 };
 
 pub const ReplaySafety = struct {
-    /// No source bytes have been read or spooled in this increment.
+    /// True only after the source bytes were spooled and independently
+    /// verified against the descriptor.
     source_verified: bool = false,
     /// Mount/start POSTs and future body requests are never replay-safe.
     non_idempotent_replay_allowed: bool = false,
@@ -1503,14 +1525,25 @@ pub const ReplaySafety = struct {
     probe_before_retry: bool = true,
 };
 
-/// Owned continuation state for the upload increment. Formatting never
-/// exposes the upload URL or a provider-signed query.
+/// Owned failure state for a remote upload that may remain for registry
+/// garbage collection. Formatting never exposes the upload URL or a
+/// provider-signed query.
+pub const UploadSessionSummary = struct {
+    origin: registry_http.Origin,
+    authorization_stripped: bool,
+
+    pub fn deinit(self: *UploadSessionSummary) void {
+        self.origin.deinit();
+        self.* = undefined;
+    }
+};
+
 pub const UploadHandoff = struct {
     digest: content.Digest,
     size: u64,
     roles: transport.DescriptorRoles,
     reason: UploadReason,
-    session: ?registry_http.ResolvedUploadLocation = null,
+    session: ?UploadSessionSummary = null,
     replay: ReplaySafety = .{},
 
     pub fn deinit(self: *UploadHandoff) void {
@@ -1524,7 +1557,7 @@ pub const UploadHandoff = struct {
     ) Io.Writer.Error!void {
         const digest_text = self.digest.format();
         try writer.print(
-            "upload-required(digest={s}, size={d}, reason={s}",
+            "upload-incomplete(digest={s}, size={d}, reason={s}",
             .{ &digest_text, self.size, @tagName(self.reason) },
         );
         if (self.session) |session| {
@@ -1549,18 +1582,35 @@ const SeenDescriptor = struct {
 
 const MountOutcome = union(enum) {
     mounted,
-    declined: registry_http.ResolvedUploadLocation,
+    declined: UploadSession,
+    fallback,
 };
 
-/// Registry destination increment implementing only preflight, verified blob
-/// reuse, and same-origin mount. It cannot publish manifests or report a
-/// committed root.
+const UploadSession = struct {
+    location: registry_http.ResolvedUploadLocation,
+    uuid: ?[]u8 = null,
+    offset: u64 = 0,
+
+    fn deinit(self: *UploadSession, allocator: Allocator) void {
+        self.location.deinit();
+        if (self.uuid) |uuid| {
+            @memset(uuid, 0);
+            allocator.free(uuid);
+        }
+        self.* = undefined;
+    }
+};
+
+/// Registry destination with verified blob upload, immutable child/root
+/// staging, and a root-tag-last commit lifecycle.
 pub const Destination = struct {
     allocator: Allocator,
     remote: Source,
     tag: []u8,
     graph_limits: graph.Limits,
     mount_policy: MountPolicy,
+    upload_chunk_bytes: ?u64,
+    spool_directory: []u8,
     state_value: DestinationState = .initialized,
     root_digest: ?content.Digest = null,
     seen: std.AutoHashMap(content.Digest, SeenDescriptor),
@@ -1582,12 +1632,19 @@ pub const Destination = struct {
         );
         errdefer remote.deinit();
         const owned_tag = try allocator.dupe(u8, tag);
+        errdefer allocator.free(owned_tag);
+        const spool_directory = try allocator.dupe(
+            u8,
+            options.spool_directory orelse ".",
+        );
         return .{
             .allocator = allocator,
             .remote = remote,
             .tag = owned_tag,
             .graph_limits = options.graph_limits,
             .mount_policy = options.mount_policy,
+            .upload_chunk_bytes = options.upload_chunk_bytes,
+            .spool_directory = spool_directory,
             .seen = std.AutoHashMap(content.Digest, SeenDescriptor).init(allocator),
         };
     }
@@ -1615,12 +1672,19 @@ pub const Destination = struct {
         );
         errdefer remote.deinit();
         const owned_tag = try allocator.dupe(u8, tag);
+        errdefer allocator.free(owned_tag);
+        const spool_directory = try allocator.dupe(
+            u8,
+            options.spool_directory orelse ".",
+        );
         return .{
             .allocator = allocator,
             .remote = remote,
             .tag = owned_tag,
             .graph_limits = options.graph_limits,
             .mount_policy = options.mount_policy,
+            .upload_chunk_bytes = options.upload_chunk_bytes,
+            .spool_directory = spool_directory,
             .seen = std.AutoHashMap(content.Digest, SeenDescriptor).init(allocator),
         };
     }
@@ -1632,6 +1696,7 @@ pub const Destination = struct {
             self.allocator.free(entry.media_type);
         }
         self.seen.deinit();
+        self.allocator.free(self.spool_directory);
         self.allocator.free(self.tag);
         self.remote.deinit();
         self.* = undefined;
@@ -1653,9 +1718,8 @@ pub const Destination = struct {
         return self.remote.lastDiagnostic();
     }
 
-    /// This increment has no state from which committed success is possible.
-    pub fn committed(_: *const Destination) bool {
-        return false;
+    pub fn committed(self: *const Destination) bool {
+        return self.state_value == .finished;
     }
 
     pub fn prepareRoot(
@@ -1745,13 +1809,10 @@ pub const Destination = struct {
         transfer: transport.DescriptorTransfer,
     ) Error!transport.DescriptorResult {
         if (self.state_value != .prepared) {
-            return if (self.state_value == .upload_required)
-                error.UploadRequired
-            else
-                error.DestinationNotPrepared;
+            return error.DestinationNotPrepared;
         }
         return self.ensureDescriptorInner(transfer) catch |err| {
-            if (err != error.UploadRequired) self.state_value = .failed;
+            self.state_value = .failed;
             return err;
         };
     }
@@ -1778,17 +1839,24 @@ pub const Destination = struct {
         switch (transfer.data) {
             .exact_metadata => |bytes| {
                 if (!transfer.roles.index_child or transfer.roles.root or
-                    transfer.roles.config or transfer.roles.layer or
-                    !model.classifyMediaType(transfer.descriptor.mediaType).isDocument())
+                    transfer.roles.config or transfer.roles.layer)
                 {
                     return error.InvalidContent;
                 }
+                model.validateMediaType(transfer.descriptor.mediaType) catch
+                    return error.InvalidContent;
                 content.verifyBytes(
                     digest,
                     transfer.descriptor.size,
                     bytes,
                 ) catch return error.InvalidContent;
-                return error.ManifestPublicationNotImplemented;
+                const outcome = try self.ensureManifest(
+                    transfer.descriptor,
+                    bytes,
+                    .publish_manifest,
+                );
+                self.setOutcome(digest, outcome);
+                return outcome;
             },
             .opaque_blob => |source| {
                 if (transfer.roles.root or transfer.roles.index_child or
@@ -1819,6 +1887,8 @@ pub const Destination = struct {
             return .reused;
         }
 
+        var mount_session: ?UploadSession = null;
+        defer if (mount_session) |*session| session.deinit(self.allocator);
         if (source.registry_identity) |identity| {
             if (try self.mountEligible(identity)) {
                 switch (try self.tryMount(identity, descriptor)) {
@@ -1827,31 +1897,704 @@ pub const Destination = struct {
                         return .mounted;
                     },
                     .declined => |session| {
-                        self.pending_upload = .{
-                            .digest = digest,
-                            .size = descriptor.size,
-                            .roles = roles,
-                            .reason = .mount_declined,
-                            .session = session,
-                        };
-                        self.state_value = .upload_required;
-                        return error.UploadRequired;
+                        mount_session = session;
                     },
+                    .fallback => {},
                 }
             }
         }
+        if (mount_session) |*owned_session| {
+            try self.trackPendingUpload(
+                descriptor,
+                roles,
+                .mount_declined,
+                owned_session,
+                false,
+            );
+        }
 
+        var spool = try self.spoolVerified(source, descriptor);
+        defer spool.deinit(self.remote.io, self.allocator);
+
+        const used_mount_session = mount_session != null;
+        var session = if (mount_session) |owned_session| blk: {
+            mount_session = null;
+            break :blk @as(?UploadSession, owned_session);
+        } else try self.beginUpload(descriptor, roles);
+        if (session == null) {
+            self.setOutcome(digest, .reused);
+            self.clearPendingUpload();
+            return .reused;
+        }
+        try self.trackPendingUpload(
+            descriptor,
+            roles,
+            (if (source.registry_identity == null)
+                .blob_missing
+            else if (used_mount_session)
+                .mount_declined
+            else
+                .mount_not_permitted),
+            &session.?,
+            true,
+        );
+        defer session.?.deinit(self.allocator);
+
+        const completed = if (self.upload_chunk_bytes) |chunk_bytes|
+            try self.uploadChunked(
+                &session.?,
+                spool.file,
+                descriptor,
+                roles,
+                chunk_bytes,
+            )
+        else
+            try self.uploadMonolithic(
+                &session.?,
+                spool.file,
+                descriptor,
+                roles,
+            );
+        if (!completed) return error.UploadIncomplete;
+        self.setOutcome(digest, .transferred);
+        self.clearPendingUpload();
+        return .transferred;
+    }
+
+    fn clearPendingUpload(self: *Destination) void {
+        if (self.pending_upload) |*handoff| handoff.deinit();
+        self.pending_upload = null;
+    }
+
+    fn trackPendingUpload(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+        reason: UploadReason,
+        session: ?*const UploadSession,
+        source_verified: bool,
+    ) Error!void {
+        self.clearPendingUpload();
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        var summary: ?UploadSessionSummary = null;
+        errdefer if (summary) |*value| value.deinit();
+        if (session) |value| {
+            const origin = value.location.origin.clone(self.allocator) catch |err|
+                return switch (err) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    else => error.InvalidContent,
+                };
+            summary = .{
+                .origin = origin,
+                .authorization_stripped = value.location.authorization_stripped,
+            };
+        }
         self.pending_upload = .{
             .digest = digest,
             .size = descriptor.size,
             .roles = roles,
-            .reason = if (source.registry_identity == null)
-                .blob_missing
-            else
-                .mount_not_permitted,
+            .reason = reason,
+            .session = summary,
+            .replay = .{ .source_verified = source_verified },
         };
-        self.state_value = .upload_required;
-        return error.UploadRequired;
+    }
+
+    fn spoolVerified(
+        self: *Destination,
+        source: transport.Source,
+        descriptor: model.Descriptor,
+    ) Error!SpoolFile {
+        if (self.remote.client.clock.now() >= self.remote.deadline.at_ns) {
+            return self.remote.fail(
+                error.DeadlineExceeded,
+                .destination_upload_write,
+                .deadline,
+                null,
+                null,
+                descriptor.parsedDigest() catch null,
+            );
+        }
+        var dir = Io.Dir.cwd().openDir(
+            self.remote.io,
+            self.spool_directory,
+            .{},
+        ) catch return self.remote.fail(
+            error.TransportFailed,
+            .destination_upload_write,
+            .transport,
+            null,
+            null,
+            descriptor.parsedDigest() catch null,
+        );
+        var dir_owned = true;
+        errdefer if (dir_owned) dir.close(self.remote.io);
+        const temporary = createUniqueTempFile(
+            self.remote.io,
+            self.allocator,
+            dir,
+            "registry-upload",
+        ) catch return self.remote.fail(
+            error.TransportFailed,
+            .destination_upload_write,
+            .transport,
+            null,
+            null,
+            descriptor.parsedDigest() catch null,
+        );
+        var spool: SpoolFile = .{
+            .dir = dir,
+            .name = temporary.name,
+            .file = temporary.file,
+        };
+        dir_owned = false;
+        errdefer spool.deinit(self.remote.io, self.allocator);
+
+        source.copyVerifiedTo(descriptor, spool.file) catch |err| {
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.InvalidDigest,
+                error.UnsupportedDigestAlgorithm,
+                error.SizeMismatch,
+                error.DigestMismatch,
+                error.SizeOverflow,
+                error.VerifierFinished,
+                error.SourceContractViolation,
+                error.DescriptorUnavailable,
+                => self.remote.fail(
+                    error.InvalidContent,
+                    .destination_upload_write,
+                    .invalid_content,
+                    null,
+                    null,
+                    descriptor.parsedDigest() catch null,
+                ),
+                else => self.remote.fail(
+                    error.TransportFailed,
+                    .destination_upload_write,
+                    .transport,
+                    null,
+                    null,
+                    descriptor.parsedDigest() catch null,
+                ),
+            };
+        };
+        spool.file.sync(self.remote.io) catch
+            return self.remote.fail(
+                error.TransportFailed,
+                .destination_upload_write,
+                .transport,
+                null,
+                null,
+                descriptor.parsedDigest() catch null,
+            );
+        verifySpoolFile(
+            self.remote.io,
+            spool.file,
+            descriptor,
+        ) catch |err| return switch (err) {
+            error.InvalidContent => self.remote.fail(
+                error.InvalidContent,
+                .destination_upload_write,
+                .invalid_content,
+                null,
+                null,
+                descriptor.parsedDigest() catch null,
+            ),
+            else => self.remote.fail(
+                error.TransportFailed,
+                .destination_upload_write,
+                .transport,
+                null,
+                null,
+                descriptor.parsedDigest() catch null,
+            ),
+        };
+        if (self.remote.client.clock.now() >= self.remote.deadline.at_ns) {
+            return self.remote.fail(
+                error.DeadlineExceeded,
+                .destination_upload_write,
+                .deadline,
+                null,
+                null,
+                descriptor.parsedDigest() catch null,
+            );
+        }
+        return spool;
+    }
+
+    fn beginUpload(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+    ) Error!?UploadSession {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/blobs/uploads/",
+            .{self.remote.repository},
+        );
+        defer self.allocator.free(path);
+
+        var response = self.remote.client.execute(.{
+            .method = .POST,
+            .path_and_query = path,
+            .class = .registry,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .allow_auth_replay = false,
+            .deadline = self.remote.deadline,
+        }) catch |err| {
+            if (!isAmbiguousHttpFailure(err)) {
+                return self.remote.mapHttpFailure(
+                    err,
+                    .destination_upload_start,
+                    digest,
+                );
+            }
+            return self.resolveAmbiguousInitiation(descriptor, roles);
+        };
+        defer response.deinit();
+        if (registry_http.isRetryableStatus(response.status)) {
+            return self.resolveAmbiguousInitiation(descriptor, roles);
+        }
+        if (response.status != 202) {
+            return self.requireMutationStatus(
+                response,
+                .destination_upload_start,
+                digest,
+            );
+        }
+        const session = try self.sessionFromResponse(
+            response,
+            path,
+            null,
+            0,
+            digest,
+            .destination_upload_start,
+        );
+        self.remote.last_diagnostic = null;
+        return session;
+    }
+
+    fn resolveAmbiguousInitiation(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+    ) Error!?UploadSession {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const blob_state = self.blobState(descriptor) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try self.trackPendingUpload(
+                descriptor,
+                roles,
+                .initiation_ambiguous,
+                null,
+                true,
+            );
+            return self.remote.fail(
+                error.UploadIncomplete,
+                .destination_upload_start,
+                .transport,
+                null,
+                null,
+                digest,
+            );
+        };
+        if (blob_state == .verified) return null;
+        try self.trackPendingUpload(
+            descriptor,
+            roles,
+            .initiation_ambiguous,
+            null,
+            true,
+        );
+        return self.remote.fail(
+            error.UploadIncomplete,
+            .destination_upload_start,
+            .transport,
+            null,
+            null,
+            digest,
+        );
+    }
+
+    fn uploadMonolithic(
+        self: *Destination,
+        session: *UploadSession,
+        file: Io.File,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+    ) Error!bool {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const target = try appendDigestQueryAlloc(
+            self.allocator,
+            session.location.url,
+            digest,
+            self.remote.client.limits.max_location_bytes,
+        );
+        defer {
+            @memset(target, 0);
+            self.allocator.free(target);
+        }
+        var file_source: FileBodySource = .{
+            .io = self.remote.io,
+            .file = file,
+            .start = 0,
+            .length = descriptor.size,
+        };
+        const headers = [_]registry_http.Header{.{
+            .name = "Content-Type",
+            .value = "application/octet-stream",
+        }};
+        var response = self.remote.client.execute(.{
+            .method = .PUT,
+            .absolute_url = target,
+            .authorization_stripped = session.location.authorization_stripped,
+            .class = .registry,
+            .headers = &headers,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .body_source = registry_http.BodySource.init(
+                &file_source,
+                descriptor.size,
+            ),
+            .allow_auth_replay = false,
+            .deadline = self.remote.deadline,
+        }) catch |err| return self.resolveAmbiguousBlobWrite(
+            err,
+            session,
+            descriptor,
+            roles,
+            .write_ambiguous,
+            .destination_upload_write,
+        );
+        defer response.deinit();
+        if (registry_http.isRetryableStatus(response.status)) {
+            return self.resolveAmbiguousBlobResponse(
+                session,
+                descriptor,
+                roles,
+                .write_ambiguous,
+                .destination_upload_write,
+            );
+        }
+        if (response.status != 201) {
+            return self.requireMutationStatus(
+                response,
+                .destination_upload_write,
+                digest,
+            );
+        }
+        try self.validateBlobCompletion(
+            response,
+            target,
+            descriptor,
+            .destination_upload_write,
+        );
+        return true;
+    }
+
+    fn uploadChunked(
+        self: *Destination,
+        session: *UploadSession,
+        file: Io.File,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+        chunk_bytes: u64,
+    ) Error!bool {
+        if (chunk_bytes == 0) return error.InvalidConfiguration;
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const chunks = if (descriptor.size == 0)
+            0
+        else
+            std.math.divCeil(u64, descriptor.size, chunk_bytes) catch
+                return error.LimitExceeded;
+        if (chunks > self.remote.limits.max_upload_chunks) {
+            return self.remote.fail(
+                error.LimitExceeded,
+                .destination_upload_write,
+                .limit,
+                null,
+                null,
+                digest,
+            );
+        }
+
+        while (session.offset < descriptor.size) {
+            const length = @min(
+                chunk_bytes,
+                descriptor.size - session.offset,
+            );
+            const end = std.math.add(u64, session.offset, length) catch
+                return error.LimitExceeded;
+            var file_source: FileBodySource = .{
+                .io = self.remote.io,
+                .file = file,
+                .start = session.offset,
+                .length = length,
+            };
+            var range_buffer: [96]u8 = undefined;
+            const range = std.fmt.bufPrint(
+                &range_buffer,
+                "{d}-{d}",
+                .{ session.offset, end - 1 },
+            ) catch return error.LimitExceeded;
+            const headers = [_]registry_http.Header{
+                .{
+                    .name = "Content-Type",
+                    .value = "application/octet-stream",
+                },
+                .{ .name = "Content-Range", .value = range },
+            };
+            var response = self.remote.client.execute(.{
+                .method = .PATCH,
+                .absolute_url = session.location.url,
+                .authorization_stripped = session.location.authorization_stripped,
+                .class = .registry,
+                .headers = &headers,
+                .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+                .body_source = registry_http.BodySource.init(
+                    &file_source,
+                    length,
+                ),
+                .allow_auth_replay = false,
+                .deadline = self.remote.deadline,
+            }) catch |err| return self.resolveAmbiguousBlobWrite(
+                err,
+                session,
+                descriptor,
+                roles,
+                .write_ambiguous,
+                .destination_upload_write,
+            );
+            defer response.deinit();
+            if (registry_http.isRetryableStatus(response.status)) {
+                return self.resolveAmbiguousBlobResponse(
+                    session,
+                    descriptor,
+                    roles,
+                    .write_ambiguous,
+                    .destination_upload_write,
+                );
+            }
+            if (response.status != 202) {
+                return self.requireMutationStatus(
+                    response,
+                    .destination_upload_write,
+                    digest,
+                );
+            }
+            const next = try self.sessionFromResponse(
+                response,
+                session.location.url,
+                session,
+                end,
+                digest,
+                .destination_upload_write,
+            );
+            session.deinit(self.allocator);
+            session.* = next;
+        }
+
+        const target = try appendDigestQueryAlloc(
+            self.allocator,
+            session.location.url,
+            digest,
+            self.remote.client.limits.max_location_bytes,
+        );
+        defer {
+            @memset(target, 0);
+            self.allocator.free(target);
+        }
+        var response = self.remote.client.execute(.{
+            .method = .PUT,
+            .absolute_url = target,
+            .authorization_stripped = session.location.authorization_stripped,
+            .class = .registry,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .allow_auth_replay = false,
+            .deadline = self.remote.deadline,
+        }) catch |err| return self.resolveAmbiguousBlobWrite(
+            err,
+            session,
+            descriptor,
+            roles,
+            .finalize_ambiguous,
+            .destination_upload_finalize,
+        );
+        defer response.deinit();
+        if (registry_http.isRetryableStatus(response.status)) {
+            return self.resolveAmbiguousBlobResponse(
+                session,
+                descriptor,
+                roles,
+                .finalize_ambiguous,
+                .destination_upload_finalize,
+            );
+        }
+        if (response.status != 201) {
+            return self.requireMutationStatus(
+                response,
+                .destination_upload_finalize,
+                digest,
+            );
+        }
+        try self.validateBlobCompletion(
+            response,
+            target,
+            descriptor,
+            .destination_upload_finalize,
+        );
+        return true;
+    }
+
+    fn resolveAmbiguousBlobWrite(
+        self: *Destination,
+        err: registry_http.Error,
+        session: *const UploadSession,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+        reason: UploadReason,
+        operation: Operation,
+    ) Error!bool {
+        if (!isAmbiguousHttpFailure(err)) {
+            return self.remote.mapHttpFailure(
+                err,
+                operation,
+                descriptor.parsedDigest() catch null,
+            );
+        }
+        return self.resolveAmbiguousBlobResponse(
+            session,
+            descriptor,
+            roles,
+            reason,
+            operation,
+        );
+    }
+
+    fn resolveAmbiguousBlobResponse(
+        self: *Destination,
+        session: *const UploadSession,
+        descriptor: model.Descriptor,
+        roles: transport.DescriptorRoles,
+        reason: UploadReason,
+        operation: Operation,
+    ) Error!bool {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const blob_state = self.blobState(descriptor) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try self.trackPendingUpload(
+                descriptor,
+                roles,
+                reason,
+                session,
+                true,
+            );
+            return self.remote.fail(
+                error.UploadAmbiguous,
+                operation,
+                .transport,
+                null,
+                null,
+                digest,
+            );
+        };
+        if (blob_state == .verified) {
+            self.remote.last_diagnostic = null;
+            return true;
+        }
+        try self.trackPendingUpload(
+            descriptor,
+            roles,
+            reason,
+            session,
+            true,
+        );
+        return self.remote.fail(
+            error.UploadAmbiguous,
+            operation,
+            .transport,
+            null,
+            null,
+            digest,
+        );
+    }
+
+    fn validateBlobCompletion(
+        self: *Destination,
+        response: registry_http.Response,
+        current_target: []const u8,
+        descriptor: model.Descriptor,
+        operation: Operation,
+    ) Error!void {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        try self.remote.corroborateDigestHeader(
+            response,
+            digest,
+            operation,
+        );
+        const location = (singleHeader(response, "Location") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) orelse return self.remote.fail(
+            error.InvalidContent,
+            operation,
+            .invalid_content,
+            response.status,
+            null,
+            digest,
+        );
+        var completed = registry_http.resolveUploadLocationAlloc(
+            self.allocator,
+            self.remote.client.endpoint,
+            current_target,
+            location,
+            self.remote.client.limits.max_location_bytes,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => self.remote.fail(
+                error.RedirectRejected,
+                operation,
+                .redirect,
+                response.status,
+                null,
+                digest,
+            ),
+        };
+        completed.deinit();
+        const blob_state = self.blobState(descriptor) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return self.remote.fail(
+                error.UploadIncomplete,
+                operation,
+                .transport,
+                response.status,
+                null,
+                digest,
+            );
+        };
+        if (blob_state != .verified) {
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        }
+        self.remote.last_diagnostic = null;
     }
 
     /// A 404 HEAD is missing. Unsupported or successful HEAD responses are
@@ -2107,11 +2850,18 @@ pub const Destination = struct {
             .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
             .allow_auth_replay = false,
             .deadline = self.remote.deadline,
-        }) catch |err| return self.remote.mapHttpFailure(
-            err,
-            .destination_mount,
-            digest,
-        );
+        }) catch |err| {
+            if (!isAmbiguousHttpFailure(err)) {
+                return self.remote.mapHttpFailure(
+                    err,
+                    .destination_mount,
+                    digest,
+                );
+            }
+            if (try self.blobState(descriptor) == .verified) return .mounted;
+            self.remote.last_diagnostic = null;
+            return .fallback;
+        };
         defer response.deinit();
 
         switch (response.status) {
@@ -2169,39 +2919,14 @@ pub const Destination = struct {
                     digest,
                     .destination_mount,
                 );
-                const location = (singleHeader(response, "Location") catch
-                    return self.remote.fail(
-                        error.InvalidContent,
-                        .destination_mount,
-                        .invalid_content,
-                        response.status,
-                        null,
-                        digest,
-                    )) orelse return self.remote.fail(
-                    error.InvalidContent,
-                    .destination_mount,
-                    .invalid_content,
-                    response.status,
-                    null,
-                    digest,
-                );
-                const session = registry_http.resolveUploadLocationAlloc(
-                    self.allocator,
-                    self.remote.client.endpoint,
+                const session = try self.sessionFromResponse(
+                    response,
                     path,
-                    location,
-                    self.remote.client.limits.max_location_bytes,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => self.remote.fail(
-                        error.RedirectRejected,
-                        .destination_mount,
-                        .redirect,
-                        response.status,
-                        null,
-                        digest,
-                    ),
-                };
+                    null,
+                    0,
+                    digest,
+                    .destination_mount,
+                );
                 self.remote.last_diagnostic = null;
                 return .{ .declined = session };
             },
@@ -2223,6 +2948,522 @@ pub const Destination = struct {
         }
     }
 
+    fn sessionFromResponse(
+        self: *Destination,
+        response: registry_http.Response,
+        current_target: []const u8,
+        previous: ?*const UploadSession,
+        expected_offset: u64,
+        digest: content.Digest,
+        operation: Operation,
+    ) Error!UploadSession {
+        const location = (singleHeader(response, "Location") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) orelse return self.remote.fail(
+            error.InvalidContent,
+            operation,
+            .invalid_content,
+            response.status,
+            null,
+            digest,
+        );
+        var resolved = registry_http.resolveUploadLocationAlloc(
+            self.allocator,
+            self.remote.client.endpoint,
+            current_target,
+            location,
+            self.remote.client.limits.max_location_bytes,
+        ) catch |err| return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => self.remote.fail(
+                error.RedirectRejected,
+                operation,
+                .redirect,
+                response.status,
+                null,
+                digest,
+            ),
+        };
+        errdefer resolved.deinit();
+        if (previous) |prior| {
+            if (!prior.location.origin.eql(resolved.origin) or
+                prior.location.authorization_stripped !=
+                    resolved.authorization_stripped or
+                !uploadLocationPathEqual(
+                    prior.location.url,
+                    resolved.url,
+                ))
+            {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    operation,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            }
+        }
+
+        const uuid_header = singleHeader(
+            response,
+            "Docker-Upload-UUID",
+        ) catch return self.remote.fail(
+            error.InvalidContent,
+            operation,
+            .invalid_content,
+            response.status,
+            null,
+            digest,
+        );
+        var uuid: ?[]u8 = null;
+        errdefer if (uuid) |value| {
+            @memset(value, 0);
+            self.allocator.free(value);
+        };
+        if (uuid_header) |value| {
+            if (!validUploadUuid(
+                value,
+                self.remote.client.limits.max_location_bytes,
+            )) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    operation,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            }
+            if (previous) |prior| {
+                if (prior.uuid) |expected| {
+                    if (!std.mem.eql(u8, expected, value)) {
+                        return self.remote.fail(
+                            error.InvalidContent,
+                            operation,
+                            .invalid_content,
+                            response.status,
+                            null,
+                            digest,
+                        );
+                    }
+                }
+            }
+            uuid = try self.allocator.dupe(u8, value);
+        } else if (previous) |prior| {
+            if (prior.uuid != null) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    operation,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            }
+        }
+
+        const range_header = singleHeader(response, "Range") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        if (range_header) |value| {
+            if (!validUploadRange(value, expected_offset)) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    operation,
+                    .invalid_content,
+                    response.status,
+                    null,
+                    digest,
+                );
+            }
+        } else if (previous != null and expected_offset != 0) {
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        }
+        return .{
+            .location = resolved,
+            .uuid = uuid,
+            .offset = expected_offset,
+        };
+    }
+
+    fn requireMutationStatus(
+        self: *Destination,
+        response: registry_http.Response,
+        operation: Operation,
+        digest: content.Digest,
+    ) Error {
+        return switch (response.status) {
+            401 => self.remote.fail(
+                error.AuthenticationFailed,
+                operation,
+                .authentication,
+                response.status,
+                null,
+                digest,
+            ),
+            403 => self.remote.fail(
+                error.AuthorizationDenied,
+                operation,
+                .authorization,
+                response.status,
+                null,
+                digest,
+            ),
+            404 => self.remote.fail(
+                error.ContentNotFound,
+                operation,
+                .not_found,
+                response.status,
+                null,
+                digest,
+            ),
+            413, 429 => self.remote.fail(
+                error.LimitExceeded,
+                operation,
+                .limit,
+                response.status,
+                null,
+                digest,
+            ),
+            else => self.remote.fail(
+                error.RegistryFailed,
+                operation,
+                .registry,
+                response.status,
+                null,
+                digest,
+            ),
+        };
+    }
+
+    fn ensureManifest(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        bytes: []const u8,
+        operation: Operation,
+    ) Error!transport.DescriptorResult {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        model.validateMediaType(descriptor.mediaType) catch
+            return error.InvalidContent;
+        content.verifyBytes(digest, descriptor.size, bytes) catch
+            return error.InvalidContent;
+        const digest_text = digest.format();
+        if (try self.manifestState(descriptor, &digest_text, operation) ==
+            .verified)
+        {
+            return .reused;
+        }
+        try self.putManifest(
+            descriptor,
+            bytes,
+            &digest_text,
+            operation,
+            false,
+        );
+        return .transferred;
+    }
+
+    fn manifestState(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        selector: []const u8,
+        operation: Operation,
+    ) Error!BlobState {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/manifests/{s}",
+            .{ self.remote.repository, selector },
+        );
+        defer self.allocator.free(path);
+        var sink: VerifySink = .{
+            .digest = digest,
+            .size = descriptor.size,
+        };
+        var response = self.remote.client.execute(.{
+            .path_and_query = path,
+            .class = .registry,
+            .headers = &.{.{
+                .name = "Accept",
+                .value = manifest_accept,
+            }},
+            .max_body_bytes = descriptor.size,
+            .body_sink = registry_http.BodySink.init(&sink),
+            .deadline = self.remote.deadline,
+        }) catch |err| {
+            if (err == error.BodySinkFailed) {
+                return self.remote.fail(
+                    error.InvalidContent,
+                    operation,
+                    .invalid_content,
+                    null,
+                    null,
+                    digest,
+                );
+            }
+            return self.remote.mapHttpFailure(err, operation, digest);
+        };
+        defer response.deinit();
+        if (response.status == 404) return .missing;
+        if (response.status != 200) {
+            return self.requireMutationStatus(response, operation, digest);
+        }
+        try self.remote.corroborateContentLength(
+            response,
+            descriptor.size,
+            operation,
+            digest,
+        );
+        try self.remote.corroborateDigestHeader(
+            response,
+            digest,
+            operation,
+        );
+        const content_type_header = singleHeader(
+            response,
+            "Content-Type",
+        ) catch return self.remote.fail(
+            error.InvalidContent,
+            operation,
+            .invalid_content,
+            response.status,
+            null,
+            digest,
+        );
+        const content_type = mediaTypeBase(content_type_header orelse
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) orelse return self.remote.fail(
+            error.InvalidContent,
+            operation,
+            .invalid_content,
+            response.status,
+            null,
+            digest,
+        );
+        model.validateMediaType(content_type) catch
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        if (!std.mem.eql(u8, content_type, descriptor.mediaType)) {
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            );
+        }
+        self.remote.last_diagnostic = null;
+        return .verified;
+    }
+
+    fn putManifest(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        bytes: []const u8,
+        selector: []const u8,
+        operation: Operation,
+        confirm_tag_and_digest: bool,
+    ) Error!void {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        content.verifyBytes(digest, descriptor.size, bytes) catch
+            return error.InvalidContent;
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/v2/{s}/manifests/{s}",
+            .{ self.remote.repository, selector },
+        );
+        defer self.allocator.free(path);
+        var bytes_source: BytesBodySource = .{ .bytes = bytes };
+        const headers = [_]registry_http.Header{.{
+            .name = "Content-Type",
+            .value = descriptor.mediaType,
+        }};
+        var response = self.remote.client.execute(.{
+            .method = .PUT,
+            .path_and_query = path,
+            .class = .registry,
+            .headers = &headers,
+            .max_body_bytes = self.remote.limits.max_preflight_body_bytes,
+            .body_source = registry_http.BodySource.init(
+                &bytes_source,
+                descriptor.size,
+            ),
+            .allow_auth_replay = false,
+            .deadline = self.remote.deadline,
+        }) catch |err| {
+            if (!isAmbiguousHttpFailure(err)) {
+                return self.remote.mapHttpFailure(err, operation, digest);
+            }
+            return self.confirmManifestWrite(
+                descriptor,
+                selector,
+                operation,
+                confirm_tag_and_digest,
+                true,
+            );
+        };
+        defer response.deinit();
+        if (registry_http.isRetryableStatus(response.status)) {
+            return self.confirmManifestWrite(
+                descriptor,
+                selector,
+                operation,
+                confirm_tag_and_digest,
+                true,
+            );
+        }
+        if (response.status != 201) {
+            return self.requireMutationStatus(response, operation, digest);
+        }
+        try self.remote.corroborateDigestHeader(
+            response,
+            digest,
+            operation,
+        );
+        if (singleHeader(response, "Location") catch
+            return self.remote.fail(
+                error.InvalidContent,
+                operation,
+                .invalid_content,
+                response.status,
+                null,
+                digest,
+            )) |location|
+        {
+            var resolved = registry_http.resolveUploadLocationAlloc(
+                self.allocator,
+                self.remote.client.endpoint,
+                path,
+                location,
+                self.remote.client.limits.max_location_bytes,
+            ) catch |err| return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => self.remote.fail(
+                    error.RedirectRejected,
+                    operation,
+                    .redirect,
+                    response.status,
+                    null,
+                    digest,
+                ),
+            };
+            resolved.deinit();
+        }
+        try self.confirmManifestWrite(
+            descriptor,
+            selector,
+            operation,
+            confirm_tag_and_digest,
+            false,
+        );
+    }
+
+    fn confirmManifestWrite(
+        self: *Destination,
+        descriptor: model.Descriptor,
+        selector: []const u8,
+        operation: Operation,
+        confirm_tag_and_digest: bool,
+        ambiguous: bool,
+    ) Error!void {
+        const digest = model.validateDescriptor(descriptor) catch
+            return error.InvalidContent;
+        const selected = self.manifestState(
+            descriptor,
+            selector,
+            operation,
+        ) catch |err| {
+            if (ambiguous and err != error.OutOfMemory) {
+                return self.remote.fail(
+                    error.PublicationUnconfirmed,
+                    operation,
+                    .registry,
+                    null,
+                    null,
+                    digest,
+                );
+            }
+            return err;
+        };
+        if (selected != .verified) {
+            return self.remote.fail(
+                error.PublicationUnconfirmed,
+                operation,
+                .registry,
+                null,
+                null,
+                digest,
+            );
+        }
+        if (confirm_tag_and_digest) {
+            const digest_text = digest.format();
+            const immutable = self.manifestState(
+                descriptor,
+                &digest_text,
+                operation,
+            ) catch |err| {
+                if (ambiguous and err != error.OutOfMemory) {
+                    return self.remote.fail(
+                        error.PublicationUnconfirmed,
+                        operation,
+                        .registry,
+                        null,
+                        null,
+                        digest,
+                    );
+                }
+                return err;
+            };
+            if (immutable != .verified) {
+                return self.remote.fail(
+                    error.PublicationUnconfirmed,
+                    operation,
+                    .registry,
+                    null,
+                    null,
+                    digest,
+                );
+            }
+        }
+        self.remote.last_diagnostic = null;
+    }
+
     pub fn stageRoot(
         self: *Destination,
         publication: transport.RootPublication,
@@ -2230,12 +3471,27 @@ pub const Destination = struct {
         if (self.state_value != .prepared) {
             return error.DestinationNotPrepared;
         }
-        self.validatePublication(publication, null) catch |err| {
-            self.state_value = .failed;
-            return err;
+        const result = blk: {
+            self.validatePublication(publication, null) catch |err| {
+                self.state_value = .failed;
+                return err;
+            };
+            break :blk self.ensureManifest(
+                publication.descriptor,
+                publication.exact_bytes,
+                .stage_root,
+            ) catch |err| {
+                self.state_value = .failed;
+                return err;
+            };
         };
-        self.state_value = .failed;
-        return error.RootPublicationNotImplemented;
+        const digest = model.validateDescriptor(publication.descriptor) catch {
+            self.state_value = .failed;
+            return error.InvalidContent;
+        };
+        self.setOutcome(digest, result);
+        self.state_value = .staged;
+        return result;
     }
 
     pub fn commitRoot(
@@ -2243,8 +3499,8 @@ pub const Destination = struct {
         publication: transport.RootPublication,
         selection: ?reference.Selection,
     ) Error!transport.CommitResult {
-        if (self.state_value != .prepared) {
-            return error.DestinationNotPrepared;
+        if (self.state_value != .staged) {
+            return error.DestinationNotStaged;
         }
         if (selection == null) {
             self.state_value = .failed;
@@ -2254,13 +3510,36 @@ pub const Destination = struct {
             self.state_value = .failed;
             return err;
         };
-        self.state_value = .failed;
-        return error.RootPublicationNotImplemented;
+        self.putManifest(
+            publication.descriptor,
+            publication.exact_bytes,
+            self.tag,
+            .commit_root,
+            true,
+        ) catch |err| {
+            self.state_value = .failed;
+            return err;
+        };
+        self.state_value = .committed;
+        return .published;
     }
 
     pub fn finish(self: *Destination) Error!void {
-        self.state_value = .failed;
-        return error.DestinationNotCommitted;
+        if (self.state_value != .committed) {
+            return error.DestinationNotCommitted;
+        }
+        if (self.remote.client.clock.now() >= self.remote.deadline.at_ns) {
+            self.state_value = .failed;
+            return self.remote.fail(
+                error.DeadlineExceeded,
+                .finish,
+                .deadline,
+                null,
+                null,
+                self.root_digest,
+            );
+        }
+        self.state_value = .finished;
     }
 
     fn registerDescriptor(
@@ -2349,6 +3628,238 @@ pub const Destination = struct {
         self.seen.getPtr(digest).?.outcome = outcome;
     }
 };
+
+const TempFile = struct {
+    name: []u8,
+    file: Io.File,
+};
+
+const SpoolFile = struct {
+    dir: Io.Dir,
+    name: []u8,
+    file: Io.File,
+
+    fn deinit(
+        self: *SpoolFile,
+        io: Io,
+        allocator: Allocator,
+    ) void {
+        self.file.close(io);
+        self.dir.deleteFile(io, self.name) catch {};
+        self.dir.close(io);
+        allocator.free(self.name);
+        self.* = undefined;
+    }
+};
+
+const FileBodySource = struct {
+    io: Io,
+    file: Io.File,
+    start: u64,
+    length: u64,
+
+    pub fn read(
+        self: *FileBodySource,
+        offset: u64,
+        buffer: []u8,
+    ) registry_http.BodySourceError!usize {
+        if (offset >= self.length) return 0;
+        const remaining: usize = @intCast(@min(
+            self.length - offset,
+            buffer.len,
+        ));
+        const position = std.math.add(u64, self.start, offset) catch
+            return error.SourceFailed;
+        return self.file.readPositional(
+            self.io,
+            &.{buffer[0..remaining]},
+            position,
+        ) catch error.SourceFailed;
+    }
+};
+
+const BytesBodySource = struct {
+    bytes: []const u8,
+
+    pub fn read(
+        self: *BytesBodySource,
+        offset: u64,
+        buffer: []u8,
+    ) registry_http.BodySourceError!usize {
+        const start = std.math.cast(usize, offset) orelse
+            return error.SourceFailed;
+        if (start >= self.bytes.len) return 0;
+        const count = @min(buffer.len, self.bytes.len - start);
+        @memcpy(buffer[0..count], self.bytes[start..][0..count]);
+        return count;
+    }
+};
+
+fn verifySpoolFile(
+    io: Io,
+    file: Io.File,
+    descriptor: model.Descriptor,
+) !void {
+    const digest = model.validateDescriptor(descriptor) catch
+        return error.InvalidContent;
+    const length = file.length(io) catch return error.TransportFailed;
+    if (length != descriptor.size) {
+        return error.InvalidContent;
+    }
+    var verifier = content.Verifier.init(digest, descriptor.size);
+    var buffer: [transport.copy_buffer_size]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < descriptor.size) {
+        const remaining: usize = @intCast(@min(
+            descriptor.size - offset,
+            buffer.len,
+        ));
+        const count = file.readPositional(
+            io,
+            &.{buffer[0..remaining]},
+            offset,
+        ) catch return error.TransportFailed;
+        if (count == 0) return error.InvalidContent;
+        verifier.update(buffer[0..count]) catch
+            return error.InvalidContent;
+        offset = std.math.add(u64, offset, count) catch
+            return error.InvalidContent;
+    }
+    verifier.finish() catch return error.InvalidContent;
+}
+
+fn createUniqueTempFile(
+    io: Io,
+    allocator: Allocator,
+    dir: Io.Dir,
+    kind: []const u8,
+) !TempFile {
+    var random: [16]u8 = undefined;
+    for (0..64) |_| {
+        try io.randomSecure(&random);
+        const suffix = std.fmt.bytesToHex(random, .lower);
+        const name = try std.fmt.allocPrint(
+            allocator,
+            ".wabt-oci-{s}-{s}.tmp",
+            .{ kind, suffix },
+        );
+        const file = dir.createFile(io, name, .{
+            .exclusive = true,
+            .read = true,
+            .permissions = privateFilePermissions(),
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                allocator.free(name);
+                continue;
+            },
+            else => {
+                allocator.free(name);
+                return err;
+            },
+        };
+        return .{ .name = name, .file = file };
+    }
+    return error.PathAlreadyExists;
+}
+
+fn privateFilePermissions() Io.File.Permissions {
+    return switch (builtin.os.tag) {
+        .windows => .default_file,
+        else => .fromMode(0o600),
+    };
+}
+
+fn appendDigestQueryAlloc(
+    allocator: Allocator,
+    base: []const u8,
+    digest: content.Digest,
+    max_bytes: usize,
+) Error![]u8 {
+    const digest_text = digest.format();
+    const encoded = try percentEncodeQueryAlloc(allocator, &digest_text);
+    defer allocator.free(encoded);
+    const separator: []const u8 = if (std.mem.indexOfScalar(
+        u8,
+        base,
+        '?',
+    ) == null) "?" else if (std.mem.endsWith(u8, base, "?") or
+        std.mem.endsWith(u8, base, "&")) "" else "&";
+    const required = std.math.add(usize, base.len, separator.len) catch
+        return error.LimitExceeded;
+    const with_name = std.math.add(usize, required, "digest=".len) catch
+        return error.LimitExceeded;
+    const total = std.math.add(usize, with_name, encoded.len) catch
+        return error.LimitExceeded;
+    if (total > max_bytes) return error.LimitExceeded;
+    return std.fmt.allocPrint(
+        allocator,
+        "{s}{s}digest={s}",
+        .{ base, separator, encoded },
+    );
+}
+
+fn uploadLocationPathEqual(
+    left: []const u8,
+    right: []const u8,
+) bool {
+    return std.mem.eql(u8, uploadLocationPath(left), uploadLocationPath(right));
+}
+
+fn uploadLocationPath(url: []const u8) []const u8 {
+    const scheme = std.mem.indexOf(u8, url, "://") orelse return &.{};
+    const authority_start = scheme + 3;
+    const path_start = std.mem.indexOfScalarPos(
+        u8,
+        url,
+        authority_start,
+        '/',
+    ) orelse return "/";
+    const query = std.mem.indexOfScalarPos(
+        u8,
+        url,
+        path_start,
+        '?',
+    ) orelse url.len;
+    return url[path_start..query];
+}
+
+fn validUploadUuid(value: []const u8, max_bytes: usize) bool {
+    if (value.len == 0 or value.len > max_bytes) return false;
+    for (value) |byte| {
+        if (byte <= 0x20 or byte == 0x7f or byte == '/' or
+            byte == '?' or byte == '#')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn validUploadRange(value: []const u8, expected_offset: u64) bool {
+    const trimmed = std.mem.trim(u8, value, " \t");
+    const text = if (std.mem.startsWith(u8, trimmed, "bytes="))
+        trimmed["bytes=".len..]
+    else
+        trimmed;
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return false;
+    if (std.mem.indexOfScalarPos(u8, text, dash + 1, '-') != null) {
+        return false;
+    }
+    const start = std.fmt.parseInt(u64, text[0..dash], 10) catch
+        return false;
+    const end = std.fmt.parseInt(u64, text[dash + 1 ..], 10) catch
+        return false;
+    if (start != 0) return false;
+    if (expected_offset == 0) return end == 0;
+    return end == expected_offset - 1;
+}
+
+fn isAmbiguousHttpFailure(err: registry_http.Error) bool {
+    return err == error.TransportFailed or
+        err == error.BodySourceFailed or
+        err == error.DeadlineExceeded or
+        err == error.RetryLimitExceeded;
+}
 
 const VerifySink = struct {
     digest: content.Digest,
@@ -2660,6 +4171,14 @@ fn validateDestinationConfiguration(
         options.graph_limits.max_metadata_bytes == 0)
     {
         return error.InvalidConfiguration;
+    }
+    if (options.upload_chunk_bytes) |value| {
+        if (value == 0) return error.InvalidConfiguration;
+    }
+    if (options.spool_directory) |path| {
+        if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) {
+            return error.InvalidConfiguration;
+        }
     }
     return tag;
 }

@@ -61,13 +61,25 @@ cross-repository mount outcomes.
 
 The registry destination state and mount request shape adapt miz
 `Destination.prepareTransport`, `ensureBlob`, `tryMount`, `mountUrl`, and
-`resolveUploadLocation`. WABT requires an explicit destination tag and
-independent destination authentication context, re-verifies blob bytes before
-reuse and after a 201 mount, percent-encodes mount parameters, disables
-non-idempotent redirect/retry/authentication replay, and returns an owned
-redacted upload-session handoff for a valid 202 decline. This increment does
-not adapt miz's spooling, ordinary upload start/body/finalization, manifest
-publication, convenience copy entry points, or root commit.
+`resolveUploadLocation`, plus its spool/upload and manifest publication flow.
+WABT requires an explicit destination tag and independent destination
+authentication context, re-verifies blob bytes before reuse and after a 201
+mount, percent-encodes mount parameters, and disables non-idempotent
+redirect/retry/authentication replay. Missing opaque blobs are streamed once
+into exclusive private spool files, independently reverified, and uploaded
+through bounded monolithic PUT or explicitly configured PATCH/finalize flows.
+Every returned session Location is bounded and revalidated; signed queries are
+preserved, cross-origin authorization is stripped, offsets/UUIDs/session paths
+are checked, and ambiguous writes are resolved only by safe exact-state probes.
+Owned redacted incomplete-upload state documents remote sessions that may
+remain while local spool files are always removed.
+
+Exact child manifests/indexes and the root are published at immutable digest
+references without JSON reserialization. The destination tag PUT is the final
+visibility operation, and an ambiguous final PUT succeeds only after both the
+tag and immutable digest resolve to the expected exact content. This increment
+does not adapt miz's convenience copy pairing entry points, CLI/profile upload
+logic, deletion, signatures, or referrers.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
 the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned

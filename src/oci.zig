@@ -2,6 +2,10 @@
 //!
 //! The implementation provenance and pinned upstream source mapping are
 //! recorded in `SOURCE_PROVENANCE.md`.
+//! Registry destinations verify/reuse or upload opaque blobs, publish exact
+//! child/root documents by immutable digest, and expose a destination tag only
+//! through the final `commitRoot` lifecycle operation. Copy pairing
+//! conveniences and CLI behavior remain outside this increment.
 
 const std = @import("std");
 
@@ -49,6 +53,7 @@ pub const RegistryHttpDeadline = registry_http.Deadline;
 pub const RegistryHttpRequestOptions = registry_http.RequestOptions;
 pub const RegistryHttpResponse = registry_http.Response;
 pub const RegistryHttpDiagnostic = registry_http.Diagnostic;
+pub const RegistryHttpBodySource = registry_http.BodySource;
 pub const RegistryUploadLocation = registry_http.ResolvedUploadLocation;
 
 pub const RegistrySource = registry.Source;
@@ -64,6 +69,7 @@ pub const RegistryMountPolicy = registry.MountPolicy;
 pub const RegistryBlobState = registry.BlobState;
 pub const RegistryDestinationState = registry.DestinationState;
 pub const RegistryUploadHandoff = registry.UploadHandoff;
+pub const RegistryUploadSessionSummary = registry.UploadSessionSummary;
 pub const RegistryUploadReason = registry.UploadReason;
 pub const RegistryUploadReplaySafety = registry.ReplaySafety;
 pub const RegistryOperation = registry.Operation;
