@@ -38,3 +38,13 @@ discovery with explicit depth, descriptor-count, total-byte, and per-document
 bounds; verifies exact metadata before parsing; retains content-addressed
 bytes; rejects subjects, cycles, conflicts, and unsupported graph nodes; and
 does not select a host platform.
+
+`src/oci/layout.zig` adapts miz `layout.Source.resolve`,
+`layout.Source.copyVerifiedTo`, `layout.Destination.ensureContent`,
+`layout.Destination.commitExact`, and its lock/temp helpers. WABT uses the
+frozen transport interfaces, `.wabt-oci-*` staging/temp names, generic
+artifact validation, bounded metadata reads, and separate missing-versus-
+corrupt blob errors. `src/oci/copy.zig` adapts the dependency-first execution
+portion of miz `copy.resolvedToDestination`; discovery remains exclusively in
+WABT's single `graph.planCopy` implementation and performs no platform
+selection.

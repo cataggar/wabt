@@ -10,6 +10,8 @@ pub const reference = @import("oci/reference.zig");
 pub const model = @import("oci/model.zig");
 pub const transport = @import("oci/transport.zig");
 pub const graph = @import("oci/graph.zig");
+pub const layout = @import("oci/layout.zig");
+pub const copy = @import("oci/copy.zig");
 
 pub const Digest = content.Digest;
 pub const ContentVerifier = content.Verifier;
@@ -37,6 +39,13 @@ pub const GraphRoot = graph.Root;
 pub const GraphPlan = graph.Plan;
 pub const planGraphCopy = graph.planCopy;
 
+pub const LayoutSource = layout.Source;
+pub const LayoutDestination = layout.Destination;
+pub const LayoutResolvedRoot = layout.ResolvedRoot;
+pub const LayoutFailurePoint = layout.FailurePoint;
+pub const copyLayoutToLayout = copy.layoutToLayout;
+pub const copyPlannedGraph = copy.executePlan;
+
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;
 pub const RegistryReference = reference.RegistryReference;
@@ -52,4 +61,7 @@ test {
     _ = @import("oci/model.zig");
     _ = @import("oci/transport.zig");
     _ = @import("oci/graph.zig");
+    _ = @import("oci/layout.zig");
+    _ = @import("oci/copy.zig");
+    _ = @import("oci/integration_tests.zig");
 }
