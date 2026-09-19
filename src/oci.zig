@@ -90,9 +90,18 @@ pub const LayoutSource = layout.Source;
 pub const LayoutDestination = layout.Destination;
 pub const LayoutResolvedRoot = layout.ResolvedRoot;
 pub const LayoutFailurePoint = layout.FailurePoint;
+pub const PackageSource = copy.PackageSource;
+pub const CopyOptions = copy.Options;
 pub const copyLayoutToLayout = copy.layoutToLayout;
+pub const copyPackageToLayout = copy.packageToLayout;
+pub const copySourceToDestination = copy.planAndCopy;
 pub const copyPlannedGraph = copy.executePlan;
 
+pub const WasmProfile = wasm.Profile;
+pub const WasmDirectManifestProfile = wasm.DirectManifestProfile;
+pub const WasmBuildOptions = wasm.BuildOptions;
+pub const PreparedWasmArtifact = wasm.PreparedArtifact;
+pub const WasmExtractionPlan = wasm.ExtractionPlan;
 pub const WasmKind = wasm_metadata.WasmKind;
 pub const WasmV0Target = wasm_metadata.WasmV0Target;
 pub const WasmExternKind = wasm_metadata.ExternKind;
@@ -102,11 +111,17 @@ pub const WasmPayloadMetadata = wasm_metadata.PayloadMetadata;
 pub const WasmValidationError = wasm_metadata.ValidationError;
 pub const validateWasmPayload = wasm_metadata.validatePayload;
 pub const classifyWasmPayload = wasm_metadata.classifyPayload;
+pub const prepareWasmArtifact = wasm.prepare;
+pub const classifyDirectWasmManifest = wasm.classifyDirectManifest;
+pub const safeWasmLayerTitle = wasm.safeLayerTitle;
 
 pub const ExtractionLayerSource = extract.LayerSource;
 pub const ExtractionOptions = extract.Options;
 pub const ExtractionResult = extract.Result;
 pub const extractDirectManifest = extract.directManifest;
+pub const extractResolvedSource = extract.fromResolvedSource;
+pub const extractLayoutSource = extract.fromLayoutSource;
+pub const extractRegistrySource = extract.fromRegistrySource;
 
 pub const parseReference = reference.parse;
 pub const Reference = reference.Reference;

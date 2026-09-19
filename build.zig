@@ -260,6 +260,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/oci/registry_test.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{
+            .{ .name = "wabt", .module = wabt_mod },
+        },
     });
     const oci_registry_tests = b.addTest(.{
         .root_module = oci_registry_test_mod,
