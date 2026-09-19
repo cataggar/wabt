@@ -86,6 +86,9 @@ pub const CopyV1 = struct {
     destinationReference: []const u8,
     destinationRootReference: []const u8,
     root: DescriptorV1,
+    manifest: ?DescriptorV1,
+    config: ?DescriptorV1,
+    payload: ?DescriptorV1,
     transferred: u64,
     reused: u64,
     mounted: u64,
@@ -116,6 +119,7 @@ pub const ExecutionError = error{
     StderrWriteFailed,
     ProgressWriteFailed,
     CommittedButReportingFailed,
+    DestinationDigestMismatch,
     UnexpectedFailure,
 };
 
@@ -439,7 +443,8 @@ pub fn diagnosticText(err: anyerror) []const u8 {
         error.StdoutWriteFailed => "failed to write stdout",
         error.StderrWriteFailed => "failed to write stderr",
         error.ProgressWriteFailed => "failed to write progress",
-        error.CommittedButReportingFailed => "publication committed but reporting failed",
+        error.CommittedButReportingFailed => "operation committed but reporting failed",
+        error.DestinationDigestMismatch => "destination digest does not match the source root",
         error.OutOfMemory => "out of memory",
         error.UnexpectedFailure => "OCI operation failed",
         else => @errorName(err),
@@ -569,12 +574,15 @@ test "push and copy DTO JSON schemas are stable" {
         .destinationReference = "registry.example/repo:tag",
         .destinationRootReference = "registry.example/repo@sha256:abc",
         .root = descriptor_value,
+        .manifest = descriptor_value,
+        .config = descriptor_value,
+        .payload = descriptor_value,
         .transferred = 3,
         .reused = 2,
         .mounted = 1,
     });
     try std.testing.expectEqualStrings(
-        "{\"schema\":\"wabt.oci.copy\",\"schemaVersion\":1,\"sourceReference\":\"oci:source:tag\",\"sourceRootReference\":\"oci:source@sha256:abc\",\"destinationReference\":\"registry.example/repo:tag\",\"destinationRootReference\":\"registry.example/repo@sha256:abc\",\"root\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"transferred\":3,\"reused\":2,\"mounted\":1}\n",
+        "{\"schema\":\"wabt.oci.copy\",\"schemaVersion\":1,\"sourceReference\":\"oci:source:tag\",\"sourceRootReference\":\"oci:source@sha256:abc\",\"destinationReference\":\"registry.example/repo:tag\",\"destinationRootReference\":\"registry.example/repo@sha256:abc\",\"root\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"manifest\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"config\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"payload\":{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:abc\",\"size\":8},\"transferred\":3,\"reused\":2,\"mounted\":1}\n",
         bytes[0..stdout_writer.end],
     );
 }

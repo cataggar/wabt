@@ -173,10 +173,10 @@ const RecordingDestination = struct {
         selection: ?wabt.oci.Selection,
     ) !void {
         if (self.phase != .initial) return error.DestinationStateConflict;
-        self.selected_tag = switch (selection orelse
-            return error.TagRequired) {
+        const selected = selection orelse return error.TagRequired;
+        self.selected_tag = switch (selected) {
             .tag => |tag| tag,
-            .digest => return error.TagRequired,
+            .digest => null,
         };
         self.phase = .prepared;
     }
@@ -906,11 +906,13 @@ test "push creation time policy explains deterministic and changing digests" {
                 &changed_digest,
             ));
         }
-        try std.testing.expect(std.mem.indexOf(
-            u8,
-            capture.stdout(),
-            "created-source=current-time",
-        ) != null);
+        const expected_stdout = try std.fmt.allocPrint(
+            allocator,
+            "registry.example/team/app@{s}\n",
+            .{root},
+        );
+        defer allocator.free(expected_stdout);
+        try std.testing.expectEqualStrings(expected_stdout, capture.stdout());
     }
 
     var explicit_one = try preparePackage(
@@ -1168,7 +1170,7 @@ test "write diagnostics are stable and redact secret-shaped text" {
         error.CommittedButReportingFailed,
     );
     try std.testing.expectEqualStrings(
-        "error: wabt oci push: publication committed but reporting failed\n",
+        "error: wabt oci push: operation committed but reporting failed\n",
         capture.stderr(),
     );
     try std.testing.expect(std.mem.indexOf(
@@ -1257,6 +1259,21 @@ test "copy executes all four endpoint pairings with immutable roots and exact co
             capture.stdout(),
             "\"transferred\":3",
         ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            capture.stdout(),
+            "\"manifest\":{\"mediaType\":",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            capture.stdout(),
+            "\"config\":{\"mediaType\":",
+        ) != null);
+        try std.testing.expect(std.mem.indexOf(
+            u8,
+            capture.stdout(),
+            "\"payload\":{\"mediaType\":\"application/wasm\"",
+        ) != null);
     }
 
     var recording: RecordingDestination = .{
@@ -1290,6 +1307,56 @@ test "copy executes all four endpoint pairings with immutable roots and exact co
             capture.stdout(),
             package.root_descriptor.digest,
         ) != null);
+    }
+
+    recording.reset();
+    destination_factory = .{ .destination = &recording };
+    const digest_destination = try std.fmt.allocPrint(
+        allocator,
+        "registry.example/team/destination@{s}",
+        .{package.root_descriptor.digest},
+    );
+    defer allocator.free(digest_destination);
+    {
+        var counters: runtime_mod.Counters = .{};
+        var capture: Capture = undefined;
+        capture.reset();
+        var runtime = initRuntime(&counters, &capture);
+        runtime.registry_destination_factory = .{
+            .context = &destination_factory,
+            .create_fn = DestinationFactory.create,
+        };
+        try copy_cmd.execute(&.{
+            source_layout_ref,
+            digest_destination,
+            "--json",
+        }, &runtime);
+        try std.testing.expect(recording.finished);
+        try std.testing.expect(recording.selected_tag == null);
+        try std.testing.expectEqual(@as(usize, 1), destination_factory.create_count);
+    }
+
+    recording.reset();
+    destination_factory = .{ .destination = &recording };
+    {
+        var counters: runtime_mod.Counters = .{};
+        var capture: Capture = undefined;
+        capture.reset();
+        var runtime = initRuntime(&counters, &capture);
+        runtime.registry_destination_factory = .{
+            .context = &destination_factory,
+            .create_fn = DestinationFactory.create,
+        };
+        try std.testing.expectError(
+            error.DestinationDigestMismatch,
+            copy_cmd.execute(&.{
+                source_layout_ref,
+                "registry.example/team/destination@" ++
+                    "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            }, &runtime),
+        );
+        try std.testing.expectEqual(@as(usize, 0), destination_factory.create_count);
+        try std.testing.expect(counters.isZero());
     }
 
     var backend: PackageRegistryBackend = .{
@@ -1726,6 +1793,11 @@ test "layout copy preserves nested shared graphs and exact root extensions" {
         u8,
         capture.stdout(),
         "\"transferred\":5",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        capture.stdout(),
+        "\"manifest\":null,\"config\":null,\"payload\":null",
     ) != null);
 }
 

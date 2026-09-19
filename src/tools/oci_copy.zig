@@ -8,8 +8,9 @@ pub const usage =
     "Usage: wabt oci copy SOURCE DESTINATION [options]\n" ++
     "\n" ++
     "Copy one complete bounded OCI graph without platform selection.\n" ++
-    "Registry destinations require an explicit tag. Registry and oci: layout\n" ++
-    "endpoints are instantiated independently; layout-only copies stay offline.\n" ++
+    "Registry destinations require an explicit tag or exact root digest.\n" ++
+    "Registry and oci: layout endpoints are instantiated independently;\n" ++
+    "layout-only copies stay offline.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --json                            Emit the versioned JSON result\n" ++
@@ -52,7 +53,6 @@ pub const Error = options.Error || wabt.oci.reference.Error ||
     MissingSource,
     MissingDestination,
     UnexpectedArgument,
-    DestinationTagRequired,
 };
 
 pub fn parseArgs(args: []const []const u8) Error!Options {
@@ -88,11 +88,6 @@ pub fn parseArgs(args: []const []const u8) Error!Options {
 
     const source = try wabt.oci.parseReference(positionals[0].?, .source);
     const destination = try wabt.oci.parseReference(positionals[1].?, .destination);
-    if (destination == .registry) {
-        const selection = destination.registry.selection orelse
-            return error.DestinationTagRequired;
-        if (selection != .tag) return error.DestinationTagRequired;
-    }
     return .{
         .source_text = positionals[0].?,
         .source = source,
@@ -183,6 +178,9 @@ fn copyResolved(
     ) catch |err| return output.mapCopyError(err);
     defer plan.deinit();
 
+    try validateDestinationDigest(parsed.destination, root_descriptor);
+    const root_details = describeRoot(plan.rootNode(), root_descriptor);
+
     const result = switch (parsed.destination) {
         .registry => |reference| blk: {
             var destination = runtime.openRegistryDestination(
@@ -243,6 +241,7 @@ fn copyResolved(
         source_canonical,
         destination_canonical,
         root_descriptor,
+        root_details,
         result,
     ) catch return error.CommittedButReportingFailed;
 }
@@ -277,6 +276,7 @@ fn emit(
     source_canonical: []const u8,
     destination_canonical: []const u8,
     root_descriptor: wabt.oci.Descriptor,
+    root_details: RootDetails,
     result: wabt.oci.TransferResult,
 ) output.ExecutionError!void {
     if (parsed.json) {
@@ -286,6 +286,9 @@ fn emit(
             .destinationReference = parsed.destination_text,
             .destinationRootReference = destination_canonical,
             .root = output.descriptor(root_descriptor),
+            .manifest = root_details.manifest,
+            .config = root_details.config,
+            .payload = root_details.payload,
             .transferred = result.counts.transferred,
             .reused = result.counts.reused,
             .mounted = result.counts.mounted,
@@ -299,6 +302,50 @@ fn emit(
     ) catch return error.OutOfMemory;
     defer runtime.allocator.free(line);
     return output.writeText(runtime, line);
+}
+
+const RootDetails = struct {
+    manifest: ?output.DescriptorV1 = null,
+    config: ?output.DescriptorV1 = null,
+    payload: ?output.DescriptorV1 = null,
+};
+
+fn describeRoot(
+    root_node: *const wabt.oci.graph.Node,
+    root_descriptor: wabt.oci.Descriptor,
+) RootDetails {
+    return switch (root_node.view) {
+        .index => .{},
+        .manifest => |manifest| .{
+            .manifest = output.descriptor(root_descriptor),
+            .config = output.descriptor(manifest.config),
+            .payload = if (manifest.layers.len == 1 and std.mem.eql(
+                u8,
+                manifest.layers[0].mediaType,
+                wabt.oci.wasm.media_type_wasm,
+            ))
+                output.descriptor(manifest.layers[0])
+            else
+                null,
+        },
+    };
+}
+
+fn validateDestinationDigest(
+    destination: wabt.oci.Reference,
+    root_descriptor: wabt.oci.Descriptor,
+) output.ExecutionError!void {
+    const selection = switch (destination) {
+        .registry => |reference| reference.selection,
+        .layout => |reference| reference.selection,
+    } orelse return;
+    const expected = switch (selection) {
+        .tag => return,
+        .digest => |digest| digest,
+    };
+    const actual = wabt.oci.Digest.parse(root_descriptor.digest) catch
+        return error.InvalidContent;
+    if (!actual.eql(expected)) return error.DestinationDigestMismatch;
 }
 
 test "copy parses every endpoint pairing and keeps endpoint options separate" {
@@ -390,12 +437,12 @@ test "copy rejects registry options on layouts and unprefixed endpoint options" 
         error.UnexpectedArgument,
         parseArgs(&.{ "oci:a", "oci:b", "extra" }),
     );
-    try std.testing.expectError(
-        error.DestinationTagRequired,
-        parseArgs(&.{
-            "oci:a",
-            "registry.example/team/dest@" ++
-                "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-        }),
+    const digest_destination = try parseArgs(&.{
+        "oci:a",
+        "registry.example/team/dest@" ++
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    });
+    try std.testing.expect(
+        digest_destination.destination.registry.selection.? == .digest,
     );
 }

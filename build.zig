@@ -497,9 +497,7 @@ pub fn build(b: *std.Build) void {
         layout_pull.addArg("-o");
         _ = layout_pull.addOutputFileArg("layout-smoke.wasm");
         layout_pull.expectExitCode(0);
-        layout_pull.expectStdOutMatch(
-            "pulled sha256:93a44bbb96c751218e4c00d479e4c14358122a389acca16205b1e4d0dc5f9476",
-        );
+        layout_pull.expectStdOutEqual("");
         layout_pull.expectStdErrEqual("");
         test_step.dependOn(&layout_pull.step);
         oci_cli_test_step.dependOn(&layout_pull.step);

@@ -33,12 +33,47 @@ jobs:
           echo "version=${V#v}" >> "$GITHUB_OUTPUT"
       - name: Build wheels
         run: uv run scripts/build_wheels.py ${{ steps.version.outputs.version }}
+      - name: Verify wheel contents
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          required = {
+              "README.md",
+              "licenses/LICENSE",
+              "licenses/SOURCE_PROVENANCE.md",
+              "licenses/THIRD_PARTY_NOTICES.md",
+              "licenses/LICENSES/miz-MIT.txt",
+          }
+          wheels = sorted(Path("dist").glob("*.whl"))
+          assert wheels
+          for wheel in wheels:
+              with ZipFile(wheel) as archive:
+                  names = archive.namelist()
+              scripts = [
+                  name for name in names
+                  if ".data/scripts/" in name and not name.endswith("/")
+              ]
+              assert len(scripts) == 1, (wheel, scripts)
+              assert Path(scripts[0]).name in {"wabt", "wabt.exe"}, scripts[0]
+              for suffix in required:
+                  assert any(name.endswith(f".dist-info/{suffix}") for name in names), (
+                      wheel,
+                      suffix,
+                  )
+          PY
       - name: Smoke host wheel OCI command help
         run: |
           uv venv .wheel-smoke
           uv pip install --python .wheel-smoke/bin/python dist/*manylinux_2_17_x86_64*.whl
           PATH="$PWD/.wheel-smoke/bin:$PATH" wabt help oci
-          PATH="$PWD/.wheel-smoke/bin:$PATH" wabt oci resolve help
+          PATH="$PWD/.wheel-smoke/bin:$PATH" wabt oci help
+          for verb in push pull copy inspect resolve list-tags; do
+            PATH="$PWD/.wheel-smoke/bin:$PATH" wabt help oci "$verb"
+            PATH="$PWD/.wheel-smoke/bin:$PATH" wabt oci help "$verb"
+            PATH="$PWD/.wheel-smoke/bin:$PATH" wabt oci "$verb" help
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: dist

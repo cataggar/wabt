@@ -52,9 +52,9 @@ pub fn parseSubcommand(s: []const u8) ?Subcommand {
     return null;
 }
 
-pub fn writeStdout(io: std.Io, text: []const u8) void {
+pub fn writeStdout(io: std.Io, text: []const u8) !void {
     var stdout_file = std.Io.File.stdout();
-    stdout_file.writeStreamingAll(io, text) catch {};
+    try stdout_file.writeStreamingAll(io, text);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -74,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
 
     switch (subcmd) {
         .version => {
-            writeStdout(init.io, "wabt " ++ wabt.version ++ "\n");
+            try writeStdout(init.io, "wabt " ++ wabt.version ++ "\n");
             return;
         },
         .help => try runHelp(init, sub_args),
@@ -128,7 +128,7 @@ const help_usage =
 
 fn runHelp(init: std.process.Init, args: []const []const u8) !void {
     if (args.len == 0) {
-        writeStdout(init.io, top_usage);
+        try writeStdout(init.io, top_usage);
         return;
     }
     const sub = parseSubcommand(args[0]) orelse {
@@ -153,15 +153,15 @@ fn runHelp(init: std.process.Init, args: []const []const u8) !void {
     }
 
     switch (sub) {
-        .text => writeStdout(init.io, text_cmd.usage),
-        .module => writeStdout(init.io, module_cmd.usage),
-        .component => writeStdout(init.io, component_cmd.usage),
-        .interface => writeStdout(init.io, interface_cmd.usage),
-        .compose => writeStdout(init.io, compose_cmd.usage),
-        .spec => writeStdout(init.io, spec_cmd.usage),
-        .oci => writeStdout(init.io, oci_cmd.usage),
-        .version => writeStdout(init.io, version_usage),
-        .help => writeStdout(init.io, help_usage),
+        .text => try writeStdout(init.io, text_cmd.usage),
+        .module => try writeStdout(init.io, module_cmd.usage),
+        .component => try writeStdout(init.io, component_cmd.usage),
+        .interface => try writeStdout(init.io, interface_cmd.usage),
+        .compose => try writeStdout(init.io, compose_cmd.usage),
+        .spec => try writeStdout(init.io, spec_cmd.usage),
+        .oci => try writeStdout(init.io, oci_cmd.usage),
+        .version => try writeStdout(init.io, version_usage),
+        .help => try writeStdout(init.io, help_usage),
     }
 }
 

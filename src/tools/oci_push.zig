@@ -10,8 +10,8 @@ pub const usage =
     "Publish one validated core Wasm module or component to a registry tag.\n" ++
     "The default wasm-v0 profile is wkg-compatible. The explicit oci profile\n" ++
     "uses the generic OCI 1.1/ORAS shape and is not wkg-compatible.\n" ++
-    "Without --created, the current UTC second is embedded and reported;\n" ++
-    "use --created for reproducible digests.\n" ++
+    "Without --created, the current UTC second is embedded; --json reports it.\n" ++
+    "Use --created for reproducible digests.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --format wasm-v0|oci             Artifact profile (default: wasm-v0)\n" ++
@@ -301,11 +301,8 @@ fn emit(
             .payload = output.descriptor(package.layer_descriptor),
         });
     }
-    const line = std.fmt.allocPrint(
-        runtime.allocator,
-        "{s} created={s} created-source={s}\n",
-        .{ immutable, created, created_source },
-    ) catch return error.OutOfMemory;
+    const line = std.fmt.allocPrint(runtime.allocator, "{s}\n", .{immutable}) catch
+        return error.OutOfMemory;
     defer runtime.allocator.free(line);
     return output.writeText(runtime, line);
 }

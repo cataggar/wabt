@@ -2621,7 +2621,7 @@ test "blob redirects strip authorization and deadlines and limits do not accept 
     try std.testing.expectEqual(@as(usize, 0), limited_fake.index);
 }
 
-test "destination requires a tag and preflights before descriptor transfer" {
+test "destination requires a selector and preflights before descriptor transfer" {
     const no_steps = [_]Step{};
     var runtime: FakeRuntime = .{};
     var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &no_steps };
@@ -2654,12 +2654,10 @@ test "destination requires a tag and preflights before descriptor transfer" {
     try std.testing.expectEqual(@as(usize, 0), fake.index);
 
     const root_value = descriptor("{}", model.media_type_oci_manifest);
-    try std.testing.expectError(
-        error.TagRequired,
-        initDestination(&fake, &runtime, .{
-            .selection = .{ .digest = root_value.digest },
-        }),
-    );
+    var digest_destination = try initDestination(&fake, &runtime, .{
+        .selection = .{ .digest = root_value.digest },
+    });
+    digest_destination.deinit();
     try std.testing.expectEqual(@as(usize, 0), fake.index);
 
     const preflight_steps = [_]Step{.{
@@ -2743,6 +2741,79 @@ test "destination requires a tag and preflights before descriptor transfer" {
         limited.prepareRoot(root_value.value(), .{ .tag = "latest" }),
     );
     try std.testing.expectEqual(@as(usize, 0), limited_fake.index);
+}
+
+test "digest destination commits the exact immutable root without a tag write" {
+    const allocator = std.testing.allocator;
+    const root_bytes =
+        "{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[]}";
+    const root = descriptor(root_bytes, model.media_type_oci_index);
+    const root_path = try std.fmt.allocPrint(
+        allocator,
+        "/v2/dest/manifests/{s}",
+        .{&root.digest_text},
+    );
+    defer allocator.free(root_path);
+    const root_headers = try headersFor(
+        allocator,
+        model.media_type_oci_index,
+        root_bytes,
+        &root.digest_text,
+        &.{},
+    );
+    defer freeHeaders(allocator, root_headers);
+    const root_put_headers = [_]registry_http.Header{
+        .{ .name = "Location", .value = root_path },
+        .{ .name = "Docker-Content-Digest", .value = &root.digest_text },
+    };
+    const steps = [_]Step{
+        .{ .path_suffix = "/v2/", .class = .registry },
+        .{ .path_suffix = root_path, .class = .registry, .status = 404 },
+        .{
+            .method = .PUT,
+            .path_suffix = root_path,
+            .class = .registry,
+            .status = 201,
+            .headers = &root_put_headers,
+            .expected_body = root_bytes,
+        },
+        .{
+            .path_suffix = root_path,
+            .class = .registry,
+            .headers = root_headers.values,
+            .body = root_bytes,
+        },
+    };
+    var runtime: FakeRuntime = .{};
+    var fake: ScriptedBackend = .{ .runtime = &runtime, .steps = &steps };
+    const selection: reference.Selection = .{ .digest = root.digest };
+    var destination = try initDestination(&fake, &runtime, .{
+        .selection = selection,
+    });
+    defer destination.deinit();
+    try destination.prepareRoot(root.value(), selection);
+    try std.testing.expectEqual(
+        transport.DescriptorResult.transferred,
+        try destination.stageRoot(.{
+            .descriptor = root.value(),
+            .descriptor_json = null,
+            .exact_bytes = root_bytes,
+        }),
+    );
+    try std.testing.expectEqual(
+        transport.CommitResult.published,
+        try destination.commitRoot(
+            .{
+                .descriptor = root.value(),
+                .descriptor_json = null,
+                .exact_bytes = root_bytes,
+            },
+            selection,
+        ),
+    );
+    try destination.finish();
+    try std.testing.expect(destination.committed());
+    try std.testing.expectEqual(@as(usize, steps.len), fake.index);
 }
 
 test "destination blob reuse verifies HEAD and bounded GET" {

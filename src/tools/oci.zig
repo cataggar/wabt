@@ -204,6 +204,8 @@ test "invalid parse paths return before all runtime boundaries" {
         &.{ "pull", "registry.example/team/app:tag", "-o", "out/" },
         &.{ "copy", "oci:source", "oci:destination", "--source-auth-file", "auth.json" },
         &.{ "resolve", "registry.example/team/app:tag", "--password", "do-not-read" },
+        &.{ "inspect", "registry.example/team/app:tag", "--deadline", "0s" },
+        &.{ "list-tags", "registry.example/team/app:tag" },
     };
     for (commands) |command| {
         var counters: runtime_mod.Counters = .{};
