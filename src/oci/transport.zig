@@ -77,6 +77,12 @@ pub const Source = struct {
             descriptor: model.Descriptor,
             max_bytes: u64,
         ) anyerror!Metadata,
+        read_manifest_metadata: *const fn (
+            context: *anyopaque,
+            allocator: std.mem.Allocator,
+            descriptor: model.Descriptor,
+            max_bytes: u64,
+        ) anyerror!Metadata,
         copy_verified_to: *const fn (
             context: *anyopaque,
             descriptor: model.Descriptor,
@@ -108,8 +114,26 @@ pub const Source = struct {
                 return implementation.copyVerifiedTo(descriptor, destination);
             }
 
+            fn readManifestMetadata(
+                context: *anyopaque,
+                allocator: std.mem.Allocator,
+                descriptor: model.Descriptor,
+                max_bytes: u64,
+            ) anyerror!Metadata {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                if (comptime @hasDecl(@TypeOf(implementation.*), "readManifestMetadata")) {
+                    return implementation.readManifestMetadata(
+                        allocator,
+                        descriptor,
+                        max_bytes,
+                    );
+                }
+                return implementation.readMetadata(allocator, descriptor, max_bytes);
+            }
+
             const vtable: VTable = .{
                 .read_metadata = @This().readMetadata,
+                .read_manifest_metadata = @This().readManifestMetadata,
                 .copy_verified_to = @This().copyVerifiedTo,
             };
         };
@@ -129,6 +153,22 @@ pub const Source = struct {
         max_bytes: u64,
     ) !Metadata {
         return self.vtable.read_metadata(
+            self.context,
+            allocator,
+            descriptor,
+            max_bytes,
+        );
+    }
+
+    /// Reads an index child through a manifest-capable source path even when
+    /// its extension media type is not recognized locally.
+    pub fn readManifestMetadata(
+        self: Source,
+        allocator: std.mem.Allocator,
+        descriptor: model.Descriptor,
+        max_bytes: u64,
+    ) !Metadata {
+        return self.vtable.read_manifest_metadata(
             self.context,
             allocator,
             descriptor,

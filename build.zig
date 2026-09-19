@@ -256,6 +256,22 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_lib_tests.step);
 
+    const oci_registry_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/oci/registry_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const oci_registry_tests = b.addTest(.{
+        .root_module = oci_registry_test_mod,
+    });
+    const run_oci_registry_tests = b.addRunArtifact(oci_registry_tests);
+    const oci_registry_test_step = b.step(
+        "test-oci-registry",
+        "Run deterministic OCI registry fixture tests",
+    );
+    oci_registry_test_step.dependOn(&run_oci_registry_tests.step);
+    test_step.dependOn(oci_registry_test_step);
+
     // Per-subcommand inline tests
     for (subcommand_sources) |src| {
         const sub_mod = b.createModule(.{

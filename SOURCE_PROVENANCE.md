@@ -14,7 +14,7 @@ The following paths identify the pinned sources and their WABT destinations:
 | `packages/miz/src/oci/content.zig` | `src/oci/content.zig` |
 | `packages/miz/src/oci/reference.zig` | `src/oci/reference.zig` |
 | `packages/miz/src/oci/auth.zig` | `src/oci/auth.zig` |
-| `packages/miz/src/oci/registry.zig` | `src/oci/registry_http.zig` |
+| `packages/miz/src/oci/registry.zig` | `src/oci/registry_http.zig`, `src/oci/registry.zig`, `src/oci/registry_test.zig` |
 | `packages/miz/src/oci/model.zig` | `src/oci/model.zig`, `src/oci/graph.zig` |
 | `packages/miz/src/oci/transport.zig` | `src/oci/transport.zig` |
 | `packages/miz/src/oci/layout.zig` | `src/oci/layout.zig`, `src/oci/integration_tests.zig` |
@@ -46,6 +46,17 @@ canonical origin policy, loopback-only explicit HTTP, authorization stripping,
 an injected backend/runtime boundary, absolute operation deadlines, scoped
 token-cache integration, secret-safe diagnostics, and explicit Zig 0.16
 socket-timeout capability reporting.
+
+`src/oci/registry.zig` materially adapts miz's registry resolve, manifest,
+blob, and tag-list read paths behind WABT's repository-bound source and
+injected HTTP/authentication boundaries. WABT resolves tags from exact GET
+bytes once, derives immutable descriptors, uses digest-only follow-up
+requests, validates artifact-capable graphs, separates manifest reads from
+opaque blob streaming, enforces bounded same-origin pagination, and returns
+typed redacted diagnostics. `src/oci/registry_test.zig` replaces miz's
+platform-specific/live assumptions with deterministic injected and loopback
+fixtures covering authentication, retries, redirects, corruption, pagination,
+and output cleanup.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
 the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned

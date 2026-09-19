@@ -29,6 +29,8 @@ pub const Error = error{
     TransportFailed,
     TlsValidationFailed,
     ProtocolError,
+    ContentEncodingRejected,
+    BodySinkFailed,
 };
 
 pub const Limits = struct {
@@ -340,6 +342,56 @@ pub const RequestClass = enum {
     blob,
 };
 
+pub const BodySinkError = error{SinkFailed};
+
+/// A retry-aware streaming response destination. Backends call `begin`
+/// before every successful response body attempt, so implementations can
+/// discard a partial prior attempt before accepting replayed bytes.
+pub const BodySink = struct {
+    context: *anyopaque,
+    begin_fn: *const fn (*anyopaque, ?u64) BodySinkError!void,
+    write_fn: *const fn (*anyopaque, []const u8) BodySinkError!void,
+    finish_fn: *const fn (*anyopaque) BodySinkError!void,
+
+    pub fn init(pointer: anytype) BodySink {
+        const Pointer = @TypeOf(pointer);
+        const Adapter = struct {
+            fn begin(context: *anyopaque, content_length: ?u64) BodySinkError!void {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.begin(content_length);
+            }
+
+            fn write(context: *anyopaque, bytes: []const u8) BodySinkError!void {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.write(bytes);
+            }
+
+            fn finish(context: *anyopaque) BodySinkError!void {
+                const implementation: Pointer = @ptrCast(@alignCast(context));
+                return implementation.finish();
+            }
+        };
+        return .{
+            .context = pointer,
+            .begin_fn = Adapter.begin,
+            .write_fn = Adapter.write,
+            .finish_fn = Adapter.finish,
+        };
+    }
+
+    pub fn begin(self: BodySink, content_length: ?u64) BodySinkError!void {
+        return self.begin_fn(self.context, content_length);
+    }
+
+    pub fn write(self: BodySink, bytes: []const u8) BodySinkError!void {
+        return self.write_fn(self.context, bytes);
+    }
+
+    pub fn finish(self: BodySink) BodySinkError!void {
+        return self.finish_fn(self.context);
+    }
+};
+
 pub const BackendCapabilities = struct {
     absolute_deadline: bool = false,
     dns_timeout: bool = false,
@@ -357,7 +409,9 @@ pub const BackendRequest = struct {
     headers: []const Header,
     authorization: ?[]const u8,
     response_header_limit: usize,
-    body_limit: usize,
+    body_limit: u64,
+    error_body_limit: usize = 64 * 1024,
+    body_sink: ?BodySink = null,
     absolute_deadline_ns: i128,
     attempt_timeout_ns: u64,
     body_idle_timeout_ns: u64,
@@ -392,6 +446,7 @@ pub const BackendError = error{
     Timeout,
     HeaderLimitExceeded,
     BodyLimitExceeded,
+    BodySinkFailed,
     TransportFailure,
     ProtocolFailure,
 };
@@ -509,7 +564,7 @@ pub const SystemRuntime = struct {
     }
 
     pub fn now(self: *SystemRuntime) i128 {
-        return Io.Clock.awake.now(self.io).raw.toNanoseconds();
+        return Io.Clock.awake.now(self.io).toNanoseconds();
     }
 
     pub fn unixSeconds(self: *SystemRuntime) i64 {
@@ -576,7 +631,8 @@ pub const RequestOptions = struct {
     path_and_query: []const u8,
     class: RequestClass = .registry,
     headers: []const Header = &.{},
-    max_body_bytes: ?usize = null,
+    max_body_bytes: ?u64 = null,
+    body_sink: ?BodySink = null,
     deadline: Deadline,
 };
 
@@ -735,7 +791,9 @@ pub const Client = struct {
             return self.fail(error.InvalidRequest, .protocol, options.class, null, self.endpoint.origin.canonical);
         }
         const body_limit = options.max_body_bytes orelse self.limits.max_metadata_body_bytes;
-        if (body_limit == 0 or body_limit > self.limits.max_metadata_body_bytes) {
+        if ((body_limit == 0 and options.method != .HEAD and options.body_sink == null) or
+            (options.body_sink == null and body_limit > self.limits.max_metadata_body_bytes))
+        {
             return self.fail(error.LimitExceeded, .limit, options.class, null, self.endpoint.origin.canonical);
         }
         try self.checkDeadline(options.deadline, options.class, self.endpoint.origin.canonical);
@@ -786,7 +844,9 @@ pub const Client = struct {
                 .headers = effective_headers[0..effective_count],
                 .authorization = authorization,
                 .response_header_limit = self.limits.max_response_header_bytes,
-                .body_limit = @max(body_limit, self.limits.max_error_body_bytes),
+                .body_limit = body_limit,
+                .error_body_limit = self.limits.max_error_body_bytes,
+                .body_sink = options.body_sink,
                 .absolute_deadline_ns = options.deadline.at_ns,
                 .attempt_timeout_ns = attempt_timeout,
                 .body_idle_timeout_ns = body_idle_timeout,
@@ -812,6 +872,7 @@ pub const Client = struct {
                     error.TlsFailure => self.fail(error.TlsValidationFailed, .tls, options.class, null, current_origin.canonical),
                     error.Timeout => self.fail(error.DeadlineExceeded, .deadline, options.class, null, current_origin.canonical),
                     error.HeaderLimitExceeded, error.BodyLimitExceeded => self.fail(error.LimitExceeded, .limit, options.class, null, current_origin.canonical),
+                    error.BodySinkFailed => self.fail(error.BodySinkFailed, .protocol, options.class, null, current_origin.canonical),
                     error.ProtocolFailure => self.fail(error.ProtocolError, .protocol, options.class, null, current_origin.canonical),
                     error.DnsFailure,
                     error.ConnectionRefused,
@@ -834,10 +895,14 @@ pub const Client = struct {
                 if (response.status >= 200 and response.status < 300)
                     body_limit
                 else
-                    self.limits.max_error_body_bytes,
+                    @as(u64, @intCast(self.limits.max_error_body_bytes)),
             ) catch |err| {
                 response.deinit();
                 return self.fail(err, .limit, options.class, null, current_origin.canonical);
+            };
+            validateIdentityContentEncoding(response) catch |err| {
+                response.deinit();
+                return self.fail(err, .protocol, options.class, response.status, current_origin.canonical);
             };
 
             if (isRedirectStatus(response.status)) {
@@ -1217,9 +1282,6 @@ pub const StdBackend = struct {
         }
         var std_response = std_request.receiveHead(&.{}) catch |err|
             return mapStdBackendError(err);
-        if (std_response.head.content_encoding != .identity) {
-            return error.ProtocolFailure;
-        }
 
         var headers = std.array_list.Managed(OwnedHeader).init(allocator);
         errdefer {
@@ -1250,16 +1312,52 @@ pub const StdBackend = struct {
         errdefer body.deinit();
         if (options.method.responseHasBody()) {
             var reader_buffer: [16 * 1024]u8 = undefined;
-            var transfer_buffer: [16 * 1024]u8 = undefined;
+            var transfer_buffer: [64 * 1024]u8 = undefined;
             const reader = std_response.reader(&reader_buffer);
-            while (true) {
-                const count = reader.readSliceShort(&transfer_buffer) catch
-                    return error.ReadFailed;
-                if (count == 0) break;
-                if (count > options.body_limit -| body.items.len) {
-                    return error.BodyLimitExceeded;
+            const status: u16 = @intFromEnum(std_response.head.status);
+            if (status >= 200 and status < 300) {
+                if (std_response.head.content_length) |length| {
+                    if (length > options.body_limit) return error.BodyLimitExceeded;
                 }
-                body.appendSlice(transfer_buffer[0..count]) catch return error.OutOfMemory;
+                if (options.body_sink) |sink| {
+                    sink.begin(std_response.head.content_length) catch
+                        return error.BodySinkFailed;
+                    var total: u64 = 0;
+                    while (true) {
+                        const count = reader.readSliceShort(&transfer_buffer) catch
+                            return error.ReadFailed;
+                        if (count == 0) break;
+                        total = std.math.add(u64, total, count) catch
+                            return error.BodyLimitExceeded;
+                        if (total > options.body_limit) return error.BodyLimitExceeded;
+                        sink.write(transfer_buffer[0..count]) catch
+                            return error.BodySinkFailed;
+                    }
+                    sink.finish() catch return error.BodySinkFailed;
+                } else {
+                    while (true) {
+                        const count = reader.readSliceShort(&transfer_buffer) catch
+                            return error.ReadFailed;
+                        if (count == 0) break;
+                        const current: u64 = @intCast(body.items.len);
+                        if (@as(u64, count) > options.body_limit -| current) {
+                            return error.BodyLimitExceeded;
+                        }
+                        body.appendSlice(transfer_buffer[0..count]) catch
+                            return error.OutOfMemory;
+                    }
+                }
+            } else {
+                while (true) {
+                    const count = reader.readSliceShort(&transfer_buffer) catch
+                        return error.ReadFailed;
+                    if (count == 0) break;
+                    if (count > options.error_body_limit -| body.items.len) {
+                        return error.BodyLimitExceeded;
+                    }
+                    body.appendSlice(transfer_buffer[0..count]) catch
+                        return error.OutOfMemory;
+                }
             }
         }
         return .{
@@ -1505,6 +1603,58 @@ fn resolveRedirectAlloc(
     return result;
 }
 
+/// Resolves an RFC Link target against an endpoint-relative request and
+/// returns another endpoint-relative target only when the normalized origin
+/// is unchanged. The returned value never contains userinfo or a fragment.
+pub fn resolveSameOriginPathAlloc(
+    allocator: Allocator,
+    endpoint: Endpoint,
+    current_path_and_query: []const u8,
+    location: []const u8,
+    max_result_bytes: usize,
+) Error![]u8 {
+    if (max_result_bytes == 0 or location.len == 0 or
+        location.len > max_result_bytes or containsUnsafeUriByte(location) or
+        !hasValidPercentEncoding(location))
+    {
+        return error.RedirectRejected;
+    }
+    const current_url = try endpoint.urlAlloc(current_path_and_query);
+    defer endpoint.allocator.free(current_url);
+    const absolute_limit = std.math.add(
+        usize,
+        max_result_bytes,
+        current_url.len,
+    ) catch return error.RedirectRejected;
+    const resolved_url = try resolveRedirectAlloc(
+        allocator,
+        current_url,
+        location,
+        absolute_limit,
+    );
+    defer allocator.free(resolved_url);
+    var resolved_origin = try parseOrigin(allocator, resolved_url);
+    defer resolved_origin.deinit();
+    if (!endpoint.origin.eql(resolved_origin)) return error.RedirectRejected;
+
+    const scheme_end = std.mem.indexOf(u8, resolved_url, "://") orelse
+        return error.RedirectRejected;
+    const authority_start = scheme_end + 3;
+    const suffix_index = std.mem.indexOfAnyPos(
+        u8,
+        resolved_url,
+        authority_start,
+        "/?",
+    ) orelse return allocator.dupe(u8, "/") catch error.OutOfMemory;
+    const suffix = resolved_url[suffix_index..];
+    if (suffix[0] == '/') {
+        if (suffix.len > max_result_bytes) return error.RedirectRejected;
+        return allocator.dupe(u8, suffix) catch error.OutOfMemory;
+    }
+    if (suffix.len + 1 > max_result_bytes) return error.RedirectRejected;
+    return std.fmt.allocPrint(allocator, "/{s}", .{suffix}) catch error.OutOfMemory;
+}
+
 fn parseDistributionChallenge(
     allocator: Allocator,
     response: Response,
@@ -1545,7 +1695,7 @@ fn mapTokenAcquisitionError(err: auth.TokenAcquisitionError) Error {
 fn validateResponseLimits(
     response: Response,
     header_limit: usize,
-    body_limit: usize,
+    body_limit: u64,
 ) Error!void {
     var total: usize = 0;
     for (response.headers) |header| {
@@ -1557,7 +1707,22 @@ fn validateResponseLimits(
             return error.LimitExceeded;
         if (total > header_limit) return error.LimitExceeded;
     }
-    if (response.body.len > body_limit) return error.LimitExceeded;
+    if (@as(u64, @intCast(response.body.len)) > body_limit) {
+        return error.LimitExceeded;
+    }
+}
+
+fn validateIdentityContentEncoding(response: Response) Error!void {
+    var value: ?[]const u8 = null;
+    for (response.headers) |header| {
+        if (!std.ascii.eqlIgnoreCase(header.name, "Content-Encoding")) continue;
+        if (value != null) return error.ContentEncodingRejected;
+        value = header.value;
+    }
+    const encoding = std.mem.trim(u8, value orelse return, " \t");
+    if (!std.ascii.eqlIgnoreCase(encoding, "identity")) {
+        return error.ContentEncodingRejected;
+    }
 }
 
 fn singleHeader(response: Response, name: []const u8) Error!?[]const u8 {
@@ -1598,6 +1763,7 @@ pub fn isRetryableBackendError(err: BackendError) bool {
         error.TlsFailure,
         error.HeaderLimitExceeded,
         error.BodyLimitExceeded,
+        error.BodySinkFailed,
         error.TransportFailure,
         error.ProtocolFailure,
         => false,
@@ -2035,12 +2201,30 @@ const FakeBackend = struct {
         self.runtime.now_ns += self.steps[current].advance_ns;
         return switch (self.steps[current].outcome) {
             .failure => |err| err,
-            .response => |response| Response.initCopy(
-                allocator,
-                response.status,
-                response.headers,
-                response.body,
-            ) catch error.OutOfMemory,
+            .response => |response| response: {
+                if (request_options.body_sink) |sink| {
+                    if (response.status >= 200 and response.status < 300) {
+                        if (response.body.len > request_options.body_limit) {
+                            return error.BodyLimitExceeded;
+                        }
+                        sink.begin(response.body.len) catch return error.BodySinkFailed;
+                        sink.write(response.body) catch return error.BodySinkFailed;
+                        sink.finish() catch return error.BodySinkFailed;
+                        break :response Response.initCopy(
+                            allocator,
+                            response.status,
+                            response.headers,
+                            "",
+                        ) catch error.OutOfMemory;
+                    }
+                }
+                break :response Response.initCopy(
+                    allocator,
+                    response.status,
+                    response.headers,
+                    response.body,
+                ) catch error.OutOfMemory;
+            },
         };
     }
 

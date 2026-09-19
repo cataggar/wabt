@@ -49,6 +49,58 @@ Constructing an HTTP client copies only explicit endpoint, CA, and
 authorization inputs. It performs no environment, credential-file, helper, or
 other ambient credential discovery.
 
+## Registry source behavior
+
+`wabt.oci.registry.Source` is bound to one normalized registry authority and
+repository. Construction applies the explicit `CredentialPolicy` once and
+owns an independent HTTP client, authorization value, bearer-token cache, and
+redacted diagnostic slot. The injected initialization path validates endpoint
+transport policy before reading an authentication file or invoking a helper.
+There is no fallback to ambient credentials beyond the selected policy.
+
+`resolve` performs one GET of the selected tag or digest with the OCI and
+Docker schema-2 manifest/index Accept set. It hashes the exact response bytes,
+checks a requested digest, corroborates any single
+`Docker-Content-Digest`, validates the response media type and artifact-capable
+document, and returns an owned immutable descriptor/reference plus the exact
+bytes. `inspect(reference)` calls `resolve` once; `inspectResolved` reuses
+those root bytes. Child manifest and blob requests are digest-addressed and do
+not revisit the mutable tag.
+
+Recognized manifest metadata uses the manifest endpoint, and
+`readManifestMetadata` forces that endpoint for index children whose extension
+media type is not otherwise recognized. Other metadata uses the blob endpoint.
+`copyVerifiedTo` always streams an opaque descriptor from the blob endpoint
+through a fixed 64 KiB buffer into a caller-owned file while counting and
+hashing. A present `Content-Length` must agree, but chunked responses are
+accepted when the verified byte count and digest match.
+Retries truncate and restart the destination from byte zero; every final
+failure attempts to truncate it again. No blob-sized allocation or hidden
+temporary file is used.
+
+Tag listing accepts only a selector-free reference for the bound repository.
+Each JSON page must contain the exact repository name and either an array of
+valid tags or `null`. Duplicate JSON fields, malformed or ambiguous Link
+values, multiple `rel=next` links, cross-origin links, fragments, userinfo,
+downgrades, cycles, and configured page/tag/byte limit exhaustion are
+rejected. Results are deduplicated and returned in lexical order. Every page
+uses the source's authorization policy and the same absolute operation
+deadline supplied to the source.
+
+Successful registry and token responses must be identity encoded. Manifest
+media types, descriptor sizes and SHA-256 digests, and any digest or length
+corroboration headers are checked before content is accepted. Stable errors
+distinguish authentication, authorization, missing content, invalid content,
+transport/TLS/deadline/retry failures, and explicit policy or limit failures.
+Diagnostics retain only bounded operation/category/status/code,
+authority/repository, and expected-digest context; response detail, bodies,
+credentials, tokens, helper output, and full URLs or queries are never
+retained.
+
+These APIs implement library reads only. They do not provide uploads,
+destinations, registry commands, command-line secret handling, or live/cloud
+test behavior.
+
 ## Credential policies
 
 `CredentialPolicy` has four mutually exclusive modes:
