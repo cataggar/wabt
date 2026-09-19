@@ -10,6 +10,10 @@ const reference = @import("reference.zig");
 const transport = @import("transport.zig");
 
 const Io = std.Io;
+// Some portable file-lock backends are process-scoped, so sibling threads
+// also need in-process serialization around bootstrap and catalog commits.
+var process_bootstrap_mutex: Io.Mutex = .init;
+var process_catalog_mutex: Io.Mutex = .init;
 
 pub const Error = error{
     InvalidLayout,
@@ -372,6 +376,7 @@ pub const Destination = struct {
     work_path: []u8,
     is_new: bool,
     bootstrap_lock: ?Io.File = null,
+    process_bootstrap_locked: bool = false,
     failure_point: FailurePoint = .none,
     prepared: bool = false,
     prepared_digest: ?content.Digest = null,
@@ -391,6 +396,9 @@ pub const Destination = struct {
         {
             return error.InvalidDestinationPath;
         }
+        process_bootstrap_mutex.lockUncancelable(io);
+        var process_lock_owned = true;
+        errdefer if (process_lock_owned) process_bootstrap_mutex.unlock(io);
         try Io.Dir.cwd().createDirPath(io, parent);
         var bootstrap_lock = try openBootstrapLock(
             io,
@@ -410,6 +418,8 @@ pub const Destination = struct {
             try source.validateLayout();
             const work_path = try allocator.dupe(u8, path);
             bootstrap_lock.close(io);
+            process_bootstrap_mutex.unlock(io);
+            process_lock_owned = false;
             return .{
                 .io = io,
                 .allocator = allocator,
@@ -434,8 +444,10 @@ pub const Destination = struct {
             .work_path = staging,
             .is_new = true,
             .bootstrap_lock = bootstrap_lock,
+            .process_bootstrap_locked = true,
         };
         try result.createSkeleton();
+        process_lock_owned = false;
         return result;
     }
 
@@ -444,6 +456,9 @@ pub const Destination = struct {
             Io.Dir.cwd().deleteTree(self.io, self.work_path) catch {};
         }
         if (self.bootstrap_lock) |lock| lock.close(self.io);
+        if (self.process_bootstrap_locked) {
+            process_bootstrap_mutex.unlock(self.io);
+        }
         self.allocator.free(self.work_path);
         self.* = undefined;
     }
@@ -543,6 +558,8 @@ pub const Destination = struct {
             return error.RootNotStaged;
         }
 
+        process_catalog_mutex.lockUncancelable(self.io);
+        defer process_catalog_mutex.unlock(self.io);
         var lock = try self.openCatalogLock();
         defer lock.close(self.io);
 
@@ -653,6 +670,10 @@ pub const Destination = struct {
         if (self.bootstrap_lock) |lock| {
             lock.close(self.io);
             self.bootstrap_lock = null;
+        }
+        if (self.process_bootstrap_locked) {
+            process_bootstrap_mutex.unlock(self.io);
+            self.process_bootstrap_locked = false;
         }
     }
 
