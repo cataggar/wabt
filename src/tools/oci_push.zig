@@ -7,7 +7,7 @@ pub const usage =
     "Usage: wabt oci push REF FILE [options]\n" ++
     "\n" ++
     "Validate a tagged registry destination and a Wasm input filename.\n" ++
-    "Execution is not implemented in this command-shell increment.\n" ++
+    "Execution is not implemented; it is planned for the next increment.\n" ++
     "\n" ++
     "Options:\n" ++
     "  --format wasm-v0|oci             Artifact profile (default: wasm-v0)\n" ++

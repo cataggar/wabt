@@ -1,36 +1,36 @@
 const std = @import("std");
 const wabt = @import("wabt");
 const options = @import("oci_options.zig");
+const output = @import("oci_output.zig");
 const runtime_mod = @import("oci_runtime.zig");
 
 pub const usage =
     "Usage: wabt oci pull REF -o FILE [options]\n" ++
     "\n" ++
-    "Validate a selected registry source and one output filename.\n" ++
-    "Existing output refusal is the default; --force is an explicit opt-in.\n" ++
-    "Execution and extraction are not implemented in this increment.\n" ++
+    "Pull one supported direct Wasm artifact from a registry or OCI layout.\n" ++
+    "The explicit output is atomically published and is not overwritten unless\n" ++
+    "--force is specified. OCI layer titles are never used as paths.\n" ++
     "\n" ++
     "Options:\n" ++
-    "  -o, --output FILE                 One output filename (required)\n" ++
-    "  --force                           Permit future atomic replacement\n" ++
-    "  --json                            Select the future versioned JSON result\n" ++
+    "  -o, --output FILE                 Output filename (required)\n" ++
+    "  --force                           Atomically replace one regular file\n" ++
+    "  --json                            Emit the versioned JSON result\n" ++
     options.endpoint_help;
 
 pub const Options = struct {
     reference_text: []const u8,
-    reference: wabt.oci.RegistryReference,
+    reference: wabt.oci.Reference,
     output_file: []const u8,
     force: bool = false,
     json: bool = false,
-    endpoint: options.EndpointOptions,
+    endpoint: ?options.EndpointOptions,
 };
 
-pub const Error = options.Error || wabt.oci.reference.Error || error{
+pub const Error = options.Error || wabt.oci.reference.Error ||
+    output.ExecutionError || error{
     MissingReference,
     MissingOutput,
     UnexpectedArgument,
-    SourceMustBeRegistry,
-    CommandNotImplemented,
 };
 
 pub fn parseArgs(args: []const []const u8) Error!Options {
@@ -47,7 +47,9 @@ pub fn parseArgs(args: []const []const u8) Error!Options {
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (try endpoint_builder.consume(args, &index, .single)) continue;
-        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+        if (std.mem.eql(u8, arg, "-o") or
+            std.mem.eql(u8, arg, "--output"))
+        {
             try options.markOnce(&output_seen);
             output_file = try options.takeValue(args, &index);
             try options.validateOutputFile(output_file.?);
@@ -70,20 +72,15 @@ pub fn parseArgs(args: []const []const u8) Error!Options {
     }
 
     const requested = reference_text orelse return error.MissingReference;
-    const output = output_file orelse return error.MissingOutput;
+    const output_file_value = output_file orelse return error.MissingOutput;
     const parsed = try wabt.oci.parseReference(requested, .source);
-    const registry = switch (parsed) {
-        .registry => |value| value,
-        .layout => return error.SourceMustBeRegistry,
-    };
-
     return .{
         .reference_text = requested,
-        .reference = registry,
-        .output_file = output,
+        .reference = parsed,
+        .output_file = output_file_value,
         .force = force,
         .json = json,
-        .endpoint = (try endpoint_builder.finish(parsed)).?,
+        .endpoint = try endpoint_builder.finish(parsed),
     };
 }
 
@@ -91,16 +88,129 @@ pub fn execute(
     args: []const []const u8,
     runtime: *runtime_mod.Runtime,
 ) Error!void {
-    _ = runtime;
-    _ = try parseArgs(args);
-    return error.CommandNotImplemented;
+    const parsed = try parseArgs(args);
+    const extraction_options: wabt.oci.ExtractionOptions = .{
+        .force = parsed.force,
+    };
+    wabt.oci.preflightExtractionOutput(
+        runtime.io,
+        parsed.output_file,
+        extraction_options,
+    ) catch |err| return output.mapLocalWriteError(err);
+
+    switch (parsed.reference) {
+        .registry => |reference| {
+            var source = runtime.openRegistrySource(
+                reference,
+                parsed.endpoint.?,
+            ) catch |err| return output.mapExecutionError(err);
+            defer source.deinit();
+            var resolved = source.resolve(reference) catch |err|
+                return output.mapExecutionError(err);
+            defer resolved.deinit();
+            var immutable_source = source.resolvedSource(&resolved);
+            try pullResolved(
+                runtime,
+                parsed,
+                resolved.canonical_reference,
+                immutable_source.asTransport(),
+                resolved.descriptor,
+                resolved.bytes,
+                extraction_options,
+            );
+        },
+        .layout => |reference| {
+            var source = wabt.oci.LayoutSource.init(
+                runtime.io,
+                runtime.allocator,
+                reference.path,
+            );
+            var resolved = source.resolve(reference) catch |err|
+                return output.mapExecutionError(err);
+            defer resolved.deinit();
+            const canonical = std.fmt.allocPrint(
+                runtime.allocator,
+                "oci:{s}@{s}",
+                .{ reference.path, resolved.descriptor.digest },
+            ) catch return error.OutOfMemory;
+            defer runtime.allocator.free(canonical);
+            try pullResolved(
+                runtime,
+                parsed,
+                canonical,
+                source.asTransport(),
+                resolved.descriptor,
+                resolved.bytes,
+                extraction_options,
+            );
+        },
+    }
+}
+
+fn pullResolved(
+    runtime: *runtime_mod.Runtime,
+    parsed: Options,
+    canonical: []const u8,
+    source: wabt.oci.Source,
+    root_descriptor: wabt.oci.Descriptor,
+    manifest_bytes: []const u8,
+    extraction_options: wabt.oci.ExtractionOptions,
+) output.ExecutionError!void {
+    var document = wabt.oci.parseDocument(
+        runtime.allocator,
+        manifest_bytes,
+    ) catch |err| return output.mapExecutionError(err);
+    defer document.deinit();
+    const manifest = switch (document.value) {
+        .index => return error.UnsupportedContent,
+        .manifest => |manifest| manifest.value,
+    };
+
+    const result = wabt.oci.extractResolvedSource(
+        runtime.io,
+        runtime.allocator,
+        source,
+        root_descriptor,
+        manifest_bytes,
+        parsed.output_file,
+        extraction_options,
+    ) catch |err| return output.mapLocalWriteError(err);
+    if (manifest.layers.len != 1) return error.UnsupportedContent;
+    const payload = manifest.layers[0];
+
+    if (parsed.json) {
+        return output.writeJson(runtime, output.PullV1{
+            .originalReference = parsed.reference_text,
+            .reference = canonical,
+            .root = output.descriptor(root_descriptor),
+            .manifest = output.descriptor(root_descriptor),
+            .config = output.descriptor(manifest.config),
+            .payload = output.descriptor(payload),
+            .profile = output.profileText(result.profile),
+            .output = parsed.output_file,
+            .size = result.bytes_written,
+        });
+    }
+
+    const line = std.fmt.allocPrint(
+        runtime.allocator,
+        "pulled {s} to {s}\n",
+        .{ payload.digest, parsed.output_file },
+    ) catch return error.OutOfMemory;
+    defer runtime.allocator.free(line);
+    return output.writeText(runtime, line);
 }
 
 const digest =
     "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-test "pull parses tag or digest and exactly one output filename" {
-    const tagged = try parseArgs(&.{ "registry.example/team/app:tag", "-o", "app.wasm" });
+test "pull parses registry or layout and exactly one output filename" {
+    const tagged = try parseArgs(&.{
+        "registry.example/team/app:tag",
+        "-o",
+        "app.wasm",
+    });
+    try std.testing.expect(tagged.reference == .registry);
     try std.testing.expectEqualStrings("app.wasm", tagged.output_file);
     try std.testing.expect(!tagged.force);
 
@@ -112,10 +222,13 @@ test "pull parses tag or digest and exactly one output filename" {
         "--json",
         "--no-credential-discovery",
     });
-    try std.testing.expect(immutable.reference.selection.? == .digest);
     try std.testing.expect(immutable.force);
     try std.testing.expect(immutable.json);
-    try std.testing.expect(immutable.endpoint.credentials == .none);
+    try std.testing.expect(immutable.endpoint.?.credentials == .none);
+
+    const layout = try parseArgs(&.{ "oci:layout", "-o", "app.wasm" });
+    try std.testing.expect(layout.reference == .layout);
+    try std.testing.expect(layout.endpoint == null);
 }
 
 test "pull rejects missing duplicate directory-like and extra outputs" {
@@ -124,23 +237,27 @@ test "pull rejects missing duplicate directory-like and extra outputs" {
         parseArgs(&.{ "registry.example/team/app", "-o", "app.wasm" }),
     );
     try std.testing.expectError(
-        error.SourceMustBeRegistry,
-        parseArgs(&.{ "oci:layout:tag", "-o", "app.wasm" }),
-    );
-    try std.testing.expectError(
         error.MissingOutput,
         parseArgs(&.{"registry.example/team/app:tag"}),
     );
     try std.testing.expectError(
         error.DuplicateOption,
-        parseArgs(&.{ "registry.example/team/app:tag", "-o", "a", "--output", "b" }),
+        parseArgs(&.{
+            "registry.example/team/app:tag", "-o", "a", "--output", "b",
+        }),
     );
     try std.testing.expectError(
         error.InvalidOutputFile,
         parseArgs(&.{ "registry.example/team/app:tag", "-o", "out/" }),
     );
     try std.testing.expectError(
+        error.RegistryOptionForLayout,
+        parseArgs(&.{ "oci:layout", "-o", "app.wasm", "--token-stdin" }),
+    );
+    try std.testing.expectError(
         error.UnexpectedArgument,
-        parseArgs(&.{ "registry.example/team/app:tag", "-o", "app.wasm", "extra" }),
+        parseArgs(&.{
+            "registry.example/team/app:tag", "-o", "app.wasm", "extra",
+        }),
     );
 }

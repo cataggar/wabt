@@ -1,8 +1,7 @@
-//! `wabt oci <verb>` — canonical OCI artifact command shell.
+//! `wabt oci <verb>` — canonical OCI artifact commands.
 //!
-//! This increment owns dispatch, help, and complete argument validation only.
-//! Every well-formed leaf remains explicitly non-successful until execution is
-//! wired in a later increment.
+//! Read commands execute through injected runtime boundaries. Push and copy
+//! remain explicit non-successes for the next increment.
 
 const std = @import("std");
 
@@ -12,18 +11,19 @@ const list_tags_cmd = @import("oci_list_tags.zig");
 const pull_cmd = @import("oci_pull.zig");
 const push_cmd = @import("oci_push.zig");
 const resolve_cmd = @import("oci_resolve.zig");
+const output = @import("oci_output.zig");
 const runtime_mod = @import("oci_runtime.zig");
 
 pub const usage =
     "Usage: wabt oci <verb> [args...]\n" ++
     "\n" ++
-    "OCI artifact command shell (argument validation only; execution pending):\n" ++
-    "  push       Validate a tagged registry destination and Wasm file\n" ++
-    "  pull       Validate a selected registry source and output filename\n" ++
-    "  copy       Validate registry/layout source and destination references\n" ++
-    "  inspect    Validate a selected registry reference for inspection\n" ++
-    "  resolve    Validate a selected registry reference for resolution\n" ++
-    "  list-tags  Validate a selector-less registry repository\n" ++
+    "OCI WebAssembly artifact commands:\n" ++
+    "  push       Not implemented (planned next increment)\n" ++
+    "  pull       Atomically extract one supported direct Wasm artifact\n" ++
+    "  copy       Not implemented (planned next increment)\n" ++
+    "  inspect    Inspect a verified registry or OCI layout graph\n" ++
+    "  resolve    Resolve a mutable or local reference immutably\n" ++
+    "  list-tags  List all tags in one registry repository\n" ++
     "\n" ++
     "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
 
@@ -50,6 +50,7 @@ pub fn parseVerb(text: []const u8) ?Verb {
 
 pub const DispatchResult = union(enum) {
     help: []const u8,
+    executed,
 };
 
 pub const Error =
@@ -94,7 +95,7 @@ pub fn dispatch(
         .list_tags => list_tags_cmd.execute(verb_args, runtime) catch |err| return err,
         .help => unreachable,
     }
-    unreachable;
+    return .executed;
 }
 
 fn helpForVerb(verb: Verb) []const u8 {
@@ -111,23 +112,23 @@ fn helpForVerb(verb: Verb) []const u8 {
 
 pub fn run(init: std.process.Init, args: []const []const u8) !void {
     var counters: runtime_mod.Counters = .{};
-    var runtime = runtime_mod.Runtime.init(&counters);
+    var runtime = runtime_mod.Runtime.initProcess(init, &counters);
     const result = dispatch(args, &runtime) catch |err| {
-        if (args.len > 0 and parseVerb(args[0]) != null and parseVerb(args[0]).? != .help) {
-            std.debug.print("error: wabt oci {s}: {s}\n", .{ args[0], @errorName(err) });
-        } else {
-            std.debug.print("error: wabt oci: {s}\n", .{@errorName(err)});
-        }
+        const command: ?[]const u8 =
+            if (args.len > 0 and parseVerb(args[0]) != null and
+            parseVerb(args[0]).? != .help)
+                args[0]
+            else
+                null;
+        output.writeDiagnostic(&runtime, command, err) catch {};
         std.process.exit(1);
     };
     switch (result) {
-        .help => |text| {
-            var stdout_file = std.Io.File.stdout();
-            stdout_file.writeStreamingAll(init.io, text) catch |err| {
-                std.debug.print("error: wabt oci help: {s}\n", .{@errorName(err)});
-                std.process.exit(1);
-            };
+        .help => |text| output.writeText(&runtime, text) catch |err| {
+            output.writeDiagnostic(&runtime, "help", err) catch {};
+            std.process.exit(1);
         },
+        .executed => {},
     }
 }
 
@@ -158,19 +159,23 @@ test "subject and leaf help are stable and side-effect free" {
     const expected_subject =
         "Usage: wabt oci <verb> [args...]\n" ++
         "\n" ++
-        "OCI artifact command shell (argument validation only; execution pending):\n" ++
-        "  push       Validate a tagged registry destination and Wasm file\n" ++
-        "  pull       Validate a selected registry source and output filename\n" ++
-        "  copy       Validate registry/layout source and destination references\n" ++
-        "  inspect    Validate a selected registry reference for inspection\n" ++
-        "  resolve    Validate a selected registry reference for resolution\n" ++
-        "  list-tags  Validate a selector-less registry repository\n" ++
+        "OCI WebAssembly artifact commands:\n" ++
+        "  push       Not implemented (planned next increment)\n" ++
+        "  pull       Atomically extract one supported direct Wasm artifact\n" ++
+        "  copy       Not implemented (planned next increment)\n" ++
+        "  inspect    Inspect a verified registry or OCI layout graph\n" ++
+        "  resolve    Resolve a mutable or local reference immutably\n" ++
+        "  list-tags  List all tags in one registry repository\n" ++
         "\n" ++
         "Run `wabt help oci <verb>` for verb-specific syntax and options.\n";
     try std.testing.expectEqualStrings(expected_subject, usage);
 
     var counters: runtime_mod.Counters = .{};
-    var runtime = runtime_mod.Runtime.init(&counters);
+    var runtime = runtime_mod.Runtime.initForTest(
+        std.testing.allocator,
+        std.testing.io,
+        &counters,
+    );
     const subject = try dispatch(&.{"help"}, &runtime);
     try std.testing.expectEqualStrings(usage, subject.help);
 
@@ -193,14 +198,10 @@ test "subject and leaf help are stable and side-effect free" {
     try std.testing.expect(counters.isZero());
 }
 
-test "well-formed unwired commands return CommandNotImplemented without side effects" {
+test "well-formed mutating commands remain explicitly unimplemented" {
     const commands = [_][]const []const u8{
         &.{ "push", "registry.example/team/app:tag", "app.wasm" },
-        &.{ "pull", "registry.example/team/app:tag", "-o", "app.wasm" },
         &.{ "copy", "oci:source", "oci:destination" },
-        &.{ "inspect", "registry.example/team/app:tag" },
-        &.{ "resolve", "registry.example/team/app:tag" },
-        &.{ "list-tags", "registry.example/team/app" },
         &.{
             "copy",
             "localhost:5000/team/source:tag",
@@ -216,7 +217,11 @@ test "well-formed unwired commands return CommandNotImplemented without side eff
 
     for (commands) |command| {
         var counters: runtime_mod.Counters = .{};
-        var runtime = runtime_mod.Runtime.init(&counters);
+        var runtime = runtime_mod.Runtime.initForTest(
+            std.testing.allocator,
+            std.testing.io,
+            &counters,
+        );
         try std.testing.expectError(
             error.CommandNotImplemented,
             dispatch(command, &runtime),
@@ -234,7 +239,11 @@ test "invalid parse paths return before all runtime boundaries" {
     };
     for (commands) |command| {
         var counters: runtime_mod.Counters = .{};
-        var runtime = runtime_mod.Runtime.init(&counters);
+        var runtime = runtime_mod.Runtime.initForTest(
+            std.testing.allocator,
+            std.testing.io,
+            &counters,
+        );
         _ = dispatch(command, &runtime) catch {};
         try std.testing.expect(counters.isZero());
     }

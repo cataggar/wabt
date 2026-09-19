@@ -8,7 +8,7 @@
 //!   wabt interface <verb>   WIT IDL (.wit) work
 //!   wabt compose <verb>     WAC composition (.wac) work
 //!   wabt spec <verb>        Spec testing (.wast) work
-//!   wabt oci <verb>         OCI artifact command shell
+//!   wabt oci <verb>         OCI WebAssembly artifact operations
 //!   wabt version            Print version
 //!   wabt help [topic]       Print help
 //!
@@ -98,7 +98,7 @@ const top_usage =
     \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
     \\  component  Component-model work — new, embed, compose
     \\  spec       Spec testing (.wast) work — run, to-json
-    \\  oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags
+    \\  oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags
     \\
     \\Global:
     \\  version    Print the wabt version and exit
@@ -188,7 +188,7 @@ test "top-level help has the stable OCI subject spelling" {
         \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
         \\  component  Component-model work — new, embed, compose
         \\  spec       Spec testing (.wast) work — run, to-json
-        \\  oci        OCI artifact command shell — push, pull, copy, inspect, resolve, list-tags
+        \\  oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags
         \\
         \\Global:
         \\  version    Print the wabt version and exit
