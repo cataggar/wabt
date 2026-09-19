@@ -47,10 +47,12 @@ jobs:
     timeout-minutes: 120
     env:
       WABT_OCI_INTEROP_MODE: qualify
-      WABT_OCI_INTEROP_STATE_DIR: ${{ runner.temp }}/wabt-oci-interoperability
       WABT_OCI_INTEROP_MAX_STATE_KIB: "12582912"
 
     steps:
+      - name: Configure bounded runner state
+        run: echo "WABT_OCI_INTEROP_STATE_DIR=$RUNNER_TEMP/wabt-oci-interoperability" >> "$GITHUB_ENV"
+
       - name: Check out source
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -75,11 +77,11 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
-            ${{ env.WABT_OCI_INTEROP_STATE_DIR }}/tools/downloads
-            ${{ env.WABT_OCI_INTEROP_STATE_DIR }}/tools/rustup
-            ${{ env.WABT_OCI_INTEROP_STATE_DIR }}/tools/cargo
-            ${{ env.WABT_OCI_INTEROP_STATE_DIR }}/tools/cargo-target
-            ${{ env.WABT_OCI_INTEROP_STATE_DIR }}/cache/zig-global
+            ${{ runner.temp }}/wabt-oci-interoperability/tools/downloads
+            ${{ runner.temp }}/wabt-oci-interoperability/tools/rustup
+            ${{ runner.temp }}/wabt-oci-interoperability/tools/cargo
+            ${{ runner.temp }}/wabt-oci-interoperability/tools/cargo-target
+            ${{ runner.temp }}/wabt-oci-interoperability/cache/zig-global
           key: oci-interop-arm64-v1-rust-1.97.0-wkg-5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a-${{ hashFiles('scripts/oci/generate_interop_fixtures.sh', 'scripts/oci/fixture_manifest.py') }}
 
       - name: Run two clean pinned qualifications
