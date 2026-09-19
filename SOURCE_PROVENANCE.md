@@ -14,6 +14,7 @@ The following paths identify the pinned sources and their WABT destinations:
 | `packages/miz/src/oci/content.zig` | `src/oci/content.zig` |
 | `packages/miz/src/oci/reference.zig` | `src/oci/reference.zig` |
 | `packages/miz/src/oci/auth.zig` | `src/oci/auth.zig` |
+| `packages/miz/src/oci/registry.zig` | `src/oci/registry_http.zig` |
 | `packages/miz/src/oci/model.zig` | `src/oci/model.zig`, `src/oci/graph.zig` |
 | `packages/miz/src/oci/transport.zig` | `src/oci/transport.zig` |
 | `packages/miz/src/oci/layout.zig` | `src/oci/layout.zig`, `src/oci/integration_tests.zig` |
@@ -37,6 +38,14 @@ deadlines, redacted formatting, deterministic scope canonicalization, and
 registry-origin/context/generation cache isolation. It performs no HTTP and
 does not inspect ambient credentials unless the caller invokes the enabled
 policy.
+
+`src/oci/registry_http.zig` adapts miz's system-plus-additional CA loading,
+manual redirect handling, bounded `Retry-After` parsing, and deterministic
+backoff. WABT separates those mechanics from Distribution semantics and adds
+canonical origin policy, loopback-only explicit HTTP, authorization stripping,
+an injected backend/runtime boundary, absolute operation deadlines, scoped
+token-cache integration, secret-safe diagnostics, and explicit Zig 0.16
+socket-timeout capability reporting.
 
 The transport `Source`, `Destination`, and transfer-counting callbacks adapt
 the corresponding pinned `transport.zig` contracts. WABT adds allocator-owned

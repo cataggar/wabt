@@ -6,6 +6,49 @@ credential helpers, access a registry, or acquire a token. Callers must invoke
 credential resolution and provide its environment, filesystem, process, clock,
 and token-acquisition boundaries explicitly.
 
+## Registry HTTP endpoint policy
+
+`wabt.oci.registry_http` implements the endpoint and HTTP policy used by later
+registry operations; it does not expose registry commands or manifest, tag,
+blob, upload, or profile APIs.
+
+Endpoints take a scheme-less authority. HTTPS is the default and the production
+backend retains Zig's hostname verification and system trust loading. An
+explicit additional PEM CA file or PEM buffer is bounded and appended after a
+system-bundle rescan. Missing, empty, malformed, or certificate-less CA input
+fails explicitly. There is no insecure or skip-verification option.
+
+Plain HTTP requires an explicit `plain_http` option and is accepted only for
+`localhost`, canonical IPv4 literals in `127.0.0.0/8`, or the IPv6 loopback
+literal `::1`, with an optional port. Userinfo, embedded schemes, fragments,
+non-canonical/disguised numeric addresses, percent-encoded hosts, and every
+non-loopback cleartext endpoint are rejected before a request.
+
+Registry and token request redirects remain same-origin. Blob redirects may
+cross origin only to HTTPS, or to another loopback HTTP origin when cleartext
+development mode was explicitly enabled. HTTPS downgrade is always rejected.
+On the first origin change, Authorization, cookies, and caller-marked secret
+headers are removed and cannot be reacquired later in the chain. Caller
+overrides for Host, framing, content encoding, connection, Authorization, and
+proxy-authorization headers are rejected. Redirect locations, headers, bodies,
+attempts, and backoff are bounded; only replay-safe GET and HEAD operations are
+redirected or retried. Both delta-seconds and IMF-fixdate `Retry-After` values
+are capped.
+
+Every call receives one absolute deadline. Backend calls, authentication,
+redirects, retries, and sleeps consume that same budget, with per-attempt and
+body-idle values clamped to what remains. Zig 0.16's `std.http.Client` does not
+provide interruptible DNS, connect, TLS-handshake, write, response-head, or
+body-idle socket timeouts through this API. The production backend therefore
+reports those capabilities as unsupported and can check the absolute deadline
+only immediately before and after a blocking standard-library request. Callers
+that require enforceable in-flight cancellation must inject a backend that
+implements and reports those timeout capabilities.
+
+Constructing an HTTP client copies only explicit endpoint, CA, and
+authorization inputs. It performs no environment, credential-file, helper, or
+other ambient credential discovery.
+
 ## Credential policies
 
 `CredentialPolicy` has four mutually exclusive modes:
