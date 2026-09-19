@@ -490,14 +490,27 @@ pub const TypeBound = union(enum) {
     sub_resource,
 };
 
+/// Optional semantic information attached to a component import/export name.
+///
+/// These attributes do not participate in import/export identity, but they
+/// must be retained: in particular, `version_suffix` carries the part of an
+/// interface version removed by canonical-name encoding.
+pub const ExternNameAttribute = union(enum) {
+    implements: []const u8,
+    version_suffix: []const u8,
+    external_id: []const u8,
+};
+
 pub const ImportDecl = struct {
     name: []const u8,
     desc: ExternDesc,
+    attributes: []const ExternNameAttribute = &.{},
 };
 
 pub const ExportDecl = struct {
     name: []const u8,
     desc: ExternDesc,
+    attributes: []const ExternNameAttribute = &.{},
     /// Set for top-level component exports (see spec `export` rule):
     ///   export ::= en:<exportname'> si:<sortidx> ed?:<externdesc>?
     /// Null for export declarators inside a component-type / instance-type
@@ -545,6 +558,7 @@ pub const InstantiateArg = struct {
 pub const InlineExport = struct {
     name: []const u8,
     sort_idx: SortIdx,
+    attributes: []const ExternNameAttribute = &.{},
 };
 
 // ── Start function ──────────────────────────────────────────────────────────

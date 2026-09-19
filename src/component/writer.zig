@@ -339,7 +339,7 @@ fn writeInstanceExpr(w: *Writer, ie: ctypes.InstanceExpr) EncodeError!void {
             if (exps.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(exps.len));
             for (exps) |e| {
-                try writeExternName(w, e.name);
+                try writeExternName(w, e.name, e.attributes);
                 try writeSortIdx(w, e.sort_idx);
             }
         },
@@ -550,12 +550,12 @@ fn writeDecl(w: *Writer, d: ctypes.Decl) EncodeError!void {
         },
         .import => |imp| {
             try w.appendByte(0x03);
-            try writeExternName(w, imp.name);
+            try writeExternName(w, imp.name, imp.attributes);
             try writeExternDesc(w, imp.desc);
         },
         .@"export" => |e| {
             try w.appendByte(0x04);
-            try writeExternName(w, e.name);
+            try writeExternName(w, e.name, e.attributes);
             try writeExternDesc(w, e.desc);
         },
     }
@@ -789,7 +789,7 @@ fn writeImportSection(w: *Writer, imports: []const ctypes.ImportDecl) EncodeErro
     if (imports.len > std.math.maxInt(u32)) return error.ValueTooLarge;
     try body.writeU32Leb(@intCast(imports.len));
     for (imports) |imp| {
-        try writeExternName(&body, imp.name);
+        try writeExternName(&body, imp.name, imp.attributes);
         try writeExternDesc(&body, imp.desc);
     }
     try emitSection(w, SECTION_IMPORT, body.buf.items);
@@ -802,7 +802,7 @@ fn writeExportSection(w: *Writer, exports: []const ctypes.ExportDecl) EncodeErro
     if (exports.len > std.math.maxInt(u32)) return error.ValueTooLarge;
     try body.writeU32Leb(@intCast(exports.len));
     for (exports) |e| {
-        try writeExternName(&body, e.name);
+        try writeExternName(&body, e.name, e.attributes);
         // Top-level exports require a sort_idx. Synthesize one from
         // the descriptor if missing (decls inside a component-type body
         // never set sort_idx; if such a decl reaches this path it's a
@@ -984,17 +984,31 @@ fn writeExternDesc(w: *Writer, desc: ctypes.ExternDesc) EncodeError!void {
     }
 }
 
-/// Write an importname'/exportname'. We always emit the 0x00 prefix
-/// (plain name) — versioned-name support requires re-parsing the
-/// embedded `@<semver>` suffix from the name string, which the loader
-/// strips, so that information is no longer round-trippable through
-/// the AST. For real fixtures this is fine because the externname
-/// already includes the `@<semver>` text inline (e.g.
-/// `"wasi:io/poll@0.2.6"`); the Component Model treats both forms as
-/// equivalent for the purpose of import/export matching.
-fn writeExternName(w: *Writer, name: []const u8) EncodeError!void {
-    try w.appendByte(0x00);
+/// Write a component import/export name and all retained attributes.
+fn writeExternName(
+    w: *Writer,
+    name: []const u8,
+    attributes: []const ctypes.ExternNameAttribute,
+) EncodeError!void {
+    try w.appendByte(if (attributes.len == 0) 0x00 else 0x02);
     try w.writeName(name);
+    if (attributes.len == 0) return;
+    if (attributes.len > std.math.maxInt(u32)) return error.ValueTooLarge;
+    try w.writeU32Leb(@intCast(attributes.len));
+    for (attributes) |attribute| switch (attribute) {
+        .implements => |value| {
+            try w.appendByte(0x00);
+            try w.writeName(value);
+        },
+        .version_suffix => |value| {
+            try w.appendByte(0x01);
+            try w.writeName(value);
+        },
+        .external_id => |value| {
+            try w.appendByte(0x02);
+            try w.writeName(value);
+        },
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
