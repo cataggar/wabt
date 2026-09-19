@@ -3,6 +3,7 @@
 //! Files are synced before publication. Zig's portable `std.Io` exposes file
 //! sync and atomic rename, but no portable directory-sync primitive, so this
 //! does not promise stronger power-loss durability than those operations.
+const builtin = @import("builtin");
 const std = @import("std");
 const content = @import("content.zig");
 const model = @import("model.zig");
@@ -557,6 +558,11 @@ pub const Destination = struct {
         {
             return error.RootNotStaged;
         }
+        try validateRootDocument(
+            self.allocator,
+            publication.descriptor,
+            publication.exact_bytes,
+        );
 
         process_catalog_mutex.lockUncancelable(self.io);
         defer process_catalog_mutex.unlock(self.io);
@@ -651,21 +657,7 @@ pub const Destination = struct {
             return error.DescriptorMismatch;
         }
 
-        const existing = Io.Dir.cwd().openDir(self.io, self.path, .{}) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
-        if (existing) |dir| {
-            dir.close(self.io);
-            return error.PathAlreadyExists;
-        }
-        try Io.Dir.rename(
-            Io.Dir.cwd(),
-            self.work_path,
-            Io.Dir.cwd(),
-            self.path,
-            self.io,
-        );
+        try installNewLayout(self.io, self.work_path, self.path);
         self.is_new = false;
         if (self.bootstrap_lock) |lock| {
             lock.close(self.io);
@@ -954,6 +946,44 @@ fn writeSyncedFile(
     try file.sync(io);
 }
 
+fn installNewLayout(
+    io: Io,
+    staging_path: []const u8,
+    final_path: []const u8,
+) !void {
+    Io.Dir.renamePreserve(
+        Io.Dir.cwd(),
+        staging_path,
+        Io.Dir.cwd(),
+        final_path,
+        io,
+    ) catch |err| switch (err) {
+        error.PermissionDenied, error.OperationUnsupported => {
+            if (builtin.os.tag != .macos) return err;
+
+            // macOS implements portable no-replace rename through hard links,
+            // which cannot install directories. The bootstrap lock serializes
+            // WABT writers around this checked atomic-rename fallback.
+            const existing = Io.Dir.cwd().openDir(io, final_path, .{}) catch |open_err| switch (open_err) {
+                error.FileNotFound => null,
+                else => return open_err,
+            };
+            if (existing) |dir| {
+                dir.close(io);
+                return error.PathAlreadyExists;
+            }
+            try Io.Dir.rename(
+                Io.Dir.cwd(),
+                staging_path,
+                Io.Dir.cwd(),
+                final_path,
+                io,
+            );
+        },
+        else => return err,
+    };
+}
+
 fn createUniqueDirectory(
     io: Io,
     allocator: std.mem.Allocator,
@@ -1203,7 +1233,7 @@ fn setReferenceName(
     name: ?[]const u8,
 ) !void {
     var annotations = descriptor.getPtr("annotations");
-    if (annotations == null) {
+    if (annotations == null or annotations.?.* == .null) {
         if (name == null) return;
         try descriptor.put(
             allocator,

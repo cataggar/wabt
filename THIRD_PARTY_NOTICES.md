@@ -2,7 +2,7 @@
 
 ## miz
 
-The OCI foundation is being adapted from
+The OCI foundation is adapted from
 [cataggar/miz](https://github.com/cataggar/miz) at commit
 [`669a27982b376311f558e820b69e9a692735b0cd`](https://github.com/cataggar/miz/commit/669a27982b376311f558e820b69e9a692735b0cd).
 The upstream source files are:
