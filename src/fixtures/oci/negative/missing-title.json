@@ -1,0 +1,15 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "outputSelection": "explicit-only",
+    "payload": "byte-identical",
+    "result": "accept"
+  },
+  "id": "missing-title",
+  "mutation": {
+    "operation": "remove",
+    "target": "manifest.layers[0].annotations.org.opencontainers.image.title"
+  },
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

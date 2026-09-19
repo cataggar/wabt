@@ -1,0 +1,20 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "committedDigestPrinted": false,
+    "destinationTag": "absent-or-unchanged",
+    "finalOutput": "absent-or-byte-identical",
+    "result": "reject",
+    "rootPublishedBeforeDependencies": false
+  },
+  "failurePoints": [
+    "truncated-layer-download",
+    "interrupted-blob-upload",
+    "declined-cross-repository-mount",
+    "final-manifest-put",
+    "final-tag-put"
+  ],
+  "id": "interrupted-publication",
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

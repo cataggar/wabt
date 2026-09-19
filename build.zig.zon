@@ -12,6 +12,7 @@
         "LICENSE",
         "LICENSES",
         "README.md",
+        "scripts",
         "SOURCE_PROVENANCE.md",
         "THIRD_PARTY_NOTICES.md",
     },

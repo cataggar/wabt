@@ -1,0 +1,24 @@
+{
+  "baseLayout": "wabt-oci-v1.1",
+  "expected": {
+    "category": "invalid-layer-count",
+    "finalOutput": "absent",
+    "inspect": "accept-descriptors",
+    "pull": "reject"
+  },
+  "id": "layer-count",
+  "mutations": [
+    {
+      "operation": "replace",
+      "target": "manifest.layers",
+      "value": []
+    },
+    {
+      "count": 2,
+      "operation": "duplicate-first",
+      "target": "manifest.layers"
+    }
+  ],
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}

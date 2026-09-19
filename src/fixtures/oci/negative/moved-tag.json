@@ -1,0 +1,16 @@
+{
+  "baseLayout": "wkg-wasm-v0",
+  "expected": {
+    "reportedRoot": "original-root",
+    "result": "accept-original",
+    "tagResolutions": 1
+  },
+  "id": "moved-tag",
+  "scenario": {
+    "moveTagBeforeBlobReads": "replacement-root",
+    "resolve": "original-root",
+    "subsequentReads": "original-digest-only"
+  },
+  "schema": "wabt.oci.negative-fixture",
+  "schemaVersion": 1
+}
