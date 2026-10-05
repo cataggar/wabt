@@ -139,7 +139,9 @@ test "embedCustomSection: replaces existing same-named section" {
     const core = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // existing custom section "component-type:w" with payload 0xAA
-        0x00, 0x12, 0x10, 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't', '-', 't', 'y', 'p', 'e', ':', 'w', 0xAA,
+        0x00, 0x12, 0x10, 'c',  'o',  'm',  'p',  'o',
+        'n',  'e',  'n',  't',  '-',  't',  'y',  'p',
+        'e',  ':',  'w',  0xAA,
     };
     const payload = [_]u8{0xBB};
     const out = try embedCustomSection(testing.allocator, &core, "component-type:w", &payload);

@@ -53,7 +53,7 @@ const SectionId = enum(u8) {
     type = 7,
     canon = 8,
     start = 9,
-    @"import" = 10,
+    import = 10,
     @"export" = 11,
     value = 12,
 
@@ -69,7 +69,7 @@ const SectionId = enum(u8) {
             .type => "type",
             .canon => "canon",
             .start => "start",
-            .@"import" => "import",
+            .import => "import",
             .@"export" => "export",
             .value => "value",
         };
@@ -119,8 +119,8 @@ fn walkSections(allocator: std.mem.Allocator, bytes: []const u8) WalkError!Walk 
         const section_end = section_start + section_size;
 
         const id = std.enums.fromInt(SectionId, id_byte) orelse return error.InvalidSectionId;
-        if (!seen[@intFromEnum(id)]) {
-            seen[@intFromEnum(id)] = true;
+        if (!seen[@backingInt(id)]) {
+            seen[@backingInt(id)] = true;
             try section_order.append(allocator, id);
         }
 
@@ -325,7 +325,8 @@ test "dump renders summary block for minimal component with one custom section" 
         // custom section: id=0, size=14
         0x00, 0x0e,
         // name length=13 + "wit-component"
-        0x0d, 'w', 'i', 't', '-', 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't',
+        0x0d, 'w',  'i',  't',  '-',  'c',
+        'o',  'm',  'p',  'o',  'n',  'e',  'n',  't',
     };
     const out = try dump(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(out);
@@ -349,8 +350,8 @@ test "reemit round-trips a component through the loader + writer" {
     // loader would drop.
     const bytes = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00,
-        0x00, 0x0e,
-        0x0d, 'w', 'i', 't', '-', 'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't',
+        0x00, 0x0e, 0x0d, 'w',  'i',  't',  '-',  'c',
+        'o',  'm',  'p',  'o',  'n',  'e',  'n',  't',
     };
     const out = try reemit(std.testing.allocator, &bytes);
     defer std.testing.allocator.free(out);

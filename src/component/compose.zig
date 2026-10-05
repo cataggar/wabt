@@ -87,7 +87,7 @@ pub fn plan(
 pub const Source = struct {
     /// 0 ⇒ consumer; 1..providers.len ⇒ providers[source_idx - 1].
     source_idx: u32,
-    role: enum { @"import", @"export" },
+    role: enum { import, @"export" },
 };
 
 /// One observation of a versioned name.
@@ -159,7 +159,7 @@ pub fn detectVersionConflicts(
             src_idx: u32,
         ) !void {
             for (comp.imports) |imp| {
-                try observe(ar, map, imp.name, .{ .source_idx = src_idx, .role = .@"import" });
+                try observe(ar, map, imp.name, .{ .source_idx = src_idx, .role = .import });
             }
             for (comp.exports) |exp| {
                 try observe(ar, map, exp.name, .{ .source_idx = src_idx, .role = .@"export" });
@@ -239,16 +239,28 @@ test "plan: resolves matching import" {
         .{ .name = "docs:adder/add@0.1.0", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &prov_exports,
     };
     const providers = [_]*const ctypes.Component{&provider};
     const p = try plan(ar, &consumer, &providers);
@@ -266,10 +278,16 @@ test "plan: leaves unmatched imports unresolved" {
         .{ .name = "wasi:cli/environment@0.2.0", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const providers = [_]*const ctypes.Component{};
     const p = try plan(ar, &consumer, &providers);
@@ -293,16 +311,28 @@ test "detectVersionConflicts: reports same iface at two patch versions" {
         .{ .name = "wasi:io/streams@0.2.10", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &prov_imports, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &prov_exports,
     };
     const providers = [_]*const ctypes.Component{&provider};
     const conflicts = try detectVersionConflicts(ar, &consumer, &providers);
@@ -336,16 +366,28 @@ test "detectVersionConflicts: same version everywhere is not a conflict" {
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &prov_exports,
     };
     const providers = [_]*const ctypes.Component{&provider};
     const conflicts = try detectVersionConflicts(ar, &consumer, &providers);
@@ -362,10 +404,16 @@ test "detectVersionConflicts: unversioned names are ignored" {
         .{ .name = "wasi:io/error@0.2.10", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const providers = [_]*const ctypes.Component{};
     const conflicts = try detectVersionConflicts(ar, &consumer, &providers);
@@ -384,16 +432,28 @@ test "detectVersionConflicts: records source index + role for each occurrence" {
         .{ .name = "wasi:io/error@0.2.10", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{}, .types = &.{}, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const providers = [_]*const ctypes.Component{&provider};
     const conflicts = try detectVersionConflicts(ar, &consumer, &providers);
@@ -402,8 +462,8 @@ test "detectVersionConflicts: records source index + role for each occurrence" {
     var saw_consumer = false;
     var saw_provider = false;
     for (conflicts[0].occurrences) |o| {
-        if (o.where.source_idx == 0 and o.where.role == .@"import") saw_consumer = true;
-        if (o.where.source_idx == 1 and o.where.role == .@"import") saw_provider = true;
+        if (o.where.source_idx == 0 and o.where.role == .import) saw_consumer = true;
+        if (o.where.source_idx == 1 and o.where.role == .import) saw_provider = true;
     }
     try testing.expect(saw_consumer);
     try testing.expect(saw_provider);

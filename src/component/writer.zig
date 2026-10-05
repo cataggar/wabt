@@ -258,7 +258,7 @@ fn writeCoreInstanceExpr(
             try w.writeU32Leb(@intCast(exps.len));
             for (exps) |e| {
                 try w.writeName(e.name);
-                try w.appendByte(@intFromEnum(e.sort_idx.sort));
+                try w.appendByte(@backingInt(e.sort_idx.sort));
                 try w.writeU32Leb(e.sort_idx.idx);
             }
         },
@@ -284,10 +284,10 @@ fn writeCoreTypeDef(w: *Writer, ct: ctypes.CoreTypeDef) EncodeError!void {
             try w.appendByte(0x60);
             if (f.params.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(f.params.len));
-            for (f.params) |p| try w.appendByte(@intFromEnum(p));
+            for (f.params) |p| try w.appendByte(@backingInt(p));
             if (f.results.len > std.math.maxInt(u32)) return error.ValueTooLarge;
             try w.writeU32Leb(@intCast(f.results.len));
-            for (f.results) |r| try w.appendByte(@intFromEnum(r));
+            for (f.results) |r| try w.appendByte(@backingInt(r));
         },
         .module => |m| {
             try w.appendByte(0x50);
@@ -478,7 +478,7 @@ fn writeTypeDef(w: *Writer, td: ctypes.TypeDef) EncodeError!void {
             // encoded section round-trips through external tooling
             // (wasm-tools, wasmtime).
             try w.appendByte(0x3F);
-            try w.appendByte(@intFromEnum(r.rep));
+            try w.appendByte(@backingInt(r.rep));
             if (r.destructor) |d| {
                 try w.appendByte(0x01);
                 try w.writeU32Leb(d);
@@ -697,12 +697,12 @@ fn writeCanon(w: *Writer, c: ctypes.Canon) EncodeError!void {
         .subtask_drop => try w.appendByte(0x0D),
         .context_get => |cx| {
             try w.appendByte(0x0A);
-            try w.appendByte(@intFromEnum(cx.ty));
+            try w.appendByte(@backingInt(cx.ty));
             try w.writeU32Leb(cx.slot);
         },
         .context_set => |cx| {
             try w.appendByte(0x0B);
-            try w.appendByte(@intFromEnum(cx.ty));
+            try w.appendByte(@backingInt(cx.ty));
             try w.writeU32Leb(cx.slot);
         },
         .backpressure_inc => try w.appendByte(0x24),
@@ -933,7 +933,7 @@ fn writeSort(w: *Writer, sort: ctypes.Sort) EncodeError!void {
     switch (sort) {
         .core => |cs| {
             try w.appendByte(0x00);
-            try w.appendByte(@intFromEnum(cs));
+            try w.appendByte(@backingInt(cs));
         },
         .func => try w.appendByte(0x01),
         .value => try w.appendByte(0x02),

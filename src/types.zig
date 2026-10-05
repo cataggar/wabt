@@ -56,24 +56,24 @@ pub const ValType = enum(i32) {
     array = 0x5e,
 
     // GC nullable bottom types (ref null <bottom>)
-    nullfuncref = 0x73,   // (ref null nofunc) — bottom of func hierarchy
+    nullfuncref = 0x73, // (ref null nofunc) — bottom of func hierarchy
     nullexternref = 0x72, // (ref null noextern) — bottom of extern hierarchy
-    nullref = 0x65,       // (ref null none) — bottom of internal hierarchy
-    nullexnref = 0x68,    // (ref null noexn) — bottom of exn hierarchy
+    nullref = 0x65, // (ref null none) — bottom of internal hierarchy
+    nullexnref = 0x68, // (ref null noexn) — bottom of exn hierarchy
 
     // Non-nullable abstract heap types (internal-only, not binary encoded)
-    ref_func = -1,     // (ref func) — non-nullable func
-    ref_extern = -2,   // (ref extern) — non-nullable extern
-    ref_any = -3,      // (ref any) — non-nullable any
-    ref_none = -4,     // (ref none) — non-nullable none (bottom)
-    ref_nofunc = -5,   // (ref nofunc) — non-nullable nofunc (bottom)
+    ref_func = -1, // (ref func) — non-nullable func
+    ref_extern = -2, // (ref extern) — non-nullable extern
+    ref_any = -3, // (ref any) — non-nullable any
+    ref_none = -4, // (ref none) — non-nullable none (bottom)
+    ref_nofunc = -5, // (ref nofunc) — non-nullable nofunc (bottom)
     ref_noextern = -6, // (ref noextern) — non-nullable noextern (bottom)
-    ref_eq = -7,       // (ref eq) — non-nullable eq
-    ref_i31 = -8,      // (ref i31) — non-nullable i31
-    ref_struct = -9,   // (ref struct) — non-nullable struct
-    ref_array = -10,   // (ref array) — non-nullable array
-    ref_exn = -11,     // (ref exn) — non-nullable exn
-    ref_noexn = -12,   // (ref noexn) — non-nullable noexn (bottom)
+    ref_eq = -7, // (ref eq) — non-nullable eq
+    ref_i31 = -8, // (ref i31) — non-nullable i31
+    ref_struct = -9, // (ref struct) — non-nullable struct
+    ref_array = -10, // (ref array) — non-nullable array
+    ref_exn = -11, // (ref exn) — non-nullable exn
+    ref_noexn = -12, // (ref noexn) — non-nullable noexn (bottom)
 
     // Block void type
     void_ = 0x40,
@@ -82,10 +82,32 @@ pub const ValType = enum(i32) {
     /// exnref, ref, ref_null).
     pub fn isRefType(self: ValType) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .eqref, .i31ref, .structref, .arrayref, .exnref, .ref, .ref_null,
-            .nullfuncref, .nullexternref, .nullref, .nullexnref,
-            .ref_func, .ref_extern, .ref_any, .ref_eq, .ref_i31, .ref_struct, .ref_array,
-            .ref_none, .ref_nofunc, .ref_noextern, .ref_exn, .ref_noexn,
+            .funcref,
+            .externref,
+            .anyref,
+            .eqref,
+            .i31ref,
+            .structref,
+            .arrayref,
+            .exnref,
+            .ref,
+            .ref_null,
+            .nullfuncref,
+            .nullexternref,
+            .nullref,
+            .nullexnref,
+            .ref_func,
+            .ref_extern,
+            .ref_any,
+            .ref_eq,
+            .ref_i31,
+            .ref_struct,
+            .ref_array,
+            .ref_none,
+            .ref_nofunc,
+            .ref_noextern,
+            .ref_exn,
+            .ref_noexn,
             => true,
             else => false,
         };
@@ -254,17 +276,17 @@ pub const CatchKind = enum {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 test "ValType encoding" {
-    try std.testing.expectEqual(@as(i32, 0x7f), @intFromEnum(ValType.i32));
-    try std.testing.expectEqual(@as(i32, 0x7e), @intFromEnum(ValType.i64));
-    try std.testing.expectEqual(@as(i32, 0x7d), @intFromEnum(ValType.f32));
-    try std.testing.expectEqual(@as(i32, 0x7c), @intFromEnum(ValType.f64));
-    try std.testing.expectEqual(@as(i32, 0x7b), @intFromEnum(ValType.v128));
-    try std.testing.expectEqual(@as(i32, 0x70), @intFromEnum(ValType.funcref));
-    try std.testing.expectEqual(@as(i32, 0x6f), @intFromEnum(ValType.externref));
-    try std.testing.expectEqual(@as(i32, 0x6e), @intFromEnum(ValType.anyref));
-    try std.testing.expectEqual(@as(i32, 0x69), @intFromEnum(ValType.exnref));
-    try std.testing.expectEqual(@as(i32, 0x60), @intFromEnum(ValType.func));
-    try std.testing.expectEqual(@as(i32, 0x40), @intFromEnum(ValType.void_));
+    try std.testing.expectEqual(@as(i32, 0x7f), @backingInt(ValType.i32));
+    try std.testing.expectEqual(@as(i32, 0x7e), @backingInt(ValType.i64));
+    try std.testing.expectEqual(@as(i32, 0x7d), @backingInt(ValType.f32));
+    try std.testing.expectEqual(@as(i32, 0x7c), @backingInt(ValType.f64));
+    try std.testing.expectEqual(@as(i32, 0x7b), @backingInt(ValType.v128));
+    try std.testing.expectEqual(@as(i32, 0x70), @backingInt(ValType.funcref));
+    try std.testing.expectEqual(@as(i32, 0x6f), @backingInt(ValType.externref));
+    try std.testing.expectEqual(@as(i32, 0x6e), @backingInt(ValType.anyref));
+    try std.testing.expectEqual(@as(i32, 0x69), @backingInt(ValType.exnref));
+    try std.testing.expectEqual(@as(i32, 0x60), @backingInt(ValType.func));
+    try std.testing.expectEqual(@as(i32, 0x40), @backingInt(ValType.void_));
 }
 
 test "Limits.indexType" {

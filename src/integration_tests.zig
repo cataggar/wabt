@@ -150,7 +150,7 @@ test "text parse → binary write → binary read" {
     defer module2.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), module2.memories.items.len);
-    try std.testing.expectEqual(@as(u64, 1), module2.memories.items[0].@"type".limits.initial);
+    try std.testing.expectEqual(@as(u64, 1), module2.memories.items[0].type.limits.initial);
     try std.testing.expectEqual(@as(usize, 1), module2.exports.items.len);
     try std.testing.expectEqualStrings("mem", module2.exports.items[0].name);
     try std.testing.expectEqual(types.ExternalKind.memory, module2.exports.items[0].kind);
@@ -237,7 +237,7 @@ test "decompiler produces output for module with memory" {
     defer module.deinit();
 
     try module.memories.append(allocator, .{
-        .@"type" = .{ .limits = .{ .initial = 1 } },
+        .type = .{ .limits = .{ .initial = 1 } },
     });
 
     const output = try Decompiler.decompile(allocator, &module);
@@ -286,7 +286,7 @@ test "multi-section binary: type+import+func+memory+export+code" {
 
     // Memory: 1 page
     try module.memories.append(allocator, .{
-        .@"type" = .{ .limits = .{ .initial = 1 } },
+        .type = .{ .limits = .{ .initial = 1 } },
     });
 
     // Exports: "run" -> func 1, "mem" -> memory 0

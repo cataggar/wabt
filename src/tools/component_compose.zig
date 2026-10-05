@@ -504,7 +504,7 @@ fn printConflictDiagnostic(
             else
                 provider_paths[o.where.source_idx - 1];
             const role: []const u8 = switch (o.where.role) {
-                .@"import" => "import",
+                .import => "import",
                 .@"export" => "export",
             };
             std.debug.print("    @{s}  ({s} of {s})\n", .{ o.version, role, src_label });
@@ -1555,9 +1555,16 @@ test "composeBinaries: links consumer import to provider export end-to-end" {
         },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &prov_instances, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &.{}, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &prov_instances,
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &prov_exports,
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -1566,9 +1573,16 @@ test "composeBinaries: links consumer import to provider export end-to-end" {
         .{ .name = "docs:adder/add@0.1.0", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1596,9 +1610,16 @@ test "composeBinaries: bubbles up unmet imports" {
         .{ .name = "wasi:cli/environment@0.2.0", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1642,9 +1663,16 @@ test "composeBinaries: bubbled import passes through to consumer instantiation" 
         .{ .name = "wasi:cli/stdout@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1698,9 +1726,16 @@ test "composeBinaries: multi-package consumer + provider end-to-end" {
         },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &prov_instances, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &.{}, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &prov_instances,
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &prov_exports,
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -1709,9 +1744,16 @@ test "composeBinaries: multi-package consumer + provider end-to-end" {
         .{ .name = qname, .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1773,10 +1815,16 @@ test "composeBinaries: copies transitive type deps when bubbling up instance imp
         .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 1 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1853,10 +1901,16 @@ test "composeBinaries: emits closure types in encounter order with remap" {
         .{ .name = "ns:pkg/iface@0.1.0", .desc = .{ .instance = 1 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -1921,15 +1975,21 @@ test "composeBinaries: replicates alias-of-instance-export resource binding (#12
     // slot we replicate (the resource pulled into the outer
     // typespace).
     const streams_decls = [_]ctypes.Decl{
-        .{ .alias = .{ .outer = .{
-            .sort = .type,
-            .outer_count = 1,
-            .idx = 1, // the alias-of-instance-export resource binding
-        } } },
-        .{ .@"export" = .{
-            .name = "with-error",
-            .desc = .{ .type = .{ .eq = 0 } }, // local idx 0 inside the instance body == the aliased resource
-        } },
+        .{
+            .alias = .{
+                .outer = .{
+                    .sort = .type,
+                    .outer_count = 1,
+                    .idx = 1, // the alias-of-instance-export resource binding
+                },
+            },
+        },
+        .{
+            .@"export" = .{
+                .name = "with-error",
+                .desc = .{ .type = .{ .eq = 0 } }, // local idx 0 inside the instance body == the aliased resource
+            },
+        },
     };
     const streams_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &streams_decls } };
 
@@ -1941,11 +2001,13 @@ test "composeBinaries: replicates alias-of-instance-export resource binding (#12
     // imports: 0 = wasi:io/error (instance (type 0)), 1 = wasi:io/streams (instance (type 2)).
     const types = [_]ctypes.TypeDef{ error_inst_type, streams_inst_type };
     const aliases = [_]ctypes.Alias{
-        .{ .instance_export = .{
-            .sort = .type,
-            .instance_idx = 0, // wasi:io/error import (consumer comp_instance_indexspace[0])
-            .name = "error",
-        } },
+        .{
+            .instance_export = .{
+                .sort = .type,
+                .instance_idx = 0, // wasi:io/error import (consumer comp_instance_indexspace[0])
+                .name = "error",
+            },
+        },
     };
     const imports = [_]ctypes.ImportDecl{
         .{ .name = "wasi:io/error@0.2.0", .desc = .{ .instance = 0 } },
@@ -1959,10 +2021,16 @@ test "composeBinaries: replicates alias-of-instance-export resource binding (#12
         .{ .kind = .import, .start = 1, .count = 1 }, // import streams
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &aliases,
-        .types = &types, .canons = &.{},
-        .imports = &imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &aliases,
+        .types = &types,
+        .canons = &.{},
+        .imports = &imports,
+        .exports = &.{},
         .section_order = &section_order,
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
@@ -2033,9 +2101,16 @@ test "composeBinaries: re-export desc is un-ascribed (#132)" {
         },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &cons_instances, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &.{}, .exports = &cons_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &cons_instances,
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &cons_exports,
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2081,9 +2156,9 @@ test "parseExplicitRewrite: missing pieces are rejected" {
 
 test "lowestVersion: picks 0.2.6 over 0.2.10" {
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .import } },
         .{ .version = "0.2.6", .where = .{ .source_idx = 1, .role = .@"export" } },
-        .{ .version = "0.2.8", .where = .{ .source_idx = 1, .role = .@"import" } },
+        .{ .version = "0.2.8", .where = .{ .source_idx = 1, .role = .import } },
     };
     try testing.expectEqualStrings("0.2.6", lowestVersion(&occs));
 }
@@ -2094,8 +2169,8 @@ test "resolveRules: default error mode leaves wasi conflicts unresolved" {
     const ar = arena.allocator();
 
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
-        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .import } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .import } },
     };
     const conflicts = [_]compose.Conflict{
         .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
@@ -2115,11 +2190,11 @@ test "resolveRules: --align-wasi=<X> rewrites every wasi package to X (#226)" {
     const ar = arena.allocator();
 
     const occs1 = [_]compose.Occurrence{
-        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
-        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .import } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .import } },
     };
     const occs2 = [_]compose.Occurrence{
-        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .import } },
         .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"export" } },
     };
     const conflicts = [_]compose.Conflict{
@@ -2148,7 +2223,7 @@ test "resolveRules: --align-wasi=auto picks global lowest across observations (#
     const ar = arena.allocator();
 
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 0, .role = .import } },
         .{ .version = "0.2.6", .where = .{ .source_idx = 1, .role = .@"export" } },
     };
     const conflicts = [_]compose.Conflict{
@@ -2170,7 +2245,7 @@ test "resolveRules: --rewrite-import handles non-wasi conflicts" {
     const ar = arena.allocator();
 
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .import } },
         .{ .version = "0.2.0", .where = .{ .source_idx = 1, .role = .@"export" } },
     };
     const conflicts = [_]compose.Conflict{
@@ -2199,7 +2274,7 @@ test "resolveRules: non-wasi conflict without explicit rewrite stays unresolved"
     const ar = arena.allocator();
 
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .@"import" } },
+        .{ .version = "0.1.0", .where = .{ .source_idx = 0, .role = .import } },
         .{ .version = "0.2.0", .where = .{ .source_idx = 1, .role = .@"export" } },
     };
     const conflicts = [_]compose.Conflict{
@@ -2245,8 +2320,8 @@ test "resolveRules: --align-wasi=<X> aligns mixed single-occurrence + conflictin
     const ar = arena.allocator();
 
     const occs = [_]compose.Occurrence{
-        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .@"import" } },
-        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .@"import" } },
+        .{ .version = "0.2.6", .where = .{ .source_idx = 0, .role = .import } },
+        .{ .version = "0.2.10", .where = .{ .source_idx = 1, .role = .import } },
     };
     const conflicts = [_]compose.Conflict{
         .{ .ns = "wasi", .pkg = "io", .iface = "error", .occurrences = &occs },
@@ -2281,11 +2356,16 @@ test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &cons_types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &cons_types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2305,11 +2385,16 @@ test "compose end-to-end: --align-wasi rewrite makes mismatched seam match" {
         .{ .instance = .{ .decls = &.{} } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &prov_instances, .aliases = &.{},
-        .types = &prov_types, .canons = &.{},
-        .imports = &.{}, .exports = &prov_exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &prov_instances,
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &prov_exports,
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2376,11 +2461,16 @@ test "compose end-to-end: --align-wasi rewrites single-occurrence non-conflictin
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &cons_types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &cons_types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2393,11 +2483,16 @@ test "compose end-to-end: --align-wasi rewrites single-occurrence non-conflictin
         .{ .instance = .{ .decls = &.{} } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &prov_types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2446,9 +2541,16 @@ test "composeBinaries: provider with own imports gets Instantiate args wired (#2
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2456,9 +2558,16 @@ test "composeBinaries: provider with own imports gets Instantiate args wired (#2
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2499,9 +2608,16 @@ test "composeBinaries: provider import the consumer doesn't share → UnmatchedP
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2512,9 +2628,16 @@ test "composeBinaries: provider import the consumer doesn't share → UnmatchedP
         .{ .name = "wasi:filesystem/types@0.2.6", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2541,9 +2664,16 @@ test "compose end-to-end: provider with mismatched wasi version composes after -
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2551,9 +2681,16 @@ test "compose end-to-end: provider with mismatched wasi version composes after -
         .{ .name = "wasi:io/error@0.2.10", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2612,9 +2749,16 @@ test "composeBinaries: provider imports the consumer doesn't share are bubbled b
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2622,9 +2766,16 @@ test "composeBinaries: provider imports the consumer doesn't share are bubbled b
         .{ .name = "wasi:http/types@0.2.6", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2675,9 +2826,16 @@ test "composeBinaries: consumer+provider overlap dedups in wrapper outer-imports
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -2685,9 +2843,16 @@ test "composeBinaries: consumer+provider overlap dedups in wrapper outer-imports
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 
@@ -2729,11 +2894,16 @@ test "loader correctly separates outer vs nested component imports (#218 audit)"
     };
     const inner_types = [_]ctypes.TypeDef{func_type};
     const inner = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &inner_types, .canons = &.{},
-        .imports = &inner_func_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &inner_types,
+        .canons = &.{},
+        .imports = &inner_func_imports,
+        .exports = &.{},
     };
     const inner_bytes = try writer.encode(ar, &inner);
 
@@ -2748,11 +2918,16 @@ test "loader correctly separates outer vs nested component imports (#218 audit)"
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const outer = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
         .components = &components_arr,
-        .instances = &.{}, .aliases = &.{},
-        .types = &outer_types, .canons = &.{},
-        .imports = &outer_imports, .exports = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &outer_types,
+        .canons = &.{},
+        .imports = &outer_imports,
+        .exports = &.{},
     };
     const outer_bytes = try writer.encode(ar, &outer);
     const loaded = try loader.load(outer_bytes, ar);
@@ -2779,9 +2954,16 @@ test "composeBinaries: bubbles top-level .func provider import (#218)" {
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const cb = try writer.encode(ar, &consumer);
 
@@ -2793,10 +2975,16 @@ test "composeBinaries: bubbles top-level .func provider import (#218)" {
         .{ .name = "import-func-compile", .desc = .{ .func = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &prov_types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const pb = try writer.encode(ar, &provider);
 
@@ -2854,9 +3042,16 @@ test "composeBinaries: mixed .instance + .func provider imports both bubble (#21
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{}, .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const cb = try writer.encode(ar, &consumer);
 
@@ -2872,10 +3067,16 @@ test "composeBinaries: mixed .instance + .func provider imports both bubble (#21
         .{ .name = "import-func-compile", .desc = .{ .func = 1 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &prov_types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const pb = try writer.encode(ar, &provider);
 
@@ -2939,10 +3140,16 @@ test "composeBinaries: consumer alias to a name also bubbled from provider resol
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &cons_types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &cons_types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const cb = try writer.encode(ar, &consumer);
 
@@ -2958,11 +3165,15 @@ test "composeBinaries: consumer alias to a name also bubbled from provider resol
     };
     const error_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &error_decls } };
     const streams_decls = [_]ctypes.Decl{
-        .{ .alias = .{ .outer = .{
-            .sort = .type,
-            .outer_count = 1,
-            .idx = 1, // slot 1 = alias-instance-export resource binding
-        } } },
+        .{
+            .alias = .{
+                .outer = .{
+                    .sort = .type,
+                    .outer_count = 1,
+                    .idx = 1, // slot 1 = alias-instance-export resource binding
+                },
+            },
+        },
         .{ .@"export" = .{
             .name = "with-error",
             .desc = .{ .type = .{ .eq = 0 } },
@@ -2971,11 +3182,13 @@ test "composeBinaries: consumer alias to a name also bubbled from provider resol
     const streams_inst_type = ctypes.TypeDef{ .instance = .{ .decls = &streams_decls } };
     const prov_types = [_]ctypes.TypeDef{ error_inst_type, streams_inst_type };
     const prov_aliases = [_]ctypes.Alias{
-        .{ .instance_export = .{
-            .sort = .type,
-            .instance_idx = 0, // wasi:io/error import
-            .name = "error",
-        } },
+        .{
+            .instance_export = .{
+                .sort = .type,
+                .instance_idx = 0, // wasi:io/error import
+                .name = "error",
+            },
+        },
     };
     const prov_imports = [_]ctypes.ImportDecl{
         .{ .name = "wasi:io/error@0.2.6", .desc = .{ .instance = 0 } },
@@ -2989,10 +3202,16 @@ test "composeBinaries: consumer alias to a name also bubbled from provider resol
         .{ .kind = .import, .start = 1, .count = 1 },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &prov_aliases,
-        .types = &prov_types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &prov_aliases,
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
         .section_order = &prov_section_order,
     };
     const pb = try writer.encode(ar, &provider);
@@ -3072,10 +3291,16 @@ test "composeBinaries: provider with resource methods retains them post-compose 
         .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &prov_types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const pb = try writer.encode(ar, &provider);
 
@@ -3099,10 +3324,16 @@ test "composeBinaries: provider with resource methods retains them post-compose 
         .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &cons_types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &cons_types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const cb = try writer.encode(ar, &consumer);
 
@@ -3177,10 +3408,16 @@ test "compose end-to-end: resource methods survive --align-wasi rewrite + compos
         .{ .name = "wasi:io/poll@0.2.6", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const cb_orig = try writer.encode(ar, &consumer);
 
@@ -3189,10 +3426,16 @@ test "compose end-to-end: resource methods survive --align-wasi rewrite + compos
         .{ .name = "wasi:io/poll@0.2.10", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{}, .core_types = &.{},
-        .components = &.{}, .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const pb_orig = try writer.encode(ar, &provider);
 
@@ -3272,11 +3515,16 @@ test "composeBinaries: widest-source wins when consumer + provider declare same 
         .{ .name = "ns:foo/iface@0.1.0", .desc = .{ .instance = 0 } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{},   .core_instances = &.{},
-        .core_types = &.{},     .components = &.{},
-        .instances = &.{},      .aliases = &.{},
-        .types = &cons_types,   .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &cons_types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const consumer_bytes = try writer.encode(ar, &consumer);
 
@@ -3297,11 +3545,16 @@ test "composeBinaries: widest-source wins when consumer + provider declare same 
         .{ .name = "ns:foo/iface@0.1.0", .desc = .{ .instance = 0 } },
     };
     const provider: ctypes.Component = .{
-        .core_modules = &.{},   .core_instances = &.{},
-        .core_types = &.{},     .components = &.{},
-        .instances = &.{},      .aliases = &.{},
-        .types = &prov_types,   .canons = &.{},
-        .imports = &prov_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &prov_types,
+        .canons = &.{},
+        .imports = &prov_imports,
+        .exports = &.{},
     };
     const provider_bytes = try writer.encode(ar, &provider);
 

@@ -682,7 +682,6 @@ fn cloneInstBodyDeclLocal(
     };
 }
 
-
 // ── Encode the rebuilt encoded-world payload ──────────────────────────────
 
 fn buildAndEncodePayload(

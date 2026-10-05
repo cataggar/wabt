@@ -259,42 +259,60 @@ fn prescanNames(
         }
         if (tok.kind == .kw_func) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 func_names.put(allocator, normalizeIdentifier(allocator, tok.text), func_idx) catch {};
             }
             func_idx += 1;
         } else if (tok.kind == .kw_type) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 type_names.put(allocator, normalizeIdentifier(allocator, tok.text), type_idx) catch {};
             }
             type_idx += 1;
         } else if (tok.kind == .kw_global) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 global_names.put(allocator, normalizeIdentifier(allocator, tok.text), global_idx) catch {};
             }
             global_idx += 1;
         } else if (tok.kind == .kw_table) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 table_names.put(allocator, normalizeIdentifier(allocator, tok.text), table_idx) catch {};
             }
             table_idx += 1;
         } else if (tok.kind == .kw_memory) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 memory_names.put(allocator, normalizeIdentifier(allocator, tok.text), memory_idx) catch {};
             }
             memory_idx += 1;
         } else if (tok.kind == .kw_data) {
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .identifier) {
                 data_names.put(allocator, normalizeIdentifier(allocator, tok.text), data_idx) catch {};
             }
@@ -304,46 +322,70 @@ fn prescanNames(
             // (import "mod" "name" (func $name ...)) to count import funcs.
             // Skip module and field strings, then read the '(' before kind desc
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             // module string consumed
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             // field string consumed
             tok = lex.next();
-            while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+            while (tok.kind == .annotation) {
+                skipPrescanAnnotation(&lex);
+                tok = lex.next();
+            }
             if (tok.kind == .l_paren) {
                 tok = lex.next();
-                while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                while (tok.kind == .annotation) {
+                    skipPrescanAnnotation(&lex);
+                    tok = lex.next();
+                }
                 if (tok.kind == .kw_func) {
                     tok = lex.next();
-                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                    while (tok.kind == .annotation) {
+                        skipPrescanAnnotation(&lex);
+                        tok = lex.next();
+                    }
                     if (tok.kind == .identifier) {
                         func_names.put(allocator, normalizeIdentifier(allocator, tok.text), func_idx) catch {};
                     }
                     func_idx += 1;
                 } else if (tok.kind == .kw_global) {
                     tok = lex.next();
-                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                    while (tok.kind == .annotation) {
+                        skipPrescanAnnotation(&lex);
+                        tok = lex.next();
+                    }
                     if (tok.kind == .identifier) {
                         global_names.put(allocator, normalizeIdentifier(allocator, tok.text), global_idx) catch {};
                     }
                     global_idx += 1;
                 } else if (tok.kind == .kw_table) {
                     tok = lex.next();
-                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                    while (tok.kind == .annotation) {
+                        skipPrescanAnnotation(&lex);
+                        tok = lex.next();
+                    }
                     if (tok.kind == .identifier) {
                         table_names.put(allocator, normalizeIdentifier(allocator, tok.text), table_idx) catch {};
                     }
                     table_idx += 1;
                 } else if (tok.kind == .kw_memory) {
                     tok = lex.next();
-                    while (tok.kind == .annotation) { skipPrescanAnnotation(&lex); tok = lex.next(); }
+                    while (tok.kind == .annotation) {
+                        skipPrescanAnnotation(&lex);
+                        tok = lex.next();
+                    }
                     if (tok.kind == .identifier) {
                         memory_names.put(allocator, normalizeIdentifier(allocator, tok.text), memory_idx) catch {};
                     }
                     memory_idx += 1;
                 }
-                // Skip remaining tokens in kind desc '(func/global/... ...)' 
+                // Skip remaining tokens in kind desc '(func/global/... ...)'
                 var inner_depth: u32 = 1;
                 if (tok.kind == .l_paren or tok.kind == .annotation) inner_depth += 1;
                 while (inner_depth > 0) {
@@ -830,38 +872,42 @@ const Parser = struct {
                                     _ = self.advance();
                                     fmut = true;
                                     const rb1 = self.collected_type_refs.items.len;
-                                    const si1 = self.in_type_parse; self.in_type_parse = true;
+                                    const si1 = self.in_type_parse;
+                                    self.in_type_parse = true;
                                     const ftype = self.parseValType() catch .ref_null;
                                     self.in_type_parse = si1;
                                     const ft1: u32 = if (self.collected_type_refs.items.len > rb1) self.collected_type_refs.items[rb1] else 0xFFFFFFFF;
                                     if (self.peek().kind == .r_paren) _ = self.advance();
-                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = fmut, .type_idx = ft1 }) catch {};
+                                    fields.append(self.allocator, .{ .name = fname, .type = ftype, .mutable = fmut, .type_idx = ft1 }) catch {};
                                 } else {
                                     self.lexer.pos = sp2;
                                     self.peeked = spk2;
                                     const rb2 = self.collected_type_refs.items.len;
-                                    const si2 = self.in_type_parse; self.in_type_parse = true;
+                                    const si2 = self.in_type_parse;
+                                    self.in_type_parse = true;
                                     const ftype = self.parseValType() catch .ref_null;
                                     self.in_type_parse = si2;
                                     const ft2: u32 = if (self.collected_type_refs.items.len > rb2) self.collected_type_refs.items[rb2] else 0xFFFFFFFF;
-                                    fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft2 }) catch {};
+                                    fields.append(self.allocator, .{ .name = fname, .type = ftype, .mutable = false, .type_idx = ft2 }) catch {};
                                 }
                             } else {
                                 const rb3 = self.collected_type_refs.items.len;
-                                const si3 = self.in_type_parse; self.in_type_parse = true;
+                                const si3 = self.in_type_parse;
+                                self.in_type_parse = true;
                                 const ftype = self.parseValType() catch .ref_null;
                                 self.in_type_parse = si3;
                                 const ft3: u32 = if (self.collected_type_refs.items.len > rb3) self.collected_type_refs.items[rb3] else 0xFFFFFFFF;
-                                fields.append(self.allocator, .{ .name = fname, .@"type" = ftype, .mutable = false, .type_idx = ft3 }) catch {};
+                                fields.append(self.allocator, .{ .name = fname, .type = ftype, .mutable = false, .type_idx = ft3 }) catch {};
                             }
                             // Handle multiple anonymous fields: (field type type type ...)
                             while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                                 const rb4 = self.collected_type_refs.items.len;
-                                const si4 = self.in_type_parse; self.in_type_parse = true;
+                                const si4 = self.in_type_parse;
+                                self.in_type_parse = true;
                                 const extra_type = self.parseValType() catch break;
                                 self.in_type_parse = si4;
                                 const ft4: u32 = if (self.collected_type_refs.items.len > rb4) self.collected_type_refs.items[rb4] else 0xFFFFFFFF;
-                                fields.append(self.allocator, .{ .@"type" = extra_type, .type_idx = ft4 }) catch {};
+                                fields.append(self.allocator, .{ .type = extra_type, .type_idx = ft4 }) catch {};
                             }
                             if (self.peek().kind == .r_paren) _ = self.advance();
                         }
@@ -907,7 +953,7 @@ const Parser = struct {
                         try self.expect(.r_paren); // close array
                         if (meta.is_sub) try self.expect(.r_paren);
                         try module.module_types.append(self.allocator, .{
-                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = elem_mut, .type_idx = tidx } },
+                            .array_type = .{ .field = .{ .type = elem_type, .mutable = elem_mut, .type_idx = tidx } },
                         });
                     } else {
                         self.lexer.pos = sp;
@@ -921,7 +967,7 @@ const Parser = struct {
                         try self.expect(.r_paren); // close array
                         if (meta.is_sub) try self.expect(.r_paren);
                         try module.module_types.append(self.allocator, .{
-                            .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false, .type_idx = tidx } },
+                            .array_type = .{ .field = .{ .type = elem_type, .mutable = false, .type_idx = tidx } },
                         });
                     }
                 } else {
@@ -934,7 +980,7 @@ const Parser = struct {
                     try self.expect(.r_paren); // close array
                     if (meta.is_sub) try self.expect(.r_paren);
                     try module.module_types.append(self.allocator, .{
-                        .array_type = .{ .field = .{ .@"type" = elem_type, .mutable = false, .type_idx = tidx } },
+                        .array_type = .{ .field = .{ .type = elem_type, .mutable = false, .type_idx = tidx } },
                     });
                 }
             } else {
@@ -1146,7 +1192,7 @@ const Parser = struct {
             const tmeta = meta_items[type_idx];
 
             // Kind byte
-            key.append(alloc, @intFromEnum(tmeta.kind)) catch {};
+            key.append(alloc, @backingInt(tmeta.kind)) catch {};
 
             // Finality (part of type identity in the GC spec)
             key.append(alloc, if (tmeta.is_final) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
@@ -1193,13 +1239,13 @@ const Parser = struct {
                     var ref_idx: usize = 0;
                     for (st.fields.items) |field| {
                         key.append(alloc, if (field.mutable) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
-                        ref_idx = appendCanonicalValType(alloc, key, field.@"type", tmeta.type_refs, ref_idx, meta_items, group_start, group_size);
+                        ref_idx = appendCanonicalValType(alloc, key, field.type, tmeta.type_refs, ref_idx, meta_items, group_start, group_size);
                     }
                 },
                 .array_type => |at| {
                     key.append(alloc, 0x30) catch {};
                     key.append(alloc, if (at.field.mutable) @as(u8, 0x01) else @as(u8, 0x00)) catch {};
-                    _ = appendCanonicalValType(alloc, key, at.field.@"type", tmeta.type_refs, 0, meta_items, group_start, group_size);
+                    _ = appendCanonicalValType(alloc, key, at.field.type, tmeta.type_refs, 0, meta_items, group_start, group_size);
                 },
             }
         }
@@ -1235,7 +1281,7 @@ const Parser = struct {
             return ref_idx + 1;
         }
         // Non-reference type — encode the ValType directly
-        const val: i32 = @intFromEnum(vt);
+        const val: i32 = @backingInt(vt);
         key.appendSlice(alloc, std.mem.asBytes(&val)) catch {};
         return ref_idx;
     }
@@ -1448,7 +1494,10 @@ const Parser = struct {
                     const refs_before = self.collected_type_refs.items.len;
                     const saved_itp = self.in_type_parse;
                     self.in_type_parse = true;
-                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    const vt = self.parseValType() catch {
+                        self.in_type_parse = saved_itp;
+                        break;
+                    };
                     self.in_type_parse = saved_itp;
                     params_list.append(self.allocator, vt) catch return error.OutOfMemory;
                     param_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
@@ -1464,7 +1513,10 @@ const Parser = struct {
                     const refs_before = self.collected_type_refs.items.len;
                     const saved_itp = self.in_type_parse;
                     self.in_type_parse = true;
-                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    const vt = self.parseValType() catch {
+                        self.in_type_parse = saved_itp;
+                        break;
+                    };
                     self.in_type_parse = saved_itp;
                     results_list.append(self.allocator, vt) catch return error.OutOfMemory;
                     result_tidxs_list.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
@@ -1600,7 +1652,10 @@ const Parser = struct {
                     const refs_before = self.collected_type_refs.items.len;
                     const saved_itp = self.in_type_parse;
                     self.in_type_parse = true;
-                    const vt = self.parseValType() catch { self.in_type_parse = saved_itp; break; };
+                    const vt = self.parseValType() catch {
+                        self.in_type_parse = saved_itp;
+                        break;
+                    };
                     self.in_type_parse = saved_itp;
                     func.local_types.append(self.allocator, vt) catch return error.OutOfMemory;
                     func.local_type_idxs.append(self.allocator, if (self.collected_type_refs.items.len > refs_before) self.collected_type_refs.items[refs_before] else 0xFFFFFFFF) catch {};
@@ -1637,10 +1692,16 @@ const Parser = struct {
                             const inner = scan.next();
                             if (inner.kind == .kw_param) {
                                 if (saw_instr or saw_local) {
-                                    if (!last_was_select) { self.malformed = true; break :scan_loop; }
+                                    if (!last_was_select) {
+                                        self.malformed = true;
+                                        break :scan_loop;
+                                    }
                                 }
                             } else if (inner.kind == .kw_result) {
-                                if (saw_instr and !last_was_select) { self.malformed = true; break :scan_loop; }
+                                if (saw_instr and !last_was_select) {
+                                    self.malformed = true;
+                                    break :scan_loop;
+                                }
                             } else if (inner.kind == .kw_local) {
                                 saw_local = true;
                                 last_was_select = false;
@@ -1748,8 +1809,10 @@ const Parser = struct {
                     if (ck == .kw_catch or ck == .kw_catch_ref or ck == .kw_catch_all or ck == .kw_catch_all_ref) {
                         const catch_kind = self.advance().kind;
                         const cc: u8 = switch (catch_kind) {
-                            .kw_catch => 0x00, .kw_catch_ref => 0x01,
-                            .kw_catch_all => 0x02, .kw_catch_all_ref => 0x03,
+                            .kw_catch => 0x00,
+                            .kw_catch_ref => 0x01,
+                            .kw_catch_all => 0x02,
+                            .kw_catch_all_ref => 0x03,
                             else => 0x00,
                         };
                         catch_bytes.append(self.allocator, cc) catch {};
@@ -1757,7 +1820,9 @@ const Parser = struct {
                             var tag_idx: u32 = 0;
                             if (self.peek().kind == .identifier) {
                                 tag_idx = self.tag_names.get(self.advance().text) orelse 0;
-                            } else { tag_idx = self.parseU32() catch 0; }
+                            } else {
+                                tag_idx = self.parseU32() catch 0;
+                            }
                             var buf: [5]u8 = undefined;
                             const n = leb128.writeU32Leb128(&buf, tag_idx);
                             catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
@@ -1765,7 +1830,9 @@ const Parser = struct {
                         var depth: u32 = 0;
                         if (self.peek().kind == .identifier) {
                             depth = self.resolveLabelDepth(self.advance().text) orelse 0;
-                        } else { depth = self.parseU32() catch 0; }
+                        } else {
+                            depth = self.parseU32() catch 0;
+                        }
                         var buf: [5]u8 = undefined;
                         const n = leb128.writeU32Leb128(&buf, depth);
                         catch_bytes.appendSlice(self.allocator, buf[0..n]) catch {};
@@ -2059,17 +2126,27 @@ const Parser = struct {
                         }
                         if (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                             const ht_tok = self.advance();
-                            if (std.mem.eql(u8, ht_tok.text, "i31")) { target_heap = 0x6c; }
-                            else if (std.mem.eql(u8, ht_tok.text, "eq")) { target_heap = 0x6d; }
-                            else if (std.mem.eql(u8, ht_tok.text, "any")) { target_heap = 0x6e; }
-                            else if (std.mem.eql(u8, ht_tok.text, "func")) { target_heap = 0x70; }
-                            else if (std.mem.eql(u8, ht_tok.text, "extern")) { target_heap = 0x6f; }
-                            else if (std.mem.eql(u8, ht_tok.text, "struct")) { target_heap = 0x6b; }
-                            else if (std.mem.eql(u8, ht_tok.text, "array")) { target_heap = 0x6a; }
-                            else if (std.mem.eql(u8, ht_tok.text, "none")) { target_heap = 0x65; }
-                            else if (std.mem.eql(u8, ht_tok.text, "nofunc")) { target_heap = 0x73; }
-                            else if (std.mem.eql(u8, ht_tok.text, "noextern")) { target_heap = 0x72; }
-                            else if (ht_tok.kind == .identifier) {
+                            if (std.mem.eql(u8, ht_tok.text, "i31")) {
+                                target_heap = 0x6c;
+                            } else if (std.mem.eql(u8, ht_tok.text, "eq")) {
+                                target_heap = 0x6d;
+                            } else if (std.mem.eql(u8, ht_tok.text, "any")) {
+                                target_heap = 0x6e;
+                            } else if (std.mem.eql(u8, ht_tok.text, "func")) {
+                                target_heap = 0x70;
+                            } else if (std.mem.eql(u8, ht_tok.text, "extern")) {
+                                target_heap = 0x6f;
+                            } else if (std.mem.eql(u8, ht_tok.text, "struct")) {
+                                target_heap = 0x6b;
+                            } else if (std.mem.eql(u8, ht_tok.text, "array")) {
+                                target_heap = 0x6a;
+                            } else if (std.mem.eql(u8, ht_tok.text, "none")) {
+                                target_heap = 0x65;
+                            } else if (std.mem.eql(u8, ht_tok.text, "nofunc")) {
+                                target_heap = 0x73;
+                            } else if (std.mem.eql(u8, ht_tok.text, "noextern")) {
+                                target_heap = 0x72;
+                            } else if (ht_tok.kind == .identifier) {
                                 target_heap = @intCast(self.type_names.get(ht_tok.text) orelse 0);
                             } else if (ht_tok.kind == .integer) {
                                 target_heap = @intCast(std.fmt.parseInt(u32, ht_tok.text, 0) catch 0);
@@ -2435,7 +2512,10 @@ const Parser = struct {
                                 _ = self.advance();
                                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                                     if (self.parseValType()) |vt| {
-                                        if (rci_param_count < 16) { rci_params[rci_param_count] = vt; rci_param_count += 1; }
+                                        if (rci_param_count < 16) {
+                                            rci_params[rci_param_count] = vt;
+                                            rci_param_count += 1;
+                                        }
                                     } else |_| break;
                                 }
                                 if (self.peek().kind == .r_paren) _ = self.advance();
@@ -2443,7 +2523,10 @@ const Parser = struct {
                                 _ = self.advance();
                                 while (self.peek().kind != .r_paren and self.peek().kind != .eof) {
                                     if (self.parseValType()) |vt| {
-                                        if (rci_result_count < 16) { rci_results[rci_result_count] = vt; rci_result_count += 1; }
+                                        if (rci_result_count < 16) {
+                                            rci_results[rci_result_count] = vt;
+                                            rci_result_count += 1;
+                                        }
                                     } else |_| break;
                                 }
                                 if (self.peek().kind == .r_paren) _ = self.advance();
@@ -2455,9 +2538,17 @@ const Parser = struct {
                         }
                         // Create func type and emit index
                         if (self.module) |mod| {
-                            const p = self.allocator.alloc(types.ValType, rci_param_count) catch { self.emitLeb128U32(code, 0); self.emitLeb128U32(code, rci_table_idx); return; };
+                            const p = self.allocator.alloc(types.ValType, rci_param_count) catch {
+                                self.emitLeb128U32(code, 0);
+                                self.emitLeb128U32(code, rci_table_idx);
+                                return;
+                            };
                             @memcpy(p, rci_params[0..rci_param_count]);
-                            const r = self.allocator.alloc(types.ValType, rci_result_count) catch { self.emitLeb128U32(code, 0); self.emitLeb128U32(code, rci_table_idx); return; };
+                            const r = self.allocator.alloc(types.ValType, rci_result_count) catch {
+                                self.emitLeb128U32(code, 0);
+                                self.emitLeb128U32(code, rci_table_idx);
+                                return;
+                            };
                             @memcpy(r, rci_results[0..rci_result_count]);
                             const type_idx: u32 = @intCast(mod.module_types.items.len);
                             mod.module_types.append(self.allocator, .{ .func_type = .{ .params = p, .results = r } }) catch {};
@@ -2497,7 +2588,7 @@ const Parser = struct {
                         self.emitLeb128U32(code, count);
                         for (0..count) |ci| {
                             if (ci < 8) {
-                                const raw: u32 = @bitCast(@intFromEnum(sel_types[ci]));
+                                const raw: u32 = @bitCast(@backingInt(sel_types[ci]));
                                 code.append(self.allocator, @truncate(raw)) catch {};
                             }
                         }
@@ -2623,7 +2714,7 @@ const Parser = struct {
                             self.lexer.pos = save_pos;
                             self.peeked = save_peeked;
                             if (self.parseValType()) |vt| {
-                                const raw: u32 = @bitCast(@intFromEnum(vt));
+                                const raw: u32 = @bitCast(@backingInt(vt));
                                 code.append(self.allocator, @truncate(raw)) catch return;
                             } else |_| {
                                 code.append(self.allocator, 0x70) catch return;
@@ -2667,16 +2758,7 @@ const Parser = struct {
                         heap_type_idx = 0x70; // func abstract heap type
                     } else if (self.peek().kind != .r_paren) {
                         const ht_text = self.advance().text;
-                        if (std.mem.eql(u8, ht_text, "extern")) heap_type_idx = 0x6f
-                        else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e
-                        else if (std.mem.eql(u8, ht_text, "i31")) heap_type_idx = 0x6c
-                        else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d
-                        else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b
-                        else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a
-                        else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x65
-                        else if (std.mem.eql(u8, ht_text, "nofunc")) heap_type_idx = 0x73
-                        else if (std.mem.eql(u8, ht_text, "noextern")) heap_type_idx = 0x72
-                        else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x68;
+                        if (std.mem.eql(u8, ht_text, "extern")) heap_type_idx = 0x6f else if (std.mem.eql(u8, ht_text, "any")) heap_type_idx = 0x6e else if (std.mem.eql(u8, ht_text, "i31")) heap_type_idx = 0x6c else if (std.mem.eql(u8, ht_text, "eq")) heap_type_idx = 0x6d else if (std.mem.eql(u8, ht_text, "struct")) heap_type_idx = 0x6b else if (std.mem.eql(u8, ht_text, "array")) heap_type_idx = 0x6a else if (std.mem.eql(u8, ht_text, "none")) heap_type_idx = 0x65 else if (std.mem.eql(u8, ht_text, "nofunc")) heap_type_idx = 0x73 else if (std.mem.eql(u8, ht_text, "noextern")) heap_type_idx = 0x72 else if (std.mem.eql(u8, ht_text, "noexn")) heap_type_idx = 0x68;
                     }
                     if (self.peek().kind == .r_paren) _ = self.advance();
                     // Emit sub-opcode
@@ -2767,7 +2849,11 @@ const Parser = struct {
 
         // Consume all (param ...) blocks
         while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
-            if (self.peek().kind == .annotation) { _ = self.advance(); self.skipAnnotation() catch break; continue; }
+            if (self.peek().kind == .annotation) {
+                _ = self.advance();
+                self.skipAnnotation() catch break;
+                continue;
+            }
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
@@ -2808,7 +2894,11 @@ const Parser = struct {
 
         // Consume all (result ...) blocks
         while (self.peek().kind == .l_paren or self.peek().kind == .annotation) {
-            if (self.peek().kind == .annotation) { _ = self.advance(); self.skipAnnotation() catch break; continue; }
+            if (self.peek().kind == .annotation) {
+                _ = self.advance();
+                self.skipAnnotation() catch break;
+                continue;
+            }
             const sp = self.lexer.pos;
             const spk = self.peeked;
             _ = self.advance(); // consume '('
@@ -2850,13 +2940,13 @@ const Parser = struct {
         // No block type annotations found
         if (param_count == 0 and result_count == 0) {
             // Fall through to check for (type N) below
-        } else if (param_count == 0 and result_count == 1 and @intFromEnum(result_types_buf[0]) > 0) {
+        } else if (param_count == 0 and result_count == 1 and @backingInt(result_types_buf[0]) > 0) {
             // Simple single-result block type: emit valtype byte
             // BUT ref/ref_null need the multi-value path (type index) because
             // they require a heap type that can't be encoded in a single byte
             const rt = result_types_buf[0];
             if (rt != .ref_null and rt != .ref and !force_type_index) {
-                const raw: u32 = @bitCast(@intFromEnum(rt));
+                const raw: u32 = @bitCast(@backingInt(rt));
                 buf[0] = @truncate(raw);
                 return 1;
             }
@@ -3567,8 +3657,7 @@ const Parser = struct {
         self.skipAnnotations();
         const tok = self.peek();
         switch (tok.kind) {
-            .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const,
-            .kw_ref_null, .kw_ref_func, .kw_global_get => {
+            .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const, .kw_ref_null, .kw_ref_func, .kw_global_get => {
                 // Parse nested args first, then the instruction
                 self.parseInitExprPlain(code);
                 // Skip to closing paren
@@ -3706,7 +3795,7 @@ const Parser = struct {
                 self.in_type_parse = saved_itp_it;
                 const import_tidx: u32 = if (self.collected_type_refs.items.len > refs_before_it) self.collected_type_refs.items[refs_before_it] else 0xFFFFFFFF;
                 try module.tables.append(self.allocator, .{
-                    .@"type" = .{ .elem_type = elem_type, .limits = limits },
+                    .type = .{ .elem_type = elem_type, .limits = limits },
                     .is_import = true,
                     .is_table64 = is_table64,
                     .type_idx = import_tidx,
@@ -3800,7 +3889,7 @@ const Parser = struct {
             }
             const initial: u64 = @intCast(elem_indices.items.len);
             try module.tables.append(self.allocator, .{
-                .@"type" = .{ .elem_type = elem_type, .limits = .{ .initial = initial, .is_64 = is_table64 } },
+                .type = .{ .elem_type = elem_type, .limits = .{ .initial = initial, .is_64 = is_table64 } },
                 .type_idx = inline_type_idx,
                 .is_table64 = is_table64,
             });
@@ -3819,7 +3908,10 @@ const Parser = struct {
                 // Check if any ref.null present — if so, use expression encoding
                 var has_null = false;
                 for (elem_indices.items) |v| {
-                    if (v.index == std.math.maxInt(u32)) { has_null = true; break; }
+                    if (v.index == std.math.maxInt(u32)) {
+                        has_null = true;
+                        break;
+                    }
                 }
                 if (has_null) {
                     // Generate expression bytes: ref.func $idx end | ref.null funcref end
@@ -3928,7 +4020,7 @@ const Parser = struct {
             table_init_bytes = init_code.toOwnedSlice(self.allocator) catch &.{};
         }
         try module.tables.append(self.allocator, .{
-            .@"type" = .{ .elem_type = elem_type, .limits = limits },
+            .type = .{ .elem_type = elem_type, .limits = limits },
             .init_expr_bytes = table_init_bytes,
             .type_idx = table_type_idx,
             .is_table64 = is_table64,
@@ -4074,7 +4166,7 @@ const Parser = struct {
             limits.has_max = true;
         }
         try module.memories.append(self.allocator, .{
-            .@"type" = .{ .limits = limits },
+            .type = .{ .limits = limits },
             .is_memory64 = is_memory64,
         });
     }
@@ -4309,7 +4401,7 @@ const Parser = struct {
                     .kind = .tag,
                 }) catch {};
                 try module.tags.append(self.allocator, .{
-                    .@"type" = .{ .sig = .{ .params = params, .results = &.{} } },
+                    .type = .{ .sig = .{ .params = params, .results = &.{} } },
                     .type_idx = inline_tag_type_idx,
                     .is_import = true,
                 });
@@ -4390,7 +4482,7 @@ const Parser = struct {
             tag_type_idx = self.findOrAddFuncTypeWithTidxs(module, params, results, param_tidxs, result_tidxs);
         }
         try module.tags.append(self.allocator, .{
-            .@"type" = .{ .sig = .{ .params = params, .results = results } },
+            .type = .{ .sig = .{ .params = params, .results = results } },
             .type_idx = tag_type_idx,
         });
     }
@@ -4408,11 +4500,17 @@ const Parser = struct {
                     if (ft.params.len == params.len and ft.results.len == results.len) {
                         var match = true;
                         for (ft.params, params) |a, b| {
-                            if (a != b) { match = false; break; }
+                            if (a != b) {
+                                match = false;
+                                break;
+                            }
                         }
                         if (match) {
                             for (ft.results, results) |a, b| {
-                                if (a != b) { match = false; break; }
+                                if (a != b) {
+                                    match = false;
+                                    break;
+                                }
                             }
                         }
                         if (match) return @intCast(i);
@@ -4721,7 +4819,7 @@ const Parser = struct {
                 const params = params_list.toOwnedSlice(self.allocator) catch &.{};
                 const results = results_list.toOwnedSlice(self.allocator) catch &.{};
                 try module.tags.append(self.allocator, .{
-                    .@"type" = .{ .sig = .{ .params = params, .results = results } },
+                    .type = .{ .sig = .{ .params = params, .results = results } },
                     .type_idx = imp_tag_type_idx,
                     .is_import = true,
                 });
@@ -5178,12 +5276,30 @@ fn decodeWatString(allocator: std.mem.Allocator, raw: []const u8) []const u8 {
         if (raw[i] == '\\' and i + 1 < raw.len) {
             i += 1;
             switch (raw[i]) {
-                'n' => { buf.append(allocator, '\n') catch return &.{}; i += 1; },
-                't' => { buf.append(allocator, '\t') catch return &.{}; i += 1; },
-                'r' => { buf.append(allocator, '\r') catch return &.{}; i += 1; },
-                '\\' => { buf.append(allocator, '\\') catch return &.{}; i += 1; },
-                '"' => { buf.append(allocator, '"') catch return &.{}; i += 1; },
-                '\'' => { buf.append(allocator, '\'') catch return &.{}; i += 1; },
+                'n' => {
+                    buf.append(allocator, '\n') catch return &.{};
+                    i += 1;
+                },
+                't' => {
+                    buf.append(allocator, '\t') catch return &.{};
+                    i += 1;
+                },
+                'r' => {
+                    buf.append(allocator, '\r') catch return &.{};
+                    i += 1;
+                },
+                '\\' => {
+                    buf.append(allocator, '\\') catch return &.{};
+                    i += 1;
+                },
+                '"' => {
+                    buf.append(allocator, '"') catch return &.{};
+                    i += 1;
+                },
+                '\'' => {
+                    buf.append(allocator, '\'') catch return &.{};
+                    i += 1;
+                },
                 else => {
                     // Try \xx hex escape
                     if (i + 1 < raw.len) {
@@ -5222,12 +5338,30 @@ fn decodeWatStringInto(raw: []const u8, out: *std.ArrayListUnmanaged(u8), alloca
         if (raw[i] == '\\' and i + 1 < raw.len) {
             i += 1;
             switch (raw[i]) {
-                'n' => { out.append(allocator, '\n') catch {}; i += 1; },
-                't' => { out.append(allocator, '\t') catch {}; i += 1; },
-                'r' => { out.append(allocator, '\r') catch {}; i += 1; },
-                '\\' => { out.append(allocator, '\\') catch {}; i += 1; },
-                '"' => { out.append(allocator, '"') catch {}; i += 1; },
-                '\'' => { out.append(allocator, '\'') catch {}; i += 1; },
+                'n' => {
+                    out.append(allocator, '\n') catch {};
+                    i += 1;
+                },
+                't' => {
+                    out.append(allocator, '\t') catch {};
+                    i += 1;
+                },
+                'r' => {
+                    out.append(allocator, '\r') catch {};
+                    i += 1;
+                },
+                '\\' => {
+                    out.append(allocator, '\\') catch {};
+                    i += 1;
+                },
+                '"' => {
+                    out.append(allocator, '"') catch {};
+                    i += 1;
+                },
+                '\'' => {
+                    out.append(allocator, '\'') catch {};
+                    i += 1;
+                },
                 else => {
                     if (i + 1 < raw.len) {
                         const hi = hexVal(raw[i]);
@@ -5253,8 +5387,7 @@ fn decodeWatStringInto(raw: []const u8, out: *std.ArrayListUnmanaged(u8), alloca
 /// Check if a token kind is a constant instruction (valid in init expressions).
 fn isConstInstrToken(kind: TokenKind) bool {
     return switch (kind) {
-        .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const,
-        .kw_ref_null, .kw_ref_func, .kw_global_get => true,
+        .kw_i32_const, .kw_i64_const, .kw_f32_const, .kw_f64_const, .kw_ref_null, .kw_ref_func, .kw_global_get => true,
         else => false,
     };
 }
@@ -5458,7 +5591,10 @@ fn parseHexFloatBits(comptime F: type, text: []const u8) ?if (F == f32) u32 else
     var saw_digit = false;
 
     while (pos < text.len) : (pos += 1) {
-        if (text[pos] == '.') { in_frac = true; continue; }
+        if (text[pos] == '.') {
+            in_frac = true;
+            continue;
+        }
         const d: u128 = hexDigitVal(text[pos]) orelse break;
         saw_digit = true;
         if ((sig >> 124) != 0) {
@@ -6285,19 +6421,33 @@ fn normalizeIdentifier(allocator: std.mem.Allocator, text: []const u8) []const u
     while (i < inner.len) {
         if (inner[i] == '\\' and i + 1 < inner.len) {
             const next = inner[i + 1];
-            if (next == 'n') { result.append(allocator, '\n') catch {}; i += 2; }
-            else if (next == 't') { result.append(allocator, '\t') catch {}; i += 2; }
-            else if (next == 'r') { result.append(allocator, '\r') catch {}; i += 2; }
-            else if (next == '\\') { result.append(allocator, '\\') catch {}; i += 2; }
-            else if (next == '"') { result.append(allocator, '"') catch {}; i += 2; }
-            else if (next == '\'') { result.append(allocator, '\'') catch {}; i += 2; }
-            else if (next == 'u' and i + 2 < inner.len and inner[i + 2] == '{') {
+            if (next == 'n') {
+                result.append(allocator, '\n') catch {};
+                i += 2;
+            } else if (next == 't') {
+                result.append(allocator, '\t') catch {};
+                i += 2;
+            } else if (next == 'r') {
+                result.append(allocator, '\r') catch {};
+                i += 2;
+            } else if (next == '\\') {
+                result.append(allocator, '\\') catch {};
+                i += 2;
+            } else if (next == '"') {
+                result.append(allocator, '"') catch {};
+                i += 2;
+            } else if (next == '\'') {
+                result.append(allocator, '\'') catch {};
+                i += 2;
+            } else if (next == 'u' and i + 2 < inner.len and inner[i + 2] == '{') {
                 // \u{XXXX} Unicode escape
                 i += 3; // skip \u{
                 var codepoint: u21 = 0;
                 while (i < inner.len and inner[i] != '}') : (i += 1) {
                     const hd = hexDigitVal(inner[i]);
-                    if (hd) |d| { codepoint = codepoint * 16 + @as(u21, @intCast(d)); } else break;
+                    if (hd) |d| {
+                        codepoint = codepoint * 16 + @as(u21, @intCast(d));
+                    } else break;
                 }
                 if (i < inner.len and inner[i] == '}') i += 1; // skip }
                 // Encode as UTF-8

@@ -153,7 +153,7 @@ pub const TypeEntry = union(enum) {
 
         pub const Field = struct {
             name: ?[]const u8 = null,
-            @"type": types.ValType,
+            type: types.ValType,
             mutable: bool = false,
             type_idx: u32 = 0xFFFFFFFF,
         };
@@ -215,7 +215,7 @@ pub const Func = struct {
 /// A defined or imported global.
 pub const Global = struct {
     name: ?[]const u8 = null,
-    @"type": types.GlobalType = .{},
+    type: types.GlobalType = .{},
     type_idx: u32 = 0xFFFFFFFF,
     loc: Location = .{},
     is_import: bool = false,
@@ -227,7 +227,7 @@ pub const Global = struct {
 /// A defined or imported table.
 pub const Table = struct {
     name: ?[]const u8 = null,
-    @"type": types.TableType = .{},
+    type: types.TableType = .{},
     init_expr_bytes: []const u8 = &.{},
     type_idx: u32 = 0xFFFFFFFF,
     loc: Location = .{},
@@ -238,7 +238,7 @@ pub const Table = struct {
 /// A defined or imported memory.
 pub const Memory = struct {
     name: ?[]const u8 = null,
-    @"type": types.MemoryType = .{},
+    type: types.MemoryType = .{},
     loc: Location = .{},
     is_import: bool = false,
     is_memory64: bool = false,
@@ -247,7 +247,7 @@ pub const Memory = struct {
 /// A defined or imported tag (exception-handling proposal).
 pub const Tag = struct {
     name: ?[]const u8 = null,
-    @"type": types.TagType = .{},
+    type: types.TagType = .{},
     type_idx: u32 = std.math.maxInt(u32),
     loc: Location = .{},
     is_import: bool = false,
@@ -399,8 +399,8 @@ pub const Module = struct {
         }
         self.globals.deinit(self.allocator);
         for (self.tags.items) |tag| {
-            if (tag.@"type".sig.params.len > 0) self.allocator.free(tag.@"type".sig.params);
-            if (tag.@"type".sig.results.len > 0) self.allocator.free(tag.@"type".sig.results);
+            if (tag.type.sig.params.len > 0) self.allocator.free(tag.type.sig.params);
+            if (tag.type.sig.results.len > 0) self.allocator.free(tag.type.sig.results);
         }
         self.tags.deinit(self.allocator);
         self.imports.deinit(self.allocator);

@@ -260,9 +260,9 @@ fn buildMockAdapterCore(allocator: Allocator) ![]u8 {
     {
         var b = std.ArrayListUnmanaged(u8).empty;
         defer b.deinit(allocator);
-        try b.append(allocator, 0x01);                     // 1 body
-        try b.append(allocator, 0x04);                     // body size
-        try b.append(allocator, 0x00);                     // 0 locals
+        try b.append(allocator, 0x01); // 1 body
+        try b.append(allocator, 0x04); // body size
+        try b.append(allocator, 0x00); // 0 locals
         try b.appendSlice(allocator, &.{ 0x41, 0x00, 0x0b }); // i32.const 0; end
         try Section.write(&out, allocator, 0x0a, b.items);
     }

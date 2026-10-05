@@ -108,14 +108,14 @@ fn checkTypes(m: *const Mod.Module) Error!void {
                                 return error.TypeMismatch;
                             if (child_at.field.mutable) {
                                 // Mutable: types must be exactly equal
-                                if (child_at.field.@"type" != parent_at.field.@"type")
+                                if (child_at.field.type != parent_at.field.type)
                                     return error.TypeMismatch;
                             } else {
                                 // Immutable: child element type must be subtype of parent
-                                if (child_at.field.@"type" != parent_at.field.@"type") {
+                                if (child_at.field.type != parent_at.field.type) {
                                     // Check basic subtyping
-                                    const cv = ValTypeOrUnknown.fromValType(child_at.field.@"type");
-                                    const pv = ValTypeOrUnknown.fromValType(parent_at.field.@"type");
+                                    const cv = ValTypeOrUnknown.fromValType(child_at.field.type);
+                                    const pv = ValTypeOrUnknown.fromValType(parent_at.field.type);
                                     if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
                                 }
                             }
@@ -141,11 +141,11 @@ fn checkTypes(m: *const Mod.Module) Error!void {
                                 const cf = child_st.fields.items[fi];
                                 if (cf.mutable != pf.mutable) return error.TypeMismatch;
                                 if (cf.mutable) {
-                                    if (cf.@"type" != pf.@"type") return error.TypeMismatch;
+                                    if (cf.type != pf.type) return error.TypeMismatch;
                                 } else {
-                                    if (cf.@"type" != pf.@"type") {
-                                        const cv = ValTypeOrUnknown.fromValType(cf.@"type");
-                                        const pv = ValTypeOrUnknown.fromValType(pf.@"type");
+                                    if (cf.type != pf.type) {
+                                        const cv = ValTypeOrUnknown.fromValType(cf.type);
+                                        const pv = ValTypeOrUnknown.fromValType(pf.type);
                                         if (!cv.isSubtypeOf(pv)) return error.TypeMismatch;
                                     }
                                 }
@@ -192,7 +192,7 @@ fn checkTables(m: *const Mod.Module, options: Options) Error!void {
         const vt = ValTypeOrUnknown.fromValType(table.type.elem_type);
         if (vt.isNonNullableRef())
             return error.TypeMismatch;
-        try checkLimits(table.@"type".limits, std.math.maxInt(u32));
+        try checkLimits(table.type.limits, std.math.maxInt(u32));
         // Validate table init expression type
         if (table.init_expr_bytes.len > 0) {
             // Check init expr produces a ref type matching the table's elem type
@@ -239,7 +239,7 @@ fn checkGlobals(m: *const Mod.Module) Error!void {
 fn checkTags(m: *const Mod.Module) Error!void {
     for (m.tags.items) |tag| {
         // Tag types must have empty result types per spec.
-        if (tag.@"type".sig.results.len > 0) return error.TypeMismatch;
+        if (tag.type.sig.results.len > 0) return error.TypeMismatch;
     }
 }
 
@@ -549,25 +549,25 @@ fn unpackInitState(bits: [4]u64, local_inited: []bool) void {
 }
 
 const ValTypeOrUnknown = enum(i32) {
-    i32 = @intFromEnum(types.ValType.i32),
-    i64 = @intFromEnum(types.ValType.i64),
-    f32 = @intFromEnum(types.ValType.f32),
-    f64 = @intFromEnum(types.ValType.f64),
-    v128 = @intFromEnum(types.ValType.v128),
-    funcref = @intFromEnum(types.ValType.funcref),
-    externref = @intFromEnum(types.ValType.externref),
-    anyref = @intFromEnum(types.ValType.anyref),
-    ref = @intFromEnum(types.ValType.ref),
-    ref_null = @intFromEnum(types.ValType.ref_null),
-    nullfuncref = @intFromEnum(types.ValType.nullfuncref),
-    nullexternref = @intFromEnum(types.ValType.nullexternref),
-    nullref = @intFromEnum(types.ValType.nullref),
-    ref_func = @intFromEnum(types.ValType.ref_func),
-    ref_extern = @intFromEnum(types.ValType.ref_extern),
-    ref_any = @intFromEnum(types.ValType.ref_any),
-    ref_none = @intFromEnum(types.ValType.ref_none),
-    ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
-    ref_noextern = @intFromEnum(types.ValType.ref_noextern),
+    i32 = @backingInt(types.ValType.i32),
+    i64 = @backingInt(types.ValType.i64),
+    f32 = @backingInt(types.ValType.f32),
+    f64 = @backingInt(types.ValType.f64),
+    v128 = @backingInt(types.ValType.v128),
+    funcref = @backingInt(types.ValType.funcref),
+    externref = @backingInt(types.ValType.externref),
+    anyref = @backingInt(types.ValType.anyref),
+    ref = @backingInt(types.ValType.ref),
+    ref_null = @backingInt(types.ValType.ref_null),
+    nullfuncref = @backingInt(types.ValType.nullfuncref),
+    nullexternref = @backingInt(types.ValType.nullexternref),
+    nullref = @backingInt(types.ValType.nullref),
+    ref_func = @backingInt(types.ValType.ref_func),
+    ref_extern = @backingInt(types.ValType.ref_extern),
+    ref_any = @backingInt(types.ValType.ref_any),
+    ref_none = @backingInt(types.ValType.ref_none),
+    ref_nofunc = @backingInt(types.ValType.ref_nofunc),
+    ref_noextern = @backingInt(types.ValType.ref_noextern),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -597,9 +597,20 @@ const ValTypeOrUnknown = enum(i32) {
 
     fn isRefType(self: ValTypeOrUnknown) bool {
         return switch (self) {
-            .funcref, .externref, .anyref, .ref, .ref_null,
-            .nullfuncref, .nullexternref, .nullref,
-            .ref_func, .ref_extern, .ref_any, .ref_none, .ref_nofunc, .ref_noextern,
+            .funcref,
+            .externref,
+            .anyref,
+            .ref,
+            .ref_null,
+            .nullfuncref,
+            .nullexternref,
+            .nullref,
+            .ref_func,
+            .ref_extern,
+            .ref_any,
+            .ref_none,
+            .ref_nofunc,
+            .ref_noextern,
             => true,
             else => false,
         };
@@ -826,7 +837,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 if (m.tables.items.len == 0) return error.InvalidTableIndex;
                 if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
                 // call_indirect requires a funcref table
-                if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
+                if (m.tables.items[table_idx].type.elem_type != .funcref) return error.TypeMismatch;
                 try popExpect(&val_stack, &ctrl_stack, .i32); // table index operand
                 const ft = switch (m.module_types.items[type_idx]) {
                     .func_type => |ft| ft,
@@ -906,30 +917,76 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 try popExpect(&val_stack, &ctrl_stack, .i32);
             },
             // Memory load instructions
-            0x28 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x28); },
-            0x29 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x29); },
-            0x2a => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x2a); },
-            0x2b => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x2b); },
-            0x2c => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2c); },
-            0x2d => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2d); },
-            0x2e => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2e); },
-            0x2f => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2f); },
-            0x30 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x30); },
-            0x31 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x31); },
-            0x32 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x32); },
-            0x33 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x33); },
-            0x34 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x34); },
-            0x35 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x35); },
+            0x28 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x28);
+            },
+            0x29 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x29);
+            },
+            0x2a => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x2a);
+            },
+            0x2b => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x2b);
+            },
+            0x2c => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2c);
+            },
+            0x2d => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2d);
+            },
+            0x2e => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2e);
+            },
+            0x2f => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2f);
+            },
+            0x30 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x30);
+            },
+            0x31 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x31);
+            },
+            0x32 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x32);
+            },
+            0x33 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x33);
+            },
+            0x34 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x34);
+            },
+            0x35 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x35);
+            },
             // Memory store instructions
-            0x36 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x36); },
-            0x37 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x37); },
-            0x38 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x38); },
-            0x39 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x39); },
-            0x3a => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3a); },
-            0x3b => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3b); },
-            0x3c => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3c); },
-            0x3d => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d); },
-            0x3e => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e); },
+            0x36 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x36);
+            },
+            0x37 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x37);
+            },
+            0x38 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x38);
+            },
+            0x39 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x39);
+            },
+            0x3a => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3a);
+            },
+            0x3b => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3b);
+            },
+            0x3c => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3c);
+            },
+            0x3d => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d);
+            },
+            0x3e => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e);
+            },
             0x3f => { // memory.size
                 if (pos < bytes.len and bytes[pos] != 0x00) return error.TypeMismatch;
                 const mem_idx = readU32(bytes, &pos);
@@ -960,53 +1017,117 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                 val_stack.append(gpa(m), .f64) catch return error.OutOfMemory;
             },
             // i32 comparison: unary
-            0x45 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x45 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i32 comparison: binary
-            0x46...0x4f => { try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x46...0x4f => {
+                try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i64 comparison: unary
-            0x50 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            0x50 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            },
             // i64 comparison: binary
-            0x51...0x5a => { try checkBinary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            0x51...0x5a => {
+                try checkBinary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            },
             // f32 comparison
-            0x5b...0x60 => { try checkBinary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
+            0x5b...0x60 => {
+                try checkBinary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
             // f64 comparison
-            0x61...0x66 => { try checkBinary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
+            0x61...0x66 => {
+                try checkBinary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m));
+            },
             // i32 unary
-            0x67...0x69 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x67...0x69 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i32 binary
-            0x6a...0x78 => { try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x6a...0x78 => {
+                try checkBinary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i64 unary
-            0x79...0x7b => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0x79...0x7b => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // i64 binary
-            0x7c...0x8a => { try checkBinary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0x7c...0x8a => {
+                try checkBinary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // f32 unary
-            0x8b...0x91 => { try checkUnary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            0x8b...0x91 => {
+                try checkUnary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m));
+            },
             // f32 binary
-            0x92...0x98 => { try checkBinary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            0x92...0x98 => {
+                try checkBinary(&val_stack, &ctrl_stack, .f32, .f32, gpa(m));
+            },
             // f64 unary
-            0x99...0x9f => { try checkUnary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            0x99...0x9f => {
+                try checkUnary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m));
+            },
             // f64 binary
-            0xa0...0xa6 => { try checkBinary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            0xa0...0xa6 => {
+                try checkBinary(&val_stack, &ctrl_stack, .f64, .f64, gpa(m));
+            },
             // Conversions
-            0xa7 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m)); }, // i32.wrap_i64
-            0xa8, 0xa9 => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
-            0xaa, 0xab => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
-            0xac, 0xad => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i64, gpa(m)); },
-            0xae, 0xaf => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i64, gpa(m)); },
-            0xb0, 0xb1 => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
-            0xb2, 0xb3 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
-            0xb4, 0xb5 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f32, gpa(m)); },
-            0xb6 => { try checkUnary(&val_stack, &ctrl_stack, .f64, .f32, gpa(m)); },
-            0xb7, 0xb8 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f64, gpa(m)); },
-            0xb9, 0xba => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
-            0xbb => { try checkUnary(&val_stack, &ctrl_stack, .f32, .f64, gpa(m)); },
-            0xbc => { try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
-            0xbd => { try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
-            0xbe => { try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
-            0xbf => { try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
+            0xa7 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            }, // i32.wrap_i64
+            0xa8, 0xa9 => {
+                try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
+            0xaa, 0xab => {
+                try checkUnary(&val_stack, &ctrl_stack, .f64, .i32, gpa(m));
+            },
+            0xac, 0xad => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .i64, gpa(m));
+            },
+            0xae, 0xaf => {
+                try checkUnary(&val_stack, &ctrl_stack, .f32, .i64, gpa(m));
+            },
+            0xb0, 0xb1 => {
+                try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m));
+            },
+            0xb2, 0xb3 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m));
+            },
+            0xb4, 0xb5 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .f32, gpa(m));
+            },
+            0xb6 => {
+                try checkUnary(&val_stack, &ctrl_stack, .f64, .f32, gpa(m));
+            },
+            0xb7, 0xb8 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .f64, gpa(m));
+            },
+            0xb9, 0xba => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m));
+            },
+            0xbb => {
+                try checkUnary(&val_stack, &ctrl_stack, .f32, .f64, gpa(m));
+            },
+            0xbc => {
+                try checkUnary(&val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
+            0xbd => {
+                try checkUnary(&val_stack, &ctrl_stack, .f64, .i64, gpa(m));
+            },
+            0xbe => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .f32, gpa(m));
+            },
+            0xbf => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .f64, gpa(m));
+            },
             // Sign extension
-            0xc0, 0xc1 => { try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
-            0xc2...0xc4 => { try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0xc0, 0xc1 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
+            0xc2...0xc4 => {
+                try checkUnary(&val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // Reference types
             0xd0 => { // ref.null
                 if (pos < bytes.len) pos += 1; // skip reftype byte
@@ -1081,7 +1202,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         const tbl_idx = readU32(bytes, &pos);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                         if (tbl_idx < m.tables.items.len) {
-                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].@"type".elem_type);
+                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].type.elem_type);
                             try popExpect(&val_stack, &ctrl_stack, elem_t);
                         } else {
                             _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
@@ -1096,7 +1217,7 @@ fn checkOneBody(m: *const Mod.Module, func: *const Mod.Func, declared_funcs: *co
                         const tbl_idx = readU32(bytes, &pos);
                         try popExpect(&val_stack, &ctrl_stack, .i32);
                         if (tbl_idx < m.tables.items.len) {
-                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].@"type".elem_type);
+                            const elem_t = ValTypeOrUnknown.fromValType(m.tables.items[tbl_idx].type.elem_type);
                             try popExpect(&val_stack, &ctrl_stack, elem_t);
                         } else {
                             _ = popVal(&val_stack, &ctrl_stack) catch return error.TypeMismatch;
@@ -1526,8 +1647,8 @@ test "load with multi-memory bit + explicit mem-idx" {
         .params = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
         .results = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
     } });
-    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
-    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
+    try module.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 0 } } });
+    try module.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 0 } } });
     try module.funcs.append(alloc, .{
         .decl = .{ .type_var = .{ .index = 0 } },
         .code_bytes = &bytes,

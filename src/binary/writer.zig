@@ -83,7 +83,7 @@ const Writer = struct {
     fn writeValTypeWithTidx(self: *Writer, vt: types.ValType, tidx: u32) WriteError!void {
         if ((vt == .ref_null or vt == .ref) and tidx != 0xFFFFFFFF) {
             // Concrete typed ref: write prefix + type index
-            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+            try self.appendByte(@bitCast(@as(i8, @intCast(@backingInt(vt)))));
             try self.writeU32Leb(tidx);
         } else if (vt == .ref_func) {
             try self.appendByte(0x64); // ref
@@ -122,7 +122,7 @@ const Writer = struct {
             try self.appendByte(0x64); // ref
             try self.appendByte(0x68); // noexn
         } else {
-            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+            try self.appendByte(@bitCast(@as(i8, @intCast(@backingInt(vt)))));
         }
     }
 
@@ -238,13 +238,13 @@ const Writer = struct {
                     try self.appendByte(0x5F);
                     try self.writeU32Leb(@intCast(st.fields.items.len));
                     for (st.fields.items) |f| {
-                        try self.writeValTypeWithTidx(f.@"type", f.type_idx);
+                        try self.writeValTypeWithTidx(f.type, f.type_idx);
                         try self.appendByte(if (f.mutable) 1 else 0);
                     }
                 },
                 .array_type => |at| {
                     try self.appendByte(0x5E);
-                    try self.writeValTypeWithTidx(at.field.@"type", at.field.type_idx);
+                    try self.writeValTypeWithTidx(at.field.type, at.field.type_idx);
                     try self.appendByte(if (at.field.mutable) 1 else 0);
                 },
             }
@@ -258,7 +258,7 @@ const Writer = struct {
         for (module.imports.items) |imp| {
             try self.writeName(imp.module_name);
             try self.writeName(imp.field_name);
-            try self.appendByte(@intFromEnum(imp.kind));
+            try self.appendByte(@backingInt(imp.kind));
             switch (imp.kind) {
                 .func => try self.writeU32Leb(if (imp.func) |f| f.type_var.index else 0),
                 .table => {
@@ -313,7 +313,7 @@ const Writer = struct {
                 try self.appendByte(0x0b);
             } else if ((et == .ref_null or et == .ref) and table.type_idx != 0xFFFFFFFF) {
                 // Typed reference: write prefix + concrete type index
-                try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(et)))));
+                try self.appendByte(@bitCast(@as(i8, @intCast(@backingInt(et)))));
                 try self.writeU32Leb(table.type_idx);
                 try self.writeLimits(table.type.limits);
             } else {
@@ -345,7 +345,7 @@ const Writer = struct {
             // Resolve type index: if not set, find matching type by signature
             var tidx = tag.type_idx;
             if (tidx == std.math.maxInt(u32)) {
-                tidx = findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
+                tidx = findMatchingType(module, tag.type.sig.params, tag.type.sig.results) orelse 0;
             }
             try self.writeU32Leb(tidx);
         }
@@ -359,11 +359,17 @@ const Writer = struct {
                     if (ft.params.len == params.len and ft.results.len == results.len) {
                         var match = true;
                         for (ft.params, params) |a, b| {
-                            if (a != b) { match = false; break; }
+                            if (a != b) {
+                                match = false;
+                                break;
+                            }
                         }
                         if (match) {
                             for (ft.results, results) |a, b| {
-                                if (a != b) { match = false; break; }
+                                if (a != b) {
+                                    match = false;
+                                    break;
+                                }
                             }
                         }
                         if (match) return @intCast(i);
@@ -401,7 +407,7 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(module.exports.items.len));
         for (module.exports.items) |exp| {
             try self.writeName(exp.name);
-            try self.appendByte(@intFromEnum(exp.kind));
+            try self.appendByte(@backingInt(exp.kind));
             try self.writeU32Leb(exp.var_.index);
         }
         self.endSection(ph);
@@ -627,7 +633,8 @@ test "round-trip exports" {
     const allocator = std.testing.allocator;
     const input = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x07, 0x07, 0x01, 0x03, 'm', 'e', 'm', 0x02, 0x00,
+        0x07, 0x07, 0x01, 0x03, 'm',  'e',  'm',  0x02,
+        0x00,
     };
     var module = try reader.readModule(allocator, &input);
     defer module.deinit();
@@ -886,8 +893,7 @@ test "binary read+write: defined table with init expression round-trips" {
         // preamble
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // table section: id=4, size=9, count=1, body
-        0x04, 0x09, 0x01,
-        0x40, 0x00, 0x70, 0x00, 0x01,
+        0x04, 0x09, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
         0xd0, 0x70, 0x0b,
     };
 

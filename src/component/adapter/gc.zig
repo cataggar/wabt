@@ -398,8 +398,14 @@ fn walkOps(bytes: []const u8, sink: anytype) Error!void {
             },
             0x41 => _ = try readSignedAt(bytes, &pos, 32), // i32.const
             0x42 => _ = try readSignedAt(bytes, &pos, 64), // i64.const
-            0x43 => { if (pos + 4 > bytes.len) return error.InvalidBody; pos += 4; }, // f32.const
-            0x44 => { if (pos + 8 > bytes.len) return error.InvalidBody; pos += 8; }, // f64.const
+            0x43 => {
+                if (pos + 4 > bytes.len) return error.InvalidBody;
+                pos += 4;
+            }, // f32.const
+            0x44 => {
+                if (pos + 8 > bytes.len) return error.InvalidBody;
+                pos += 8;
+            }, // f64.const
             0x45...0xc4 => {}, // numeric/comparison/conversion: no operands
             0xd0 => { // ref.null reftype
                 if (pos >= bytes.len) return error.InvalidBody;

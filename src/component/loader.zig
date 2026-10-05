@@ -112,7 +112,7 @@ const SectionId = enum(u8) {
     type = 7,
     canon = 8,
     start = 9,
-    @"import" = 10,
+    import = 10,
     @"export" = 11,
     value = 12,
 };
@@ -321,7 +321,7 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
             .start => {
                 start = try parseStart(&reader, allocator);
             },
-            .@"import" => {
+            .import => {
                 const count = try reader.readU32();
                 var i: u32 = 0;
                 while (i < count) : (i += 1) {
@@ -367,7 +367,7 @@ fn loadInner(data: []const u8, allocator: std.mem.Allocator, capture_layout: boo
                 .type => mkEntry(.type, len_before.type, type_defs.items.len),
                 .canon => mkEntry(.canon, len_before.canon, canons.items.len),
                 .start => ctypes.SectionEntry{ .kind = Kind.start, .start = 0, .count = 0 },
-                .@"import" => mkEntry(.import, len_before.@"import", imports.items.len),
+                .import => mkEntry(.import, len_before.import, imports.items.len),
                 .@"export" => mkEntry(.@"export", len_before.@"export", exports.items.len),
                 // `value` sections aren't materialized, so the layout
                 // cannot be faithfully reproduced — disable layout capture.
@@ -1229,9 +1229,15 @@ test "parseTypeDef: instance type with `sub resource` type decl" {
     //     0x00 0x00       ; bound: eq, typeidx 0
     const data = [_]u8{
         0x42, 0x02,
-        0x01, 0x3F, 0x7F, 0x00,
-        0x04, 0x00, 0x08, 'p', 'o', 'l', 'l', 'a', 'b', 'l', 'e',
-        0x03, 0x00, 0x00,
+        0x01, 0x3F,
+        0x7F, 0x00,
+        0x04, 0x00,
+        0x08, 'p',
+        'o',  'l',
+        'l',  'a',
+        'b',  'l',
+        'e',  0x03,
+        0x00, 0x00,
     };
     var reader = BinaryReader{ .data = &data };
     const td = try parseTypeDef(&reader, std.testing.allocator);
