@@ -687,12 +687,12 @@ pub const Code = enum(u32) {
 
     /// Returns true if this is a prefixed (multi-byte) opcode.
     pub fn isPrefixed(self: Code) bool {
-        return @intFromEnum(self) > 0xff;
+        return @backingInt(self) > 0xff;
     }
 
     /// Get the prefix byte (0 for single-byte opcodes).
     pub fn getPrefix(self: Code) u8 {
-        const raw = @intFromEnum(self);
+        const raw = @backingInt(self);
         if (raw <= 0xff) return 0;
         // 4-hex-digit values (0xPPCC): prefix is top byte
         if (raw <= 0xffff) return @truncate(raw >> 8);
@@ -702,7 +702,7 @@ pub const Code = enum(u32) {
 
     /// Get the sub-opcode (code after prefix, or the single byte itself).
     pub fn getCode(self: Code) u32 {
-        const raw = @intFromEnum(self);
+        const raw = @backingInt(self);
         if (raw <= 0xff) return raw;
         const pfx: u32 = self.getPrefix();
         if (raw <= 0xffff) return raw - (pfx << 8);
@@ -713,7 +713,7 @@ pub const Code = enum(u32) {
     /// Single-byte opcodes produce 1 byte. Prefixed opcodes produce the
     /// prefix byte followed by a LEB128-encoded sub-opcode.
     pub fn getBytes(self: Code, buf: *[6]u8) u8 {
-        const raw = @intFromEnum(self);
+        const raw = @backingInt(self);
         if (raw <= 0xff) {
             buf[0] = @truncate(raw);
             return 1;
@@ -1875,17 +1875,17 @@ pub const Code = enum(u32) {
 // ── Tests ────────────────────────────────────────────────────────────────
 
 test "opcode encoding — single-byte values" {
-    try std.testing.expectEqual(@as(u32, 0x00), @intFromEnum(Code.@"unreachable"));
-    try std.testing.expectEqual(@as(u32, 0x0b), @intFromEnum(Code.end));
-    try std.testing.expectEqual(@as(u32, 0x41), @intFromEnum(Code.i32_const));
-    try std.testing.expectEqual(@as(u32, 0xbf), @intFromEnum(Code.f64_reinterpret_i64));
+    try std.testing.expectEqual(@as(u32, 0x00), @backingInt(Code.@"unreachable"));
+    try std.testing.expectEqual(@as(u32, 0x0b), @backingInt(Code.end));
+    try std.testing.expectEqual(@as(u32, 0x41), @backingInt(Code.i32_const));
+    try std.testing.expectEqual(@as(u32, 0xbf), @backingInt(Code.f64_reinterpret_i64));
 }
 
 test "opcode encoding — prefixed values" {
-    try std.testing.expectEqual(@as(u32, 0xfc00), @intFromEnum(Code.i32_trunc_sat_f32_s));
-    try std.testing.expectEqual(@as(u32, 0xfd0c), @intFromEnum(Code.v128_const));
-    try std.testing.expectEqual(@as(u32, 0xfe00), @intFromEnum(Code.memory_atomic_notify));
-    try std.testing.expectEqual(@as(u32, 0xfe4e), @intFromEnum(Code.i64_atomic_rmw32_cmpxchg_u));
+    try std.testing.expectEqual(@as(u32, 0xfc00), @backingInt(Code.i32_trunc_sat_f32_s));
+    try std.testing.expectEqual(@as(u32, 0xfd0c), @backingInt(Code.v128_const));
+    try std.testing.expectEqual(@as(u32, 0xfe00), @backingInt(Code.memory_atomic_notify));
+    try std.testing.expectEqual(@as(u32, 0xfe4e), @backingInt(Code.i64_atomic_rmw32_cmpxchg_u));
 }
 
 test "isPrefixed" {
@@ -2065,5 +2065,5 @@ test "name — spot checks" {
     try std.testing.expectEqualStrings("i32.trunc_sat_f32_s", Code.i32_trunc_sat_f32_s.name());
     try std.testing.expectEqualStrings("v128.const", Code.v128_const.name());
     try std.testing.expectEqualStrings("memory.atomic.notify", Code.memory_atomic_notify.name());
-    try std.testing.expectEqualStrings("<unknown>", (@as(Code, @enumFromInt(0xFFFF))).name());
+    try std.testing.expectEqualStrings("<unknown>", (@as(Code, @fromBackingInt(@intCast(0xFFFF)))).name());
 }

@@ -80,7 +80,7 @@ test "module with custom section is stripped" {
         0x00, // custom section id
         0x05, // section size = 5
         0x04, // name length = 4
-        't',  'e',  's',  't', // name = "test"
+        't', 'e', 's', 't', // name = "test"
     };
     const result = try strip(std.testing.allocator, wasm_with_custom);
     defer std.testing.allocator.free(result);

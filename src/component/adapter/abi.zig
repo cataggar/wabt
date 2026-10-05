@@ -437,7 +437,6 @@ fn resolveAndFlatten(idx: u32, resolver: TypeResolver, depth: u32, unresolved: F
     return flattenTypeDef(r.td, sub, depth + 1);
 }
 
-
 fn flattenTypeDef(td: ctypes.TypeDef, resolver: TypeResolver, depth: u32) FlatInfo {
     return switch (td) {
         .val => |vt| flattenInner(vt, resolver, depth),
@@ -1241,7 +1240,8 @@ test "lowerCoreSig: async func -> (params, result_ptr) -> i32 status" {
     try testing.expect(classifyFunc(ftr).opts.memory);
 }
 
-test "lowerCoreSig: 1-flat result keeps 1 result, no extra param" {    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+test "lowerCoreSig: 1-flat result keeps 1 result, no extra param" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
 

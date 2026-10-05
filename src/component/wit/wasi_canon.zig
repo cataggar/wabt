@@ -76,8 +76,8 @@ fn pkg(
 fn coreP2(comptime version: []const u8) []const Package {
     const list = [_]Package{
         pkg(version, "cli", &.{
-            "command.wit",     "environment.wit", "exit.wit", "imports.wit",
-            "run.wit",         "stdio.wit",       "terminal.wit",
+            "command.wit", "environment.wit", "exit.wit",     "imports.wit",
+            "run.wit",     "stdio.wit",       "terminal.wit",
         }),
         pkg(version, "clocks", &.{
             "monotonic-clock.wit", "timezone.wit", "wall-clock.wit", "world.wit",
@@ -89,8 +89,8 @@ fn coreP2(comptime version: []const u8) []const Package {
             "insecure-seed.wit", "insecure.wit", "random.wit", "world.wit",
         }),
         pkg(version, "sockets", &.{
-            "instance-network.wit",  "ip-name-lookup.wit",    "network.wit",
-            "tcp-create-socket.wit", "tcp.wit",               "udp-create-socket.wit",
+            "instance-network.wit",  "ip-name-lookup.wit", "network.wit",
+            "tcp-create-socket.wit", "tcp.wit",            "udp-create-socket.wit",
             "udp.wit",               "world.wit",
         }),
     };
@@ -106,7 +106,7 @@ fn coreP2(comptime version: []const u8) []const Package {
 pub const version_sets = [_]VersionSet{
     .{ .version = "0.3.0", .packages = &.{
         pkg("0.3.0", "cli", &.{
-            "command.wit", "environment.wit", "exit.wit", "imports.wit",
+            "command.wit", "environment.wit", "exit.wit",     "imports.wit",
             "run.wit",     "stdio.wit",       "terminal.wit",
         }),
         pkg("0.3.0", "clocks", &.{

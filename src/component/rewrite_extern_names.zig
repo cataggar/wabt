@@ -1051,11 +1051,16 @@ test "apply: rewrites top-level import name" {
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const bytes = try writer.encode(ar, &consumer);
 
@@ -1096,11 +1101,16 @@ test "apply: rewrites top-level export name" {
     // about cross-section index validity.
 
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &.{}, .exports = &exports,
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &exports,
     };
     const bytes = try writer.encode(ar, &consumer);
 
@@ -1129,11 +1139,16 @@ test "apply: rewrites import name nested in component-type body" {
     const ct = ctypes.TypeDef{ .component = .{ .decls = &ct_decls } };
     const types = [_]ctypes.TypeDef{ct};
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const bytes = try writer.encode(ar, &consumer);
 
@@ -1169,11 +1184,16 @@ test "apply: leaves unrelated names alone" {
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const bytes = try writer.encode(ar, &consumer);
 
@@ -1198,11 +1218,16 @@ test "apply: extending the version string (0.2.6 → 0.2.10) round-trips" {
         .{ .instance = .{ .decls = &.{} } },
     };
     const consumer: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &cons_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &cons_imports,
+        .exports = &.{},
     };
     const bytes = try writer.encode(ar, &consumer);
 
@@ -1231,11 +1256,16 @@ test "apply: recurses through nested-component import sections (regression for #
         .{ .instance = .{ .decls = &.{} } },
     };
     const nested = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &nested_types, .canons = &.{},
-        .imports = &nested_imports, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &nested_types,
+        .canons = &.{},
+        .imports = &nested_imports,
+        .exports = &.{},
     };
     const nested_bytes = try writer.encode(ar, &nested);
 
@@ -1245,11 +1275,16 @@ test "apply: recurses through nested-component import sections (regression for #
     const components_arr = [_]*ctypes.Component{&passthrough_ptr};
 
     const outer = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &components_arr,
-        .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &components_arr,
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const outer_bytes = try writer.encode(ar, &outer);
 
@@ -1297,11 +1332,16 @@ test "apply: rewrites a nested component's component-type-body import (audit for
     const ct = ctypes.TypeDef{ .component = .{ .decls = &ct_decls } };
     const nested_types = [_]ctypes.TypeDef{ct};
     const nested = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &nested_types, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &nested_types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const nested_bytes = try writer.encode(ar, &nested);
 
@@ -1311,11 +1351,16 @@ test "apply: rewrites a nested component's component-type-body import (audit for
     const components_arr = [_]*ctypes.Component{&passthrough_ptr};
 
     const outer = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &components_arr,
-        .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &components_arr,
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const outer_bytes = try writer.encode(ar, &outer);
 
@@ -1384,11 +1429,16 @@ test "apply: rewrites a nested component's core_module imports (audit for #214 s
         .{ .data = core_bytes.items },
     };
     const nested = ctypes.Component{
-        .core_modules = &core_modules, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &core_modules,
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const nested_bytes = try writer.encode(ar, &nested);
 
@@ -1398,11 +1448,16 @@ test "apply: rewrites a nested component's core_module imports (audit for #214 s
     const components_arr = [_]*ctypes.Component{&passthrough_ptr};
 
     const outer = ctypes.Component{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &components_arr,
-        .instances = &.{}, .aliases = &.{},
-        .types = &.{}, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &components_arr,
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &.{},
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const outer_bytes = try writer.encode(ar, &outer);
 
@@ -1982,11 +2037,16 @@ test "apply: preserves [method]R.M-named export decls inside instance-type bodie
     const ct = ctypes.TypeDef{ .component = .{ .decls = &ct_decls } };
     const types = [_]ctypes.TypeDef{ct};
     const comp: ctypes.Component = .{
-        .core_modules = &.{}, .core_instances = &.{},
-        .core_types = &.{}, .components = &.{},
-        .instances = &.{}, .aliases = &.{},
-        .types = &types, .canons = &.{},
-        .imports = &.{}, .exports = &.{},
+        .core_modules = &.{},
+        .core_instances = &.{},
+        .core_types = &.{},
+        .components = &.{},
+        .instances = &.{},
+        .aliases = &.{},
+        .types = &types,
+        .canons = &.{},
+        .imports = &.{},
+        .exports = &.{},
     };
     const bytes = try writer.encode(ar, &comp);
 

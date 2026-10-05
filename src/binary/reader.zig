@@ -66,7 +66,7 @@ pub fn readModule(allocator: std.mem.Allocator, bytes: []const u8) ReadError!Mod
 /// Safe enum cast: returns null if the integer doesn't match any tag.
 fn enumFromIntChecked(comptime E: type, value: @typeInfo(E).@"enum".tag_type) ?E {
     inline for (std.enums.values(E)) |field_value| {
-        if (value == @intFromEnum(field_value)) return field_value;
+        if (value == @backingInt(field_value)) return field_value;
     }
     return null;
 }
@@ -669,7 +669,8 @@ test "read memory section" {
 test "read export section" {
     const bytes = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x07, 0x07, 0x01, 0x03, 'm', 'e', 'm', 0x02, 0x00,
+        0x07, 0x07, 0x01, 0x03, 'm',  'e',  'm',  0x02,
+        0x00,
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
@@ -694,9 +695,10 @@ test "read import section" {
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00, // type
         0x02, 0x0b, 0x01, // import section, 1 import
-        0x03, 'e', 'n', 'v',
-        0x03, 'l', 'o', 'g',
-        0x00, 0x00,
+        0x03, 'e',  'n',
+        'v',  0x03, 'l',
+        'o',  'g',  0x00,
+        0x00,
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
@@ -721,7 +723,8 @@ test "read global section" {
 test "read custom section" {
     const bytes = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x00, 0x07, 0x04, 't', 'e', 's', 't', 0xDE, 0xAD,
+        0x00, 0x07, 0x04, 't',  'e',  's',  't',  0xDE,
+        0xAD,
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
@@ -735,7 +738,8 @@ test "read data section" {
         0x0b, 0x0b, 0x01,
         0x00, // active, memory 0
         0x41, 0x00, 0x0b, // offset: i32.const 0, end
-        0x05, 'h', 'e', 'l', 'l', 'o',
+        0x05, 'h',  'e',
+        'l',  'l',  'o',
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
@@ -767,19 +771,24 @@ test "accept element then data_count then code then data ordering" {
         // type section: one type () -> ()
         0x01, 0x04, 0x01, 0x60, 0x00, 0x00,
         // function section: one func of type 0
-        0x03, 0x02, 0x01, 0x00,
+        0x03, 0x02,
+        0x01, 0x00,
         // table section: one funcref table, min 1
         0x04, 0x04, 0x01, 0x70, 0x00, 0x01,
         // memory section: one memory, min 1
         0x05, 0x03, 0x01, 0x00, 0x01,
         // element section (id 9): one active elem, table 0, offset 0, func 0
-        0x09, 0x07, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x01, 0x00,
+        0x09, 0x07, 0x01,
+        0x00, 0x41, 0x00, 0x0b, 0x01, 0x00,
         // data count section (id 12): 1 data segment
-        0x0c, 0x01, 0x01,
+        0x0c, 0x01,
+        0x01,
         // code section (id 10): one body, empty (just `end`)
         0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
         // data section (id 11): one active segment "hi"
-        0x0b, 0x08, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x02, 'h', 'i',
+        0x0b,
+        0x08, 0x01, 0x00, 0x41, 0x00, 0x0b, 0x02, 'h',
+        'i',
     };
     var module = try readModule(std.testing.allocator, &bytes);
     defer module.deinit();
