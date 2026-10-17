@@ -69,12 +69,27 @@ def sha256_digest(data: bytes) -> str:
     return urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
+def _previous_patch_version(version: str) -> str:
+    base = version.split(".post")[0]
+    parts = base.split(".")
+    if len(parts) >= 3 and parts[-1].isdigit() and int(parts[-1]) > 0:
+        parts[-1] = str(int(parts[-1]) - 1)
+        return ".".join(parts)
+    return base
+
+
 def download_asset(release_version: str, platform_key: str) -> bytes:
     """Download a wabt release asset."""
     asset_name = f"wabt-{release_version}-{platform_key}.tar.gz"
     url = f"https://github.com/{WABT_REPO}/releases/download/v{release_version}/{asset_name}"
     print(f"  Downloading {asset_name} ...")
     resp = requests.get(url, allow_redirects=True, timeout=300)
+    if resp.status_code == 404:
+        fallback = _previous_patch_version(release_version)
+        asset_name = f"wabt-{fallback}-{platform_key}.tar.gz"
+        url = f"https://github.com/{WABT_REPO}/releases/download/v{fallback}/{asset_name}"
+        print(f"  v{release_version} not found upstream; falling back to {asset_name} ...")
+        resp = requests.get(url, allow_redirects=True, timeout=300)
     resp.raise_for_status()
     return resp.content
 
@@ -93,12 +108,9 @@ def build_wheel(
             if not m.isfile() or "/bin/" not in m.name:
                 continue
             basename = m.name.rsplit("/", 1)[-1]
-            for tool in TOOLS:
-                if basename == f"{tool}{ext}":
-                    f = tf.extractfile(m)
-                    if f is not None:
-                        tool_binaries[basename] = f.read()
-                    break
+            f = tf.extractfile(m)
+            if f is not None:
+                tool_binaries[basename] = f.read()
 
     if not tool_binaries:
         raise RuntimeError(f"No tool binaries found in archive for {platform_key}")
@@ -153,9 +165,10 @@ def build_wheel(
         f"Metadata-Version: 2.4\n"
         f"Name: wabt-bin\n"
         f"Version: {version}\n"
-        f"Summary: WebAssembly Binary Toolkit — native CLI tools\n"
-        f"Home-page: https://github.com/cataggar/wabt\n"
+        f"Summary: DEPRECATED: Use 'ghr install cataggar/wabt' instead (https://cataggar.github.io/ghr/)\n"
+        f"Home-page: https://cataggar.github.io/ghr/\n"
         f"License: Apache-2.0\n"
+        f"Classifier: Development Status :: 7 - Inactive\n"
         f"License-File: LICENSE\n"
         f"License-File: SOURCE_PROVENANCE.md\n"
         f"License-File: THIRD_PARTY_NOTICES.md\n"
