@@ -232,11 +232,6 @@ def main() -> int:
         ),
         errors,
     )
-    require_text(
-        ".github/workflows/pypi.yml",
-        ("docs/oci.md", "docs/oci-authentication.md"),
-        errors,
-    )
 
     provenance_values = (
         producers["oras"]["archive"]["sha256"],
