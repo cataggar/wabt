@@ -217,18 +217,20 @@ pub fn cloneAlias(
             .instance_idx = remap(inst_remap, ie.instance_idx),
             .name = try arena.dupe(u8, ie.name),
         } },
-        .outer => |o| .{ .outer = .{
-            .sort = o.sort,
-            .outer_count = o.outer_count,
-            // depth-0 outer alias references the enclosing
-            // component's indexspace; world_gc's caller has always
-            // emitted this for boilerplate (idx 0) and left it
-            // verbatim. Compose's caller likewise emits this only
-            // for top-level body alias decls, where the enclosing
-            // scope is the wrapping component and the idx is fresh
-            // in the wrapper's space — leave verbatim here too.
-            .idx = o.idx,
-        } },
+        .outer => |o| .{
+            .outer = .{
+                .sort = o.sort,
+                .outer_count = o.outer_count,
+                // depth-0 outer alias references the enclosing
+                // component's indexspace; world_gc's caller has always
+                // emitted this for boilerplate (idx 0) and left it
+                // verbatim. Compose's caller likewise emits this only
+                // for top-level body alias decls, where the enclosing
+                // scope is the wrapping component and the idx is fresh
+                // in the wrapper's space — leave verbatim here too.
+                .idx = o.idx,
+            },
+        },
     };
 }
 

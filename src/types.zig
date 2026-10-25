@@ -36,7 +36,7 @@ pub const AbstractHeapType = enum(i32) {
 
     pub fn fromCode(code: i64) ?AbstractHeapType {
         inline for (std.enums.values(AbstractHeapType)) |heap| {
-            if (code == @intFromEnum(heap)) return heap;
+            if (code == @backingInt(heap)) return heap;
         }
         return null;
     }
@@ -443,17 +443,17 @@ pub const CatchKind = enum {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 test "ValType encoding" {
-    try std.testing.expectEqual(@as(i32, 0x7f), @intFromEnum(ValType.i32));
-    try std.testing.expectEqual(@as(i32, 0x7e), @intFromEnum(ValType.i64));
-    try std.testing.expectEqual(@as(i32, 0x7d), @intFromEnum(ValType.f32));
-    try std.testing.expectEqual(@as(i32, 0x7c), @intFromEnum(ValType.f64));
-    try std.testing.expectEqual(@as(i32, 0x7b), @intFromEnum(ValType.v128));
-    try std.testing.expectEqual(@as(i32, 0x70), @intFromEnum(ValType.funcref));
-    try std.testing.expectEqual(@as(i32, 0x6f), @intFromEnum(ValType.externref));
-    try std.testing.expectEqual(@as(i32, 0x6e), @intFromEnum(ValType.anyref));
-    try std.testing.expectEqual(@as(i32, 0x69), @intFromEnum(ValType.exnref));
-    try std.testing.expectEqual(@as(i32, 0x60), @intFromEnum(ValType.func));
-    try std.testing.expectEqual(@as(i32, 0x40), @intFromEnum(ValType.void_));
+    try std.testing.expectEqual(@as(i32, 0x7f), @backingInt(ValType.i32));
+    try std.testing.expectEqual(@as(i32, 0x7e), @backingInt(ValType.i64));
+    try std.testing.expectEqual(@as(i32, 0x7d), @backingInt(ValType.f32));
+    try std.testing.expectEqual(@as(i32, 0x7c), @backingInt(ValType.f64));
+    try std.testing.expectEqual(@as(i32, 0x7b), @backingInt(ValType.v128));
+    try std.testing.expectEqual(@as(i32, 0x70), @backingInt(ValType.funcref));
+    try std.testing.expectEqual(@as(i32, 0x6f), @backingInt(ValType.externref));
+    try std.testing.expectEqual(@as(i32, 0x6e), @backingInt(ValType.anyref));
+    try std.testing.expectEqual(@as(i32, 0x69), @backingInt(ValType.exnref));
+    try std.testing.expectEqual(@as(i32, 0x60), @backingInt(ValType.func));
+    try std.testing.expectEqual(@as(i32, 0x40), @backingInt(ValType.void_));
 }
 
 /// Every `ValType` member with a binary encoding, paired with the byte the
@@ -495,10 +495,10 @@ const spec_valtype_bytes = [_]struct { ValType, u8 }{
 // that have a binary encoding. A type added to `ValType` without a spec byte
 // here fails this test instead of silently colliding with an unrelated type.
 test "ValType binary encodings match the spec" {
-    var seen_bytes = [_]bool{false} ** 256;
+    var seen_bytes: [256]bool = @splat(false);
     for (spec_valtype_bytes) |entry| {
         const vt, const byte = entry;
-        try std.testing.expectEqual(@as(i32, byte), @intFromEnum(vt));
+        try std.testing.expectEqual(@as(i32, byte), @backingInt(vt));
         try std.testing.expect(!seen_bytes[byte]);
         seen_bytes[byte] = true;
     }
@@ -506,13 +506,13 @@ test "ValType binary encodings match the spec" {
     // Exhaustiveness: every member is either in the table above or is an
     // internal-only marker, which must be negative so it can never be
     // confused with a byte read from a binary.
-    inline for (@typeInfo(ValType).@"enum".fields) |field| {
-        const vt: ValType = @enumFromInt(field.value);
+    inline for (@typeInfo(ValType).@"enum".field_values) |field_value| {
+        const vt: ValType = @fromBackingInt(@intCast(field_value));
         var in_table = false;
         for (spec_valtype_bytes) |entry| {
             if (entry[0] == vt) in_table = true;
         }
-        if (!in_table) try std.testing.expect(field.value < 0);
+        if (!in_table) try std.testing.expect(field_value < 0);
     }
 }
 
@@ -583,7 +583,7 @@ test "RefType carries abstract and concrete heap types" {
     try std.testing.expectEqual(@as(u32, 7), concrete.heap.concrete);
     try std.testing.expectEqual(
         @as(i32, -0x10),
-        @intFromEnum((RefType.fromValType(.ref_func) orelse unreachable).heap.abstract),
+        @backingInt((RefType.fromValType(.ref_func) orelse unreachable).heap.abstract),
     );
 }
 

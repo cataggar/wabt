@@ -31,7 +31,7 @@ pub const Set = packed struct {
     compact_imports: bool = false,
     wide_arithmetic: bool = false,
 
-    const field_names = std.meta.fieldNames(Set);
+    const field_names = @typeInfo(Set).@"struct".field_names;
 
     /// Default feature set — features enabled by their default values.
     pub const mvp = Set{};

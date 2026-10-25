@@ -44,7 +44,7 @@ manual redirect handling, bounded `Retry-After` parsing, and deterministic
 backoff. WABT separates those mechanics from Distribution semantics and adds
 canonical origin policy, loopback-only explicit HTTP, authorization stripping,
 an injected backend/runtime boundary, absolute operation deadlines, scoped
-token-cache integration, secret-safe diagnostics, and explicit Zig 0.16
+token-cache integration, secret-safe diagnostics, and explicit Zig 0.17
 socket-timeout capability reporting.
 
 `src/oci/registry.zig` materially adapts miz's registry resolve, manifest,
@@ -153,8 +153,8 @@ offline verifier and default Zig tests consume only committed bytes.
   `cb482cd75185f5dde1d40e50b258c5cd6a4465dcf3f494f2dc0e57224bf314b2`)
   and Cargo 1.97.0 (binary SHA-256
   `48465d951d7b6a98f2fd9cddfa3bfde8ad81796d8c4b56d1f1e4c45775740b53`)
-  using Zig 0.16.0 as the native linker (binary SHA-256
-  `6e2989a7efbd4e81acbacb6c6378e34340d8e88bb023b10c4a941021be55cdcb`).
+  using Zig 0.17.0 as the native linker (binary SHA-256
+  `5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7`).
   Rust was installed by rustup 1.28.2 from the Linux arm64 `rustup-init`
   binary with SHA-256
   `e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c`.

@@ -291,12 +291,30 @@ pub fn decodeQuoteStrings(allocator: std.mem.Allocator, mod_text: []const u8) ![
                 if (mod_text[i] == '\\' and i + 1 < mod_text.len) {
                     i += 1;
                     switch (mod_text[i]) {
-                        'n' => { try result.append(allocator, '\n'); i += 1; },
-                        't' => { try result.append(allocator, '\t'); i += 1; },
-                        'r' => { try result.append(allocator, '\r'); i += 1; },
-                        '\\' => { try result.append(allocator, '\\'); i += 1; },
-                        '"' => { try result.append(allocator, '"'); i += 1; },
-                        '\'' => { try result.append(allocator, '\''); i += 1; },
+                        'n' => {
+                            try result.append(allocator, '\n');
+                            i += 1;
+                        },
+                        't' => {
+                            try result.append(allocator, '\t');
+                            i += 1;
+                        },
+                        'r' => {
+                            try result.append(allocator, '\r');
+                            i += 1;
+                        },
+                        '\\' => {
+                            try result.append(allocator, '\\');
+                            i += 1;
+                        },
+                        '"' => {
+                            try result.append(allocator, '"');
+                            i += 1;
+                        },
+                        '\'' => {
+                            try result.append(allocator, '\'');
+                            i += 1;
+                        },
                         else => {
                             // \xx hex escape — decode to actual byte
                             if (i + 1 < mod_text.len) {

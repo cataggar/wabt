@@ -1083,7 +1083,11 @@ test "extractFromCoreWasm: finds custom section" {
         0x01, 0x00, 0x00, 0x00,
         0x00, 0x07,
         0x05, // name length=5
-        'h', 'e', 'l', 'l', 'o',
+        'h',
+        'e',
+        'l',
+        'l',
+        'o',
     } ++ [_]u8{0x00};
     const found = try extractFromCoreWasm(&core);
     try testing.expect(found == null); // name doesn't match prefix
@@ -1093,8 +1097,24 @@ test "extractFromCoreWasm: finds custom section" {
         0x01, 0x00, 0x00, 0x00,
         0x00, 0x13, // section id=0, size=19
         0x10, // name len=16 ("component-type:w")
-        'c', 'o', 'm', 'p', 'o', 'n', 'e', 'n', 't', '-', 't', 'y', 'p', 'e', ':', 'w',
-        0xAA, 0xBB,
+        'c',
+        'o',
+        'm',
+        'p',
+        'o',
+        'n',
+        'e',
+        'n',
+        't',
+        '-',
+        't',
+        'y',
+        'p',
+        'e',
+        ':',
+        'w',
+        0xAA,
+        0xBB,
     };
     const f2 = try extractFromCoreWasm(&core2);
     try testing.expect(f2 != null);

@@ -21,7 +21,7 @@ env:
   # built-ins (`backpressure.*`, `context.*`, `subtask.cancel`) require Wasmtime
   # >= 46 (wasmparser 0.251). Bump these single lines to move the pins.
   WASMTIME_VERSION: v46.0.0
-  ZIG_VERSION: v0.16.0
+  ZIG_VERSION: v0.17.0
 
 jobs:
   p3-conformance:

@@ -941,7 +941,7 @@ def verify_qualification_producers(root, tools, manifest):
         raise ValueError("fixed realtime source drift")
     if " 3.1.1" not in run_output([tool_bin / "registry", "--version"]):
         raise ValueError("registry version output drift")
-    if run_output(["zig", "version"]) != "0.16.0":
+    if run_output(["zig", "version"]) != "0.17.0":
         raise ValueError("Zig version drift")
     if not run_output([toolchain_bin / "rustc", "--version"]).startswith(
         "rustc 1.97.0 "

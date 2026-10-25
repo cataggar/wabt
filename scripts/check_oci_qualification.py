@@ -267,7 +267,7 @@ def main() -> int:
     require("oci-interop" not in ci, "external tools leaked into normal CI", errors)
     require(
         "os: [ubuntu-22.04, macos-latest, windows-latest]" in ci
-        and "optimize: [Debug, ReleaseSafe]" in ci,
+        and "optimize: [debug, safe]" in ci,
         "ordinary six-cell matrix changed",
         errors,
     )

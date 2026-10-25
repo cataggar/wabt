@@ -263,12 +263,12 @@ fn skipSelectValueType(bytes: []const u8, pos: *usize) Error!void {
 }
 
 const select_value_type_bytes = blk: {
-    var table = [_]bool{false} ** 256;
-    for (@typeInfo(types.ValType).@"enum".fields) |field| {
-        if (field.value < 0 or field.value > 0xff) continue;
-        const vt: types.ValType = @enumFromInt(field.value);
+    var table: [256]bool = @splat(false);
+    for (@typeInfo(types.ValType).@"enum".field_values) |field_value| {
+        if (field_value < 0 or field_value > 0xff) continue;
+        const vt: types.ValType = @fromBackingInt(@intCast(field_value));
         if (vt.isNumType() or vt.isRefType())
-            table[@as(usize, field.value)] = true;
+            table[@as(usize, field_value)] = true;
     }
     break :blk table;
 };

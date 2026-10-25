@@ -119,8 +119,8 @@ fn walkSections(allocator: std.mem.Allocator, bytes: []const u8) WalkError!Walk 
         const section_end = section_start + section_size;
 
         const id = std.enums.fromInt(SectionId, id_byte) orelse return error.InvalidSectionId;
-        if (!seen[@intFromEnum(id)]) {
-            seen[@intFromEnum(id)] = true;
+        if (!seen[@backingInt(id)]) {
+            seen[@backingInt(id)] = true;
             try section_order.append(allocator, id);
         }
 

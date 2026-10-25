@@ -49,15 +49,15 @@ pub fn reportFailure(failure: Failure) void {
 }
 
 fn setAll(set: *wabt.Feature.Set, enabled: bool) void {
-    inline for (std.meta.fields(wabt.Feature.Set)) |field| {
-        @field(set, field.name) = enabled;
+    inline for (@typeInfo(wabt.Feature.Set).@"struct".field_names) |field_name| {
+        @field(set, field_name) = enabled;
     }
 }
 
 fn setNamed(set: *wabt.Feature.Set, name: []const u8, enabled: bool) bool {
-    inline for (std.meta.fields(wabt.Feature.Set)) |field| {
-        if (cliNameEql(name, field.name)) {
-            @field(set, field.name) = enabled;
+    inline for (@typeInfo(wabt.Feature.Set).@"struct".field_names) |field_name| {
+        if (cliNameEql(name, field_name)) {
+            @field(set, field_name) = enabled;
             return true;
         }
     }
@@ -93,8 +93,8 @@ test "feature selectors allow duplicates and last selector wins" {
     try std.testing.expect(!features.gc);
 
     try std.testing.expectEqual(@as(?Failure, null), apply(&features, "all,-all"));
-    inline for (std.meta.fields(wabt.Feature.Set)) |field| {
-        try std.testing.expect(!@field(features, field.name));
+    inline for (@typeInfo(wabt.Feature.Set).@"struct".field_names) |field_name| {
+        try std.testing.expect(!@field(features, field_name));
     }
 }
 

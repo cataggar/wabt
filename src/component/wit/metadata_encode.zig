@@ -3226,4 +3226,3 @@ test "metadata_encode #195p3: include with { N as A } rename" {
     };
     try testing.expect(found_renamed);
 }
-

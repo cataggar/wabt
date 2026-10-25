@@ -36,12 +36,12 @@ python3 -m pip install wabt-bin
 
 ## From source
 
-Requires [Zig](https://ziglang.org/) 0.16. No other dependencies.
+Requires [Zig](https://ziglang.org/) 0.17. No other dependencies.
 
 ```sh
 git clone --recursive https://github.com/cataggar/wabt
 cd wabt
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 ```
 
 Binaries are written to `zig-out/bin/`.

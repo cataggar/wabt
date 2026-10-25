@@ -769,7 +769,7 @@ fn restrictivePermissions() Io.File.Permissions {
     return if (builtin.os.tag == .windows)
         .default_file
     else
-        @enumFromInt(0o600);
+        @fromBackingInt(@intCast(0o600));
 }
 
 // ── Hermetic extraction fixtures and tests ───────────────────────────────

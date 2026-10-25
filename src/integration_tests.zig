@@ -132,18 +132,11 @@ test "empty recursion groups survive binary-text-binary round-trip" {
     const allocator = std.testing.allocator;
     const wasm = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x18, 0x09,
-        0x4e, 0x00,
-        0x4e, 0x00,
-        0x60, 0x00, 0x00,
-        0x4e, 0x00,
-        0x4e, 0x01, 0x60, 0x00, 0x00,
-        0x4e, 0x00,
-        0x4e, 0x00,
-        0x60, 0x00, 0x00,
-        0x4e, 0x00,
-        0x03, 0x02, 0x01, 0x02,
-        0x0a, 0x04, 0x01, 0x02, 0x00, 0x0b,
+        0x01, 0x18, 0x09, 0x4e, 0x00, 0x4e, 0x00, 0x60,
+        0x00, 0x00, 0x4e, 0x00, 0x4e, 0x01, 0x60, 0x00,
+        0x00, 0x4e, 0x00, 0x4e, 0x00, 0x60, 0x00, 0x00,
+        0x4e, 0x00, 0x03, 0x02, 0x01, 0x02, 0x0a, 0x04,
+        0x01, 0x02, 0x00, 0x0b,
     };
     const expected_positions = [_]u32{ 0, 0, 1, 2, 2, 3 };
 
@@ -196,7 +189,7 @@ test "text parse → binary write → binary read" {
     defer module2.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), module2.memories.items.len);
-    try std.testing.expectEqual(@as(u64, 1), module2.memories.items[0].@"type".limits.initial);
+    try std.testing.expectEqual(@as(u64, 1), module2.memories.items[0].type.limits.initial);
     try std.testing.expectEqual(@as(usize, 1), module2.exports.items.len);
     try std.testing.expectEqualStrings("mem", module2.exports.items[0].name);
     try std.testing.expectEqual(types.ExternalKind.memory, module2.exports.items[0].kind);
@@ -283,7 +276,7 @@ test "decompiler produces output for module with memory" {
     defer module.deinit();
 
     try module.memories.append(allocator, .{
-        .@"type" = .{ .limits = .{ .initial = 1 } },
+        .type = .{ .limits = .{ .initial = 1 } },
     });
 
     const output = try Decompiler.decompile(allocator, &module);
@@ -332,7 +325,7 @@ test "multi-section binary: type+import+func+memory+export+code" {
 
     // Memory: 1 page
     try module.memories.append(allocator, .{
-        .@"type" = .{ .limits = .{ .initial = 1 } },
+        .type = .{ .limits = .{ .initial = 1 } },
     });
 
     // Exports: "run" -> func 1, "mem" -> memory 0

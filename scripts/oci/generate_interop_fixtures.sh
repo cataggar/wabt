@@ -297,7 +297,7 @@ PY
   exit 1
 fi
 
-zig build -Doptimize=ReleaseSafe -Dversion=oci-fixtures
+zig build -Doptimize=safe -Dversion=oci-fixtures
 WABT="$ROOT/zig-out/bin/wabt"
 [[ "$("$WABT" version)" == "wabt oci-fixtures" ]]
 

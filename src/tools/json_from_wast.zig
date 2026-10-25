@@ -54,10 +54,15 @@ pub fn wastToJsonInMemory(allocator: std.mem.Allocator, source: []const u8, base
     while (pos < source.len) {
         pos = wast.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
-        if (source[pos] != '(') { pos += 1; continue; }
+        if (source[pos] != '(') {
+            pos += 1;
+            continue;
+        }
 
         line_num = 1;
-        for (source[0..pos]) |c| { if (c == '\n') line_num += 1; }
+        for (source[0..pos]) |c| {
+            if (c == '\n') line_num += 1;
+        }
 
         const sexpr = wast.extractSExpr(source, pos) orelse break;
         pos = sexpr.end;
@@ -156,7 +161,9 @@ pub fn wastToJsonInMemory(allocator: std.mem.Allocator, source: []const u8, base
             .invoke => try writeAssertCmd(w, sexpr.text, "action", line_num),
             .get => try writeAssertCmd(w, sexpr.text, "action", line_num),
             .assert_exception => try writeAssertCmd(w, sexpr.text, "assert_trap", line_num),
-            .unknown => { first = true; }, // undo the comma
+            .unknown => {
+                first = true;
+            }, // undo the comma
         }
     }
 
@@ -184,11 +191,16 @@ pub fn wastToJson(allocator: std.mem.Allocator, io: std.Io, source: []const u8, 
         // Count lines up to current position
         pos = wast.skipWhitespaceAndComments(source, pos);
         if (pos >= source.len) break;
-        if (source[pos] != '(') { pos += 1; continue; }
+        if (source[pos] != '(') {
+            pos += 1;
+            continue;
+        }
 
         // Calculate line number
         line_num = 1;
-        for (source[0..pos]) |c| { if (c == '\n') line_num += 1; }
+        for (source[0..pos]) |c| {
+            if (c == '\n') line_num += 1;
+        }
 
         const sexpr = wast.extractSExpr(source, pos) orelse break;
         pos = sexpr.end;

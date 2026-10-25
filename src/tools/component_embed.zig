@@ -227,4 +227,3 @@ test "embed end-to-end with adder world" {
     try testing.expectEqualSlices(u8, "\x00asm\x01\x00\x00\x00", out[0..8]);
     try testing.expectEqual(@as(u8, 0), out[8]); // custom section id
 }
-
