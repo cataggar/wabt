@@ -2791,7 +2791,7 @@ test "inline records support strict auth and reject unsupported forms" {
 }
 
 test "auth file and decoded credentials enforce allocation bounds" {
-    const oversized = "{" ++ (" " ** 64) ++ "}";
+    const oversized = "{" ++ (&@as([64]u8, @splat(' '))) ++ "}";
     var files = TestFiles{
         .records = &.{.{ .path = "/large.json", .contents = oversized }},
         .expected_paths = &.{"/large.json"},

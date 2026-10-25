@@ -111,13 +111,13 @@ fn checkTypes(m: *const Mod.Module) Error!void {
             // Fields and array elements are *storage* types, so the packed
             // types are admissible here and nowhere else.
             .struct_type => |st| for (st.fields.items) |f| {
-                if (!isStorageType(f.@"type")) return error.InvalidTypeIndex;
-                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), f.@"type", f.type_idx))
+                if (!isStorageType(f.type)) return error.InvalidTypeIndex;
+                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), f.type, f.type_idx))
                     return error.InvalidTypeIndex;
             },
             .array_type => |at| {
-                if (!isStorageType(at.field.@"type")) return error.InvalidTypeIndex;
-                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), at.field.@"type", at.field.type_idx))
+                if (!isStorageType(at.field.type)) return error.InvalidTypeIndex;
+                if (!checkConcreteTypeIndexFrom(m, @intCast(idx), at.field.type, at.field.type_idx))
                     return error.InvalidTypeIndex;
             },
         }
@@ -240,7 +240,7 @@ fn checkGlobals(m: *const Mod.Module, options: Options) Error!void {
 fn checkTags(m: *const Mod.Module) Error!void {
     for (m.tags.items) |tag| {
         // Tag types must have empty result types per spec.
-        if (tag.@"type".sig.results.len > 0) return error.TypeMismatch;
+        if (tag.type.sig.results.len > 0) return error.TypeMismatch;
         // A tag's type index must name a function type in the module. The
         // binary reader checks this as it decodes, but a tag can also arrive
         // from the text parser, so re-check rather than trust the producer.
@@ -833,7 +833,7 @@ fn opcodeDiscriminant(prefix: ?u8, code: u32) u32 {
 
 /// Return the declared opcode for an instruction encoding, if any.
 fn declaredOpcode(prefix: ?u8, code: u32) ?Opcode.Code {
-    const tag: Opcode.Code = @enumFromInt(opcodeDiscriminant(prefix, code));
+    const tag: Opcode.Code = @fromBackingInt(@intCast(opcodeDiscriminant(prefix, code)));
     if (std.enums.tagName(Opcode.Code, tag) == null) return null;
 
     const tag_prefix: ?u8 = if (tag.isPrefixed()) tag.getPrefix() else null;
@@ -1176,7 +1176,7 @@ fn tagParams(m: *const Mod.Module, tag: Mod.Tag) TypeSeq {
             else => {},
         }
     }
-    return .{ .vts = tag.@"type".sig.params, .type_idxs = tag.@"type".sig.param_type_idxs };
+    return .{ .vts = tag.type.sig.params, .type_idxs = tag.type.sig.param_type_idxs };
 }
 
 fn typeSeqEql(a: TypeSeq, b: TypeSeq) bool {
@@ -1222,37 +1222,37 @@ fn unpackInitState(bits: [4]u64, local_inited: []bool) void {
 }
 
 const ValTypeOrUnknown = enum(i32) {
-    i32 = @intFromEnum(types.ValType.i32),
-    i64 = @intFromEnum(types.ValType.i64),
-    f32 = @intFromEnum(types.ValType.f32),
-    f64 = @intFromEnum(types.ValType.f64),
-    v128 = @intFromEnum(types.ValType.v128),
-    funcref = @intFromEnum(types.ValType.funcref),
-    externref = @intFromEnum(types.ValType.externref),
-    anyref = @intFromEnum(types.ValType.anyref),
-    eqref = @intFromEnum(types.ValType.eqref),
-    i31ref = @intFromEnum(types.ValType.i31ref),
-    structref = @intFromEnum(types.ValType.structref),
-    arrayref = @intFromEnum(types.ValType.arrayref),
-    exnref = @intFromEnum(types.ValType.exnref),
-    nullfuncref = @intFromEnum(types.ValType.nullfuncref),
-    nullexternref = @intFromEnum(types.ValType.nullexternref),
-    nullref = @intFromEnum(types.ValType.nullref),
-    nullexnref = @intFromEnum(types.ValType.nullexnref),
-    ref_func = @intFromEnum(types.ValType.ref_func),
-    ref_extern = @intFromEnum(types.ValType.ref_extern),
-    ref_any = @intFromEnum(types.ValType.ref_any),
-    ref_eq = @intFromEnum(types.ValType.ref_eq),
-    ref_i31 = @intFromEnum(types.ValType.ref_i31),
-    ref_struct = @intFromEnum(types.ValType.ref_struct),
-    ref_array = @intFromEnum(types.ValType.ref_array),
-    ref_none = @intFromEnum(types.ValType.ref_none),
-    ref_nofunc = @intFromEnum(types.ValType.ref_nofunc),
-    ref_noextern = @intFromEnum(types.ValType.ref_noextern),
-    ref_exn = @intFromEnum(types.ValType.ref_exn),
-    ref_noexn = @intFromEnum(types.ValType.ref_noexn),
-    concrete_ref = @intFromEnum(types.ValType.concrete_ref),
-    concrete_ref_null = @intFromEnum(types.ValType.concrete_ref_null),
+    i32 = @backingInt(types.ValType.i32),
+    i64 = @backingInt(types.ValType.i64),
+    f32 = @backingInt(types.ValType.f32),
+    f64 = @backingInt(types.ValType.f64),
+    v128 = @backingInt(types.ValType.v128),
+    funcref = @backingInt(types.ValType.funcref),
+    externref = @backingInt(types.ValType.externref),
+    anyref = @backingInt(types.ValType.anyref),
+    eqref = @backingInt(types.ValType.eqref),
+    i31ref = @backingInt(types.ValType.i31ref),
+    structref = @backingInt(types.ValType.structref),
+    arrayref = @backingInt(types.ValType.arrayref),
+    exnref = @backingInt(types.ValType.exnref),
+    nullfuncref = @backingInt(types.ValType.nullfuncref),
+    nullexternref = @backingInt(types.ValType.nullexternref),
+    nullref = @backingInt(types.ValType.nullref),
+    nullexnref = @backingInt(types.ValType.nullexnref),
+    ref_func = @backingInt(types.ValType.ref_func),
+    ref_extern = @backingInt(types.ValType.ref_extern),
+    ref_any = @backingInt(types.ValType.ref_any),
+    ref_eq = @backingInt(types.ValType.ref_eq),
+    ref_i31 = @backingInt(types.ValType.ref_i31),
+    ref_struct = @backingInt(types.ValType.ref_struct),
+    ref_array = @backingInt(types.ValType.ref_array),
+    ref_none = @backingInt(types.ValType.ref_none),
+    ref_nofunc = @backingInt(types.ValType.ref_nofunc),
+    ref_noextern = @backingInt(types.ValType.ref_noextern),
+    ref_exn = @backingInt(types.ValType.ref_exn),
+    ref_noexn = @backingInt(types.ValType.ref_noexn),
+    concrete_ref = @backingInt(types.ValType.concrete_ref),
+    concrete_ref_null = @backingInt(types.ValType.concrete_ref_null),
     unknown = 0,
 
     fn fromValType(vt: types.ValType) ValTypeOrUnknown {
@@ -1294,7 +1294,7 @@ const ValTypeOrUnknown = enum(i32) {
 
     fn toValType(self: ValTypeOrUnknown) ?types.ValType {
         if (self == .unknown) return null;
-        return @enumFromInt(@intFromEnum(self));
+        return @fromBackingInt(@intCast(@backingInt(self)));
     }
 
     fn asRefType(self: ValTypeOrUnknown) ?types.RefType {
@@ -1526,11 +1526,11 @@ fn refSubtypeOf(maybe_m: ?*const Mod.Module, actual: types.RefType, expected: ty
 }
 
 fn fieldStackType(field: Mod.TypeEntry.StructType.Field) StackType {
-    return StackType.fromValTypeAndIndex(field.@"type", field.type_idx);
+    return StackType.fromValTypeAndIndex(field.type, field.type_idx);
 }
 
 fn storageStackType(field: Mod.TypeEntry.StructType.Field) StackType {
-    return if (field.@"type".isPackedType())
+    return if (field.type.isPackedType())
         StackType.known(.i32)
     else
         fieldStackType(field);
@@ -1563,7 +1563,7 @@ fn arrayTypeAt(m: *const Mod.Module, type_idx: u32) Error!Mod.TypeEntry.ArrayTyp
 }
 
 fn isDefaultableField(field: Mod.TypeEntry.StructType.Field) bool {
-    if (field.@"type".isNumType() or field.@"type".isPackedType()) return true;
+    if (field.type.isNumType() or field.type.isPackedType()) return true;
     const ref_type = fieldStackType(field).asRefType() orelse return false;
     return ref_type.nullable;
 }
@@ -1577,7 +1577,7 @@ fn concreteArrayRef(type_idx: u32, nullable: bool) StackType {
 }
 
 fn isDataArrayField(field: Mod.TypeEntry.StructType.Field) bool {
-    return field.@"type".isNumType() or field.@"type".isPackedType();
+    return field.type.isNumType() or field.type.isPackedType();
 }
 
 fn arrayFieldsMatch(
@@ -1585,8 +1585,8 @@ fn arrayFieldsMatch(
     source: Mod.TypeEntry.StructType.Field,
     destination: Mod.TypeEntry.StructType.Field,
 ) bool {
-    if (source.@"type".isPackedType() or destination.@"type".isPackedType())
-        return source.@"type" == destination.@"type";
+    if (source.type.isPackedType() or destination.type.isPackedType())
+        return source.type == destination.type;
     return fieldStackType(source).isSubtypeOf(m, fieldStackType(destination));
 }
 
@@ -1877,7 +1877,7 @@ fn checkOneBody(
                 if (m.tables.items.len == 0) return error.InvalidTableIndex;
                 if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
                 // call_indirect requires a funcref table
-                if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
+                if (m.tables.items[table_idx].type.elem_type != .funcref) return error.TypeMismatch;
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, table_idx)));
                 const ft = switch (m.module_types.items[type_idx]) {
                     .func_type => |ft| ft,
@@ -1900,7 +1900,7 @@ fn checkOneBody(
                 if (type_idx >= m.module_types.items.len) return error.InvalidTypeIndex;
                 if (m.tables.items.len == 0) return error.InvalidTableIndex;
                 if (table_idx >= m.tables.items.len) return error.InvalidTableIndex;
-                if (m.tables.items[table_idx].@"type".elem_type != .funcref) return error.TypeMismatch;
+                if (m.tables.items[table_idx].type.elem_type != .funcref) return error.TypeMismatch;
                 const ft = switch (m.module_types.items[type_idx]) {
                     .func_type => |ft| ft,
                     else => Mod.FuncSignature{},
@@ -2053,30 +2053,76 @@ fn checkOneBody(
                 try popExpect(m, &val_stack, &ctrl_stack, StackType.known(tableIndexType(m, idx)));
             },
             // Memory load instructions
-            0x28 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x28); },
-            0x29 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x29); },
-            0x2a => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x2a); },
-            0x2b => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x2b); },
-            0x2c => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2c); },
-            0x2d => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2d); },
-            0x2e => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2e); },
-            0x2f => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2f); },
-            0x30 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x30); },
-            0x31 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x31); },
-            0x32 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x32); },
-            0x33 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x33); },
-            0x34 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x34); },
-            0x35 => { try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x35); },
+            0x28 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x28);
+            },
+            0x29 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x29);
+            },
+            0x2a => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x2a);
+            },
+            0x2b => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x2b);
+            },
+            0x2c => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2c);
+            },
+            0x2d => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2d);
+            },
+            0x2e => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2e);
+            },
+            0x2f => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x2f);
+            },
+            0x30 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x30);
+            },
+            0x31 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x31);
+            },
+            0x32 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x32);
+            },
+            0x33 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x33);
+            },
+            0x34 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x34);
+            },
+            0x35 => {
+                try checkMemLoad(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x35);
+            },
             // Memory store instructions
-            0x36 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x36); },
-            0x37 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x37); },
-            0x38 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x38); },
-            0x39 => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x39); },
-            0x3a => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3a); },
-            0x3b => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3b); },
-            0x3c => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3c); },
-            0x3d => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d); },
-            0x3e => { try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e); },
+            0x36 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x36);
+            },
+            0x37 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x37);
+            },
+            0x38 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f32, gpa(m), 0x38);
+            },
+            0x39 => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .f64, gpa(m), 0x39);
+            },
+            0x3a => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3a);
+            },
+            0x3b => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i32, gpa(m), 0x3b);
+            },
+            0x3c => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3c);
+            },
+            0x3d => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3d);
+            },
+            0x3e => {
+                try checkMemStore(m, bytes, &pos, &val_stack, &ctrl_stack, .i64, gpa(m), 0x3e);
+            },
             0x3f => { // memory.size
                 const mem_idx = readU32(bytes, &pos);
                 if (m.memories.items.len == 0 or mem_idx >= m.memories.items.len) return error.InvalidMemoryIndex;
@@ -2106,53 +2152,117 @@ fn checkOneBody(
                 val_stack.append(gpa(m), StackType.known(.f64)) catch return error.OutOfMemory;
             },
             // i32 comparison: unary
-            0x45 => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x45 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i32 comparison: binary
-            0x46...0x4f => { try checkBinary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x46...0x4f => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i64 comparison: unary
-            0x50 => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            0x50 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            },
             // i64 comparison: binary
-            0x51...0x5a => { try checkBinary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m)); },
+            0x51...0x5a => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            },
             // f32 comparison
-            0x5b...0x60 => { try checkBinary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
+            0x5b...0x60 => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
             // f64 comparison
-            0x61...0x66 => { try checkBinary(m, &val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
+            0x61...0x66 => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .f64, .i32, gpa(m));
+            },
             // i32 unary
-            0x67...0x69 => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x67...0x69 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i32 binary
-            0x6a...0x78 => { try checkBinary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
+            0x6a...0x78 => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
             // i64 unary
-            0x79...0x7b => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0x79...0x7b => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // i64 binary
-            0x7c...0x8a => { try checkBinary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0x7c...0x8a => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // f32 unary
-            0x8b...0x91 => { try checkUnary(m, &val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            0x8b...0x91 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f32, .f32, gpa(m));
+            },
             // f32 binary
-            0x92...0x98 => { try checkBinary(m, &val_stack, &ctrl_stack, .f32, .f32, gpa(m)); },
+            0x92...0x98 => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .f32, .f32, gpa(m));
+            },
             // f64 unary
-            0x99...0x9f => { try checkUnary(m, &val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            0x99...0x9f => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f64, .f64, gpa(m));
+            },
             // f64 binary
-            0xa0...0xa6 => { try checkBinary(m, &val_stack, &ctrl_stack, .f64, .f64, gpa(m)); },
+            0xa0...0xa6 => {
+                try checkBinary(m, &val_stack, &ctrl_stack, .f64, .f64, gpa(m));
+            },
             // Conversions
-            0xa7 => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m)); }, // i32.wrap_i64
-            0xa8, 0xa9 => { try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
-            0xaa, 0xab => { try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i32, gpa(m)); },
-            0xac, 0xad => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i64, gpa(m)); },
-            0xae, 0xaf => { try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i64, gpa(m)); },
-            0xb0, 0xb1 => { try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
-            0xb2, 0xb3 => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
-            0xb4, 0xb5 => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f32, gpa(m)); },
-            0xb6 => { try checkUnary(m, &val_stack, &ctrl_stack, .f64, .f32, gpa(m)); },
-            0xb7, 0xb8 => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f64, gpa(m)); },
-            0xb9, 0xba => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
-            0xbb => { try checkUnary(m, &val_stack, &ctrl_stack, .f32, .f64, gpa(m)); },
-            0xbc => { try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m)); },
-            0xbd => { try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i64, gpa(m)); },
-            0xbe => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f32, gpa(m)); },
-            0xbf => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f64, gpa(m)); },
+            0xa7 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i32, gpa(m));
+            }, // i32.wrap_i64
+            0xa8, 0xa9 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
+            0xaa, 0xab => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i32, gpa(m));
+            },
+            0xac, 0xad => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i64, gpa(m));
+            },
+            0xae, 0xaf => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i64, gpa(m));
+            },
+            0xb0, 0xb1 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i64, gpa(m));
+            },
+            0xb2, 0xb3 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f32, gpa(m));
+            },
+            0xb4, 0xb5 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f32, gpa(m));
+            },
+            0xb6 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f64, .f32, gpa(m));
+            },
+            0xb7, 0xb8 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f64, gpa(m));
+            },
+            0xb9, 0xba => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f64, gpa(m));
+            },
+            0xbb => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f32, .f64, gpa(m));
+            },
+            0xbc => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f32, .i32, gpa(m));
+            },
+            0xbd => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .f64, .i64, gpa(m));
+            },
+            0xbe => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .f32, gpa(m));
+            },
+            0xbf => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .f64, gpa(m));
+            },
             // Sign extension
-            0xc0, 0xc1 => { try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m)); },
-            0xc2...0xc4 => { try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m)); },
+            0xc0, 0xc1 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i32, .i32, gpa(m));
+            },
+            0xc2...0xc4 => {
+                try checkUnary(m, &val_stack, &ctrl_stack, .i64, .i64, gpa(m));
+            },
             // Reference types
             0xd0 => { // ref.null
                 const rt = readHeapStackType(m, bytes, &pos, true) orelse return error.InvalidTypeIndex;
@@ -2735,18 +2845,18 @@ fn blockRefResult(scratch: std.mem.Allocator, ref: StackType) Error!TypeSeq {
 /// returning nothing at all.
 const single_val_types = blk: {
     var table: [256]?[1]types.ValType = @splat(null);
-    for (@typeInfo(types.ValType).@"enum".fields) |f| {
+    for (@typeInfo(types.ValType).@"enum".field_values) |f_val| {
         // Negative discriminants are the internal non-nullable forms, which
         // have no single-byte encoding. The composite markers (`func`,
         // `struct`, `array`) and the GC packed types (`i8`, `i16`) do have
         // one, but only inside a type section -- never as a block type.
-        if (f.value < 0 or f.value > 0xff) continue;
-        const vt: types.ValType = @enumFromInt(f.value);
+        if (f_val < 0 or f_val > 0xff) continue;
+        const vt: types.ValType = @fromBackingInt(@intCast(f_val));
         switch (vt) {
             .func, .struct_, .array, .i8, .i16, .void_ => continue,
             else => {},
         }
-        table[@as(usize, f.value)] = .{vt};
+        table[@as(usize, f_val)] = .{vt};
     }
     break :blk table;
 };
@@ -3095,8 +3205,7 @@ fn checkRefTestOrCast(
     alloc: std.mem.Allocator,
 ) Error!void {
     const expected_heap: types.AbstractHeapType = switch ((target.asRefType() orelse
-        return error.InvalidTypeIndex).heap)
-    {
+        return error.InvalidTypeIndex).heap) {
         .abstract => |heap| switch (heap) {
             .func, .nofunc => .func,
             .extern_, .noextern => .extern_,
@@ -3104,8 +3213,7 @@ fn checkRefTestOrCast(
             .any, .eq, .i31, .struct_, .array, .none => .any,
         },
         .concrete => |idx| switch (concreteKind(m, idx) orelse
-            return error.InvalidTypeIndex)
-        {
+            return error.InvalidTypeIndex) {
             .func => .func,
             .struct_, .array => .any,
         },
@@ -3192,7 +3300,7 @@ fn checkStructGet(
     alloc: std.mem.Allocator,
 ) Error!void {
     const field = try structFieldAt(m, type_idx, field_idx);
-    const is_packed = field.@"type".isPackedType();
+    const is_packed = field.type.isPackedType();
     const result = switch (sub) {
         0x02 => blk: {
             if (is_packed) return error.TypeMismatch;
@@ -3307,7 +3415,7 @@ fn checkElemArray(
 ) Error!void {
     const field = (try arrayTypeAt(m, type_idx)).field;
     if (require_mutable and !field.mutable) return error.TypeMismatch;
-    if (!field.@"type".isRefType()) return error.TypeMismatch;
+    if (!field.type.isRefType()) return error.TypeMismatch;
     if (elem_idx >= m.elem_segments.items.len) return error.InvalidElemIndex;
     const seg = m.elem_segments.items[elem_idx];
     const seg_type = StackType.fromValTypeAndIndex(seg.elem_type, seg.elem_type_idx);
@@ -3351,7 +3459,7 @@ fn checkArrayGet(
     alloc: std.mem.Allocator,
 ) Error!void {
     const field = (try arrayTypeAt(m, type_idx)).field;
-    const is_packed = field.@"type".isPackedType();
+    const is_packed = field.type.isPackedType();
     const result = switch (sub) {
         0x0b => blk: {
             if (is_packed) return error.TypeMismatch;
@@ -3500,8 +3608,6 @@ fn checkMemStore(m: *const Mod.Module, bytes: []const u8, pos: *usize, val_stack
     try popExpect(m, val_stack, ctrl_stack, StackType.known(memIndexType(m, memarg.mem_idx)));
 }
 
-
-
 // ── Atomic (0xfe) instruction signatures ────────────────────────────────
 
 /// Shape of the immediate operands that follow an atomic opcode.
@@ -3530,9 +3636,9 @@ pub const AtomicSig = struct {
 /// asserts the two stay in sync.
 pub fn atomicSig(sub: u32) ?AtomicSig {
     return switch (sub) {
-        0x00 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_notify
-        0x01 => .{ .params = &.{.i32, .i32, .i64}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_wait32
-        0x02 => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 3 }, // memory_atomic_wait64
+        0x00 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_notify
+        0x01 => .{ .params = &.{ .i32, .i32, .i64 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // memory_atomic_wait32
+        0x02 => .{ .params = &.{ .i32, .i64, .i64 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 3 }, // memory_atomic_wait64
         0x03 => .{ .params = &.{}, .results = &.{}, .imm = .fence, .align_log2 = 0 }, // atomic_fence
         0x10 => .{ .params = &.{.i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_load
         0x11 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_load
@@ -3541,62 +3647,62 @@ pub fn atomicSig(sub: u32) ?AtomicSig {
         0x14 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_load8_u
         0x15 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_load16_u
         0x16 => .{ .params = &.{.i32}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_load32_u
-        0x17 => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_store
-        0x18 => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_store
-        0x19 => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_store8
-        0x1a => .{ .params = &.{.i32, .i32}, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_store16
-        0x1b => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_store8
-        0x1c => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_store16
-        0x1d => .{ .params = &.{.i32, .i64}, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_store32
-        0x1e => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_add
-        0x1f => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_add
-        0x20 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_add_u
-        0x21 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_add_u
-        0x22 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_add_u
-        0x23 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_add_u
-        0x24 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_add_u
-        0x25 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_sub
-        0x26 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_sub
-        0x27 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_sub_u
-        0x28 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_sub_u
-        0x29 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_sub_u
-        0x2a => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_sub_u
-        0x2b => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_sub_u
-        0x2c => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_and
-        0x2d => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_and
-        0x2e => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_and_u
-        0x2f => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_and_u
-        0x30 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_and_u
-        0x31 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_and_u
-        0x32 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_and_u
-        0x33 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_or
-        0x34 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_or
-        0x35 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_or_u
-        0x36 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_or_u
-        0x37 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_or_u
-        0x38 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_or_u
-        0x39 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_or_u
-        0x3a => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xor
-        0x3b => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xor
-        0x3c => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xor_u
-        0x3d => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xor_u
-        0x3e => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xor_u
-        0x3f => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xor_u
-        0x40 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xor_u
-        0x41 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xchg
-        0x42 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xchg
-        0x43 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xchg_u
-        0x44 => .{ .params = &.{.i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xchg_u
-        0x45 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xchg_u
-        0x46 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xchg_u
-        0x47 => .{ .params = &.{.i32, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xchg_u
-        0x48 => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_cmpxchg
-        0x49 => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_cmpxchg
-        0x4a => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_cmpxchg_u
-        0x4b => .{ .params = &.{.i32, .i32, .i32}, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_cmpxchg_u
-        0x4c => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_cmpxchg_u
-        0x4d => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_cmpxchg_u
-        0x4e => .{ .params = &.{.i32, .i64, .i64}, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_cmpxchg_u
+        0x17 => .{ .params = &.{ .i32, .i32 }, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_store
+        0x18 => .{ .params = &.{ .i32, .i64 }, .results = &.{}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_store
+        0x19 => .{ .params = &.{ .i32, .i32 }, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_store8
+        0x1a => .{ .params = &.{ .i32, .i32 }, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_store16
+        0x1b => .{ .params = &.{ .i32, .i64 }, .results = &.{}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_store8
+        0x1c => .{ .params = &.{ .i32, .i64 }, .results = &.{}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_store16
+        0x1d => .{ .params = &.{ .i32, .i64 }, .results = &.{}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_store32
+        0x1e => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_add
+        0x1f => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_add
+        0x20 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_add_u
+        0x21 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_add_u
+        0x22 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_add_u
+        0x23 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_add_u
+        0x24 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_add_u
+        0x25 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_sub
+        0x26 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_sub
+        0x27 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_sub_u
+        0x28 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_sub_u
+        0x29 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_sub_u
+        0x2a => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_sub_u
+        0x2b => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_sub_u
+        0x2c => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_and
+        0x2d => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_and
+        0x2e => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_and_u
+        0x2f => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_and_u
+        0x30 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_and_u
+        0x31 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_and_u
+        0x32 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_and_u
+        0x33 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_or
+        0x34 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_or
+        0x35 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_or_u
+        0x36 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_or_u
+        0x37 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_or_u
+        0x38 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_or_u
+        0x39 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_or_u
+        0x3a => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xor
+        0x3b => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xor
+        0x3c => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xor_u
+        0x3d => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xor_u
+        0x3e => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xor_u
+        0x3f => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xor_u
+        0x40 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xor_u
+        0x41 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_xchg
+        0x42 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_xchg
+        0x43 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_xchg_u
+        0x44 => .{ .params = &.{ .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_xchg_u
+        0x45 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_xchg_u
+        0x46 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_xchg_u
+        0x47 => .{ .params = &.{ .i32, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_xchg_u
+        0x48 => .{ .params = &.{ .i32, .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 2 }, // i32_atomic_rmw_cmpxchg
+        0x49 => .{ .params = &.{ .i32, .i64, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 3 }, // i64_atomic_rmw_cmpxchg
+        0x4a => .{ .params = &.{ .i32, .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 0 }, // i32_atomic_rmw8_cmpxchg_u
+        0x4b => .{ .params = &.{ .i32, .i32, .i32 }, .results = &.{.i32}, .imm = .memarg, .align_log2 = 1 }, // i32_atomic_rmw16_cmpxchg_u
+        0x4c => .{ .params = &.{ .i32, .i64, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 0 }, // i64_atomic_rmw8_cmpxchg_u
+        0x4d => .{ .params = &.{ .i32, .i64, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 1 }, // i64_atomic_rmw16_cmpxchg_u
+        0x4e => .{ .params = &.{ .i32, .i64, .i64 }, .results = &.{.i64}, .imm = .memarg, .align_log2 = 2 }, // i64_atomic_rmw32_cmpxchg_u
         else => null,
     };
 }
@@ -3754,10 +3860,10 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0x08 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 1 }, // v128_load16_splat
         0x09 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 2 }, // v128_load32_splat
         0x0a => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load64_splat
-        0x0b => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg, .lanes = 0, .max_align = 4 }, // v128_store
+        0x0b => .{ .params = &.{ .i32, .v128 }, .results = &.{}, .imm = .memarg, .lanes = 0, .max_align = 4 }, // v128_store
         0x0c => .{ .params = &.{}, .results = &.{.v128}, .imm = .const16, .lanes = 0, .max_align = 0 }, // v128_const
-        0x0d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .shuffle, .lanes = 32, .max_align = 0 }, // i8x16_shuffle
-        0x0e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_swizzle
+        0x0d => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .shuffle, .lanes = 32, .max_align = 0 }, // i8x16_shuffle
+        0x0e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_swizzle
         0x0f => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_splat
         0x10 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_splat
         0x11 => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_splat
@@ -3766,75 +3872,75 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0x14 => .{ .params = &.{.f64}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_splat
         0x15 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_extract_lane_s
         0x16 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_extract_lane_u
-        0x17 => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_replace_lane
+        0x17 => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .lane, .lanes = 16, .max_align = 0 }, // i8x16_replace_lane
         0x18 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_extract_lane_s
         0x19 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_extract_lane_u
-        0x1a => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_replace_lane
+        0x1a => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .lane, .lanes = 8, .max_align = 0 }, // i16x8_replace_lane
         0x1b => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .lane, .lanes = 4, .max_align = 0 }, // i32x4_extract_lane
-        0x1c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // i32x4_replace_lane
+        0x1c => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // i32x4_replace_lane
         0x1d => .{ .params = &.{.v128}, .results = &.{.i64}, .imm = .lane, .lanes = 2, .max_align = 0 }, // i64x2_extract_lane
-        0x1e => .{ .params = &.{.v128, .i64}, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // i64x2_replace_lane
+        0x1e => .{ .params = &.{ .v128, .i64 }, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // i64x2_replace_lane
         0x1f => .{ .params = &.{.v128}, .results = &.{.f32}, .imm = .lane, .lanes = 4, .max_align = 0 }, // f32x4_extract_lane
-        0x20 => .{ .params = &.{.v128, .f32}, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // f32x4_replace_lane
+        0x20 => .{ .params = &.{ .v128, .f32 }, .results = &.{.v128}, .imm = .lane, .lanes = 4, .max_align = 0 }, // f32x4_replace_lane
         0x21 => .{ .params = &.{.v128}, .results = &.{.f64}, .imm = .lane, .lanes = 2, .max_align = 0 }, // f64x2_extract_lane
-        0x22 => .{ .params = &.{.v128, .f64}, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // f64x2_replace_lane
-        0x23 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_eq
-        0x24 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ne
-        0x25 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_s
-        0x26 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_u
-        0x27 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_s
-        0x28 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_u
-        0x29 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_s
-        0x2a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_u
-        0x2b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_s
-        0x2c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_u
-        0x2d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_eq
-        0x2e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ne
-        0x2f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_s
-        0x30 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_u
-        0x31 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_s
-        0x32 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_u
-        0x33 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_s
-        0x34 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_u
-        0x35 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_s
-        0x36 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_u
-        0x37 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_eq
-        0x38 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ne
-        0x39 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_s
-        0x3a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_u
-        0x3b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_s
-        0x3c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_u
-        0x3d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_s
-        0x3e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_u
-        0x3f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_s
-        0x40 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_u
-        0x41 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_eq
-        0x42 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ne
-        0x43 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_lt
-        0x44 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_gt
-        0x45 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_le
-        0x46 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ge
-        0x47 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_eq
-        0x48 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ne
-        0x49 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_lt
-        0x4a => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_gt
-        0x4b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_le
-        0x4c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ge
+        0x22 => .{ .params = &.{ .v128, .f64 }, .results = &.{.v128}, .imm = .lane, .lanes = 2, .max_align = 0 }, // f64x2_replace_lane
+        0x23 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_eq
+        0x24 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ne
+        0x25 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_s
+        0x26 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_lt_u
+        0x27 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_s
+        0x28 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_gt_u
+        0x29 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_s
+        0x2a => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_le_u
+        0x2b => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_s
+        0x2c => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_ge_u
+        0x2d => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_eq
+        0x2e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ne
+        0x2f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_s
+        0x30 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_lt_u
+        0x31 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_s
+        0x32 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_gt_u
+        0x33 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_s
+        0x34 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_le_u
+        0x35 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_s
+        0x36 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_ge_u
+        0x37 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_eq
+        0x38 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ne
+        0x39 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_s
+        0x3a => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_lt_u
+        0x3b => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_s
+        0x3c => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_gt_u
+        0x3d => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_s
+        0x3e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_le_u
+        0x3f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_s
+        0x40 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_ge_u
+        0x41 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_eq
+        0x42 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ne
+        0x43 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_lt
+        0x44 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_gt
+        0x45 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_le
+        0x46 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ge
+        0x47 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_eq
+        0x48 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ne
+        0x49 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_lt
+        0x4a => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_gt
+        0x4b => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_le
+        0x4c => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ge
         0x4d => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_not
-        0x4e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_and
-        0x4f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_andnot
-        0x50 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_or
-        0x51 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_xor
-        0x52 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_bitselect
+        0x4e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_and
+        0x4f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_andnot
+        0x50 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_or
+        0x51 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_xor
+        0x52 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_bitselect
         0x53 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // v128_any_true
-        0x54 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_load8_lane
-        0x55 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_load16_lane
-        0x56 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_load32_lane
-        0x57 => .{ .params = &.{.i32, .v128}, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_load64_lane
-        0x58 => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_store8_lane
-        0x59 => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_store16_lane
-        0x5a => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_store32_lane
-        0x5b => .{ .params = &.{.i32, .v128}, .results = &.{}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_store64_lane
+        0x54 => .{ .params = &.{ .i32, .v128 }, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_load8_lane
+        0x55 => .{ .params = &.{ .i32, .v128 }, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_load16_lane
+        0x56 => .{ .params = &.{ .i32, .v128 }, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_load32_lane
+        0x57 => .{ .params = &.{ .i32, .v128 }, .results = &.{.v128}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_load64_lane
+        0x58 => .{ .params = &.{ .i32, .v128 }, .results = &.{}, .imm = .memarg_lane, .lanes = 16, .max_align = 0 }, // v128_store8_lane
+        0x59 => .{ .params = &.{ .i32, .v128 }, .results = &.{}, .imm = .memarg_lane, .lanes = 8, .max_align = 1 }, // v128_store16_lane
+        0x5a => .{ .params = &.{ .i32, .v128 }, .results = &.{}, .imm = .memarg_lane, .lanes = 4, .max_align = 2 }, // v128_store32_lane
+        0x5b => .{ .params = &.{ .i32, .v128 }, .results = &.{}, .imm = .memarg_lane, .lanes = 2, .max_align = 3 }, // v128_store64_lane
         0x5c => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 2 }, // v128_load32_zero
         0x5d => .{ .params = &.{.i32}, .results = &.{.v128}, .imm = .memarg, .lanes = 0, .max_align = 3 }, // v128_load64_zero
         0x5e => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_demote_f64x2_zero
@@ -3844,64 +3950,64 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0x62 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_popcnt
         0x63 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_all_true
         0x64 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_bitmask
-        0x65 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_s
-        0x66 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_u
+        0x65 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_s
+        0x66 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_narrow_i16x8_u
         0x67 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_ceil
         0x68 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_floor
         0x69 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_trunc
         0x6a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_nearest
-        0x6b => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shl
-        0x6c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_s
-        0x6d => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_u
-        0x6e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add
-        0x6f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_s
-        0x70 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_u
-        0x71 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub
-        0x72 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_s
-        0x73 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_u
+        0x6b => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shl
+        0x6c => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_s
+        0x6d => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_shr_u
+        0x6e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add
+        0x6f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_s
+        0x70 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_add_sat_u
+        0x71 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub
+        0x72 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_s
+        0x73 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_sub_sat_u
         0x74 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_ceil
         0x75 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_floor
-        0x76 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_s
-        0x77 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_u
-        0x78 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_s
-        0x79 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_u
+        0x76 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_s
+        0x77 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_min_u
+        0x78 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_s
+        0x79 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_max_u
         0x7a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_trunc
-        0x7b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_avgr_u
+        0x7b => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_avgr_u
         0x7c => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extadd_pairwise_i8x16_s
         0x7d => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extadd_pairwise_i8x16_u
         0x7e => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extadd_pairwise_i16x8_s
         0x7f => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extadd_pairwise_i16x8_u
         0x80 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_abs
         0x81 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_neg
-        0x82 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_q15mulr_sat_s
+        0x82 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_q15mulr_sat_s
         0x83 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_all_true
         0x84 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_bitmask
-        0x85 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_s
-        0x86 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_u
+        0x85 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_s
+        0x86 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_narrow_i32x4_u
         0x87 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_low_i8x16_s
         0x88 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_high_i8x16_s
         0x89 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_low_i8x16_u
         0x8a => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extend_high_i8x16_u
-        0x8b => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shl
-        0x8c => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_s
-        0x8d => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_u
-        0x8e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add
-        0x8f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_s
-        0x90 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_u
-        0x91 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub
-        0x92 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_s
-        0x93 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_u
+        0x8b => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shl
+        0x8c => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_s
+        0x8d => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_shr_u
+        0x8e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add
+        0x8f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_s
+        0x90 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_add_sat_u
+        0x91 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub
+        0x92 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_s
+        0x93 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_sub_sat_u
         0x94 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_nearest
-        0x95 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_mul
-        0x96 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_s
-        0x97 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_u
-        0x98 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_s
-        0x99 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_u
-        0x9b => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_avgr_u
-        0x9c => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_s
-        0x9d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_s
-        0x9e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_u
-        0x9f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_u
+        0x95 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_mul
+        0x96 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_s
+        0x97 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_min_u
+        0x98 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_s
+        0x99 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_max_u
+        0x9b => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_avgr_u
+        0x9c => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_s
+        0x9d => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_s
+        0x9e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_low_i8x16_u
+        0x9f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_extmul_high_i8x16_u
         0xa0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_abs
         0xa1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_neg
         0xa3 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_all_true
@@ -3910,21 +4016,21 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0xa8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_high_i16x8_s
         0xa9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_low_i16x8_u
         0xaa => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extend_high_i16x8_u
-        0xab => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shl
-        0xac => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_s
-        0xad => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_u
-        0xae => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_add
-        0xb1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_sub
-        0xb5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_mul
-        0xb6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_s
-        0xb7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_u
-        0xb8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_s
-        0xb9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_u
-        0xba => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i16x8_s
-        0xbc => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_s
-        0xbd => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_s
-        0xbe => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_u
-        0xbf => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_u
+        0xab => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shl
+        0xac => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_s
+        0xad => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_shr_u
+        0xae => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_add
+        0xb1 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_sub
+        0xb5 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_mul
+        0xb6 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_s
+        0xb7 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_min_u
+        0xb8 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_s
+        0xb9 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_max_u
+        0xba => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i16x8_s
+        0xbc => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_s
+        0xbd => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_s
+        0xbe => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_low_i16x8_u
+        0xbf => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_extmul_high_i16x8_u
         0xc0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_abs
         0xc1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_neg
         0xc3 => .{ .params = &.{.v128}, .results = &.{.i32}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_all_true
@@ -3933,44 +4039,44 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0xc8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_high_i32x4_s
         0xc9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_low_i32x4_u
         0xca => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extend_high_i32x4_u
-        0xcb => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shl
-        0xcc => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_s
-        0xcd => .{ .params = &.{.v128, .i32}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_u
-        0xce => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_add
-        0xd1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_sub
-        0xd5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_mul
-        0xd6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_eq
-        0xd7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ne
-        0xd8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_lt_s
-        0xd9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_gt_s
-        0xda => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_le_s
-        0xdb => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ge_s
-        0xdc => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_s
-        0xdd => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_s
-        0xde => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_u
-        0xdf => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_u
+        0xcb => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shl
+        0xcc => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_s
+        0xcd => .{ .params = &.{ .v128, .i32 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_shr_u
+        0xce => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_add
+        0xd1 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_sub
+        0xd5 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_mul
+        0xd6 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_eq
+        0xd7 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ne
+        0xd8 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_lt_s
+        0xd9 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_gt_s
+        0xda => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_le_s
+        0xdb => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_ge_s
+        0xdc => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_s
+        0xdd => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_s
+        0xde => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_low_i32x4_u
+        0xdf => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_extmul_high_i32x4_u
         0xe0 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_abs
         0xe1 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_neg
         0xe3 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_sqrt
-        0xe4 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_add
-        0xe5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_sub
-        0xe6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_mul
-        0xe7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_div
-        0xe8 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_min
-        0xe9 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_max
-        0xea => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmin
-        0xeb => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmax
+        0xe4 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_add
+        0xe5 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_sub
+        0xe6 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_mul
+        0xe7 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_div
+        0xe8 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_min
+        0xe9 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_max
+        0xea => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmin
+        0xeb => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_pmax
         0xec => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_abs
         0xed => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_neg
         0xef => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_sqrt
-        0xf0 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_add
-        0xf1 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_sub
-        0xf2 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_mul
-        0xf3 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_div
-        0xf4 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_min
-        0xf5 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_max
-        0xf6 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmin
-        0xf7 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmax
+        0xf0 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_add
+        0xf1 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_sub
+        0xf2 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_mul
+        0xf3 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_div
+        0xf4 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_min
+        0xf5 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_max
+        0xf6 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmin
+        0xf7 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_pmax
         0xf8 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f32x4_s
         0xf9 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f32x4_u
         0xfa => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_convert_i32x4_s
@@ -3979,26 +4085,26 @@ pub fn simdSig(sub: u32) ?SimdSig {
         0xfd => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_trunc_sat_f64x2_u_zero
         0xfe => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_convert_low_i32x4_s
         0xff => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_convert_low_i32x4_u
-        0x100 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_swizzle
+        0x100 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_swizzle
         0x101 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f32x4_s
         0x102 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f32x4_u
         0x103 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f64x2_s_zero
         0x104 => .{ .params = &.{.v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_trunc_f64x2_u_zero
-        0x105 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_madd
-        0x106 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_nmadd
-        0x107 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_madd
-        0x108 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_nmadd
-        0x109 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_laneselect
-        0x10a => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_laneselect
-        0x10b => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_laneselect
-        0x10c => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_relaxed_laneselect
-        0x10d => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_min
-        0x10e => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_max
-        0x10f => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_min
-        0x110 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_max
-        0x111 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_q15mulr_s
-        0x112 => .{ .params = &.{.v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_dot_i8x16_i7x16_s
-        0x113 => .{ .params = &.{.v128, .v128, .v128}, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i8x16_i7x16_add_s
+        0x105 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_madd
+        0x106 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_nmadd
+        0x107 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_madd
+        0x108 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_nmadd
+        0x109 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i8x16_relaxed_laneselect
+        0x10a => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_laneselect
+        0x10b => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_relaxed_laneselect
+        0x10c => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i64x2_relaxed_laneselect
+        0x10d => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_min
+        0x10e => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f32x4_relaxed_max
+        0x10f => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_min
+        0x110 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // f64x2_relaxed_max
+        0x111 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_relaxed_q15mulr_s
+        0x112 => .{ .params = &.{ .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i16x8_dot_i8x16_i7x16_s
+        0x113 => .{ .params = &.{ .v128, .v128, .v128 }, .results = &.{.v128}, .imm = .none, .lanes = 0, .max_align = 0 }, // i32x4_dot_i8x16_i7x16_add_s
         else => null,
     };
 }
@@ -4204,14 +4310,16 @@ test "concrete table and global imports validate in both text spellings" {
 test "concrete table and global imports reject invalid type indices" {
     const Parser = @import("text/Parser.zig");
 
-    var table_module = try Parser.parseModule(std.testing.allocator,
+    var table_module = try Parser.parseModule(
+        std.testing.allocator,
         "(module (type (func)) (import \"m\" \"t\" (table 1 (ref null 0))))",
     );
     defer table_module.deinit();
     table_module.tables.items[0].type_idx = 1;
     try std.testing.expectError(error.InvalidTypeIndex, validate(&table_module, .{}));
 
-    var global_module = try Parser.parseModule(std.testing.allocator,
+    var global_module = try Parser.parseModule(
+        std.testing.allocator,
         "(module (type (func)) (import \"m\" \"g\" (global (ref null 0))))",
     );
     defer global_module.deinit();
@@ -4302,8 +4410,8 @@ test "load with multi-memory bit + explicit mem-idx" {
         .params = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
         .results = try alloc.dupe(types.ValType, &[_]types.ValType{.i32}),
     } });
-    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
-    try module.memories.append(alloc, .{ .@"type" = .{ .limits = .{ .initial = 0 } } });
+    try module.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 0 } } });
+    try module.memories.append(alloc, .{ .type = .{ .limits = .{ .initial = 0 } } });
     try module.funcs.append(alloc, .{
         .decl = .{ .type_var = .{ .index = 0 } },
         .code_bytes = &bytes,
@@ -4636,12 +4744,12 @@ test "mutable struct fields are invariant under declared subtyping" {
     defer module.deinit();
 
     var parent_fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
-    try parent_fields.append(alloc, .{ .@"type" = .anyref, .mutable = true });
+    try parent_fields.append(alloc, .{ .type = .anyref, .mutable = true });
     try module.module_types.append(alloc, .{ .struct_type = .{ .fields = parent_fields } });
     try module.type_meta.append(alloc, .{ .kind = .struct_, .is_final = false });
 
     var child_fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
-    try child_fields.append(alloc, .{ .@"type" = .structref, .mutable = true });
+    try child_fields.append(alloc, .{ .type = .structref, .mutable = true });
     try module.module_types.append(alloc, .{ .struct_type = .{ .fields = child_fields } });
     try module.type_meta.append(alloc, .{ .kind = .struct_, .is_sub = true, .parent = 0 });
 
@@ -4696,7 +4804,8 @@ test "wide arithmetic 0xfc sub-opcodes reach real validator arms" {
     for ([_]u8{ 0x13, 0x14, 0x15, 0x16 }) |sub| {
         const body = [_]u8{
             0x00, // unreachable
-            0xfc, sub,
+            0xfc,
+            sub,
             0x1a, 0x1a, // drop both concrete i64 results
             0x0b,
         };
@@ -4758,13 +4867,15 @@ test "GC conversions preserve nullability and i31 instructions check operands" {
         try std.testing.expectError(error.TypeMismatch, validate(&module, .{}));
     }
 
-    var unreachable_ok = try Parser.parseModule(alloc,
+    var unreachable_ok = try Parser.parseModule(
+        alloc,
         "(module (func (result (ref any)) unreachable any.convert_extern))",
     );
     defer unreachable_ok.deinit();
     try validate(&unreachable_ok, .{});
 
-    var unreachable_bad = try Parser.parseModule(alloc,
+    var unreachable_bad = try Parser.parseModule(
+        alloc,
         "(module (func (result i32) unreachable any.convert_extern))",
     );
     defer unreachable_bad.deinit();
@@ -5298,7 +5409,7 @@ test "GC struct.set checks mutability, operand order, and value subtyping" {
             " (func (param (ref null $s)) local.get 0 i64.const 1 struct.set $s 0))",
         \\(module
         \\  (type $p (sub (struct)))
-            \\  (type $c (sub $p (struct (field i32))))
+        \\  (type $c (sub $p (struct (field i32))))
         \\  (type $box (struct (field (mut (ref null $c)))))
         \\  (func (param (ref null $box)) (param (ref $p))
         \\    local.get 0 local.get 1 struct.set $box 0))
@@ -5315,19 +5426,22 @@ test "GC struct immediates check type and field bounds and feature gating" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
 
-    var bad_type = try Parser.parseModule(alloc,
+    var bad_type = try Parser.parseModule(
+        alloc,
         "(module (func struct.new_default 10 drop))",
     );
     defer bad_type.deinit();
     try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_type, .{}));
 
-    var wrong_kind = try Parser.parseModule(alloc,
+    var wrong_kind = try Parser.parseModule(
+        alloc,
         "(module (type $f (func)) (func struct.new_default $f drop))",
     );
     defer wrong_kind.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&wrong_kind, .{}));
 
-    var bad_field = try Parser.parseModule(alloc,
+    var bad_field = try Parser.parseModule(
+        alloc,
         "(module (type $s (struct (field i32)))" ++
             " (func (param (ref null $s)) local.get 0 struct.get $s 1 drop))",
     );
@@ -5680,26 +5794,30 @@ test "GC array immediates check bounds, kinds, feature gating, and truncation" {
     const alloc = std.testing.allocator;
     const Parser = @import("text/Parser.zig");
 
-    var bad_type = try Parser.parseModule(alloc,
+    var bad_type = try Parser.parseModule(
+        alloc,
         "(module (func unreachable array.new_default 10 drop))",
     );
     defer bad_type.deinit();
     try std.testing.expectError(error.InvalidTypeIndex, validate(&bad_type, .{}));
 
-    var wrong_kind = try Parser.parseModule(alloc,
+    var wrong_kind = try Parser.parseModule(
+        alloc,
         "(module (type $f (func)) (func unreachable array.new_default $f drop))",
     );
     defer wrong_kind.deinit();
     try std.testing.expectError(error.TypeMismatch, validate(&wrong_kind, .{}));
 
-    var bad_data = try Parser.parseModule(alloc,
+    var bad_data = try Parser.parseModule(
+        alloc,
         "(module (type $a (array i32))" ++
             " (func unreachable array.new_data $a 0 drop))",
     );
     defer bad_data.deinit();
     try std.testing.expectError(error.InvalidDataIndex, validate(&bad_data, .{}));
 
-    var no_data_count = try Parser.parseModule(alloc,
+    var no_data_count = try Parser.parseModule(
+        alloc,
         "(module (type $a (array i32)) (data \"x\")" ++
             " (func unreachable array.new_data $a 0 drop))",
     );
@@ -5707,7 +5825,8 @@ test "GC array immediates check bounds, kinds, feature gating, and truncation" {
     no_data_count.has_data_count = false;
     try std.testing.expectError(error.InvalidDataIndex, validate(&no_data_count, .{}));
 
-    var bad_elem = try Parser.parseModule(alloc,
+    var bad_elem = try Parser.parseModule(
+        alloc,
         "(module (type $a (array funcref))" ++
             " (func unreachable array.new_elem $a 0 drop))",
     );
@@ -5968,16 +6087,16 @@ test "every declared non-MVP body opcode is gated in reachable and unreachable c
     const alloc = std.testing.allocator;
     const no_features = std.mem.zeroes(Feature.Set);
     const opcode_values = comptime blk: {
-        const fields = @typeInfo(Opcode.Code).@"enum".fields;
-        var values: [fields.len]u32 = undefined;
-        for (fields, 0..) |field, i| values[i] = field.value;
+        const field_values = @typeInfo(Opcode.Code).@"enum".field_values;
+        var values: [field_values.len]u32 = undefined;
+        for (field_values, 0..) |field_value, i| values[i] = field_value;
         break :blk values;
     };
     var checked: usize = 0;
     var relaxed_checked: usize = 0;
 
     for (opcode_values) |value| {
-        const code: Opcode.Code = @enumFromInt(value);
+        const code: Opcode.Code = @fromBackingInt(@intCast(value));
         if (code.isEnabled(no_features)) continue;
         checked += 1;
         if (code.getPrefix() == Opcode.prefix_simd and code.getCode() > 0xff)
@@ -6134,9 +6253,9 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
     const modern_eh_todo = [_]u8{};
     const alloc = std.testing.allocator;
     var checked: usize = 0;
-    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
-        if (f.value <= 0xff) {
-            const op: u8 = @intCast(f.value);
+    inline for (@typeInfo(Opcode.Code).@"enum".field_names, @typeInfo(Opcode.Code).@"enum".field_values) |f_name, f_val| {
+        if (f_val <= 0xff) {
+            const op: u8 = @intCast(f_val);
             const body = [_]u8{ op, 0x0b };
             var module = try testModuleWithBody(alloc, &body);
             defer module.deinit();
@@ -6149,7 +6268,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
                 error.UnsupportedOpcode, error.UnknownOpcode => {
                     std.debug.print(
                         "opcode 0x{x:0>2} ({s}) has no validator arm; add one or list it above\n",
-                        .{ op, f.name },
+                        .{ op, f_name },
                     );
                     return error.TestUnexpectedResult;
                 },
@@ -6157,7 +6276,7 @@ test "every declared single-byte opcode is handled or explicitly unsupported" {
                     std.debug.print(
                         "opcode 0x{x:0>2} ({s}) reports LegacyExceptionsUnsupported but is not" ++
                             " a legacy EH instruction\n",
-                        .{ op, f.name },
+                        .{ op, f_name },
                     );
                     return error.TestUnexpectedResult;
                 },
@@ -6292,8 +6411,7 @@ test "br_on_null rejects an unconsumed sharpened fallthrough value" {
         0x02, 0x40, // block
         0x20, 0x00, // local.get 0 : eqref
         0xd5, 0x00, // br_on_null 0; wasm-tools v1.250.0 leaves (ref eq)
-        0x0b,
-        0x0b,
+        0x0b, 0x0b,
     };
     var m = try testModuleWithSignatureAndBody(
         alloc,
@@ -6457,15 +6575,15 @@ test "every declared SIMD opcode has a signature" {
     // to Opcode.zig without a signature here would silently send it back to
     // classifyOpcode and re-reject valid modules, which is the bug D2 was.
     var checked: usize = 0;
-    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
-        if (f.value > 0xff) {
-            const code: Opcode.Code = @enumFromInt(f.value);
+    inline for (@typeInfo(Opcode.Code).@"enum".field_names, @typeInfo(Opcode.Code).@"enum".field_values) |f_name, f_val| {
+        if (f_val > 0xff) {
+            const code: Opcode.Code = @fromBackingInt(@intCast(f_val));
             if (code.getPrefix() == Opcode.prefix_simd) {
                 checked += 1;
                 if (simdSig(code.getCode()) == null) {
                     std.debug.print(
                         "SIMD opcode 0x{x} ({s}) has no signature in simdSig\n",
-                        .{ f.value, f.name },
+                        .{ f_val, f_name },
                     );
                     return error.TestUnexpectedResult;
                 }
@@ -6530,10 +6648,11 @@ test "SIMD extract_lane yields the lane's scalar type" {
 
     // ...and it really is i64, not i32: i32.eqz on it must fail.
     const body2 = [_]u8{
-        0xfd, 0x0c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0xfd, 0x0c, 0,    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         0xfd, 0x1d, 0x00,
         0x45, // i32.eqz
-        0x1a, 0x0b,
+        0x1a,
+        0x0b,
     };
     var m2 = try testModuleWithBody(alloc, &body2);
     defer m2.deinit();
@@ -6554,14 +6673,14 @@ test "SIMD lane indices are bounds-checked" {
 
     // i8x16.shuffle indices select from two concatenated vectors, so 31 is
     // in range and 32 is not.
-    const ok = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0c } ++
-        [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0d } ++ [_]u8{31} ** 16 ++ [_]u8{ 0x1a, 0x0b };
+    const ok = [_]u8{ 0xfd, 0x0c } ++ @as([16]u8, @splat(0)) ++ [_]u8{ 0xfd, 0x0c } ++
+        @as([16]u8, @splat(0)) ++ [_]u8{ 0xfd, 0x0d } ++ @as([16]u8, @splat(31)) ++ [_]u8{ 0x1a, 0x0b };
     var m_ok = try testModuleWithBody(alloc, &ok);
     defer m_ok.deinit();
     try validate(&m_ok, .{});
 
-    const bad = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0c } ++
-        [_]u8{0} ** 16 ++ [_]u8{ 0xfd, 0x0d } ++ [_]u8{32} ** 16 ++ [_]u8{ 0x1a, 0x0b };
+    const bad = [_]u8{ 0xfd, 0x0c } ++ @as([16]u8, @splat(0)) ++ [_]u8{ 0xfd, 0x0c } ++
+        @as([16]u8, @splat(0)) ++ [_]u8{ 0xfd, 0x0d } ++ @as([16]u8, @splat(32)) ++ [_]u8{ 0x1a, 0x0b };
     var m_bad = try testModuleWithBody(alloc, &bad);
     defer m_bad.deinit();
     try std.testing.expectError(error.InvalidLaneIndex, validate(&m_bad, .{}));
@@ -6590,14 +6709,14 @@ test "SIMD memarg alignment is bounds-checked" {
 test "SIMD store consumes its operands and leaves nothing" {
     const alloc = std.testing.allocator;
     // i32.const 0; v128.const 0; v128.store
-    const body = [_]u8{ 0x41, 0x00, 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++
+    const body = [_]u8{ 0x41, 0x00, 0xfd, 0x0c } ++ @as([16]u8, @splat(0)) ++
         [_]u8{ 0xfd, 0x0b, 0x04, 0x00, 0x0b };
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
     try validate(&module, .{});
 
     // Operands reversed: v128 address, i32 value.
-    const rev = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16 ++
+    const rev = [_]u8{ 0xfd, 0x0c } ++ @as([16]u8, @splat(0)) ++
         [_]u8{ 0x41, 0x00, 0xfd, 0x0b, 0x04, 0x00, 0x0b };
     var m_rev = try testModuleWithBody(alloc, &rev);
     defer m_rev.deinit();
@@ -6616,7 +6735,7 @@ test "SIMD immediates that run off the end are rejected" {
 test "relaxed SIMD opcodes above 0xff are type-checked" {
     const alloc = std.testing.allocator;
     // f32x4.relaxed_madd (0xfd 0x105) is ternary over v128.
-    const three = [_]u8{ 0xfd, 0x0c } ++ [_]u8{0} ** 16;
+    const three = [_]u8{ 0xfd, 0x0c } ++ @as([16]u8, @splat(0));
     const body = three ++ three ++ three ++ [_]u8{ 0xfd, 0x85, 0x02, 0x1a, 0x0b };
     var module = try testModuleWithBody(alloc, &body);
     defer module.deinit();
@@ -6786,15 +6905,15 @@ test "return_call_indirect type-checks like return_call" {
 test "every declared atomic opcode has a signature" {
     // Drift guard: Opcode.zig and atomicSig must agree.
     var checked: usize = 0;
-    inline for (@typeInfo(Opcode.Code).@"enum".fields) |f| {
-        if (f.value > 0xff) {
-            const code: Opcode.Code = @enumFromInt(f.value);
+    inline for (@typeInfo(Opcode.Code).@"enum".field_names, @typeInfo(Opcode.Code).@"enum".field_values) |f_name, f_val| {
+        if (f_val > 0xff) {
+            const code: Opcode.Code = @fromBackingInt(@intCast(f_val));
             if (code.getPrefix() == Opcode.prefix_threads) {
                 checked += 1;
                 if (atomicSig(code.getCode()) == null) {
                     std.debug.print(
                         "atomic opcode 0x{x} ({s}) has no signature in atomicSig\n",
-                        .{ f.value, f.name },
+                        .{ f_val, f_name },
                     );
                     return error.TestUnexpectedResult;
                 }
@@ -6996,7 +7115,7 @@ test "the legacy EH list names the legacy EH instructions and nothing else" {
     // comptime-known length turns a drifted list into a compile error, which
     // reports the mismatch without naming the offending instruction.
     for (legacy_eh_opcodes, 0..) |op, i| {
-        const tag: Opcode.Code = @enumFromInt(op);
+        const tag: Opcode.Code = @fromBackingInt(@intCast(op));
         try std.testing.expect(std.enums.tagName(Opcode.Code, tag) != null);
         try std.testing.expectEqualStrings(expected[i % expected.len], tag.name());
     }
@@ -7555,8 +7674,8 @@ test "a heap type is an s33 too, and no wider" {
     {
         const body = [_]u8{
             0x02, 0x63, 0x80, 0x80, 0x80, 0x80, 0x00,
-            0xd0, 0x80, 0x80, 0x80, 0x80, 0x00,
-            0x0b, 0x1a, 0x0b,
+            0xd0, 0x80, 0x80, 0x80, 0x80, 0x00, 0x0b,
+            0x1a, 0x0b,
         };
         var module = try testModuleWithBody(alloc, &body);
         defer module.deinit();
@@ -7593,7 +7712,7 @@ test "packed types are valid as storage types and nowhere else" {
     var packed_array = Mod.Module.init(alloc);
     defer packed_array.deinit();
     try packed_array.module_types.append(alloc, .{
-        .array_type = .{ .field = .{ .@"type" = .i8, .mutable = true } },
+        .array_type = .{ .field = .{ .type = .i8, .mutable = true } },
     });
     try packed_array.type_meta.append(alloc, .{ .kind = .array });
     try validate(&packed_array, .{});
@@ -7602,7 +7721,7 @@ test "packed types are valid as storage types and nowhere else" {
     var packed_struct = Mod.Module.init(alloc);
     defer packed_struct.deinit();
     var fields: std.ArrayListUnmanaged(Mod.TypeEntry.StructType.Field) = .empty;
-    try fields.append(alloc, .{ .@"type" = .i16 });
+    try fields.append(alloc, .{ .type = .i16 });
     try packed_struct.module_types.append(alloc, .{ .struct_type = .{ .fields = fields } });
     try packed_struct.type_meta.append(alloc, .{ .kind = .struct_ });
     try validate(&packed_struct, .{});
@@ -7693,7 +7812,7 @@ test "v128.const initialises a global" {
     const alloc = std.testing.allocator;
     // 0xfd 0x0c followed by sixteen bytes. The whole SIMD prefix was
     // rejected, so a v128 global could be printed but never read back.
-    const init = [_]u8{0xfd} ++ [_]u8{0x0c} ++ [_]u8{0} ** 16 ++ [_]u8{0x0b};
+    const init = [_]u8{0xfd} ++ [_]u8{0x0c} ++ @as([16]u8, @splat(0)) ++ [_]u8{0x0b};
     var m = try testModuleWithGlobal(alloc, .v128, &init);
     defer m.deinit();
     try validate(&m, .{});
@@ -8234,7 +8353,7 @@ test "table.init pops three operands" {
         .{ .body = &(i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
         .{ .body = &(i32_0 ++ i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = true },
         // A fourth operand is left behind, and the function returns nothing.
-        .{ .body = &(i32_0 ** 4 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
+        .{ .body = &((i32_0 ++ i32_0 ++ i32_0 ++ i32_0) ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
         // f32.const 0 in each of the three positions: destination...
         .{ .body = &([_]u8{ 0x43, 0, 0, 0, 0 } ++ i32_0 ++ i32_0 ++ [_]u8{ 0xfc, 0x0c, 0x00, 0x00, 0x0b }), .ok = false },
         // ...source...
@@ -8637,7 +8756,7 @@ test "table.fill pops a destination, a value and a length" {
         .{ .body = &(i32_zero ++ ref_null_func ++ fill_0 ++ end_only), .ok = false },
         .{ .body = &(i32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = true },
         // A fourth operand is left behind.
-        .{ .body = &(i32_zero ** 2 ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
+        .{ .body = &((i32_zero ++ i32_zero) ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
         // A wrong destination, value and length in turn.
         .{ .body = &(f32_zero ++ ref_null_func ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
         .{ .body = &(i32_zero ++ ref_null_extern ++ i32_zero ++ fill_0 ++ end_only), .ok = false },
@@ -8685,7 +8804,7 @@ test "table.grow, table.size and table.fill check the table they name" {
         // A bad index outranks a bad operand, which is the order the
         // reference implementation reports the two in.
         .{ .body = &(f32_zero ++ f32_zero ++ grow_3 ++ drop_end), .tables = &funcref_table },
-        .{ .body = &(f32_zero ** 3 ++ fill_3 ++ end_only), .tables = &funcref_table },
+        .{ .body = &((f32_zero ++ f32_zero ++ f32_zero) ++ fill_3 ++ end_only), .tables = &funcref_table },
     };
     for (cases) |c| {
         var m = try testTableModule(alloc, c.tables, &.{}, c.body);
@@ -8940,7 +9059,7 @@ test "memory.init pops three operands" {
         .{ .body = &(i32_zero ++ i32_zero ++ init), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ init), .ok = true },
         // A fourth operand is left behind, and the function returns nothing.
-        .{ .body = &(i32_zero ** 4 ++ init), .ok = false },
+        .{ .body = &((i32_zero ++ i32_zero ++ i32_zero ++ i32_zero) ++ init), .ok = false },
         // f32.const 0 in each of the three positions: destination...
         .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ init), .ok = false },
         // ...source...
@@ -9134,7 +9253,7 @@ test "memory.copy pops three operands and checks both memories" {
         .{ .body = &(i32_zero ++ copy), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ copy), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ copy), .ok = true },
-        .{ .body = &(i32_zero ** 4 ++ copy), .ok = false },
+        .{ .body = &((i32_zero ++ i32_zero ++ i32_zero ++ i32_zero) ++ copy), .ok = false },
         .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ copy), .ok = false },
         .{ .body = &(i32_zero ++ f32_zero ++ i32_zero ++ copy), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ f32_zero ++ copy), .ok = false },
@@ -9222,7 +9341,7 @@ test "memory.fill pops three operands and checks the memory it names" {
         .{ .body = &(i32_zero ++ fill), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ fill), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ i32_zero ++ fill), .ok = true },
-        .{ .body = &(i32_zero ** 4 ++ fill), .ok = false },
+        .{ .body = &((i32_zero ++ i32_zero ++ i32_zero ++ i32_zero) ++ fill), .ok = false },
         .{ .body = &(f32_zero ++ i32_zero ++ i32_zero ++ fill), .ok = false },
         .{ .body = &(i32_zero ++ f32_zero ++ i32_zero ++ fill), .ok = false },
         .{ .body = &(i32_zero ++ i32_zero ++ f32_zero ++ fill), .ok = false },

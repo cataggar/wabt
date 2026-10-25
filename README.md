@@ -69,7 +69,7 @@ signature-verification, or production-readiness evidence.
 
 ## Building
 
-Requires [Zig](https://ziglang.org/) 0.16. No other dependencies.
+Requires [Zig](https://ziglang.org/) 0.17. No other dependencies.
 
 ```console
 $ git clone --recursive https://github.com/cataggar/wabt
@@ -80,15 +80,15 @@ $ zig build
 For release builds:
 
 ```console
-$ zig build -Doptimize=ReleaseSafe
+$ zig build -Doptimize=safe
 ```
 
 Cross-compilation works out of the box:
 
 ```console
-$ zig build -Dtarget=aarch64-linux -Doptimize=ReleaseSafe
-$ zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
-$ zig build -Dtarget=x86_64-windows -Doptimize=ReleaseSafe
+$ zig build -Dtarget=aarch64-linux -Doptimize=safe
+$ zig build -Dtarget=aarch64-macos -Doptimize=safe
+$ zig build -Dtarget=x86_64-windows -Doptimize=safe
 ```
 
 ## License

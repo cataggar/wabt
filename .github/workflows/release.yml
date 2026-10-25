@@ -24,7 +24,7 @@ jobs:
           - os: ubuntu-22.04-arm
             target: aarch64-linux
             name: linux-arm64
-          - os: macos-14
+          - os: macos-15
             target: aarch64-macos
             name: macos-arm64
           - os: windows-latest
@@ -61,7 +61,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tools: |
-            cataggar/zig@v0.16.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
+            cataggar/zig@v0.17.0 RWSGOq2NVecA2UPNdBUZykf1CCb147pkmdtYxgb3Ti+JO/wCYvhbAb/U
 
       - name: Get version
         id: version
@@ -69,7 +69,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
+        run: zig build -Doptimize=safe -Dtarget=${{ matrix.target }} -Dstrip=true -Dstack-protector=true "-Dversion=${{ steps.version.outputs.version }}"
 
       - name: Smoke installed OCI command help
         if: >-

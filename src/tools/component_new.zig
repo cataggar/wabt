@@ -6203,7 +6203,7 @@ fn buildCoreWithFuncImport(
         try b.append(alloc, 0x60); // func form
         std.debug.assert(params.len < 0x80);
         try b.append(alloc, @intCast(params.len));
-        for (params) |p| try b.append(alloc, @intCast(@intFromEnum(p)));
+        for (params) |p| try b.append(alloc, @intCast(@backingInt(p)));
         try b.append(alloc, 0x00); // 0 results
         try writeSection(&out, alloc, 0x01, b.items);
     }

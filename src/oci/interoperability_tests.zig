@@ -360,7 +360,7 @@ test "negative corpus rejects corruption media and partial publication" {
         "/absolute/escape.wasm",
         "C:\\escape.wasm",
         "\\\\server\\share\\escape.wasm",
-        "x" ** 4096,
+        &@as([4096]u8, @splat('x')),
     };
     for (hostile_titles) |title| {
         const manifest = try genericManifest(
@@ -430,7 +430,7 @@ test "negative corpus rejects corruption media and partial publication" {
     try expectClassificationError(error.SizeMismatch, bad_config_size_manifest);
 
     var bad_config_digest = config;
-    bad_config_digest.digest = "sha256:" ++ "1" ** 64;
+    bad_config_digest.digest = "sha256:" ++ (&@as([64]u8, @splat('1')));
     const bad_config_digest_manifest = try genericManifest(
         allocator,
         bad_config_digest,
@@ -452,7 +452,7 @@ test "negative corpus rejects corruption media and partial publication" {
     try expectClassificationError(error.SizeMismatch, bad_layer_size_manifest);
 
     var bad_layer_digest = layer;
-    bad_layer_digest.digest = "sha256:" ++ "2" ** 64;
+    bad_layer_digest.digest = "sha256:" ++ (&@as([64]u8, @splat('2')));
     const bad_layer_digest_manifest = try genericManifest(
         allocator,
         config,
@@ -491,7 +491,7 @@ test "negative corpus rejects corruption media and partial publication" {
         valid_manifest,
         &root_digest,
     );
-    root.digest = "sha256:" ++ "0" ** 64;
+    root.digest = "sha256:" ++ (&@as([64]u8, @splat('0')));
     try std.testing.expectError(
         error.DigestMismatch,
         wasm.classifyDirectManifest(

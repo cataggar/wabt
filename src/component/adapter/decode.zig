@@ -335,7 +335,10 @@ test "extractEncodedWorld: rejects non-adapter custom sections" {
         0x00, 0x61, 0x73, 0x6d,
         0x01, 0x00, 0x00, 0x00,
         0x00, 0x07, // custom section, body size 7
-        0x05, 'h', 'e', 'l', 'l', 'o', 0x00,
+        0x05, 'h',
+        'e',  'l',
+        'l',  'o',
+        0x00,
     };
     const found = try extractEncodedWorld(&core);
     try testing.expect(found == null);

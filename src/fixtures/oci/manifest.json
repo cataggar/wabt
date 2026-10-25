@@ -263,13 +263,13 @@
       },
       {
         "path": "scripts/oci/fixture_manifest.py",
-        "sha256": "e51f58dfc7b3f6de94e3b4bb1252f1777efe4b310149a3724fbdf82e67f20871",
+        "sha256": "15a8d045c9c238ebad4a85b1cf22f2f9a6ad81e60271b7cc53a636046a2e1f43",
         "size": 39920
       },
       {
         "path": "scripts/oci/generate_interop_fixtures.sh",
-        "sha256": "b2886832eda1a75d5175bd3d77d3ee5a0c4e243a6ac11ca0e16808e03df9f3da",
-        "size": 20836
+        "sha256": "734de576bb9a6b7d6bc855ffaab99eff12fc9b670a3a48f48afb3ed97a94feac",
+        "size": 20829
       },
       {
         "path": "scripts/oci/verify_interop_fixtures.sh",
@@ -1137,9 +1137,9 @@
           ]
         },
         "zigLinker": {
-          "sha256": "6e2989a7efbd4e81acbacb6c6378e34340d8e88bb023b10c4a941021be55cdcb",
+          "sha256": "5165c9a2d17938a8173839b3adf81d025b558d38d9e9711237a6fa5b8d8bb3f7",
           "versionOutput": [
-            "0.16.0"
+            "0.17.0"
           ]
         }
       },

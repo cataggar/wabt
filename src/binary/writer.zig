@@ -128,7 +128,7 @@ const Writer = struct {
             try self.appendByte(reader.ref_prefix); // ref
             try self.appendByte(0x74); // noexn
         } else {
-            try self.appendByte(@bitCast(@as(i8, @intCast(@intFromEnum(vt)))));
+            try self.appendByte(@bitCast(@as(i8, @intCast(@backingInt(vt)))));
         }
     }
 
@@ -289,13 +289,13 @@ const Writer = struct {
                     try self.appendByte(0x5F);
                     try self.writeU32Leb(@intCast(st.fields.items.len));
                     for (st.fields.items) |f| {
-                        try self.writeValTypeWithTidx(f.@"type", f.type_idx);
+                        try self.writeValTypeWithTidx(f.type, f.type_idx);
                         try self.appendByte(if (f.mutable) 1 else 0);
                     }
                 },
                 .array_type => |at| {
                     try self.appendByte(0x5E);
-                    try self.writeValTypeWithTidx(at.field.@"type", at.field.type_idx);
+                    try self.writeValTypeWithTidx(at.field.type, at.field.type_idx);
                     try self.appendByte(if (at.field.mutable) 1 else 0);
                 },
             }
@@ -310,7 +310,7 @@ const Writer = struct {
         for (module.imports.items) |imp| {
             try self.writeName(imp.module_name);
             try self.writeName(imp.field_name);
-            try self.appendByte(@intFromEnum(imp.kind));
+            try self.appendByte(@backingInt(imp.kind));
             switch (imp.kind) {
                 .func => try self.writeU32Leb(if (imp.func) |f| f.type_var.index else 0),
                 .table => {
@@ -404,7 +404,7 @@ const Writer = struct {
     /// a defined tag with the same signature cannot resolve differently.
     fn tagTypeIndex(module: *const Mod.Module, tag: Mod.Tag) u32 {
         if (tag.type_idx != std.math.maxInt(u32)) return tag.type_idx;
-        return findMatchingType(module, tag.@"type".sig.params, tag.@"type".sig.results) orelse 0;
+        return findMatchingType(module, tag.type.sig.params, tag.type.sig.results) orelse 0;
     }
 
     /// The `idx`th imported tag in import order. Imported and defined tags
@@ -440,11 +440,17 @@ const Writer = struct {
                     if (ft.params.len == params.len and ft.results.len == results.len) {
                         var match = true;
                         for (ft.params, params) |a, b| {
-                            if (a != b) { match = false; break; }
+                            if (a != b) {
+                                match = false;
+                                break;
+                            }
                         }
                         if (match) {
                             for (ft.results, results) |a, b| {
-                                if (a != b) { match = false; break; }
+                                if (a != b) {
+                                    match = false;
+                                    break;
+                                }
                             }
                         }
                         if (match) return @intCast(i);
@@ -482,7 +488,7 @@ const Writer = struct {
         try self.writeU32Leb(@intCast(module.exports.items.len));
         for (module.exports.items) |exp| {
             try self.writeName(exp.name);
-            try self.appendByte(@intFromEnum(exp.kind));
+            try self.appendByte(@backingInt(exp.kind));
             try self.writeU32Leb(exp.var_.index);
         }
         self.endSection(ph);
@@ -760,10 +766,10 @@ test "imported concrete heap type index 112 survives a binary round trip" {
 
     try std.testing.expectEqual(@as(u32, 112), round_trip.imports.items[0].table_type_idx);
     try std.testing.expectEqual(@as(u32, 112), round_trip.tables.items[0].type_idx);
-    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.tables.items[0].@"type".elem_type);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.tables.items[0].type.elem_type);
     try std.testing.expectEqual(@as(u32, 112), round_trip.imports.items[1].global_type_idx);
     try std.testing.expectEqual(@as(u32, 112), round_trip.globals.items[0].type_idx);
-    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.globals.items[0].@"type".val_type);
+    try std.testing.expectEqual(types.ValType.concrete_ref_null, round_trip.globals.items[0].type.val_type);
 }
 
 test "round-trip memory section" {
@@ -789,7 +795,8 @@ test "round-trip exports" {
     const allocator = std.testing.allocator;
     const input = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x07, 0x07, 0x01, 0x03, 'm', 'e', 'm', 0x02, 0x00,
+        0x07, 0x07, 0x01, 0x03, 'm',  'e',  'm',  0x02,
+        0x00,
     };
     var module = try reader.readModule(allocator, &input);
     defer module.deinit();
@@ -1193,8 +1200,7 @@ test "binary read+write: defined table with init expression round-trips" {
         // preamble
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
         // table section: id=4, size=9, count=1, body
-        0x04, 0x09, 0x01,
-        0x40, 0x00, 0x70, 0x00, 0x01,
+        0x04, 0x09, 0x01, 0x40, 0x00, 0x70, 0x00, 0x01,
         0xd0, 0x70, 0x0b,
     };
 
@@ -1332,7 +1338,7 @@ test "binary read: reference types decode from the spec-assigned bytes" {
     // nullref/nullexnref before this was fixed. They must not decode.
     for ([_]u8{ 0x65, 0x68 }) |bad_byte| {
         const src = [_]u8{
-            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00,     0x00, 0x00,
             0x01, 0x05, 0x01, 0x60, 0x01, bad_byte, 0x00,
         };
         try std.testing.expectError(error.InvalidType, reader.readModule(allocator, &src));
@@ -1355,10 +1361,11 @@ test "binary read+write: tag signatures round-trip instead of collapsing to ()" 
     const allocator = std.testing.allocator;
     const src = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x0e, 0x03, 0x60, 0x02, 0x7c, 0x7c, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x00, 0x00,
-        0x03, 0x02, 0x01, 0x02,
-        0x0d, 0x05, 0x02, 0x00, 0x01, 0x00, 0x00,
-        0x0a, 0x0a, 0x01, 0x08, 0x00, 0x41, 0x01, 0x42, 0x02, 0x08, 0x00, 0x0b,
+        0x01, 0x0e, 0x03, 0x60, 0x02, 0x7c, 0x7c, 0x00,
+        0x60, 0x02, 0x7f, 0x7e, 0x00, 0x60, 0x00, 0x00,
+        0x03, 0x02, 0x01, 0x02, 0x0d, 0x05, 0x02, 0x00,
+        0x01, 0x00, 0x00, 0x0a, 0x0a, 0x01, 0x08, 0x00,
+        0x41, 0x01, 0x42, 0x02, 0x08, 0x00, 0x0b,
     };
 
     var module = try reader.readModule(allocator, &src);
@@ -1372,12 +1379,12 @@ test "binary read+write: tag signatures round-trip instead of collapsing to ()" 
     try std.testing.expectEqualSlices(
         types.ValType,
         &.{ .i32, .i64 },
-        module2.tags.items[0].@"type".sig.params,
+        module2.tags.items[0].type.sig.params,
     );
     try std.testing.expectEqualSlices(
         types.ValType,
         &.{ .f64, .f64 },
-        module2.tags.items[1].@"type".sig.params,
+        module2.tags.items[1].type.sig.params,
     );
 }
 
@@ -1388,8 +1395,9 @@ test "binary read+write: imported tag signatures round-trip" {
     const allocator = std.testing.allocator;
     const src = [_]u8{
         0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x09, 0x02, 0x60, 0x00, 0x00, 0x60, 0x02, 0x7f, 0x7e, 0x00,
-        0x02, 0x08, 0x01, 0x01, 0x6d, 0x01, 0x65, 0x04, 0x00, 0x01,
+        0x01, 0x09, 0x02, 0x60, 0x00, 0x00, 0x60, 0x02,
+        0x7f, 0x7e, 0x00, 0x02, 0x08, 0x01, 0x01, 0x6d,
+        0x01, 0x65, 0x04, 0x00, 0x01,
     };
 
     var module = try reader.readModule(allocator, &src);
@@ -1404,7 +1412,7 @@ test "binary read+write: imported tag signatures round-trip" {
     try std.testing.expectEqualSlices(
         types.ValType,
         &.{ .i32, .i64 },
-        module2.tags.items[0].@"type".sig.params,
+        module2.tags.items[0].type.sig.params,
     );
 }
 
@@ -1425,8 +1433,8 @@ test "the writer pairs tag imports by is_import, not by list position" {
     try module.module_types.append(allocator, .{ .func_type = .{ .params = try allocator.dupe(types.ValType, &.{.f32}) } });
 
     // Defined tag first, imported tag second.
-    try module.tags.append(allocator, .{ .@"type" = .{ .sig = .{ .params = i32_params } }, .type_idx = 0 });
-    try module.tags.append(allocator, .{ .@"type" = .{ .sig = .{ .params = f32_params } }, .type_idx = 1, .is_import = true });
+    try module.tags.append(allocator, .{ .type = .{ .sig = .{ .params = i32_params } }, .type_idx = 0 });
+    try module.tags.append(allocator, .{ .type = .{ .sig = .{ .params = f32_params } }, .type_idx = 1, .is_import = true });
     module.num_tag_imports = 1;
     try module.imports.append(allocator, .{ .module_name = "m", .field_name = "t", .kind = .tag });
 
@@ -1438,9 +1446,9 @@ test "the writer pairs tag imports by is_import, not by list position" {
     // Decoding puts imports first, so the imported f32 tag leads.
     try std.testing.expectEqual(@as(usize, 2), rt.tags.items.len);
     try std.testing.expect(rt.tags.items[0].is_import);
-    try std.testing.expectEqualSlices(types.ValType, &.{.f32}, rt.tags.items[0].@"type".sig.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.f32}, rt.tags.items[0].type.sig.params);
     try std.testing.expect(!rt.tags.items[1].is_import);
-    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[1].@"type".sig.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[1].type.sig.params);
 }
 
 test "text->binary: an imported tag with an inline signature emits a usable type index" {
@@ -1460,7 +1468,7 @@ test "text->binary: an imported tag with an inline signature emits a usable type
     defer rt.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), rt.tags.items.len);
-    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[0].@"type".sig.params);
+    try std.testing.expectEqualSlices(types.ValType, &.{.i32}, rt.tags.items[0].type.sig.params);
 }
 
 test "a recursion group holding one type keeps its 0x4e marker" {
@@ -1530,15 +1538,29 @@ test "empty recursion groups retain binary type-section ordering" {
 
     const expected_payload = [_]u8{
         0x09,
-        0x4e, 0x00,
-        0x4e, 0x00,
-        0x60, 0x00, 0x00,
-        0x4e, 0x00,
-        0x4e, 0x01, 0x60, 0x00, 0x00,
-        0x4e, 0x00,
-        0x4e, 0x00,
-        0x60, 0x00, 0x00,
-        0x4e, 0x00,
+        0x4e,
+        0x00,
+        0x4e,
+        0x00,
+        0x60,
+        0x00,
+        0x00,
+        0x4e,
+        0x00,
+        0x4e,
+        0x01,
+        0x60,
+        0x00,
+        0x00,
+        0x4e,
+        0x00,
+        0x4e,
+        0x00,
+        0x60,
+        0x00,
+        0x00,
+        0x4e,
+        0x00,
     };
     try std.testing.expect(std.mem.indexOf(u8, wasm, &expected_payload) != null);
 

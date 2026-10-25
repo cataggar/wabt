@@ -1284,7 +1284,7 @@ pub const Client = struct {
     }
 };
 
-/// Production backend. Zig 0.16's `std.http.Client` validates hostnames and
+/// Production backend. Zig 0.17's `std.http.Client` validates hostnames and
 /// chains against `ca_bundle`; this backend never exposes a verification
 /// bypass. The standard client does not expose DNS, connect, TLS-handshake,
 /// write, response-head, or body-idle timeout controls through `request`, so
@@ -1433,7 +1433,7 @@ pub const StdBackend = struct {
             var reader_buffer: [16 * 1024]u8 = undefined;
             var transfer_buffer: [64 * 1024]u8 = undefined;
             const reader = std_response.reader(&reader_buffer);
-            const status: u16 = @intFromEnum(std_response.head.status);
+            const status: u16 = @backingInt(std_response.head.status);
             if (status >= 200 and status < 300) {
                 if (std_response.head.content_length) |length| {
                     if (length > options.body_limit) return error.BodyLimitExceeded;
@@ -1481,7 +1481,7 @@ pub const StdBackend = struct {
         }
         return .{
             .allocator = allocator,
-            .status = @intFromEnum(std_response.head.status),
+            .status = @backingInt(std_response.head.status),
             .headers = headers.toOwnedSlice() catch return error.OutOfMemory,
             .body = body.toOwnedSlice() catch return error.OutOfMemory,
         };
@@ -1552,7 +1552,10 @@ fn parseOrigin(allocator: Allocator, url: []const u8) Error!Origin {
     }
     if (componentContainsPercent(uri.host.?)) return error.InvalidEndpoint;
     var host_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
-    const raw_host = (uri.getHost(&host_buffer) catch return error.InvalidEndpoint).bytes;
+    const raw_host = if (std.Io.net.HostName.fromUri(uri, &host_buffer)) |host_name|
+        host_name.bytes
+    else |_|
+        uri.host.?.toRaw(&host_buffer) catch return error.InvalidEndpoint;
     const normalized = try normalizeHostAlloc(allocator, raw_host);
     errdefer allocator.free(normalized.host);
     const port = uri.port orelse scheme.defaultPort();
@@ -3656,7 +3659,7 @@ test "signed URLs and authorization never appear in diagnostics or formatting" {
     try std.testing.expect(std.mem.indexOf(u8, request_text, "AUTHORIZATION-SECRET") == null);
 }
 
-test "production backend declares honest Zig 0.16 timeout limitations and rejects malformed CA data" {
+test "production backend declares honest Zig 0.17 timeout limitations and rejects malformed CA data" {
     try std.testing.expect(!StdBackend.capabilities.absolute_deadline);
     try std.testing.expect(!StdBackend.capabilities.dns_timeout);
     try std.testing.expect(!StdBackend.capabilities.connect_timeout);

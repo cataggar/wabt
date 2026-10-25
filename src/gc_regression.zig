@@ -109,14 +109,14 @@ test "GC regression corpus covers every core subopcode end to end" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(u32, 1), parsed.value.version);
 
-    var expected_counts = [_]u8{0} ** gc_subopcode_count;
-    var binary_counts = [_]u8{0} ** gc_subopcode_count;
+    var expected_counts: [gc_subopcode_count]u8 = @splat(0);
+    var binary_counts: [gc_subopcode_count]u8 = @splat(0);
 
     for (parsed.value.valid) |case| {
         try std.testing.expect(case.name.len > 0);
         try std.testing.expect(case.family.len > 0);
 
-        var case_expected = [_]bool{false} ** gc_subopcode_count;
+        var case_expected: [gc_subopcode_count]bool = @splat(false);
         for (case.subopcodes) |sub| {
             try std.testing.expect(sub < gc_subopcode_count);
             try std.testing.expect(!case_expected[sub]);
@@ -139,7 +139,7 @@ test "GC regression corpus covers every core subopcode end to end" {
         defer decoded.deinit();
         try Validator.validate(&decoded, .{});
 
-        var case_actual = [_]u8{0} ** gc_subopcode_count;
+        var case_actual: [gc_subopcode_count]u8 = @splat(0);
         try collectGcSubopcodes(&decoded, &case_actual);
         for (case_actual, 0..) |count, sub| {
             try std.testing.expectEqual(@as(u8, if (case_expected[sub]) 1 else 0), count);
