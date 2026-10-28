@@ -26,7 +26,7 @@ Usage: wabt <subject> <verb> [args...]
 
 Subjects:
   text       Text format (.wat) work — parse, print, desugar
-  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink, optimize
   component  Component-model work — new, embed, compose
   spec       Spec testing (.wast) work — run, to-json
   oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags
@@ -37,6 +37,28 @@ Global:
 ```
 
 Run `wabt help <subject>` for the verbs in that subject.
+
+## Module optimization
+
+`wabt module optimize` runs a fixed, deterministic sequence of behavior-preserving optimization passes on a core WebAssembly module and validates both the input and output binaries:
+
+```console
+$ wabt module optimize input.wasm -o optimized.wasm
+$ wabt module validate optimized.wasm
+```
+
+Passes execute in a fixed deterministic order (repeating intra-procedural passes to a bounded fixed point before dead-function removal):
+
+1. **Constant folding** — folds `i32`/`i64` constant arithmetic, bitwise, shift/rotate, and comparison operations when trap-free (preserving division/remainder by zero and signed `INT_MIN / -1` overflow traps).
+2. **Control-flow simplification** — removes `nop`, simplifies `if` and `br_if` with constant conditions, and eliminates trivial empty or unused `block` wrappers with branch-depth adjustment.
+3. **Dead-code elimination** — removes unreachable instructions following unconditional control transfers (`unreachable`, `return`, `br`, `br_table`) up to the matching block boundary.
+4. **Dead-function removal** — computes reachability from exports, `start`, globals, tables, and element segments, removes unreachable defined functions, and remaps all surviving function indices across the module.
+
+Scope and safety policy:
+
+- **Supported subset (fail-closed):** operates on validated core WebAssembly modules using standard MVP/sign-extension/bulk-memory/reference-type instructions and rejects unsupported proposals (SIMD, atomics/threads, GC, exception handling, tail calls, typed function references, multi-memory, memory64, custom page sizes, wide arithmetic) and Component Model binaries rather than emitting unverified code.
+- **Custom sections:** rejected by default because code transformations and function index remapping invalidate custom section offsets and indices (`name`, DWARF, `producers`, etc.). Pass `--strip-custom` to discard custom sections explicitly before optimizing.
+- **Distinct from `shrink` and Binaryen `wasm-opt`:** unlike `wabt module shrink` (which minimizes a binary against an external predicate and may alter semantics), `wabt module optimize` is strictly semantics-preserving. It does not expose `-O` / `-O2` / `-Os` flags or claim equivalence to Binaryen's optimization pipeline; for full whole-program Binaryen optimization passes, pair `wabt` with `wasm-opt` (`ghr install WebAssembly/binaryen`).
 
 ## OCI artifacts
 

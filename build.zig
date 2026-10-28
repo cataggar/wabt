@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     // vendored wasm32-wasip3 testsuite is missing — set by CI once the suite is
     // vendored, so a dropped checkout is a hard failure rather than a silent skip.
     const wasip3_require_suite = b.option(bool, "wasip3-require-suite", "Fail (not skip) wasi-p3-testsuite when the testsuite is not vendored (CI)") orelse false;
+    const optimize_require_wasmtime = b.option(bool, "optimize-require-wasmtime", "Fail (not skip) optimize-regression when no Wasmtime is found (CI)") orelse false;
 
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
@@ -52,6 +53,7 @@ pub fn build(b: *std.Build) void {
         "src/tools/stats.zig",
         "src/tools/desugar.zig",
         "src/tools/shrink.zig",
+        "src/tools/optimize.zig",
         "src/tools/component.zig",
         "src/tools/component_embed.zig",
         "src/tools/component_new.zig",
@@ -801,6 +803,77 @@ pub fn build(b: *std.Build) void {
             dash_help.expectExitCode(1);
             test_step.dependOn(&dash_help.step);
         }
+
+        // ── #492: `wabt module optimize` CLI smoke assertions ─────────
+        const optimize_help_header = "Usage: wabt module optimize [options] <file.wasm> -o <output.wasm>";
+
+        const optimize_global_help = b.addRunArtifact(wabt_exe);
+        optimize_global_help.addArgs(&.{ "help", "module", "optimize" });
+        optimize_global_help.expectExitCode(0);
+        optimize_global_help.expectStdOutMatch(optimize_help_header);
+        optimize_global_help.expectStdErrEqual("");
+        test_step.dependOn(&optimize_global_help.step);
+
+        const optimize_subject_help = b.addRunArtifact(wabt_exe);
+        optimize_subject_help.addArgs(&.{ "module", "help", "optimize" });
+        optimize_subject_help.expectExitCode(0);
+        optimize_subject_help.expectStdOutMatch(optimize_help_header);
+        optimize_subject_help.expectStdErrEqual("");
+        test_step.dependOn(&optimize_subject_help.step);
+
+        const optimize_leaf_help = b.addRunArtifact(wabt_exe);
+        optimize_leaf_help.addArgs(&.{ "module", "optimize", "help" });
+        optimize_leaf_help.expectExitCode(0);
+        optimize_leaf_help.expectStdOutMatch(optimize_help_header);
+        optimize_leaf_help.expectStdErrEqual("");
+        test_step.dependOn(&optimize_leaf_help.step);
+
+        const optimize_dash_h = b.addRunArtifact(wabt_exe);
+        optimize_dash_h.addArgs(&.{ "module", "optimize", "-h" });
+        optimize_dash_h.expectExitCode(1);
+        optimize_dash_h.expectStdOutEqual("");
+        test_step.dependOn(&optimize_dash_h.step);
+
+        const optimize_dash_help = b.addRunArtifact(wabt_exe);
+        optimize_dash_help.addArgs(&.{ "module", "optimize", "--help" });
+        optimize_dash_help.expectExitCode(1);
+        optimize_dash_help.expectStdOutEqual("");
+        test_step.dependOn(&optimize_dash_help.step);
+
+        const optimize_missing_output = b.addRunArtifact(wabt_exe);
+        optimize_missing_output.addArgs(&.{ "module", "optimize", "input.wasm" });
+        optimize_missing_output.expectExitCode(1);
+        optimize_missing_output.expectStdOutEqual("");
+        optimize_missing_output.expectStdErrMatch("error: optimize requires -o <output.wasm>");
+        test_step.dependOn(&optimize_missing_output.step);
+
+        const optimize_fixture_wat = cli_feature_fixtures.add(
+            "optimize-smoke.wat",
+            "(module (func (export \"add\") (result i32) (i32.add (i32.const 20) (i32.const 22))) (func (result i32) (i32.const 99)))\n",
+        );
+        const parse_optimize_fixture = b.addRunArtifact(wabt_exe);
+        parse_optimize_fixture.addArgs(&.{ "text", "parse" });
+        parse_optimize_fixture.addFileArg(optimize_fixture_wat);
+        parse_optimize_fixture.addArg("-o");
+        const optimize_fixture_wasm = parse_optimize_fixture.addOutputFileArg("optimize-smoke.wasm");
+        parse_optimize_fixture.expectExitCode(0);
+        test_step.dependOn(&parse_optimize_fixture.step);
+
+        const run_optimize_smoke = b.addRunArtifact(wabt_exe);
+        run_optimize_smoke.addArgs(&.{ "module", "optimize" });
+        run_optimize_smoke.addFileArg(optimize_fixture_wasm);
+        run_optimize_smoke.addArg("-o");
+        const optimized_smoke_wasm = run_optimize_smoke.addOutputFileArg("optimize-smoke.opt.wasm");
+        run_optimize_smoke.expectExitCode(0);
+        run_optimize_smoke.expectStdOutEqual("");
+        run_optimize_smoke.expectStdErrEqual("");
+        test_step.dependOn(&run_optimize_smoke.step);
+
+        const validate_optimized_smoke = b.addRunArtifact(wabt_exe);
+        validate_optimized_smoke.addArgs(&.{ "module", "validate" });
+        validate_optimized_smoke.addFileArg(optimized_smoke_wasm);
+        validate_optimized_smoke.expectExitCode(0);
+        test_step.dependOn(&validate_optimized_smoke.step);
     }
 
     // ── WASI Preview 3 conformance gate (#267 Phase 3) ────────────────
@@ -856,6 +929,20 @@ pub fn build(b: *std.Build) void {
         "Decode + byte-identical round-trip upstream wasm32-wasip3 components with wabt",
     );
     wasip3_step.dependOn(&wasip3_runner.step);
+
+    // ── Core module optimizer regression gate (#492) ───────────────────
+    const optimize_runner = b.addSystemCommand(&.{
+        "python3",
+        "scripts/optimize_regression.py",
+        "--wabt",
+    });
+    optimize_runner.addArtifactArg(wabt_exe);
+    if (optimize_require_wasmtime) optimize_runner.addArg("--require-wasmtime");
+    const optimize_regression_step = b.step(
+        "optimize-regression",
+        "Run wabt module optimize runtime regression suite against Wasmtime (set WASMTIME)",
+    );
+    optimize_regression_step.dependOn(&optimize_runner.step);
 }
 
 /// Adapter shape selector used by `buildAdapterArtifact` to pick

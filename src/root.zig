@@ -13,6 +13,7 @@ pub const Opcode = @import("Opcode.zig");
 pub const Feature = @import("Feature.zig");
 pub const Module = @import("Module.zig");
 pub const Validator = @import("Validator.zig");
+pub const Optimizer = @import("Optimizer.zig");
 pub const CWriter = @import("CWriter.zig");
 pub const Decompiler = @import("Decompiler.zig");
 pub const wast_runner = @import("wast_runner.zig");
@@ -105,5 +106,6 @@ test {
     _ = @import("typed_select_regression.zig");
     _ = @import("feature_gate_regression.zig");
     _ = @import("declaration_feature_gate_regression.zig");
+    _ = @import("Optimizer.zig");
     _ = @import("oci.zig");
 }
