@@ -87,7 +87,7 @@ For the standalone wasm-tools 1.250.0 differential matrix:
 
 ```console
 $ zig build
-$ scripts/gc_regression.py \
+$ zig build wasm-tools-diff -- --suite gc \
     zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```
@@ -114,7 +114,7 @@ The focused wasm-tools 1.250.0 matrix also exercises the CLI's
 
 ```console
 $ zig build
-$ scripts/wide_arithmetic_regression.py \
+$ zig build wasm-tools-diff -- --suite wide-arithmetic \
     zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```
@@ -132,7 +132,7 @@ wasm-tools 1.250.0 matrix with:
 
 ```console
 $ zig build
-$ scripts/custom_page_sizes.py \
+$ zig build wasm-tools-diff -- --suite custom-page-sizes \
     zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```
@@ -157,7 +157,7 @@ Run the wasm-tools 1.250.0 differential matrix with:
 
 ```console
 $ zig build
-$ scripts/typed_select_regression.py \
+$ zig build wasm-tools-diff -- --suite typed-select \
     zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```
@@ -181,7 +181,9 @@ types, tables, globals, tags, blocks, and element segments. Compare its WAT
 and binary expectations with wasm-tools 1.250.0 using:
 
 ```console
-$ scripts/declaration_feature_gate_regression.py \
+$ zig build
+$ zig build wasm-tools-diff -- --suite declaration-feature-gate \
+    zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```
 
@@ -194,7 +196,7 @@ Run every case against wabt and wasm-tools 1.250.0 with:
 
 ```console
 $ zig build
-$ scripts/cross_feature_regression.py \
+$ zig build wasm-tools-diff -- --suite cross-feature \
     zig-out/bin/wabt \
     /path/to/wasm-tools-1.250.0
 ```

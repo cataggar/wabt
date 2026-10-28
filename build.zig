@@ -274,15 +274,20 @@ pub fn build(b: *std.Build) void {
         "test-oci-cli",
         "Run focused OCI command-shell unit and CLI tests",
     );
-    const oci_qualification_check = b.addSystemCommand(&.{
-        "python3",
-        "scripts/check_oci_qualification.py",
+    const oci_qualification_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/oci/qualification_test.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    const oci_qualification_tests = b.addTest(.{
+        .root_module = oci_qualification_test_mod,
+    });
+    const run_oci_qualification_tests = b.addRunArtifact(oci_qualification_tests);
     const oci_qualification_test_step = b.step(
         "test-oci-qualification",
         "Lint OCI qualification documentation, workflow pins, and packaging",
     );
-    oci_qualification_test_step.dependOn(&oci_qualification_check.step);
+    oci_qualification_test_step.dependOn(&run_oci_qualification_tests.step);
 
     const oci_registry_test_mod = b.createModule(.{
         .root_source_file = b.path("src/oci/registry_test.zig"),
@@ -881,13 +886,20 @@ pub fn build(b: *std.Build) void {
     // `tests/p3/*.wat` guests through `wabt component new`, then validates
     // each produced component on upstream Wasmtime (resolved from the
     // `WASMTIME` env var; needs P3 feature flags, e.g. wasmtime >= 46). Not
-    // wired into the default `test` aggregate — it requires Python 3 + an
-    // external Wasmtime, and skips cleanly when none is found. CI gates
-    // regressions in a follow-up. Run locally with `zig build p3-conformance`
-    // (optionally `WASMTIME=/path/to/wasmtime`).
-    const p3_runner = b.addSystemCommand(&.{
-        "python3",
-        "scripts/p3_conformance.py",
+    // wired into the default `test` aggregate — it requires an external
+    // Wasmtime, and skips cleanly when none is found. CI gates regressions.
+    // Run locally with `zig build p3-conformance` (optionally
+    // `WASMTIME=/path/to/wasmtime`).
+    const p3_runner_exe = b.addExecutable(.{
+        .name = "p3-conformance",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/p3_conformance.zig"),
+            .target = native_host,
+            .optimize = optimize,
+        }),
+    });
+    const p3_runner = b.addRunArtifact(p3_runner_exe);
+    p3_runner.addArgs(&.{
         "--fixtures",
         "tests/p3",
         "--skip",
@@ -898,6 +910,7 @@ pub fn build(b: *std.Build) void {
     // CI installs a pinned Wasmtime and sets this so a missing/broken
     // Wasmtime is a hard failure rather than a silent skip.
     if (p3_require_wasmtime) p3_runner.addArg("--require-wasmtime");
+    p3_runner.addPassthruArgs();
     const p3_step = b.step(
         "p3-conformance",
         "Validate wabt-produced P3 components against Wasmtime (set WASMTIME)",
@@ -913,17 +926,25 @@ pub fn build(b: *std.Build) void {
     // component loader to decode every one (`wabt component objdump`). wabt is
     // a toolkit, not a runtime, so this is the loader-parity analog of the
     // wamr project's wasip3 runtime gate. Not in the default `test` aggregate
-    // (needs Python 3 + the testsuite submodule); skips cleanly when the suite
-    // isn't checked out. Run locally with `zig build wasi-p3-testsuite`.
-    const wasip3_runner = b.addSystemCommand(&.{
-        "python3",
-        "scripts/wasi_p3_testsuite.py",
+    // (needs the testsuite submodule); skips cleanly when the suite isn't
+    // checked out. Run locally with `zig build wasi-p3-testsuite`.
+    const wasip3_runner_exe = b.addExecutable(.{
+        .name = "wasi-p3-testsuite",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/wasi_p3_testsuite.zig"),
+            .target = native_host,
+            .optimize = optimize,
+        }),
+    });
+    const wasip3_runner = b.addRunArtifact(wasip3_runner_exe);
+    wasip3_runner.addArgs(&.{
         "--skip",
         "tests/wasi-p3-testsuite-skip.json",
         "--wabt",
     });
     wasip3_runner.addArtifactArg(wabt_exe);
     if (wasip3_require_suite) wasip3_runner.addArg("--require-suite");
+    wasip3_runner.addPassthruArgs();
     const wasip3_step = b.step(
         "wasi-p3-testsuite",
         "Decode + byte-identical round-trip upstream wasm32-wasip3 components with wabt",
@@ -931,18 +952,58 @@ pub fn build(b: *std.Build) void {
     wasip3_step.dependOn(&wasip3_runner.step);
 
     // ── Core module optimizer regression gate (#492) ───────────────────
-    const optimize_runner = b.addSystemCommand(&.{
-        "python3",
-        "scripts/optimize_regression.py",
-        "--wabt",
+    const optimize_runner_exe = b.addExecutable(.{
+        .name = "optimize-regression",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/optimize_regression.zig"),
+            .target = native_host,
+            .optimize = optimize,
+        }),
     });
+    const optimize_runner = b.addRunArtifact(optimize_runner_exe);
+    optimize_runner.addArg("--wabt");
     optimize_runner.addArtifactArg(wabt_exe);
     if (optimize_require_wasmtime) optimize_runner.addArg("--require-wasmtime");
+    optimize_runner.addPassthruArgs();
     const optimize_regression_step = b.step(
         "optimize-regression",
         "Run wabt module optimize runtime regression suite against Wasmtime (set WASMTIME)",
     );
     optimize_regression_step.dependOn(&optimize_runner.step);
+
+    // ── WASI WIT canonical vendoring tool ──────────────────────────────
+    const vendor_wit_exe = b.addExecutable(.{
+        .name = "vendor-wasi-wit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/vendor_wasi_wit.zig"),
+            .target = native_host,
+            .optimize = optimize,
+        }),
+    });
+    const run_vendor_wit = b.addRunArtifact(vendor_wit_exe);
+    run_vendor_wit.addPassthruArgs();
+    const vendor_wit_step = b.step(
+        "vendor-wasi-wit",
+        "Vendor canonical WASI .wit files into src/component/wit/wasi-canon/",
+    );
+    vendor_wit_step.dependOn(&run_vendor_wit.step);
+
+    // ── Standalone wasm-tools 1.250.0 differential runner ──────────────
+    const wasm_tools_diff_exe = b.addExecutable(.{
+        .name = "wasm-tools-diff",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/wasm_tools_diff.zig"),
+            .target = native_host,
+            .optimize = optimize,
+        }),
+    });
+    const run_wasm_tools_diff = b.addRunArtifact(wasm_tools_diff_exe);
+    run_wasm_tools_diff.addPassthruArgs();
+    const wasm_tools_diff_step = b.step(
+        "wasm-tools-diff",
+        "Run standalone wasm-tools 1.250.0 differential suites",
+    );
+    wasm_tools_diff_step.dependOn(&run_wasm_tools_diff.step);
 }
 
 /// Adapter shape selector used by `buildAdapterArtifact` to pick

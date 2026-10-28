@@ -262,19 +262,19 @@
         "size": 783
       },
       {
-        "path": "scripts/oci/fixture_manifest.py",
-        "sha256": "15a8d045c9c238ebad4a85b1cf22f2f9a6ad81e60271b7cc53a636046a2e1f43",
-        "size": 39920
+        "path": "tools/oci_fixture_manifest.zig",
+        "sha256": "49bcbe6bf63e23e19fc367d241bff118fef8b1a04885e49efc6f5e45e0e400e0",
+        "size": 86811
       },
       {
         "path": "scripts/oci/generate_interop_fixtures.sh",
-        "sha256": "734de576bb9a6b7d6bc855ffaab99eff12fc9b670a3a48f48afb3ed97a94feac",
-        "size": 20829
+        "sha256": "34665de762a97f8841533f823bd6808f8ca619a00c8e1e474717bf88da436d62",
+        "size": 19200
       },
       {
         "path": "scripts/oci/verify_interop_fixtures.sh",
-        "sha256": "73e7c694300078f1c4d473fd9d4c4cd6b7f0941a782339842e29a7e51cf8f226",
-        "size": 278
+        "sha256": "87cdec2402fcd56b314bb06a06b9661ab31797055ed69abb450c371ccf58b285",
+        "size": 456
       }
     ]
   },
