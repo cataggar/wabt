@@ -4,8 +4,8 @@
 //! `wasi-canon/<version>/<pkg>/*.wit` and `@embedFile`d here so the CLI
 //! can resolve `wasi:*@<ver>` references without an on-disk
 //! `wit/deps/` copy (issue 261). Files are byte-for-byte identical to
-//! their upstream git tag; `scripts/vendor_wasi_wit.py` regenerates the
-//! tree and documents the source repo + tag for every version.
+//! their upstream git tag; `tools/vendor_wasi_wit.zig` (`zig build vendor-wasi-wit`)
+//! regenerates the tree and documents the source repo + tag for every version.
 //!
 //! Sources (see the vendoring script's manifest):
 //!   * core  — github.com/WebAssembly/WASI tags `v0.2.6`, `v0.2.12`

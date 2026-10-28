@@ -15,7 +15,8 @@ on:
       - "src/tools/oci*.zig"
       - "src/component/fixtures/stdio-echo.wasm"
       - "src/fixtures/oci/**"
-      - "scripts/check_oci_qualification.py"
+      - "src/oci/qualification_test.zig"
+      - "tools/oci_fixture_manifest.zig"
       - "scripts/oci/**"
   pull_request:
     branches: [main]
@@ -30,7 +31,8 @@ on:
       - "src/tools/oci*.zig"
       - "src/component/fixtures/stdio-echo.wasm"
       - "src/fixtures/oci/**"
-      - "scripts/check_oci_qualification.py"
+      - "src/oci/qualification_test.zig"
+      - "tools/oci_fixture_manifest.zig"
       - "scripts/oci/**"
 
 permissions:
@@ -73,7 +75,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/oci/verify_interop_fixtures.sh
-          python3 scripts/check_oci_qualification.py
+          zig build test-oci-qualification
 
       - name: Restore bounded producer caches
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
@@ -84,7 +86,8 @@ jobs:
             ${{ runner.temp }}/wabt-oci-interoperability/tools/cargo
             ${{ runner.temp }}/wabt-oci-interoperability/tools/cargo-target
             ${{ runner.temp }}/wabt-oci-interoperability/cache/zig-global
-          key: oci-interop-arm64-v1-rust-1.97.0-wkg-5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a-${{ hashFiles('scripts/oci/generate_interop_fixtures.sh', 'scripts/oci/fixture_manifest.py') }}
+          key: oci-interop-arm64-v1-rust-1.97.0-wkg-5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a-${{ hashFiles('scripts/oci/generate_interop_fixtures.sh', 'tools/oci_fixture_manifest.zig') }}
+          restore-keys: oci-interop-arm64-v1-rust-1.97.0-wkg-5a4c2ab721e12511f39bb9cb42cf71fe76f6c89a-
 
       - name: Run two clean pinned qualifications
         run: |
@@ -114,47 +117,10 @@ jobs:
         if: failure()
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          state = Path(os.environ["WABT_OCI_INTEROP_STATE_DIR"])
-          output = Path("zig-out/oci-interop-failure/summary.txt")
-          output.parent.mkdir(parents=True, exist_ok=True)
-          manifest = json.loads(Path("src/fixtures/oci/manifest.json").read_text())
-          lines = [
-              "OCI external interoperability failure",
-              f"schema={manifest['schema']}@{manifest['schemaVersion']}",
-              f"platform={manifest['executionPlatform']}",
-              f"oras={manifest['producers']['oras']['version']} "
-              f"{manifest['producers']['oras']['binary']['sha256']}",
-              f"wkg={manifest['producers']['wkg']['version']} "
-              f"{manifest['producers']['wkg']['binary']['sha256']}",
-              f"registry={manifest['producers']['registry']['version']} "
-              f"{manifest['producers']['registry']['binary']['sha256']}",
-          ]
-          candidates = sorted((state / "ci-logs").glob("*.log"))
-          candidates += sorted((state / "work" / "logs").glob("*"))
-          remaining = 48 * 1024
-          for path in candidates:
-              if not path.is_file() or remaining <= 0:
-                  continue
-              data = path.read_bytes()[-min(path.stat().st_size, 16 * 1024):]
-              text = data.decode("utf-8", "replace")
-              text = re.sub(
-                  r"(?i)(authorization|password|token)(\s*[:=]\s*)\S+",
-                  r"\1\2<redacted>",
-                  text,
-              )
-              text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?<redacted-query>", text)
-              section = f"\n--- {path.name} (tail) ---\n{text}"
-              encoded = section.encode("utf-8")[:remaining]
-              lines.append(encoded.decode("utf-8", "ignore"))
-              remaining -= len(encoded)
-          output.write_text("\n".join(lines)[:64 * 1024] + "\n", encoding="utf-8")
-          PY
+          zig run tools/oci_fixture_manifest.zig -- failure-summary \
+            --state "$WABT_OCI_INTEROP_STATE_DIR" \
+            --manifest src/fixtures/oci/manifest.json \
+            --output zig-out/oci-interop-failure/summary.txt
           test "$(wc -c < zig-out/oci-interop-failure/summary.txt)" -le 65536
 
       - name: Upload concise failure diagnostics

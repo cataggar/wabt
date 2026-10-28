@@ -72,7 +72,7 @@ ZIG_GLOBAL_CACHE_DIR="$CACHE/zig-global"
 ZIG_LOCAL_CACHE_DIR="$CACHE/zig-local"
 export RUSTUP_HOME CARGO_HOME CARGO_TARGET_DIR TMPDIR HOME XDG_CACHE_HOME
 export DOCKER_CONFIG ORAS_CACHE ZIG_GLOBAL_CACHE_DIR ZIG_LOCAL_CACHE_DIR
-export CARGO_INCREMENTAL=0 PYTHONDONTWRITEBYTECODE=1
+export CARGO_INCREMENTAL=0
 
 ORAS_VERSION=1.3.4
 ORAS_COMMIT=db9e29505c3059f2b8fde34ae8cae266c5c765e9
@@ -106,24 +106,9 @@ download() {
   if [[ -f "$output" ]]; then
     return
   fi
-  python3 - "$url" "$output" <<'PY'
-from pathlib import Path
-import sys
-from urllib.request import Request, urlopen
-
-url, output = sys.argv[1:]
-path = Path(output)
-partial = path.with_suffix(path.suffix + ".partial")
-partial.unlink(missing_ok=True)
-request = Request(url, headers={"User-Agent": "wabt-oci-fixture-generator/1"})
-try:
-    with urlopen(request, timeout=120) as response, partial.open("wb") as stream:
-        while chunk := response.read(1024 * 1024):
-            stream.write(chunk)
-    partial.replace(path)
-finally:
-    partial.unlink(missing_ok=True)
-PY
+  local partial="${output}.partial"
+  rm -f "$partial"
+  curl -fsSL --retry 3 --max-time 120 -A "wabt-oci-fixture-generator/1" -o "$partial" "$url" && mv "$partial" "$output"
 }
 
 verify_sha() {
@@ -217,16 +202,7 @@ git -C "$SOURCE" checkout --quiet --detach FETCH_HEAD
 [[ "$(git -C "$SOURCE" rev-parse HEAD)" == "$WKG_REVISION" ]]
 [[ "$(git -C "$SOURCE" rev-parse HEAD^{tree})" == ea20d1f82502eec5c5bc7315bc0fd7653a154221 ]]
 verify_sha "$SOURCE/Cargo.lock" "$WKG_LOCK_SHA"
-python3 - "$SOURCE/Cargo.lock" "$OCI_WASM_SHA" <<'PY'
-from pathlib import Path
-import sys
-
-lock = Path(sys.argv[1]).read_text(encoding="utf-8")
-expected = sys.argv[2]
-block = lock.split('name = "oci-wasm"', 1)[1].split("\n\n", 1)[0]
-if 'version = "0.6.0"' not in block or f'checksum = "{expected}"' not in block:
-    raise SystemExit("Cargo.lock does not contain pinned oci-wasm 0.6.0")
-PY
+zig run "$ROOT/tools/oci_fixture_manifest.zig" -- check-cargo-lock "$SOURCE/Cargo.lock" "$OCI_WASM_SHA"
 
 cat >"$BIN/zig-cc" <<'EOF'
 #!/usr/bin/env bash
@@ -264,22 +240,7 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$BIN/zig-cc"
 
 cargo build --quiet --locked -p wkg --release --manifest-path "$SOURCE/Cargo.toml"
 install -m 0755 "$CARGO_TARGET_DIR/release/wkg" "$BIN/wkg"
-python3 - "$BIN/wkg" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-data = path.read_bytes()
-data, count = re.subn(
-    rb"(/deps/rustc)[A-Za-z0-9]{6}(/raw-dylibs)",
-    rb"\1STATIC\2",
-    data,
-)
-if count != 1:
-    raise SystemExit(f"expected one Rust raw-dylibs RUNPATH, found {count}")
-path.write_bytes(data)
-PY
+zig run "$ROOT/tools/oci_fixture_manifest.zig" -- patch-wkg-runpath "$BIN/wkg"
 [[ "$("$BIN/wkg" --version)" == "wkg 0.16.1" ]]
 OCI_WASM_CRATE="$(find "$CARGO_HOME/registry/cache" -type f -name 'oci-wasm-0.6.0.crate' -print -quit)"
 [[ -n "$OCI_WASM_CRATE" ]]
@@ -288,14 +249,8 @@ verify_sha "$OCI_WASM_CRATE" "$OCI_WASM_SHA"
 zig cc -shared -fPIC -O2 \
   -o "$BIN/fixed_realtime.so" \
   "$ROOT/scripts/oci/fixed_realtime.c"
-if [[ "$(LD_PRELOAD="$BIN/fixed_realtime.so" python3 - <<'PY'
-from datetime import datetime, timezone
-print(datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-PY
-)" != "$FIXED_CREATED" ]]; then
-  echo "fixed wall-clock interposer did not take effect" >&2
-  exit 1
-fi
+LD_PRELOAD="$BIN/fixed_realtime.so" \
+  zig run "$ROOT/tools/oci_fixture_manifest.zig" -- check-fixed-clock "$FIXED_CREATED"
 
 zig build -Doptimize=safe -Dversion=oci-fixtures
 WABT="$ROOT/zig-out/bin/wabt"
@@ -305,15 +260,7 @@ mkdir -p "$WORK"/{stage,pulls,layouts,logs,registry-data}
 cp "$ROOT/src/component/fixtures/stdio-echo.wasm" "$WORK/stage/component.wasm"
 verify_sha "$WORK/stage/component.wasm" "$PAYLOAD_SHA"
 
-python3 - "$REGISTRY_HOST" <<'PY'
-import socket
-import sys
-
-host, port = sys.argv[1].split(":")
-with socket.socket() as sock:
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((host, int(port)))
-PY
+zig run "$ROOT/tools/oci_fixture_manifest.zig" -- check-port-free "$REGISTRY_HOST"
 cat >"$WORK/registry.yml" <<EOF
 version: 0.1
 log:
@@ -349,14 +296,7 @@ trap cleanup EXIT INT TERM
 REGISTRY_PID=$!
 REGISTRY_READY=0
 for _ in $(seq 1 50); do
-  if python3 - "$REGISTRY_HOST" <<'PY' 2>/dev/null
-import sys
-from urllib.request import urlopen
-
-with urlopen(f"http://{sys.argv[1]}/v2/", timeout=1) as response:
-    raise SystemExit(0 if response.status == 200 and response.read() == b"{}" else 1)
-PY
-  then
+  if [[ "$(curl -fsS --max-time 1 "http://$REGISTRY_HOST/v2/" 2>/dev/null || true)" == "{}" ]]; then
     REGISTRY_READY=1
     break
   fi
@@ -477,17 +417,9 @@ run_wabt oci copy \
   "oci:$WORK/layouts/wabt-oci-v1.1:fixture" \
   "oci:$WORK/layouts/copy-roundtrip:fixture" \
   --json >"$WORK/logs/copy-layout-layout.json"
-python3 - \
+zig run "$ROOT/tools/oci_fixture_manifest.zig" -- compare-root-digest \
   "$WORK/logs/copy-layout-layout.json" \
-  "$WORK/logs/wabt-push-oci.json" <<'PY'
-import json
-import sys
-
-left = json.load(open(sys.argv[1], encoding="utf-8"))["root"]["digest"]
-right = json.load(open(sys.argv[2], encoding="utf-8"))["root"]["digest"]
-if left != right:
-    raise SystemExit(f"layout copy root changed: {left} != {right}")
-PY
+  "$WORK/logs/wabt-push-oci.json"
 run_wabt oci copy \
   "oci:$WORK/layouts/wkg-wasm-v0:fixture" \
   "$REGISTRY_HOST/wabt/wkg-layout-copy:fixture" \
@@ -547,18 +479,18 @@ find "$WORK/layouts" -type f \
   -delete
 
 if [[ "$MODE" == refresh ]]; then
-  python3 "$ROOT/scripts/oci/fixture_manifest.py" write \
+  zig run "$ROOT/tools/oci_fixture_manifest.zig" -- write \
     --repo "$ROOT" \
     --work "$WORK" \
     --tools "$TOOLS" \
     --update
 else
-  python3 "$ROOT/scripts/oci/fixture_manifest.py" qualify \
+  zig run "$ROOT/tools/oci_fixture_manifest.zig" -- qualify \
     --repo "$ROOT" \
     --work "$WORK" \
     --tools "$TOOLS"
 fi
-python3 "$ROOT/scripts/oci/fixture_manifest.py" verify \
+zig run "$ROOT/tools/oci_fixture_manifest.zig" -- verify \
   --fixtures "$ROOT/src/fixtures/oci"
 
 rm -rf "$RESULTS"
