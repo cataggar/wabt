@@ -95,7 +95,7 @@ const top_usage =
     \\
     \\Subjects:
     \\  text       Text format (.wat) work — parse, print, desugar
-    \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+    \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink, optimize
     \\  component  Component-model work — new, embed, compose
     \\  spec       Spec testing (.wast) work — run, to-json
     \\  oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags
@@ -185,7 +185,7 @@ test "top-level help has the stable OCI subject spelling" {
         \\
         \\Subjects:
         \\  text       Text format (.wat) work — parse, print, desugar
-        \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink
+        \\  module     Core wasm (.wasm) work — validate, objdump, strip, stats, decompile, shrink, optimize
         \\  component  Component-model work — new, embed, compose
         \\  spec       Spec testing (.wast) work — run, to-json
         \\  oci        OCI WebAssembly artifacts — push, pull, copy, inspect, resolve, list-tags
@@ -213,6 +213,7 @@ test "parseSubcommand rejects flat verbs (no longer top-level)" {
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("desugar"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("spectest"));
     try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("shrink"));
+    try std.testing.expectEqual(@as(?Subcommand, null), parseSubcommand("optimize"));
 }
 
 test "parseSubcommand rejects unknown and old names" {

@@ -12,6 +12,7 @@ const strip_cmd = @import("strip.zig");
 const stats_cmd = @import("stats.zig");
 const decompile_cmd = @import("decompile.zig");
 const shrink_cmd = @import("shrink.zig");
+const optimize_cmd = @import("optimize.zig");
 
 pub const usage =
     \\Usage: wabt module <verb> [args...]
@@ -23,6 +24,7 @@ pub const usage =
     \\  stats      Print module statistics
     \\  decompile  Decompile a wasm binary into readable pseudo-code
     \\  shrink     Minimize a wasm binary while preserving a property
+    \\  optimize   Optimize a core WebAssembly binary
     \\
     \\Run `wabt help module <verb>` for verb-specific help.
     \\
@@ -35,6 +37,7 @@ pub const Verb = enum {
     stats,
     decompile,
     shrink,
+    optimize,
     help,
 };
 
@@ -45,6 +48,7 @@ pub fn parseVerb(s: []const u8) ?Verb {
     if (std.mem.eql(u8, s, "stats")) return .stats;
     if (std.mem.eql(u8, s, "decompile")) return .decompile;
     if (std.mem.eql(u8, s, "shrink")) return .shrink;
+    if (std.mem.eql(u8, s, "optimize")) return .optimize;
     if (std.mem.eql(u8, s, "help")) return .help;
     return null;
 }
@@ -66,6 +70,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
         .stats => try stats_cmd.run(init, verb_args),
         .decompile => try decompile_cmd.run(init, verb_args),
         .shrink => try shrink_cmd.run(init, verb_args),
+        .optimize => try optimize_cmd.run(init, verb_args),
         .help => {
             if (verb_args.len == 0) {
                 writeStdout(init.io, usage);
@@ -82,6 +87,7 @@ pub fn run(init: std.process.Init, sub_args: []const []const u8) !void {
                 .stats => stats_cmd.usage,
                 .decompile => decompile_cmd.usage,
                 .shrink => shrink_cmd.usage,
+                .optimize => optimize_cmd.usage,
                 .help => usage,
             });
         },
@@ -100,6 +106,7 @@ test "parseVerb recognizes all module verbs" {
     try std.testing.expectEqual(@as(?Verb, .stats), parseVerb("stats"));
     try std.testing.expectEqual(@as(?Verb, .decompile), parseVerb("decompile"));
     try std.testing.expectEqual(@as(?Verb, .shrink), parseVerb("shrink"));
+    try std.testing.expectEqual(@as(?Verb, .optimize), parseVerb("optimize"));
     try std.testing.expectEqual(@as(?Verb, .help), parseVerb("help"));
 }
 
